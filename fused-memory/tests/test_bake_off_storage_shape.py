@@ -1,0 +1,5290 @@
+"""Tests for bake_off_storage_shape.py — the E2 storage-shape bake-off (task 3199).
+
+The script is loaded via importlib so it can be tested without sys.path
+pollution — mirrors test_calibrate_write_triage.py and
+test_memory_eval_retrieval_probe.py.  The loader is invoked lazily (via
+``_mod()``) rather than bound at import time, so the fixture-contract tests
+stay runnable independently of the script.
+
+LANE DISCIPLINE — READ BEFORE ADDING A TEST
+-------------------------------------------
+Every test in this file is free of network, Qdrant and OPENAI_API_KEY
+**except the single live end-to-end test**, which carries its markers
+PER-TEST::
+
+    @pytest.mark.integration
+    @pytest.mark.timeout(300)
+    @qdrant_skipif()
+    @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), ...)
+
+Never via a module-level ``pytestmark``.  ``fused-memory/pyproject.toml``
+sets ``addopts = "-n auto --dist loadgroup -m 'not integration'"``, so a
+module-level integration marker would deselect every pure test in this file
+from the merge lane too — see the same warning at
+``test_memory_eval_retrieval_probe.py:3419-3422``.
+
+All retrievals in the pure tests are INJECTED (hand-built ranked hit lists
+with exactly-known answers), never embedded.  That is what lets the metric
+tests assert exact values with no tolerances.
+"""
+from __future__ import annotations
+
+import functools
+import importlib.util
+import types
+from collections.abc import Container
+from pathlib import Path
+
+SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
+
+FIXTURES_DIR = Path(__file__).parent / 'fixtures'
+ALPHA_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration.jsonl'
+REGISTRY_PATH = FIXTURES_DIR / 'memory_eval_topic_registry.json'
+ARM_CLAIMS_PATH = FIXTURES_DIR / 'e2_arm_claims.jsonl'
+QUERY_SET_PATH = FIXTURES_DIR / 'e2_query_set.jsonl'
+DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
+
+
+def _load_module() -> types.ModuleType:
+    """Load bake_off_storage_shape.py from its file path.
+
+    The module is registered in sys.modules under its bare name so that
+    @dataclass and other reflection-based decorators work correctly (they
+    call sys.modules.get(cls.__module__)).
+    """
+    import sys  # noqa: PLC0415
+
+    mod_name = 'bake_off_storage_shape'
+    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    return _load_module()
+
+
+# ===========================================================================
+# step-1 — fixture loaders
+# ===========================================================================
+#
+# Contract paths read the COMMITTED fixtures; error paths build tiny
+# synthetic fixtures in tmp_path.  No network, no Qdrant.
+
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+class TestLoadCalibrationClusters:
+    """`load_calibration_clusters` groups the α fixture into its clusters."""
+
+    def test_groups_the_committed_fixture_into_twenty_clusters(self):
+        clusters = _mod().load_calibration_clusters(ALPHA_FIXTURE_PATH)
+
+        assert len(clusters) == 20
+        assert sum(len(c.members) for c in clusters.values()) == 104
+
+    def test_each_cluster_exposes_its_single_canonical_and_keeps_labels(self):
+        clusters = _mod().load_calibration_clusters(ALPHA_FIXTURE_PATH)
+
+        for cluster_id, cluster in clusters.items():
+            assert cluster.cluster_id == cluster_id
+            # Exactly one canonical, and it is the record whose id IS the
+            # cluster id (the α fixture's own invariant).
+            canonicals = [r for r in cluster.members if r['label'] == 'canonical']
+            assert len(canonicals) == 1
+            assert cluster.canonical['memory_id'] == cluster_id
+            assert cluster.canonical is canonicals[0]
+            # Labels survive grouping — the guard-adequacy probe selects on
+            # label=='duplicate', so a loader that dropped them would
+            # silently change which record is the probing write.
+            assert all(r['label'] for r in cluster.members)
+
+    def test_malformed_line_raises_with_its_one_based_line_number(self, tmp_path):
+        path = tmp_path / 'broken.jsonl'
+        path.write_text('{"memory_id": "a", "cluster_id": "a", "label": "canonical"}\nnot json\n')
+
+        with pytest.raises(_mod().FixtureError, match=r':2:'):
+            _mod().load_calibration_clusters(path)
+
+    def test_cluster_without_a_canonical_is_named_loudly(self, tmp_path):
+        path = tmp_path / 'no_canonical.jsonl'
+        path.write_text(json.dumps({
+            'memory_id': 'm1', 'cluster_id': 'c1', 'label': 'duplicate',
+            'content': 'x', 'category': 'procedural_knowledge',
+        }) + '\n')
+
+        with pytest.raises(_mod().FixtureError, match='c1'):
+            _mod().load_calibration_clusters(path)
+
+
+class TestLoadRegistryTopics:
+    """`load_registry_topics` keys the curator-gate entries by cluster id."""
+
+    def test_returns_the_twenty_curator_gate_entries_keyed_by_cluster_id(self):
+        topics = _mod().load_registry_topics(REGISTRY_PATH)
+
+        assert len(topics) == 20
+        for cluster_id, topic in topics.items():
+            assert topic.cluster_id == cluster_id
+            assert topic.topic and topic.topic == topic.topic.strip()
+            assert len(topic.phrasings) == 3
+            assert any(p['held_out'] for p in topic.phrasings)
+
+    def test_ignores_entries_not_derived_from_the_curator_gate(self, tmp_path):
+        path = tmp_path / 'registry.json'
+        path.write_text(json.dumps({'schema_version': 1, '_disclosures': {}, 'entries': [
+            {'topic': 'kept', 'derived_from': 'curator_gate',
+             'phrasings': [{'text': 'p', 'held_out': True}],
+             'provenance': {'cluster_id': 'c1'}},
+            {'topic': 'dropped', 'derived_from': 'census_topic',
+             'phrasings': [{'text': 'p', 'held_out': False}],
+             'provenance': {'cluster_id': 'c2'}},
+        ]}))
+
+        topics = _mod().load_registry_topics(path)
+
+        assert list(topics) == ['c1']
+
+
+class TestLoadE2Fixtures:
+    """The three E2-owned fixtures parse into their declared shapes."""
+
+    def test_load_arm_claims_reads_every_committed_claim(self):
+        claims = _mod().load_arm_claims(ARM_CLAIMS_PATH)
+
+        assert len(claims) == 176
+        assert len({c.claim_id for c in claims}) == 176
+        assert all(isinstance(c.canonical, bool) and isinstance(c.contested, bool) for c in claims)
+
+    def test_load_query_set_reads_both_query_kinds(self):
+        queries = _mod().load_query_set(QUERY_SET_PATH)
+
+        assert len(queries) == 236
+        assert sum(1 for q in queries if q.kind == 'topic_phrasing') == 60
+        assert sum(1 for q in queries if q.kind == 'claim') == 176
+        assert {q.kind for q in queries} == {'topic_phrasing', 'claim'}
+
+    def test_load_distractor_slab_reads_the_frozen_slab(self):
+        slab = _mod().load_distractor_slab(DISTRACTOR_SLAB_PATH)
+
+        assert len(slab) == 300
+        assert len({d.distractor_id for d in slab}) == 300
+        # A distractor must never be topic-anchorable, or it stops being a
+        # distractor and starts being a right answer for the pin to find.
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+        for d in slab:
+            assert not (RESERVED_VOCABULARY_KEYS & set(d.raw))
+
+    def test_missing_distractor_slab_says_how_to_regenerate_it(self, tmp_path):
+        """A missing slab must NEVER fall back to an empty one.
+
+        Seeding no distractors would quietly delete the contamination
+        variable the eval doc says matters most, and the run would look
+        entirely successful while measuring a different experiment.
+        """
+        missing = tmp_path / 'absent.jsonl'
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_distractor_slab(missing)
+
+        message = str(excinfo.value)
+        assert 'absent.jsonl' in message
+        assert 'README' in message  # points at the regeneration procedure
+
+
+class TestFixtureCrossValidation:
+    """The four fixtures must agree with each other, not merely parse."""
+
+    def test_every_alpha_cluster_has_a_registry_topic_and_at_least_one_claim(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters(ALPHA_FIXTURE_PATH)
+        topics = mod.load_registry_topics(REGISTRY_PATH)
+        claims = mod.load_arm_claims(ARM_CLAIMS_PATH)
+
+        claimed = {c.cluster_id for c in claims}
+        assert set(clusters) == set(topics) == claimed
+
+    def test_every_claim_topic_matches_its_clusters_registry_topic(self):
+        mod = _mod()
+        topics = mod.load_registry_topics(REGISTRY_PATH)
+
+        for claim in mod.load_arm_claims(ARM_CLAIMS_PATH):
+            assert claim.topic == topics[claim.cluster_id].topic
+
+    def test_every_claim_source_memory_id_resolves_inside_its_own_cluster(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters(ALPHA_FIXTURE_PATH)
+
+        for claim in mod.load_arm_claims(ARM_CLAIMS_PATH):
+            member_ids = {r['memory_id'] for r in clusters[claim.cluster_id].members}
+            assert claim.source_memory_id in member_ids
+
+    def test_exactly_one_canonical_claim_per_cluster(self):
+        mod = _mod()
+        claims = mod.load_arm_claims(ARM_CLAIMS_PATH)
+
+        per_cluster: dict[str, int] = {}
+        for claim in claims:
+            per_cluster.setdefault(claim.cluster_id, 0)
+            if claim.canonical:
+                per_cluster[claim.cluster_id] += 1
+        assert set(per_cluster.values()) == {1}
+
+    def test_every_query_expectation_resolves_to_a_claim_in_its_own_cluster(self):
+        mod = _mod()
+        claims = {c.claim_id: c for c in mod.load_arm_claims(ARM_CLAIMS_PATH)}
+
+        for query in mod.load_query_set(QUERY_SET_PATH):
+            assert query.expects_claim_ids
+            for claim_id in query.expects_claim_ids:
+                assert claim_id in claims
+                assert claims[claim_id].cluster_id == query.cluster_id
+
+    def test_cross_validation_names_the_offending_cluster(self, tmp_path):
+        """A fixture disagreement must be reported by name, not as a KeyError."""
+        mod = _mod()
+        claims_path = tmp_path / 'claims.jsonl'
+        claims_path.write_text(json.dumps({
+            'claim_id': 'orphan-01', 'cluster_id': 'nope', 'topic': 'orphan',
+            'text': 'x', 'source_memory_id': 'nope', 'canonical': True,
+            'b_arm_role': 'canonical', 'contested': False,
+        }) + '\n')
+
+        with pytest.raises(mod.FixtureError, match='nope'):
+            mod.cross_validate_fixtures(
+                clusters=mod.load_calibration_clusters(ALPHA_FIXTURE_PATH),
+                topics=mod.load_registry_topics(REGISTRY_PATH),
+                claims=mod.load_arm_claims(claims_path),
+                queries=[],
+            )
+
+
+class TestDefaultFixturePaths:
+    """Default paths are package-relative — never a per-task worktree path."""
+    def test_defaults_point_at_the_committed_fixtures(self):
+        mod = _mod()
+
+        assert mod.DEFAULT_ARM_CLAIMS_PATH == ARM_CLAIMS_PATH
+        assert mod.DEFAULT_QUERY_SET_PATH == QUERY_SET_PATH
+        assert mod.DEFAULT_DISTRACTOR_SLAB_PATH == DISTRACTOR_SLAB_PATH
+        assert mod.DEFAULT_ALPHA_FIXTURE_PATH == ALPHA_FIXTURE_PATH
+        assert mod.DEFAULT_REGISTRY_PATH == REGISTRY_PATH
+        # Committed, not merely named: a default pointing at a path nobody
+        # ever added would only surface on a live run.
+        assert all(
+            path.exists() for path in (
+                ARM_CLAIMS_PATH, QUERY_SET_PATH, DISTRACTOR_SLAB_PATH,
+                ALPHA_FIXTURE_PATH, REGISTRY_PATH,
+            )
+        )
+
+    def test_paths_are_derived_from___file___not_baked_in(self, tmp_path):
+        """The lesson test_calibrate_write_triage.py:1267 pins.
+
+        A path resolved at AUTHOR time breaks the moment the script runs from
+        another checkout.  Asserting `is_relative_to(package_root)` on the
+        module as loaded from THIS worktree could not tell the two apart: a
+        hardcoded
+        `/home/leo/src/dark-factory/.worktrees/3199/fused-memory/tests/
+        fixtures/e2_arm_claims.jsonl` is absolute, is under this package root,
+        and exists, so it would satisfy every such assertion.
+
+        So relocate the script — copy it to a package root somewhere else
+        entirely and import THAT — and require the defaults to follow it.
+        Only a `__file__`-derived path can.
+        """
+        import importlib.util  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        (tmp_path / 'scripts').mkdir()
+        relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
+        shutil.copy2(SCRIPT_PATH, relocated)
+
+        name = 'relocated_bake_off_storage_shape'
+        spec = importlib.util.spec_from_file_location(name, relocated)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # @dataclass looks itself up here
+        try:
+            spec.loader.exec_module(module)
+            defaults = (
+                module.DEFAULT_ARM_CLAIMS_PATH,
+                module.DEFAULT_QUERY_SET_PATH,
+                module.DEFAULT_DISTRACTOR_SLAB_PATH,
+                module.DEFAULT_ALPHA_FIXTURE_PATH,
+                module.DEFAULT_REGISTRY_PATH,
+            )
+        finally:
+            sys.modules.pop(name, None)
+
+        for default in defaults:
+            assert default.is_absolute()
+            assert default.is_relative_to(tmp_path), (
+                f'{default} did not follow the script to {tmp_path} — it is '
+                f'baked in, so the script only works from the checkout it '
+                f'was authored in'
+            )
+        # Nothing was copied alongside it, so a default that "exists" here
+        # would mean it is pointing back at the original tree.
+        assert not any(default.exists() for default in defaults)
+
+
+# ===========================================================================
+# step-3 — arm materialization
+# ===========================================================================
+#
+# `materialize_arm` turns the SAME knowledge into the three storage shapes
+# E2 arbitrates between (eval-design §5 E2 / PRD D9):
+#
+#   status_quo — the α corpus exactly as it actually existed: long original
+#                records, no vocabulary metadata at all.
+#   c_peers    — short single-claim peers, flat, all sharing a `topic`, with
+#                exactly one carrying `canonical: True` (PRD's Option C).
+#   b_grouped  — one canonical plus `parent_id` children (PRD's δ/Option B).
+#
+# Every arm additionally carries the IDENTICAL frozen distractor slab, which
+# is what makes the comparison controlled: the eval doc's contamination
+# result says distractors are what actually move retrieval.
+#
+# All pure — no network, no Qdrant, no embedder.
+
+
+@functools.cache
+def _committed_inputs() -> dict:
+    """The four committed fixtures, loaded once for the whole module."""
+    mod = _mod()
+    return {
+        'clusters': mod.load_calibration_clusters(ALPHA_FIXTURE_PATH),
+        'topics': mod.load_registry_topics(REGISTRY_PATH),
+        'claims': mod.load_arm_claims(ARM_CLAIMS_PATH),
+        'distractors': mod.load_distractor_slab(DISTRACTOR_SLAB_PATH),
+    }
+
+
+@functools.cache
+def _arm(shape: str) -> tuple:
+    """Materialize `shape` from the committed fixtures (cached, immutable view)."""
+    return tuple(_mod().materialize_arm(shape, **_committed_inputs()))
+
+
+def _knowledge(records) -> list:
+    """Just the arm's own records — the distractor slab filtered out."""
+    return [r for r in records if r.role != 'distractor']
+
+
+def _distractors(records) -> list:
+    return [r for r in records if r.role == 'distractor']
+
+
+class TestArmShapesBand:
+    """The arm set is pinned by EQUALITY, so a shape cannot be added silently.
+
+    E2's whole claim is that it compared *these three* shapes; a fourth
+    appearing without the report growing a column would make the decision
+    table quietly incomplete.
+    """
+
+    def test_arm_shapes_are_exactly_the_three_e2_arms(self):
+        assert _mod().ARM_SHAPES == ('status_quo', 'c_peers', 'b_grouped')
+
+    def test_unknown_shape_is_rejected_by_name(self):
+        mod = _mod()
+
+        with pytest.raises(ValueError, match='hybrid'):
+            mod.materialize_arm('hybrid', **_committed_inputs())
+
+
+class TestMaterializeStatusQuoArm:
+    """Arm (a): the corpus as it actually existed — long originals, no vocabulary."""
+
+    def test_emits_every_alpha_record_verbatim(self):
+        records = _knowledge(_arm('status_quo'))
+        clusters = _committed_inputs()['clusters']
+
+        originals = {r['memory_id']: r for c in clusters.values() for r in c.members}
+        assert len(records) == 104
+        assert {r.record_id for r in records} == set(originals)
+        for record in records:
+            # Verbatim: the status-quo arm must not be "helpfully" cleaned up,
+            # or it stops being the baseline the other two are measured against.
+            assert record.content == originals[record.record_id]['content']
+            assert record.cluster_id == originals[record.record_id]['cluster_id']
+
+    def test_carries_no_reserved_vocabulary_key_at_all(self):
+        """The α records genuinely have no `metadata` key — arm (a) reproduces that."""
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+
+        for record in _knowledge(_arm('status_quo')):
+            assert not (RESERVED_VOCABULARY_KEYS & set(record.metadata))
+
+    def test_role_preserves_the_alpha_label(self):
+        """The guard-adequacy probe selects the last `duplicate` record, so the
+        α labels must survive into the arm rather than being flattened."""
+        records = _knowledge(_arm('status_quo'))
+
+        assert {r.role for r in records} == {
+            'canonical', 'duplicate', 'pseudo_contradiction', 'distinct',
+        }
+
+
+class TestMaterializeCPeersArm:
+    """Arm (c): short single-claim peers sharing a topic, one flagged canonical."""
+
+    def test_emits_one_peer_per_claim_with_the_claim_text(self):
+        records = _knowledge(_arm('c_peers'))
+        claims = {c.claim_id: c for c in _committed_inputs()['claims']}
+
+        assert len(records) == len(claims) == 176
+        for record in records:
+            assert record.claim_ids and len(record.claim_ids) == 1
+            claim = claims[record.claim_ids[0]]
+            assert record.content == claim.text
+            assert record.cluster_id == claim.cluster_id
+
+    def test_all_peers_of_a_cluster_share_the_registry_topic(self):
+        """PRD D4: one topic namespace — slugs are taken verbatim from E1."""
+        topics = _committed_inputs()['topics']
+
+        for record in _knowledge(_arm('c_peers')):
+            assert record.metadata['topic'] == topics[record.cluster_id].topic
+
+    def test_exactly_one_peer_per_cluster_is_flagged_canonical(self):
+        per_cluster: dict[str, int] = {}
+        for record in _knowledge(_arm('c_peers')):
+            per_cluster.setdefault(record.cluster_id, 0)
+            # β's `invalid_canonical_type` rule is bool-identity, so the arm
+            # must emit a real True — a truthy 1 would be a fatal violation.
+            if record.metadata.get('canonical') is True:
+                per_cluster[record.cluster_id] += 1
+        assert len(per_cluster) == 20
+        assert set(per_cluster.values()) == {1}
+
+    def test_the_canonical_peer_is_short_not_a_concatenation(self):
+        """PRD §3: arm (c)'s canonical is an INDEX claim, not a rolled-up digest.
+
+        This is the load-bearing difference between C and B. If the canonical
+        were built by concatenating its cluster's peers, arm (c) would win
+        claim-recall trivially (every claim is inside the canonical) and lose
+        tokens-per-query for a reason that has nothing to do with the storage
+        shape — the experiment would measure a concatenation, not a peer set.
+        """
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('c_peers')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        clusters = _committed_inputs()['clusters']
+        for cluster_id, records in by_cluster.items():
+            canonical = next(r for r in records if r.metadata.get('canonical') is True)
+            peers = [r for r in records if r is not canonical]
+
+            # Not a concatenation: shorter than its own peers put together...
+            assert len(canonical.content) < sum(len(p.content) for p in peers)
+            # ...and no longer than the longest single peer, i.e. it sits
+            # inside the peer band rather than above it.
+            assert len(canonical.content) <= max(len(p.content) for p in peers)
+            # And dramatically shorter than the long α original it replaces —
+            # which is exactly the D4 cost question arm (c) exists to answer.
+            assert len(canonical.content) < len(clusters[cluster_id].canonical['content'])
+
+    def test_arm_c_is_flat_no_parent_links(self):
+        """Peers-as-default means no parent edge — that is arm (b)'s shape."""
+        for record in _knowledge(_arm('c_peers')):
+            assert 'parent_id' not in record.metadata
+
+
+class TestMaterializeBGroupedArm:
+    """Arm (b): one canonical per cluster plus `parent_id` children."""
+
+    def test_each_cluster_has_exactly_one_parentless_canonical(self):
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('b_grouped')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        assert len(by_cluster) == 20
+        for records in by_cluster.values():
+            canonicals = [r for r in records if r.metadata.get('canonical') is True]
+            assert len(canonicals) == 1
+            assert 'parent_id' not in canonicals[0].metadata
+
+    def test_every_child_points_at_its_clusters_canonical(self):
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('b_grouped')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        for records in by_cluster.values():
+            canonical = next(r for r in records if r.metadata.get('canonical') is True)
+            children = [r for r in records if r is not canonical]
+            assert children  # a grouped arm with no children is not grouped
+            for child in children:
+                assert child.metadata['parent_id'] == canonical.record_id
+
+    def test_children_carry_a_registry_kind_never_the_word_canonical(self):
+        """`kind: 'canonical'` is NOT in β's KIND_REGISTRY and would be fatal.
+
+        Canonicality is expressed by the `canonical` key, not by a `kind` —
+        this test pins that the arm does not conflate the two.
+        """
+        from fused_memory.memory_metadata import KIND_REGISTRY  # noqa: PLC0415
+
+        for record in _knowledge(_arm('b_grouped')):
+            kind = record.metadata.get('kind')
+            if record.metadata.get('canonical') is True:
+                assert kind is None
+                continue
+            assert kind in {'amendment', 'sighting'}
+            assert kind in KIND_REGISTRY
+
+    def test_parent_ids_are_canonical_dashed_uuids(self):
+        """β's `_is_full_uuid` rule: 36 chars, dashed, and its own str() round-trip.
+
+        A short hex id or a bare hex32 would trip `invalid_parent_id_shape`,
+        so the arm cannot mint ids casually.
+        """
+        import uuid  # noqa: PLC0415
+
+        seen = set()
+        for record in _knowledge(_arm('b_grouped')):
+            parent_id = record.metadata.get('parent_id')
+            if parent_id is None:
+                continue
+            assert len(parent_id) == 36
+            assert str(uuid.UUID(parent_id)) == parent_id
+            seen.add(parent_id)
+        assert len(seen) == 20  # one canonical per cluster
+
+
+class TestDistractorSlabIsSharedAndInert:
+    """The contamination variable must be IDENTICAL across arms, and inert."""
+
+    def test_every_arm_carries_the_same_slab_in_the_same_order(self):
+        slabs = {shape: _distractors(_arm(shape)) for shape in _mod().ARM_SHAPES}
+
+        for records in slabs.values():
+            assert len(records) == 300
+        reference = [(r.record_id, r.content) for r in slabs['status_quo']]
+        # Compared against the OTHER shapes only: including 'status_quo' would
+        # compare the reference against itself, a tautology among the three.
+        others = {s: r for s, r in slabs.items() if s != 'status_quo'}
+        assert others, 'no arm left to compare the slab against'
+        for shape, records in others.items():
+            assert [(r.record_id, r.content) for r in records] == reference, shape
+
+    def test_distractors_are_never_topic_anchorable(self):
+        """A distractor carrying a `topic` would stop being a distractor and
+        start being a right answer for the pin to find."""
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+
+        for shape in _mod().ARM_SHAPES:
+            for record in _distractors(_arm(shape)):
+                assert not (RESERVED_VOCABULARY_KEYS & set(record.metadata))
+                assert record.cluster_id is None
+                assert record.claim_ids == []
+
+
+class TestClaimCoverageParity:
+    """The mechanical anti-laziness guard for the blind-authoring protocol.
+
+    The eval doc names the experiment's own biggest weakness: "arm quality
+    reflects authoring skill — the experiment is gameable by authoring one
+    arm well and another lazily". The floor against that is coverage parity:
+    an arm cannot be lazily authored by simply dropping claims.
+
+    Deliberately NOT total-content-length parity — arm (a)'s long originals
+    versus arm (c)'s short peers differ BY CONSTRUCTION, and that difference
+    IS the tokens-per-query metric (see the test below).
+    """
+
+    def test_every_arm_realizes_exactly_the_same_claim_set(self):
+        mod = _mod()
+        all_claim_ids = {c.claim_id for c in _committed_inputs()['claims']}
+
+        realized = {
+            shape: {cid for r in _arm(shape) for cid in r.claim_ids}
+            for shape in mod.ARM_SHAPES
+        }
+        for shape, ids in realized.items():
+            assert ids == all_claim_ids, f'{shape} does not realize every claim'
+
+    def test_status_quo_realizes_claims_through_its_source_records(self):
+        """For arm (a) a claim is realized by its `source_memory_id` record
+        being present — that is what makes parity checkable at all for an arm
+        that was never decomposed into claims."""
+        claims = _committed_inputs()['claims']
+        by_record = {r.record_id: r for r in _knowledge(_arm('status_quo'))}
+
+        for claim in claims:
+            assert claim.claim_id in by_record[claim.source_memory_id].claim_ids
+
+    def test_arms_deliberately_differ_in_length_that_is_the_d4_metric(self):
+        """The inverse guard: assert the arms were NOT length-equalized.
+
+        If some future edit "balanced" the arms to look fair, it would delete
+        the tokens-per-query result the D4 question is asked to answer.
+        """
+        totals = {
+            shape: sum(len(r.content) for r in _knowledge(_arm(shape)))
+            for shape in _mod().ARM_SHAPES
+        }
+
+        assert totals['status_quo'] > 2 * totals['c_peers']
+        assert totals['c_peers'] == totals['b_grouped']  # same claim bodies
+
+
+class TestCategoryIsPreservedAcrossArms:
+    """Every arm record carries the SAME category the same knowledge has in
+    arm (a) — otherwise the guard replay measures the wrong thing.
+
+    `find_near_duplicate_memory` defensively filters on `category`
+    (near_duplicate_guard.py:78), so an arm whose records carried no category
+    — or a shifted one — would score zero guard adequacy for a reason that
+    has nothing to do with its storage shape. That failure would look exactly
+    like a genuine result, which is what makes it worth pinning.
+    """
+
+    def test_every_record_in_every_arm_carries_a_category(self):
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                assert record.metadata.get('category'), (shape, record.record_id)
+
+    def test_a_claims_category_matches_its_source_record_in_arm_a(self):
+        claims = {c.claim_id: c for c in _committed_inputs()['claims']}
+        status_quo = {r.record_id: r for r in _knowledge(_arm('status_quo'))}
+
+        for shape in ('c_peers', 'b_grouped'):
+            for record in _knowledge(_arm(shape)):
+                claim = claims[record.claim_ids[0]]
+                source = status_quo[claim.source_memory_id]
+                assert record.metadata['category'] == source.metadata['category']
+
+    def test_the_two_category_mixed_alpha_clusters_are_not_flattened(self):
+        """Two of the twenty α clusters are genuinely category-mixed.
+
+        Deriving category per-cluster instead of per-source-record would
+        silently edit the corpus — so assert the mixing survives.
+        """
+        for shape in _mod().ARM_SHAPES:
+            per_cluster: dict[str, set] = {}
+            for record in _knowledge(_arm(shape)):
+                per_cluster.setdefault(record.cluster_id, set()).add(
+                    record.metadata['category']
+                )
+            mixed = sum(1 for v in per_cluster.values() if len(v) > 1)
+            assert mixed == 2, shape
+
+
+class TestBetaVocabularyConformance:
+    """Every emitted metadata dict must be storable through the real seam.
+
+    The bake-off writes through `Mem0Backend` directly, so it bypasses the
+    service-seam validation entirely. Running β/3195's validator over the
+    emitted metadata keeps the experiment measuring shapes the system could
+    ACTUALLY store — otherwise an arm could win by using a shape the write
+    boundary would have rejected in production.
+    """
+
+    def test_no_arm_emits_a_fatal_metadata_violation(self):
+        from fused_memory.memory_metadata import validate_memory_metadata  # noqa: PLC0415
+
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                violations = validate_memory_metadata(
+                    dict(record.metadata), enforce_kind_registry=True
+                )
+                fatal = [v for v in violations if v.fatal]
+                assert not fatal, f'{shape}/{record.record_id}: {fatal}'
+
+    def test_every_topic_matches_the_shared_slug_shape(self):
+        """PRD D4's one-namespace rule, pinned mechanically rather than by
+        convention — the slugs come verbatim from E1's registry."""
+        from fused_memory.memory_metadata import (  # noqa: PLC0415
+            TOPIC_SLUG_MAX_LEN,
+            TOPIC_SLUG_RE,
+        )
+
+        topicked = 0
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                topic = record.metadata.get('topic')
+                if topic is None:
+                    continue
+                topicked += 1
+                assert TOPIC_SLUG_RE.match(topic)
+                assert len(topic) <= TOPIC_SLUG_MAX_LEN
+        assert topicked  # the anchored arms really do carry topics
+
+
+class TestMaterializationIsDeterministic:
+    """A rerun must seed byte-identical collections, or the two runs' reports
+    are not comparable and a diff stops being signal."""
+
+    def test_two_materializations_agree_exactly(self):
+        mod = _mod()
+
+        for shape in mod.ARM_SHAPES:
+            first = mod.materialize_arm(shape, **_committed_inputs())
+            second = mod.materialize_arm(shape, **_committed_inputs())
+
+            assert [(r.record_id, r.content, r.metadata, r.role) for r in first] == [
+                (r.record_id, r.content, r.metadata, r.role) for r in second
+            ]
+
+    def test_record_ids_are_unique_within_an_arm(self):
+        for shape in _mod().ARM_SHAPES:
+            records = _arm(shape)
+            assert len({r.record_id for r in records}) == len(records), shape
+
+
+# ===========================================================================
+# step-5 — apply_grouped_read (arm-local reference implementation of 3129)
+# ===========================================================================
+#
+# `server/grouped_read.py` DOES NOT EXIST: task 3129 is deferred behind gate
+# η, which depends on this task. A downstream task structurally cannot supply
+# an upstream premise, so the bake-off carries its own arm-local reference
+# implementation of PRD V2/D6 — which doubles as the executable specification
+# 3129 can port if the gate ratifies grouping.
+#
+# The two rules that are NOT negotiable:
+#
+#   D6 — a child hit must resolve UPWARD to its parent's grouped document.
+#        Without it a child's content becomes unreachable, which is the whole
+#        objection to δ/Option B.
+#   V2 — a `contested` child is NEVER suppressed. It survives as its own hit
+#        alongside the grouped document (the esc-5712 shape: a contested
+#        amendment folded invisibly into a canonical is how a disagreement
+#        gets silently resolved in favour of whoever wrote the canonical).
+#
+# All hit lists here are hand-built with exactly-known answers — no
+# embeddings, so every assertion is exact and tolerance-free.
+
+
+def _hit(record_id, *, parent_id=None, canonical=False, kind=None,
+         contested=False, content='body', claim_ids=(), topic='t'):
+    """One ranked hit, in the shape `apply_grouped_read` consumes."""
+    metadata: dict = {'category': 'procedural_knowledge', 'topic': topic}
+    if parent_id is not None:
+        metadata['parent_id'] = parent_id
+    if canonical:
+        metadata['canonical'] = True
+    if kind is not None:
+        metadata['kind'] = kind
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=list(claim_ids),
+        role='canonical' if canonical else (kind or 'peer'),
+    ), contested
+
+
+def _index(*pairs):
+    """Build (hits, records_by_id, contested_ids) from `_hit` pairs."""
+    records = [record for record, _ in pairs]
+    contested = {record.record_id for record, is_contested in pairs if is_contested}
+    return records, {r.record_id: r for r in records}, contested
+
+
+PARENT = '11111111-1111-4111-8111-111111111111'
+
+
+class TestGroupedReadUpwardResolution:
+    """D6: a child hit resolves upward — a child's content is never unreachable."""
+
+    def test_a_child_only_hit_returns_its_parents_grouped_document(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='AMEND', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert len(grouped) == 1
+        assert grouped[0].record_id == PARENT
+        # The child's content must be REACHABLE through the group, not lost.
+        assert 'AMEND' in grouped[0].content
+        assert 'CANON' in grouped[0].content
+        # And its claim must be credited to the group, or arm (b) would be
+        # unfairly penalised on claim-recall for grouping correctly.
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+    def test_two_children_of_one_parent_collapse_to_a_single_document(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        first, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        second, _ = _hit('child-b', parent_id=PARENT, kind='sighting', claim_ids=['k3'])
+        records_by_id = {PARENT: parent, 'child-a': first, 'child-b': second}
+
+        grouped = mod.apply_grouped_read(
+            [first, second], records_by_id, contested_ids=set()
+        )
+
+        assert len(grouped) == 1
+        # k3 is the SIGHTING's claim: collapsed to a count, body never
+        # rendered, so it is not credited. See the sighting test below.
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+    def test_a_counted_sightings_claim_is_not_credited_to_the_group(self):
+        """Crediting must agree with rendering.
+
+        `_render_grouped_document` collapses sightings to `[sightings: N]` —
+        none of their text reaches the reader — while `tokens_returned`
+        charges arm (b) only for that count.  Crediting the sighting's claim
+        anyway gave arm (b) claim-recall AND the token discount for the same
+        content simultaneously, a double advantage in exactly the two columns
+        the η decision table is read on.  Material, not theoretical: 34 of the
+        176 fixture claims carry `b_arm_role='sighting'` with substantive
+        bodies, and 34 of the 236 queries expect one of them.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        seen, _ = _hit('child-a', parent_id=PARENT, kind='sighting',
+                       content='THE SIGHTING BODY', claim_ids=['k-sighting'])
+        records_by_id = {PARENT: parent, 'child-a': seen}
+
+        grouped = mod.apply_grouped_read([seen], records_by_id, contested_ids=set())
+
+        assert len(grouped) == 1
+        # The body is genuinely absent from the payload ...
+        assert 'THE SIGHTING BODY' not in grouped[0].content
+        # ... so the claim must not be scored as realized.
+        assert set(grouped[0].claim_ids) == {'k1'}
+
+    def test_a_third_kinds_claim_is_still_credited_because_its_body_renders(self):
+        """The exclusion is scoped to sightings, not to every non-amendment.
+
+        `others` children ARE pasted into the document verbatim, so their
+        claims stay credited — otherwise the fix would swing the bias the
+        other way and penalise arm (b) for content it does return.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        other, _ = _hit('child-a', parent_id=PARENT, kind='retraction',
+                        content='THE RETRACTION TEXT', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': other}
+
+        grouped = mod.apply_grouped_read([other], records_by_id, contested_ids=set())
+
+        assert 'THE RETRACTION TEXT' in grouped[0].content
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+    def test_collapse_preserves_the_better_of_the_collapsed_ranks(self):
+        """The group must land where its BEST member ranked.
+
+        Demoting it to the worse rank would make grouping look worse than it
+        is at every k — an artifact of the transform, not of the shape.
+        """
+        mod = _mod()
+        other, _ = _hit('unrelated-1', content='X')
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        early, _ = _hit('child-a', parent_id=PARENT, kind='amendment')
+        late, _ = _hit('child-b', parent_id=PARENT, kind='sighting')
+        records_by_id = {
+            PARENT: parent, 'child-a': early, 'child-b': late, 'unrelated-1': other,
+        }
+
+        grouped = mod.apply_grouped_read(
+            [early, other, late], records_by_id, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == [PARENT, 'unrelated-1']
+
+    def test_a_parent_hit_and_its_own_child_hit_do_not_duplicate_the_group(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read(
+            [parent, child], records_by_id, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == [PARENT]
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+
+class TestGroupedReadDocumentShape:
+    """The grouped document is canonical body + amendment digests + a count."""
+
+    def test_document_carries_canonical_body_amendment_digests_and_a_sighting_count(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='THE CANONICAL BODY')
+        amend, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='THE AMENDMENT TEXT')
+        seen_one, _ = _hit('child-b', parent_id=PARENT, kind='sighting', content='S1')
+        seen_two, _ = _hit('child-c', parent_id=PARENT, kind='sighting', content='S2')
+        records_by_id = {
+            PARENT: parent, 'child-a': amend, 'child-b': seen_one, 'child-c': seen_two,
+        }
+
+        grouped = mod.apply_grouped_read(
+            [amend, seen_one, seen_two], records_by_id, contested_ids=set()
+        )
+
+        document = grouped[0].content
+        assert document.startswith('THE CANONICAL BODY')
+        assert 'THE AMENDMENT TEXT' in document
+        # Sightings are counted, not pasted — that IS the D4 cost claim
+        # grouping makes, so the transform has to actually make it.
+        assert 'S1' not in document and 'S2' not in document
+        assert '2' in document
+        assert grouped[0].role == 'grouped'
+
+    def test_a_child_of_a_third_kind_is_not_relabelled_an_amendment(self):
+        """`apply_grouped_read` buckets members into amendments / sightings /
+        `others`, then passed `amendments + others` through the parameter the
+        renderer prefixes with the literal `[amendment]`.  Any child carrying
+        a kind that is neither amendment nor sighting was therefore rendered
+        as an amendment — misattributing what the record actually IS, inside
+        the transform whose own docstring calls itself the executable
+        specification of PRD D6.
+
+        Latent on the measured path, not theoretical: the committed
+        `e2_arm_claims.jsonl` only uses amendment/sighting/canonical, which is
+        exactly why no artifact assertion catches it — but the `others` bucket
+        exists precisely because the code anticipates other kinds, and a
+        grouped read that renames a retraction into an amendment resolves a
+        disagreement in the canonical's favour, the esc-5712 shape V2 forbids.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='THE CANONICAL BODY')
+        other, _ = _hit('child-a', parent_id=PARENT, kind='retraction',
+                        content='THE RETRACTION TEXT')
+        records_by_id = {PARENT: parent, 'child-a': other}
+
+        grouped = mod.apply_grouped_read([other], records_by_id, contested_ids=set())
+
+        document = grouped[0].content
+        # D6 still holds: the body resolves upward and stays reachable ...
+        assert 'THE RETRACTION TEXT' in document
+        # ... but it is not announced as something it is not.
+        assert '[amendment]' not in document, (
+            f'a retraction was rendered as an amendment: {document!r}'
+        )
+        assert '[retraction] THE RETRACTION TEXT' in document
+
+    def test_an_amendment_and_a_third_kind_are_labelled_apart_in_one_document(self):
+        """The mislabelling is only visible when both kinds share a document:
+        a renderer that dropped the prefix entirely would pass the test above
+        while making an amendment and a retraction indistinguishable, which is
+        the same misattribution in the other direction.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        amend, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='AMENDED')
+        other, _ = _hit('child-b', parent_id=PARENT, kind='retraction',
+                        content='RETRACTED')
+        records_by_id = {PARENT: parent, 'child-a': amend, 'child-b': other}
+
+        grouped = mod.apply_grouped_read(
+            [amend, other], records_by_id, contested_ids=set()
+        )
+
+        document = grouped[0].content
+        assert '[amendment] AMENDED' in document
+        assert '[retraction] RETRACTED' in document
+
+    def test_grouped_document_keeps_the_parents_identity_and_topic(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', topic='alpha-topic')
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', topic='alpha-topic')
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert grouped[0].record_id == PARENT
+        assert grouped[0].metadata['topic'] == 'alpha-topic'
+        assert grouped[0].metadata['canonical'] is True
+
+
+class TestGroupedReadPassThrough:
+    """A hit with no parent link is untouched and stays in place."""
+
+    def test_parentless_hits_pass_through_unchanged_and_in_order(self):
+        mod = _mod()
+        first, _ = _hit('flat-1', content='A')
+        second, _ = _hit('flat-2', content='B')
+        third, _ = _hit('flat-3', content='C')
+        hits, records_by_id, contested = _index(
+            (first, False), (second, False), (third, False),
+        )
+
+        grouped = mod.apply_grouped_read(hits, records_by_id, contested_ids=contested)
+
+        # Identity of the ELEMENTS, not value equality: `ArmRecord` is a
+        # frozen dataclass, so `==` is field-wise and a transform that rebuilt
+        # equal-valued copies — allocating on every no-op call, which the hot
+        # read path makes per query per arm — would satisfy `==`.
+        assert all(g is h for g, h in zip(grouped, hits, strict=True))
+
+    def test_an_empty_hit_list_is_returned_empty(self):
+        assert _mod().apply_grouped_read([], {}, contested_ids=set()) == []
+
+    def test_a_child_whose_parent_is_absent_from_the_index_survives(self):
+        """A dangling parent link must never delete the hit.
+
+        `parent_id` liveness is leaf δ's problem, not this transform's — and
+        dropping the hit would silently lose a real answer.
+        """
+        mod = _mod()
+        orphan, _ = _hit('child-a', parent_id=PARENT, kind='amendment', content='ORPHAN')
+
+        grouped = mod.apply_grouped_read(
+            [orphan], {'child-a': orphan}, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == ['child-a']
+        assert grouped[0].content == 'ORPHAN'
+
+
+class TestSuppressionImmunityIsRealInEveryLiveArm:
+    """Every V2 test below hands `contested_ids=` in literally, so all of them
+    stay green if the LIVE path derives an empty set.
+
+    The live path is `_index_arm` -> `contested_record_ids`, which reads the
+    flag through `load_arm_claims`' ``record.get('contested', False)``.  A
+    fixture field rename, or a regression in either function, would turn
+    suppression-immunity silently OFF in every run — arm (b)'s numbers would
+    shift, the artifact gate eta depends on would not say so, and this file
+    would still pass.  That is the silent-fail-soft the repo's design
+    invariants forbid, so the derivation is asserted against the fixture ON
+    DISK rather than against the loader that reads it.
+    """
+
+    @staticmethod
+    def _raw_claims() -> list[dict]:
+        return [
+            json.loads(line)
+            for line in ARM_CLAIMS_PATH.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ]
+
+    def test_the_committed_fixture_still_carries_contested_claims(self):
+        """Read from the JSONL, not through the loader whose flag-reading is
+        exactly what could regress."""
+        contested = [row for row in self._raw_claims() if row.get('contested')]
+
+        assert contested, (
+            'no row in e2_arm_claims.jsonl is flagged contested, so every '
+            'live arm measures suppression-immunity over an empty set'
+        )
+
+    def test_every_arm_derives_a_non_empty_contested_set(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        raw_contested = {
+            row['claim_id'] for row in self._raw_claims() if row.get('contested')
+        }
+
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+
+            assert seeded.contested_ids, (
+                f'{shape}: the seeded arm carries no contested record, so the '
+                f'grouped read is free to fold every child away'
+            )
+            # Sound: nothing is marked contested that the fixture on disk does
+            # not flag...
+            for record_id in seeded.contested_ids:
+                realized = set(seeded.records_by_id[record_id].claim_ids)
+                assert realized & raw_contested, (
+                    f'{shape}/{record_id} is treated as contested but '
+                    f'realizes none of the fixture-flagged claims {realized}'
+                )
+            # ...and complete: every contested claim this arm realizes is
+            # covered, so none can be quietly folded.
+            for record in records:
+                if raw_contested & set(record.claim_ids):
+                    assert record.record_id in seeded.contested_ids, (
+                        f'{shape}/{record.record_id} realizes a contested '
+                        f'claim but is not immune to suppression'
+                    )
+
+    def test_every_cluster_keeps_a_canonical_record_in_every_arm(self):
+        """`canonical_record_ids` feeds the discoverability column the same
+        way, and an empty map would read as "no canonical to discover" rather
+        than as a broken derivation."""
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        raw_canonical = {
+            row['cluster_id']: row['claim_id']
+            for row in self._raw_claims() if row.get('canonical')
+        }
+        assert raw_canonical, 'the fixture flags no canonical claim at all'
+
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+
+            for cluster_id, claim_id in raw_canonical.items():
+                record_id = seeded.canonical_by_cluster.get(cluster_id)
+                assert record_id is not None, (
+                    f'{shape}/{cluster_id}: no canonical record, so this '
+                    f'cluster reads as undiscoverable by construction'
+                )
+                assert claim_id in seeded.records_by_id[record_id].claim_ids, (
+                    f'{shape}/{cluster_id}: canonical points at {record_id}, '
+                    f'which does not realize the fixture-canonical {claim_id}'
+                )
+
+
+class TestGroupedReadNeverSuppressesContested:
+    """PRD V2, the esc-5712 shape: a contested child is NEVER folded away."""
+
+    def test_a_contested_child_stays_as_its_own_hit_beside_the_group(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        plain, _ = _hit('child-a', parent_id=PARENT, kind='amendment', content='PLAIN')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+        records_by_id = {PARENT: parent, 'child-a': plain, 'child-b': disputed}
+
+        grouped = mod.apply_grouped_read(
+            [plain, disputed], records_by_id, contested_ids={'child-b'},
+        )
+
+        ids = [r.record_id for r in grouped]
+        assert PARENT in ids
+        assert 'child-b' in ids, 'a contested child was suppressed into the group'
+        # It stays VISIBLY itself, not merely counted.
+        disputed_hit = next(r for r in grouped if r.record_id == 'child-b')
+        assert disputed_hit.content == 'DISPUTED'
+
+    def test_a_contested_childs_body_is_not_folded_into_the_group_document(self):
+        """A group must actually FORM, or this asserts nothing.
+
+        A contested child is emitted as itself and deliberately never
+        registered in `group_members`, so a hit list containing only the
+        contested child produces no grouped document at all — and a
+        `if group is not None:` guard around the real assertion would then
+        pass unconditionally, and would keep passing if
+        `_render_grouped_document` began folding contested bodies into the
+        canonical.  That is precisely the esc-5712 silent-resolution failure
+        PRD V2 forbids and this test is named for.  So a NON-contested sibling
+        is seeded alongside, the group's existence is asserted rather than
+        guarded, and the sibling's body is checked present to prove the
+        document was really rendered from its members.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        plain, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='PLAIN')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+        records_by_id = {PARENT: parent, 'child-a': plain, 'child-b': disputed}
+
+        grouped = mod.apply_grouped_read(
+            [plain, disputed], records_by_id, contested_ids={'child-b'},
+        )
+
+        group = next((r for r in grouped if r.record_id == PARENT), None)
+        assert group is not None, 'no group formed, so nothing was tested'
+        assert 'PLAIN' in group.content       # the document really was rendered
+        assert 'DISPUTED' not in group.content
+
+    def test_a_contested_child_is_the_only_survivor_when_it_is_the_sole_hit(self):
+        """Even alone, it must not be replaced by its parent's document —
+        that would be exactly the silent resolution V2 forbids."""
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+
+        grouped = mod.apply_grouped_read(
+            [disputed], {PARENT: parent, 'child-b': disputed}, contested_ids={'child-b'},
+        )
+
+        assert 'child-b' in [r.record_id for r in grouped]
+        assert any(r.content == 'DISPUTED' for r in grouped)
+
+
+class TestGroupedReadIsArmLocalAndPure:
+    """The suppression filter must not leak into MemoryService.search.
+
+    PRD V2 forbids it explicitly: at that seam it would break
+    `mem0_dedup.find_prior_memories`' post-filter and hide candidates from
+    the write guard — the exact failure the grouped read is supposed to
+    prevent, relocated one layer down.
+    """
+
+    def test_the_transform_does_not_mutate_its_inputs(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+        before = (dict(parent.metadata), list(parent.claim_ids), parent.content)
+
+        mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert (dict(parent.metadata), list(parent.claim_ids), parent.content) == before
+        assert set(records_by_id) == {PARENT, 'child-a'}
+
+    def test_the_transform_is_synchronous_and_deterministic(self):
+        # No `iscoroutinefunction` assertion: calling the function and
+        # iterating the result — which the body does below — already fails
+        # loudly on a coroutine, so introspecting the function object first
+        # only restates it.
+        mod = _mod()
+
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment')
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        runs = [
+            [r.record_id for r in mod.apply_grouped_read(
+                [child], records_by_id, contested_ids=set())]
+            for _ in range(3)
+        ]
+        assert runs[0] == runs[1] == runs[2]
+
+
+# ===========================================================================
+# step-7 — apply_topic_anchor (arm-local reference implementation of 3111)
+# ===========================================================================
+#
+# The topic-anchored pin does not exist in `MemoryService.search` either:
+# `memory_service.py` has zero `topic` hits, and 3111 is likewise deferred
+# behind gate η. Same reasoning as the grouped read — the bake-off carries
+# its own reference implementation, which doubles as 3111's executable spec.
+#
+# PRD D1: the pin selects `topic == T AND canonical is True` and is
+# **ADDITIVE**, never subtractive. That word is load-bearing. A subtractive
+# pin — one that dropped non-canonical same-topic hits to make room — would
+# hide exactly the candidates `mem0_dedup.find_prior_memories` needs to see,
+# turning a discoverability feature into a write-guard regression.
+#
+# Because the pin is a READ-side transform, arm (d) (each shape ± pin) needs
+# no extra seeded collection: pin-on vs pin-off is an exactly-controlled A/B
+# over identical stored state, which is the only way it answers its actual
+# question ("whether 3111's pin is needed under each shape").
+
+
+def _anchor_hit(record_id, *, topic=None, canonical=None, content='body'):
+    """A hit for the pin tests. `canonical` is passed through VERBATIM so a
+    truthy-but-not-True value can be exercised."""
+    metadata: dict = {'category': 'procedural_knowledge'}
+    if topic is not None:
+        metadata['topic'] = topic
+    if canonical is not None:
+        metadata['canonical'] = canonical
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=[],
+        role='peer',
+    )
+
+
+class TestTopicAnchorIsAdditive:
+    """PRD D1: the pin ADDS the topic's canonical; it never removes a hit."""
+
+    def test_canonical_is_pinned_in_when_absent_from_the_raw_ranking(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        member = _anchor_hit('peer-1', topic='alpha')
+        other = _anchor_hit('noise-1')
+
+        pinned = mod.apply_topic_anchor(
+            [member, other], canonical_by_topic={'alpha': canonical},
+        )
+
+        ids = [r.record_id for r in pinned]
+        assert 'canon-a' in ids
+        # Additive: nothing was displaced to make room.
+        assert 'peer-1' in ids and 'noise-1' in ids
+        assert len(pinned) == 3
+
+    def test_the_relative_order_of_the_original_hits_is_unchanged(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [
+            _anchor_hit('peer-1', topic='alpha'),
+            _anchor_hit('noise-1'),
+            _anchor_hit('peer-2', topic='alpha'),
+        ]
+
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        original_order = [r.record_id for r in pinned if r.record_id != 'canon-a']
+        assert original_order == ['peer-1', 'noise-1', 'peer-2']
+
+    def test_an_already_present_canonical_is_not_duplicated(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha'), canonical],
+            canonical_by_topic={'alpha': canonical},
+        )
+
+        assert [r.record_id for r in pinned].count('canon-a') == 1
+        assert len(pinned) == 2
+
+    def test_two_topics_in_one_hit_set_both_get_their_canonical_pinned(self):
+        mod = _mod()
+        alpha_canon = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        beta_canon = _anchor_hit('canon-b', topic='beta', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha'), _anchor_hit('peer-2', topic='beta')],
+            canonical_by_topic={'alpha': alpha_canon, 'beta': beta_canon},
+        )
+
+        ids = [r.record_id for r in pinned]
+        assert 'canon-a' in ids and 'canon-b' in ids
+        assert len(pinned) == 4
+
+
+class TestTopicAnchorIdentityCases:
+    """The pin fires only when a same-topic hit is actually present."""
+
+    def test_a_hit_set_with_no_topic_metadata_is_returned_unchanged(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [_anchor_hit('noise-1'), _anchor_hit('noise-2')]
+
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        # The documented early-out is `return hits` (bake_off_storage_shape
+        # .py:1019), so assert the LIST is the same object — `==` would also
+        # pass on `return list(hits)`, which is a rewrite.
+        assert pinned is hits
+
+    def test_a_topic_with_no_registered_canonical_pins_nothing(self):
+        mod = _mod()
+
+        hits = [_anchor_hit('peer-1', topic='orphan-topic')]
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={})
+
+        assert pinned == hits
+
+    def test_an_empty_hit_list_stays_empty(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        assert mod.apply_topic_anchor([], canonical_by_topic={'alpha': canonical}) == []
+
+
+class TestTopicAnchorCanonicalIsBoolIdentity:
+    """`canonical` is matched by `is True`, mirroring β's rule.
+
+    β's `invalid_canonical_type` treats a truthy `1` as a FATAL violation, so
+    a pin that accepted it would anchor on records the write boundary would
+    have rejected — and E2 would report a discoverability win for a shape
+    production cannot store.
+
+    The rejecting half is asserted where the rule is ENFORCED —
+    `build_canonical_by_topic`, the sole producer of the index this function
+    reads (see TestBuildCanonicalByTopic below).  `apply_topic_anchor` used to
+    re-check it on the already-filtered index; that branch was unreachable
+    through the module's own wiring, so the only thing that could exercise it
+    was a hand-built dict no caller constructs.
+    """
+
+    def test_a_real_bool_true_is_accepted(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha')],
+            canonical_by_topic={'alpha': canonical},
+        )
+
+        assert 'canon-a' in [r.record_id for r in pinned]
+
+
+class TestBuildCanonicalByTopic:
+    """The index the live driver populates via `scroll_by_metadata`.
+
+    `Mem0Backend.search` exposes NO arbitrary metadata filter, so the pin's
+    canonical lookup cannot be a search — it has to be a scroll. Building the
+    index as a pure function over already-fetched records keeps that seam
+    testable without a store.
+    """
+
+    def test_indexes_exactly_the_canonical_records_by_topic(self):
+        mod = _mod()
+        records = list(_arm('c_peers'))
+
+        index = mod.build_canonical_by_topic(records)
+
+        assert len(index) == 20
+        for topic, record in index.items():
+            assert record.metadata['topic'] == topic
+            assert record.metadata['canonical'] is True
+
+    def test_a_second_canonical_for_one_topic_is_rejected_by_name(self):
+        """Per-(project, topic) canonical uniqueness is leaf ε's rule.
+
+        This transform cannot enforce it globally, but it must not silently
+        pick a winner — that would make the pin's answer depend on scroll
+        order, i.e. non-deterministic between runs.
+        """
+        mod = _mod()
+        first = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        second = _anchor_hit('canon-b', topic='alpha', canonical=True)
+
+        with pytest.raises(ValueError, match='alpha'):
+            mod.build_canonical_by_topic([first, second])
+
+    def test_records_without_a_topic_or_canonical_flag_are_ignored(self):
+        mod = _mod()
+        index = mod.build_canonical_by_topic([
+            _anchor_hit('noise-1'),
+            _anchor_hit('peer-1', topic='alpha'),
+            _anchor_hit('untopicked-canon', canonical=True),
+        ])
+
+        assert index == {}
+
+    def test_a_truthy_one_never_enters_the_index(self):
+        """Bool identity, mirroring β's `invalid_canonical_type`.
+
+        This is where the rule is enforced, and it is enforced ONCE: an
+        impostor that never enters the index can never be pinned, so
+        `apply_topic_anchor` needs no re-check downstream.  A truthy `1` is a
+        FATAL violation at β's write boundary, so anchoring on one would
+        report a discoverability win for a shape production cannot store.
+        """
+        mod = _mod()
+        impostor = _anchor_hit('impostor', topic='alpha', canonical=1)
+
+        index = mod.build_canonical_by_topic([impostor])
+
+        assert index == {}
+        # And therefore nothing to pin — the invariant, end to end.
+        hits = [_anchor_hit('peer-1', topic='alpha')]
+        assert mod.apply_topic_anchor(hits, canonical_by_topic=index) is hits
+
+    def test_the_index_is_deterministic_across_input_orderings(self):
+        mod = _mod()
+        records = list(_arm('c_peers'))
+
+        forward = mod.build_canonical_by_topic(records)
+        backward = mod.build_canonical_by_topic(list(reversed(records)))
+
+        assert {t: r.record_id for t, r in forward.items()} == {
+            t: r.record_id for t, r in backward.items()
+        }
+
+
+class TestTopicAnchorIsArmLocalAndPure:
+    """Same discipline as the grouped read — 3111's pin stays out of the seam."""
+
+    def test_the_transform_does_not_mutate_its_inputs(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [_anchor_hit('peer-1', topic='alpha')]
+        before = [(r.record_id, dict(r.metadata)) for r in hits]
+
+        mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        assert [(r.record_id, dict(r.metadata)) for r in hits] == before
+        assert len(hits) == 1  # not appended to in place
+
+
+# ===========================================================================
+# step-9 — the two rank/set-based retrieval metrics
+# ===========================================================================
+#
+# eval-design §1 states the program-wide discipline verbatim: "every
+# retrieval metric in this program must be rank-based, never
+# absolute-score-based. Re-running 3111's probe today on the canonical's own
+# topic phrase returned scores of 0.44-0.51 for the same corpus where the
+# task record measured 0.72-0.90 — wording and embedding/config drift move
+# the score scale wholesale. Ranks and set-membership (present-in-top-k)
+# survive that; thresholds on raw cosine do not."
+#
+# So these two functions take an ALREADY-RANKED hit list and read only rank
+# and set membership. Every hit list below is hand-built, so every expected
+# value is exact by construction — no embeddings, no tolerances.
+
+
+def _ranked(*claim_id_groups, topic=None):
+    """A ranked hit list where hit i realizes `claim_id_groups[i]`."""
+    mod = _mod()
+    hits = []
+    for position, claim_ids in enumerate(claim_id_groups):
+        metadata: dict = {'category': 'procedural_knowledge'}
+        if topic is not None:
+            metadata['topic'] = topic
+        hits.append(mod.ArmRecord(
+            record_id=f'r{position}',
+            content='body',
+            metadata=metadata,
+            cluster_id='c1',
+            claim_ids=list(claim_ids),
+            role='peer',
+        ))
+    return hits
+
+
+class TestClaimRecallAtK:
+    """Does the SPECIFIC claim a query targets surface within top-k?"""
+
+    def test_a_claim_at_rank_three_is_recalled_at_k5_but_not_k2(self):
+        mod = _mod()
+        hits = _ranked([], [], ['target'], [])
+
+        assert mod.claim_recall_at_k(hits, ['target'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['target'], 2) == 0.0
+
+    def test_a_claim_exactly_at_k_is_inside_the_window(self):
+        """Off-by-one guard: k is inclusive, so rank 5 counts at k=5."""
+        mod = _mod()
+        hits = _ranked([], [], [], [], ['target'])
+
+        assert mod.claim_recall_at_k(hits, ['target'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['target'], 4) == 0.0
+
+    def test_a_grouped_document_realizes_every_claim_it_absorbed(self):
+        """Otherwise arm (b) is penalised precisely FOR grouping correctly —
+        the metric would punish the shape for doing the thing under test."""
+        mod = _mod()
+        grouped = _ranked(['k1', 'k2', 'k3'])
+
+        for claim_id in ('k1', 'k2', 'k3'):
+            assert mod.claim_recall_at_k(grouped, [claim_id], 5) == 1.0
+
+    def test_recall_over_several_expected_claims_is_the_realized_fraction(self):
+        mod = _mod()
+        hits = _ranked(['k1'], ['k2'])
+
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2', 'k3'], 5) == pytest.approx(2 / 3)
+        assert mod.claim_recall_at_k(hits, ['k3', 'k4'], 5) == 0.0
+
+    def test_a_claim_realized_twice_is_not_double_counted(self):
+        mod = _mod()
+        hits = _ranked(['k1'], ['k1'], ['k2'])
+
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2'], 5) == 1.0
+
+    def test_no_expected_claims_reports_none_not_a_measured_zero(self):
+        """`calibrate_write_triage.compute_recall_at_k`'s own rule: an empty
+        denominator is NO measurement, which is not the same as a measured 0.0
+        and must not average into the report as one."""
+        assert _mod().claim_recall_at_k(_ranked(['k1']), [], 5) is None
+
+    def test_an_empty_hit_list_is_a_genuine_zero(self):
+        """Distinct from the case above: the query WAS scorable and returned
+        nothing, which is a real miss."""
+        assert _mod().claim_recall_at_k([], ['k1'], 5) == 0.0
+
+
+class TestTopicDiscoverability:
+    """Can the topic's canonical be found, and how much of the topic surfaced?"""
+
+    def test_reports_a_one_based_rank_for_a_present_canonical(self):
+        mod = _mod()
+        hits = _ranked([], [], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'r1', 5)
+
+        assert result['canonical_in_top_k'] is True
+        assert result['canonical_rank'] == 2  # r1 is the SECOND hit
+
+    def test_the_first_hit_is_rank_one_not_rank_zero(self):
+        result = _mod().topic_discoverability(
+            _ranked([], topic='alpha'), 'alpha', 'r0', 5,
+        )
+
+        assert result['canonical_rank'] == 1
+
+    def test_an_absent_canonical_reports_rank_none_never_zero(self):
+        """0 would collide with a real rank under any 0-based reading and
+        would silently average as "very good" in a mean-rank summary."""
+        mod = _mod()
+        hits = _ranked([], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'missing', 5)
+
+        assert result['canonical_in_top_k'] is False
+        assert result['canonical_rank'] is None
+
+    def test_a_canonical_ranked_beyond_k_is_out_of_the_window(self):
+        mod = _mod()
+        hits = _ranked([], [], [], [], [], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'r5', 5)
+
+        assert result['canonical_in_top_k'] is False
+        # Its true rank is still reported — "absent from top-5" and "absent
+        # entirely" are different findings and the report must tell them apart.
+        assert result['canonical_rank'] == 6
+
+    def test_member_count_counts_only_records_carrying_the_asked_topic(self):
+        mod = _mod()
+        alpha_hits = _ranked([], [], topic='alpha')
+        beta_hit = _ranked([], topic='beta')[0]
+        beta_hit = beta_hit.__class__(**{**vars(beta_hit), 'record_id': 'beta-0'})
+
+        result = mod.topic_discoverability([*alpha_hits, beta_hit], 'alpha', 'r0', 5)
+
+        assert result['topic_member_count'] == 2  # the beta hit is not a member
+
+    def test_member_count_respects_the_k_window(self):
+        mod = _mod()
+        hits = _ranked([], [], [], [], [], [], topic='alpha')
+
+        assert mod.topic_discoverability(hits, 'alpha', 'r0', 5)['topic_member_count'] == 5
+        assert mod.topic_discoverability(hits, 'alpha', 'r0', 2)['topic_member_count'] == 2
+
+    def test_an_empty_hit_list_reports_zeroes_and_no_rank(self):
+        result = _mod().topic_discoverability([], 'alpha', 'r0', 5)
+
+        assert result == {
+            'canonical_in_top_k': False,
+            'canonical_rank': None,
+            'topic_member_count': 0,
+        }
+
+
+class TestMetricsAreRankBasedNotScoreBased:
+    """eval-design §1's discipline, asserted behaviorally.
+
+    The failure mode is invisible: a score-reading metric produces perfectly
+    plausible numbers that silently stop being comparable the moment the
+    embedding config drifts — which is exactly how the 0.72-0.90 figure in
+    the task record became 0.44-0.51 on re-measurement.  So the tests below
+    perturb what a score-reading metric would be sensitive to and assert the
+    numbers do not move.  (The ScoredHit/ArmRecord type split makes the same
+    point structurally, but a type shape is not a test.)
+    """
+
+    def test_shuffling_the_payloads_without_changing_order_changes_nothing(self):
+        """Rank is the only input that matters: rewriting every content body
+        must not move a rank-based metric."""
+        mod = _mod()
+        hits = _ranked(['k1'], ['k2'], ['k3'], topic='alpha')
+        rewritten = [
+            r.__class__(**{**vars(r), 'content': f'COMPLETELY DIFFERENT {i}'})
+            for i, r in enumerate(hits)
+        ]
+
+        assert mod.claim_recall_at_k(hits, ['k2'], 5) == mod.claim_recall_at_k(
+            rewritten, ['k2'], 5
+        )
+        assert mod.topic_discoverability(hits, 'alpha', 'r1', 5) == (
+            mod.topic_discoverability(rewritten, 'alpha', 'r1', 5)
+        )
+
+
+# ===========================================================================
+# step-11 — the D4 cost metric: tokens returned per query
+# ===========================================================================
+#
+# The question D4 asks is a COST question: "a grouped read returns one long
+# document; N peers return N short ones — which costs the reader more?"  So
+# the metric sums the payloads a query actually returns within top-k, which
+# puts one long document and N short ones on the same footing (a hit-count
+# metric would answer a different, useless question).
+#
+# NOTHING BELOW PINS AN ABSOLUTE TOKEN NUMBER, and nothing pins a
+# proxy-vs-tiktoken ratio.  The metric is COMPARATIVE across arms: the report
+# reads "arm (a) costs 3.1x arm (c)", never "arm (a) costs 812 tokens".  An
+# absolute assertion here would pin this file to one tokenizer build and
+# would be asserting a property of tiktoken, not of the bake-off.  Where an
+# exact sum IS asserted it is against an explicitly INJECTED estimator whose
+# arithmetic is trivially known (word count), which tests the summation
+# without pretending to know what a real tokenizer returns.
+#
+# tiktoken is NOT installed in this venv, so the character proxy is the live
+# path today.  The selection logic is still tested in both directions by
+# injecting a fake `tiktoken` into sys.modules — a branch that only runs on
+# somebody else's machine is a branch nobody has tested.
+
+
+def _payload(content: str, *, record_id: str = 'r', **metadata):
+    """One ranked hit carrying `content` as its returned payload."""
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata={'category': 'procedural_knowledge', **metadata},
+        cluster_id='c1',
+        claim_ids=[],
+        role='peer',
+    )
+
+
+#: An injected estimator with trivially-known arithmetic, so a test can assert
+#: an exact SUM without asserting anything about a real tokenizer.
+_WORDS = ('injected:words', lambda text: len(text.split()))
+
+
+def _fake_tiktoken(encode=None, *, get_encoding_raises: Exception | None = None):
+    """A stand-in `tiktoken` module for testing the selection branch."""
+    module = types.ModuleType('tiktoken')
+
+    class _Encoding:
+        def encode(self, text):
+            return (encode or (lambda t: t.split()))(text)
+
+    def _get_encoding(name):
+        if get_encoding_raises is not None:
+            raise get_encoding_raises
+        return _Encoding()
+
+    module.get_encoding = _get_encoding  # type: ignore[attr-defined]
+    return module
+
+
+def _available_estimators():
+    """Every estimator that can actually run here, resolved by name.
+
+    tiktoken is absent from this venv, so this is normally a one-element list
+    — but the shared-invariant tests below must cover it wherever it IS
+    installed rather than silently testing half of what they claim to.
+
+    Called from inside test BODIES, never from a `parametrize` decorator:
+    the latter would load the script at collection time and break this
+    module's documented lazy-`_mod()` discipline.
+    """
+    mod = _mod()
+    estimators = [(mod.CHAR_PROXY_ESTIMATOR_NAME, mod.character_proxy_tokens)]
+    try:
+        # Optional dep, absent from this venv (see the docstring above); the
+        # except arm is the normal path, so pyright cannot resolve it.
+        import tiktoken  # type: ignore[reportMissingImports]  # noqa: PLC0415
+
+        encoding = tiktoken.get_encoding('cl100k_base')
+    except Exception:  # noqa: BLE001 — absent OR unable to fetch its BPE file
+        return estimators
+    estimators.append(
+        (mod.TIKTOKEN_ESTIMATOR_NAME, lambda text: len(encoding.encode(text)))
+    )
+    return estimators
+
+
+class TestResolveTokenEstimator:
+    """Which tokenizer ran must be a REPORTED FACT, never an assumption."""
+
+    def test_returns_a_name_and_a_callable_pair(self):
+        name, encode = _mod().resolve_token_estimator()
+
+        assert isinstance(name, str) and name
+        assert callable(encode)
+        assert isinstance(encode('some text'), int)
+
+    def test_names_tiktoken_when_tiktoken_is_importable(self, monkeypatch):
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.TIKTOKEN_ESTIMATOR_NAME == 'tiktoken:cl100k_base'
+        # ...and it really delegates to the encoding rather than just renaming
+        # the proxy: the fake tokenizes on whitespace, which no character
+        # proxy would ever agree with on this input.
+        assert encode('a bb ccc dddd eeeee ffffff') == 6
+
+    def test_falls_back_to_the_character_proxy_when_tiktoken_is_absent(
+        self, monkeypatch
+    ):
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', None)  # forces ImportError
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.CHAR_PROXY_ESTIMATOR_NAME
+        assert encode('x' * 40) == mod.character_proxy_tokens('x' * 40)
+        # The two names must be TELLABLE APART, which the identity check above
+        # cannot see: were the constants ever set equal, it would still pass
+        # while the artifact claimed tiktoken produced proxy numbers.  Compared
+        # by value, so neither name's wording is pinned.
+        assert name != mod.TIKTOKEN_ESTIMATOR_NAME
+
+    def test_an_unusable_tiktoken_falls_back_instead_of_exploding(
+        self, monkeypatch
+    ):
+        """tiktoken imports fine but fetches its BPE file from the network on
+        first `get_encoding`. On an offline box that raises — and a cost
+        metric must not take the whole bake-off down with it."""
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(
+            sys.modules,
+            'tiktoken',
+            _fake_tiktoken(get_encoding_raises=OSError('no network')),
+        )
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.CHAR_PROXY_ESTIMATOR_NAME  # honest about what ran
+        assert encode('x' * 40) == mod.character_proxy_tokens('x' * 40)
+
+    def test_resolution_is_not_cached_across_calls(self, monkeypatch):
+        """A cached resolution would make the report state whichever
+        estimator the FIRST caller in the process happened to get."""
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
+        assert mod.resolve_token_estimator()[0] == mod.TIKTOKEN_ESTIMATOR_NAME
+
+        monkeypatch.setitem(sys.modules, 'tiktoken', None)
+        assert mod.resolve_token_estimator()[0] == mod.CHAR_PROXY_ESTIMATOR_NAME
+
+
+class TestTokensReturned:
+    """Sum over the top-k payloads — one long document vs N short ones."""
+
+    def test_sums_the_payloads_of_the_top_k_hits(self):
+        mod = _mod()
+        hits = [_payload('a b c', record_id='r0'), _payload('d e', record_id='r1')]
+
+        assert mod.tokens_returned(hits, 5, _WORDS)['tokens'] == 5
+
+    def test_only_the_top_k_payloads_are_counted(self):
+        mod = _mod()
+        hits = [_payload('a b c', record_id='r0'), _payload('d e', record_id='r1')]
+
+        assert mod.tokens_returned(hits, 1, _WORDS)['tokens'] == 3
+        assert mod.tokens_returned(hits, 1, _WORDS)['payloads_counted'] == 1
+
+    def test_one_grouped_document_and_n_peers_are_weighed_on_equal_footing(self):
+        """The D4 question itself: identical knowledge, two shapes. The metric
+        must be blind to how many hits carried it — otherwise it answers "how
+        many results?" rather than "how much must the reader read?"."""
+        mod = _mod()
+        peers = [
+            _payload('claim one body', record_id='p0'),
+            _payload('claim two body', record_id='p1'),
+            _payload('claim three body', record_id='p2'),
+        ]
+        grouped = [_payload('claim one body claim two body claim three body')]
+
+        assert (
+            mod.tokens_returned(grouped, 5, _WORDS)['tokens']
+            == mod.tokens_returned(peers, 5, _WORDS)['tokens']
+            == 9
+        )
+
+    def test_the_estimator_name_is_carried_into_the_result(self):
+        """So the report can state which tokenizer produced its numbers.
+        Without this the artifact is un-interpretable a month later."""
+        mod = _mod()
+
+        result = mod.tokens_returned([_payload('a b')], 5, _WORDS)
+
+        assert result['estimator'] == 'injected:words'
+
+    def test_the_default_estimator_is_the_resolved_one_and_is_named(self):
+        mod = _mod()
+        expected_name, expected_encode = mod.resolve_token_estimator()
+
+        result = mod.tokens_returned([_payload('x' * 400)], 5)
+
+        assert result['estimator'] == expected_name
+        assert result['tokens'] == expected_encode('x' * 400)
+
+    def test_only_the_knowledge_payload_is_counted_not_the_metadata(self):
+        """Metadata rendering is a transport/formatting choice η is NOT
+        deciding. Folding it in would make the arm comparison move with how
+        the server happens to render a result dict — and would charge the
+        shapes that carry β vocabulary keys for carrying them, which is a
+        real but SEPARATE question from D4's payload cost."""
+        mod = _mod()
+        bare = [_payload('a b c')]
+        adorned = [
+            _payload(
+                'a b c',
+                topic='a-very-long-topic-slug-indeed',
+                canonical=True,
+                kind='amendment',
+            )
+        ]
+
+        assert (
+            mod.tokens_returned(adorned, 5, _WORDS)['tokens']
+            == mod.tokens_returned(bare, 5, _WORDS)['tokens']
+        )
+
+    def test_a_k_larger_than_the_hit_list_counts_what_is_there(self):
+        result = _mod().tokens_returned([_payload('a b')], 50, _WORDS)
+
+        assert result['tokens'] == 2
+        assert result['payloads_counted'] == 1
+
+
+class TestTokenEstimatorInvariants:
+    """Properties that must hold for EVERY estimator, or arms stop comparing."""
+
+    def test_every_estimator_is_monotone_in_content_length(self):
+        """Non-decreasing, not strictly increasing: the proxy floors, so two
+        near-identical lengths can legitimately tie. What must NEVER happen is
+        a longer payload costing less — that would let the verbose arm win."""
+        bodies = ['', 'w', 'word ' * 10, 'word ' * 100, 'word ' * 1000]
+
+        for name, encode in _available_estimators():
+            estimates = [encode(body) for body in bodies]
+
+            assert estimates == sorted(estimates), f'{name} is not monotone'
+            assert estimates[-1] > estimates[1], f'{name} does not grow at all'
+
+    def test_every_estimator_agrees_that_nothing_returned_costs_nothing(self):
+        mod = _mod()
+
+        for name, encode in _available_estimators():
+            assert encode('') == 0, f'{name} charges for an empty payload'
+            assert mod.tokens_returned([], 5, (name, encode)) == {
+                'tokens': 0,
+                'estimator': name,
+                'payloads_counted': 0,
+            }
+
+
+# ===========================================================================
+# step-13 — near-dup-guard candidate adequacy
+# ===========================================================================
+#
+# eval-doc :324-326's question: "would the write that became duplicate N+1
+# have been matched?"  This is the ONE metric in the program that cannot be
+# made purely rank-based without ceasing to measure the real thing —
+# `find_near_duplicate_memory` IS an absolute-threshold selector in
+# production — so it is reported SPLIT IN TWO rather than quietly violating
+# eval-design §1:
+#
+#   part 1  candidate_present  — rank/set-based and score-free: is a true
+#           cluster sibling in the arm's top-5 AT ALL?  Drift-proof, and the
+#           part that actually discriminates between storage shapes.
+#   part 2  guard_matched      — the production selector's verdict at its
+#           configured threshold, carrying `threshold_replay: True` so no
+#           reader trends it across embedding-config changes as if it were
+#           stable.
+#
+# The two must be INDEPENDENT: a corpus can put the right sibling in front of
+# the guard and still score below threshold. A metric that collapsed them
+# would report "the guard would not have fired" for a shape that did its job
+# perfectly, and the decision table would blame the shape for the threshold.
+#
+# Part 2 calls the REAL selector — not a reimplementation. Re-deriving its
+# defensive category/source_store filter here would measure THIS file's idea
+# of the guard, which is exactly the number nobody wants.
+
+
+def _scored(record_id, score, *, category='procedural_knowledge', content='body',
+            cluster_id='c1'):
+    """One ranked hit with the score the store returned for it."""
+    mod = _mod()
+    return mod.ScoredHit(
+        record=mod.ArmRecord(
+            record_id=record_id,
+            content=content,
+            metadata={'category': category},
+            cluster_id=cluster_id,
+            claim_ids=[],
+            role='peer',
+        ),
+        relevance_score=score,
+    )
+
+
+def _top5(*scores, category='procedural_knowledge'):
+    """A five-hit window: `scores[i]` for record id `s{i}`."""
+    return [
+        _scored(f's{i}', score, category=category) for i, score in enumerate(scores)
+    ]
+
+
+class TestTheCharProxyNameIsTrueOfItsArithmetic:
+    """`CHAR_PROXY_ESTIMATOR_NAME` is printed into the operator-facing
+    artifact as a factual claim about how its token numbers were produced.
+
+    Nothing asserted the arithmetic behind it: the only comparison
+    (`TestResolveTokenEstimator`) does `encode(...) == character_proxy_tokens(...)`
+    where, on a venv without tiktoken, `encode` IS `character_proxy_tokens` —
+    compared to itself.  An implementation returning `len(text)` or
+    `len(text) // 8` satisfies every monotonicity/zero/determinism test in
+    this file, and the report would then misname its own numbers by a factor
+    of four.
+    """
+
+    def test_it_really_is_four_characters_per_token(self):
+        mod = _mod()
+
+        # The boundary, not just a large sample: `// 8` and `len(text)` both
+        # break here, and so does an off-by-one divisor.
+        assert mod.character_proxy_tokens('x' * 4) == 1
+        assert mod.character_proxy_tokens('x' * 3) == 0
+        assert mod.character_proxy_tokens('x' * 7) == 1
+        assert mod.character_proxy_tokens('x' * 8) == 2
+        assert mod.character_proxy_tokens('x' * 40) == 10
+
+    def test_it_delegates_to_the_repos_one_chars_per_token_helper(self):
+        """INV-5: a second literal `// 4` here could drift from
+        `context_assembler.estimate_tokens` with no test noticing.  Asserted
+        by VALUE — introspecting the function object would only restate the
+        import."""
+        from fused_memory.reconciliation.context_assembler import (  # noqa: PLC0415
+            estimate_tokens,
+        )
+
+        mod = _mod()
+        for text in ('', 'x', 'x' * 40, 'mixed English/JSON {"a": 1}' * 7):
+            assert mod.character_proxy_tokens(text) == estimate_tokens(text)
+
+
+class TestGuardAdequacyPartOneCandidatePresent:
+    """Rank/set-based and score-free: is a sibling in front of the guard?"""
+
+    def test_a_sibling_in_the_window_is_present(self):
+        result = _mod().guard_adequacy(_top5(0.9, 0.8), {'s1'}, threshold=0.92)
+
+        assert result['candidate_present'] is True
+
+    def test_no_sibling_in_the_window_is_not_present(self):
+        result = _mod().guard_adequacy(_top5(0.99, 0.99), {'elsewhere'}, threshold=0.5)
+
+        assert result['candidate_present'] is False
+        # ...even though the guard itself matched something. The two parts
+        # answer different questions and must not be read as one.
+        assert result['guard_matched'] is True
+
+    def test_presence_is_independent_of_score(self):
+        """The point of splitting the metric: a shape that put the right
+        sibling at rank 1 did its job even if the cosine came in low. Scoring
+        that as a shape failure would blame the storage shape for the
+        threshold."""
+        mod = _mod()
+
+        low = mod.guard_adequacy(_top5(0.50, 0.50, 0.50, 0.50, 0.50), {'s2'}, 0.92)
+
+        assert low['candidate_present'] is True
+        assert low['guard_matched'] is False
+        assert low['guard_matched_id'] is None
+
+    def test_presence_ignores_the_category_filter_the_selector_applies(self):
+        """Part 1 asks about the CORPUS, not about the guard's remit."""
+        result = _mod().guard_adequacy(
+            _top5(0.99, category='observations_and_summaries'), {'s0'}, 0.92,
+        )
+
+        assert result['candidate_present'] is True
+        assert result['guard_matched'] is False  # part 2 still filters
+
+    def test_an_empty_window_has_no_candidate(self):
+        result = _mod().guard_adequacy([], {'s0'}, 0.92)
+
+        assert result['candidate_present'] is False
+        assert result['guard_matched_id'] is None
+
+
+class TestGuardAdequacyPartTwoThresholdReplay:
+    """The production selector's verdict, flagged as a threshold replay."""
+
+    def test_a_high_scoring_sibling_matches_at_the_configured_threshold(self):
+        result = _mod().guard_adequacy(
+            _top5(0.40, 0.95, 0.30), {'s1'}, threshold=0.92,
+        )
+
+        assert result['guard_matched_id'] == 's1'
+        assert result['guard_matched'] is True
+
+    def test_the_same_window_at_low_scores_does_not_match(self):
+        """Same records, same ranks, same everything but the scores — which is
+        precisely what embedding-config drift moves."""
+        result = _mod().guard_adequacy(
+            _top5(0.50, 0.50, 0.50), {'s1'}, threshold=0.92,
+        )
+
+        assert result['guard_matched_id'] is None
+        assert result['guard_matched'] is False
+
+    def test_a_high_scoring_result_of_the_wrong_category_does_not_match(self):
+        """The real selector defensively filters mismatched categories even at
+        a high score, because callers may pass unfiltered results. Production
+        guards `procedural_knowledge` writes only."""
+        result = _mod().guard_adequacy(
+            _top5(0.99, category='observations_and_summaries'), {'s0'}, 0.92,
+        )
+
+        assert result['guard_matched_id'] is None
+
+    def test_the_best_scoring_qualifying_candidate_wins(self):
+        result = _mod().guard_adequacy(
+            _top5(0.93, 0.99, 0.94), {'s0', 's1', 's2'}, 0.92,
+        )
+
+        assert result['guard_matched_id'] == 's1'
+
+    def test_the_payload_flags_itself_as_a_threshold_replay(self):
+        """Without this flag the number reads as a stable measurement, and
+        somebody trends it across an embedder change."""
+        result = _mod().guard_adequacy(_top5(0.95), {'s0'}, threshold=0.92)
+
+        assert result['threshold_replay'] is True
+        assert result['threshold'] == 0.92
+
+    def test_only_the_top_five_are_replayed(self):
+        """Production searches with `limit=5`; a caller handing over ten hits
+        must not accidentally measure a more generous guard."""
+        window = _top5(0.10, 0.10, 0.10, 0.10, 0.10) + _top5(0.99)
+
+        result = _mod().guard_adequacy(window, {'s0'}, 0.92)
+
+        assert result['guard_matched_id'] is None
+
+
+class TestGuardAdequacyUsesTheRealSelector:
+    """A reimplemented selector would measure this file, not the guard."""
+
+    def test_it_delegates_to_near_duplicate_guard(self, monkeypatch):
+        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+
+        seen = {}
+
+        def _spy(results, threshold, **kwargs):
+            seen['results'] = results
+            seen['threshold'] = threshold
+            seen['kwargs'] = kwargs
+            return None
+
+        monkeypatch.setattr(near_duplicate_guard, 'find_near_duplicate_memory', _spy)
+
+        _mod().guard_adequacy(_top5(0.95), {'s0'}, threshold=0.93)
+
+        assert seen['threshold'] == 0.93
+        assert len(seen['results']) == 1
+
+    def test_it_hands_the_selector_real_memory_result_objects(self, monkeypatch):
+        """The selector reads `.category` / `.source_store` as ENUMS and
+        `.relevance_score`; dicts would raise, and dicts-with-strings would
+        silently fail every comparison and report "guard never fires"."""
+        from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
+        from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+
+        captured = []
+        monkeypatch.setattr(
+            near_duplicate_guard,
+            'find_near_duplicate_memory',
+            lambda results, threshold, **kw: captured.extend(results) or None,
+        )
+
+        _mod().guard_adequacy(_top5(0.95, 0.10), {'s0'}, 0.92)
+
+        assert all(isinstance(r, MemoryResult) for r in captured)
+        assert captured[0].category is MemoryCategory.procedural_knowledge
+        assert captured[0].source_store is SourceStore.mem0
+        assert captured[0].relevance_score == 0.95
+        assert captured[0].id == 's0'
+
+    def test_the_adapter_preserves_rank_order(self):
+        """The selector takes the max by score, but the report quotes the
+        matched id back against the ranked window — a reordering adapter would
+        make that evidence point at the wrong record."""
+        mod = _mod()
+
+        results = mod.as_memory_results(_top5(0.10, 0.95, 0.50))
+
+        assert [r.id for r in results] == ['s0', 's1', 's2']
+
+    def test_the_adapter_passes_an_unknown_category_through_as_none(self):
+        """Rather than inventing one: a record whose category the enum does
+        not know is exactly what the selector's defensive filter exists to
+        drop, and a guessed category would defeat it."""
+        mod = _mod()
+        hit = _scored('s0', 0.99, category='not_a_real_category')
+
+        results = mod.as_memory_results([hit])
+
+        assert results[0].category is None
+
+
+class TestGuardThresholdIsNotHardcodedTwice:
+    """0.92 lives in near_duplicate_guard. A copy here would drift silently."""
+
+    def test_the_default_threshold_comes_from_the_guard_module(self):
+        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+            _DEFAULT_NEAR_DUP_THRESHOLD,
+        )
+
+        result = _mod().guard_adequacy(_top5(0.95), {'s0'})
+
+        assert result['threshold'] == _DEFAULT_NEAR_DUP_THRESHOLD
+
+    def test_a_configured_threshold_is_read_from_the_memory_service(self):
+        """The live driver has a MemoryService; the replay must use ITS
+        threshold, or the report describes a guard nobody is running."""
+        ns = types.SimpleNamespace
+        service = ns(config=ns(reconciliation=ns(
+            procedural_knowledge_near_dup_threshold=0.77,
+        )))
+
+        assert _mod().resolve_guard_threshold(service) == 0.77
+
+    def test_no_memory_service_falls_back_to_the_module_default(self):
+        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+            _DEFAULT_NEAR_DUP_THRESHOLD,
+        )
+
+        assert _mod().resolve_guard_threshold(None) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+
+class TestAuditThresholdIsNotHardcodedTwice:
+    """The D10 mirror of the guard-threshold class above.
+
+    `resolve_audit_threshold` reads the detector's default reflectively so the
+    artifact cannot report a threshold nobody runs — but nothing tied it to
+    the number the artifact actually SHIPS, and every other test hardcodes
+    0.85.  A retune upstream would silently shift the reported audit-recall
+    while the committed report went on saying 0.85.
+
+    Deliberately NOT re-asserting `inspect.signature(...)` against itself:
+    that form was deleted in an earlier cycle as tautological, and rightly —
+    it could only fail if the function stopped using inspect, and a retune
+    moved both sides together.  The committed artifact is the independent
+    side that makes the comparison mean something.
+    """
+
+    def test_the_resolved_threshold_is_the_one_the_committed_artifact_reports(self):
+        """A retune upstream must break the build rather than quietly make
+        the shipped number describe a detector nobody is running."""
+        committed = _committed_report()['audit_recall']
+
+        assert _mod().resolve_audit_threshold() == committed['threshold']
+
+    def test_the_committed_artifact_names_the_detector_it_replayed(self):
+        """The threshold alone is meaningless if the reader cannot tell which
+        function it was the default of."""
+        committed = _committed_report()['audit_recall']
+        detector = _mod().load_audit_script().find_near_duplicate_memory_groups
+
+        assert committed['detector'] == (
+            f'audit_duplicate_memories.{detector.__name__}'
+        )
+
+    def test_a_renamed_threshold_parameter_is_a_clear_error_not_a_keyerror(
+        self, monkeypatch
+    ):
+        """The failure mode this guards is a rename in
+        `audit_duplicate_memories`, which surfaces only during a live D10 run.
+        A bare `KeyError: 'threshold'` there names neither the upstream that
+        moved nor the fix."""
+        mod = _mod()
+
+        def _renamed(records, *, cutoff=0.85):  # NOT `threshold`
+            return []
+
+        monkeypatch.setattr(
+            mod, 'load_audit_script',
+            lambda: types.SimpleNamespace(
+                find_near_duplicate_memory_groups=_renamed,
+            ),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            mod.resolve_audit_threshold()
+
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, KeyError)
+        assert 'threshold' in message
+        # Names the upstream that moved and what it found instead, so the
+        # reader does not have to go and diff the signature by hand.
+        assert '_renamed' in message
+        assert 'cutoff' in message
+
+
+class TestDropCollectionsNeverAbandonsTheRemainingNames:
+    """The reaper that actually removes the ephemeral collections.
+
+    Every other test in this file monkeypatches `drop_collections` away, so
+    its two documented contracts — tolerate an already-absent collection, and
+    never abandon the rest after one failure — were unasserted.  A reaper that
+    stops at the first error leaks collections into a SHARED Qdrant, which is
+    the same class of failure the sibling reaper's own test file was added for
+    in this diff.
+    """
+
+    @staticmethod
+    def _fake_qdrant(monkeypatch, *, fails_on: Container[str] = frozenset()):
+        import qdrant_client  # noqa: PLC0415
+
+        state = {'attempted': [], 'closed': 0}
+
+        class _Client:
+            def __init__(self, url, timeout=None):
+                state['url'] = url
+
+            def delete_collection(self, name):
+                state['attempted'].append(name)
+                if name in fails_on:
+                    raise RuntimeError(f'qdrant said no: {name}')
+
+            def close(self):
+                state['closed'] += 1
+
+        monkeypatch.setattr(qdrant_client, 'QdrantClient', _Client)
+        return state
+
+    def test_a_failure_on_one_name_still_attempts_every_other(self, monkeypatch):
+        """The one that matters: a mid-list failure that aborted the loop
+        would leave later collections alive with the run reporting success."""
+        state = self._fake_qdrant(monkeypatch, fails_on={'b'})
+
+        _mod().drop_collections(['a', 'b', 'c'], qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a', 'b', 'c']
+        assert state['closed'] == 1
+
+    def test_an_already_absent_collection_is_not_an_error(self, monkeypatch):
+        """Absence is the NORMAL case on the pre-run sweep, so every name
+        failing must still return rather than raise into the caller."""
+        state = self._fake_qdrant(monkeypatch, fails_on={'a', 'b'})
+
+        _mod().drop_collections(['a', 'b'], qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a', 'b']
+        assert state['closed'] == 1
+
+    def test_the_client_is_closed_when_the_name_source_itself_raises(
+        self, monkeypatch
+    ):
+        """Chosen because it is the ONLY case that distinguishes the `finally`
+        from a plain trailing `close()`.
+
+        A "closed even when a delete failed" test would pass identically
+        against a trailing close, since the per-name `except` swallows delete
+        failures and the line after the loop is always reached — the exact
+        dead test the sibling reaper's review caught.  `names` is typed `Any`,
+        so a caller can hand it a lazy iterable that raises mid-iteration; that
+        escapes the inner `except` and only `finally` closes the connection.
+        """
+        state = self._fake_qdrant(monkeypatch)
+
+        def _names():
+            yield 'a'
+            raise RuntimeError('the name source died')
+
+        with pytest.raises(RuntimeError, match='the name source died'):
+            _mod().drop_collections(_names(), qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a']
+        assert state['closed'] == 1, 'the connection leaked'
+
+
+class TestSelectProbingWrite:
+    """Which write IS "the one that became duplicate N+1"?"""
+
+    def test_it_is_the_chronologically_last_duplicate(self):
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'early', 'label': 'duplicate',
+                 'created_at': '2026-07-16T22:16:18.712577+00:00'},
+                {'memory_id': 'late', 'label': 'duplicate',
+                 'created_at': '2026-07-26T23:58:00.802949+00:00'},
+                {'memory_id': 'mid', 'label': 'duplicate',
+                 'created_at': '2026-07-26T13:43:01.911185+00:00'},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'late'
+
+    def test_only_duplicate_labelled_records_are_eligible(self):
+        """A `distinct` or `pseudo_contradiction` member is by definition NOT
+        the write that became duplicate N+1 — probing with one would measure
+        whether the guard fires on content it is supposed to let through."""
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'dup', 'label': 'duplicate',
+                 'created_at': '2026-07-01T00:00:00+00:00'},
+                {'memory_id': 'contra', 'label': 'pseudo_contradiction',
+                 'created_at': '2026-07-30T00:00:00+00:00'},
+                {'memory_id': 'other', 'label': 'distinct',
+                 'created_at': '2026-07-31T00:00:00+00:00'},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'dup'
+
+    def test_a_cluster_with_no_duplicate_has_no_probing_write(self):
+        """None, not a substituted canonical: 5 of the committed fixture's 20
+        clusters really are duplicate-free, and probing them with SOMETHING
+        would manufacture 5 fake measurements."""
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[{'memory_id': 'd', 'label': 'distinct', 'created_at': 'x'}],
+        )
+
+        assert mod.select_probing_write(cluster) is None
+
+    def test_equal_timestamps_break_deterministically_on_memory_id(self):
+        """The 20 canonicals carry `created_at: null` and nothing forbids two
+        duplicates sharing a stamp — an unstable tiebreak would make the probe
+        query, and therefore the whole arm's guard column, move between runs."""
+        mod = _mod()
+        same = '2026-07-26T13:43:01.911185+00:00'
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'bbb', 'label': 'duplicate', 'created_at': same},
+                {'memory_id': 'aaa', 'label': 'duplicate', 'created_at': same},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'bbb'  # max id
+
+    def test_over_the_committed_fixture_every_probe_is_a_duplicate(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters(ALPHA_FIXTURE_PATH)
+
+        probes = {
+            cid: mod.select_probing_write(c) for cid, c in clusters.items()
+        }
+        measurable = {cid: p for cid, p in probes.items() if p is not None}
+
+        assert len(probes) == 20
+        assert all(p['label'] == 'duplicate' for p in measurable.values())
+        # 5 duplicate-free clusters are unmeasurable BY CONSTRUCTION, and the
+        # report must show 15 measurements rather than 20 with 5 invented.
+        assert len(measurable) == 15
+
+
+# ===========================================================================
+# step-15 — PRD D10: audit-recall over alpha/3130's labeled fixture
+# ===========================================================================
+#
+# D10 (3136's deferral item 3): "ζ also delivers the audit-recall measurement
+# — run audit_duplicate_memories.py against α/3130's labeled fixture and
+# report recall on the paraphrase class — the number that decides how much to
+# trust the κ report."
+#
+# NO RATE, BOUND OR TOLERANCE IS ASSERTED AGAINST THE REAL FIXTURE (gate G6).
+# The measurement informs a judgement; it does not gate a build. Asserting
+# today's recall would also freeze it: a detector improvement would read as a
+# test failure, which is the precise opposite of what the number is for.
+# So correctness is proven on hand-built corpora with exactly-derivable
+# answers, and the real fixture is asserted for STRUCTURE only.
+#
+# The positive class is split into two bands by each pair's max
+# SequenceMatcher ratio against the threshold:
+#
+#   lexical band     — the detector COULD reach it. "Did it?" is a fair
+#                      question about the detector.
+#   paraphrase band  — by construction unreachable by a character-level
+#                      threshold, no matter how the detector is tuned short
+#                      of changing kind. Counting these as detector misses
+#                      without saying so would read as "the audit script is
+#                      broken" rather than "this class is invisible to it".
+#
+# GOTCHA (pinned at test_audit_duplicate_memories.py:1116-1119):
+# SequenceMatcher.ratio() is ORDER-SENSITIVE — the known exemplar pair scores
+# 0.0948 one way and 0.2279 the other on normalised content. The band split
+# therefore takes the MAX over both orderings: a pair is only called
+# unreachable if NEITHER ordering reaches the threshold, which can never
+# over-claim the paraphrase band.
+
+#: Exactly-derivable corpus: one byte-similar positive pair, one paraphrase
+#: positive pair, and the four cross-cluster negatives they imply.
+_SYNTHETIC_CORPUS = [
+    {'memory_id': 'a1', 'cluster_id': 'c1', 'label': 'canonical',
+     'content': 'The merge worker retries a failed rebase exactly twice.'},
+    {'memory_id': 'a2', 'cluster_id': 'c1', 'label': 'duplicate',
+     'content': 'The merge worker retries a failed rebase exactly twice!'},
+    {'memory_id': 'b1', 'cluster_id': 'c2', 'label': 'canonical',
+     'content': 'Qdrant collections are named by project id.'},
+    {'memory_id': 'b2', 'cluster_id': 'c2', 'label': 'duplicate',
+     'content': 'Vector store namespaces derive from the canonicalised '
+                'project identifier.'},
+]
+
+#: Same cluster, but the third record is curator-ruled NOT a duplicate while
+#: being byte-similar — the hardest negative there is.
+_HARD_NEGATIVE_CORPUS = [
+    {'memory_id': 'a1', 'cluster_id': 'c1', 'label': 'canonical',
+     'content': 'The merge worker retries a failed rebase exactly twice.'},
+    {'memory_id': 'a2', 'cluster_id': 'c1', 'label': 'duplicate',
+     'content': 'The merge worker retries a failed rebase exactly twice!'},
+    {'memory_id': 'a3', 'cluster_id': 'c1', 'label': 'distinct',
+     'content': 'The merge worker retries a failed rebase exactly twice?'},
+]
+
+
+@functools.cache
+def _synthetic_audit():
+    return _mod().audit_recall_over_labeled_fixture(_SYNTHETIC_CORPUS, 0.85)
+
+
+@functools.cache
+def _fixture_audit():
+    """The real measurement. Cached — it is an O(n^2) difflib sweep."""
+    mod = _mod()
+    return mod.audit_recall_over_labeled_fixture(
+        mod.load_labeled_fixture(ALPHA_FIXTURE_PATH), 0.85,
+    )
+
+
+class TestAuditRecallOnAnExactlyDerivableCorpus:
+    """Four records, one detectable pair, one paraphrase pair. No tolerances."""
+
+    def test_recall_over_the_positive_class(self):
+        result = _synthetic_audit()
+
+        assert result['true_dup']['pairs'] == 2
+        assert result['true_dup']['recovered'] == 1  # only the byte-similar one
+        assert result['true_dup']['recall'] == 0.5
+
+    def test_the_positive_class_splits_into_two_bands(self):
+        result = _synthetic_audit()
+
+        assert result['true_dup']['lexical_band']['pairs'] == 1
+        assert result['true_dup']['paraphrase_band']['pairs'] == 1
+
+    def test_per_band_recall_isolates_what_the_detector_could_reach(self):
+        """The headline number and the fair number, side by side: 0.5 overall
+        reads as a mediocre detector; 1.0 of what it could reach plus 0.0 of
+        what it structurally cannot reads as a detector working exactly as
+        designed on a corpus that is mostly out of its reach."""
+        result = _synthetic_audit()
+
+        assert result['true_dup']['lexical_band']['recall'] == 1.0
+        assert result['true_dup']['paraphrase_band']['recall'] == 0.0
+
+    def test_the_bands_partition_the_positive_class_exactly(self):
+        result = _synthetic_audit()['true_dup']
+
+        assert (
+            result['lexical_band']['pairs'] + result['paraphrase_band']['pairs']
+            == result['pairs']
+        )
+        assert (
+            result['lexical_band']['recovered']
+            + result['paraphrase_band']['recovered'] == result['recovered']
+        )
+
+    def test_a_clean_corpus_reports_no_false_groupings(self):
+        result = _synthetic_audit()
+
+        assert result['unrelated']['pairs'] == 4
+        assert result['unrelated']['falsely_grouped'] == 0
+        assert result['unrelated']['rate'] == 0.0
+
+    def test_an_empty_negative_class_reports_none_not_a_measured_zero(self):
+        """This corpus has no hard negatives at all. Reporting 0.0 would put
+        a perfect score in the table for something never measured."""
+        result = _synthetic_audit()
+
+        assert result['hard_negative']['pairs'] == 0
+        assert result['hard_negative']['rate'] is None
+
+    def test_false_groupings_are_counted_when_they_happen(self):
+        """Byte-similar but curator-ruled NOT duplicates: the detector unions
+        all three transitively, so both hard-negative pairs are false."""
+        result = _mod().audit_recall_over_labeled_fixture(
+            _HARD_NEGATIVE_CORPUS, 0.85,
+        )
+
+        assert result['hard_negative']['pairs'] == 2
+        assert result['hard_negative']['falsely_grouped'] == 2
+        assert result['hard_negative']['rate'] == 1.0
+        # ...and the true positive in the same corpus is still recovered:
+        # a false-grouping count is not a recall penalty.
+        assert result['true_dup']['recall'] == 1.0
+
+    def test_a_corpus_too_small_to_pair_reports_no_measurement(self):
+        result = _mod().audit_recall_over_labeled_fixture(
+            _SYNTHETIC_CORPUS[:1], 0.85,
+        )
+
+        assert result['true_dup']['pairs'] == 0
+        assert result['true_dup']['recall'] is None
+        assert result['groups_found'] == 0
+
+
+class TestMaxLexicalRatio:
+    """The band split's ruler — order-insensitive by construction."""
+
+    def test_it_takes_the_max_over_both_argument_orders(self):
+        """SequenceMatcher is order-sensitive; a one-directional ruler would
+        put a pair in the paraphrase band or not depending on which id sorted
+        first, which is not a property of the pair."""
+        import difflib  # noqa: PLC0415
+
+        mod = _mod()
+        left, right = 'the merge worker retries twice', 'retries twice worker'
+        forward = difflib.SequenceMatcher(None, left, right).ratio()
+        backward = difflib.SequenceMatcher(None, right, left).ratio()
+
+        measured = mod.max_lexical_ratio(left, right)
+
+        assert measured == max(forward, backward)
+        assert measured == mod.max_lexical_ratio(right, left)  # symmetric
+
+    def test_it_normalises_the_way_the_detector_does(self):
+        """`(content or '').strip().lower()` — if the ruler and the detector
+        disagreed on normalisation, the band split would describe a detector
+        nobody is running."""
+        mod = _mod()
+
+        assert mod.max_lexical_ratio('  Merge Worker ', 'merge worker') == 1.0
+
+    def test_empty_content_has_no_measurable_ratio(self):
+        """The detector explicitly refuses to cluster empty content (an
+        unextractable memory must not be deleted as a duplicate), so there is
+        no ratio to report — None, not the 1.0 SequenceMatcher would give."""
+        assert _mod().max_lexical_ratio('', '') is None
+        assert _mod().max_lexical_ratio('body', '   ') is None
+
+
+@pytest.mark.xdist_group('e2_audit_recall')
+class TestAuditRecallOverTheCommittedFixture:
+    """STRUCTURE ONLY. G6/D10: the number is reported, never asserted.
+
+    Grouped onto one xdist worker so the O(n^2) difflib sweep over the 104
+    committed records is paid ONCE (via the `_fixture_audit` cache) rather
+    than once per worker the class happens to be scattered across.
+    """
+
+    def test_the_pair_counts_match_the_labeled_partition(self):
+        """Fixture facts, not detector rates: `build_pair_sets` produces these
+        exact class sizes for the committed 104 records."""
+        result = _fixture_audit()
+
+        assert result['true_dup']['pairs'] == 301
+        assert result['hard_negative']['pairs'] == 18
+        assert result['unrelated']['pairs'] == 5037
+
+    def test_the_bands_sum_to_the_positive_class(self):
+        result = _fixture_audit()['true_dup']
+
+        assert (
+            result['lexical_band']['pairs'] + result['paraphrase_band']['pairs']
+            == 301
+        )
+
+    def test_every_reported_rate_is_a_fraction_or_no_measurement(self):
+        result = _fixture_audit()
+        rates = [
+            result['true_dup']['recall'],
+            result['true_dup']['lexical_band']['recall'],
+            result['true_dup']['paraphrase_band']['recall'],
+            result['hard_negative']['rate'],
+            result['unrelated']['rate'],
+        ]
+
+        for rate in rates:
+            assert rate is None or 0.0 <= rate <= 1.0
+
+    def test_the_payload_names_the_detector_it_replayed(self):
+        """The report is read months later by somebody deciding how much to
+        trust the κ sweep. "Recall was X" is unreadable without "of what"."""
+        result = _fixture_audit()
+
+        assert 'find_near_duplicate_memory_groups' in result['detector']
+        assert result['threshold'] == 0.85
+
+    def test_the_known_paraphrase_exemplar_is_not_lexically_reachable(self):
+        """The independently-measured exemplar (cluster e0a41fcd, cosine
+        0.905 at difflib 0.102) proves the paraphrase class is real and
+        structurally invisible to the character threshold — asserted as band
+        membership, not as a pinned ratio."""
+        mod = _mod()
+        records = {
+            r['memory_id']: r
+            for r in mod.load_labeled_fixture(ALPHA_FIXTURE_PATH)
+        }
+        left = records['243b6dec-f0ce-4123-bb09-16d834b7e9c8']
+        right = records['c315352b-6d4e-467d-9a3f-360bc2d53229']
+
+        ratio = mod.max_lexical_ratio(left['content'], right['content'])
+
+        assert left['cluster_id'] == right['cluster_id']  # a true-dup pair
+        assert ratio < 0.85
+
+    def test_paraphrase_exemplars_are_emitted_for_hand_auditing(self):
+        """A band split nobody can check by hand is a number to be believed
+        rather than read. The exemplars are the nearest misses — how far the
+        threshold would have to fall to reach the class at all."""
+        result = _fixture_audit()
+        exemplars = result['paraphrase_exemplars']
+
+        assert exemplars, 'the paraphrase band is non-empty; show some of it'
+        for exemplar in exemplars:
+            assert exemplar['max_ratio'] < result['threshold']
+        # Deterministic order (descending ratio), so a rerun's diff is signal.
+        assert [e['max_ratio'] for e in exemplars] == sorted(
+            (e['max_ratio'] for e in exemplars), reverse=True,
+        )
+
+    def test_the_measurement_is_deterministic(self):
+        """No sampling, no set iteration order leaking into the numbers."""
+        mod = _mod()
+        records = mod.load_labeled_fixture(ALPHA_FIXTURE_PATH)
+
+        first = mod.audit_recall_over_labeled_fixture(records[:30], 0.85)
+        second = mod.audit_recall_over_labeled_fixture(records[:30], 0.85)
+
+        assert first == second
+
+
+# ===========================================================================
+# step-17 — the report: build_report + render_markdown
+# ===========================================================================
+#
+# `plans/e2-storage-shape-bakeoff-report.{json,md}` is this task's
+# user-observable output and the signal gate leaf η puts in front of an
+# operator: the PRD's choice between δ-as-default and peers-as-default gets
+# made by reading it. So the artifact is held to artifact standards.
+#
+#   * SIX arm variants — three shapes x pin on/off. The pin is a read-side
+#     transform, so its variants share their shape's seeded collection, but
+#     they are separate ROWS: "does the pin help?" is a question the table
+#     must answer per shape.
+#   * A partial table RAISES. A decision table with a silently blank cell is
+#     worse than no table: the reader cannot tell "measured and equal" from
+#     "never measured", and the blank always reads as the former.
+#   * Rendering is byte-deterministic, so a rerun's diff is signal.
+#
+# NO metric value, rate or bound is asserted (G6) — every measurement below
+# is synthetic, chosen to make a shape assertion legible, and means nothing.
+
+
+def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
+                     pin_on=False, window_changed_rate=0.25):
+    """One arm's metrics, fully populated. Values are arbitrary.
+
+    ``window_changed_rate`` is ``None`` on a pin-OFF arm: the question "did
+    the pin change the window?" was never asked there, and a 0.0 would read
+    as "asked, and it changed nothing".
+    """
+    return {
+        'pin': {
+            'enabled': pin_on,
+            'window_changed_rate': window_changed_rate if pin_on else None,
+        },
+        'claim_recall': {'at_5': recall5, 'at_10': recall10},
+        'discoverability': {
+            'canonical_in_top_5_rate': 0.7,
+            'median_canonical_rank': 2.0,
+            'canonical_found_count': 14,
+            'canonical_candidates': 20,
+            'canonical_rank_window': 10,
+            'mean_topic_member_count': 3.0,
+        },
+        'by_query_kind': {
+            kind: {
+                'queries': 8,
+                'claim_recall': {'at_5': recall5, 'at_10': recall10},
+                'discoverability': {
+                    'canonical_in_top_5_rate': 0.7,
+                    'median_canonical_rank': 2.0,
+                    'canonical_found_count': 6,
+                    'canonical_candidates': 8,
+                    'canonical_rank_window': 10,
+                },
+            }
+            for kind in (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET)
+        },
+        'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
+        'guard_adequacy': {
+            'clusters_measured': 15,
+            'candidate_present_rate': 0.6,
+            'guard_matched_rate': 0.2,
+            'threshold_replay': True,
+            'threshold': 0.92,
+            'max_observed_score': 0.71,
+            'probes': 15,
+            'guard_covered_probes': 12,
+            'guard_covered_category': 'procedural_knowledge',
+        },
+    }
+
+
+def _all_arms():
+    return {
+        arm: _arm_measurement(pin_on=arm.endswith('+pin'))
+        for arm in _mod().ARM_VARIANTS
+    }
+
+
+def _protocol():
+    return {
+        'blind_authoring': 'single-author-blind-to-metrics (commit ordering)',
+        'fixtures': [
+            {'path': 'tests/fixtures/e2_arm_claims.jsonl', 'commit': 'abc1234'},
+            {'path': 'tests/fixtures/e2_query_set.jsonl', 'commit': 'def5678'},
+        ],
+        'token_estimator': 'char-proxy:4-chars-per-token',
+        'guard_threshold': 0.92,
+        'distractor_slab_size': 40,
+        'embedder_model': 'text-embedding-3-small',
+    }
+
+
+def _audit_recall():
+    return {
+        'detector': 'audit_duplicate_memories.find_near_duplicate_memory_groups',
+        'threshold': 0.85,
+        'groups_found': 0,
+        'true_dup': {
+            'pairs': 301, 'recovered': 0, 'recall': 0.0,
+            'lexical_band': {'pairs': 0, 'recovered': 0, 'recall': None},
+            'paraphrase_band': {'pairs': 301, 'recovered': 0, 'recall': 0.0},
+        },
+        'hard_negative': {'pairs': 18, 'falsely_grouped': 0, 'rate': 0.0},
+        'unrelated': {'pairs': 5037, 'falsely_grouped': 0, 'rate': 0.0},
+        'paraphrase_exemplars': [{'a': 'x', 'b': 'y', 'max_ratio': 0.55}],
+    }
+
+
+def _report():
+    return _mod().build_report(
+        arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+    )
+
+
+class TestArmVariants:
+    """Three shapes x pin on/off, named once."""
+
+    def test_there_are_exactly_six_named_variants(self):
+        mod = _mod()
+
+        assert mod.ARM_VARIANTS == (
+            'status_quo', 'status_quo+pin',
+            'c_peers', 'c_peers+pin',
+            'b_grouped', 'b_grouped+pin',
+        )
+
+    def test_every_shape_appears_with_and_without_the_pin(self):
+        mod = _mod()
+
+        for shape in mod.ARM_SHAPES:
+            assert shape in mod.ARM_VARIANTS
+            assert f'{shape}+pin' in mod.ARM_VARIANTS
+
+
+class TestBuildReportShape:
+    """What gate η reads."""
+
+    def test_it_carries_an_entry_for_every_arm_variant(self):
+        report = _report()
+
+        assert list(report['arms']) == list(_mod().ARM_VARIANTS)
+
+    def test_every_arm_carries_all_four_e2_metrics(self):
+        report = _report()
+
+        for arm, measurement in report['arms'].items():
+            assert set(measurement) >= {
+                'claim_recall', 'discoverability', 'tokens_per_query',
+                'guard_adequacy',
+            }, arm
+
+    def test_claim_recall_is_reported_at_both_k(self):
+        """k=5 because the near-dup guard lives there; k=10 because a shape
+        that merely ranks slower is a different finding from one that loses
+        the claim outright."""
+        report = _report()
+
+        for measurement in report['arms'].values():
+            assert set(measurement['claim_recall']) == {'at_5', 'at_10'}
+
+    def test_guard_adequacy_keeps_both_of_its_parts(self):
+        report = _report()
+
+        for measurement in report['arms'].values():
+            guard = measurement['guard_adequacy']
+            assert 'candidate_present_rate' in guard  # rank/set-based
+            assert 'guard_matched_rate' in guard      # threshold replay
+            assert guard['threshold_replay'] is True
+
+    def test_it_carries_the_d10_audit_recall_block(self):
+        report = _report()
+
+        assert report['audit_recall']['true_dup']['paraphrase_band']['pairs'] == 301
+
+    def test_the_protocol_block_records_how_the_experiment_was_run(self):
+        """An arbitration artifact whose provenance is not in it cannot be
+        re-read six months later by somebody who was not here."""
+        protocol = _report()['protocol']
+
+        assert protocol['blind_authoring']
+        assert protocol['fixtures'][0]['commit']       # the audit trail
+        assert protocol['token_estimator']             # which numbers these are
+        assert protocol['guard_threshold'] == 0.92
+        assert protocol['distractor_slab_size'] == 40
+        assert protocol['embedder_model']
+
+    def test_the_report_is_json_serializable(self):
+        """It is written to disk as JSON; a non-serializable value would fail
+        at the very end of an hour-long run."""
+        json.dumps(_report())
+
+
+class TestBuildReportRefusesAPartialTable:
+    """A blank cell reads as "measured and equal". It never is."""
+
+    def test_a_missing_arm_raises(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped+pin']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped+pin' in str(excinfo.value)
+
+    def test_a_missing_metric_names_both_the_arm_and_the_metric(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers']['tokens_per_query']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers' in str(excinfo.value)
+        assert 'tokens_per_query' in str(excinfo.value)
+
+    def test_a_missing_k_within_claim_recall_raises(self):
+        """The nested case is the one that would actually slip through: the
+        metric key is present, so a shallow check passes and the column
+        renders blank."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['status_quo']['claim_recall']['at_10']
+
+        with pytest.raises(mod.IncompleteReportError):
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+    def test_a_missing_guard_part_raises(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['guard_adequacy']['candidate_present_rate']
+
+        with pytest.raises(mod.IncompleteReportError):
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+    @pytest.mark.parametrize('kind', ['claim', 'topic_phrasing', 'held_out'])
+    def test_a_missing_by_query_kind_subset_raises(self, kind):
+        """The same nested case as `claim_recall`, on the block that carries
+        the ONLY claim-vs-topic split in the report.  `by_query_kind` is in
+        `_REQUIRED_ARM_METRICS` but had no refusal test, so a subset dropped
+        by a bad split would publish a by-kind table with a silently absent
+        row rather than refusing."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['by_query_kind'][kind]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped' in str(excinfo.value)
+        assert 'by_query_kind' in str(excinfo.value)
+
+    def test_an_unknown_arm_name_raises(self):
+        """A typo would otherwise drop a real arm AND add a phantom one, and
+        the table would still look complete."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['c_peers_pin'] = arms.pop('c_peers+pin')
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers_pin' in str(excinfo.value)
+
+    def test_a_missing_protocol_key_raises(self):
+        mod = _mod()
+        protocol = _protocol()
+        del protocol['token_estimator']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=_all_arms(), audit_recall=_audit_recall(), protocol=protocol,
+            )
+
+        assert 'token_estimator' in str(excinfo.value)
+
+    def test_a_none_measurement_is_accepted_and_is_not_a_missing_one(self):
+        """"Measured, no denominator" is a legitimate result and must survive
+        to the table as such — only an ABSENT key is a broken run."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['claim_recall']['at_10'] = None
+
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert report['arms']['status_quo']['claim_recall']['at_10'] is None
+
+
+def _decision_table_rows(rendered: str) -> list[str]:
+    """The decision table's data rows — header and separator excluded."""
+    lines = rendered.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith('| arm '))
+    rows = []
+    for line in lines[start + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return rows
+
+
+class TestPinCellKeepsNeverFiredApartFromBarelyFired:
+    """Three outcomes in one column, and `0.00` is the load-bearing one.
+
+    The reading guide defines `0.00` as "the pin never fired".  Reusing
+    `_cell`'s 2-decimal precision made a rate that DID fire print that value,
+    so the artifact asserted the opposite of the measurement in the one column
+    built to tell the two apart.
+    """
+
+    def test_the_pin_off_row_is_no_measurement_not_a_zero(self):
+        assert _mod()._pin_cell(None) == '—'
+
+    def test_an_exact_zero_still_prints_as_the_never_fired_value(self):
+        """`0.00` must keep meaning what the guide says it means."""
+        assert _mod()._pin_cell(0.0) == '0.00'
+
+    def test_the_committed_runs_underflowing_rate_does_not_print_as_zero(self):
+        """2 of 487 windows — the value that shipped as `0.00`."""
+        mod = _mod()
+
+        assert mod._pin_cell(2 / 487) == '<0.01'
+
+    @pytest.mark.parametrize('rate', [1e-9, 0.0001, 0.004, 0.00499])
+    def test_every_rate_that_rounds_to_zero_is_flagged_instead(self, rate):
+        assert _mod()._pin_cell(rate) == '<0.01'
+
+    @pytest.mark.parametrize('rate,expected', [
+        (0.005, '0.01'),    # the first rate that rounds UP is left alone
+        (0.38, '0.38'),
+        (1.0, '1.00'),
+    ])
+    def test_a_rate_that_survives_rounding_is_untouched(self, rate, expected):
+        assert _mod()._pin_cell(rate) == expected
+
+
+class TestRenderMarkdown:
+    """The operator-facing decision table."""
+
+    def test_it_renders_exactly_one_row_per_arm_in_the_json(self):
+        """Sliced out of the decision table specifically — the artifact holds
+        several tables, and "every row somewhere in the document" would pass
+        even if an arm rendered into the D10 block by mistake."""
+        report = _report()
+
+        rows = _decision_table_rows(_mod().render_markdown(report))
+
+        assert len(rows) == len(report['arms'])
+        for arm in report['arms']:
+            assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
+
+    def test_it_names_the_estimator_that_produced_the_token_column(self):
+        rendered = _mod().render_markdown(_report())
+
+        assert 'char-proxy:4-chars-per-token' in rendered
+
+    def test_a_missing_measurement_renders_as_no_measurement_not_zero(self):
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['claim_recall']['at_5'] = None
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        row = next(
+            line for line in mod.render_markdown(report).splitlines()
+            if line.startswith('| status_quo |')
+        )
+
+        assert '0.00' not in row.split('|')[2]
+        assert '—' in row
+
+    def test_rendering_is_byte_identical_for_identical_input(self):
+        """A rerun's diff is only signal if formatting contributes nothing."""
+        mod = _mod()
+
+        assert mod.render_markdown(_report()) == mod.render_markdown(_report())
+
+    def test_it_records_the_fixture_commits_that_prove_the_blind_protocol(self):
+        rendered = _mod().render_markdown(_report())
+
+        assert 'abc1234' in rendered
+        assert 'e2_arm_claims.jsonl' in rendered
+
+
+class TestTheTwoArtifactsAreWrittenAsAPair:
+    """Each file is written atomically; the PAIR has to be atomic too.
+
+    The JSON and the markdown are gate eta's decision input, and a reader has
+    no way to tell they disagree.  Writing the JSON first means any raise
+    inside `render_markdown` leaves a NEW json beside a STALE markdown
+    describing a different run — and `render_markdown` does unguarded
+    subscripting of blocks `_check_arms` never validates, so this is
+    reachable rather than theoretical.
+    """
+
+    def test_a_render_failure_leaves_BOTH_artifacts_untouched(self, tmp_path):
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+        json_path.write_text('OLD JSON', encoding='utf-8')
+        md_path.write_text('OLD MD', encoding='utf-8')
+
+        # The shape `_check_arms` does not validate: a report that survives
+        # to write_artifacts but blows up mid-render.
+        broken = _report()
+        del broken['audit_recall']['true_dup']
+
+        with pytest.raises(KeyError):
+            mod.write_artifacts(broken, json_path, md_path)
+
+        assert json_path.read_text(encoding='utf-8') == 'OLD JSON'
+        assert md_path.read_text(encoding='utf-8') == 'OLD MD'
+
+    def test_the_happy_path_still_writes_both(self, tmp_path):
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+
+        written = mod.write_artifacts(_report(), json_path, md_path)
+
+        assert written == (json_path, md_path)
+        assert json.loads(json_path.read_text(encoding='utf-8'))['arms']
+        # `# ` only: that markdown was written, not what it is titled. The
+        # sibling test below asserts md == render_markdown(json), which
+        # constrains the content without pinning the title prose.
+        assert md_path.read_text(encoding='utf-8').startswith('# ')
+
+    def test_the_markdown_on_disk_is_what_the_committed_json_renders_to(
+        self, tmp_path
+    ):
+        """The same pairing invariant the committed-artifact guard asserts,
+        but at the WRITE seam rather than after the fact."""
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+        report = _report()
+
+        mod.write_artifacts(report, json_path, md_path)
+
+        assert md_path.read_text(encoding='utf-8') == mod.render_markdown(
+            json.loads(json_path.read_text(encoding='utf-8'))
+        )
+
+
+class TestFixtureProvenance:
+    """The blind-authoring audit trail is git history; the report cites it."""
+
+    def test_it_reports_the_commit_that_last_touched_a_committed_fixture(self):
+        provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
+
+        assert len(provenance) == 1
+        assert provenance[0]['path'].endswith('e2_arm_claims.jsonl')
+        assert len(provenance[0]['commit']) == 40  # a full sha
+
+    def test_an_untracked_path_reports_no_commit_rather_than_a_wrong_one(self,
+                                                                        tmp_path):
+        untracked = tmp_path / 'never_committed.jsonl'
+        untracked.write_text('{}\n')
+
+        provenance = _mod().fixture_provenance([untracked])
+
+        assert provenance[0]['commit'] is None
+
+    def test_paths_are_reported_repo_relative_not_absolute(self):
+        """An artifact naming `/home/<someone>/src/...` is not reproducible
+        and leaks the checkout it happened to run in."""
+        provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
+
+        assert not provenance[0]['path'].startswith('/')
+
+
+# ===========================================================================
+# step-19 — the live driver's wiring, exercised WITHOUT a network
+# ===========================================================================
+#
+# The driver is the only part of this script that touches Qdrant or an
+# embedder, so it is the only part the pure tests cannot reach directly.
+# What CAN be reached — and is what actually goes wrong — is its WIRING:
+# which collections it creates, whose config it mutates, how many queries it
+# issues, and whether it cleans up when a run dies halfway.  All of that is
+# asserted here against a `_FakeMem0`/`_FakeMemoryService` pair, in the
+# `_install_run_doubles` spirit of test_audit_duplicate_memories.py:3296-3376,
+# with `build_parser()` / `main(argv)` driven directly — never via subprocess,
+# which would put the assertions on the far side of a process boundary and
+# reduce them to an exit code.
+#
+# The single LIVE end-to-end test lives in the next section and carries its
+# markers PER-TEST.  Everything here runs in the merge lane.
+
+import asyncio  # noqa: E402
+import copy  # noqa: E402
+
+
+class _FakeConfig(types.SimpleNamespace):
+    """A config with the leaves the driver reads, plus ``model_copy``.
+
+    ``model_copy(deep=True)`` is the seam that keeps the driver from mutating
+    the caller's config in place — so the double has to implement it for real
+    rather than returning ``self``, or the test that asserts non-mutation
+    would pass against a driver that mutates.
+    """
+
+    def model_copy(self, *, deep: bool = False) -> _FakeConfig:
+        return copy.deepcopy(self) if deep else copy.copy(self)
+
+
+def _driver_config() -> _FakeConfig:
+    return _FakeConfig(
+        mem0=types.SimpleNamespace(
+            collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
+            qdrant_url='http://localhost:6333',
+        ),
+        embedder=types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=types.SimpleNamespace(
+                openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+        # The SHARED durable-write-queue path, as it comes out of the schema:
+        # relative, so from the repo root it resolves onto the live server's
+        # own queue DB.  The driver must repoint it at a per-run temp dir
+        # before `MemoryService.initialize()` can attach to it.
+        queue=types.SimpleNamespace(data_dir='./data/queue'),
+    )
+
+
+class _FakeInstance:
+    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
+
+    def __init__(self):
+        # A sentinel, not None: the driver must REPLACE it with its no-op, and
+        # `is not sentinel` is how the test proves the stub actually landed.
+        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
+
+    _SENTINEL = object()
+
+
+class _FakeMem0:
+    """The Mem0Backend surface the driver touches, and nothing else."""
+
+    def __init__(
+        self,
+        *,
+        search_raises_on: int | None = None,
+        add_returns_no_id_on: int | None = None,
+        add_ticks: int = 1,
+    ):
+        self.added: list[tuple[str, str]] = []            # (project_id, content)
+        self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
+        self.instances: dict[str, _FakeInstance] = {}
+        self.inflight = 0
+        self.max_inflight = 0
+        self.search_inflight = 0
+        self.max_search_inflight = 0
+        self._search_raises_on = search_raises_on
+        #: 1-based ordinal of an `add` that returns a result with no id — the
+        #: shape that makes `seed_arm._write` raise SeedingError.
+        self._add_returns_no_id_on = add_returns_no_id_on
+        #: Event-loop ticks a successful `add` parks for.  >1 keeps a sibling
+        #: measurably in flight past the moment a failing peer raises, which
+        #: is the only way to tell "awaited every write" from "propagated and
+        #: left them running".
+        self._add_ticks = add_ticks
+        self._add_calls = 0
+        self._stored: dict[str, list[dict]] = {}
+
+    async def _get_instance(self, scope):
+        return self.instances.setdefault(scope.project_id, _FakeInstance())
+
+    async def add(self, content, scope, metadata=None):
+        self._add_calls += 1
+        ordinal = self._add_calls
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            if ordinal == self._add_returns_no_id_on:
+                # Fails WITHOUT suspending, so its peers are still parked below
+                # when `seed_arm` sees the error.
+                return {'results': []}
+            # A REAL suspension point.  Without one, every scheduling policy
+            # looks bounded because nothing ever overlaps; with it, an
+            # unbounded gather parks all N tasks here at once and
+            # `max_inflight` reaches N.
+            for _ in range(self._add_ticks):
+                await asyncio.sleep(0)
+            bucket = self._stored.setdefault(scope.project_id, [])
+            stored_id = f'{scope.project_id}-{len(bucket):04d}'
+            bucket.append({'id': stored_id, 'memory': content,
+                           'metadata': dict(metadata or {})})
+            self.added.append((scope.project_id, content))
+            return {'results': [{'id': stored_id, 'memory': content, 'event': 'ADD'}]}
+        finally:
+            self.inflight -= 1
+
+    async def search(self, query, scope, limit=10, categories=None):
+        self.searches.append((scope.project_id, query, limit))
+        if (self._search_raises_on is not None
+                and len(self.searches) >= self._search_raises_on):
+            raise RuntimeError('qdrant went away mid-run')
+        self.search_inflight += 1
+        self.max_search_inflight = max(
+            self.max_search_inflight, self.search_inflight,
+        )
+        try:
+            # Same reason as `add`: without a real suspension point the read
+            # side cannot be observed to overlap at all, and a serial fetch
+            # would be indistinguishable from a bounded-concurrent one.
+            await asyncio.sleep(0)
+            bucket = self._stored.get(scope.project_id, [])
+            return {'results': [
+                {'id': item['id'], 'memory': item['memory'],
+                 'metadata': item['metadata'], 'score': round(0.99 - 0.01 * rank, 4)}
+                for rank, item in enumerate(bucket[:limit])
+            ]}
+        finally:
+            self.search_inflight -= 1
+
+
+class _FakeMemoryService:
+    """Stand-in for MemoryService with the surface the driver actually uses."""
+
+    instances: list = []
+    search_raises_on: int | None = None
+    add_returns_no_id_on: int | None = None
+    add_ticks: int = 1
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = _FakeMem0(
+            search_raises_on=type(self).search_raises_on,
+            add_returns_no_id_on=type(self).add_returns_no_id_on,
+            add_ticks=type(self).add_ticks,
+        )
+        self.initialized = False
+        self.closed = False
+        # `config` is held by REFERENCE, so reading `config.queue.data_dir`
+        # after the run cannot tell "repointed before the queue was built"
+        # apart from "repointed afterwards, too late".  Snapshot it at the
+        # moment the real `initialize()` constructs its `DurableWriteQueue` —
+        # that is when attaching to the shared path would do the damage.
+        self.queue_data_dir_at_initialize: str | None = None
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        self.initialized = True
+        self.queue_data_dir_at_initialize = self.config.queue.data_dir
+
+    async def close(self):
+        self.closed = True
+
+
+class _DropRecorder:
+    """Records every collection-drop the driver asks for, in order."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def __call__(self, names, **kwargs):
+        self.calls.append(list(names))
+
+    @property
+    def dropped(self) -> set[str]:
+        return {name for call in self.calls for name in call}
+
+
+def _install_driver_doubles(
+    monkeypatch,
+    *,
+    search_raises_on: int | None = None,
+    add_returns_no_id_on: int | None = None,
+    add_ticks: int = 1,
+):
+    """Patch the three seams the driver reaches through, at their source.
+
+    The driver imports ``FusedMemoryConfig`` and ``MemoryService``
+    function-locally, so patching the defining module (never a name already
+    bound into this script) is what actually intercepts them.
+    ``drop_collections`` is patched on the script itself because it is the
+    script's OWN qdrant seam — the alternative, a fake QdrantClient, would
+    test qdrant_client's import machinery rather than the driver's teardown.
+    """
+    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+    _FakeMemoryService.instances = []
+    _FakeMemoryService.search_raises_on = search_raises_on
+    _FakeMemoryService.add_returns_no_id_on = add_returns_no_id_on
+    _FakeMemoryService.add_ticks = add_ticks
+    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _driver_config)
+    monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+    drops = _DropRecorder()
+    monkeypatch.setattr(_mod(), 'drop_collections', drops)
+    return drops
+
+
+#: A deliberately small run: two clusters and a twelve-record slab.  The
+#: wiring assertions below are about counts and identities, none of which
+#: depend on corpus size — and a 20-cluster/300-distractor run through the
+#: doubles would spend seconds proving nothing extra.
+_SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'utest'}
+
+
+class TestEphemeralCollectionIdentity:
+    """A collection nobody can reap is a leak, so its NAME is a contract."""
+
+    def test_every_arm_collection_starts_with_the_reapable_prefix(self):
+        mod = _mod()
+        prefix = mod.load_cleanup_script().E2_BAKEOFF_PREFIX
+
+        collections = mod.ephemeral_collections(suffix='utest')
+
+        assert set(collections) == set(mod.ARM_SHAPES)
+        for name in collections.values():
+            assert name.startswith(prefix)
+
+    def test_the_six_variants_map_onto_exactly_three_collections(self):
+        """The pin is a READ-side transform: its variants reuse their shape's
+        collection, so pin-on and pin-off compare identical stored state."""
+        mod = _mod()
+
+        collections = mod.ephemeral_collections(suffix='utest')
+
+        assert len(mod.ARM_VARIANTS) == 6
+        assert len(set(collections.values())) == 3
+
+    def test_the_project_id_is_scoped_per_xdist_worker(self, monkeypatch):
+        """Two workers sharing a collection would seed each other's arms."""
+        mod = _mod()
+
+        monkeypatch.setenv('PYTEST_XDIST_WORKER', 'gw7')
+        assert mod.worker_suffix() == 'gw7'
+        assert 'gw7' in mod.arm_project_id('c_peers')
+
+        monkeypatch.delenv('PYTEST_XDIST_WORKER')
+        assert mod.worker_suffix()  # never empty — an unsuffixed id would collide
+
+    def test_the_collection_name_is_what_scope_would_really_build(self):
+        """Derived through Scope, not string-formatted here: Scope canonicalizes
+        the project_id (lowercase, '-'->'_'), so a hand-built name would differ
+        from the collection mem0 actually writes to and the reap would miss."""
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        mod = _mod()
+
+        expected = Scope(
+            project_id=mod.arm_project_id('b_grouped', suffix='utest'),
+        ).mem0_collection_name(mod.ephemeral_collection_prefix())
+
+        assert mod.ephemeral_collections(suffix='utest')['b_grouped'] == expected
+
+
+class TestGuardProbeSelfDrop:
+    """Pure functions only — no driver, no doubles, so this class is not
+    asyncio-marked."""
+
+    def test_every_arms_replay_window_is_at_least_GUARD_TOP_K_deep(self):
+        """The two invariants — drop ALL of the probe's own records, and
+        replay over 5 — are enforced in different places and drifted apart
+        once already (the fixed +1).
+
+        The arithmetic half is NOT what is asserted here: `guard_fetch_limit`
+        is literally `GUARD_TOP_K + len(own)`, so `depth - len(own) >= 5` is
+        an identity that holds for an empty or wrong `own` too, and asserting
+        it would test nothing.  What can actually regress, and did, is the
+        set: `probe_own_record_ids` resolves provenance, and an id-equality
+        filter silently returns nothing on the two decomposed shapes
+        (bake_off_storage_shape.py:2538-2551).  So assert the set against an
+        independent re-derivation from the fixtures, that it is non-empty,
+        that decomposition really does split one write across several records
+        — the fact that makes a fixed +1 wrong — and that the arm still holds
+        a full GUARD_TOP_K window of records the probe does not own.
+        """
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        # Re-derived from the CLAIMS, never from `seeded.records_by_source` —
+        # otherwise this compares the index against itself.
+        source_of = {claim.claim_id: claim.source_memory_id for claim in claims}
+
+        own_sizes: dict[str, dict[str, int]] = {}
+        for shape in ('status_quo', 'c_peers', 'b_grouped'):
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            own_sizes[shape] = {}
+            for cluster_id in sorted(clusters):
+                probe = mod.select_probing_write(clusters[cluster_id])
+                if probe is None:
+                    continue
+                memory_id = probe['memory_id']
+                own = mod.probe_own_record_ids(seeded, memory_id)
+                expected = {memory_id} | {
+                    record.record_id for record in records
+                    if any(
+                        source_of.get(claim_id) == memory_id
+                        for claim_id in record.claim_ids
+                    )
+                }
+
+                assert own == expected, (
+                    f'{shape}/{cluster_id}: the self-drop set is {own}, but '
+                    f'the probing write really occupies {expected} in this '
+                    f'arm — the difference is a free self-match'
+                )
+                assert own, f'{shape}/{cluster_id}: nothing to drop'
+                own_sizes[shape][cluster_id] = len(own)
+
+                # The over-fetch is worthless if the arm cannot supply a full
+                # window of records the probe does NOT own.
+                non_own = [r for r in records if r.record_id not in own]
+                assert len(non_own) >= mod.GUARD_TOP_K, (
+                    f'{shape}/{cluster_id}: only {len(non_own)} records the '
+                    f'probe does not own, so the replay cannot be '
+                    f'{mod.GUARD_TOP_K} deep however far the fetch reaches'
+                )
+
+        # Why the floor had to become dynamic: a decomposed arm splits one
+        # write across MORE than one record, so a fixed +1 would leave those
+        # arms replaying over a shorter window than the baseline.
+        assert any(
+            own_sizes[shape][cluster_id] > own_sizes['status_quo'][cluster_id]
+            for shape in ('c_peers', 'b_grouped')
+            for cluster_id in own_sizes[shape]
+        ), 'no arm splits a probing write across several records'
+
+
+@pytest.mark.asyncio
+class TestRunBakeOffWiring:
+    """What the driver does to the world, measured through doubles."""
+
+    async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        service = _FakeMemoryService.instances[-1]
+        assert len(_FakeMemoryService.instances) == 1
+        assert sorted(service.mem0._stored) == sorted(
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        )
+        assert list(report['arms']) == list(mod.ARM_VARIANTS)
+
+    async def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
+        self, monkeypatch,
+    ):
+        """Collections are f'{collection_prefix}_{project_id}'.  A driver that
+        scoped only the project_id would write under the default 'fused'
+        prefix, which the reaper does not match — a permanent leak."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        config = _FakeMemoryService.instances[-1].config
+        assert config.mem0.collection_prefix == mod.ephemeral_collection_prefix()
+
+    async def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, monkeypatch):
+        """A stub constant vector would make every ranking in the report
+        meaningless; nulling the config key makes mem0 fall back to the real
+        OPENAI_API_KEY (the probe_config recipe)."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        config = _FakeMemoryService.instances[-1].config
+        assert config.embedder.providers.openai.api_key is None
+
+    async def test_it_never_attaches_to_the_shared_durable_write_queue(
+        self, monkeypatch,
+    ):
+        """The data-loss guard at bake_off_storage_shape.py:2947-2967.
+
+        `config.queue.data_dir` comes out of the schema RELATIVE
+        (`./data/queue`), so run from the repo root — the natural cwd — an
+        un-repointed run initialises the live server's own queue DB:
+        `_recover_in_flight()` flips the other process's in-flight rows back
+        to pending, workers drain real user writes through the backend whose
+        prefix was just repointed at `_test_e2_bakeoff_*`, and the
+        `drop_collections` in the driver's `finally` then destroys them.
+        Silent data loss on the production memory store, invisible in the
+        artifact and the logs.
+
+        Deleting the two repoint lines broke no test in this suite until this
+        one existed, which is what `_driver_config`'s `./data/queue` was put
+        there for.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        shared = _driver_config().queue.data_dir
+
+        await mod.run_bake_off(**_SMALL_RUN)
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        # Read at `initialize()`, not after the run: the repoint has to have
+        # happened BEFORE the queue is built to be worth anything, and the
+        # config is held by reference so an after-the-fact read cannot tell
+        # the two apart.
+        attached = [
+            service.queue_data_dir_at_initialize
+            for service in _FakeMemoryService.instances
+        ]
+        assert len(attached) == 2 and all(a is not None for a in attached)
+
+        for a in attached:
+            assert a != shared, (
+                f'the run attached to the shared queue path {shared!r} — a '
+                f'real MemoryService would have recovered and drained the '
+                f"live server's in-flight writes into this experiment's "
+                f'collections'
+            )
+            path = Path(a)
+            assert path.is_absolute(), (
+                f'{a!r} is relative, so it still resolves against whatever '
+                f'cwd the run happens to have — the exact failure mode'
+            )
+            assert path.is_relative_to(Path(tempfile.gettempdir()))
+            # Outside the checkout, so no run leaves queue state in a tree
+            # nothing sweeps...
+            assert not path.is_relative_to(SCRIPT_PATH.parent.parent)
+            # ...and the run removes it rather than accumulating scratch.
+            assert not path.exists()
+
+        # Per-RUN, so two bake-offs cannot share a queue with each other
+        # either — which a fixed path outside the checkout would still allow.
+        assert attached[0] != attached[1]
+
+    async def test_a_failed_initialize_still_tears_the_run_down(self, monkeypatch):
+        """The queue temp dir and the service were acquired OUTSIDE the
+        `try:`/`finally:` that cleans them up, so the one failure mode the
+        temp dir exists for — `initialize()` raising, which is exactly what an
+        unreachable Qdrant, a missing key, or a durable-queue recovery failure
+        does — leaked the directory and skipped `close()`.
+
+        The test above proves the happy path removes the dir; that is the
+        cheap half.  The module comment above the `mkdtemp` argues at length
+        that this queue must never outlive the run, and a teardown that only
+        holds when nothing goes wrong does not carry that argument.
+
+        `MemoryService.close()` is safe on a partially-initialised service —
+        every sub-close goes through `_safe_close`, which is time-boxed and
+        logs without re-raising (memory_service.py:1192) — so the finally can
+        call it unguarded rather than swallowing close failures on the happy
+        path too.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+
+        async def _initialize_explodes(self):
+            raise RuntimeError('qdrant unreachable')
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize', _initialize_explodes)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        # The failure has to keep propagating: a driver that swallowed it
+        # would publish an artifact measured against nothing.
+        assert len(_FakeMemoryService.instances) == 1
+        service = _FakeMemoryService.instances[-1]
+
+        queue_dir = Path(service.config.queue.data_dir)
+        assert queue_dir.is_relative_to(Path(tempfile.gettempdir()))
+        assert not queue_dir.exists(), (
+            f'{queue_dir} survived a failed run — the queue state the module '
+            f'comment says must never outlive the run now outlives it, and '
+            f'accumulates one directory per failed attempt'
+        )
+        assert service.closed, (
+            'close() was skipped, so whatever initialize() managed to build '
+            'before raising is never torn down'
+        )
+        # The ephemeral collections are dropped on the way out too: a failure
+        # after the pre-clean drop must not leave a half-seeded arm behind for
+        # the next run to measure.
+        assert drops.calls, 'nothing was dropped on the failure path'
+
+    async def test_it_copies_the_config_rather_than_mutating_the_callers(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        caller_config = _driver_config()
+
+        await mod.run_bake_off(config=caller_config, **_SMALL_RUN)
+
+        assert caller_config.mem0.collection_prefix == 'fused'
+        assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
+
+    async def test_it_stubs_the_xdist_contended_history_writer(self, monkeypatch):
+        """mem0's SQLite history writer is process-shared and contended (and
+        read-only in the sandbox).  It is not the question under test, and its
+        failure would mask the one that is."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        instances = _FakeMemoryService.instances[-1].mem0.instances
+        assert len(instances) == 3
+        for instance in instances.values():
+            assert instance.db.add_history is not _FakeInstance._SENTINEL
+            assert instance.db.add_history('anything', keyword=1) is None
+
+    async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
+        """The contamination floor is a controlled variable: an arm that got a
+        smaller slab would be ranking against a thinner field and would win for
+        a reason the decision table does not name."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        slab = mod.load_distractor_slab()[:_SMALL_RUN['distractor_limit']]
+        slab_contents = {d.content for d in slab}
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        added = _FakeMemoryService.instances[-1].mem0.added
+        by_project: dict[str, set[str]] = {}
+        for project_id, content in added:
+            by_project.setdefault(project_id, set()).add(content)
+
+        assert len(by_project) == 3
+        for contents in by_project.values():
+            assert slab_contents <= contents
+
+    async def test_seeding_is_bounded_rather_than_one_unbounded_gather(
+        self, monkeypatch,
+    ):
+        """A gather over the whole slab opens hundreds of concurrent embedding
+        requests at once — rate-limited into retries at best, and a run whose
+        wall clock is set by the throttler rather than the experiment."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        smallest_arm = min(
+            len(bucket) for bucket in mem0._stored.values()
+        )
+        assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
+        assert mem0.max_inflight <= mod.SEED_CONCURRENCY
+
+    async def test_fetching_stays_serial_because_a_swallowed_read_timeout_is_silent(
+        self, monkeypatch,
+    ):
+        """The read side is the one half that must NOT be made concurrent.
+
+        Bounding it at SEED_CONCURRENCY is the obvious efficiency win — 753
+        independent, order-insensitive round trips across the three arms — and
+        it was implemented and measured. The live run aborted partway through
+        the second arm with `MeasurementError: ... returned no results for a
+        10-limit query`. `Mem0Client.search` SWALLOWS its read timeout (logs,
+        returns `{}`), so on the read side concurrency converts a latency win
+        into a silently-empty ranking; `add` propagates its timeout instead,
+        which is why the write side keeps its bound.
+
+        Asserted as the OBSERVABLE property — one search in flight at a time —
+        rather than as "no semaphore exists", so a future re-attempt has to
+        confront this test rather than route around it.
+        """
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        per_arm = len(mem0.searches) / len(mod.ARM_SHAPES)
+        assert per_arm > 1  # there is something to overlap, so this can fail
+        assert mem0.max_search_inflight == 1
+
+    async def test_a_failed_seed_leaves_no_write_in_flight_past_teardown(
+        self, monkeypatch,
+    ):
+        """An orphan write can recreate the collection teardown just dropped.
+
+        A bare `gather` propagates the first SeedingError IMMEDIATELY and
+        leaves its siblings running.  Control unwinds to `run_bake_off`'s
+        `finally`, which closes the service and then drops the ephemeral
+        collections — and a write still in flight inside mem0's client can
+        land AFTER the drop, recreating the collection under the
+        `_test_e2_bakeoff` prefix and leaking exactly what the module's
+        ISOLATION block says cannot leak.
+
+        Asserted as "nothing is in flight when the raise arrives", which is
+        the property that makes the ordering safe, rather than as "a
+        TaskGroup was used", which is an implementation.  The exception type
+        is pinned too: callers catch SeedingError, and an ExceptionGroup
+        wrapper would be a silent contract change.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(
+            monkeypatch, add_returns_no_id_on=1, add_ticks=5,
+        )
+
+        with pytest.raises(mod.SeedingError):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        assert mem0.inflight == 0, (
+            f'{mem0.inflight} seeding write(s) still in flight when teardown '
+            f'dropped the collections'
+        )
+        # The bound had to actually bite, or "nothing in flight" is vacuous:
+        # a run whose every write completed before the raise proves nothing.
+        assert mem0.max_inflight > 1
+        # Teardown really did run underneath the raise.
+        assert len(drops.calls) == 2
+
+    async def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
+        self, monkeypatch,
+    ):
+        """Pin-on and pin-off must run over the SAME ranked list, or the
+        comparison is two ANN draws rather than a controlled A/B — and the run
+        pays for six arms' worth of embeddings to answer a four-arm question."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        searches = _FakeMemoryService.instances[-1].mem0.searches
+        issued = [(project_id, query) for project_id, query, _ in searches]
+        assert len(issued) == len(set(issued))          # no query issued twice
+        assert len({project_id for project_id, _ in issued}) == 3
+
+    async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
+        self, monkeypatch,
+    ):
+        """The probing write's own record has to leave its own guard window:
+        in the real timeline that write had not landed when the guard ran, and
+        arm (a) stores it verbatim — leaving it in would hand the BASELINE a
+        free ~1.0 self-match the peer arms structurally cannot get, and the
+        table would read that as arm (a) having the better guard.  Dropping it
+        costs a slot, so the fetch is deeper — by the number of records the
+        probe's own content occupies in THIS arm, which the decomposed arms
+        split into several.  A fixed +1 would leave them replaying over a
+        2-record window while the baseline replayed over 5.  The replay itself
+        still happens at GUARD_TOP_K, which `guard_adequacy` enforces on its
+        own (server/tools.py:1556 runs production's pre-check at limit=5)."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
+        assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1     # the FLOOR
+        assert mod.guard_fetch_limit(set()) == mod.GUARD_TOP_K
+        assert mod.guard_fetch_limit({'a', 'b', 'c'}) == mod.GUARD_TOP_K + 3
+        # Every probe limit clears the floor, and at least one arm fetched
+        # DEEPER than the floor — otherwise the dynamic depth is untested.
+        probe_limits = limits - {mod.DEFAULT_SEARCH_LIMIT}
+        assert probe_limits
+        assert min(probe_limits) >= mod.GUARD_FETCH_LIMIT
+        assert max(probe_limits) > mod.GUARD_FETCH_LIMIT
+
+    async def test_the_probing_write_is_never_its_own_guard_match(
+        self, monkeypatch,
+    ):
+        """The over-fetched slot is worthless unless the self-hit is actually
+        dropped, so assert the drop and not merely the fetch depth."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        clusters = mod.load_calibration_clusters()
+        probe_by_cluster = {}
+        for cluster_id in sorted(clusters)[:_SMALL_RUN['cluster_limit']]:
+            probe = mod.select_probing_write(clusters[cluster_id])
+            if probe is not None:
+                probe_by_cluster[cluster_id] = probe['memory_id']
+        assert probe_by_cluster  # the subset really does contain a probeable cluster
+
+        captured: list[dict[str, list[str]]] = []
+        real_fetch = mod.fetch_arm
+
+        async def _capture(backend, seeded, queries, probes, **kwargs):
+            fetched = await real_fetch(backend, seeded, queries, probes, **kwargs)
+            captured.append({
+                cluster_id: [hit.record.record_id for hit in hits]
+                for cluster_id, hits in fetched['probes'].items()
+            })
+            return fetched
+
+        monkeypatch.setattr(mod, 'fetch_arm', _capture)
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(captured) == len(mod.ARM_SHAPES)  # the probe path ran per arm
+        # status_quo stores the alpha record verbatim under its own memory_id,
+        # so this is the arm where a self-hit is even possible.  Checked
+        # per-cluster: another cluster's probe record is a legitimate hit.
+        for arm in captured:
+            for cluster_id, probe_id in probe_by_cluster.items():
+                assert probe_id not in arm[cluster_id]
+
+    async def test_every_collection_is_dropped_before_and_after_the_run(
+        self, monkeypatch,
+    ):
+        """Before AND after: a swallowed teardown then self-heals on the next
+        run instead of poisoning it with a half-seeded arm."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        expected = set(mod.ephemeral_collections(suffix='utest').values())
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(drops.calls) == 2
+        assert set(drops.calls[0]) == expected
+        assert set(drops.calls[-1]) == expected
+
+    async def test_the_collections_are_dropped_even_when_a_query_raises(
+        self, monkeypatch,
+    ):
+        """The failure that leaks is the mid-run one; a `finally` is the only
+        thing that reaches it."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch, search_raises_on=2)
+        expected = set(mod.ephemeral_collections(suffix='utest').values())
+
+        with pytest.raises(RuntimeError, match='qdrant went away'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert set(drops.calls[-1]) == expected
+        assert _FakeMemoryService.instances[-1].closed is True
+
+    async def test_the_report_it_returns_is_the_one_build_report_validated(
+        self, monkeypatch,
+    ):
+        """Not a second, looser assembly path: the completeness check that
+        refuses to publish a partial decision table has to be on THIS road."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
+        assert set(report) == {'schema_version', 'protocol', 'arms', 'audit_recall'}
+        for arm in mod.ARM_VARIANTS:
+            for metric in mod._REQUIRED_ARM_METRICS:
+                assert metric in report['arms'][arm]
+        assert report['protocol']['distractor_slab_size'] == 12
+        assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+
+# ===========================================================================
+# step-26 — the equal-window discipline
+# ===========================================================================
+#
+# THE BUG THIS SECTION PINS.  `apply_topic_anchor` APPENDS: a full 5-hit
+# window plus one pinned canonical is six records.  `measure_arm` then scored
+# every metric at `k = len(window)`, so the +pin variants were measured over a
+# SIX-record window while their pin-off twins were measured over five.  The
+# pin column did not report "the pin helped"; it reported "the pin was given
+# a bigger budget".  In the first committed artifact that showed up as
+# c_peers 0.504 -> c_peers+pin 0.992 on canonical-in-top-5 and 1180 -> 1290
+# tokens/query — a discoverability "win" bought entirely with extra results.
+#
+# The fix is a post-transform truncation in `read_path` plus literal-k
+# scoring in `measure_arm`.  It is deliberately NOT a change to
+# `apply_topic_anchor`, which stays additive-and-never-subtractive per PRD D1
+# — the window budget is the READER's, so it belongs at the read path.
+#
+# Grouping is untouched by this: it SHRINKS the window, so it keeps its
+# legitimate token win, and a pin that lands in the headroom grouping freed
+# still survives.  That is the pin's real win, and it is the one the decision
+# table should show.
+
+
+def _rec(record_id, **kwargs):
+    """Just the `ArmRecord` half of `_hit` — this section never needs the flag."""
+    record, _ = _hit(record_id, **kwargs)
+    return record
+
+
+def _sh(record, score=0.5):
+    return _mod().ScoredHit(record=record, relevance_score=score)
+
+
+def _seeded(shape, records, *, canonical_by_topic=None, contested_ids=None,
+            canonical_by_cluster=None, siblings_by_cluster=None,
+            records_by_source=None):
+    """A `SeededArm` over hand-built records — no store, no network."""
+    mod = _mod()
+    return mod.SeededArm(
+        shape=shape,
+        project_id=f'e2_{shape}_utest',
+        collection=f'e2_{shape}_utest',
+        records=list(records),
+        by_stored_id={},
+        records_by_id={record.record_id: record for record in records},
+        canonical_by_topic=canonical_by_topic or {},
+        contested_ids=contested_ids or set(),
+        canonical_by_cluster=canonical_by_cluster or {},
+        siblings_by_cluster=siblings_by_cluster or {},
+        records_by_source=records_by_source or {},
+    )
+
+
+def _full_window_arm(shape='c_peers', *, n=12, topic='t'):
+    """An arm whose fetch fills any window, with a pinnable canonical OUTSIDE it.
+
+    The canonical is deliberately never a hit: that is the case where the pin
+    has something to add, and therefore the case where an unequal window would
+    show up as a fake win.
+    """
+    canonical = _rec('canon', topic=topic, canonical=True, claim_ids=['k-canon'])
+    hits = [
+        _sh(_rec(f'p{i}', topic=topic, claim_ids=[f'k{i}']), 0.9 - i / 100.0)
+        for i in range(n)
+    ]
+    seeded = _seeded(
+        shape,
+        [canonical, *(hit.record for hit in hits)],
+        canonical_by_topic={topic: canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {hit.record.record_id for hit in hits}},
+    )
+    return seeded, hits
+
+
+def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1',
+           kind='claim', held_out=False):
+    return _mod().Query(
+        query_id=query_id,
+        kind=kind,
+        text='does the pin change the window?',
+        topic=topic,
+        cluster_id=cluster_id,
+        expects_claim_ids=list(expects),
+        held_out=held_out,
+    )
+
+
+#: A `(name, encode)` estimator that is trivially checkable by hand.
+_CHARS = ('injected:chars', len)
+
+
+def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10):
+    return _mod().measure_arm(
+        seeded,
+        {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+        pin=pin,
+        queries=list(queries if queries is not None else [_query()]),
+        probes=list(probes),
+        estimator=_CHARS,
+        guard_threshold=0.92,
+        limit=limit,
+    )
+
+
+class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
+    """`by_query_kind` is a REQUIRED report block that had no behavioral test.
+
+    It is why the report can say anything at all about the distinction
+    eval-design §5 E2 draws: pooled into one mean, a shape that wins on claim
+    queries while losing on topic phrasings is indistinguishable from one that
+    ties on both.  It is required (`_REQUIRED_ARM_METRICS`), rendered as its
+    own markdown table, and computed by a real split in `measure_arm` — but
+    it appeared in this file only inside the synthetic `_arm_measurement()`
+    builder, where it was constructed and never asserted on.
+    """
+
+    @staticmethod
+    def _by_kind(queries):
+        seeded, hits = _full_window_arm('status_quo')
+        return _mod().measure_arm(
+            seeded,
+            {'queries': {q.query_id: hits for q in queries}, 'probes': {'c1': hits}},
+            pin=False,
+            queries=list(queries),
+            probes=[],
+            estimator=_CHARS,
+            guard_threshold=0.92,
+            limit=10,
+        )['by_query_kind']
+
+    def test_each_kinds_query_count_is_the_input_split(self):
+        by_kind = self._by_kind([
+            _query('q1', kind='claim'),
+            _query('q2', kind='claim'),
+            _query('q3', kind='topic_phrasing'),
+            _query('q4', kind='topic_phrasing', held_out=True),
+        ])
+
+        assert by_kind['claim']['queries'] == 2
+        assert by_kind['topic_phrasing']['queries'] == 2
+        assert by_kind['held_out']['queries'] == 1
+
+    def test_held_out_is_a_subset_of_its_kind_and_not_a_third_kind(self):
+        """The markdown states this in prose, and the split has to honour it.
+
+        A held-out query is still a `topic_phrasing` query: if the split
+        moved it out of its kind instead of also counting it under
+        `held_out`, the topic row would silently shed the very phrasings that
+        measure generalisation, and the two rows would no longer sum to
+        anything a reader could reason about.
+        """
+        held_out_only = self._by_kind([
+            _query('q1', kind='topic_phrasing', held_out=True),
+        ])
+
+        assert held_out_only['topic_phrasing']['queries'] == 1
+        assert held_out_only['held_out']['queries'] == 1
+        # Same single query on both rows, so the metrics must agree exactly.
+        assert held_out_only['held_out'] == held_out_only['topic_phrasing']
+
+    def test_an_unasked_subset_reports_none_rather_than_a_measured_zero(self):
+        """`queries: 0` with `0.0` beside it would read as "measured, scored
+        nothing" — the same lie the `—` cell exists to prevent in the table."""
+        by_kind = self._by_kind([_query('q1', kind='claim')])
+
+        empty = by_kind['topic_phrasing']
+        assert empty['queries'] == 0
+        assert empty['claim_recall']['at_5'] is None
+        assert empty['claim_recall']['at_10'] is None
+        assert empty['discoverability']['canonical_in_top_5_rate'] is None
+        assert empty['discoverability']['median_canonical_rank'] is None
+        # The kind that WAS asked is scored, so the None above is the empty
+        # subset talking and not the whole block failing to compute.
+        assert by_kind['claim']['queries'] == 1
+        assert by_kind['claim']['claim_recall']['at_5'] is not None
+
+
+class TestReadPathHoldsTheWindowBudget:
+    """Pin-on and pin-off must be scored over equal-size windows."""
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    @pytest.mark.parametrize('k', [5, 10])
+    def test_a_pinned_window_is_never_wider_than_k(self, shape, k):
+        mod = _mod()
+        seeded, hits = _full_window_arm(shape)
+
+        assert len(mod.read_path(seeded, hits, k, pin=True)) <= k
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    @pytest.mark.parametrize('k', [5, 10])
+    def test_a_full_fetch_gives_both_variants_the_same_size_window(self, shape, k):
+        """The A/B is only controlled if the two arms get the same budget."""
+        mod = _mod()
+        seeded, hits = _full_window_arm(shape)
+
+        off = mod.read_path(seeded, hits, k, pin=False)
+        on = mod.read_path(seeded, hits, k, pin=True)
+
+        assert len(on) == len(off) == k
+
+    def test_the_pre_transform_truncation_still_stands(self):
+        """A record the store never returned must not enter the window, so the
+        transforms still act on `hits[:k]` and not on the whole fetch."""
+        mod = _mod()
+        seeded, hits = _full_window_arm('c_peers', n=12)
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+
+        assert [r.record_id for r in window] == ['p0', 'p1', 'p2', 'p3', 'p4']
+
+
+class TestGroupingKeepsItsAdvantage:
+    """The fix must not take back grouping's legitimate win."""
+
+    def _grouped_arm(self):
+        """Four children of one parent, plus one hit on a second topic.
+
+        The grouped read collapses the four into one document, taking a
+        5-record window down to 2 — real headroom, freed by the storage shape
+        rather than by a wider budget.
+        """
+        parent = _rec(PARENT, topic='t1', canonical=True, claim_ids=['k-par'])
+        children = [
+            _rec(f'child-{i}', parent_id=PARENT, kind='amendment', topic='t1',
+                 claim_ids=[f'k{i}'])
+            for i in range(4)
+        ]
+        other = _rec('other-1', topic='t2', claim_ids=['k-other'])
+        anchor = _rec('canon-t2', topic='t2', canonical=True, claim_ids=['k-t2'])
+        hits = [_sh(record, 0.9 - i / 100.0)
+                for i, record in enumerate([*children, other])]
+        seeded = _seeded(
+            'b_grouped',
+            [parent, *children, other, anchor],
+            canonical_by_topic={'t1': parent, 't2': anchor},
+            canonical_by_cluster={'c1': PARENT},
+            siblings_by_cluster={'c1': {c.record_id for c in children}},
+        )
+        return seeded, hits, anchor
+
+    def test_a_collapsed_window_stays_short_it_is_not_padded_back_to_k(self):
+        mod = _mod()
+        seeded, hits, _ = self._grouped_arm()
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+
+        assert len(window) == 2  # the four children became one document
+        assert {r.record_id for r in window} == {PARENT, 'other-1'}
+
+    def test_a_pin_landing_in_freed_headroom_survives_the_truncation(self):
+        """Grouping frees a slot; the pin fills it.  THAT is the pin's real
+        win, and truncating at k must not delete it."""
+        mod = _mod()
+        seeded, hits, anchor = self._grouped_arm()
+
+        window = mod.read_path(seeded, hits, 5, pin=True)
+
+        assert len(window) == 3
+        assert anchor.record_id in {r.record_id for r in window}
+
+
+class TestTopicDiscoverabilityRespectsTheLiteralK:
+    """A rank-6 record is not "in the top 5", whatever the caller passes."""
+
+    def test_a_canonical_past_k_is_reported_absent_but_its_rank_survives(self):
+        hits = [_rec(f'r{i}', topic='t') for i in range(5)]
+        hits.append(_rec('canon', topic='t', canonical=True))
+
+        found = _mod().topic_discoverability(hits, 't', 'canon', 5)
+
+        assert found['canonical_in_top_k'] is False
+        assert found['canonical_rank'] == 6  # "nearly there" is its own finding
+
+    def test_the_boundary_rank_equal_to_k_is_inside_the_window(self):
+        hits = [_rec(f'r{i}', topic='t') for i in range(4)]
+        hits.append(_rec('canon', topic='t', canonical=True))
+
+        found = _mod().topic_discoverability(hits, 't', 'canon', 5)
+
+        assert found['canonical_in_top_k'] is True
+        assert found['canonical_rank'] == 5
+
+
+class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
+    """Pure — the bias is a property of the committed fixtures, not the store."""
+
+    def test_the_self_hit_filter_bites_in_the_PEER_arms_not_only_the_baseline(
+        self,
+    ):
+        """An id-equality filter is a NO-OP outside `status_quo`.
+
+        `record_id == memory_id` holds only in `_materialize_status_quo`; the
+        peer arms derive every id through `_derive_record_id`.  So filtering
+        on id removes the self-match for the BASELINE alone — while the peer
+        arms keep searching a corpus that still contains the probing write's
+        own claims, decomposed into peers.  That biases the guard column in
+        the opposite direction from the one GUARD_FETCH_LIMIT's rationale
+        describes, and the guard column is one of E2's four named metrics.
+
+        Asserted over the REAL fixtures, because the bias is a property of how
+        the committed decomposition assigns `source_memory_id` — a hand-built
+        double could be written so the question never arises.
+        """
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+
+        bit_in: dict[str, int] = {}
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            removed = 0
+            for cluster_id in sorted(clusters):
+                probe = mod.select_probing_write(clusters[cluster_id])
+                if probe is None:
+                    continue
+                own = mod.probe_own_record_ids(seeded, probe['memory_id'])
+                removed += len(own & set(seeded.records_by_id))
+            bit_in[shape] = removed
+
+        # Every arm — not just the one whose ids happen to collide.
+        for shape in mod.ARM_SHAPES:
+            assert bit_in[shape] > 0, (
+                f'{shape}: the probing write leaves nothing behind, so its own '
+                f'content stayed in its own guard window'
+            )
+
+    def test_a_peer_arm_drops_MORE_than_one_record_per_probing_write(self):
+        """The decomposition splits one original into several peers, so the
+        filter has to remove all of them, not one representative."""
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+
+        for shape in ('c_peers', 'b_grouped'):
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            widest = max(
+                len(mod.probe_own_record_ids(seeded, probe['memory_id']) - {probe['memory_id']})
+                for probe in (
+                    mod.select_probing_write(clusters[c]) for c in sorted(clusters)
+                )
+                if probe is not None
+            )
+            assert widest > 1, (
+                f'{shape}: no probing write decomposed into more than one peer, '
+                f'so this test can no longer tell an id filter from a '
+                f'provenance filter'
+            )
+
+
+@pytest.mark.asyncio
+class TestAFailedQueryIsNotAMeasuredZero:
+    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+
+    So a network failure and a shape that ranked nothing arrive at `_search`
+    as the same empty list — which this module's own rule ("an empty hits list
+    with a real expectation IS a measured zero") then scores as 0.0 recall,
+    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
+    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    ranking is not a possible outcome here: it is unambiguously detectable and
+    must be loud, per the no-silent-fail-soft design invariant.
+    """
+
+    class _Backend:
+        def __init__(self, response):
+            self._response = response
+
+        async def search(self, **kwargs):
+            return self._response
+
+    async def _search_against(self, response):
+        mod = _mod()
+        seeded = _seeded('status_quo', [_rec('r0')])
+        return await mod._search(
+            self._Backend(response), seeded, 'anything', limit=10,
+        )
+
+    @pytest.mark.parametrize('response', [{}, None, {'results': []}, {'results': None}])
+    async def test_an_empty_ranking_raises_rather_than_scoring_zero(self, response):
+        with pytest.raises(_mod().MeasurementError, match='no results'):
+            await self._search_against(response)
+
+    async def test_a_scoreless_hit_raises_rather_than_defaulting_to_zero(self):
+        """A 0.0 default feeds the THRESHOLD replay a value the store never
+        produced, and `guard matched (replay) = 0.00` then reads as a shape
+        finding rather than as missing score plumbing."""
+        mod = _mod()
+        record = _rec('r0')
+        seeded = _seeded('status_quo', [record])
+        seeded.by_stored_id['stored-0'] = record
+
+        with pytest.raises(mod.MeasurementError, match='no score'):
+            await mod._search(
+                self._Backend({'results': [{'id': 'stored-0'}]}),
+                seeded, 'anything', limit=10,
+            )
+
+    async def test_a_real_ranking_still_passes_through(self):
+        """The guard must not fire on the healthy path."""
+        mod = _mod()
+        record = _rec('r0')
+        seeded = _seeded('status_quo', [record])
+        seeded.by_stored_id['stored-0'] = record
+
+        hits = await mod._search(
+            self._Backend({'results': [{'id': 'stored-0', 'score': 0.42}]}),
+            seeded, 'anything', limit=10,
+        )
+
+        assert [(h.record.record_id, h.relevance_score) for h in hits] == [('r0', 0.42)]
+
+
+class TestTheGuardColumnSaysWhatTheReplayActuallySaw:
+    """Pure — the diagnostic half of the same no-silent-zero concern."""
+
+    def test_the_guard_column_carries_the_best_score_the_replay_actually_saw(self):
+        """`guard_matched_rate: 0.00` across every arm is ambiguous on its own.
+        "the best candidate scored 0.71 against a 0.92 threshold" is a shape
+        finding; "the best candidate scored 0.00" is a bug report."""
+        seeded, hits = _full_window_arm('status_quo')
+
+        measured = _measure(seeded, hits, pin=False, probes=[('c1', {'memory_id': 'x'})])
+
+        assert measured['guard_adequacy']['max_observed_score'] == pytest.approx(0.9)
+
+
+class TestRescoreAgreesWithTheRankTheGroupedReadGave:
+    """Score and rank are two views of one ordering. They cannot disagree.
+
+    `apply_grouped_read` gives a group the BEST rank among its members
+    (`group_rank[parent] = min(...)`).  If `rescore` gave it the canonical's
+    OWN score whenever the canonical was itself a hit, a group could rank 1st
+    on a child's 0.95 and then replay into the threshold guard at the
+    canonical's 0.30 — a guard false negative attributable to this helper
+    rather than to the storage shape, which is exactly the materialization
+    artifact `_claim_categories` warns about.
+    """
+
+    def test_a_group_takes_its_best_childs_score_even_when_the_canonical_hit(self):
+        mod = _mod()
+        canonical = _rec('canon', topic='t')
+        child = _rec('kid', topic='t', parent_id='canon')
+        hits = [_sh(child, 0.95), _sh(canonical, 0.30)]
+
+        rescored = mod.rescore([canonical], hits)
+
+        assert rescored[0].relevance_score == 0.95
+
+    def test_a_canonical_that_outscores_its_children_keeps_its_own_score(self):
+        """max(), not "children always win" — the rule is best-available."""
+        mod = _mod()
+        canonical = _rec('canon', topic='t')
+        child = _rec('kid', topic='t', parent_id='canon')
+        hits = [_sh(canonical, 0.95), _sh(child, 0.30)]
+
+        rescored = mod.rescore([canonical], hits)
+
+        assert rescored[0].relevance_score == 0.95
+
+    def test_the_guard_replay_sees_the_rank_one_score_not_the_canonicals(self):
+        """The consequence, at the seam that matters: a group the grouped read
+        ranked first must not fail a threshold its best member cleared."""
+        mod = _mod()
+        canonical = _rec('canon', topic='t', claim_ids=['k0'])
+        child = _rec('kid', topic='t', parent_id='canon', claim_ids=['k1'])
+        hits = [_sh(child, 0.95), _sh(canonical, 0.30)]
+        seeded = _seeded(
+            'b_grouped', [canonical, child],
+            canonical_by_cluster={'c1': 'canon'},
+            siblings_by_cluster={'c1': {'canon', 'kid'}},
+        )
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+        verdict = mod.guard_adequacy(
+            mod.rescore(window, hits), {'canon', 'kid'}, 0.92,
+        )
+
+        assert verdict['guard_matched'] is True
+
+    def test_a_child_outside_the_replay_window_cannot_donate_its_score(self):
+        """The mirror of the test above, and the boundary between them.
+
+        `rescore` builds `best_child` by iterating everything it is HANDED, so
+        handing it the full fetched list while the window was truncated to 5
+        lets hit #6 donate its score to a group inside the window.  The arm
+        then books a `guard_matched` that production — whose pre-check runs at
+        limit=5 — structurally could not produce.  `guard_adequacy`'s own
+        defensive window cannot catch this: the leak happens upstream of it.
+        """
+        mod = _mod()
+        canonical = _rec('canon', topic='t', claim_ids=['k0'])
+        fillers = [_rec(f'f{i}', topic='other', claim_ids=[f'f{i}']) for i in range(4)]
+        # Rank 6 — one past the k=5 replay window — and scoring high enough to
+        # clear the 0.92 threshold if it were ever allowed to count.
+        outsider = _rec('kid', topic='t', parent_id='canon', claim_ids=['k1'])
+        hits = (
+            [_sh(canonical, 0.30)]
+            + [_sh(filler, 0.29) for filler in fillers]
+            + [_sh(outsider, 0.95)]
+        )
+        seeded = _seeded(
+            'b_grouped', [canonical, *fillers, outsider],
+            canonical_by_cluster={'c1': 'canon'},
+            siblings_by_cluster={'c1': {'canon', 'kid'}},
+        )
+
+        window = mod.read_path(seeded, hits, mod.GUARD_TOP_K, pin=False)
+        leaky = mod.guard_adequacy(
+            mod.rescore(window, hits), {'canon', 'kid'}, 0.92,
+        )
+        honest = mod.guard_adequacy(
+            mod.rescore(window, hits[:mod.GUARD_TOP_K]), {'canon', 'kid'}, 0.92,
+        )
+
+        # The fixture is only meaningful if the leak is reachable at all.
+        assert leaky['guard_matched'] is True
+        assert honest['guard_matched'] is False
+
+
+class TestCanonicalRankIsNotCensoredByTheReadWindow:
+    """"Outside top-5" and "absent entirely" are different findings.
+
+    `topic_discoverability` documents that its rank survives past the window.
+    Scoring it against an ALREADY-truncated k=5 window makes that contract
+    dead in the live path: rank can never exceed 5, so a near-miss shape and a
+    shape that never surfaces the canonical both report `None`, and the median
+    — taken over successes only — prints BEST for the arm that found it least.
+    """
+
+    def test_measure_arm_reports_a_rank_beyond_the_five_record_read_window(self):
+        seeded, hits = _full_window_arm('status_quo', n=12)
+        # Put the canonical at rank 8 — outside the k=5 read window, but well
+        # inside the fetch depth the arm was actually measured over.
+        canonical = seeded.records_by_id['canon']
+        hits = [*hits[:7], _sh(canonical, 0.5), *hits[7:]]
+
+        measured = _measure(seeded, hits, pin=False)
+        disco = measured['discoverability']
+
+        assert disco['canonical_in_top_5_rate'] == 0.0   # genuinely not in the read
+        assert disco['median_canonical_rank'] == 8.0     # but NOT "absent entirely"
+        assert disco['canonical_found_count'] == 1
+
+    def test_the_censored_denominator_travels_with_the_median(self):
+        """A median over successes only is uninterpretable without its n."""
+        seeded, hits = _full_window_arm('status_quo')
+
+        disco = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disco['canonical_candidates'] == 1
+        assert disco['canonical_found_count'] == 0       # never surfaced at all
+        assert disco['median_canonical_rank'] is None
+
+    def test_the_markdown_prints_the_denominator_next_to_the_median(self):
+        """The JSON already carried `canonical_found_count`; the OPERATOR
+        making the shape decision reads the markdown."""
+        mod = _mod()
+
+        cell = mod._rank_cell({
+            'median_canonical_rank': 2.0,
+            'canonical_found_count': 119,
+            'canonical_candidates': 236,
+        })
+
+        assert cell == '2.00 (n=119/236)'
+
+    def test_the_disclosed_rank_window_is_the_depth_THIS_run_fetched_at(self):
+        """`canonical_rank_window` is what stops the uncensoring fix from just
+        moving the censoring point somewhere undisclosed.
+
+        Rank is no longer censored at the k=5 read window, but it is still
+        censored at the FETCH depth — and that depth is `--limit`, a CLI flag,
+        not a constant.  Reporting `DEFAULT_SEARCH_LIMIT` would mean a
+        `--limit 25` run publishes a field claiming 10: the artifact would
+        understate how far it actually looked, which is the same class of
+        defect as the censored median it replaces.
+        """
+        seeded, hits = _full_window_arm('status_quo', n=12)
+
+        measured = _measure(seeded, hits, pin=False, limit=25)
+
+        assert measured['discoverability']['canonical_rank_window'] == 25
+
+    def test_run_arm_threads_its_own_fetch_depth_into_the_report(
+        self, monkeypatch
+    ):
+        """The seam that matters: the number in the artifact has to come from
+        the same `limit` the fetch was actually issued at."""
+        mod = _mod()
+        seeded, hits = _full_window_arm('status_quo', n=12)
+        issued_at: list[int] = []
+
+        async def _fake_fetch(backend, s, queries, probes, *, limit):
+            issued_at.append(limit)
+            return {'queries': {'q1': hits}, 'probes': {}}
+
+        monkeypatch.setattr(mod, 'fetch_arm', _fake_fetch)
+        rows = asyncio.run(mod.run_arm(
+            None, seeded, queries=[_query()], probes=[],
+            limit=25, estimator=_CHARS, guard_threshold=0.92,
+        ))
+
+        assert issued_at == [25]
+        for row in rows.values():
+            assert row['discoverability']['canonical_rank_window'] == 25
+
+
+class TestMeasureArmScoresBothVariantsAtTheSameK:
+    """The inflated column, asserted directly on `measure_arm`'s output."""
+
+    def test_a_full_window_arm_measures_identically_with_and_without_the_pin(self):
+        """The committed artifact's c_peers/c_peers+pin divergence, in one
+        assertion: at a fixed result budget an append-only pin has nowhere to
+        put anything, so every column must be unchanged."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['discoverability']['canonical_in_top_5_rate'] == (
+            off['discoverability']['canonical_in_top_5_rate']
+        )
+        assert on['claim_recall']['at_5'] == off['claim_recall']['at_5']
+        assert on['tokens_per_query']['mean'] == off['tokens_per_query']['mean']
+
+    def test_every_block_is_unchanged_not_merely_the_three_headline_numbers(self):
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        for metric in ('claim_recall', 'discoverability', 'tokens_per_query',
+                       'guard_adequacy'):
+            assert on[metric] == off[metric], metric
+
+    def test_a_claim_only_the_pinned_record_realizes_is_not_credited_at_5(self):
+        """The mechanism, isolated: `k-canon` lives on the appended canonical
+        alone, so crediting it at 5 is exactly the off-by-one-window bug."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True, queries=[_query(expects=('k-canon',))])
+
+        assert on['claim_recall']['at_5'] == 0.0
+
+    def test_the_token_column_charges_for_ten_payloads_not_eleven(self):
+        """tokens/query is the cost half of the decision.  An eleventh payload
+        billed to the pin is a cost the reader would never have paid."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True)
+
+        # `_CHARS` counts characters, and every hand-built body is `'body'`.
+        assert on['tokens_per_query']['mean'] == 10 * len('body')
+
+
+class TestPinDiagnostic:
+    """`pin` says whether the pin was on, and whether it did anything."""
+
+    def test_pin_off_reports_not_applicable_rather_than_a_measured_zero(self):
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+
+        assert off['pin'] == {'enabled': False, 'window_changed_rate': None}
+
+    def test_a_full_window_arm_reports_a_zero_change_rate(self):
+        """Enabled, asked, and it changed nothing — a measured zero, which is
+        a different statement from `None`."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['pin']['enabled'] is True
+        assert on['pin']['window_changed_rate'] == 0.0
+
+    def test_a_grouped_arm_with_headroom_reports_a_positive_change_rate(self):
+        mod = _mod()
+        parent = _rec(PARENT, topic='t1', canonical=True, claim_ids=['k-par'])
+        children = [
+            _rec(f'child-{i}', parent_id=PARENT, kind='amendment', topic='t1',
+                 claim_ids=[f'k{i}'])
+            for i in range(4)
+        ]
+        other = _rec('other-1', topic='t2', claim_ids=['k-other'])
+        anchor = _rec('canon-t2', topic='t2', canonical=True, claim_ids=['k-t2'])
+        hits = [_sh(record, 0.9 - i / 100.0)
+                for i, record in enumerate([*children, other])]
+        seeded = _seeded(
+            'b_grouped',
+            [parent, *children, other, anchor],
+            canonical_by_topic={'t1': parent, 't2': anchor},
+            canonical_by_cluster={'c1': PARENT},
+            siblings_by_cluster={'c1': {c.record_id for c in children}},
+        )
+
+        on = mod.measure_arm(
+            seeded,
+            {'queries': {'q1': hits}, 'probes': {}},
+            pin=True, queries=[_query(topic='t2')], probes=[],
+            estimator=_CHARS, guard_threshold=0.92, limit=10,
+        )
+
+        assert on['pin']['window_changed_rate'] > 0
+
+
+class TestReportCarriesThePinDiagnostic:
+    """A column that explains the other columns has to be in the artifact."""
+
+    def test_build_report_refuses_an_arm_with_no_pin_block(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['pin']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers+pin' in str(excinfo.value)
+        assert 'pin' in str(excinfo.value)
+
+    @pytest.mark.parametrize('key', ['enabled', 'window_changed_rate'])
+    def test_build_report_refuses_a_pin_block_missing_either_key(self, key):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped+pin']['pin'][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped+pin' in str(excinfo.value)
+        assert key in str(excinfo.value)
+
+    def test_the_decision_table_surfaces_the_diagnostic(self):
+        """Without it, two identical rows read as "the pin is useless" rather
+        than "the pin never fired"."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['c_peers+pin']['pin']['window_changed_rate'] = 0.375
+
+        rendered = mod.render_markdown(mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        ))
+
+        row = next(
+            r for r in _decision_table_rows(rendered) if r.startswith('| c_peers+pin |')
+        )
+        assert '0.38' in row
+
+    def test_a_pin_off_row_renders_no_measurement_not_a_zero(self):
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+
+        row = next(
+            r for r in _decision_table_rows(rendered) if r.startswith('| c_peers |')
+        )
+        assert '—' in row
+
+
+class TestBuildParser:
+    """The CLI surface, pinned by equality."""
+
+    def test_the_defaults_are_the_committed_fixtures_and_artifact_paths(self):
+        mod = _mod()
+
+        args = mod.build_parser().parse_args([])
+
+        assert Path(args.arm_claims) == mod.DEFAULT_ARM_CLAIMS_PATH
+        assert Path(args.query_set) == mod.DEFAULT_QUERY_SET_PATH
+        assert Path(args.distractor_slab) == mod.DEFAULT_DISTRACTOR_SLAB_PATH
+        assert Path(args.json_out) == mod.DEFAULT_REPORT_JSON
+        assert Path(args.md_out) == mod.DEFAULT_REPORT_MD
+
+    def test_the_default_run_is_the_whole_fixture_not_a_sample(self):
+        """A silently-sampled default would publish a decision table over a
+        subset while reading as a full run."""
+        args = _mod().build_parser().parse_args([])
+
+        assert args.clusters is None
+        assert args.distractors is None
+        assert args.limit == _mod().DEFAULT_SEARCH_LIMIT
+
+
+class TestMain:
+    """`main(argv)` driven directly — no subprocess."""
+
+    def test_a_successful_run_writes_both_artifacts_and_returns_zero(
+        self, monkeypatch, tmp_path,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+
+        code = mod.main([
+            '--clusters', '2', '--distractors', '12', '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(md_out),
+        ])
+
+        assert code == 0
+        assert list(json.loads(json_out.read_text())['arms']) == list(mod.ARM_VARIANTS)
+
+    def test_a_missing_fixture_exits_2_before_a_single_collection_exists(
+        self, monkeypatch, tmp_path,
+    ):
+        """Ordering matters as much as the code: a fixture checked AFTER
+        seeding would leave three live collections behind on every typo."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+
+        code = mod.main([
+            '--arm-claims', str(tmp_path / 'does-not-exist.jsonl'),
+            '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(md_out),
+        ])
+
+        assert code == 2
+        assert drops.calls == []
+        assert _FakeMemoryService.instances == []
+        assert not json_out.exists()
+        assert not md_out.exists()
+
+    def test_an_inconsistent_fixture_set_exits_2_with_no_artifact(
+        self, monkeypatch, tmp_path,
+    ):
+        """Cross-validation is part of the pre-flight, not a later surprise:
+        a claim pointing at a missing cluster surfaces deep in the metrics as
+        a silently-zero recall indistinguishable from a retrieval miss."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        bad_claims = tmp_path / 'claims.jsonl'
+        bad_claims.write_text(json.dumps({
+            'claim_id': 'ghost-01', 'cluster_id': 'no-such-cluster',
+            'topic': 'ghost', 'text': 'a claim about a cluster that is not there',
+            'source_memory_id': 'nobody', 'canonical': True,
+            'b_arm_role': 'canonical', 'contested': False,
+        }) + '\n', encoding='utf-8')
+        json_out = tmp_path / 'report.json'
+
+        code = mod.main([
+            '--arm-claims', str(bad_claims), '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(tmp_path / 'report.md'),
+        ])
+
+        assert code == 2
+        assert drops.calls == []
+        assert not json_out.exists()
+
+    def test_it_reports_the_fixture_failure_on_stderr_not_silently(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        code = mod.main([
+            '--query-set', str(tmp_path / 'absent.jsonl'),
+            '--project-suffix', 'utest',
+            '--json-out', str(tmp_path / 'r.json'), '--md-out', str(tmp_path / 'r.md'),
+        ])
+
+        assert 'absent.jsonl' in capsys.readouterr().err
+        # Reporting the failure on stderr but still returning 0 is the worse
+        # half of "silently": the run looks successful and a stale or absent
+        # artifact gets published as if it were a fresh measurement.
+        assert code == 2
+
+
+# ===========================================================================
+# step-20 — the ONE live end-to-end test
+# ===========================================================================
+#
+# Everything above measures this script's arithmetic against injected hit
+# lists and doubled backends.  This measures it against a real Qdrant, a real
+# embedder and a real MemoryService, and asserts the one thing a double can
+# never prove: that a full seed/query/measure/teardown cycle produces a
+# COMPLETE report and leaves NOTHING behind.
+#
+# It pins no metric value (G6).  A live embedding ranking is exactly the kind
+# of number eval-design §1 says moves wholesale with wording and config drift
+# — asserting one here would make this test fail for a reason that is not a
+# defect.
+#
+# Marked PER-TEST, never via a module `pytestmark`: fused-memory's
+# `addopts = -m 'not integration'` would otherwise deselect the ~200 pure
+# tests above from the merge lane along with this one.
+
+import os  # noqa: E402
+
+from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@qdrant_skipif()
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='the seeded bake-off needs a real embedder',
+)
+async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
+    worker_id,
+):
+    """A 2-cluster / 12-distractor subset: enough to exercise every seam
+    (three collections, six variants, both read transforms, the guard replay,
+    the D10 block, both artifacts) at a fraction of a full run's wall clock."""
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    mod = _mod()
+    suffix = f'live_{worker_id}'
+    collections = set(mod.ephemeral_collections(suffix=suffix).values())
+
+    report = await mod.run_bake_off(
+        cluster_limit=2, distractor_limit=12, project_suffix=suffix,
+    )
+
+    assert list(report['arms']) == list(mod.ARM_VARIANTS)
+    for arm in mod.ARM_VARIANTS:
+        for metric, required in mod._REQUIRED_ARM_METRICS.items():
+            for key in required:
+                assert key in report['arms'][arm][metric]
+    assert report['audit_recall']['true_dup']['pairs'] > 0
+    assert report['protocol']['distractor_slab_size'] == 12
+
+    # The teardown is the half that leaks silently: a report that looks right
+    # while three collections survive is the failure this asserts against.
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    try:
+        live = {col.name for col in client.get_collections().collections}
+    finally:
+        client.close()
+    assert live.isdisjoint(collections)
+
+
+# ===========================================================================
+# step-23 — the committed artifact, asserted as DATA
+# ===========================================================================
+#
+# `plans/e2-storage-shape-bakeoff-report.{json,md}` is this task's
+# user-observable signal and gate leaf η's input, so it is guarded as data
+# rather than described in prose: a decision table nobody parses is a
+# decision table that can rot in place.
+#
+# Pins NO metric value, rate or bound (G6).  What it pins is COMPLETENESS —
+# every arm present, every metric measured rather than `—`, both artifacts
+# agreeing — because that is the difference between "the run said C wins"
+# and "the run half-failed and the blank cells read as a tie".
+#
+# Pure file reads.  No network, no Qdrant, no key: this runs in the merge
+# lane on every commit, which is the point.
+
+
+@functools.cache
+def _committed_report() -> dict:
+    path = _mod().DEFAULT_REPORT_JSON
+    assert path.exists(), (
+        f'{path} is missing. It is the artifact gate eta reads; regenerate '
+        f'it with `uv run python fused-memory/scripts/bake_off_storage_shape.py`.'
+    )
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+class TestCommittedReportJson:
+    """The machine-readable half."""
+
+    def test_it_parses_and_declares_its_schema_version(self):
+        report = _committed_report()
+
+        assert report['schema_version'] == _mod().REPORT_SCHEMA_VERSION
+
+    def test_every_arm_variant_has_a_row(self):
+        report = _committed_report()
+
+        assert list(report['arms']) == list(_mod().ARM_VARIANTS)
+
+    @pytest.mark.parametrize('metric,keys', [
+        ('claim_recall', ('at_5', 'at_10')),
+        ('discoverability', ('canonical_in_top_5_rate',)),
+        ('tokens_per_query', ('mean',)),
+        # Both halves: the rank-based one and the flagged threshold replay.
+        ('guard_adequacy', ('candidate_present_rate', 'guard_matched_rate')),
+    ])
+    def test_every_arm_measured_every_metric(self, metric, keys):
+        """`None` is a legitimate value in the pipeline — "measured, no
+        denominator" — but in a FULL committed run it means the arm was never
+        asked, and the markdown renders it as `—` next to real numbers."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            for key in keys:
+                assert measurement[metric][key] is not None, f'{arm}.{metric}.{key}'
+
+    def test_every_arm_measured_every_query_kind(self):
+        """The by-kind table is the block above split the way eval-design §5
+        E2 says the metrics differ, so an unasked subset there is the same
+        defect as an unasked metric — and in the committed run all three
+        subsets are non-empty (176 claim / 60 topic_phrasing / 20 held_out),
+        so `queries: 0` means the split broke, not that a subset was empty."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            by_kind = measurement['by_query_kind']
+            for kind in ('claim', 'topic_phrasing', 'held_out'):
+                assert by_kind[kind]['queries'] > 0, f'{arm}.{kind}'
+                for key in ('at_5', 'at_10'):
+                    assert by_kind[kind]['claim_recall'][key] is not None, (
+                        f'{arm}.{kind}.claim_recall.{key}'
+                    )
+            # held_out is a SUBSET of topic_phrasing, never a third kind, and
+            # a strict one — the whole point is that some phrasings WERE the
+            # registry's derivation input and so cannot measure generalisation.
+            assert by_kind['held_out']['queries'] < by_kind['topic_phrasing']['queries']
+
+    def test_every_arm_carries_the_pin_diagnostic(self):
+        """Both keys on all six rows. A `+pin` row identical to its twin is
+        unreadable without it: "the pin never fired" and "the pin does not
+        help" are different findings, and the artifact has to say which."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            assert 'pin' in measurement, arm
+            assert measurement['pin']['enabled'] is arm.endswith('+pin'), arm
+            assert 'window_changed_rate' in measurement['pin'], arm
+
+    def test_a_pin_off_row_reports_no_rate_rather_than_a_measured_zero(self):
+        """The question was never asked there. A 0.0 would claim it was."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            if not arm.endswith('+pin'):
+                assert measurement['pin']['window_changed_rate'] is None, arm
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    def test_a_pin_column_differs_from_its_twin_only_where_the_pin_fired(self, shape):
+        """The reviewer's finding, stated as an invariant over the artifact.
+
+        A `+pin` variant is measured over a window of the SAME size as its
+        pin-off twin, so it can only score differently when the pin actually
+        CHANGED that window. If it changed nothing, every metric block must be
+        byte-identical to the twin's; and wherever any block differs, the
+        diagnostic must show the pin firing. Anything else is a column bought
+        with a bigger budget rather than earned.
+
+        Pins no value, rate or bound (G6/D10) — only the two-way agreement
+        between the diagnostic and the metrics it explains.
+
+        Stated as ONE unconditional implication rather than as a branch per
+        case, deliberately: `rate > 0` beside identical blocks is a state the
+        artifact's own reading guide calls a legitimate third finding ("it
+        fired and moved nothing these metrics measure"), so a guarded form
+        executes zero assertions on exactly that input and passes vacuously.
+        Here every parametrized shape runs both assertions whatever the data
+        does, so the test cannot silently degrade to a no-op.
+        """
+        arms = _committed_report()['arms']
+        off, on = arms[shape], arms[f'{shape}+pin']
+        blocks = ('claim_recall', 'discoverability', 'tokens_per_query',
+                  'guard_adequacy')
+        differing = [block for block in blocks if on[block] != off[block]]
+        rate = on['pin']['window_changed_rate']
+
+        # A `+pin` arm always measured the pin, so the diagnostic that makes
+        # its row readable is never absent.
+        assert rate is not None, f'{shape}+pin carries no pin diagnostic'
+        # The invariant itself: a column may differ ONLY where the pin fired.
+        # (The converse is NOT asserted — a pin that fired and moved nothing
+        # measurable is a real finding, not a failure.)
+        assert not (differing and rate == 0.0), (
+            f'{shape}+pin differs from its twin in {differing} while the pin '
+            f'changed no window — the difference is an unequal measurement, '
+            f'not a result'
+        )
+
+    def test_the_guard_column_is_flagged_as_a_threshold_replay_on_every_arm(self):
+        """Carried per-arm so a reader who copies one row out of the table
+        cannot lose the flag (eval-design §1's one sanctioned exception)."""
+        report = _committed_report()
+
+        for measurement in report['arms'].values():
+            assert measurement['guard_adequacy']['threshold_replay'] is True
+            assert measurement['guard_adequacy']['threshold'] is not None
+
+    def test_the_d10_block_carries_its_recall_and_its_band_split(self):
+        """D10 is a second, independent deliverable, not a footnote of E2."""
+        audit = _committed_report()['audit_recall']
+        true_dup = audit['true_dup']
+
+        assert true_dup['recall'] is not None
+        assert true_dup['pairs'] == (
+            true_dup['lexical_band']['pairs'] + true_dup['paraphrase_band']['pairs']
+        )
+        assert audit['hard_negative']['pairs'] > 0
+        assert audit['unrelated']['pairs'] > 0
+
+    def test_the_protocol_block_says_how_the_numbers_were_produced(self):
+        """An arbitration artifact whose provenance is not in it cannot be
+        re-read in six months by somebody who was not in the room."""
+        mod = _mod()
+        protocol = _committed_report()['protocol']
+
+        for key in mod._REQUIRED_PROTOCOL_KEYS:
+            assert protocol[key] is not None
+        assert protocol['token_estimator'] in (
+            mod.TIKTOKEN_ESTIMATOR_NAME, mod.CHAR_PROXY_ESTIMATOR_NAME,
+        )
+        assert protocol['distractor_slab_size'] > 0
+
+    def test_it_records_the_fixture_commits_the_blind_protocol_rests_on(self):
+        """The claim "no metric code existed when the arms were authored" is
+        only checkable if the artifact says which commits to go and look at."""
+        fixtures = _committed_report()['protocol']['fixtures']
+
+        paths = {entry['path'] for entry in fixtures}
+        assert any(path.endswith('e2_arm_claims.jsonl') for path in paths)
+        assert any(path.endswith('e2_query_set.jsonl') for path in paths)
+        for entry in fixtures:
+            assert not entry['path'].startswith('/')  # repo-relative, reproducible
+            assert entry['commit'], f"{entry['path']} is not committed"
+
+    def test_the_run_measured_the_whole_fixture_not_a_smoke_subset(self):
+        """A `--clusters 2` artifact would read exactly like a full one."""
+        protocol = _committed_report()['protocol']
+
+        assert protocol['clusters_measured'] == len(_mod().load_calibration_clusters())
+        assert protocol['queries_measured'] == len(_mod().load_query_set())
+        assert protocol['distractor_slab_size'] == len(_mod().load_distractor_slab())
+
+
+class TestCommittedReportMarkdown:
+    """The operator-facing half, and its agreement with the JSON."""
+
+    def test_the_decision_table_has_exactly_one_row_per_arm_in_the_json(self):
+        """The two artifacts are written from one `build_report` result; this
+        is what makes it impossible for them to disagree unnoticed."""
+        rendered = _mod().DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        rows = _decision_table_rows(rendered)
+        arms = list(_committed_report()['arms'])
+        assert len(rows) == len(arms)
+        for arm in arms:
+            assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
+
+    def test_the_table_header_is_the_pinned_column_set(self):
+        mod = _mod()
+
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        header = next(
+            line for line in rendered.splitlines() if line.startswith('| arm ')
+        )
+
+        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
+
+    def test_no_measurement_cell_in_the_committed_table_is_missing(self):
+        """`—` means "never measured", and next to real numbers it reads as a
+        tie.  A committed table must not contain one.
+
+        Scoped to the MEASUREMENT columns.  `pin changed window` is a
+        diagnostic, not a measurement of the arm, and on a pin-off row the
+        question genuinely was never asked — see the test below, which pins
+        that column's `—` exactly where it belongs rather than allowing it
+        anywhere.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            assert '—' not in cells[:pin_column], row
+
+    def test_the_pin_column_is_not_applicable_exactly_on_the_pin_off_rows(self):
+        """The stronger form of the rule above: `—` in that column is correct
+        on a pin-off row and a broken run anywhere else."""
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            arm, pin_cell = cells[0], cells[pin_column]
+            assert (pin_cell == '—') is not arm.endswith('+pin'), row
+
+    def test_a_pin_that_fired_never_renders_as_the_never_fired_value(self):
+        """`0.00` in this column is a CLAIM, and the artifact makes it.
+
+        The reading guide reads `0.00` as "the pin never fired" — one of the
+        two findings this diagnostic exists to separate.  A rate of 0.0041 (2
+        of 487 windows) rounded to `0.00` at 2 decimals therefore makes the
+        deliverable state the opposite of what was measured, and steers the
+        gate-η reader to the wrong finding.  Asserted against the COMMITTED
+        pair, because that is the artifact the operator reads.
+        """
+        mod = _mod()
+        report = _committed_report()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        by_arm = {}
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            by_arm[cells[0]] = cells[pin_column]
+
+        checked = 0
+        for arm, measurement in report['arms'].items():
+            rate = measurement['pin']['window_changed_rate']
+            if rate is None or rate == 0:
+                continue
+            checked += 1
+            assert by_arm[arm] != '0.00', (
+                f'{arm}: window_changed_rate={rate} rendered as `0.00`, which '
+                f"this artifact's own reading guide defines as \"the pin never "
+                f'fired"'
+            )
+        assert checked, 'no arm fired the pin, so this test asserted nothing'
+
+    def test_the_prose_bullet_restates_the_same_rate_as_the_table_cell(self):
+        """The bullet and the table cell are INDEPENDENT lookups.
+
+        ``render_markdown`` reads ``arms[f'{shape}+pin']`` for the bullet
+        (bake_off_storage_shape.py:2039) but formats the row from whichever
+        arm the table loop is on (:2013).  Cross-wiring the bullet to the
+        pin-OFF arm would make the artifact's prose contradict the column it
+        summarizes, and byte-identity with the committed JSON could not
+        notice: both sides render through the same function, so the wrong
+        value would be written to the committed markdown too.
+
+        Compared as extracted VALUES rather than as a sentence, and the bullet
+        is LOCATED by `pin_bullet_prefix(shape)` — the anchor the renderer
+        itself emits — rather than by English wording.  Selecting on "starts
+        with `- `, names the shape, and contains the word 'pin'" would fail
+        on a reworded bullet with a count mismatch, i.e. break on the one
+        thing this test is supposed to leave free.  Only the number has to
+        agree.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        by_arm = {}
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            by_arm[cells[0]] = cells[pin_column]
+
+        for shape in mod.ARM_SHAPES:
+            bullets = [
+                line for line in rendered.splitlines()
+                if line.startswith(mod.pin_bullet_prefix(shape))
+            ]
+            # Exactly one, so a reworded bullet fails loudly here rather than
+            # silently reducing the check below to a no-op.
+            assert len(bullets) == 1, f'{shape}: {len(bullets)} pin bullets'
+
+            cell = by_arm[f'{shape}+pin']
+            assert cell != mod._NO_MEASUREMENT, (
+                f'{shape}+pin rendered as unmeasured, so this assertion '
+                f'cannot tell the two arms apart'
+            )
+            assert cell in bullets[0].split(), (
+                f'{shape}: table says {cell!r} for {shape}+pin, but the '
+                f'prose bullet does not restate it: {bullets[0]!r}'
+            )
+
+    def test_it_renders_byte_identically_from_the_committed_json(self):
+        """The markdown is a pure function of the JSON, so the two cannot have
+        been edited apart — and a rerun's diff stays signal."""
+        mod = _mod()
+
+        assert mod.render_markdown(_committed_report()) == (
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        )
