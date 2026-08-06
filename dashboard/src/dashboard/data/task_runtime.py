@@ -127,6 +127,13 @@ async def fetch_task_runtime(
     ``'deadline_exceeded'`` (our probe budget fired) vs ``'unreachable'``
     (connect refused / HTTP error / malformed payload). See the module
     docstring for the full taxonomy.
+
+    Beyond the per-project reasons, this emits ONE aggregate WARNING when
+    EVERY probed project (>= 2 of them) exceeded the deadline at once. That
+    pattern is the 2026-07-30 discriminator: a real outage is per-project,
+    so all-at-once points at the dashboard's own event loop rather than at
+    the orchestrators. The returned mapping is unaffected — the signal is
+    purely additive.
     """
     if not escalation_urls:
         return {}
@@ -137,4 +144,29 @@ async def fetch_task_runtime(
         *(_probe_one(client, base, per_call_timeout) for base in base_urls),
         return_exceptions=False,
     )
+    # A genuine orchestrator outage is PER-PROJECT. Every probed project
+    # blowing the deadline in the same pass is the signature of OUR event loop
+    # being starved — say so, so an operator is not sent chasing N healthy
+    # orchestrators (the 2026-07-30 misdiagnosis).
+    #
+    # The >= 2 threshold is load-bearing: with a single configured project the
+    # pattern carries no information at all — "all projects timed out" is then
+    # exactly "that one orchestrator might be down", and claiming the dashboard
+    # is at fault would be the same unfounded diagnosis in the other direction.
+    # dashboard.static.redux.runtime_format.rtProbeSummary applies the IDENTICAL
+    # threshold so the log and the UI can never disagree.
+    deadline = [
+        lbl for lbl, snap in zip(labels, results, strict=True)
+        if snap.offline_reason == 'deadline_exceeded'
+    ]
+    if len(labels) >= 2 and len(deadline) == len(labels):
+        logger.warning(
+            'get_task_runtime_state: all %d probed projects (%s) exceeded the '
+            '%.2fs probe deadline in the same pass. A real orchestrator outage '
+            'is per-project, so this pattern points at the DASHBOARD\'s own '
+            'event loop being starved rather than at the orchestrators, which '
+            'may be healthy — see the 2026-07-30 incident. Look at what is '
+            'blocking the dashboard event loop before restarting anything.',
+            len(labels), ', '.join(deadline), per_call_timeout,
+        )
     return dict(zip(labels, results, strict=True))
