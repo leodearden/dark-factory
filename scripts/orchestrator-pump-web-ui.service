@@ -15,12 +15,26 @@
 #   templates carry RestartSteps=4.
 #
 #   Propagation is committed->installed via scripts/setup-host.sh, which copies
-#   this file over the host's copy. A parity pass (scripts/check_orchestrator_
-#   unit_parity.py, task 3424) must read this header and NOT "reconcile" the
-#   RestartSteps=4 line back out to match the host.
+#   this file over the host's copy. A FUTURE parity pass (task 3424; the script
+#   scripts/check_orchestrator_unit_parity.py is NOT yet written — do not go
+#   looking for it) must read this header and NOT "reconcile" the RestartSteps=4
+#   line back out to match the host.
+#
+#   Divergence from the fleet, flagged so it does not read as an oversight:
+#   the After= below is NARROWER than every sibling orchestrator unit's — it
+#   omits pytest-jobserver.service (and reify-jobserver.service). That is
+#   correct here, not drift to be widened. Those units seed FIFO token buckets
+#   consumed by the `shared.pytest_jobserver` pytest plugin, which a project
+#   opts into via `pytest_plugins` in its own conftest.py. pump-web-ui's verify
+#   lane shells out to its own backend/.venv/bin/pytest, an isolated venv with
+#   no dependency on dark-factory's `shared` package and no such opt-in, so it
+#   never touches /tmp/pytest-jobserver and inherits no boot-race from starting
+#   before the jobservers. If pump-web-ui ever adopts the shared plugin, add
+#   pytest-jobserver.service to After= at the same time.
 
 [Unit]
 Description=Pump Web UI Orchestrator (supervised)
+# Narrower than the sibling units on purpose — see the provenance header.
 After=network.target fused-memory.service
 # Wants=, not Requires=: a Requires= turns a single fused-memory boot-race failure
 # into a PERMANENT cancel of our start job. Wants= orders us after it but lets us

@@ -145,7 +145,7 @@ fi
 #   - orchestrator-my-solar-challenge.service (my-solar-challenge, escalation 8106)
 #   - orchestrator-solar-challenge-platform.service (platform, escalation 8107)
 #   - orchestrator-pump-web-ui.service      (pump-web-ui orchestrator, escalation 8108)
-#   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, supervised)
+#   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, escalation 8101)
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
 #     The .service is static (no [Install]) — the .timer carries the install, so
 #     only the timer is enabled below. `systemctl enable` on it would error.
