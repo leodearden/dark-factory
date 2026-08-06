@@ -51,6 +51,48 @@ RANGE_EDGE_RELATES_TO = (
     '(e.uuid, e.group_id, e.name, e.created_at, e.expired_at, e.valid_at, e.invalid_at)'
 )
 
+# --- The measured FalkorDB FULLTEXT forms, verbatim ------------------------
+#
+# Copied character-for-character from get_fulltext_indices(GraphProvider.FALKORDB)
+# under graphiti-core 0.28.2 — including the 48/52-space indentation and the full
+# 33-word stopwords list.  The stopwords list is precisely WHY these are copied
+# verbatim rather than paraphrased: it is a quoted, comma-separated list living
+# INSIDE the config map, so a naive comma- or quote-split over the whole
+# statement reports ~36 bogus "properties".  Newlines are explicit (rather than
+# a triple-quoted block) so the measured leading whitespace on each line cannot
+# be silently reflowed by an editor or a formatter.
+
+_STOPWORDS = (
+    "                                                    stopwords: ['a', 'is', 'the', 'an', "
+    "'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in', 'into', 'it', 'no', "
+    "'not', 'of', 'on', 'or', 'such', 'that', 'their', 'then', 'there', 'these', 'they', "
+    "'this', 'to', 'was', 'will', 'with']"
+)
+
+FULLTEXT_NODE_ENTITY = '\n'.join((
+    'CALL db.idx.fulltext.createNodeIndex(',
+    '                                                {',
+    "                                                    label: 'Entity',",
+    _STOPWORDS,
+    '                                                },',
+    "                                                'name', 'summary', 'group_id'",
+    '                                                )',
+))
+
+FULLTEXT_NODE_COMMUNITY = '\n'.join((
+    'CALL db.idx.fulltext.createNodeIndex(',
+    '                                                {',
+    "                                                    label: 'Community',",
+    _STOPWORDS,
+    '                                                },',
+    "                                                'name', 'group_id'",
+    '                                                )',
+))
+
+FULLTEXT_EDGE_RELATES_TO = (
+    'CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id)'
+)
+
 # --- The neo4j forms, measured verbatim from the BARE-STRING provider call --
 # These must NOT parse.  See TestFailsLoudly for why that is the contract.
 
@@ -106,6 +148,62 @@ class TestParseRangeStatements:
         diff would report "nothing missing" for an index that was never created.
         """
         assert parse_index_statement(statement) != []
+
+
+class TestParseFulltextStatements:
+    """The two upstream FULLTEXT syntaxes — a CALL procedure and a CREATE statement.
+
+    graphiti emits fulltext indices in two entirely different shapes depending on
+    node vs edge, so this is not one form with a keyword difference: the node side
+    is a stored-procedure CALL whose properties are positional arguments AFTER a
+    config map, and the edge side is an ordinary ``CREATE FULLTEXT INDEX ... ON (...)``.
+    """
+
+    def test_node_fulltext_call_form_fans_out_to_one_spec_per_property(self):
+        specs = parse_index_statement(FULLTEXT_NODE_ENTITY)
+        assert set(specs) == {
+            ('Entity', 'NODE', 'name', 'FULLTEXT'),
+            ('Entity', 'NODE', 'summary', 'FULLTEXT'),
+            ('Entity', 'NODE', 'group_id', 'FULLTEXT'),
+        }
+
+    def test_stopwords_never_leak_into_the_property_set(self):
+        """THE comma hazard: properties come from AFTER the config map's closing brace.
+
+        The config map embeds a 33-word quoted, comma-separated stopwords list, so
+        a naive comma- or quote-split over the whole statement yields ~36 bogus
+        "properties" — every one of which would then be reported as a MISSING
+        index forever, and none of which could ever be created.  This assertion is
+        what pins the brace-matching requirement.
+        """
+        props = {spec[2] for spec in parse_index_statement(FULLTEXT_NODE_ENTITY)}
+        assert props == {'name', 'summary', 'group_id'}
+        for stopword in ('a', 'is', 'the', 'and', 'with'):
+            assert stopword not in props
+
+    def test_node_fulltext_arity_follows_the_statement(self):
+        """Community indexes 2 properties, Entity 3 — the arity is not hardcoded."""
+        specs = parse_index_statement(FULLTEXT_NODE_COMMUNITY)
+        assert set(specs) == {
+            ('Community', 'NODE', 'name', 'FULLTEXT'),
+            ('Community', 'NODE', 'group_id', 'FULLTEXT'),
+        }
+        assert len(specs) == 2
+
+    def test_edge_fulltext_create_form(self):
+        specs = parse_index_statement(FULLTEXT_EDGE_RELATES_TO)
+        assert set(specs) == {
+            ('RELATES_TO', 'RELATIONSHIP', 'name', 'FULLTEXT'),
+            ('RELATES_TO', 'RELATIONSHIP', 'fact', 'FULLTEXT'),
+            ('RELATES_TO', 'RELATIONSHIP', 'group_id', 'FULLTEXT'),
+        }
+
+    def test_config_map_without_a_label_key_raises_rather_than_yielding_an_empty_label(self):
+        """Strictness survives the new branch — no silent ('', 'NODE', 'name', 'FULLTEXT')."""
+        statement = "CALL db.idx.fulltext.createNodeIndex({stopwords: []}, 'name')"
+        with pytest.raises(UnparsedIndexStatementError) as excinfo:
+            parse_index_statement(statement)
+        assert statement in str(excinfo.value)
 
 
 class TestFailsLoudly:
