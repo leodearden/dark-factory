@@ -1232,6 +1232,14 @@
       "created_at",
       "content"
     ],
+    "record_fields": [
+      "uuid",
+      "name",
+      "group_id",
+      "source_description",
+      "created_at",
+      "content"
+    ],
     "statement": "Corpus membership is NEVER conditioned on the incumbent extraction pipeline's outcome. The population query projects only the six fields listed in projected_fields and applies no WHERE clause, no LIMIT and no ranking of any kind; e.entity_edges — the per-episode record of what the incumbent produced — is never read, never filtered on, and never used as a stratification dimension. Within each stratum the draw is an unconditioned seeded permutation, not a score-ranked take. An episode the incumbent extracted zero edges from is exactly as eligible as any other.",
     "stratification_dimensions": [
       "month(created_at)",

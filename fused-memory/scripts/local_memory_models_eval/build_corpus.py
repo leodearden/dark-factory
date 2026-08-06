@@ -30,9 +30,12 @@ untouched. The guarantee is mechanized three ways, each of them tested:
    no filtering predicate of any kind.
 2. :class:`EpisodeRecord` has no outcome attribute, so no downstream sampling
    rule *can* condition on one.
-3. The manifest records the machine-checkable facts (the projected field list,
-   the dimensions used) beside the prose statement, so a reviewer can check
-   the claim rather than trust it.
+3. The manifest records the machine-checkable facts beside the prose
+   statement, so a reviewer can check the claim rather than trust it: the
+   projected field list, the dimensions used, and — reflected independently off
+   :class:`EpisodeRecord` rather than copied from the projection constant —
+   ``record_fields``, which shows the record type holds nothing more than what
+   was projected.
 
 Measured read-only on 2026-08-05: exactly one episode of 2770
 (``e622a9bf-f1c8-431b-ad36-92762d69436d``) has ``size(entity_edges) == 0`` —
@@ -128,6 +131,7 @@ import os
 import random
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -234,6 +238,20 @@ class EpisodeRecord:
     content: str
 
 
+def record_field_names() -> tuple[str, ...]:
+    """Return :class:`EpisodeRecord`'s field names, in declaration order.
+
+    Recorded in the manifest as ``no_outcome_filter.record_fields``, beside
+    ``projected_fields``. The two are derived from INDEPENDENT sources — this
+    one by reflection over the dataclass that actually holds a fetched row, that
+    one from the :data:`PROJECTED_FIELDS` constant the Cypher RETURN list is
+    built from — so a reviewer holding only the artifact can see that the record
+    type carries no field beyond what was projected, rather than taking the
+    prose statement's word for it. A test pins the two equal.
+    """
+    return tuple(f.name for f in dataclasses.fields(EpisodeRecord))
+
+
 # ---------------------------------------------------------------------------
 # Stratum derivation
 # ---------------------------------------------------------------------------
@@ -333,7 +351,7 @@ def payload_kind(source_description: object) -> str:
     return ADD_EPISODE_KIND
 
 
-def content_hash(content: str) -> str:
+def content_hash(content: str, *, uuid: str | None = None) -> str:
     """Return the full 64-char SHA-256 hex digest of *content*'s UTF-8 bytes.
 
     Deliberately NOT ``memory_eval_retrieval_probe.content_key()``, which is
@@ -344,9 +362,17 @@ def content_hash(content: str) -> str:
     independent variable, so a whitespace change IS a change and must fail
     verification, and truncating to 16 hex chars would weaken a collision
     guarantee that costs nothing to keep. Same primitive, different semantics.
+
+    *uuid*, when given, names the offending episode in the error text. Every
+    other error in this module names what it choked on; without it, a NULL
+    ``content`` reaching here reports a bare type and leaves the reader to find
+    which of ~2,800 episodes it came from.
     """
     if not isinstance(content, str):
-        raise CorpusBuildError(f'content must be a string, got {type(content).__name__}')
+        where = f' for episode {uuid!r}' if uuid is not None else ''
+        raise CorpusBuildError(
+            f'content must be a string, got {type(content).__name__}{where}'
+        )
     return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
 
@@ -531,22 +557,20 @@ def _group_by_cell(
     return cells
 
 
-def cell_permutation(
-    population: list[EpisodeRecord], cell: tuple[str, str], *, seed: str
+def _permutation_from_cells(
+    cells: dict[tuple[str, str], list[EpisodeRecord]],
+    cell: tuple[str, str],
+    *,
+    seed: str,
 ) -> list[str]:
-    """Return *cell*'s full seeded permutation of uuids, for any N.
+    """Permute *cell* from an ALREADY-grouped population.
 
-    Exposed as its own function so the prefix property is directly checkable:
-    a reviewer (and the test suite) can confirm that what :func:`select`
-    returned for a cell really is the head of this list, rather than taking the
-    claim on faith.
-
-    The **canonical uuid sort before seeding** is what makes the result
-    independent of the order FalkorDB returns rows — which is not guaranteed
-    stable between runs. Without it, a re-run could silently produce a
-    different corpus while still claiming the same seed.
+    Split out from :func:`cell_permutation` purely so :func:`select` can group
+    once instead of once per cell. Grouping is not free: it derives a stratum
+    key for every record, and each key costs an ISO-8601 parse plus a regex
+    substitution — on the real store that is 16 cells x ~2,800 episodes of
+    redundant work for a grouping the caller already holds.
     """
-    cells = _group_by_cell(population)
     if cell not in cells:
         raise CorpusBuildError(f'no such stratum cell in population: {cell!r}')
     uuids = sorted(record.uuid for record in cells[cell])
@@ -558,6 +582,21 @@ def cell_permutation(
     # gains or loses episodes.
     random.Random(f'{seed}:{cell[0]}:{cell[1]}').shuffle(uuids)
     return uuids
+
+
+def cell_permutation(
+    population: list[EpisodeRecord], cell: tuple[str, str], *, seed: str
+) -> list[str]:
+    """Return *cell*'s full seeded permutation of uuids, for any N.
+
+    Exposed as its own function so the prefix property is directly checkable:
+    a reviewer (and the test suite) can confirm that what :func:`select`
+    returned for a cell really is the head of this list, rather than taking the
+    claim on faith. It takes a raw population — the shape a reviewer has in
+    hand — and groups it itself; :func:`select`, which already grouped, calls
+    :func:`_permutation_from_cells` directly.
+    """
+    return _permutation_from_cells(_group_by_cell(population), cell, seed=seed)
 
 
 def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionResult:
@@ -597,7 +636,7 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
     selected: list[EpisodeRecord] = []
     not_selected: dict[str, str] = {}
     for cell in sorted(cells):
-        permutation = cell_permutation(population, cell, seed=seed)
+        permutation = _permutation_from_cells(cells, cell, seed=seed)
         take = allocation[cell]
         selected.extend(by_uuid[uuid] for uuid in permutation[:take])
         for uuid in permutation[take:]:
@@ -723,6 +762,14 @@ class EpisodeReader:
         :class:`CorpusBuildError` rather than being dropped — a silently
         dropped row would shrink a stratum's denominator and skew every
         proportional share computed from it.
+
+        ``content`` is validated in the same loop, for the same reason. A
+        FalkorDB ``RETURN e.content`` over a node lacking the property yields
+        NULL, which lands here as ``None``; deferring that to
+        :func:`content_hash` would surface it only if the row happened to be
+        DRAWN, and an undrawn one would still be counted in its stratum's
+        denominator. Content is the replay experiment's independent variable,
+        so an unusable one is exactly the condition that must be loud.
         """
         self.assert_read_only_command(RO_COMMAND)
         graph = self._resolve_graph()
@@ -737,6 +784,13 @@ class EpisodeReader:
                 )
             record = EpisodeRecord(**dict(zip(PROJECTED_FIELDS, row, strict=True)))
             stratum_key(record)  # fail fast and loudly on an unplaceable row
+            if not isinstance(record.content, str):
+                raise CorpusBuildError(
+                    f'row {index} (episode {record.uuid!r}) has non-string content '
+                    f'{type(record.content).__name__} — a projection over a node '
+                    f'without the property yields NULL. Refusing to count it toward a '
+                    f'stratum denominator it could never be replayed from.'
+                )
             population.append(record)
         if not population:
             raise CorpusBuildError(
@@ -902,13 +956,17 @@ def build_manifest(
 
     earliest = min(population, key=_instant).created_at
     latest = max(population, key=_instant).created_at
+    # Each selected record's stratum key is derived ONCE and reused for both
+    # its episode entry and the per-cell tally. Re-deriving is not free (an
+    # ISO-8601 parse plus a regex per call), and the tally in particular used to
+    # be an O(cells x selected) rescan of the whole selection per cell.
+    keyed = [(record, stratum_key(record)) for record in result.selected]
+    selected_per_cell = Counter(cell for _, cell in keyed)
     cells = {
         _cell_label(cell): {
             'population': count,
             'allocated': result.allocation[cell],
-            'selected': sum(
-                1 for r in result.selected if stratum_key(r) == cell
-            ),
+            'selected': selected_per_cell.get(cell, 0),
         }
         for cell, count in sorted(result.cell_counts.items())
     }
@@ -929,11 +987,11 @@ def build_manifest(
         'episodes': [
             {
                 'uuid': record.uuid,
-                'content_hash': content_hash(record.content),
-                'month': stratum_key(record)[0],
-                'payload_kind': stratum_key(record)[1],
+                'content_hash': content_hash(record.content, uuid=record.uuid),
+                'month': cell[0],
+                'payload_kind': cell[1],
             }
-            for record in result.selected
+            for record, cell in keyed
         ],
         'no_outcome_filter': {
             'entity_edges_queried': False,
@@ -941,6 +999,11 @@ def build_manifest(
             'entity_edges_used_as_stratum': False,
             'population_query': POPULATION_CYPHER,
             'projected_fields': list(PROJECTED_FIELDS),
+            # Reflected off EpisodeRecord, NOT copied from PROJECTED_FIELDS
+            # above: two independent derivations of the same claim, so the
+            # artifact shows that the type holding a fetched row carries no
+            # field beyond what was projected. See record_field_names().
+            'record_fields': list(record_field_names()),
             'statement': NO_OUTCOME_FILTER_STATEMENT,
             'stratification_dimensions': list(STRATIFICATION_DIMENSIONS),
         },
@@ -1082,6 +1145,39 @@ def _read_criteria(manifest: object) -> tuple[dict, list[dict]]:
     return criteria, episodes
 
 
+def _rule_drift(criteria: dict) -> str:
+    """Describe any recorded-sampler mismatch against THIS builder's constants.
+
+    :data:`BUILDER_VERSION` exists so a reviewer can tell "the artifact is
+    wrong" from "the sampler moved underneath it". Stamping it and never reading
+    it back buys nothing: a manifest built before a rule change does not
+    re-derive under the new one BY CONSTRUCTION, and reporting that as a bare
+    ``id_mismatch`` — whose documented remedy is "re-derive, or investigate
+    tampering" — points the reader at the one explanation that is not true.
+
+    Returned as a detail fragment rather than a distinct status, because the
+    verdict really is ``id_mismatch``: the artifact no longer describes what its
+    own criteria produce. Only the diagnosis changes. A manifest whose recorded
+    rules still match is unaffected, so this never invents a failure.
+    """
+    drift = [
+        f'{key}={criteria.get(key)!r} (this builder: {current!r})'
+        for key, current in (
+            ('builder_version', BUILDER_VERSION),
+            ('allocation_rule', ALLOCATION_RULE),
+            ('selection_rule', SELECTION_RULE),
+        )
+        if criteria.get(key) != current
+    ]
+    if not drift:
+        return ''
+    return (
+        '; the manifest records a DIFFERENT sampler than this builder implements '
+        f'({"; ".join(drift)}), so re-derivation is expected to differ — rebuild '
+        f'the corpus rather than investigating tampering'
+    )
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1174,7 +1270,7 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
             detail=(
                 f're-deriving from the recorded criteria (seed={criteria["seed"]!r}, '
                 f'n={criteria["n"]}) produced a different corpus than the manifest '
-                f'records{frame}'
+                f'records{frame}{_rule_drift(criteria)}'
             ),
             checked=len(recorded_ids),
             rederived=rederived,
@@ -1185,13 +1281,22 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
             },
         )
 
+    # Hashed once per episode, not once in the filter and again in the value:
+    # this is the verifier's only hot loop, it walks full episode content, and
+    # the duplicate grew linearly with any N re-tune by ζ.
+    actual = {
+        entry['uuid']: content_hash(
+            present[entry['uuid']].content, uuid=entry['uuid']
+        )
+        for entry in episodes
+    }
     drift = {
         entry['uuid']: {
             'expected': entry['content_hash'],
-            'actual': content_hash(present[entry['uuid']].content),
+            'actual': actual[entry['uuid']],
         }
         for entry in episodes
-        if content_hash(present[entry['uuid']].content) != entry['content_hash']
+        if actual[entry['uuid']] != entry['content_hash']
     }
     if drift:
         return VerifyReport(
@@ -1215,16 +1320,6 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         checked=len(recorded_ids),
         rederived=rederived,
     )
-
-
-def record_field_names() -> tuple[str, ...]:
-    """Return :class:`EpisodeRecord`'s field names, in declaration order.
-
-    Used by the manifest to record what was actually projected, so the
-    no-outcome-filter claim is checkable against the code rather than asserted
-    in prose alone.
-    """
-    return tuple(f.name for f in dataclasses.fields(EpisodeRecord))
 
 
 # ---------------------------------------------------------------------------
