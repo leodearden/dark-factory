@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
+from _dashboard_helpers import live_aiosqlite_worker_threads
 
 from dashboard.data.db import DbPool, with_db
 
@@ -585,6 +586,148 @@ class TestDbPool:
                 'connection adopted from the cancelled getter was not reaped'
             )
         finally:
+            await _reap(opened)
+
+    async def test_racing_getter_does_not_overwrite_adopted_connection(self, tmp_path):
+        """An ADOPTED connection must survive a getter that was already in flight.
+
+        ``_adopt_or_close`` installs into ``_conns`` WITHOUT holding
+        ``_open_locks[path]`` — the cancelled getter released that lock while
+        unwinding through ``async with lock``, so a second getter for the same
+        path can be suspended inside its own ``aiosqlite.connect()`` when the
+        adoption happens.
+
+        Pre-fix: ``get()``'s post-shield re-check tests only ``self._closed``,
+        never ``resolved in self._conns``, so the second getter's connection
+        OVERWRITES the adopted one.  The adopted connection is then in neither
+        ``_conns`` nor ``_inflight`` — ``close_all()`` cannot reach it, and its
+        (non-daemon) aiosqlite worker thread lives for the process lifetime.
+
+        Post-fix: ``get()`` keeps the incumbent, closes the connection it just
+        opened, and returns the pooled one — the same one-connection-per-path
+        contract already pinned by ``test_get_reuses_connection`` and
+        ``test_concurrent_get_same_path_opens_once``.
+
+        Production reachability is real: ``/healthz``'s ``_probe_db``
+        (dashboard/app.py) is the cancelling getter and ``_metrics_loop``'s
+        ``_run_once`` gets the very same paths on its poll cycle.
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        # Per-connect gates: connect #1 is A's, connect #2 is B's.  Counting
+        # invocations (rather than inspecting args) is what lets one wrapper
+        # drive two independently-released connects for the SAME path.
+        calls = 0
+        a_inside = asyncio.Event()
+        b_inside = asyncio.Event()
+        gate_a = asyncio.Event()
+        gate_b = asyncio.Event()
+
+        async def wrapper(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                a_inside.set()
+                await gate_a.wait()
+            else:
+                b_inside.set()
+                await gate_b.wait()
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        before = {id(t) for t in live_aiosqlite_worker_threads()}
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                # (1) Getter A suspends mid-connect, then is cancelled.  The
+                #     shielded connect keeps running; the per-path lock is
+                #     released as A unwinds.
+                getter_a = asyncio.create_task(pool.get(db_path))
+                await asyncio.wait_for(a_inside.wait(), timeout=2.0)
+                getter_a.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter_a
+
+                # (2) Getter B takes the freed lock and starts its OWN connect
+                #     for the same path — A's is still in flight, so B sees an
+                #     empty _conns and cannot know one is landing.
+                getter_b = asyncio.create_task(pool.get(db_path))
+                await asyncio.wait_for(b_inside.wait(), timeout=2.0)
+
+                # (3) A lands first and is ADOPTED into the pool.
+                gate_a.set()
+                await _wait_until(lambda: pool.open_count == 1)
+
+                # (4) B lands second, resuming into the post-shield re-check.
+                gate_b.set()
+                result_b = await asyncio.wait_for(getter_b, timeout=2.0)
+
+            assert len(opened) == 2, (
+                f'expected 2 physical connects (A adopted, B racing), got '
+                f'{len(opened)}'
+            )
+            assert pool.open_count == 1, (
+                f'expected exactly one pooled connection for the path, got '
+                f'{pool.open_count}'
+            )
+            assert pool._conns[db_path.resolve()] is opened[0], (
+                'the adopted connection was overwritten in _conns; it is now '
+                'in neither _conns nor _inflight, so close_all() can never '
+                'reap it and its aiosqlite worker thread is unreachable'
+            )
+            assert result_b is opened[0], (
+                f'expected the racing getter to converge on the pooled '
+                f'connection, got {result_b!r} (is opened[0]: '
+                f'{result_b is opened[0]}, is opened[1]: '
+                f'{result_b is opened[1]})'
+            )
+
+            # close_all() must reap BOTH: the adopted one it holds, and the
+            # loser B opened (which get() is responsible for closing).
+            await pool.close_all()
+            assert pool.open_count == 0, (
+                f'expected open_count=0 after close_all, got {pool.open_count}'
+            )
+            # Verified against aiosqlite >=0.22.x — see the private-attribute
+            # pin rationale on the close_all race test above.
+            for index, conn in enumerate(opened):
+                assert (
+                    hasattr(conn, '_connection')
+                    and hasattr(conn, '_running')
+                    and hasattr(conn, '_thread')
+                ), 'aiosqlite internal attribute names changed — update test'
+                assert conn._connection is None, (
+                    f'opened[{index}] not closed (_connection is '
+                    f'{conn._connection!r})'
+                )
+                assert conn._running is False, (
+                    f'opened[{index}] worker still running (_running is '
+                    f'{conn._running!r})'
+                )
+                conn._thread.join(timeout=2.0)
+                assert not conn._thread.is_alive(), (
+                    f'opened[{index}] aiosqlite worker thread did not exit: '
+                    f'an adopted connection was overwritten in _conns; its '
+                    f'aiosqlite worker thread is unreachable by close_all()'
+                )
+
+            survivors = [
+                t for t in live_aiosqlite_worker_threads() if id(t) not in before
+            ]
+            assert not survivors, (
+                f'{len(survivors)} aiosqlite worker thread(s) survived '
+                f'close_all(): an adopted connection was overwritten in '
+                f'_conns; its aiosqlite worker thread is unreachable by '
+                f'close_all()'
+            )
+        finally:
+            gate_a.set()
+            gate_b.set()
             await _reap(opened)
 
     async def test_close_all_warns_when_inflight_connect_exceeds_drain_budget(
