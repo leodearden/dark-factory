@@ -1295,12 +1295,29 @@ def fused_memory_liveness_pass() -> None:
                 f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); not restarting yet"
             )
             return
+        # ORDERING: the streak was recorded BEFORE this cap check on purpose,
+        # so evidence keeps accumulating during a capped window and the revive
+        # fires promptly the moment the window expires — rather than the count
+        # restarting from scratch every time the cap suppresses a tick.
+        if _within_fm_liveness_restart_min_interval():
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+                f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}) but a liveness "
+                f"restart is capped to one per {FM_LIVENESS_RESTART_MIN_INTERVAL_SECS}s; "
+                f"skipping"
+            )
+            # Deliberately NOT clearing the streak: the cap means "too soon",
+            # not "it recovered".
+            return
         log(
             f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
             f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
         )
         restart_unit(FUSED_MEMORY_UNIT)
         log(f"{FUSED_MEMORY_UNIT} restart issued")
+        # Arm the cap immediately after the restart is issued, so it holds even
+        # if the streak clear below fails.
+        _stamp_fm_liveness_restart_clock()
         # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
         # pass would degrade back to one-verdict-per-kill immediately after
         # the first restart.

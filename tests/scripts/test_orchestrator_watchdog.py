@@ -7192,33 +7192,55 @@ def test_liveness_pass_cap_does_not_clear_the_streak(
 ) -> None:
     """A capped tick must NOT clear the streak — "too soon" is not "it recovered".
 
-    The accumulated evidence must survive so the revive fires promptly the
-    moment the window expires, rather than restarting the count from scratch.
+    The accumulated evidence must survive across the capped window so the
+    revive fires PROMPTLY the moment the window expires, rather than the count
+    restarting from scratch on every suppressed tick.
+
+    Driven at the REAL 60s timer cadence (OnUnitActiveSec=60) rather than by
+    jumping the clock: a jump would mean ticks were genuinely missed, which
+    FM_LIVENESS_STREAK_MAX_AGE_SECS correctly treats as breaking the
+    "consecutive" claim. This is the honest model of a wedged fm being probed
+    every minute throughout a capped hour.
     """
     wdog = _load_watchdog()
     monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
     monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
     streak_file = tmp_path / "streak.json"
-    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
-    now = [1783000000.0]
-    _stamp_clock_file(tmp_path / "liveness_clock.json", now[0] - 600.0)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+    start = 1783000000.0
+    now = [start]
+    # A liveness restart happened 10 minutes ago — we are inside the window.
+    _stamp_clock_file(tmp_path / "liveness_clock.json", start - 600.0)
     monkeypatch.setattr(wdog.time, "time", lambda: now[0])
 
     for _ in range(3):
         wdog.fused_memory_liveness_pass()
+        now[0] += 60.0
 
-    assert restarted == []
+    assert restarted == [], "the cap must suppress the restart"
     assert streak_file.exists(), "a capped tick must not clear the accumulated evidence"
     assert json.loads(streak_file.read_text())["count"] == 3
 
-    # The window expires; the very NEXT non-healthy verdict must revive fm,
-    # not restart the count.
-    now[0] += 3601.0
+    # Keep ticking at the real cadence until the 3600s window expires. The
+    # evidence must accumulate throughout, never reset.
+    while now[0] - (start - 600.0) < 3600.0:
+        wdog.fused_memory_liveness_pass()
+        assert restarted == [], f"no restart may fire before the window expires at {now[0]}"
+        assert json.loads(streak_file.read_text())["count"] >= 3, (
+            "the streak must keep accumulating across the capped window"
+        )
+        now[0] += 60.0
+
+    # First tick past the window: the revive must fire immediately, with no
+    # fresh N-streak required.
     wdog.fused_memory_liveness_pass()
 
     assert restarted == ["fused-memory.service"], (
         f"the revive must fire on the first tick past the window; got {restarted}"
     )
+    assert not streak_file.exists(), "the consumed streak must then be cleared"
 
 
 def test_liveness_pass_restart_stamps_the_liveness_clock(
