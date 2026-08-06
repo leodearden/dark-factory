@@ -7,6 +7,9 @@ records. Production cutover (LLM) and the embedding backfill/migration are **fol
 authored only after — and gated on — the verdicts.** They are deliberately unfiled today and are
 not counted as G1 consumers of anything here.
 
+> **Amendment 2026-08-06 (task 3748)** — the operating VRAM budget is the MEASURED ~16.4 GiB, not
+> the nominal 19–20GB this PRD was authored against. See D10.
+
 ## Goal
 
 Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
@@ -163,6 +166,25 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
 9. **Scratch-graph guard is a hard rejection**: harness writes only to `evalmem_`-prefixed
    group_ids; anything else raises a typed error, and the boundary test observes the rejection fire.
 10. **whisper-writer stays resident** (Leo): all capacity math against ~19–20GB, not 24GB.
+    - **Superseded 2026-08-06 — the operative figure is the measured ~16.4 GiB.** Direct
+      measurement (task 3748, pre-1): `nvidia-smi --query-gpu=memory.total,memory.used,memory.free`
+      → `24576, 7309, 16813` MiB ⇒ **16.42 GiB free** (consistent with the architect's plan-time
+      reading of `24576, 7312, 16811` MiB ⇒ 16.42 GiB, and with the task-3713 steward's 2026-08-05
+      reading; small drift across readings is normal desktop jitter, not signal).
+    - **Why the nominal figure was wrong (the mechanism):** `nvidia-smi --query-compute-apps`
+      enumerates only CUDA *compute* applications — here exactly one row, whisper-writer at
+      4050 MiB — and does **not** enumerate the KDE/X11 desktop's graphics contexts at all. The
+      remaining ~3.18–3.19 GB (measured used-minus-compute-apps: 3259–3262 MiB across readings) is
+      that desktop. Therefore any `24GB − whisper-writer` arithmetic overstates headroom by
+      ~3.2–3.3 GB on a host running a desktop session; the nominal 19–20GB was an **arithmetic
+      derivation**, never a measurement.
+    - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
+      it implies is corrected.
+    - **Consequence** (not a decision — see Open Q3): the three dense LLM arms (~6, ~9, ~14 GiB) and
+      all embedding arms still fit inside ~16.4 GiB; the MoE stretch arm (~17GB) does not. Flagged at
+      the arm table (line 127) and Open Q3; sizing left open for α/η.
+    - Cites: memory `c01e7d1b-2916-4a8d-8f6e-c5e42692ce3d` (authoritative measurement),
+      `38a4fcf2-30ba-4884-82f9-412737ddda13` (contradiction resolution).
 11. **Long runs in transient `systemd --user` units**, never bare background shells.
 12. **No conflation-rate metric** — that number is owned (and about to be zeroed) by the
     referent-fidelity PRD; using it would confound both directions.
