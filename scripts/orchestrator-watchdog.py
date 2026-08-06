@@ -854,8 +854,8 @@ def _newest_fm_watched_commit_epoch() -> int | None:
         return None
 
 
-def _atomic_write_json(path: str, payload: dict) -> None:
-    """Atomically write *payload* as JSON to *path*, creating its parent dir.
+def _atomic_write_json(path: str, payload: dict) -> bool:
+    """Atomically write *payload* as JSON to *path*; return True iff it landed.
 
     The shared write primitive behind every piece of persisted watchdog state
     (fm deploy clock, fm liveness streak, fm liveness restart clock) — extracted
@@ -872,6 +872,13 @@ def _atomic_write_json(path: str, payload: dict) -> None:
     not having happened — see _record_fm_liveness_failure, where a failed write
     means the streak counter cannot accumulate and so fails SAFE (toward never
     restarting).
+
+    RETURNS True only after the rename succeeded. Fail-soft is not the same as
+    fail-safe: for most callers a missed write is benign, but for one it is
+    not — _stamp_fm_liveness_restart_clock ARMS a cap, so a silently-missed
+    write leaves the liveness revive unbounded. Such callers must inspect this
+    value and say so loudly; the log line here alone is one line among healthy
+    ticks and is not sufficient signal on its own.
     """
     tmp_path: str | None = None
     try:
@@ -884,6 +891,7 @@ def _atomic_write_json(path: str, payload: dict) -> None:
             f.write(json.dumps(payload) + "\n")
         os.replace(tmp_path, path)
         tmp_path = None  # renamed away — nothing to clean up
+        return True
     except Exception as exc:  # noqa: BLE001
         if tmp_path is not None:
             try:
@@ -891,6 +899,7 @@ def _atomic_write_json(path: str, payload: dict) -> None:
             except OSError:
                 pass
         log(f"_atomic_write_json: failed to write {path}: {exc!r}")
+        return False
 
 
 def _read_json_state(path: str) -> dict | None:
@@ -963,8 +972,8 @@ def _read_clock_epoch(path: str, label: str) -> float | None:
         return None
 
 
-def _stamp_clock(path: str) -> None:
-    """Atomically stamp *path* with the current ``{ts, iso}`` time.
+def _stamp_clock(path: str) -> bool:
+    """Atomically stamp *path* with the current ``{ts, iso}`` time; True iff it landed.
 
     The shared CLOCK-layer write primitive paired with _read_clock_epoch.
     Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock,
@@ -973,12 +982,13 @@ def _stamp_clock(path: str) -> None:
     not have to decode a bare number.
 
     Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
-    error is logged and swallowed rather than raised. Callers whose SAFETY
-    depends on the stamp landing (rather than merely their convenience) must
-    say so at their own call site — see _stamp_fm_liveness_restart_clock.
+    error is logged and swallowed rather than raised, and reported back as
+    False. Callers whose SAFETY depends on the stamp landing (rather than
+    merely their convenience) must inspect that value and say so at their own
+    call site — see _stamp_fm_liveness_restart_clock.
     """
     now = time.time()
-    _atomic_write_json(
+    return _atomic_write_json(
         path,
         {
             "ts": int(now),
@@ -1146,8 +1156,8 @@ def _within_fm_liveness_restart_min_interval() -> bool:
     )
 
 
-def _stamp_fm_liveness_restart_clock() -> None:
-    """Stamp FM_LIVENESS_RESTART_CLOCK_PATH with the current ``{ts, iso}`` time.
+def _stamp_fm_liveness_restart_clock() -> bool:
+    """Stamp FM_LIVENESS_RESTART_CLOCK_PATH; return True iff the cap was armed.
 
     Arms the liveness restart cap. Sibling of _stamp_fm_deploy_clock over a
     DIFFERENT file (task 3764) — writing fm's deploy clock here would silence
@@ -1158,8 +1168,20 @@ def _stamp_fm_liveness_restart_clock() -> None:
     issues a revive, so the cap is armed even if the subsequent streak clear
     fails. Thin wrapper over the shared _stamp_clock helper, which owns the
     ``{ts, iso}`` payload schema and the atomic-write dance.
+
+    THE RETURN VALUE IS LOAD-BEARING and must not be dropped. This is the one
+    watchdog write whose failure points the WRONG way: _atomic_write_json is
+    fail-soft, so a clock that cannot be written (a stale root-owned file,
+    ENOSPC, exhausted inodes) leaves the cap unarmed while streak writes keep
+    succeeding — and the pass then degrades to a revive roughly every
+    FM_LIVENESS_STREAK_THRESHOLD ticks (~180s at defaults) indefinitely,
+    strictly worse flapping than the one-per-hour bound this layer promises.
+    Unlike the fm deploy clock — a secondary flap-guard that self-heals from
+    ActiveEnterTimestamp on the next tick — nothing else reconstructs this
+    one, so the caller must surface the failure loudly rather than let it
+    disappear into a single routine persistence line among healthy ticks.
     """
-    _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
+    return _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
 
 
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
@@ -1449,8 +1471,16 @@ def fused_memory_liveness_pass() -> None:
         restart_unit(FUSED_MEMORY_UNIT)
         log(f"{FUSED_MEMORY_UNIT} restart issued")
         # Arm the cap immediately after the restart is issued, so it holds even
-        # if the streak clear below fails.
-        _stamp_fm_liveness_restart_clock()
+        # if the streak clear below fails. The stamp is fail-SOFT but not
+        # fail-safe: an unarmed cap makes the revive unbounded (a revive every
+        # ~N ticks), so its failure gets its own high-signal line rather than
+        # disappearing into _atomic_write_json's routine one.
+        if not _stamp_fm_liveness_restart_clock():
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
+                f"further revives are unbounded until "
+                f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
+            )
         # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
         # pass would degrade back to one-verdict-per-kill immediately after
         # the first restart.

@@ -6364,6 +6364,27 @@ def test_atomic_write_json_fail_soft_on_unwritable_dir(
     assert logged, "a swallowed write failure must be logged, not silent"
 
 
+def test_atomic_write_json_reports_whether_the_write_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The writer returns True only after the rename succeeded, False otherwise.
+
+    Fail-soft is not the same as fail-safe: one caller
+    (_stamp_fm_liveness_restart_clock) ARMS a cap, so it must be able to tell
+    a landed write from a swallowed failure rather than assume the former.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    assert wdog._atomic_write_json(str(tmp_path / "ok.json"), {"ts": 1}) is True
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    assert wdog._atomic_write_json(str(tmp_path / "bad.json"), {"ts": 1}) is False
+
+
 def test_read_json_state_returns_parsed_dict(tmp_path: pathlib.Path) -> None:
     """_read_json_state parses a well-formed file into a dict."""
     wdog = _load_watchdog()
@@ -7139,6 +7160,82 @@ def test_within_fm_liveness_restart_min_interval_false_when_clock_absent(
     monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
 
     assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_stamp_fm_liveness_restart_clock_reports_whether_the_cap_was_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The stamp propagates the writer's verdict instead of dropping it."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness.json")
+    )
+
+    assert wdog._stamp_fm_liveness_restart_clock() is True
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    assert wdog._stamp_fm_liveness_restart_clock() is False
+
+
+def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A cap that cannot be armed gets its OWN high-signal line, not a routine one.
+
+    The cap's arming is a fail-soft write, so its failure points the WRONG
+    way: with the clock file unwritable (stale root-owned file, ENOSPC,
+    exhausted inodes) while streak writes still succeed, the pass degrades to
+    a revive roughly every FM_LIVENESS_STREAK_THRESHOLD ticks (~180s at
+    defaults) indefinitely — strictly worse flapping than the one-per-hour
+    bound this layer promises. Nothing else reconstructs this clock (unlike
+    the fm deploy clock, which self-heals from ActiveEnterTimestamp), so one
+    `_atomic_write_json:` line buried among healthy ticks is not enough
+    signal.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    logged: list[str] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("no space left on device")
+
+    real_replace = os.replace
+
+    def replace_but_not_the_clock(src, dst):  # noqa: ANN001
+        # Streak writes keep succeeding — only the cap clock is unwritable.
+        if str(dst) == wdog.FM_LIVENESS_RESTART_CLOCK_PATH:
+            return boom(src, dst)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(wdog.os, "replace", replace_but_not_the_clock)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"an unarmable cap must not block the justified revive; got {restarted}"
+    )
+    unarmed = [m for m in logged if "could NOT be armed" in m]
+    assert unarmed, (
+        f"a cap that could not be armed must say so distinguishably: {logged!r}"
+    )
+    assert any(wdog.FM_LIVENESS_RESTART_CLOCK_PATH in m for m in unarmed), (
+        f"the line must name the file the operator has to fix: {unarmed!r}"
+    )
+    assert any("unbounded" in m for m in unarmed), (
+        f"the line must state the consequence, not just the failure: {unarmed!r}"
+    )
+    routine = [m for m in logged if m.startswith("_atomic_write_json:")]
+    assert routine and unarmed != routine, (
+        "the high-signal line must be distinguishable from the routine "
+        f"persistence hiccup line: {logged!r}"
+    )
 
 
 def test_stamp_fm_liveness_restart_clock_does_not_touch_fm_deploy_clock(
