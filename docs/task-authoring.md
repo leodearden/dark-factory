@@ -955,6 +955,47 @@ there only for a genuinely load-bearing, stable convention; Tier-B/C drift
 should be fixed by renaming to the canonical key or moving under `x_`, not
 by blessing it.
 
+### Known gaps (measured 2026-08-06 — not fixed)
+
+Three `unknown_key` sources are known, measured, and deliberately left
+open. They are recorded here so the next reader does not re-measure them.
+All counts are a snapshot of a **growing** corpus (3553 tasks carried dict
+metadata at measurement), not an invariant.
+
+| Gap | Measured | Owner |
+|---|---|---|
+| `execution_class` is read by two live guards but is neither blessed nor typed | 272 tasks | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+
+**`execution_class`** is not in `_BLESSED_METADATA_KEYS`, is not a typed
+`TaskMetadata` field and is not a registered submodel — yet
+`execution_class_guard` and `routing_intent_guard` both read it, so every
+one of those 272 tasks plausibly emits this same warning class. It was
+deliberately **not** blessed by task 3697: 272 tasks and two live guards
+make it a broader vocabulary decision (bless / promote to a typed field /
+retire) than a single-task cleanup should settle. Originally recorded as
+Finding 5 of the toolcall-markup-containment capability manifest. The
+count is still climbing — 253 at that PRD's decompose, 272 here.
+
+**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
+a ~30-task metadata rewrite has a very different blast radius from one
+reserved task. `x_`-prefixed precedents for these same spellings already
+exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
+`x_related_df_tasks` 5), so the target spelling is not in doubt and the
+sweep is a mechanical per-task re-run of
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`.
+
+**The write-path blocker** is why the third row is still open, and it
+bounds both of the others: `update_task` rejects any metadata payload
+containing `done_provenance` — a presence-only write-authority floor
+evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
+retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
+with no deletion sentinel. A whole-blob `'replace'` is therefore
+structurally impossible on any `done`/merged task, which is most of the
+corpus above. Check a target task's status before assuming its metadata is
+writable.
+
 ---
 
 ## 9. Practical recipes
