@@ -9,11 +9,17 @@ import os
 from pathlib import Path
 
 from shared import transcript_archive as transcript_archive_module
-from shared.transcript_archive import archive_task_transcripts
+from shared.transcript_archive import archive_task_transcripts, durable_archive_path
 
 # A representative encoded-project directory name (Claude Code encodes the
 # absolute project path into this leaf; the exact encoding is irrelevant here).
 ENC = '-home-leo-src-dark-factory'
+
+# A SECOND encoded-project dir: the same session archived from a different
+# worktree lane (the observed re-dispatched-across-lanes case). ENC is a strict
+# prefix of ENC_B, so ENC sorts FIRST lexically — the multi-match rows below
+# rely on that known order to make "first match" and "newest mtime" differ.
+ENC_B = '-home-leo-src-dark-factory--worktrees-3727'
 
 
 def _write(path: Path, data: bytes) -> Path:
@@ -196,3 +202,72 @@ class TestBestEffortLoud:
         assert rec.task_id == task_id
         assert str(bad) in rec.path
         assert rec.errno == errno.EISDIR
+
+
+class TestDurableArchivePathLookup:
+    """B1/B2/B4 — the read side: locate one session's archived transcript.
+
+    See plans/session-resume-eligibility-seam-prd.md §8 for the contract this
+    class pins. The archive layout asserted here is read off the producer
+    (:func:`_archive_one`), not off prose, so locator and writer cannot drift.
+    """
+
+    def test_b1_same_lane_returns_the_archived_transcript(self, tmp_path):
+        """B1: an archive written under the caller's own lane is found."""
+        root = tmp_path / 'archive'
+        sid = 'sess-b1'
+        task_id = '42'
+
+        archived = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+
+        found = durable_archive_path(root, task_id, sid)
+
+        assert found == archived
+        # D6: the locator returns a Path, never a bool — "does it exist" is
+        # spelled `is not None`, and 3578's restore reuses this same path
+        # rather than growing a second glob that must agree forever (INV-5).
+        assert isinstance(found, Path)
+        assert not isinstance(found, bool)
+        assert found.exists()
+
+    def test_b2_cross_lane_archive_is_found(self, tmp_path):
+        """B2 (I-B): the encoded-cwd component is globbed, never assumed.
+
+        The MEASURED reify case: a session archived from lane A is looked up
+        after re-dispatch into lane B, so the caller knows nothing about which
+        encoded-cwd dir produced it.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b2'
+        task_id = '42'
+
+        # Written ONLY under ENC_B; the caller passes no lane information.
+        archived = _write(root / task_id / ENC_B / f'{sid}.jsonl.gz', b'gz-bytes')
+
+        found = durable_archive_path(root, task_id, sid)
+
+        assert found == archived
+        assert found.exists()
+
+    def test_b4_absent_session_returns_none(self, tmp_path):
+        """B4: a populated root that holds a DIFFERENT session yields None."""
+        root = tmp_path / 'archive'
+        task_id = '42'
+
+        _write(root / task_id / ENC / 'sess-other.jsonl.gz', b'gz-bytes')
+
+        assert durable_archive_path(root, task_id, 'sess-missing') is None
+
+    def test_b4_task_id_component_is_not_globbed(self, tmp_path):
+        """B4: the task_id is an exact path component, not a wildcard.
+
+        A session archived under task 42 must NOT be reported as recoverable
+        when task 99 asks — the archive is keyed on (task_id, session_id).
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b4'
+
+        _write(root / '42' / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+
+        assert durable_archive_path(root, '42', sid) is not None
+        assert durable_archive_path(root, '99', sid) is None
