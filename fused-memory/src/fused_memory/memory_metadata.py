@@ -55,7 +55,6 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +73,21 @@ from fused_memory.topic_slug import (
     TOPIC_SLUG_RE,
     is_valid_topic_slug,
 )
+
+# The canonical-full-UUID predicate that used to live here (task 3132, leaf η).
+# It moved to ``utils/validation.py`` so the delete_memory guards, recon_report's
+# citation gate and citation_verifier's forwarding-pointer guard all answer
+# "is this a canonical full UUID" from ONE definition (INV-5).
+from fused_memory.utils.validation import is_full_uuid
+
+#: Back-compat alias for the pre-move private spelling, bound to the *same
+#: object* — the same re-export-not-redefine treatment applied to
+#: ``TOPIC_SLUG_RE`` above, for the same INV-5 reason.  ``scripts/
+#: retro_stamp_topics.py`` imports this name and
+#: ``tests/test_retro_stamp_topics.py`` pins the binding by ``is``, so the
+#: alias is load-bearing rather than cosmetic.  New callers should import
+#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` directly.
+_is_full_uuid = is_full_uuid
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
@@ -764,29 +778,6 @@ def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolat
     )
 
 
-def _is_full_uuid(value: Any) -> bool:
-    """True iff *value* is a canonical full-UUID string.
-
-    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
-    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
-    prefixes.  Requiring the canonical 36-char dashed rendering is what
-    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
-    members) and truncated hex generally — a bare parse would let a
-    32-hex-digit string through as "well formed" while no store would
-    resolve it in that spelling.
-
-    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
-    a rendering choice, not a different identifier.
-    """
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return str(parsed) == value.lower()
-
-
 def validate_memory_metadata(
     meta: dict[str, Any], *, enforce_kind_registry: bool
 ) -> list[MetadataViolation]:
@@ -867,7 +858,7 @@ def validate_memory_metadata(
         members = normalize_supersedes(meta['supersedes'])
         meta['supersedes'] = members
         for member in members:
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 violations.append(_violation(
                     'supersedes',
                     'invalid_supersedes_member',
@@ -966,7 +957,7 @@ def validate_memory_metadata(
     # 2d. parent_id — SHAPE only; liveness is leaf δ's (see the docstring).
     if 'parent_id' in meta:
         parent_id = meta['parent_id']
-        if not _is_full_uuid(parent_id):
+        if not is_full_uuid(parent_id):
             violations.append(_violation(
                 'parent_id',
                 'invalid_parent_id_shape',
