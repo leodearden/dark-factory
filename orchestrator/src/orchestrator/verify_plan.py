@@ -705,8 +705,14 @@ def _derive_module_runs(
     is degradation, so the emitted ``reason`` names the still-unrun file(s)
     explicitly rather than reading as "the change was verified".
 
-    The TWIN of this arm in :func:`_derive_fallback_runs` is deliberately NOT
-    wired — see that function's own paragraph for why.
+    The TWIN of this arm lives in :func:`_derive_fallback_runs`, and is closed
+    (task 3513) one layer down rather than in that decision function — by
+    :func:`widen_fallback_for_marker_deselection`, against the ALREADY-EXECUTED
+    fallback config. Both arms share this arm's probe,
+    :func:`deselecting_expression_for_command`, so the two can never disagree
+    about which commands are refused or where the ini file is looked for. See
+    that function's own paragraph for why the fallback arm needs the extra
+    layer.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -982,25 +988,33 @@ def _derive_fallback_runs(
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
 
-    MARKER DESELECTION (task 3494) is deliberately NOT wired here, so this
-    branch knowingly retains the pre-3494 behaviour. The bare-default
-    ``collectable_tests`` branch below has the identical "the path says
-    collectable, pytest collects zero" failure mode whenever the repo root
-    carries an ``addopts = "-m 'not X'"`` and the diff touches only
-    X-marked test files — it will still plan a zero-collecting FILE_SCOPED run
-    that rc=5-REDs. It is left open for two reasons. (i) SOUNDNESS: this branch
-    fires only when there are NO registered module_configs, and the "Fidelity
-    caveat" above is exactly why — the run this function records is not
-    necessarily the run that executes. ``_build_fallback_config`` may rescope a
-    fallback diff into a subproject (``cd <sub> && uv run pytest ...``), which
-    moves pytest's rootdir and therefore which ``addopts`` apply, so a probe
-    reading the ROOT ``pyproject.toml`` here could widen on a config the
-    executed command never sees — an over-fire, the one direction task 3494
-    forbids. (ii) REACH: the module path covers every subproject registered in
-    this repo, so the residual exposure is a project with a marker-partitioned
-    root suite and no ``orchestrator.yaml`` anywhere. Closing it properly needs
-    the executed-config reconciliation :func:`_executed_fallback_plan` performs,
-    which is a different layer than this decision function.
+    MARKER DESELECTION (task 3494's twin, CLOSED by task 3513) is still not
+    wired HERE, and deliberately so — but the gap it left is closed one layer
+    down. The bare-default ``collectable_tests`` branch below has the identical
+    "the path says collectable, pytest collects zero" failure mode whenever the
+    repo root carries an ``addopts = "-m 'not X'"`` and the diff touches only
+    X-marked test files, so this function's own raw return value still reads
+    FILE_SCOPED for exactly that shape.
+
+    WHY NOT HERE: the "Fidelity caveat" above. This branch fires only when
+    there are NO registered module_configs, and the run this function records
+    is not necessarily the run that executes — ``_build_fallback_config`` may
+    rescope a fallback diff into a subproject (``cd <sub> && uv run pytest
+    ...``), which moves pytest's rootdir and therefore which ``addopts`` apply.
+    A probe reading the ROOT ``pyproject.toml`` here could widen on a config
+    the executed command never sees: an over-fire, the one direction task 3494
+    forbids.
+
+    WHERE IT IS CLOSED: :func:`widen_fallback_for_marker_deselection`, called
+    from ``verify.run_scoped_verification``'s fallback branch immediately after
+    ``_build_fallback_config`` + ``_apply_cargo_scope``. By then the rescoping
+    has already happened, so the EXECUTED command's own shape decides and the
+    over-fire above is structurally impossible. It rewrites the ``ModuleConfig``
+    that is about to run (this branch executes the config, not the plan — see
+    the paragraph below), and ``verify._executed_fallback_plan``'s
+    ``pytest_reason`` keyword reconciles the record to match, so what a
+    consumer of ``VerifyResult.plan`` sees is FULL_SUITE even though this
+    function decided FILE_SCOPED.
 
     This caveat describes THIS function's raw return value only. Its caller
     in :func:`run_scoped_verification` reconciles this gap before attaching

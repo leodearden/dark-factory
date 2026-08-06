@@ -15,9 +15,29 @@ SCOPING layer, by widening to the owning module's FULL_SUITE — never by
 softening rc=5 in the classification layer (``verify_classify.py`` carries that
 invariant verbatim and is untouched by this task).
 
+BOTH ARMS (task 3513).  Task 3494 closed only ``_derive_module_runs`` arm 4.
+The twin in ``_derive_fallback_runs`` — the branch that fires when a project
+registers NO module_configs — has the identical failure mode, and dark-factory's
+own root ``pyproject.toml`` carries ``-m 'not smoke'``, so the ingredient is
+present; only this repo's registered module_configs keep the branch unreachable
+here.  It is reachable in other projects dark-factory targets.
+
+The two arms share ONE probe (``verify_plan.deselecting_expression_for_command``)
+so they can never disagree about which commands are refused or where the ini
+file is looked for.  The fallback arm needs one extra layer: that branch hands
+``run_verification`` the ModuleConfig rather than the plan, so the widening is
+applied to the ALREADY-EXECUTED config
+(``verify_plan.widen_fallback_for_marker_deselection``) and the plan record is
+reconciled to match (``verify._executed_fallback_plan``'s ``pytest_reason``).
+Taking the executed config is also what makes the over-fire task 3494's
+docstring feared structurally impossible: by then any subproject rescoping has
+already happened, so the command's own shape decides.
+
 This module unit-tests the pure static detector (``orchestrator.pytest_markers``)
 against synthetic strings, then pins the wired ``derive_verify_plan`` behaviour —
-including the real-config incident golden — at the end.
+including the real-config incident golden — then the shared probe, the fallback
+widener's refusal and positive halves, the plan-record reconciliation, and
+finally the end-to-end pin through ``run_scoped_verification``'s fallback branch.
 """
 from __future__ import annotations
 
@@ -1223,7 +1243,9 @@ class TestExecutedFallbackPlanRecordsTheWidening:
 
     def test_the_pytest_run_records_the_widening(self, tmp_path):
         plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
-        assert _run_for(plan, '__fallback__', 'pytest:').scope_kind is ScopeKind.FILE_SCOPED
+        decided = _run_for(plan, '__fallback__', 'pytest:')
+        assert decided is not None
+        assert decided.scope_kind is ScopeKind.FILE_SCOPED
 
         executed = verify._executed_fallback_plan(
             plan, self._widened_fallback(), pytest_reason=self._WIDENED_REASON,
@@ -1264,7 +1286,9 @@ class TestExecutedFallbackPlanRecordsTheWidening:
     def test_a_skipped_pytest_slot_does_not_crash(self, tmp_path):
         """A source-only diff skips pytest; only the 'pytest:'-prefixed run may move."""
         plan = self._decision_plan(['src/mod.py'], tmp_path)
-        assert _run_for(plan, '__fallback__', 'pytest:').scope_kind is ScopeKind.SKIPPED
+        decided = _run_for(plan, '__fallback__', 'pytest:')
+        assert decided is not None
+        assert decided.scope_kind is ScopeKind.SKIPPED
 
         executed = verify._executed_fallback_plan(
             plan,

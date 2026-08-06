@@ -6833,6 +6833,28 @@ async def run_scoped_verification(
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
+                # MARKER DESELECTION (task 3513, the task-3494 twin): widen a
+                # file-scoped pytest command whose every target is provably
+                # deselected by the effective `-m`, BEFORE it executes. It must
+                # happen here and not in _derive_fallback_runs: that pure
+                # decision function cannot see the subproject rescoping
+                # _build_fallback_config performs, whereas `fallback` IS the
+                # rescoped result — so the command's own shape decides. One
+                # reader serves both this probe and the plan derivation below.
+                fallback_reader = _worktree_reader(worktree)
+                fallback, fallback_pytest_reason = (
+                    verify_plan.widen_fallback_for_marker_deselection(
+                        fallback, fallback_reader,
+                    )
+                )
+                if fallback_pytest_reason is not None:
+                    # Loud over silent: this is DEGRADATION (the widened run
+                    # applies the same addopts, so the trigger files stay
+                    # deselected and unrun), not a free coverage upgrade.
+                    logger.warning(
+                        'Fallback pytest widened to %r — %s',
+                        fallback.test_command, fallback_pytest_reason,
+                    )
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
                 # Plan-authoritative execution (task κ,
                 # verify-scope-inversion-prd.md): derive_verify_plan's
@@ -6854,8 +6876,9 @@ async def run_scoped_verification(
                 # the _build_fallback_config call site) — unchanged from
                 # before this task.
                 plan_dict = _safe_derive_verify_plan_dict(
-                    existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                    existing_files, module_configs, config, fallback_reader, role=role,
                     executed_fallback=fallback,
+                    fallback_pytest_reason=fallback_pytest_reason,
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
