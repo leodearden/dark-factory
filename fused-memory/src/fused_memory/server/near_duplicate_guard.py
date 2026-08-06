@@ -249,6 +249,13 @@ def build_topic_cluster_block(
     two guards' agent-facing diagnostics stay cleanly separable. Uses the
     matched cluster's ``hint`` when set, else the module default
     (:data:`_TOPIC_CLUSTER_DEFAULT_HINT`).
+
+    ``matched_phrases`` may contain FEWER entries than the matched cluster's
+    ``min_phrase_hits`` -- that is a correct sufficient-phrase block, not a
+    guard bug. :func:`find_matching_topic_cluster` also qualifies a cluster on
+    a single phrase declared in its ``sufficient_phrases`` (task 3054), and
+    this field then reports exactly the one phrase that fired, which is what
+    makes the routing unambiguous.
     """
     return {
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',

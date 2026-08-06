@@ -483,13 +483,25 @@ class ProceduralTopicCluster(BaseModel):
     """One known-contradictory procedural_knowledge topic for the write-time topic guard.
 
     A cluster is matched deterministically: an incoming ``procedural_knowledge``
-    add_memory write whose (lowercased) content contains at least
-    ``min_phrase_hits`` DISTINCT ``phrases`` is soft-blocked, routing the writer
+    add_memory write is soft-blocked when its (lowercased) content contains
+    EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``, OR any single
+    phrase listed in ``sufficient_phrases``. A blocked write routes the writer
     to consolidate/update the existing entries or add context to the human gate
     task named in ``hint`` -- instead of accumulating another paraphrased,
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
     (task 2845). ``extra='forbid'`` so a mistyped cluster key fails loud at config
     load/reload, never silently matches nothing.
+
+    The ``sufficient_phrases`` arm (task 3054) exists because hits do NOT
+    aggregate across clusters: a write touching one distinctive phrase in each
+    of several clusters reached no cluster's ``min_phrase_hits`` and was blocked
+    by none, even though each phrase unambiguously identified its own topic.
+    Declaring a phrase sufficient is reserved for identifier-shaped names that
+    cannot appear incidentally -- a generic token promoted this way would turn
+    every passing mention into a false block. It is validated as a
+    case-insensitive SUBSET of ``phrases`` and fails loud at config load for the
+    same reason ``extra='forbid'`` does: the matcher only tests ``phrases``, so
+    a stray entry could never fire.
 
     ``topic_id`` shares ONE namespace with the ``metadata.topic`` memory
     vocabulary key (PRD ``docs/prds/memory-metadata-vocabulary.md`` D4):
@@ -634,6 +646,15 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     gate 3342 -- the first cluster whose corpus spans BOTH
     ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
     entries), which is how it grew uncaught.
+
+    Task 3054 then made per-phrase distinctiveness expressible: the
+    report_task_already_done cluster declares its two identifier-shaped
+    phrases ``sufficient_phrases``, so either qualifies that cluster ALONE.
+    Before that, a write naming one distinctive phrase from each of three
+    clusters reached no cluster's ``min_phrase_hits`` and was blocked by none.
+    The same task extended the plan-revalidation cluster with the warm-lane
+    reseed sub-case's vocabulary, which is caught at the ordinary 2-hit bar.
+
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -1447,10 +1468,13 @@ class ReconciliationConfig(BaseModel):
         description=(
             'Known-contradictory procedural_knowledge topic clusters. An add_memory '
             "write whose content contains >= a cluster's min_phrase_hits distinct "
-            'phrases is soft-blocked (error_type='
-            'ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE the cosine '
-            'near-dup search. Seeded with the two known eval-worktree clusters '
-            '(gates 2841/2844); an empty list disables the topic guard. Green-tier '
+            "phrases -- OR any single one of that cluster's sufficient_phrases, for "
+            'phrases distinctive enough to qualify alone -- is soft-blocked '
+            '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
+            'the cosine near-dup search. Seeded with the two known eval-worktree '
+            'clusters (gates 2841/2844); an empty list disables the topic guard. '
+            'A sufficient_phrases entry absent from that cluster\'s phrases is '
+            'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
             'by resolve_topic_guard_clusters in server/near_duplicate_guard.py). '
             'Shares the procedural_knowledge_near_dup_guard_enabled kill-switch and '
