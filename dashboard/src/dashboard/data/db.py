@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 
+# How long :meth:`DbPool.close_all` waits for in-flight ``aiosqlite.connect()``
+# calls to land before giving up on them and reporting them.  BOUNDED on
+# purpose: an unbounded wait would let one wedged sqlite open hang application
+# shutdown forever — the exact failure mode ``_probe_db`` (dashboard/app.py)
+# was written to avoid — and would convert a leak into a hang inside pytest
+# teardown.  Stragglers are reported LOUDLY instead (see close_all).
+_INFLIGHT_DRAIN_TIMEOUT = 5.0
+
 
 class DbPool:
     """Lazy-open pool of read-only aiosqlite connections.
@@ -51,11 +59,29 @@ class DbPool:
     **Guardrail**: any future caller that passes per-run or otherwise-unbounded
     paths to :meth:`get` MUST revisit lock eviction with a refcount-gated
     scheme, because naive per-path deletion is not safe under concurrent access.
+
+    **Ownership invariant: the pool owns every connection it causes to exist,
+    including ones still being opened.**
+    ``aiosqlite.Connection.__await__`` starts its worker thread BEFORE the
+    connect completes, so between ``aiosqlite.connect(...)`` and the value
+    landing in ``_conns`` there is a live OS thread that ``close_all()`` cannot
+    see.  A caller cancelled in that window (``lifespan()`` cancelling
+    ``_metrics_loop`` at shutdown; ``_probe_db`` abandoning a /healthz probe on
+    its deadline) would strand that thread permanently — and DbPool connects
+    via plain ``aiosqlite.connect``, whose thread is NOT a daemon, so a
+    stranded one also blocks process exit.  Every in-flight connect is
+    therefore run in its own task tracked in ``_inflight``, awaited under
+    :func:`asyncio.shield` so a cancelled caller does not cancel the connect
+    itself, and drained by :meth:`close_all` before it returns.
     """
 
     def __init__(self) -> None:
         self._conns: dict[Path, aiosqlite.Connection] = {}
         self._closed: bool = False
+        # In-flight aiosqlite.connect() tasks -> the path each is opening.
+        # Populated by get() before it awaits, cleared by each task's own
+        # done-callback.  See the ownership invariant in the class docstring.
+        self._inflight: dict[asyncio.Task, Path] = {}
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
         # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
@@ -98,11 +124,30 @@ class DbPool:
             try:
                 if not resolved.exists():
                     return None
+
                 # as_uri() yields the correctly percent-encoded file: URI (stdlib, POSIX/Windows-aware).
-                conn = await aiosqlite.connect(
-                    f'{resolved.as_uri()}?mode=ro',
-                    uri=True,
-                )
+                async def _do_connect() -> aiosqlite.Connection:
+                    # Awaiting INSIDE an `async def` (rather than
+                    # asyncio.ensure_future(aiosqlite.connect(...))) is
+                    # load-bearing: the real aiosqlite.connect() returns an
+                    # awaitable Connection, not a coroutine, while the test
+                    # suite patches it with an `async def` wrapper that returns
+                    # a coroutine.  `await` handles both shapes identically.
+                    return await aiosqlite.connect(
+                        f'{resolved.as_uri()}?mode=ro',
+                        uri=True,
+                    )
+
+                task = asyncio.create_task(_do_connect())
+                self._inflight[task] = resolved
+                task.add_done_callback(self._forget_inflight)
+                # shield(), not a bare `await task`: a bare await propagates
+                # THIS caller's cancellation into the connect task, and
+                # cancelling an in-flight aiosqlite connect is not a fix —
+                # it leaves the same half-built Connection with a live worker
+                # thread, just reached by a different route.  shield() lets the
+                # connect run to completion so the pool can actually close it.
+                conn = await asyncio.shield(task)
                 # (b) Post-connect re-check: close_all() may have completed while
                 # we were suspended inside aiosqlite.connect() above.
                 if self._closed:
@@ -118,10 +163,65 @@ class DbPool:
                 logger.warning('DbPool: cannot open %s', resolved, exc_info=True)
                 return None
 
+    def _forget_inflight(self, task: asyncio.Task) -> None:
+        """Drop a finished connect task from ``_inflight``.
+
+        Also consumes the task's exception so asyncio does not log "exception
+        was never retrieved" for a connect whose only awaiter was cancelled
+        before the shield could re-raise it.  Mirrors ``_discard_abandoned_probe``
+        in dashboard/app.py.  Consuming it here does NOT hide it from
+        :meth:`get`: retrieving an exception only clears the never-retrieved
+        warning flag; the shield's own callback still copies it to the awaiting
+        future, which lands in get()'s ``except`` funnel.
+        """
+        self._inflight.pop(task, None)
+        if not task.cancelled():
+            task.exception()
+
     @property
     def open_count(self) -> int:
         """Number of currently held connections."""
         return len(self._conns)
+
+    @property
+    def inflight_count(self) -> int:
+        """Number of ``aiosqlite.connect()`` calls currently in flight."""
+        return len(self._inflight)
+
+    async def _drain_inflight(self) -> None:
+        """Wait out in-flight connects and close whatever landed.
+
+        Runs while the event loop is STILL RUNNING — that is the whole point.
+        aiosqlite's worker thread signals completion with
+        ``future.get_loop().call_soon_threadsafe(...)``; once the owning loop is
+        closed that call raises ``RuntimeError: Event loop is closed`` OUT of
+        ``_connection_worker_thread``, the thread never reaches its STOP
+        sentinel, and the escaped exception gets attributed to whatever
+        unrelated code happens to be running.  Closing here, before shutdown
+        returns, is what lets those threads exit cleanly.
+        """
+        # Snapshot the mapping, not just the keys: each task's own done-callback
+        # pops it from _inflight, so the paths would be gone by the time we
+        # want to report on them.
+        inflight = dict(self._inflight)
+        if not inflight:
+            return
+        done, _still_pending = await asyncio.wait(
+            set(inflight), timeout=_INFLIGHT_DRAIN_TIMEOUT
+        )
+        for task in done:
+            if task.cancelled() or task.exception() is not None:
+                # A connect that raised already stopped its own worker thread
+                # (aiosqlite's _connect catches BaseException and calls stop()).
+                continue
+            try:
+                await task.result().close()
+            except Exception:
+                logger.debug(
+                    'DbPool: error closing in-flight connection for %s',
+                    inflight.get(task),
+                    exc_info=True,
+                )
 
     async def close_all(self) -> None:
         """Close every managed connection and clear the pool."""
@@ -129,6 +229,9 @@ class DbPool:
         # lock after we clear _conns will see _closed=True and return None rather
         # than re-populating a pool that is supposed to be drained.
         self._closed = True
+        # Drain in-flight connects FIRST: a connection still being opened is not
+        # in _conns yet, so the loop below cannot reap it.
+        await self._drain_inflight()
         for conn in self._conns.values():
             try:
                 await conn.close()
