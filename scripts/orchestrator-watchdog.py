@@ -891,6 +891,69 @@ def _within_fleet_deploy_min_interval() -> bool:
     return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
 
 
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """Atomically write *payload* as JSON to *path*, creating its parent dir.
+
+    The shared write primitive behind every piece of persisted watchdog state
+    (fm deploy clock, fm liveness streak, fm liveness restart clock) — extracted
+    in task 3764 so the mkdir/mktemp/write/rename dance is defined ONCE rather
+    than copy-pasted per state file. Python analogue of
+    restart-all-orchestrators.sh's stamp_fleet_deploy_clock: mkdir -p, mktemp a
+    sibling in the SAME directory (so os.replace is a same-filesystem atomic
+    rename), write, rename over the target.
+
+    Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
+    (the temp file, if created, is unlinked) rather than raised. A persistence
+    hiccup must never crash the Type=oneshot watchdog or abort the rest of the
+    tick. Every caller's contract must therefore tolerate the write silently
+    not having happened — see _record_fm_liveness_failure, where a failed write
+    means the streak counter cannot accumulate and so fails SAFE (toward never
+    restarting).
+    """
+    tmp_path: str | None = None
+    try:
+        target_dir = os.path.dirname(path)
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="." + os.path.basename(path) + ".", dir=target_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+        os.replace(tmp_path, path)
+        tmp_path = None  # renamed away — nothing to clean up
+    except Exception as exc:  # noqa: BLE001
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        log(f"_atomic_write_json: failed to write {path}: {exc!r}")
+
+
+def _read_json_state(path: str) -> dict | None:
+    """Return the parsed JSON dict at *path*, or None if it cannot be read.
+
+    The shared fail-open read primitive paired with _atomic_write_json
+    (task 3764). Returns None — never raises — when the file is missing,
+    corrupt, truncated (a torn concurrent write), or unreadable.
+
+    A MISSING file is the normal "no state yet" case (fresh checkout, never
+    stamped, streak just cleared) and is deliberately SILENT: logging it would
+    spam the journal on every 60s tick. Corrupt/unreadable files ARE logged —
+    those are genuine degradations, and swallowing them silently is exactly the
+    silent-degradation failure mode the project's norms forbid.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else None
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"ignoring unreadable/corrupt watchdog state at {path}: {exc!r}")
+        return None
+
+
 def _read_last_fm_deploy_epoch() -> float | None:
     """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
 
@@ -904,17 +967,21 @@ def _read_last_fm_deploy_epoch() -> float | None:
     when it is corrupt, unreadable, or missing its ``ts`` key. Callers must
     treat None as "the min-interval cap does not apply" (fail toward running
     the backstop, not toward silence).
+
+    Thin wrapper over the shared _read_json_state helper (task 3764), which
+    owns the missing/corrupt/unreadable fail-open branches; only the ``ts``
+    extraction is fm-deploy-specific. Reads FM_DEPLOY_CLOCK_PATH at CALL time,
+    not at def time, so tests that monkeypatch the module global still work.
     """
-    try:
-        with open(FM_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
-        return float(raw["ts"])
-    except FileNotFoundError:
+    state = _read_json_state(FM_DEPLOY_CLOCK_PATH)
+    if state is None:
         return None
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+    try:
+        return float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
         log(
-            f"ignoring unreadable/corrupt fm-deploy clock at "
-            f"{FM_DEPLOY_CLOCK_PATH}: {exc!r}"
+            f"ignoring fm-deploy clock at {FM_DEPLOY_CLOCK_PATH} "
+            f"with unusable 'ts': {exc!r}"
         )
         return None
 
@@ -951,33 +1018,24 @@ def _stamp_fm_deploy_clock() -> None:
     restart can never silence the backstop).
 
     Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
-    (the temp file, if created, is unlinked) rather than raised — a stamp
-    failure must not crash the detached unit. The backstop still self-heals via
-    ActiveEnterTimestamp next tick, so the clock is only a secondary flap-guard.
+    by _atomic_write_json (the temp file, if created, is unlinked) rather than
+    raised — a stamp failure must not crash the detached unit. The backstop
+    still self-heals via ActiveEnterTimestamp next tick, so the clock is only a
+    secondary flap-guard.
+
+    Thin wrapper over the shared _atomic_write_json helper (task 3764): this
+    function owns only the ``{ts, iso}`` payload schema. Reads
+    FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work.
     """
-    tmp_path: str | None = None
-    try:
-        clock_dir = os.path.dirname(FM_DEPLOY_CLOCK_PATH)
-        os.makedirs(clock_dir, exist_ok=True)
-        now = time.time()
-        payload = json.dumps(
-            {
-                "ts": int(now),
-                "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
-            }
-        )
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".last_redeploy_fused_memory.", dir=clock_dir
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload + "\n")
-        os.replace(tmp_path, FM_DEPLOY_CLOCK_PATH)
-        tmp_path = None  # renamed away — nothing to clean up
-    except Exception as exc:  # noqa: BLE001
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-        log(f"_stamp_fm_deploy_clock: failed to stamp {FM_DEPLOY_CLOCK_PATH}: {exc!r}")
+    now = time.time()
+    _atomic_write_json(
+        FM_DEPLOY_CLOCK_PATH,
+        {
+            "ts": int(now),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
 
 
 def main() -> None:
