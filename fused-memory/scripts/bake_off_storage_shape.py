@@ -1820,6 +1820,14 @@ DECISION_TABLE_COLUMNS: tuple[str, ...] = (
     'claim recall@5',
     'claim recall@10',
     'canonical in top-5',
+    # The same question, asked of the RAW store hits.  The column above is
+    # measured over the read window, so under `b_grouped` it credits the
+    # synthesised grouped document — which wears the canonical's `record_id`
+    # — for any child hit that folded upward.  This one asks only whether the
+    # canonical's own stored record ranked.  Adjacent on purpose: the gap
+    # between the two IS the read transform's contribution, and a qualifier
+    # placed anywhere else is not a qualifier on this number.
+    'canonical in top-5 (stored)',
     'median canonical rank',
     'tokens/query',
     'guard candidate present',
@@ -2142,6 +2150,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             _cell(measurement['claim_recall']['at_5']),
             _cell(measurement['claim_recall']['at_10']),
             _cell(measurement['discoverability']['canonical_in_top_5_rate']),
+            _cell(measurement['discoverability'][
+                'stored_canonical_in_top_5_rate']),
             _rank_cell(measurement['discoverability']),
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
@@ -2210,8 +2220,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         'than recall of the derivation input.',
         '',
         '| arm | kind | queries | claim recall@5 | claim recall@10 | '
-        'canonical in top-5 | median canonical rank |',
-        '| --- | --- | --- | --- | --- | --- | --- |',
+        'canonical in top-5 | canonical in top-5 (stored) | '
+        'median canonical rank |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- |',
     ]
 
     for arm in ARM_VARIANTS:
@@ -2225,6 +2236,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                 _cell(subset['claim_recall']['at_5']),
                 _cell(subset['claim_recall']['at_10']),
                 _cell(subset['discoverability']['canonical_in_top_5_rate']),
+                # Per subset, from the subset's own block — `held_out` is the
+                # row that measures generalisation, and it is exactly the row
+                # where a transform-credited rate is least safe to read alone.
+                _cell(subset['discoverability'][
+                    'stored_canonical_in_top_5_rate']),
                 _rank_cell(subset['discoverability']),
             ]) + ' |')
 
