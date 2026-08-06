@@ -684,3 +684,74 @@ def test_metrics_loop_cancelled_mid_connect_reports_no_unhandled_thread_exceptio
         f'to be running. DbPool.close_all() must close every connection it '
         f'caused to be opened while the loop is still alive.'
     )
+
+
+@pytest.mark.asyncio
+async def test_nested_lifespan_closes_the_stores_it_opened(tmp_path: Path, monkeypatch):
+    """Overlapping lifespans over one ``app`` must each close their OWN handles.
+
+    ``app.state`` is a single mutable namespace on the ``FastAPI`` instance, so
+    a second lifespan over the same ``app`` overwrites ``burndown_store`` /
+    ``metrics_store`` / ``db`` / ``http_client``.  A shutdown that read those
+    back from ``app.state`` therefore closed the INNER lifespan's (already
+    closed) handles — a silent no-op — and stranded the OUTER's two writable
+    WAL connections and its ``DbPool``.
+
+    This is not hypothetical: it is the second, independent source of the
+    roaming ``PytestUnhandledThreadExceptionWarning`` this task exists to
+    remove, measured in the full dashboard suite.  ~15 module-scoped
+    ``TestClient(app)`` fixtures coexist with the function-scoped ``client``
+    fixture in ``tests/conftest.py``, and starlette runs a full lifespan per
+    ``TestClient`` context — so every such module leaked exactly two writable
+    connections, which ``aiosqlite.Connection.__del__`` later finalised against
+    a closed loop.
+
+    Deliberately structural rather than ordering-dependent: it nests the two
+    lifespans directly, so it fails for the same reason the suite did without
+    depending on which fixtures happen to overlap.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+
+    shared_app = FastAPI(lifespan=lifespan)
+    with (
+        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+    ):
+        async with lifespan(shared_app):
+            outer = (
+                shared_app.state.burndown_store,
+                shared_app.state.metrics_store,
+                shared_app.state.db,
+            )
+            outer_http = shared_app.state.http_client
+            # The inner lifespan clobbers every one of those app.state slots.
+            async with lifespan(shared_app):
+                inner = (
+                    shared_app.state.burndown_store,
+                    shared_app.state.metrics_store,
+                    shared_app.state.db,
+                )
+                assert all(o is not i for o, i in zip(outer, inner, strict=True)), (
+                    'the nested lifespan reused the outer objects — this test no '
+                    'longer reproduces the app.state clobber it exists to pin'
+                )
+            # Inner shutdown has run; app.state still holds the inner handles.
+
+    outer_burndown, outer_metrics, outer_pool = outer
+    for store, name in ((outer_burndown, 'burndown'), (outer_metrics, 'metrics')):
+        assert store._conn is None, (
+            f'the outer lifespan did not close its own {name} store — it closed '
+            f'whatever app.state pointed at (the inner lifespan\'s, already '
+            f'closed). Its writable WAL connection is stranded, and '
+            f'aiosqlite.Connection.__del__ will queue work onto this now-dead '
+            f'loop and raise "Event loop is closed" out of '
+            f'_connection_worker_thread.'
+        )
+    assert outer_pool._closed, (
+        'the outer lifespan did not close its own DbPool — close_all() ran '
+        'against the inner lifespan\'s pool instead'
+    )
+    assert outer_http.is_closed, (
+        'the outer lifespan did not close its own httpx client — aclose() ran '
+        "against the inner lifespan's client instead"
+    )

@@ -332,10 +332,30 @@ async def _metrics_loop(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage shared resources: HTTP client, DB connection pool."""
-    app.state.http_client = httpx.AsyncClient(follow_redirects=True)
+    """Manage shared resources: HTTP client, DB connection pool.
+
+    **Shutdown closes the objects THIS lifespan opened, held in locals — never
+    whatever ``app.state`` happens to point at by then** (task 3466).
+    ``app.state`` is a single mutable namespace on the ``FastAPI`` instance, so
+    two overlapping lifespans over one ``app`` (which the dashboard test suite
+    does routinely: ~15 module-scoped ``TestClient(app)`` fixtures coexist with
+    the function-scoped ``client`` fixture in ``tests/conftest.py``, and
+    starlette runs a full lifespan per ``TestClient`` context) leave the inner
+    one's handles installed.  Reading them back at shutdown made the OUTER
+    lifespan close the INNER's already-closed stores — a silent no-op — and
+    strand its own two writable WAL connections plus its ``DbPool``.  Each
+    stranded ``aiosqlite.Connection`` is later finalised by ``__del__``, whose
+    ``stop()`` queues work onto a loop that has since closed, so
+    ``RuntimeError: Event loop is closed`` escapes ``_connection_worker_thread``
+    and pytest blames whichever unrelated test is running at that instant.
+    ``app.state`` stays assigned for request handlers and for tests that swap
+    ``app.state.config``; it is simply not the shutdown path's source of truth.
+    """
+    http_client = httpx.AsyncClient(follow_redirects=True)
+    app.state.http_client = http_client
     app.state.config = DashboardConfig.from_env()
-    app.state.db = DbPool()
+    pool = DbPool()
+    app.state.db = pool
     app.state.start_time = time.monotonic()
 
     # Burndown snapshot collector (writable WAL connection with full durability triad).
@@ -347,7 +367,7 @@ async def lifespan(app: FastAPI):
         _burndown_loop(
             burndown_store,
             app.state.config,
-            app.state.http_client,
+            http_client,
         )
     )
 
@@ -366,10 +386,10 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await app.state.burndown_store.close()
-    await app.state.metrics_store.close()
-    await app.state.db.close_all()
-    await app.state.http_client.aclose()
+    await burndown_store.close()
+    await metrics_store.close()
+    await pool.close_all()
+    await http_client.aclose()
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
