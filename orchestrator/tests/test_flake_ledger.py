@@ -1024,3 +1024,82 @@ class TestResolveDebt:
         assert raw['prior_resolving_commit'] == 'c0ffee'
         # Resolving does not re-enter: only `open_debt` opens a cycle.
         assert raw['open_count'] == 1
+
+
+@pytest.mark.asyncio
+class TestDebtReEntry:
+    """α's single-row invariant: re-entry after a resolution UPDATEs the one row rather
+    than inserting a second.  ASYNC-ONLY CLASS.
+
+    This is what makes η's recurrence trigger a primary-key lookup rather than a scan,
+    and what supplies its evidence (``prior_resolved_at``, ``prior_resolving_commit``).
+    """
+
+    T0 = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
+    T1 = datetime(2026, 8, 6, 11, 0, tzinfo=UTC)
+    T2 = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    T3 = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    T4 = datetime(2026, 8, 6, 14, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def _cycle(self, db_path: Path, resolved_at, commit, reopened_at):
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit=commit, now=resolved_at
+        )
+        return await open_debt(db_path, 'dark_factory', self.TEST_ID, now=reopened_at)
+
+    async def test_second_cycle_updates_the_single_row(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.T0)
+        row = await self._cycle(db_path, self.T1, 'c0ffee', self.T2)
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 1
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['open_count'] == 2
+        assert raw['resolved_at'] is None  # open again
+        # η's recurrence evidence: the previous cycle's close, carried forward.
+        assert raw['prior_resolved_at'] == self.T1.isoformat()
+        # Preserved UNTOUCHED across the re-open — §5.6 class 2(a) cites it VERBATIM
+        # in the regressed_after_resolution L2.
+        assert raw['prior_resolving_commit'] == 'c0ffee'
+        # The NEW cycle's clock, so θ's age backstop measures the current cycle rather
+        # than the original one.
+        assert raw['opened_at'] == self.T2.isoformat()
+        assert raw['last_occurrence_at'] == self.T2.isoformat()
+        assert raw['test_id'] == self.TEST_ID
+        assert raw['project_id'] == 'dark_factory'
+
+        assert row is not None
+        assert row.open_count == 2
+        assert row.resolved_at is None
+        assert row.prior_resolved_at == self.T1.isoformat()
+        assert row.prior_resolving_commit == 'c0ffee'
+        assert row.opened_at == self.T2.isoformat()
+
+    async def test_third_cycle_tracks_the_most_recent_closed_cycle(self, tmp_path: Path) -> None:
+        """The prior-cycle fields always describe the MOST RECENT closed cycle, not the
+        first one."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.T0)
+        await self._cycle(db_path, self.T1, 'c0ffee', self.T2)
+        row = await self._cycle(db_path, self.T3, 'f00d', self.T4)
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 1
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['open_count'] == 3
+        assert raw['resolved_at'] is None
+        assert raw['prior_resolved_at'] == self.T3.isoformat()
+        assert raw['prior_resolving_commit'] == 'f00d'
+        assert raw['opened_at'] == self.T4.isoformat()
+
+        assert row is not None
+        assert row.open_count == 3
+        assert row.prior_resolved_at == self.T3.isoformat()
+        assert row.prior_resolving_commit == 'f00d'
+        assert row.opened_at == self.T4.isoformat()
