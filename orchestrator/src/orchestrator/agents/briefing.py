@@ -53,6 +53,51 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
     return '\n'.join(lines)
 
 
+def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[str, int]:
+    """Drop cross-project results from a fused-memory ``search`` JSON payload.
+
+    ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
+    FastMCP returns as the ``search`` tool's text block (see
+    :meth:`BriefingAssembler._mcp_search`). Each result's project tag is read
+    from ``entry['metadata']['project_id']``; the entry is dropped when a tag
+    is present and differs from ``project_id``, and kept otherwise —
+    including when ``metadata`` is missing, empty, or not a dict.
+
+    Untagged results are deliberately kept rather than dropped: every
+    Graphiti-sourced result has ``metadata == {}`` today (verified at
+    ``fused-memory/src/fused_memory/services/memory_service.py:3332-3407``,
+    ``_search_graphiti``, which only ever adds a ``planned`` key), so
+    dropping untagged results would empty the ``# Context`` block for most
+    queries. Only Mem0-sourced results can carry a project tag today.
+
+    Returns the re-serialised payload — sibling top-level keys such as
+    ``degraded``/``failed_stores``/``failed_store_diagnostics`` are preserved
+    verbatim — and the number of results dropped. Returns ``('', dropped)``
+    when nothing survives, so the existing ``if section:`` guards in
+    ``_get_memory_context`` skip an all-foreign section the same way they
+    skip an empty one.
+    """
+    payload = json.loads(payload_text)
+    results = payload['results']
+
+    kept = []
+    dropped = 0
+    for entry in results:
+        metadata = entry.get('metadata')
+        tag = metadata.get('project_id') if isinstance(metadata, dict) else None
+        if tag and tag != project_id:
+            dropped += 1
+            continue
+        kept.append(entry)
+
+    if not kept:
+        return '', dropped
+
+    payload = dict(payload)
+    payload['results'] = kept
+    return json.dumps(payload, indent=2), dropped
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
