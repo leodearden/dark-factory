@@ -3021,6 +3021,7 @@ def _architect_result(
     config_name: str = 'architect-sonnet-high',
     plan_quality: float = 0.75,
     plan_steps: int = 6,
+    judged_without_reference: bool = False,
 ):
     """An architect cell that DID produce a plan.
 
@@ -3028,19 +3029,27 @@ def _architect_result(
     over the steps a plan actually carried, and ``plan_steps > 0`` is the
     predicate the report layer reads to know one exists. A stepless cell is the
     distinct no-plan shape, requested explicitly by the tests that exercise it.
+
+    ``judged_without_reference`` (task 3628) mints a cell whose score came from
+    a judge handed an EMPTY reference diff. Note the DEFAULT omits the key
+    entirely, so the default cell doubles as the legacy-metrics shape.
     """
     from orchestrator.evals.runner import EvalResult
+
+    metrics = {
+        'role_under_test': 'architect',
+        'plan_quality': plan_quality,
+        'plan_steps': plan_steps,
+        'composite_score': 0.0,
+    }
+    if judged_without_reference:
+        metrics['judged_without_reference'] = True
 
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
         outcome='done',
-        metrics={
-            'role_under_test': 'architect',
-            'plan_quality': plan_quality,
-            'plan_steps': plan_steps,
-            'composite_score': 0.0,
-        },
+        metrics=metrics,
         worktree_path='/tmp/wt-arch',
     )
 
@@ -3212,6 +3221,104 @@ class TestPlanQualityReport:
             _cap_tainted_result(task_id='t3', config_name='b'),
         ])
         assert report['cap_excluded'] == 2
+
+    # -- judged_without_reference (task 3628) --------------------------------
+    #
+    # The θ-surface twin of cap_excluded, with one decisive difference: it
+    # BOUNDS validity rather than excluding. The flagged cell stays in `n` and
+    # in `mean_plan_quality` at its real score.
+
+    def test_rows_carry_judged_without_reference_defaulting_false(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', judged_without_reference=True),
+            _architect_result(task_id='t2'),
+        ])
+        by_task = {r['task_id']: r for r in report['rows']}
+
+        assert by_task['t1']['judged_without_reference'] is True
+        # A metrics dict predating the field reads back default-safe.
+        assert by_task['t2']['judged_without_reference'] is False
+
+    def test_per_config_count_bounds_but_does_not_exclude(self):
+        """The flagged cells are COUNTED yet still averaged in.
+
+        The single most likely misimplementation is to treat this like
+        cap_excluded and drop the cell from the pool. It is not an exclusion:
+        the score is real, only the confidence in it is reduced. Pinned by
+        asserting the mean is over all THREE cells, not just the healthy one.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, plan_quality=0.9,
+                judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, plan_quality=0.6,
+                judged_without_reference=True,
+            ),
+            _architect_result(task_id='t3', config_name=cfg, plan_quality=0.3),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] == 2
+        assert agg['n'] == 3
+        assert agg['mean_plan_quality'] == 0.6  # (0.9 + 0.6 + 0.3) / 3
+
+    def test_cap_tainted_cell_is_not_counted_as_judged_blind(self):
+        """Disjoint from cap_excluded: the θ count is scoped to the ADMITTED pool.
+
+        A cap-tainted cell has no plan_quality to bound, so even carrying the
+        flag it must land in cap_excluded ALONE — exactly how `no_plan` is
+        scoped on this surface.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        capped = _cap_tainted_result(task_id='t2', config_name=cfg)
+        capped.metrics['judged_without_reference'] = True
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name=cfg, plan_quality=0.9),
+            capped,
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['cap_excluded'] == 1
+        assert agg['judged_without_reference'] == 0
+
+    def test_report_level_judged_without_reference_total(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name='a', judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name='b', judged_without_reference=True,
+            ),
+            _architect_result(task_id='t3', config_name='b'),
+        ])
+        assert report['judged_without_reference'] == 2
+        assert sum(
+            c['judged_without_reference'] for c in report['configs']
+        ) == report['judged_without_reference']
+
+    def test_non_architect_rows_are_not_counted(self):
+        """Architect-scoped, like every other count on this surface."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        impl = _implementer_result(task_id='t2', config_name='opus-high')
+        impl.metrics['judged_without_reference'] = True
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name='a'), impl,
+        ])
+        assert report['judged_without_reference'] == 0
 
     def test_exclusions_are_broken_out_by_cause(self):
         # The causes are NOT interchangeable: a cap hit is transient and
