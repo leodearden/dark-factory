@@ -14,6 +14,7 @@ mixed-colour (sync writer/readers, async debt functions); the split is structura
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1103,3 +1104,114 @@ class TestDebtReEntry:
         assert row.prior_resolved_at == self.T3.isoformat()
         assert row.prior_resolving_commit == 'f00d'
         assert row.opened_at == self.T4.isoformat()
+
+
+def _blocked_path(tmp_path: Path) -> Path:
+    """A db_path whose parent DIRECTORY cannot be created — a FILE sits where the
+    directory must go, so ``mkdir(parents=True)`` raises.  Portable: no chmod, no root
+    dependency, works the same for an unprivileged CI user."""
+    (tmp_path / 'blocker').write_text('x')
+    return tmp_path / 'blocker' / 'runs.db'
+
+
+def _corrupt_path(tmp_path: Path) -> Path:
+    """A db_path that exists but is not a SQLite database — the sqlite3.DatabaseError
+    path, so the contract is not tied to one exception type."""
+    db_path = tmp_path / 'runs.db'
+    db_path.write_bytes(b'not a database')
+    return db_path
+
+
+_FAULTS = [_blocked_path, _corrupt_path]
+
+
+def _assert_logged_loudly(caplog) -> None:
+    """B12's second half: the failure is LOUD, not a silent fail-soft.  ``exc_info`` is
+    required — a bare message without the traceback is not a diagnosable report."""
+    records = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+    assert records, 'expected at least one warning on orchestrator.flake_ledger'
+    assert any(r.levelno == logging.WARNING for r in records)
+    assert all(r.exc_info is not None for r in records)
+
+
+@pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
+class TestNeverRaisesSync:
+    """Boundary row B12, applied uniformly to every SYNC entry point: a ledger failure
+    must never fail a verify or a merge.
+
+    The merge path has no ``VerifyInfraError`` handler, so an uncaught raise here does
+    not degrade one merge — it stalls the queue.  Each entry point must return its
+    honest-degrade value AND log loudly.
+    """
+
+    def test_ensure_schema(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import ensure_schema
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert ensure_schema(make_path(tmp_path)) is None
+        _assert_logged_loudly(caplog)
+
+    def test_record_flake_occurrence(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert (
+                record_flake_occurrence(
+                    make_path(tmp_path),
+                    'dark_factory',
+                    _suppression(),
+                    merge_sha=None,
+                    task_id=None,
+                )
+                is None
+            )
+        _assert_logged_loudly(caplog)
+
+    def test_read_occurrences(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_occurrences(make_path(tmp_path)) == []
+        _assert_logged_loudly(caplog)
+
+    def test_read_debt(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import read_debt
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_debt(make_path(tmp_path), 'tests/test_a.py::test_one') is None
+        _assert_logged_loudly(caplog)
+
+    def test_list_open_debt(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import list_open_debt
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert list_open_debt(make_path(tmp_path)) == []
+        _assert_logged_loudly(caplog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
+class TestNeverRaisesAsync:
+    """Boundary row B12 for the ASYNC entry points.  ASYNC-ONLY CLASS."""
+
+    async def test_open_debt(self, tmp_path: Path, caplog, make_path) -> None:
+        """``open_debt`` degrading to ``None`` is precisely why α returns
+        ``DebtRow | None`` rather than §8.3's literal ``DebtRow``: it cannot both
+        refuse to raise and produce a row when the DB is unwritable."""
+        from orchestrator.flake_ledger import open_debt
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert await open_debt(make_path(tmp_path), 'dark_factory', 'a::t') is None
+        _assert_logged_loudly(caplog)
+
+    async def test_resolve_debt(self, tmp_path: Path, caplog, make_path) -> None:
+        from orchestrator.flake_ledger import resolve_debt
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert (
+                await resolve_debt(
+                    make_path(tmp_path), 'dark_factory', 'a::t', resolving_commit='deadbee'
+                )
+                is None
+            )
+        _assert_logged_loudly(caplog)
