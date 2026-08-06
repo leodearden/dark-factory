@@ -4783,8 +4783,28 @@ def test_fused_memory_recon_busy_verdict_unknown_on_fetch_exception(
     assert warnings, "the swallowed fetch exception must be logged"
 
 
+def _isolate_fm_liveness_state(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point every fm persisted-state path at tmp_path (all absent by default).
+
+    The fm report row is read-only, so reading the repo's real
+    data/fused-memory/ would be harmless — but it would make a test's output
+    depend on whatever the live watchdog last wrote there. Shared by the
+    task-3764 Part D report tests (via _wire_report_row) and the older row
+    tests, which predate the streak/liveness-clock fields.
+    """
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "deploy_clock.json"))
+
+
 def test_print_fused_memory_liveness_row_includes_deploy_age(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """The enriched fm row renders DEPLOY-AGE as fm-clock age in hours (one decimal).
 
@@ -4793,6 +4813,7 @@ def test_print_fused_memory_liveness_row_includes_deploy_age(
     """
     wdog = _load_watchdog()
     now = 2_000_000_000.0
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: now - 3 * 3600)
@@ -4801,19 +4822,28 @@ def test_print_fused_memory_liveness_row_includes_deploy_age(
     wdog._print_fused_memory_liveness()
 
     out = capsys.readouterr().out
-    assert "DEPLOY-AGE" in out, f"expected DEPLOY-AGE label in fm row: {out!r}"
-    assert "3.0h" in out, f"expected DEPLOY-AGE ~3.0h in fm row: {out!r}"
+    assert re.search(r"DEPLOY-AGE:\s*3\.0h", out), (
+        f"expected a labelled DEPLOY-AGE of ~3.0h in fm row: {out!r}"
+    )
 
 
 def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """DEPLOY-AGE renders 'unknown' when the fm deploy clock is absent (fail-open).
 
     Mirrors _read_last_fm_deploy_epoch's fail-open contract (None when the fm
     clock file has never been stamped / is unreadable).
+
+    ANCHORED to the DEPLOY-AGE label on purpose: the row now also carries a
+    LIVENESS-RESTART-AGE field that renders 'unknown' whenever the liveness
+    clock is unstamped, so a bare `"unknown" in out` would pass even if
+    DEPLOY-AGE stopped rendering altogether.
     """
     wdog = _load_watchdog()
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
@@ -4821,15 +4851,19 @@ def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
     wdog._print_fused_memory_liveness()
 
     out = capsys.readouterr().out
-    assert "DEPLOY-AGE" in out
-    assert "unknown" in out, f"expected DEPLOY-AGE 'unknown' in fm row: {out!r}"
+    assert re.search(r"DEPLOY-AGE:\s*unknown", out), (
+        f"expected a labelled DEPLOY-AGE of 'unknown' in fm row: {out!r}"
+    )
 
 
 def test_print_fused_memory_liveness_row_includes_recon_busy(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """The enriched fm row carries a labelled recon-busy field from the verdict."""
     wdog = _load_watchdog()
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "busy")
@@ -4875,8 +4909,8 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
-    clock = tmp_path / "last_redeploy_fused_memory.json"
-    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock))
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
+    clock = pathlib.Path(wdog.FM_DEPLOY_CLOCK_PATH)
 
     wdog._print_fused_memory_liveness()
 
@@ -4885,6 +4919,12 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     _assert_zero_mutating_calls(recorded_calls)
     assert not clock.exists(), (
         "the read-only fm row must never write the fm deploy clock file"
+    )
+    assert not pathlib.Path(wdog.FM_LIVENESS_RESTART_CLOCK_PATH).exists(), (
+        "the read-only fm row must never write the liveness restart clock"
+    )
+    assert not pathlib.Path(wdog.FM_LIVENESS_STREAK_PATH).exists(), (
+        "the read-only fm row must never create the liveness streak file"
     )
 
 
@@ -7873,11 +7913,7 @@ def _wire_report_row(
     """Point the fm report row's reads at tmp state with a known verdict."""
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "no")
-    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
-    monkeypatch.setattr(
-        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
-    )
-    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "deploy_clock.json"))
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
 
 
 def test_report_row_shows_streak_when_present(
