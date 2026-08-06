@@ -728,10 +728,12 @@ class TestReadOccurrences:
         db_path = tmp_path / 'runs.db'
         self._seed(db_path)
 
+        # Chronological, and the two rows tied at T_MID break on `id` — which is what
+        # makes the sequence fully determined rather than merely mostly-sorted.
         assert [(r.observed_at, r.test_id) for r in read_occurrences(db_path)] == [
             (self.T_EARLY, self.TEST_A),
+            (self.T_MID, self.TEST_B),  # seeded first, so lower id
             (self.T_MID, self.TEST_A),
-            (self.T_MID, self.TEST_B),
             (self.T_LATE, self.TEST_B),
         ]
 
@@ -754,9 +756,11 @@ class TestReadOccurrences:
         self._seed(db_path)
 
         rows = read_occurrences(db_path, since=self.T_MID)
+        # BOTH rows stamped exactly at the boundary are included, so an off-by-one in
+        # either direction is visible.
         assert [(r.observed_at, r.test_id) for r in rows] == [
-            (self.T_MID, self.TEST_A),
             (self.T_MID, self.TEST_B),
+            (self.T_MID, self.TEST_A),
             (self.T_LATE, self.TEST_B),
         ]
 

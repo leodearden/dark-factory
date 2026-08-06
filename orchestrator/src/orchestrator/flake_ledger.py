@@ -285,13 +285,45 @@ def _to_occurrence_row(row: sqlite3.Row) -> FlakeOccurrenceRow:
     )
 
 
-def read_occurrences(db_path: Path) -> list[FlakeOccurrenceRow]:
-    """Every recorded occurrence, oldest first."""
+def read_occurrences(
+    db_path: Path,
+    *,
+    test_id: str | None = None,
+    since: str | None = None,
+) -> list[FlakeOccurrenceRow]:
+    """Recorded occurrences, oldest first, optionally filtered.
+
+    Args:
+        test_id: Only this test's observations — the recurrence chain for one test.
+        since: Only observations at or after this ISO-8601 UTC stamp.  INCLUSIVE at
+            the boundary.  The comparison is lexicographic on a TEXT column, which is
+            sound because ISO-8601 UTC strings with a fixed offset sort in the same
+            order as they do chronologically; ``idx_flake_occurrence_observed`` serves
+            the window scan.
+
+    Ordering is part of the contract, not incidental: ``observed_at`` then ``id``, so
+    the sequence reads chronologically even though rows arrive out of order (a remote
+    observation is written on the dispatcher after a local one that followed it).
+    """
     ensure_schema(db_path)
+    # Values are BOUND, never interpolated — a test_id is an arbitrary pytest node-id
+    # arriving from a remote host.
+    clauses: list[str] = []
+    params: list[str] = []
+    if test_id is not None:
+        clauses.append('test_id = ?')
+        params.append(test_id)
+    if since is not None:
+        clauses.append('observed_at >= ?')
+        params.append(since)
+    where = f' WHERE {" AND ".join(clauses)}' if clauses else ''
+
     conn = _connect(db_path)
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute('SELECT * FROM flake_occurrence ORDER BY id').fetchall()
+        rows = conn.execute(
+            f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id', params
+        ).fetchall()
     finally:
         conn.close()
     return [_to_occurrence_row(r) for r in rows]
