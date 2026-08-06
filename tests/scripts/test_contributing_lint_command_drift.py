@@ -1,27 +1,178 @@
-"""RED scaffolding for the CONTRIBUTING.md <-> ``lint_command`` mirror guard (task 3558).
+"""Mirror contract: CONTRIBUTING.md's Lint bullet must restate the live ``lint_command``.
 
-Step-1 of the plan. These cases pin the CONTRACT of the marker extractor
-``_documented_lint_command`` before it exists. The full module docstring —
-provenance, placement rationale and the out-of-scope note — lands with the
-implementation in step-2, and the live drift assertion in step-3.
+Task 3558. CONTRIBUTING.md documented a ``uv run ruff check`` command that the
+repo-root ``dark-factory-orchestrator.yaml`` had outgrown TWICE — task 3397 added
+``sampler`` and ``cockpit``, task 3485 added ``conftest.py``,
+``df_pytest_isolation.py`` and ``skills`` — while the doc stayed at its original
+five targets. The failure mode is not cosmetic: a contributor who runs the
+documented command gets a clean local green over a strict SUBSET of what the
+merge gate checks, then eats a red verify on a branch they believed was ready.
 
-MEASURED RED at this commit: ``_documented_lint_command`` is undefined, so every
-case below fails with ``NameError``. That is the intended RED — the extractor's
-behaviour is specified here first.
+This is the DOCS half of the ``lint_command`` contract — "does the prose still
+say what the config says?". ``test_root_lint_covers_nonmember_py.py`` (task 3485)
+is the FILES half — "does the config still target every file that needs it?".
+Neither implies the other: the doc can faithfully mirror a command that misses a
+file, and the command can cover every file while the doc describes a stale one.
 
-SYNTHETIC FIXTURES ON PURPOSE. Every case below runs against a hand-written
-markdown string, never against the real CONTRIBUTING.md, so these cases stay
-stable under any future edit to that file's content. The one test that reads the
-real file is the live drift assertion (step-3), which is a different invariant.
+WHY A MACHINE CHECK, WHEN A POINTER ALREADY EXISTS. CONTRIBUTING.md already tells
+the reader to "treat ``dark-factory-orchestrator.yaml``'s ``test_command`` /
+``lint_command`` / ``type_check_command`` as the source of truth if these drift."
+Both drifts landed with that sentence already present, so it is measured — not
+predicted — that prose pointing at prose does not hold. The literal is kept (its
+value to a contributor is being copy-pasteable; ``lint_command`` sits under ~130
+lines of comment in the yaml) and the tie is made mechanical instead.
+
+MEASURED RED at base HEAD ``ca8dfb6a6e``: the documented command named 5 targets,
+the live ruff leg named 10, and the missing set was exactly
+``['sampler', 'cockpit', 'conftest.py', 'df_pytest_isolation.py', 'skills']``.
+
+PLACEMENT IS LOAD-BEARING, NOT STYLISTIC. This file lives in ``tests/scripts/``
+because that directory carries its own module config, so the guard actually runs
+under FULL_SUITE and merge-role ``merge_verify_breadth: full``. A drift guard
+that never ran on merge full-verify would be vacuous in exactly the way the gap
+it closes is — the same rationale ``test_root_lint_covers_nonmember_py.py`` and
+``test_scripts_module_config.py`` record for themselves.
+
+SCOPE. This guard asserts equality between two committed *executable command
+strings* — a config field and its documented mirror. It is NOT a prose or
+docstring test: it makes no assertion about surrounding wording, headings or
+explanatory text, and must not be extended to do so. It is the same class as
+``TestSplitAndChainSegmentsLiveConfigDrift`` (orchestrator/tests/
+test_verify_cmd.py) and ``test_orchestrator_restart_config_drift.py``.
+
+EXPLICITLY OUT OF SCOPE. ``_ROOT_LINT_COMMAND`` (orchestrator/tests/
+test_verify_cmd.py, test_verify_plan.py) and ``_FLEET_LINT_COMMAND_OPAQUE``
+(orchestrator/tests/test_verify_scope_kappa.py) are DELIBERATELY decoupled
+five-member shape fixtures exercising chain-splitting and scope-narrowing
+behaviour, not live lint coverage. Re-copying the live string into them would
+silently change what shape each fixture tests, converting a passing behavioural
+test into a different, unreviewed one. A test fixture that happens to contain a
+similar string is not a mirror of the config and must not be pinned as one. The
+mirror obligation applies to CONTRIBUTING.md only, which is prose addressed to
+humans.
+
+SYNTHETIC FIXTURES ON PURPOSE. Every extractor case below runs against a
+hand-written markdown string, never against the real CONTRIBUTING.md, so those
+cases stay stable under any future edit to that file's content. Only the live
+drift assertion reads the real file — a different invariant, deliberately.
 
 The fixtures spell the ``lint-command-mirror`` marker literals out in full rather
-than interpolating the implementation's constants. That is deliberate: a rename
-of a constant must not be able to silently keep a broken parser agreeing with its
-own fixtures.
+than interpolating the constants below. That is deliberate: a rename of a
+constant must not be able to silently keep a broken parser agreeing with its own
+fixtures.
 """
 from __future__ import annotations
 
+import pathlib
+import re
+
 import pytest
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+# The canonical root config filename — what the dashboard's escalation-URL
+# discovery (_discover_escalation_urls) keys on. Loading it by this exact path
+# means the guard fails loudly if the config is renamed or lint_command
+# disappears, rather than quietly guarding nothing.
+DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
+CONTRIBUTING_PATH = REPO_ROOT / "CONTRIBUTING.md"
+
+# The HTML-comment marker anchoring extraction, placed immediately around the
+# Lint bullet. An explicit marker rather than a regex on the `- **Lint**:` label
+# or on "the span matching `uv run ruff check`", for two reasons.
+#
+# MECHANICAL: CONTRIBUTING.md carries a SECOND inline-code span beginning
+# `uv run ruff check` in its quality-gates list — `uv run ruff check <touched
+# packages>` — which is deliberately generic and must never be pinned. Any
+# "first/only matching span" extractor is order-dependent and would silently
+# re-target on a harmless doc reorder or relabel.
+#
+# CAUSAL: the root cause this task closes is "nothing ties the prose to the
+# config". The marker puts that tie AT THE EDIT SITE — a human editing the line
+# sees which yaml field it mirrors and which test pins it. HTML comments render
+# invisibly, so the cost is two lines of source noise.
+MIRROR_BEGIN = "lint-command-mirror:begin"
+MIRROR_END = "lint-command-mirror:end"
+
+_HTML_COMMENT_CLOSE = "-->"
+_HTML_COMMENT_OPEN = "<!--"
+
+# Non-greedy single-backtick inline-code span. Applied only to the marker
+# payload, never to the whole document.
+_INLINE_CODE = re.compile(r"`([^`]+)`")
+
+
+def _documented_lint_command(markdown_text: str) -> str:
+    """The single inline-code command delimited by the mirror markers.
+
+    Every failure below is a loud ``AssertionError`` naming the marker literal
+    and CONTRIBUTING.md, never a ``''``/``None`` return. That is the vacuity
+    hazard and the whole point: an extractor that silently yields nothing turns
+    the drift assertion green while pinning nothing at all — strictly worse than
+    no guard, because the check still reports success.
+
+    The payload is sliced from the END of the begin comment (its ``-->``) to the
+    START of the end comment (its ``<!--``), NOT from the marker literals
+    themselves. The begin comment's own prose contains inline-code spans — the
+    real marker cites ``ruff check`` and ``lint_command`` — so slicing on the
+    literal would return comment prose, and would return a plausible-looking
+    string while doing it.
+
+    Returns the command ``strip()``ed and otherwise verbatim. No further
+    normalisation: the exact-equality assertion downstream depends on not
+    silently canonicalising away a real difference.
+    """
+    begin_count = markdown_text.count(MIRROR_BEGIN)
+    assert begin_count == 1, (
+        f"expected exactly one {MIRROR_BEGIN!r} marker, found {begin_count} "
+        f"(task 3558). This marker delimits the Lint bullet in CONTRIBUTING.md "
+        f"that mirrors the `ruff check` leg of dark-factory-orchestrator.yaml's "
+        f"lint_command. If it was deleted, restore it around that bullet; if it "
+        f"was duplicated, one of the two mirrors is unpinned and free to drift."
+    )
+    end_count = markdown_text.count(MIRROR_END)
+    assert end_count == 1, (
+        f"expected exactly one {MIRROR_END!r} marker to close {MIRROR_BEGIN!r}, "
+        f"found {end_count} (task 3558) — restore the closing marker below the "
+        f"Lint bullet in CONTRIBUTING.md"
+    )
+
+    begin_at = markdown_text.index(MIRROR_BEGIN)
+    end_at = markdown_text.index(MIRROR_END)
+    assert begin_at < end_at, (
+        f"{MIRROR_END!r} precedes {MIRROR_BEGIN!r} in CONTRIBUTING.md (task "
+        f"3558) — the markers are inverted, so no payload can be delimited"
+    )
+
+    comment_close = markdown_text.find(_HTML_COMMENT_CLOSE, begin_at, end_at)
+    assert comment_close != -1, (
+        f"the {MIRROR_BEGIN!r} marker's HTML comment is never closed with "
+        f"{_HTML_COMMENT_CLOSE!r} before {MIRROR_END!r} (task 3558) — "
+        f"CONTRIBUTING.md's marker block is malformed"
+    )
+    payload_start = comment_close + len(_HTML_COMMENT_CLOSE)
+
+    payload_end = markdown_text.rfind(_HTML_COMMENT_OPEN, payload_start, end_at)
+    assert payload_end != -1, (
+        f"the {MIRROR_END!r} marker is not opened by {_HTML_COMMENT_OPEN!r} "
+        f"(task 3558) — CONTRIBUTING.md's marker block is malformed"
+    )
+
+    payload = markdown_text[payload_start:payload_end]
+    spans: list[str] = _INLINE_CODE.findall(payload)
+    assert len(spans) == 1, (
+        f"expected exactly one `backticked` command between {MIRROR_BEGIN!r} "
+        f"and {MIRROR_END!r}, found {len(spans)}: {spans!r} (task 3558). The "
+        f"marker block in CONTRIBUTING.md must wrap the Lint bullet and nothing "
+        f"else — additional prose with inline code belongs outside it."
+    )
+
+    command = spans[0].strip()
+    assert command, (
+        f"the command between {MIRROR_BEGIN!r} and {MIRROR_END!r} in "
+        f"CONTRIBUTING.md is empty (task 3558)"
+    )
+    return command
 
 # (a) Happy path. Modelled on the real CONTRIBUTING.md block: a fenced ```bash
 # example ABOVE the marker (backticks outside the slice), and — the measured
@@ -89,7 +240,7 @@ _DECOY_DOC = """\
 
 def test_documented_lint_command_extracts_the_marked_span() -> None:
     """(a) The marked inline-code span is returned, markdown and backticks stripped."""
-    assert _documented_lint_command(_HAPPY_DOC) == _HAPPY_COMMAND  # noqa: F821
+    assert _documented_lint_command(_HAPPY_DOC) == _HAPPY_COMMAND
 
 
 def test_documented_lint_command_ignores_backticks_in_the_marker_prose() -> None:
@@ -101,7 +252,7 @@ def test_documented_lint_command_ignores_backticks_in_the_marker_prose() -> None
     explanatory prose — which is a plausible-looking string, so the mistake
     would not announce itself.
     """
-    extracted = _documented_lint_command(_HAPPY_DOC)  # noqa: F821
+    extracted = _documented_lint_command(_HAPPY_DOC)
     assert extracted == _HAPPY_COMMAND
     assert extracted not in ("ruff check", "lint_command")
     assert extracted.startswith("uv run ruff check ")
@@ -116,7 +267,7 @@ def test_documented_lint_command_raises_when_the_marker_is_missing() -> None:
     guard, because the check still reports success.
     """
     with pytest.raises(AssertionError) as excinfo:
-        _documented_lint_command(_NO_MARKER_DOC)  # noqa: F821
+        _documented_lint_command(_NO_MARKER_DOC)
 
     # The message must tell a human who deleted the marker exactly what to
     # restore and where — the marker literal and the file it belongs in.
@@ -132,7 +283,7 @@ def test_documented_lint_command_raises_on_a_duplicated_marker() -> None:
     drift — the exact failure this task closes, reintroduced one level down.
     """
     with pytest.raises(AssertionError) as excinfo:
-        _documented_lint_command(_DUPLICATE_MARKER_DOC)  # noqa: F821
+        _documented_lint_command(_DUPLICATE_MARKER_DOC)
 
     assert "lint-command-mirror:begin" in str(excinfo.value)
 
@@ -145,4 +296,4 @@ def test_documented_lint_command_is_immune_to_the_generic_ruff_decoy() -> None:
     would be wrong twice over: it would fail immediately, and "fixing" it would
     destroy a correct, audience-appropriate instruction.
     """
-    assert _documented_lint_command(_DECOY_DOC) == _HAPPY_COMMAND  # noqa: F821
+    assert _documented_lint_command(_DECOY_DOC) == _HAPPY_COMMAND
