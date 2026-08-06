@@ -6,16 +6,23 @@ lifted out of a search-result snippet (e.g. '2531b4d8') produced a fully
 confirming `{'status': 'deleted'}` envelope, a `success=True` write-journal
 entry and a `memory_deleted` event, while nothing was deleted. DF 1144 tried
 to fix that with prompt wording alone; a prompt cannot enforce an API
-contract, so the failure recurred. The enforcement now lives in the API:
-`MemoryService.delete_memory` raises `InputValidationError` on any id that is
-not a canonical 36-char UUID.
+contract, so the failure recurred. The enforcement now lives in the API, in
+two layers that this file pins in the order a call passes through them:
 
-`TestMemoryServiceDeleteMemoryRejectsTruncatedUuid` pins that guard. It uses
-a real `MemoryService` with mocked backends rather than an `AsyncMock`
-service, because an `AsyncMock` would intercept `delete_memory` before the
-guard could run — and it is the service-level guard specifically that makes
-the enforcement real for the internal (non-MCP) reconciliation and script
-callers, not just for agents.
+`TestMemoryServiceDeleteMemoryRejectsTruncatedUuid` — `MemoryService.
+delete_memory` raises `InputValidationError`. It uses a real `MemoryService`
+with mocked backends rather than an `AsyncMock` service, because an
+`AsyncMock` would intercept `delete_memory` before the guard could run — and
+it is the service-level guard specifically that makes the enforcement real
+for the internal (non-MCP) reconciliation and script callers.
+
+`TestDeleteMemoryToolRejectsTruncatedUuid` and
+`TestTruncatedUuidNeverReachesCitationRepointGate` — the agent-facing MCP
+boundary, which returns a structured `ValidationError` naming the offending
+id plus a `hint`, and rejects before either the service or the
+citation-repoint gate is reached. Both layers exist because they cover
+different callers and because `mcp_tool_errors` flattens an exception to
+`{'error', 'error_type'}` and cannot carry the hint through a raise.
 
 `TestGraphitiBackendRemoveEdgeTruncatedUuid` is deliberately UNCHANGED and
 still passing. `GraphitiBackend.remove_edge` still swallows
@@ -28,10 +35,12 @@ guard has to sit above it.
 """
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.validation import InputValidationError
 
 # A search-result snippet prefix, per stage1.py's own example — 8 hex chars,
@@ -210,3 +219,186 @@ class TestMemoryServiceDeleteMemoryRejectsTruncatedUuid:
         service.graphiti.remove_edge.assert_called_once_with(
             CANONICAL_UUID, group_id='test'
         )
+
+
+# ── MCP tool boundary ────────────────────────────────────────────────────────
+# Harness modelled on test_delete_memory_alias.py (the real delete_memory
+# MCP-tool test): create_mcp_server + _tool_manager.call_tool + _parse_result
+# unwrapping FastMCP TextContent.
+
+# A well-formed survivor id for the citation-repoint ordering case below.
+REPLACEMENT_UUID = '9f3ac071-3333-4eee-8fff-000000000003'
+RECON_AGENT = 'recon-stage-memory_consolidator'
+KNOWN_PROJECTS = {'dark_factory': '/tmp/root'}
+
+
+def _parse_result(result):
+    """Parse a FastMCP call_tool result (list of TextContent) into a dict."""
+    if isinstance(result, list):
+        content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+        return json.loads(content)
+    return result
+
+
+class TestDeleteMemoryToolRejectsTruncatedUuid:
+    """The agent-facing MCP boundary rejects a truncated id structurally.
+
+    The tool returns a dict rather than letting the service's exception
+    surface through mcp_tool_errors, because that decorator emits only
+    {'error', 'error_type'} and would drop the `hint` the signal requires.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        svc = AsyncMock()
+        svc.delete_memory = AsyncMock(
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': CANONICAL_UUID}
+        )
+        svc.get_memory_by_id = AsyncMock(return_value=None)
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        return create_mcp_server(mock_service)
+
+    async def _call(self, mcp_server, **overrides):
+        args = {
+            'memory_id': TRUNCATED_PREFIX,
+            'store': 'mem0',
+            'project_id': 'dark_factory',
+        }
+        args.update(overrides)
+        return _parse_result(
+            await mcp_server._tool_manager.call_tool('delete_memory', args)
+        )
+
+    @pytest.mark.asyncio
+    async def test_mem0_truncated_id_returns_validation_error(self, mcp_server):
+        parsed = await self._call(mcp_server)
+        assert parsed.get('error_type') == 'ValidationError'
+
+    @pytest.mark.asyncio
+    async def test_error_names_the_malformed_id(self, mcp_server):
+        """The signal explicitly requires the malformed id be named."""
+        parsed = await self._call(mcp_server)
+        assert TRUNCATED_PREFIX in parsed['error']
+
+    @pytest.mark.asyncio
+    async def test_error_carries_a_hint(self, mcp_server):
+        parsed = await self._call(mcp_server)
+        assert parsed.get('hint')
+
+    @pytest.mark.asyncio
+    async def test_does_not_report_deleted(self, mcp_server):
+        """Directly inverts the documented defect: the old behaviour returned a
+        fully confirming {'status': 'deleted'} for exactly this input."""
+        parsed = await self._call(mcp_server)
+        assert parsed.get('status') != 'deleted'
+
+    @pytest.mark.asyncio
+    async def test_service_not_reached(self, mcp_server, mock_service):
+        await self._call(mcp_server)
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_truncated_id_returns_validation_error(
+        self, mcp_server, mock_service
+    ):
+        parsed = await self._call(mcp_server, store='graphiti')
+        assert parsed.get('error_type') == 'ValidationError'
+        assert TRUNCATED_PREFIX in parsed['error']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_id_alias_cannot_bypass_the_guard(self, mcp_server, mock_service):
+        """The `id` alias resolves to the same value, so it is guarded too."""
+        parsed = _parse_result(
+            await mcp_server._tool_manager.call_tool(
+                'delete_memory',
+                {'id': TRUNCATED_PREFIX, 'store': 'mem0', 'project_id': 'dark_factory'},
+            )
+        )
+        assert parsed.get('error_type') == 'ValidationError'
+        assert TRUNCATED_PREFIX in parsed['error']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_store_error_still_wins(self, mcp_server):
+        """Ordering guard #1: the guard sits BELOW the _VALID_STORES check, which
+        is what keeps test_health_endpoint's invalid-store assertions green."""
+        parsed = await self._call(mcp_server, store='redis')
+        assert 'redis' in parsed['error']
+        assert TRUNCATED_PREFIX not in parsed['error']
+
+    @pytest.mark.asyncio
+    async def test_canonical_uuid_still_delegates(self, mcp_server, mock_service):
+        """Non-regression: a well-formed id passes straight through."""
+        await self._call(mcp_server, memory_id=CANONICAL_UUID)
+        mock_service.delete_memory.assert_awaited_once()
+        assert mock_service.delete_memory.call_args[1]['memory_id'] == CANONICAL_UUID
+
+
+class TestTruncatedUuidNeverReachesCitationRepointGate:
+    """Ordering guard #2: the repoint gate mutates live task metadata ahead of
+    an irreversible delete, so a malformed id must be rejected before it can
+    drive any repoint."""
+
+    @pytest.fixture
+    def mock_service(self):
+        svc = AsyncMock()
+        svc.delete_memory = AsyncMock(
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': CANONICAL_UUID}
+        )
+        svc.get_memory_by_id = AsyncMock(
+            return_value={'id': REPLACEMENT_UUID, 'content': 'survivor', 'metadata': {}}
+        )
+        return svc
+
+    @pytest.fixture
+    def interceptor(self):
+        itc = MagicMock()
+        itc.get_tasks = AsyncMock(return_value={'tasks': [
+            {
+                'id': '101',
+                'status': 'pending',
+                'title': 'task 101',
+                'metadata': {'mem0_canonical_entry': TRUNCATED_PREFIX},
+            },
+        ]})
+        itc.update_task = AsyncMock(return_value={'success': True})
+        return itc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncated_id_with_valid_replacement_is_a_validation_error(
+        self, mcp_server
+    ):
+        """Not a CitationReplacement* error — the gate is never entered."""
+        parsed = _parse_result(
+            await mcp_server._tool_manager.call_tool('delete_memory', {
+                'memory_id': TRUNCATED_PREFIX,
+                'store': 'mem0',
+                'project_id': 'dark_factory',
+                'agent_id': RECON_AGENT,
+                'replacement_memory_id': REPLACEMENT_UUID,
+            })
+        )
+        assert parsed.get('error_type') == 'ValidationError'
+        assert TRUNCATED_PREFIX in parsed['error']
+
+    @pytest.mark.asyncio
+    async def test_gate_never_reads_or_mutates_tasks(self, mcp_server, interceptor):
+        await mcp_server._tool_manager.call_tool('delete_memory', {
+            'memory_id': TRUNCATED_PREFIX,
+            'store': 'mem0',
+            'project_id': 'dark_factory',
+            'agent_id': RECON_AGENT,
+            'replacement_memory_id': REPLACEMENT_UUID,
+        })
+        interceptor.get_tasks.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
