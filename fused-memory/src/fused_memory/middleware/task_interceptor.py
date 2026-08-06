@@ -5160,6 +5160,24 @@ async def _validate_done_provenance(
         # is_ancestor + commit citation), and stamping it would perturb the
         # exact-equality merged-kind assertions across the existing suites
         # for no benefit.
+        #
+        # A caller-supplied value is DISCARDED with a warning rather than
+        # rejected. Rejection would break the same-status repair seam:
+        # _repair_done_provenance_same_status re-submits a previously-stored
+        # blob, which post-3576 carries its own stamped_at, so a hard reject
+        # would fail every repair of an already-stamped blob. Refreshing on
+        # repair is also the correct semantics — a repair is a fresh
+        # assertion of the attribution, and a repair that leaves the task
+        # still misattributed SHOULD re-enter the gate window. The warning
+        # keeps the override visible rather than silent.
+        supplied_stamp = raw.get('stamped_at')
+        if supplied_stamp is not None:
+            logger.warning(
+                'done_provenance.stamped_at is server-generated; discarding '
+                'caller-supplied value %r for task %s',
+                supplied_stamp,
+                task_id,
+            )
         resolved['stamped_at'] = _provenance_stamp_now()
 
     return None, resolved
