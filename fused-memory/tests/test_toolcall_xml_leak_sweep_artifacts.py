@@ -236,6 +236,45 @@ def _recovery_tracking_path(artifact_dir: Path) -> Path:
     return artifact_dir / RECOVERY_TRACKING_NAME
 
 
+def _resolved_repo_path(entry: dict, field: str, memory_id: str) -> Path:
+    """Resolve a tracking entry's repo-relative path field, or say why not.
+
+    Shared by every path field on an entry, so a field cannot look like
+    machine-checked provenance while carrying nothing but prose weight.
+    """
+    rel = entry.get(field)
+    assert isinstance(rel, str) and rel, (
+        f'{memory_id}: {field}={rel!r} is missing or not a string. A tracking '
+        'entry that names no source is prose in JSON clothing.'
+    )
+    assert not Path(rel).is_absolute(), (
+        f'{memory_id}: {field} {rel!r} is absolute; it must be repo-relative '
+        'so it survives a different checkout.'
+    )
+    resolved = (REPO_ROOT / rel).resolve()
+    assert resolved.is_relative_to(REPO_ROOT.resolve()), (
+        f'{memory_id}: {field} {rel!r} escapes the repo; it must name a '
+        'committed artifact.'
+    )
+    assert resolved.is_file(), (
+        f'{memory_id}: {field} {rel!r} does not exist. A tracker pointing at a '
+        'file that is gone reads as evidence while protecting nothing.'
+    )
+    return resolved
+
+
+def _payload_record(memory_id: str, payload_path: Path, field: str) -> dict:
+    """The record carrying *memory_id* inside a committed report."""
+    matches = [
+        r for r in _load(payload_path)['records'] if r.get('id') == memory_id
+    ]
+    assert matches, (
+        f'{memory_id}: {field} {payload_path.name} carries no record with that '
+        'id. The tracking entry points at a report that cannot account for it.'
+    )
+    return matches[0]
+
+
 def _unrepaired_danger_records(report: dict) -> list[dict]:
     """Records where the sweep ATTEMPTED a mutation and did not repair.
 
@@ -734,28 +773,12 @@ class TestUnrepairedMutationsAreTracked:
         if not outstanding:
             return
         tracking = _load(_recovery_tracking_path(path.parent))
-        repo_root = REPO_ROOT.resolve()
         for record in outstanding:
             entry = tracking[record['id']]
-            rel = entry.get('payload_source_report')
-            assert isinstance(rel, str) and rel, (
-                f'{record["id"]}: payload_source_report is missing; nothing '
-                'names where the recoverable text lives.'
+            resolved = _resolved_repo_path(
+                entry, 'payload_source_report', record['id']
             )
-            assert not Path(rel).is_absolute(), (
-                f'{record["id"]}: payload_source_report {rel!r} is absolute; '
-                'it must be repo-relative so it survives a different checkout.'
-            )
-            resolved = (REPO_ROOT / rel).resolve()
-            assert resolved.is_relative_to(repo_root), (
-                f'{record["id"]}: payload_source_report {rel!r} escapes the '
-                'repo; the payload must be a committed artifact.'
-            )
-            assert resolved.is_file(), (
-                f'{record["id"]}: payload_source_report {rel!r} does not '
-                'exist. The recovery payload is GONE — this is the deletion '
-                'this check is here to make loud.'
-            )
+            rel = entry['payload_source_report']
             # Membership in the validated set, NOT merely a '-report.json'
             # suffix: only the paths in _REPORT_PATHS are the ones every other
             # class in this module actually checks (shape, provenance,
@@ -770,8 +793,18 @@ class TestUnrepairedMutationsAreTracked:
                 'this module checks end to end, otherwise its integrity is '
                 'asserted nowhere.'
             )
+            # Which digests are REQUIRED is decided from the payload record's
+            # own classification, never from the entry's self-description.
+            # Driving it from entry['classification'] made the requirement
+            # opt-out: an entry that simply OMITTED that field dropped the
+            # repaired-content digest requirement entirely while passing every
+            # other check here — a hand-edit could weaken the pin by deleting a
+            # line. The payload is the authority, and it is already loaded.
+            payload = _payload_record(
+                record['id'], resolved, 'payload_source_report'
+            )
             required = ['payload_content_sha256']
-            if entry.get('classification') in REPAIRABLE_CLASSIFICATIONS:
+            if payload['classification'] in REPAIRABLE_CLASSIFICATIONS:
                 # Only these carry a repaired_content to hash.
                 required.append('payload_repaired_content_sha256')
             for field in required:
@@ -789,6 +822,60 @@ class TestUnrepairedMutationsAreTracked:
                 '`git show <sha>:<path>` fails once gc prunes it — taking the '
                 'documented recovery path with it. Pin the payload with the '
                 'repo-relative path plus the sha256 digests instead.'
+            )
+
+    def test_source_paths_name_the_run_that_made_the_mutation(
+        self, path: Path
+    ) -> None:
+        """``source_report``/``source_provenance`` must be checked, not decorative.
+
+        These two carried the SAME visual weight as ``payload_source_report``
+        while nothing validated them: they could name a nonexistent, renamed or
+        entirely unrelated file and the suite stayed green — machine-readable
+        provenance that is really just prose, which this module's own docstring
+        rejects as "not a tracker". They now get the same treatment as the
+        payload path, plus the two relations that make them meaningful:
+        ``source_report`` is a validated capture that ACTUALLY records this
+        record's flag, and ``source_provenance`` is that report's own sidecar
+        rather than some other run's.
+        """
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        validated = {p.resolve() for p in _REPORT_PATHS}
+        for record in outstanding:
+            memory_id = record['id']
+            entry = tracking[memory_id]
+            source = _resolved_repo_path(entry, 'source_report', memory_id)
+            assert source in validated, (
+                f'{memory_id}: source_report {entry["source_report"]!r} is not '
+                f'one of the validated captures under docs/{ARTIFACT_GLOB}/, '
+                'so nothing checks the run it claims to describe.'
+            )
+            # The mutation the entry describes must be visible IN that report.
+            source_record = _payload_record(memory_id, source, 'source_report')
+            assert source_record in _unrepaired_danger_records(_load(source)), (
+                f'{memory_id}: source_report {entry["source_report"]!r} does '
+                'not record this id as an unrepaired danger record. The entry '
+                'names a run that does not describe the mutation it tracks.'
+            )
+            claimed_flag = entry.get('flag')
+            if claimed_flag is not None:
+                assert source_record.get(claimed_flag), (
+                    f'{memory_id}: entry names flag {claimed_flag!r}, but that '
+                    f'flag is not truthy on the record in '
+                    f'{entry["source_report"]}. source_report must be the '
+                    'report the flag was actually observed on.'
+                )
+            sidecar = _resolved_repo_path(entry, 'source_provenance', memory_id)
+            assert sidecar == _provenance_path(source), (
+                f'{memory_id}: source_provenance '
+                f'{entry["source_provenance"]!r} is not the sidecar of '
+                f'{entry["source_report"]!r} (expected '
+                f'{_provenance_path(source).name}). The two halves of one '
+                'capture must not be reattributed to different runs.'
             )
 
     def test_recovered_flag_and_new_id_agree(self, path: Path) -> None:
@@ -845,17 +932,9 @@ class TestUnrepairedMutationsAreTracked:
             memory_id = record['id']
             entry = tracking[memory_id]
             payload_path = (REPO_ROOT / entry['payload_source_report']).resolve()
-            payload_report = _load(payload_path)
-            matches = [
-                r for r in payload_report['records'] if r.get('id') == memory_id
-            ]
-            assert matches, (
-                f'{memory_id}: payload_source_report '
-                f'{entry["payload_source_report"]} carries no record with that '
-                'id. The tracking entry points at a report that cannot recover '
-                'it.'
+            payload = _payload_record(
+                memory_id, payload_path, 'payload_source_report'
             )
-            payload = matches[0]
             assert payload.get('content'), (
                 f'{memory_id}: the payload record has empty content. The only '
                 'surviving copy of the deleted text is gone.'
@@ -895,17 +974,11 @@ class TestUnrepairedMutationsAreTracked:
         for record in outstanding:
             memory_id = record['id']
             entry = tracking[memory_id]
-            payload_report = _load(
-                (REPO_ROOT / entry['payload_source_report']).resolve()
+            payload = _payload_record(
+                memory_id,
+                (REPO_ROOT / entry['payload_source_report']).resolve(),
+                'payload_source_report',
             )
-            matches = [
-                r for r in payload_report['records'] if r.get('id') == memory_id
-            ]
-            assert matches, (
-                f'{memory_id}: payload_source_report carries no record with '
-                'that id; there is nothing to hash.'
-            )
-            payload = matches[0]
             for field, payload_field in _PAYLOAD_DIGEST_FIELDS.items():
                 claimed = entry.get(field)
                 if claimed is None:
@@ -944,16 +1017,21 @@ class TestUnrepairedMutationsAreTracked:
             # or copy-pasted entry that misstates them would otherwise pass
             # every check here — the exact fabrication class this module
             # exists to close. Both are pure file reads.
+            # MANDATORY, not optional. The digest requirement itself is now
+            # driven by the payload record (see
+            # test_tracking_entry_points_at_a_committed_payload), so omitting
+            # this field can no longer weaken the pin — but a human reading the
+            # tracker still decides from it what kind of record was lost, and
+            # an absent or wrong value there is exactly the hand-massaged
+            # artifact this module exists to reject.
             claimed_classification = entry.get('classification')
-            if claimed_classification is not None:
-                assert claimed_classification == payload['classification'], (
-                    f'{memory_id}: entry claims classification '
-                    f'{claimed_classification!r}, but the payload committed '
-                    f'at {entry["payload_source_report"]} is classified '
-                    f'{payload["classification"]!r}. The entry decides from '
-                    'this field whether a repaired_content is required, so a '
-                    'wrong value silently weakens the recovery check.'
-                )
+            assert claimed_classification == payload['classification'], (
+                f'{memory_id}: entry claims classification '
+                f'{claimed_classification!r}, but the payload committed '
+                f'at {entry["payload_source_report"]} is classified '
+                f'{payload["classification"]!r}. Every tracking entry must '
+                'carry this field and it must match the payload.'
+            )
             claimed_flag = entry.get('flag')
             if claimed_flag is not None:
                 assert claimed_flag in DANGER_FLAGS, (
