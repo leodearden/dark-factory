@@ -467,18 +467,92 @@ instead of at the last byte.
    The arm loads and serves (31 s to ready, 14611 MiB, 104 t/s), and llama.cpp's
    own log shows it generating the full `PROBE_MAX_TOKENS` (512) and stopping on
    length: `eval time = 4904.60 ms / 512 tokens`. `message.content` came back
-   empty, so the probe reports `empty_completion`. This is the failure step 19
-   predicted for this arm (see *Two findings for step 23* above) arriving in its
-   `empty_completion` rather than `not_json` form: a reasoning model's thinking
-   fills the cap before the answer begins. The fix belongs in the probe — a
-   reason code that distinguishes `finish_reason == "length"` from a genuinely
-   empty answer, and a token budget this arm can actually answer within — and it
-   must be written offline-first, not by widening the cap until the row turns
-   green.
+   empty, so the probe reported `empty_completion`. **Root-caused and resolved —
+   see *Reasoning mode* below.** It was never a token-budget question: the arm
+   was being served with thinking force-enabled by a stack default nobody chose.
 
 Neither is a budget failure and neither is hand-editable. `health-report.json`
 is therefore **not yet committed**: the anti-fabrication gate stays red until
-these two arms answer for real.
+the slate is re-run under the corrected probe contract.
+
+---
+
+## Reasoning mode — declared, never inherited (esc-3713-10)
+
+Diagnosed live on 2026-08-06. Two findings, and the second is the serious one.
+
+### The mode was being set by accident, differently per arm
+
+`moe-stretch`'s empty completion was not a budget problem. `/apply-template`
+shows the mechanism directly: gemma-4's own chat template defaults
+`enable_thinking` to **false** and suppresses reasoning by pre-closing the
+thought channel (`<|turn>model\n<|channel>thought\n<channel|>`) — and llama.cpp
+b10276 **overrides that to true**. 509 of the 512 tokens went into an
+unterminated thought; `message.reasoning_content` held 1912 chars and
+`message.content` was `''`.
+
+Meanwhile `qwen3.5-9b`'s template defaults thinking **on** and ends the prompt
+with an *open* `<think>` tag — and vLLM, with no `--reasoning-parser`, fills the
+xgrammar bitmask from token 0, so the model is told to think and then
+structurally prevented from doing so.
+
+So the two thinking-capable arms were running in **opposite modes, by accident,
+and nothing recorded it** — a confound sitting inside the eval's own independent
+variable. `arms.yaml` now declares `reasoning:` per arm (`lms_manifest` refuses
+an LLM arm that omits it) and the report row carries the mode it was measured
+in. `phi-4-14b` and `mistral-small-3.2-24b` have no thinking construct at all.
+
+| arm | mode | tokens | latency | probe entities found |
+|---|---|---|---|---|
+| `moe-stretch` | off | 236–276 | 2.3–2.9 s | **4/4** |
+| `moe-stretch` | on | 1807 (84% thought) | 16.5–17.2 s | **4/4** |
+| `qwen3.5-9b` | off | 18–39 | 0.35 s warm | **0/4** |
+| `qwen3.5-9b` | on + `--reasoning-parser qwen3` | 2639 | ~35 s | **4/4** |
+
+Reasoning is therefore **model-dependent, not generally good**: it buys gemma-4
+nothing at 6.4× the wall clock, and is the difference between an extraction and
+an empty object for qwen3.5. Which mode each arm is measured in is **ζ's**
+pre-registered call (task 3719), expressed by setting these manifest fields —
+not a per-run choice at η or θ.
+
+### The probe was passing empty extractions
+
+`qwen3.5-9b`'s committed **PASS** was a pass on
+`{"entities": [], "summary": "No entities extracted from the provided text."}`.
+`ProbeExtraction` accepts it because an empty list is a valid
+`list[ProbeEntity]` — so the client-side validator this package calls its
+safeguard could not tell a correct extraction from a refusal to extract, and
+every non-reasoning qwen configuration returned zero entities.
+
+`verify_llm_response` now applies an **extraction floor**: the completion must
+name at least `PROBE_MIN_ENTITIES` (3) of the four entities `PROBE_TEXT`
+contains, or it fails with `extraction_missed_entities`. Deliberately a floor
+and not a score — ranking extraction quality is η's job on δ's real-episode
+corpus; this only answers α's own question, whether the endpoint can do the
+thing at all.
+
+### Two smaller defects fixed alongside
+
+* **`COMPLETION_TRUNCATED` was unreachable on vLLM.** llama.cpp returns
+  `content: ''`, vLLM with a reasoning parser returns `content: null`. Only the
+  empty string reached the truncation branch, so a vLLM arm that spent its whole
+  budget reasoning reported `malformed_response` — blaming the harness's own cap
+  on a broken body. `_extract_reasoning` now reads both stacks' spellings
+  (`reasoning_content` and `reasoning`) and the null path is checked for
+  truncation before it is called malformed.
+* **`PROBE_MAX_TOKENS` is now derived, not chosen.** It mirrors the product's own
+  `llm.max_tokens` (`fused-memory/config/config.yaml:15`, 4096) — the output
+  budget the memory subsystem actually gives its LLM, asserted against that file
+  by test so the two cannot drift. The old 512 was a runaway watchdog that had
+  quietly become a capability gate. Runaway containment is unchanged:
+  `COMPLETION_TIMEOUT_S` still bounds the request at 180 s.
+
+### Known, not yet fixed
+
+Every latency in the slate table above is a **single-sample cold** measurement —
+`qwen3.5-9b` measured 2849 ms cold and ~350 ms warm, a 12× difference. These
+numbers are not comparable across arms and are **not** ζ's p95-under-load
+envelope metric. Tracked separately.
 
 ---
 

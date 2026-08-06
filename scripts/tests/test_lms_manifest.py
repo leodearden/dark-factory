@@ -59,6 +59,7 @@ def _llm_arm(**overrides):
         'port': 8410,
         'served_model_name': 'demo-llm',
         'structured_output_mode': 'json_schema',
+        'reasoning': 'off',
         'est_vram_gib': 6.0,
         'max_model_len': 32768,
     }
@@ -377,3 +378,96 @@ def test_committed_manifest_arms_declare_a_footprint_the_3090_could_hold():
     manifest = lms_manifest.load_arms(_COMMITTED_MANIFEST)
 
     assert all(0 < a.est_vram_gib < 24.0 for a in manifest.arms)
+
+
+# ---------------------------------------------------------------------------
+# The reasoning-mode contract (esc-3713-10).
+#
+# Two thinking-capable arms on this slate ran in OPPOSITE modes on 2026-08-06,
+# by accident, because both stacks have a default and nobody had written one
+# down.  These invariants make that state unrepresentable.
+# ---------------------------------------------------------------------------
+
+
+def test_an_llm_arm_must_declare_its_reasoning_mode(tmp_path):
+    """Omission must be an error, not an inherited `off`.
+
+    A default here would recreate the exact defect one layer up: the manifest
+    would look complete while the mode still came from whichever serving stack
+    happened to answer.
+    """
+    arm = _llm_arm()
+    del arm['reasoning']
+    path = _write_manifest(tmp_path, [arm])
+
+    with pytest.raises(lms_manifest.ArmManifestError) as excinfo:
+        lms_manifest.load_arms(path)
+
+    assert 'reasoning' in str(excinfo.value)
+
+
+def test_reasoning_parser_is_refused_on_a_llamacpp_arm(tmp_path):
+    """llama.cpp splits the thought channel natively; a parser named here would
+    never reach a command line, so accepting it would let the manifest carry a
+    setting with no effect — indistinguishable from one that works."""
+    path = _write_manifest(
+        tmp_path,
+        [_llm_arm(stack='llamacpp', structured_output_mode='json_object',
+                  quant='iq4_xs', reasoning_parser='qwen3')],
+    )
+
+    with pytest.raises(lms_manifest.ArmManifestError) as excinfo:
+        lms_manifest.load_arms(path)
+
+    assert 'vLLM-only' in str(excinfo.value)
+
+
+def test_an_embedding_arm_cannot_declare_reasoning_on(tmp_path):
+    """An embeddings endpoint runs no chat template and emits no tokens."""
+    path = _write_manifest(tmp_path, [_embedding_arm(reasoning='on')])
+
+    with pytest.raises(lms_manifest.ArmManifestError) as excinfo:
+        lms_manifest.load_arms(path)
+
+    assert 'meaningless' in str(excinfo.value)
+
+
+def test_reasoning_on_with_json_schema_requires_a_parser(tmp_path):
+    """MEASURED on qwen3.5-9b, vLLM 0.26.0, 2026-08-06.
+
+    With no `--reasoning-parser`, vLLM fills the structured-output bitmask from
+    token 0 and the model physically cannot emit a thought, whatever the chat
+    template says. It answered in 18 tokens with `entities: []`; the same model
+    with the parser found all four probe entities. Declaring reasoning=on
+    without it would put a mode in the manifest the server refuses to honour.
+    """
+    path = _write_manifest(
+        tmp_path, [_llm_arm(reasoning='on', structured_output_mode='json_schema')]
+    )
+
+    with pytest.raises(lms_manifest.ArmManifestError) as excinfo:
+        lms_manifest.load_arms(path)
+
+    assert 'reasoning_parser' in str(excinfo.value)
+
+
+def test_reasoning_on_with_json_schema_and_a_parser_is_accepted(tmp_path):
+    """The combination IS reachable — confirmed live, not inferred."""
+    path = _write_manifest(
+        tmp_path,
+        [_llm_arm(reasoning='on', structured_output_mode='json_schema',
+                  reasoning_parser='qwen3')],
+    )
+
+    arm = lms_manifest.load_arms(path).by_id('demo-llm')
+
+    assert arm.reasoning == 'on'
+    assert arm.reasoning_parser == 'qwen3'
+
+
+def test_the_committed_manifest_states_a_mode_for_every_llm_arm():
+    """The contract, checked against the real slate rather than a fixture."""
+    manifest = lms_manifest.load_arms()
+
+    for arm in manifest.by_axis('llm'):
+        assert arm.reasoning in ('on', 'off'), arm.arm_id

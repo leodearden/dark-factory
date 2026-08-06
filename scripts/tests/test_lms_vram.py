@@ -34,6 +34,7 @@ def _arm(**overrides):
     fields = {
         'arm_id': 'demo',
         'axis': 'llm',
+        'reasoning': 'off',
         'stack': 'vllm',
         'image': 'vllm/vllm-openai:v0.26.0',
         'model_ref': 'org/model',

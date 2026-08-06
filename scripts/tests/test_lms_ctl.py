@@ -108,6 +108,7 @@ def _arm(**overrides):
     fields = {
         'arm_id': 'qwen3.5-9b',
         'axis': 'llm',
+        'reasoning': 'off',
         'stack': 'vllm',
         'image': 'vllm/vllm-openai:v0.26.0',
         'model_ref': 'QuantTrio/Qwen3.5-9B-AWQ',

@@ -92,6 +92,20 @@ class ArmEntry(BaseModel):
     #: PRD Open Q1: TEI is the per-arm fallback if the vLLM pooling runner will
     #: not load an embedding model.
     fallback_stack: str | None = None
+    #: Whether this arm is measured WITH the model emitting reasoning/thinking
+    #: tokens.  DECLARED here rather than inherited from a serving default,
+    #: because both stacks have one and they disagree: llama.cpp b10276 forces
+    #: thinking ON (overriding gemma-4's own template default of off), while
+    #: vLLM leaves Qwen3.5's template default ON and then forecloses it with
+    #: xgrammar.  Measured 2026-08-06 — the two thinking-capable arms on this
+    #: slate were running in OPPOSITE modes, by accident, and nothing recorded
+    #: it.  A silent per-stack default is a confound inside the eval's own
+    #: independent variable; the mode has to be a fact the manifest states.
+    reasoning: Literal['on', 'off'] = 'off'
+    #: vLLM only: the ``--reasoning-parser`` that splits thinking out of
+    #: ``message.content`` and defers the structured-output grammar until the
+    #: thought ends.  llama.cpp does this natively and needs no flag.
+    reasoning_parser: str | None = None
     notes: str | None = None
 
     @model_validator(mode='after')
@@ -109,6 +123,52 @@ class ArmEntry(BaseModel):
                 'back to UNCONSTRAINED output on $ref/$defs schemas '
                 '(ggml-org/llama.cpp#21228), so that claim is false by '
                 'construction; use json_object plus a client-side validator'
+            )
+        if self.axis == 'llm' and 'reasoning' not in self.model_fields_set:
+            # A DEFAULT would defeat the whole field.  The defect this closes was
+            # never a wrong mode — it was two arms silently running in opposite
+            # modes because nobody had written one down.  Letting an author omit
+            # the key and inherit `off` recreates exactly that, one layer up.
+            raise ValueError(
+                f'llm arm {self.arm_id!r} does not declare `reasoning`. The mode '
+                'must be stated explicitly (on|off): both serving stacks have a '
+                'default, they disagree, and an unstated mode makes the arm\'s '
+                'verdict uninterpretable to eta/theta'
+            )
+        if self.reasoning_parser is not None and self.stack != 'vllm':
+            raise ValueError(
+                f'arm {self.arm_id!r} declares reasoning_parser='
+                f'{self.reasoning_parser!r} but stack={self.stack!r}. The flag is '
+                'vLLM-only; llama.cpp splits the thought channel natively, so a '
+                'parser named here would never reach a command line'
+            )
+        if self.axis == 'embedding' and self.reasoning != 'off':
+            raise ValueError(
+                f'embedding arm {self.arm_id!r} declares reasoning='
+                f'{self.reasoning!r}; an embeddings endpoint runs no chat '
+                'template and emits no tokens, so the mode is meaningless here'
+            )
+        if (
+            self.stack == 'vllm'
+            and self.reasoning == 'on'
+            and self.structured_output_mode == 'json_schema'
+            and not self.reasoning_parser
+        ):
+            # MEASURED 2026-08-06 on qwen3.5-9b, vLLM 0.26.0.  With no
+            # --reasoning-parser, `should_fill_bitmask` short-circuits to
+            # `return True` and xgrammar constrains from token 0, so the model
+            # cannot emit a thought no matter what the chat template says.  The
+            # arm answered in 18 tokens with `entities: []` while the SAME model
+            # with `--reasoning-parser qwen3` produced all four entities in 2639.
+            # Declaring reasoning=on without the parser would put a mode in the
+            # manifest that the server physically refuses to honour.
+            raise ValueError(
+                f'arm {self.arm_id!r} declares reasoning=on with '
+                'structured_output_mode=json_schema but names no '
+                'reasoning_parser. vLLM applies the structured-output grammar '
+                'from the first token unless a parser defers it, so the model '
+                'would be silently prevented from reasoning and the manifest '
+                'would misdescribe what was measured'
             )
         if self.port <= 0 or self.port > 65535:
             raise ValueError(f'arm {self.arm_id!r} declares an invalid port {self.port}')

@@ -44,6 +44,20 @@ arms:
     port: 8410
     served_model_name: qwen3.5-9b
     structured_output_mode: json_schema
+    # MEASURED 2026-08-06. This model's chat template defaults thinking ON and
+    # ends the prompt with an OPEN `<think>` tag; vLLM then fills the xgrammar
+    # bitmask from token 0 and the model physically cannot write the thought it
+    # was just told to write. In that state it answers in 18 tokens with
+    # `entities: []`. With `--reasoning-parser qwen3` and reasoning: on it finds
+    # all four probe entities in 2639 tokens (~35 s). So the mode is NOT a
+    # detail here -- it is the difference between an extraction and an empty
+    # object, and the cost of the good one is ~100x the cost of the empty one.
+    # Held at `off` pending zeta's pre-registered ruling (task 3719).
+    reasoning: 'off'
+    # Recorded, not yet used: _vllm_argv emits it only when reasoning is `on`.
+    # Kept here so flipping the mode is a one-word change and the enabling flag
+    # cannot be forgotten -- lms_manifest REFUSES reasoning: on without it.
+    reasoning_parser: qwen3
     est_vram_gib: 6.0
     max_model_len: 32768
     max_num_seqs: 8
@@ -68,6 +82,10 @@ arms:
     port: 8411
     served_model_name: mistral-small-3.2-24b
     structured_output_mode: json_schema
+    # No thinking construct anywhere in this model's chat template (verified
+    # 2026-08-06 against the on-disk snapshot), so `off` is the only mode it
+    # has and no parser applies.
+    reasoning: 'off'
     est_vram_gib: 14.0
     max_model_len: 16384
     max_num_seqs: 4
@@ -87,6 +105,10 @@ arms:
     port: 8412
     served_model_name: phi-4-14b
     structured_output_mode: json_schema
+    # No thinking construct in this model's chat template (verified 2026-08-06
+    # against the on-disk snapshot -- the whole template is one 377-char line
+    # with no reasoning channel), so `off` is the only mode it has.
+    reasoning: 'off'
     est_vram_gib: 9.0
     max_model_len: 16384
     max_num_seqs: 5
@@ -142,6 +164,17 @@ arms:
     # Alpha guarantees the endpoint; the forced client selection is beta's and
     # the hard client-side validator is epsilon's.
     structured_output_mode: json_object
+    # MEASURED 2026-08-06. This model's OWN template defaults thinking off and
+    # suppresses it by pre-closing the thought channel; llama.cpp b10276
+    # overrides that to ON, which is why the probe came back empty at the old
+    # 512-token cap -- 509 of 512 tokens went into an unterminated thought.
+    # Both modes work and BOTH extract all four probe entities:
+    #   off -> 236-276 tokens, 2.3-2.9 s
+    #   on  -> 1807 tokens (84% thought), 16.5-17.2 s
+    # So on this arm reasoning costs 6.4x the wall clock and buys nothing
+    # measurable. `off` restores the model author's own default; zeta (3719)
+    # owns whether it stays there.
+    reasoning: 'off'
     est_vram_gib: 14.5
     max_model_len: 16384
     max_num_seqs: 4

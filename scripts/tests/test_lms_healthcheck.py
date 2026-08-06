@@ -37,8 +37,10 @@ from __future__ import annotations
 import datetime as _datetime
 import inspect
 import json
+from pathlib import Path
 
 import pytest
+import yaml
 
 import lms_ctl
 import lms_healthcheck
@@ -60,6 +62,7 @@ def _arm(**overrides) -> lms_manifest.ArmEntry:
         'quant': 'awq',
         'port': 8410,
         'served_model_name': 'qwen3.5-9b',
+        'reasoning': 'off',
         'structured_output_mode': 'json_schema',
         'est_vram_gib': 6.0,
     }
@@ -77,6 +80,7 @@ def _moe_arm(**overrides) -> lms_manifest.ArmEntry:
         'quant': 'iq4_xs',
         'port': 8413,
         'served_model_name': 'moe-stretch',
+        'reasoning': 'off',
         'structured_output_mode': 'json_object',
         'est_vram_gib': 15.0,
     }
@@ -94,7 +98,7 @@ class _Resp:
         return self._payload
 
 
-def _completion(content: str) -> dict:
+def _completion(content: str, finish_reason: str = 'stop') -> dict:
     """An OpenAI chat-completions response body carrying *content*."""
     return {
         'id': 'cmpl-1',
@@ -103,7 +107,7 @@ def _completion(content: str) -> dict:
             {
                 'index': 0,
                 'message': {'role': 'assistant', 'content': content},
-                'finish_reason': 'stop',
+                'finish_reason': finish_reason,
             }
         ],
     }
@@ -114,17 +118,49 @@ def _models_payload(*names: str) -> dict:
 
 
 def _valid_probe_json() -> str:
+    """A conforming completion — which now means one that actually EXTRACTED.
+
+    This fixture used to name a single entity.  It was widened to the full set
+    when the extraction floor landed, and the widening is the point rather than
+    a chore: a one-entity stand-in was letting the suite call "conforming"
+    something no working arm produces.  Both models measured on 2026-08-06
+    return exactly these four whenever they are able to extract at all.
+    """
     return json.dumps(
         {
             'entities': [
                 {
+                    'name': 'Leo',
+                    'entity_type': 'Person',
+                    'attributes': [{'name': 'role', 'value': 'runs Dark Factory'}],
+                },
+                {
+                    'name': 'Dark Factory',
+                    'entity_type': 'Organization',
+                    'attributes': [{'name': 'kind', 'value': 'software factory'}],
+                },
+                {
                     'name': 'Graphiti',
                     'entity_type': 'System',
                     'attributes': [{'name': 'role', 'value': 'temporal knowledge graph'}],
-                }
+                },
+                {
+                    'name': 'FalkorDB',
+                    'entity_type': 'Database',
+                    'attributes': [{'name': 'role', 'value': 'backs Graphiti'}],
+                },
             ],
-            'summary': 'One entity extracted from the probe text.',
+            'summary': 'Four entities extracted from the probe text.',
         }
+    )
+
+
+def _empty_extraction_json() -> str:
+    """Schema-valid and empty — verbatim what qwen3.5-9b returned on 2026-08-06
+    in every configuration where it could not reason, and what the committed
+    README recorded as a PASS."""
+    return json.dumps(
+        {'entities': [], 'summary': 'No entities extracted from the provided text.'}
     )
 
 
@@ -284,6 +320,69 @@ def test_empty_completion_fails():
 
     assert result.verdict == 'FAIL'
     assert result.reason == lms_healthcheck.Reason.EMPTY_COMPLETION
+
+
+def test_a_completion_cut_off_by_the_token_cap_is_not_reported_as_empty():
+    """The moe-stretch defect measured in step 23: gemma-4-26B-A4B is a
+    reasoning arm, its thinking spent the whole 512-token budget, and the
+    content field came back empty with finish_reason `length`.  Calling that
+    `empty_completion` blames the model for the harness's cap."""
+    result = lms_healthcheck.verify_llm_response(
+        _moe_arm(), _completion('', finish_reason='length')
+    )
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.COMPLETION_TRUNCATED
+    assert result.reason != lms_healthcheck.Reason.EMPTY_COMPLETION
+
+
+def test_a_completion_cut_off_mid_json_is_not_reported_as_unparseable():
+    """A fragment that does not parse BECAUSE it was cut off is a truncation,
+    not a malformed answer — the arm never got to finish one."""
+    result = lms_healthcheck.verify_llm_response(
+        _moe_arm(), _completion('{"entities": [{"name": "Gra', finish_reason='length')
+    )
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.COMPLETION_TRUNCATED
+
+
+def test_an_empty_completion_that_stopped_normally_is_still_empty_not_truncated():
+    """The truncation code must not swallow the emptiness code: an arm that
+    chose to say nothing is a different defect from one that was cut off."""
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion(''))
+
+    assert result.reason == lms_healthcheck.Reason.EMPTY_COMPLETION
+
+
+def test_prose_that_hit_the_cap_is_still_truncation_not_a_pass():
+    """Truncation is never a softer verdict — it is FAIL with a better name."""
+    result = lms_healthcheck.verify_llm_response(
+        _moe_arm(), _completion('Let me think about this', finish_reason='length')
+    )
+
+    assert result.verdict == 'FAIL'
+
+
+def test_valid_json_that_happened_to_hit_the_cap_still_passes():
+    """finish_reason alone does not condemn an arm.  If the content the arm
+    DID emit validates, it answered — the cap is then irrelevant."""
+    result = lms_healthcheck.verify_llm_response(
+        _moe_arm(), _completion(_valid_probe_json(), finish_reason='length')
+    )
+
+    assert result.verdict == 'PASS'
+
+
+def test_the_probe_token_cap_is_uniform_across_every_llm_arm():
+    """Steward ruling on esc-3713-8: one shared cap, no per-arm and no
+    per-structured_output_mode budget.  A cap that varied by arm would hand
+    eta a probe-shaped confound between the vLLM arms and the MoE arm."""
+    body_dense = lms_healthcheck.build_llm_probe_request(_arm())
+    body_moe = lms_healthcheck.build_llm_probe_request(_moe_arm())
+
+    assert body_dense['max_tokens'] == body_moe['max_tokens']
+    assert body_dense['max_tokens'] == lms_healthcheck.PROBE_MAX_TOKENS
 
 
 def test_a_response_body_without_choices_fails_rather_than_raising():
@@ -1513,3 +1612,204 @@ def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path
 
     assert code == lms_healthcheck.EXIT_MERGE_ERROR
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# The extraction floor, and the reasoning-mode contract (esc-3713-10).
+#
+# Everything below exists because the two checks above it were each passing
+# something they should not: schema validity passed an empty extraction, and
+# the truncation branch was unreachable on the stack that needed it most.
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_completion(
+    content, reasoning: str, *, key: str = 'reasoning_content',
+    finish_reason: str = 'stop',
+) -> dict:
+    """A response carrying a thought channel. *content* may be None.
+
+    `key` selects the stack's spelling: llama.cpp says `reasoning_content`,
+    vLLM's parsers say `reasoning`.
+    """
+    return {
+        'id': 'cmpl-1',
+        'object': 'chat.completion',
+        'choices': [
+            {
+                'index': 0,
+                'message': {'role': 'assistant', 'content': content, key: reasoning},
+                'finish_reason': finish_reason,
+            }
+        ],
+    }
+
+
+def test_a_schema_valid_but_empty_extraction_is_not_a_pass():
+    """The measured qwen3.5-9b defect: 18 tokens, perfectly typed, no entities.
+
+    `ProbeExtraction` accepts it because an empty list is a valid
+    `list[ProbeEntity]`. If this test ever goes green as a PASS, the health
+    check has gone back to certifying endpoints that answer with nothing.
+    """
+    result = lms_healthcheck.verify_llm_response(
+        _arm(), _completion(_empty_extraction_json())
+    )
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.EXTRACTION_MISSED_ENTITIES
+    assert 'none' in result.detail
+
+
+def test_a_below_floor_extraction_names_exactly_what_it_missed():
+    """A reason code without the missing names costs the operator the diagnosis
+    again — which is the standard every other code in this module is held to."""
+    partial = json.dumps(
+        {
+            'entities': [
+                {'name': 'Graphiti', 'entity_type': 'System', 'attributes': []},
+            ],
+            'summary': 'Partial extraction.',
+        }
+    )
+
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion(partial))
+
+    assert result.reason == lms_healthcheck.Reason.EXTRACTION_MISSED_ENTITIES
+    assert 'Leo' in result.detail
+    assert 'FalkorDB' in result.detail
+
+
+def test_entity_names_carrying_extra_words_still_count_toward_the_floor():
+    """The floor asks whether the arm extracted, not how it spells.
+
+    Both measured models qualified their names differently run to run
+    ('Dark Factory' vs 'Dark Factory (software factory)'), and failing an arm
+    over that would be the floor manufacturing a defect.
+    """
+    qualified = json.dumps(
+        {
+            'entities': [
+                {'name': 'Leo (operator)', 'entity_type': 'Person', 'attributes': []},
+                {
+                    'name': 'Dark Factory (software factory)',
+                    'entity_type': 'Organization',
+                    'attributes': [],
+                },
+                {'name': 'FalkorDB database', 'entity_type': 'Database', 'attributes': []},
+            ],
+            'summary': 'Qualified names.',
+        }
+    )
+
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion(qualified))
+
+    assert result.verdict == 'PASS'
+
+
+def test_a_bare_substring_does_not_count_as_finding_a_known_entity():
+    """Containment is one-directional on purpose. 'Factory' is not
+    'Dark Factory', and a floor loose in both directions would let a
+    one-character entity name satisfy every known entity at once."""
+    loose = json.dumps(
+        {
+            'entities': [
+                {'name': 'Factory', 'entity_type': 'Thing', 'attributes': []},
+                {'name': 'L', 'entity_type': 'Thing', 'attributes': []},
+                {'name': 'DB', 'entity_type': 'Thing', 'attributes': []},
+            ],
+            'summary': 'Loose names.',
+        }
+    )
+
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion(loose))
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.EXTRACTION_MISSED_ENTITIES
+
+
+def test_a_null_content_cut_off_by_the_cap_is_truncation_not_malformed():
+    """Measured on qwen3.5-9b with --reasoning-parser, 2026-08-06.
+
+    vLLM returns `content: null` when a reasoning parser consumes the whole
+    generation; llama.cpp returns `''`. Only the empty string reached the
+    truncation branch, so COMPLETION_TRUNCATED — the code written for exactly
+    this failure — was unreachable on vLLM and it reported `malformed_response`
+    instead, blaming the harness's own cap on a broken response body.
+    """
+    result = lms_healthcheck.verify_llm_response(
+        _arm(),
+        _reasoning_completion(
+            None, 'thinking ' * 200, key='reasoning', finish_reason='length'
+        ),
+    )
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.COMPLETION_TRUNCATED
+    assert result.reason != lms_healthcheck.Reason.MALFORMED_RESPONSE
+
+
+def test_a_null_content_with_reasoning_and_a_clean_stop_is_empty_not_malformed():
+    """An arm that thought and then chose to say nothing answered badly; it was
+    not cut off, and it did not return an unreadable body. Three distinct
+    failures, three distinct codes."""
+    result = lms_healthcheck.verify_llm_response(
+        _arm(), _reasoning_completion(None, 'I decline.', key='reasoning')
+    )
+
+    assert result.reason == lms_healthcheck.Reason.EMPTY_COMPLETION
+
+
+def test_a_null_content_with_no_reasoning_at_all_is_still_malformed():
+    """The malformed path must survive: a body with no content and no thought
+    channel genuinely is unreadable, and softening that would hide real
+    transport-level breakage behind a friendlier code."""
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion(None))
+
+    assert result.reason == lms_healthcheck.Reason.MALFORMED_RESPONSE
+
+
+def test_reasoning_is_read_under_both_stack_spellings():
+    """A helper that knew only one spelling would report 'no reasoning' for half
+    the slate — and silently route those rows to the wrong reason code."""
+    for key in ('reasoning_content', 'reasoning'):
+        body = _reasoning_completion(None, 'thought', key=key, finish_reason='length')
+        result = lms_healthcheck.verify_llm_response(_arm(), body)
+        assert result.reason == lms_healthcheck.Reason.COMPLETION_TRUNCATED, key
+
+
+def test_a_reasoning_off_arm_is_sent_the_explicit_suppression_kwarg():
+    """Sending nothing means 'whatever this server defaults to', and the two
+    stocks disagree: llama.cpp forces gemma-4's thinking ON against its own
+    template default, vLLM leaves Qwen3.5's ON and then grammar-blocks it. The
+    probe has to state the mode rather than inherit one."""
+    body = lms_healthcheck.build_llm_probe_request(_arm(reasoning='off'))
+
+    assert body['chat_template_kwargs'] == {'enable_thinking': False}
+
+
+def test_a_reasoning_on_arm_is_sent_no_thinking_kwarg():
+    """`enable_thinking: true` is a measured NO-OP on Qwen3.5 — its template
+    tests only for the literal `false`. Omission is the only spelling of 'on'
+    that means the same thing on both stacks."""
+    body = lms_healthcheck.build_llm_probe_request(
+        _arm(reasoning='on', reasoning_parser='qwen3')
+    )
+
+    assert 'chat_template_kwargs' not in body
+
+
+def test_the_probe_cap_is_the_products_own_output_budget():
+    """PROBE_MAX_TOKENS is DERIVED from fused-memory's `llm.max_tokens`, not
+    chosen here. That is what stops it being a knob: it cannot be raised to
+    turn a row green without moving the production budget it mirrors.
+
+    Read from the config file rather than hardcoded, so the two cannot drift
+    apart silently — which is the entire point of sourcing it.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[2] / 'fused-memory' / 'config' / 'config.yaml'
+    )
+    config = yaml.safe_load(config_path.read_text())
+
+    assert lms_healthcheck.PROBE_MAX_TOKENS == config['llm']['max_tokens']

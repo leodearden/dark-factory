@@ -47,6 +47,7 @@ def _arm(**overrides):
         'quant': 'awq',
         'port': 8410,
         'served_model_name': 'demo-llm',
+        'reasoning': 'off',
         'structured_output_mode': 'json_schema',
         'est_vram_gib': 6.0,
         'max_model_len': 32768,
@@ -522,3 +523,26 @@ def test_every_committed_non_placeholder_arm_builds_an_argv():
     # arm failed to build.
     expected = [a.arm_id for a in manifest.arms if not a.is_placeholder]
     assert built == expected
+
+
+def test_vllm_argv_carries_the_reasoning_parser_when_reasoning_is_on():
+    """Without the flag the grammar is applied from token 0 and the arm cannot
+    reason at all — so a reasoning=on arm launched without it would be measured
+    in a mode it is not actually in (qwen3.5-9b, 2026-08-06)."""
+    argv = lms_serve.build_launch_argv(
+        _arm(reasoning='on', reasoning_parser='qwen3'), MEASURED_GPU
+    )
+
+    assert '--reasoning-parser' in argv
+    assert argv[argv.index('--reasoning-parser') + 1] == 'qwen3'
+
+
+def test_vllm_argv_omits_the_reasoning_parser_when_reasoning_is_off():
+    """A reasoning=off arm must launch with exactly the argv it was measured
+    with; carrying an inert parser flag would make the two runs incomparable
+    for no benefit."""
+    argv = lms_serve.build_launch_argv(
+        _arm(reasoning='off', reasoning_parser='qwen3'), MEASURED_GPU
+    )
+
+    assert '--reasoning-parser' not in argv

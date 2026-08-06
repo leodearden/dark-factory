@@ -65,12 +65,50 @@ IDENTITY_TIMEOUT_S = 15.0
 COMPLETION_TIMEOUT_S = 180.0
 #: Long enough for the probe payload, short enough that a runaway generation
 #: from an unconstrained arm terminates instead of pinning the GPU.
-PROBE_MAX_TOKENS = 512
+#:
+#: DERIVED, NOT CHOSEN.  This is `llm.max_tokens` from the product's own
+#: `fused-memory/config/config.yaml:15` — the output budget the memory
+#: subsystem actually gives its LLM.  Sourcing it there is what stops this
+#: constant being a tuning knob: it cannot be nudged upward to turn a row green
+#: without moving the production budget it mirrors, which is a decision with a
+#: different owner and a visible blast radius.  (Leo's ruling, esc-3713-10.)
+#:
+#: The number it replaces — 512 — was a runaway watchdog, never a model of
+#: production use, and it was silently deciding a question it had no business
+#: deciding: gemma-4 needs 1807 tokens to answer this probe with thinking on
+#: and 236-276 with thinking off, so a 512 cap FAILED the arm for being in a
+#: mode nobody had chosen.  At 4096 the cap stops participating in the
+#: reasoning decision (`arms.yaml: reasoning`) and that decision can be made on
+#: its merits.  Runaway containment is unaffected — COMPLETION_TIMEOUT_S still
+#: bounds the request at 180 s.
+#:
+#: Uniform across every LLM arm, because a per-arm cap would hand eta a
+#: probe-shaped difference between arms.  Uniformity is cheap here: every arm
+#: measured to date finishes well inside it (`finish_reason` `stop`).
+PROBE_MAX_TOKENS = 4096
 
 PROBE_TEXT = (
     'Leo runs Dark Factory, a software factory whose memory layer is Graphiti, '
     'a temporal knowledge graph backed by FalkorDB.'
 )
+#: The entities PROBE_TEXT unambiguously contains.  An extraction that finds
+#: none of them is not an extraction, however well-formed its JSON is.
+#:
+#: This exists because schema validity turned out to be a much weaker signal
+#: than this module claimed.  Measured 2026-08-06: qwen3.5-9b returned
+#: `{"entities": [], "summary": "No entities extracted from the provided
+#: text."}` — 18 tokens, schema-VALID, and recorded as a PASS in the committed
+#: README.  `ProbeExtraction` accepts it because an empty list is a valid
+#: `list[ProbeEntity]`, so the client-side validator this module calls its
+#: safeguard could not tell a correct extraction from a refusal to extract.
+#: The same model finds all four the moment it is allowed to reason.
+#:
+#: DELIBERATELY A FLOOR, NOT A SCORE.  Ranking extraction quality is eta's job
+#: on delta's real-episode corpus; this only answers alpha's own question —
+#: can this endpoint do the thing the eval depends on at all.  The slack of one
+#: entity keeps a defensible naming difference from failing an arm that worked.
+PROBE_KNOWN_ENTITIES = ('Leo', 'Dark Factory', 'Graphiti', 'FalkorDB')
+PROBE_MIN_ENTITIES = 3
 #: Embedding arms are probed with a QUERY, not a passage: the Qwen3-Embedding
 #: family's `query_prefix` is a query-side instruct prefix, so probing with a
 #: document would exercise the wrong half of an asymmetric model.
@@ -113,6 +151,16 @@ class Reason(StrEnum):
     #: /v1/models does not list this arm's served_model_name.
     IDENTITY_MISMATCH = 'identity_mismatch'
     EMPTY_COMPLETION = 'empty_completion'
+    #: The arm hit `max_tokens` (finish_reason == "length") before it produced
+    #: readable output.  DISTINCT from EMPTY_COMPLETION and NOT_JSON on
+    #: purpose: those two say "the arm answered badly", this one says "the arm
+    #: was cut off, so we never learned whether it can answer".  Reporting a
+    #: truncation as an emptiness blames the model for the harness's budget.
+    COMPLETION_TRUNCATED = 'completion_truncated'
+    #: Schema-valid output that extracted none (or almost none) of the entities
+    #: PROBE_TEXT plainly contains.  A structurally perfect empty answer — the
+    #: failure `ProbeExtraction` alone cannot see.
+    EXTRACTION_MISSED_ENTITIES = 'extraction_missed_entities'
     #: Prose, or JSON that is not an object.
     NOT_JSON = 'not_json'
     #: Valid JSON wrapped in a ``` fence — see `verify_llm_response`.
@@ -241,6 +289,16 @@ def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
         'max_tokens': PROBE_MAX_TOKENS,
     }
 
+    if arm.reasoning == 'off':
+        # Suppression is the ONLY request-level lever, on both stacks: Qwen3.5's
+        # template tests `enable_thinking is defined and enable_thinking is
+        # false`, so passing `true` is a measured no-op, and gemma-4's template
+        # defaults to false but llama.cpp overrides it to true.  Sending the
+        # kwarg for `off` and nothing for `on` is therefore the only spelling
+        # that means the same thing on both — and sending NOTHING at all, as
+        # this probe used to, means whatever the server happens to default to.
+        body['chat_template_kwargs'] = {'enable_thinking': False}
+
     if arm.structured_output_mode == 'json_schema':
         body['response_format'] = {
             'type': 'json_schema',
@@ -277,6 +335,70 @@ def _extract_content(body: Any) -> str | None:
     return content if isinstance(content, str) else None
 
 
+def _extract_reasoning(body: Any) -> str:
+    """The thought channel, under either stack's spelling.
+
+    llama.cpp emits `message.reasoning_content`; vLLM's reasoning parsers emit
+    `message.reasoning`.  BOTH were observed on this rig on 2026-08-06, which
+    is why neither name can be the only one checked — a helper that knew only
+    one would report "no reasoning" for half the slate.
+    """
+    if not isinstance(body, dict):
+        return ''
+    choices = body.get('choices')
+    if not isinstance(choices, list) or not choices:
+        return ''
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ''
+    message = first.get('message')
+    if not isinstance(message, dict):
+        return ''
+    for key in ('reasoning_content', 'reasoning'):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ''
+
+
+def _known_entities_found(extraction: ProbeExtraction) -> list[str]:
+    """Which of PROBE_KNOWN_ENTITIES this extraction actually named.
+
+    Compared on alphanumerics only and case-folded, and the ENTITY NAME must
+    contain the known name rather than the reverse: 'Dark Factory (software
+    factory)' counts as finding 'Dark Factory', while a bare 'Factory' does
+    not.  The floor asks whether the arm extracted, not how it spells — but a
+    containment test loose in both directions would let a one-character entity
+    name match everything and quietly restore the hole this closes.
+    """
+    def norm(text: str) -> str:
+        return ''.join(ch for ch in text.lower() if ch.isalnum())
+
+    named = {norm(entity.name) for entity in extraction.entities}
+    return [
+        known for known in PROBE_KNOWN_ENTITIES
+        if any(name and norm(known) in name for name in named)
+    ]
+
+
+def _was_truncated(body: Any) -> bool:
+    """True when the server reports it stopped because it hit `max_tokens`.
+
+    Read defensively: a body this cannot parse is reported as NOT truncated,
+    so an unreadable response keeps whatever reason the content itself earns
+    rather than being laundered into the softer truncation code.
+    """
+    if not isinstance(body, dict):
+        return False
+    choices = body.get('choices')
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    return first.get('finish_reason') == 'length'
+
+
 def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
     """Judge one completion against the probe model.
 
@@ -293,7 +415,30 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
     dressed up valid JSON.
     """
     content = _extract_content(body)
+    truncated = _was_truncated(body)
+    reasoning = _extract_reasoning(body)
+
     if content is None:
+        # A reasoning arm that spends its whole budget thinking returns a NULL
+        # content on vLLM and an EMPTY STRING on llama.cpp.  Reading the null as
+        # "unreadable body" — which this branch used to do unconditionally —
+        # blamed the harness's own cap on a malformed response AND made
+        # COMPLETION_TRUNCATED unreachable on the vLLM stack entirely.  Measured
+        # 2026-08-06 on qwen3.5-9b with --reasoning-parser: 512 of 512 tokens
+        # spent reasoning, finish_reason `length`, reported `malformed_response`.
+        if truncated:
+            return _fail(
+                Reason.COMPLETION_TRUNCATED,
+                f'the arm spent its whole {PROBE_MAX_TOKENS}-token budget '
+                f'(finish_reason=length) and returned a null content; '
+                f'{len(reasoning)} chars of it went to the thought channel',
+            )
+        if reasoning:
+            return _fail(
+                Reason.EMPTY_COMPLETION,
+                f'the arm stopped normally having emitted {len(reasoning)} '
+                'chars of reasoning and no content at all',
+            )
         preview = json.dumps(body)[:200] if body is not None else 'None'
         return _fail(
             Reason.MALFORMED_RESPONSE,
@@ -302,6 +447,14 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
 
     stripped = content.strip()
     if not stripped:
+        if truncated:
+            return _fail(
+                Reason.COMPLETION_TRUNCATED,
+                f'the arm spent its whole {PROBE_MAX_TOKENS}-token budget '
+                '(finish_reason=length) without emitting any content — a '
+                'reasoning arm whose thinking outran the cap looks exactly '
+                'like this, and is NOT the same failure as an empty answer',
+            )
         return _fail(Reason.EMPTY_COMPLETION, 'the completion was empty')
 
     if stripped.startswith('```'):
@@ -314,6 +467,13 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
     try:
         parsed = json.loads(stripped)
     except ValueError as exc:
+        if truncated:
+            return _fail(
+                Reason.COMPLETION_TRUNCATED,
+                f'the arm hit its {PROBE_MAX_TOKENS}-token budget mid-answer '
+                f'(finish_reason=length), so the fragment does not parse: '
+                f'{_exc_detail(exc)} | content={stripped[:200]!r}',
+            )
         return _fail(Reason.NOT_JSON, f'{_exc_detail(exc)} | content={stripped[:200]!r}')
 
     if not isinstance(parsed, dict):
@@ -323,7 +483,7 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
         )
 
     try:
-        ProbeExtraction.model_validate(parsed)
+        extraction = ProbeExtraction.model_validate(parsed)
     except ValidationError as exc:
         errors = exc.errors()
         missing = [e for e in errors if e['type'] == 'missing']
@@ -335,7 +495,26 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
         reason = Reason.SCHEMA_MISSING_FIELD if missing else Reason.SCHEMA_WRONG_TYPE
         return _fail(reason, located)
 
-    return _ok(f'valid {ProbeExtraction.__name__} for {arm.served_model_name}')
+    # Schema validity is NOT capability.  Everything above this line passes an
+    # arm that returned `{"entities": [], "summary": "..."}` — well-formed,
+    # correctly typed, and empty.  That is not a hypothetical: it is what
+    # qwen3.5-9b returned on every non-reasoning configuration measured on
+    # 2026-08-06, and it was recorded as a PASS.
+    found = _known_entities_found(extraction)
+    if len(found) < PROBE_MIN_ENTITIES:
+        missed = [k for k in PROBE_KNOWN_ENTITIES if k not in found]
+        return _fail(
+            Reason.EXTRACTION_MISSED_ENTITIES,
+            f'the completion is schema-valid but named only {len(found)} of the '
+            f'{len(PROBE_KNOWN_ENTITIES)} entities PROBE_TEXT contains '
+            f'(found {found or "none"}, missed {missed}); '
+            f'{len(extraction.entities)} entities were returned in total',
+        )
+
+    return _ok(
+        f'valid {ProbeExtraction.__name__} for {arm.served_model_name}, '
+        f'naming {len(found)}/{len(PROBE_KNOWN_ENTITIES)} known entities'
+    )
 
 
 def check_model_identity(arm: ArmEntry, models_body: Any) -> ProbeResult:
@@ -628,7 +807,11 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 #: v2 (2026-08-06, esc-3713-6): the vram block gained the live per-arm baseline
 #: and the arm footprint the verdict is now judged on; rows gained their own
 #: measured_at and footprint so a merged slate report stays attributable.
-REPORT_SCHEMA_VERSION = 2
+#: v3 (2026-08-06, esc-3713-10): rows carry the REASONING MODE they were
+#: measured in.  Without it a green slate is not interpretable — the two
+#: thinking-capable arms were measured in opposite modes by accident, and a
+#: report that omits the mode lets eta/theta inherit that choice invisibly.
+REPORT_SCHEMA_VERSION = 3
 
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
@@ -684,6 +867,11 @@ class ArmRow(BaseModel):
     #: row because the merged report keeps only ONE vram block, and without this
     #: the other seven arms' footprints would leave the artifact entirely.
     arm_footprint_mib: int
+    #: The reasoning mode this row was measured in, from the manifest.  A
+    #: verdict is only interpretable alongside it: the same arm passes in both
+    #: modes at very different cost, and a different arm passes in one and
+    #: returns an empty extraction in the other.
+    reasoning: str
 
 
 class VramBlock(BaseModel):
@@ -803,6 +991,7 @@ def run_healthcheck(
                 latency_ms=result.latency_ms,
                 measured_at=measured_at,
                 arm_footprint_mib=budget.arm_footprint_mib,
+                reasoning=arm.reasoning,
             )
         )
 

@@ -159,6 +159,13 @@ def _vllm_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     ]
     if arm.quant and arm.quant != 'none':
         argv += ['--quantization', arm.quant]
+    if arm.reasoning == 'on' and arm.reasoning_parser:
+        # Without this vLLM's structured-output bitmask is filled from token 0
+        # and the model cannot reason at all, whatever the chat template says
+        # (measured on qwen3.5-9b, 2026-08-06 — see lms_manifest's invariant).
+        # The parser also moves the thought out of `message.content`, which is
+        # what lets a reasoning arm still return parseable JSON.
+        argv += ['--reasoning-parser', arm.reasoning_parser]
     argv += [
         '--max-model-len', str(arm.max_model_len),
         '--max-num-seqs', str(arm.max_num_seqs),
