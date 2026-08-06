@@ -26,10 +26,24 @@ import pytest
 import run_fable_trial_v2_campaign as mod
 
 
+_PRE_SIGMA = (mod.MARKER_KEY,)
+"""``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
+
+σ declared ``judged_without_reference`` on ``EvalMetrics``, and ``to_dict`` is a
+bare ``asdict``, so every cell the live instrument emits now carries the key —
+that presence-on-every-cell property is exactly what this driver's per-cell
+validity rule (``MARKER_KEY not in metrics`` -> not known-good) reads, and it
+must NOT be weakened to a conditional emit. But a keyless cell remains a real
+input: ``--results-dir`` replays artifacts written by pre-σ runs. Dropping the
+key EXPLICITLY at those call sites states that premise on purpose, instead of
+inheriting it from the dataclass not yet having the field.
+"""
+
+
 def _cell(
     task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
     role_under_test='architect', cap_tainted=False, invocation_error=None,
-    cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None,
+    cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None, drop_metrics=(),
 ):
     """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
 
@@ -38,10 +52,12 @@ def _cell(
     predicate the report layer reads — a cell declaring a ``plan_quality``
     without the step count it came from is a self-contradictory fixture.
 
-    ``extra_metrics`` merges keys the current ``EvalMetrics`` has no field for.
-    That is exactly how ``judged_without_reference`` will arrive once
-    eval-revival σ (task 3628) adds the field, so tests can exercise the
-    post-σ world without the driver forward-referencing an unlanded instrument.
+    ``extra_metrics`` merges keys on top of the dataclass's own fields, and
+    ``drop_metrics`` pops named keys AFTER that merge, yielding a genuinely
+    KEYLESS cell. Since σ (task 3628) landed, ``judged_without_reference`` is a
+    declared field and so arrives on every cell this helper builds; a call site
+    that needs the pre-σ shape must therefore ask for it with
+    ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
     from orchestrator.evals.metrics import EvalMetrics
     from orchestrator.evals.runner import EvalResult
@@ -56,6 +72,8 @@ def _cell(
         invocation_error=invocation_error,
     )
     metrics = {**m.to_dict(), **(extra_metrics or {})}
+    for key in drop_metrics:
+        metrics.pop(key, None)
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -67,17 +85,27 @@ def _cell(
 
 
 def _mixed_results():
-    """Candidate A with one cap-tainted cell, candidate B with one no-plan cell."""
+    """Candidate A with one cap-tainted cell, candidate B with one no-plan cell.
+
+    Every cell is PRE-σ (keyless), which is what makes this the fixture for the
+    "instrument never measured reference validity" direction — the corpus a
+    ``--results-dir`` replay of an old run produces.
+    """
     return [
         # A: one transport refusal (never got to ask the model) + two scored cells.
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
-        _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6),
-        _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4),
+              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4,
+              drop_metrics=_PRE_SIGMA),
         # B: one genuine no-plan measurement + two scored cells.
-        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0),
-        _cell('f2', 'architect-fable-high', plan_quality=0.70, plan_steps=5),
-        _cell('f3', 'architect-fable-high', plan_quality=0.50, plan_steps=3),
+        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'architect-fable-high', plan_quality=0.70, plan_steps=5,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'architect-fable-high', plan_quality=0.50, plan_steps=3,
+              drop_metrics=_PRE_SIGMA),
     ]
 
 
@@ -91,7 +119,8 @@ def _mixed_marker_results():
     cells carrying the key alongside the old ones that never could.
     """
     return [
-        _cell('f_pre', 'A', plan_steps=5, plan_quality=0.95),
+        _cell('f_pre', 'A', plan_steps=5, plan_quality=0.95,
+              drop_metrics=_PRE_SIGMA),
         _cell('f_post', 'A', plan_steps=5, plan_quality=0.95,
               extra_metrics={'judged_without_reference': False}),
     ]
@@ -402,13 +431,14 @@ def test_rows_are_sorted_by_config_name():
 
 
 def test_marker_absent_everywhere_reports_none_not_zero():
-    """With today's instrument, the count is ``None`` for every candidate.
+    """Over a wholly pre-σ corpus, the count is ``None`` for every candidate.
 
     Asserting ``is None`` and NOT ``== 0`` is the whole point. The marker's
-    producer is eval-revival σ (task 3628), which is unlanded, so no cell can
-    carry the key yet. ``EvalMetrics.to_dict()`` is an ``asdict`` and therefore
-    emits every DECLARED field, which makes "key absent on every cell" mean
-    unambiguously "this instrument predates σ" rather than "no offending cell".
+    producer is eval-revival σ (task 3628); cells written before it landed
+    cannot carry the key, and ``--results-dir`` still replays them.
+    ``EvalMetrics.to_dict()`` is an ``asdict`` and therefore emits every
+    DECLARED field, which makes "key absent on every cell" mean unambiguously
+    "these cells predate σ" rather than "no offending cell".
     Reporting ``0`` would let ``plan_quality`` read as fully validity-bounded
     when nothing bounded it — the silent degradation the PRD exists to end.
     """
@@ -425,7 +455,7 @@ def test_marker_absent_everywhere_reports_none_not_zero():
 
 
 def test_marker_present_counts_per_candidate():
-    """Once σ lands, the key simply starts appearing and the Nones become counts."""
+    """With σ landed the key is simply present, and the Nones become real counts."""
     results = [
         _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
               extra_metrics={'judged_without_reference': True}),
@@ -544,13 +574,14 @@ def test_cap_tainted_cell_bands_unmeasured():
 def test_marker_unavailable_never_bands_ceiling():
     """THE load-bearing D6 safety rule: unknown validity can never discard.
 
-    With σ unlanded the driver cannot know whether a cell was judged against a
-    real reference diff, so the ceiling band's "valid reference exists" conjunct
-    is unsatisfiable and no fixture can be discarded. D6 is explicit about the
+    For a cell carrying no marker the driver cannot know whether it was judged
+    against a real reference diff, so the ceiling band's "valid reference
+    exists" conjunct is unsatisfiable and that fixture can never be discarded.
+    D6 is explicit about the
     asymmetry: misbanding-to-retain costs ~$20 of stage-2 spend, while
     misbanding-to-discard loses signal permanently.
     """
-    m = _metrics(plan_steps=5, plan_quality=0.95)
+    m = _metrics(plan_steps=5, plan_quality=0.95, drop_metrics=_PRE_SIGMA)
     assert mod.MARKER_KEY not in m, 'premise: this cell predates σ and carries no marker'
 
     assert mod.band_for_cell(m, 0.80) == 'intermittent'
@@ -944,7 +975,7 @@ def test_band_for_cell_reads_validity_per_cell():
     that looks load-bearing but is not is precisely the trap that produced this
     bug.
     """
-    keyless = _metrics(plan_steps=5, plan_quality=0.95)
+    keyless = _metrics(plan_steps=5, plan_quality=0.95, drop_metrics=_PRE_SIGMA)
     judged_without = _metrics(plan_steps=5, plan_quality=0.95,
                               extra_metrics={'judged_without_reference': True})
     validly_judged = _metrics(plan_steps=5, plan_quality=0.95,
@@ -989,9 +1020,9 @@ def test_unmeasured_marker_cells_are_counted_per_candidate():
     assert mod.count_unmeasured_marker_cells(fully_keyed) == {'A': 0}
 
     fully_keyless = [
-        _cell('f1', 'A', plan_steps=5, plan_quality=0.9),
-        _cell('f2', 'A', plan_steps=5, plan_quality=0.9),
-        _cell('f3', 'A', plan_steps=5, plan_quality=0.9),
+        _cell('f1', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
     ]
     assert mod.count_unmeasured_marker_cells(fully_keyless) == {'A': 3}
 
@@ -1009,7 +1040,8 @@ def test_implementer_cell_missing_the_key_does_not_poison_the_count():
               extra_metrics={'judged_without_reference': True}),
         _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
               extra_metrics={'judged_without_reference': False}),
-        _cell('f3', 'A', role_under_test='implementer'),  # no marker key at all
+        # No marker key at all: the role filter must reject it BEFORE the key check.
+        _cell('f3', 'A', role_under_test='implementer', drop_metrics=_PRE_SIGMA),
     ]
 
     assert mod.count_judged_without_reference(results) == {'A': 1}
