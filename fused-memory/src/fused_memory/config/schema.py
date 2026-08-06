@@ -214,6 +214,36 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
+    # Which graphiti-core LLM client to construct on the `provider='openai'`
+    # branch (it does NOT affect the anthropic branch).
+    #   'openai'         — graphiti's OpenAIClient, which drives the Responses
+    #                      API (client.responses.create). The shipped default;
+    #                      unchanged behaviour.
+    #   'openai_generic' — graphiti's OpenAIGenericClient, which drives
+    #                      chat.completions. Required for OpenAI-compatible
+    #                      local endpoints (llama.cpp, vLLM, LM Studio, …),
+    #                      which serve chat.completions but not the Responses
+    #                      API. Selecting it also skips the
+    #                      check_openai_responses_api() preflight, which guards
+    #                      a surface this client never touches.
+    client_class: Literal['openai', 'openai_generic'] = Field(default='openai')
+
+    # Structured-output request mode. Applies ONLY when
+    # client_class='openai_generic'; ignored on the 'openai' and anthropic arms.
+    #   'auto'        — graphiti-core 0.28.2's stock, response_model-driven
+    #                   selection: response_format is {'type': 'json_schema'}
+    #                   when a response_model is passed, {'type': 'json_object'}
+    #                   otherwise.
+    #   'json_object' — force {'type': 'json_object'} unconditionally. Needed
+    #                   for the llama.cpp MoE arm, which SILENTLY ignores
+    #                   $ref/$defs in a json_schema response_format
+    #                   (llama.cpp#21228) and so returns off-schema JSON with no
+    #                   error. graphiti-core 0.28.2 ships no upstream knob for
+    #                   this — mode is purely response_model-driven — which is
+    #                   why we own the forcing wrapper
+    #                   (backends/llm_clients.ForceJsonObjectOpenAIGenericClient).
+    structured_output_mode: Literal['auto', 'json_object'] = Field(default='auto')
+
 
 # --- Embedder ---
 
