@@ -4410,6 +4410,130 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
     assert 'recon' in err['reason'].lower()
 
 
+# ── Tests for the server-written `stamped_at` field (task 3576) ──
+#
+# `_validate_done_provenance` is the SINGLE write site: every found_on_main
+# producer funnels through it (the fresh-done path, the same-status repair
+# seam, agent-authored set_task_status calls, and the orchestrator's
+# Scheduler.mark_done). The field is scoped to kind='found_on_main' only —
+# it is the attribution-by-inference kind the soak gate watches; `merged`
+# already carries independent landing evidence.
+
+
+_FIXED_STAMP = '2026-08-06T01:23:45.678901+00:00'
+
+
+@pytest.fixture
+def frozen_provenance_stamp(monkeypatch):
+    """Pin the stamp clock so assertions are exact, not range checks."""
+    import fused_memory.middleware.task_interceptor as ti_mod
+
+    monkeypatch.setattr(ti_mod, '_provenance_stamp_now', lambda: _FIXED_STAMP)
+    return _FIXED_STAMP
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_stamps_found_on_main(tmp_path, frozen_provenance_stamp):
+    """Direct-call: a valid found_on_main blob comes back carrying stamped_at."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+        str(tmp_path),
+        require=False,
+    )
+
+    assert err is None
+    assert resolved is not None
+    assert resolved['stamped_at'] == frozen_provenance_stamp
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_stamp_is_tz_aware_utc_iso8601(tmp_path):
+    """The real (un-patched) clock emits a tz-aware UTC ISO-8601 string.
+
+    Guards the format itself — a naive or local-time stamp would compare
+    wrongly against the predicate's `--since` cutoff.
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+        str(tmp_path),
+        require=False,
+    )
+
+    assert err is None
+    assert resolved is not None
+    stamp = resolved['stamped_at']
+    assert isinstance(stamp, str)
+    parsed = datetime.fromisoformat(stamp)
+    assert parsed.tzinfo is not None, 'stamp must be tz-aware'
+    assert parsed.utcoffset() == UTC.utcoffset(None), 'stamp must be UTC'
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_provenance_stamp):
+    """kind='merged' is deliberately NOT stamped — the field is found_on_main-scoped.
+
+    A leak here would perturb the exact-equality merged-kind assertions
+    elsewhere in this suite, which is precisely why the scoping exists.
+    """
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=False,
+    )
+
+    assert err is None
+    assert resolved is not None
+    assert 'stamped_at' not in resolved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'raw',
+    [
+        {'kind': 'deterministic-deploy', 'pid': 4242, 'unit': 'fused-memory.service'},
+        {'kind': 'deterministic-deploy-scheduled', 'unit': 'fused-memory.service'},
+        {'kind': 'deterministic-gate', 'note': 'pure gate resolved'},
+        {'kind': 'deterministic-milestone'},
+        {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted'},
+    ],
+    ids=['deploy', 'deploy-scheduled', 'gate', 'milestone', 'operational-verified'],
+)
+async def test_validate_done_provenance_does_not_stamp_other_kinds(
+    tmp_path, frozen_provenance_stamp, raw
+):
+    """Every non-found_on_main kind omits stamped_at."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        raw,
+        str(tmp_path),
+        require=False,
+        is_recon_stage=False,
+    )
+
+    assert err is None, f'expected acceptance but got: {err}'
+    assert resolved is not None
+    assert 'stamped_at' not in resolved
+
+
 @pytest.mark.asyncio
 async def test_done_provenance_accepts_operational_verified_end_to_end(
     taskmaster, reconciler, event_buffer, tmp_path
