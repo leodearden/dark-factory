@@ -35,7 +35,12 @@ from orchestrator.pytest_markers import (
     resolve_marker_expression,
 )
 from orchestrator.verify_cmd import parse_config_command
-from orchestrator.verify_plan import ScopeKind, VerifyPlan, derive_verify_plan
+from orchestrator.verify_plan import (
+    ScopeKind,
+    VerifyPlan,
+    deselecting_expression_for_command,
+    derive_verify_plan,
+)
 
 # ---------------------------------------------------------------------------
 # resolve_marker_expression (step-1: RED)
@@ -802,3 +807,168 @@ class TestWarmLaneBashRealConfigRegression:
         assert run.scoped_targets == ()
         assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
+
+
+# ---------------------------------------------------------------------------
+# The FALLBACK (no-module_configs) arm — task 3513, the 3494 twin
+# ---------------------------------------------------------------------------
+#
+# Task 3494 closed the "path says COLLECTABLE_TEST, pytest collects zero -> rc=5
+# -> false RED" defect in ``_derive_module_runs`` arm 4 only.  The twin arm in
+# ``_derive_fallback_runs`` (fires when a project registers NO module_configs)
+# has the identical failure mode: a repo root carrying
+# ``addopts = "-m 'not X'"`` plus a diff touching only X-marked test files still
+# plans — and, crucially, EXECUTES — a zero-collecting file-scoped run.
+#
+# The two arms share ONE probe (``deselecting_expression_for_command``) so they
+# can never disagree about which commands are refused or where the ini file is
+# looked for; a divergence there would reopen exactly the over-fire risk task
+# 3494's docstring feared.
+
+#: Every ``*.py`` these readers serve is module-level ``slow``-marked, and every
+#: ``*pyproject.toml`` deselects ``slow`` — so a REFUSAL test can never pass
+#: vacuously through a missing file.  If the guard under test stopped firing,
+#: the widening would happen and the assertion would fail.
+_SLOW_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.slow\n\n\ndef test_x():\n    pass\n'
+_UNMARKED_PLAIN_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
+
+
+def _permissive_reader(
+    reads: list[str],
+    overrides: dict[str, str | None] | None = None,
+):
+    """A recording reader that says "yes, widen" to everything it is not overridden on.
+
+    Serves ``_DESELECTING_PYPROJECT`` at EVERY ``*pyproject.toml`` path and
+    ``_SLOW_MARKED_SOURCE`` at every ``*.py`` path, recording each read into
+    *reads*.  *overrides* wins where present (a ``None`` value models a file the
+    reader cannot read — a directory, or a missing path).
+
+    Same injected seam as ``verify_plan``'s ``worktree_reader``
+    (``Callable[[str], str | None]``); no new I/O is introduced.
+    """
+    over = overrides or {}
+
+    def read(path: str) -> str | None:
+        reads.append(path)
+        if path in over:
+            return over[path]
+        if path.endswith('pyproject.toml'):
+            return _DESELECTING_PYPROJECT
+        if path.endswith('.py'):
+            return _SLOW_MARKED_SOURCE
+        return None
+
+    return read
+
+
+class TestDeselectingExpressionForCommand:
+    """``deselecting_expression_for_command(test_command, targets, worktree_reader)``.
+
+    Task 3494's probe, promoted to a public pure function taking a COMMAND
+    STRING instead of a ModuleConfig, so the module arm and the new fallback
+    arm share one implementation of "which commands are refused" and "where the
+    ini file is looked for".  Returns the effective ``-m`` expression iff it
+    provably deselects EVERY target; None — "keep today's FILE_SCOPED
+    behaviour" — in every other case.
+
+    *targets* are worktree-ROOT-relative (the reader's frame), while the
+    command's own targets may be cwd-relative; only the CONFIG path follows the
+    command's ``cwd_rel``.
+    """
+
+    def test_marked_target_under_a_deselecting_root_returns_the_expression(self):
+        """The positive case: the bare fallback shape, root pyproject, marked target."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) == 'not slow'
+
+    def test_a_command_without_a_cwd_reads_the_repo_root_config(self):
+        """WHERE: no ``cd``/``--directory`` means pytest's rootdir IS the repo root."""
+        reads: list[str] = []
+        deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'], _permissive_reader(reads),
+        )
+        assert 'pyproject.toml' in reads
+        assert 'mod/pyproject.toml' not in reads
+
+    def test_a_cd_command_reads_that_subprojects_config_not_the_root(self):
+        """The anti-over-fire pin: the probe follows the command's effective rootdir.
+
+        ``cd sub && uv run pytest ...`` roots at ``sub``, so a root-only
+        ``addopts`` must never be what proves the deselection.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads)
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
+        ) == 'not slow'
+        assert 'sub/pyproject.toml' in reads
+        assert 'pyproject.toml' not in reads, 'root config is not this command\'s rootdir'
+
+    #: ``npm test`` and ``./scripts/test.sh`` both parse OPAQUE; a pyproject's
+    #: addopts describe a suite neither command ever invokes, so consulting them
+    #: would widen on a false premise.
+    @pytest.mark.parametrize('test_command', ['npm test', './scripts/test.sh'])
+    def test_a_non_pytest_command_is_refused(self, test_command):
+        """GUARD 1."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            test_command, ['mod/tests/test_a.py'], _permissive_reader(reads),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_a_raw_retained_chain_is_refused(self):
+        """GUARD 2: a chained command hides both its rootdir and which clause is scoped."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest x && cd .. && pytest y',
+            ['sub/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_a_none_command_is_refused(self):
+        """No command means no suite to reason about."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            None, ['mod/tests/test_a.py'], _permissive_reader(reads),
+        ) is None
+        assert reads == []
+
+    def test_empty_targets_never_widen(self):
+        """An empty target list is refused, never treated as vacuously all-deselected."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest', [], _permissive_reader(reads),
+        ) is None
+
+    def test_one_unmarked_target_is_enough_to_refuse(self):
+        """ALL, not ANY — a single still-collecting target means the run is not empty."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {'mod/tests/test_b.py': _UNMARKED_PLAIN_SOURCE})
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py mod/tests/test_b.py',
+            ['mod/tests/test_a.py', 'mod/tests/test_b.py'],
+            read,
+        ) is None
+
+    def test_an_unreadable_target_is_refused(self):
+        """A None answer proves nothing — the fail-safe direction."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {'mod/tests/test_a.py': None})
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'], read,
+        ) is None
+
+    def test_a_cli_dash_m_that_reselects_the_bucket_is_refused(self):
+        """Last-wins: a CLI ``-m slow`` SELECTS the marked target the addopts dropped."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest -m slow mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) is None
