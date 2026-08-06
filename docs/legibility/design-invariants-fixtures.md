@@ -11,7 +11,8 @@ questions — this doc does not restate them (per INV-5
 `no-lockstep-duplication`). When in doubt about a rule or a checkable
 question, Read the normative doc, not this one. INV-1..5 fixtures were
 seeded 2026-07-14; INV-6..7 fixtures were added 2026-08-02 with the
-task/escalation state-graph invariants.
+task/escalation state-graph invariants; INV-8 fixtures were added
+2026-08-06 with the loop-occupancy invariant.
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -310,6 +311,47 @@ def maybe_skip_recovery(task, open_escalations):
 
 ```json
 {"invariant": "holds-owned-and-bounded", "file": "orchestrator/src/orchestrator/recovery_skip.py", "line": 5, "issue": "an open escalation vetoes recovery with no structured fact naming the pinning record, no streak counter, and no bound — the hold has no visible owner and can persist indefinitely in silence", "severity": "high"}
+```
+
+## INV-8 `loop-thread-occupancy-bounded`
+
+### PRD-leaf-shaped (`INV-8-PRD`)
+
+> Add a staleness badge to the dashboard's status payload: for every task
+> on the live board, shell out to `git log -1` in that task's worktree to
+> read its last commit timestamp, then format the badge from it. The
+> renderer is a plain `def` called from the payload coroutine. Measured at
+> ~30 ms per task in local testing, so the added render cost is negligible.
+
+**Expected disposition**: `flag: loop-thread-occupancy-bounded`
+
+**Redesign that clears it**: Offload the blocking git calls
+(`asyncio.to_thread` at the boundary, per INV-8's house pattern), hoist
+the per-render-invariant work out of the loop body, and bound the fan-out
+with an explicit cap that LOGS what it dropped — so worst-case
+loop-thread occupancy is a function of the cap, not of board size. Both
+limbs are required: offloading alone still burns unbounded wall clock,
+and capping alone still blocks the loop.
+
+### Code-snippet-shaped (`INV-8-CODE`)
+
+```python
+async def build_status_payload(board) -> dict:
+    badges = []
+    for t in board.active_tasks:  # uncapped — the whole live board
+        # blocking wait AND an inline fork/exec, both on the loop thread
+        proc = subprocess.run(
+            ["git", "-C", t.worktree, "log", "-1", "--format=%cI"],
+            capture_output=True, text=True,
+        )
+        badges.append(format_badge(t.id, proc.stdout.strip()))
+    return {"badges": badges}
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "loop-thread-occupancy-bounded", "file": "dashboard/src/dashboard/status_badges.py", "line": 5, "issue": "build_status_payload runs a blocking git subprocess per task on the event-loop thread over the uncapped active_tasks set — nothing offloads the call and nothing bounds the item count, so worst-case occupancy scales with board size", "severity": "high"}
 ```
 
 ## Rehearsal verdict table
