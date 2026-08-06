@@ -811,6 +811,104 @@ class TestNoGraphitiDriverIsConstructed:
         assert not [ln for ln in imports if 'graphiti_core' in ln]
 
 
+class TestReaderRejectsUnusableContent:
+    """`content` is the replay experiment's independent variable, so NULL is loud.
+
+    A FalkorDB projection over a node lacking the property yields NULL, which
+    reaches the record as None. Caught at the seam, in the same loop as the
+    stratum-key check — not deferred to hashing, which would only fire if the
+    row happened to be drawn while an undrawn one still inflated its stratum's
+    denominator.
+    """
+
+    def _row_without_content(self, uuid: str = 'u-null') -> list[object]:
+        row = _row(uuid)
+        row[_mod.PROJECTED_FIELDS.index('content')] = None
+        return row
+
+    def test_a_null_content_row_aborts_the_fetch(self):
+        with pytest.raises(_mod.CorpusBuildError):
+            _fetch(_FalkorDouble([_row('u1'), self._row_without_content()]))
+
+    def test_the_error_names_the_row_and_the_episode(self):
+        """Every other error in the module names its offender; so does this one."""
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _fetch(_FalkorDouble([_row('u1'), self._row_without_content('u-null')]))
+        assert 'u-null' in str(exc.value)
+        assert 'row 1' in str(exc.value)
+
+    def test_an_undrawn_null_row_is_not_silently_counted(self):
+        """The whole population is validated, not just what selection touches.
+
+        Without this, a NULL-content row would sit in a stratum denominator,
+        skewing every proportional share computed from it, and only surface if
+        some later seed happened to draw it.
+        """
+        rows = [_row(f'u{i}') for i in range(8)] + [self._row_without_content()]
+        with pytest.raises(_mod.CorpusBuildError):
+            _fetch(_FalkorDouble(rows))
+
+    def test_content_hash_error_can_name_the_episode(self):
+        """The optional uuid= is what makes the deferred failure diagnosable."""
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.content_hash(None, uuid='e622a9bf')
+        assert 'e622a9bf' in str(exc.value)
+        assert 'NoneType' in str(exc.value)
+
+
+class TestFalkorEnvWiring:
+    """Host/port come from the same env vars the fused-memory test suite uses.
+
+    An operator who pointed the suite at a FalkorDB has pointed this script at
+    the same one — so these three behaviours are contract, not incidental.
+    """
+
+    def test_port_defaults_when_unset(self, monkeypatch):
+        monkeypatch.delenv('FALKOR_PORT', raising=False)
+        assert _mod._falkor_port_from_env() == 6379
+
+    def test_port_defaults_when_empty(self, monkeypatch):
+        """`FALKOR_PORT: ${FALKOR_PORT}` in a CI template expands to ''."""
+        monkeypatch.setenv('FALKOR_PORT', '   ')
+        assert _mod._falkor_port_from_env() == 6379
+
+    def test_port_is_converted_to_int_not_left_a_string(self, monkeypatch):
+        """Load-bearing: FalkorDB(port='6379') misbehaves."""
+        monkeypatch.setenv('FALKOR_PORT', '6380')
+        port = _mod._falkor_port_from_env()
+        assert port == 6380
+        assert isinstance(port, int) and not isinstance(port, bool)
+
+    def test_a_non_numeric_port_is_an_operator_error_naming_the_var(self, monkeypatch):
+        """Never a connection failure — those send the reader after the store."""
+        monkeypatch.setenv('FALKOR_PORT', 'not-a-port')
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod._falkor_port_from_env()
+        assert 'FALKOR_PORT' in str(exc.value)
+        assert 'not-a-port' in str(exc.value)
+
+    def test_host_defaults_to_localhost(self, monkeypatch):
+        monkeypatch.delenv('FALKOR_HOST', raising=False)
+        assert _mod._falkor_host_from_env() == 'localhost'
+
+    def test_host_is_read_from_the_env(self, monkeypatch):
+        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
+        assert _mod._falkor_host_from_env() == 'falkor.internal'
+
+    def test_the_reader_actually_reads_them(self, monkeypatch):
+        """The env plumbing is only worth testing if the seam consumes it."""
+        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
+        monkeypatch.setenv('FALKOR_PORT', '6380')
+        reader = _mod.EpisodeReader(graph=_FalkorDouble([]))
+        assert (reader.host, reader.port) == ('falkor.internal', 6380)
+
+    def test_explicit_arguments_win_over_the_env(self, monkeypatch):
+        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
+        monkeypatch.setenv('FALKOR_PORT', '6380')
+        reader = _mod.EpisodeReader(graph=_FalkorDouble([]), host='other', port=1234)
+        assert (reader.host, reader.port) == ('other', 1234)
+
+
 # ===========================================================================
 # Manifest — structure, reconciliation, byte-stability
 # ===========================================================================
@@ -966,6 +1064,31 @@ class TestNoOutcomeFilterStatement:
             'month(created_at)',
             'payload_kind(source_description)',
         ]
+
+    def test_records_the_record_type_s_own_fields_reflected_not_copied(self):
+        """The second, independent derivation of the projection claim.
+
+        `projected_fields` is the constant the Cypher RETURN is built from;
+        `record_fields` is reflected off EpisodeRecord, the type that actually
+        holds a fetched row. A reviewer holding only the artifact can see the
+        record carries nothing beyond what was projected — the docstring's
+        promise, mechanized rather than asserted.
+        """
+        block = _built()['no_outcome_filter']
+        assert block['record_fields'] == list(_mod.record_field_names())
+        assert block['record_fields'] == list(_mod.PROJECTED_FIELDS)
+
+    def test_an_outcome_field_on_the_record_would_show_up_in_the_manifest(self):
+        """The claim is only worth recording if it can go red.
+
+        Reflection over the live dataclass, so adding an outcome attribute to
+        EpisodeRecord surfaces in the artifact rather than being papered over by
+        a hand-maintained list that still says six fields.
+        """
+        assert _mod.record_field_names() == tuple(
+            f.name for f in dataclasses.fields(_mod.EpisodeRecord)
+        )
+        assert 'entity_edges' not in _built()['no_outcome_filter']['record_fields']
 
 
 class TestManifestSerialization:
@@ -1340,6 +1463,87 @@ class TestVerifyCatchesTampering:
         assert report.status == 'id_mismatch'
 
 
+class TestVerifyDistinguishesASamplerChangeFromTampering:
+    """BUILDER_VERSION is READ at verification, not merely stamped at build.
+
+    A manifest built before a sampling rule moved does not re-derive under the
+    new one BY CONSTRUCTION. Reporting that as a bare id_mismatch — whose
+    documented remedy is "re-derive, or investigate tampering" — would point the
+    reviewer at the one explanation that is not true. The verdict is unchanged
+    (the artifact really is out of date with its own criteria); the diagnosis
+    is not.
+    """
+
+    def _criteria(self, **over):
+        return {
+            'builder_version': _mod.BUILDER_VERSION,
+            'allocation_rule': _mod.ALLOCATION_RULE,
+            'selection_rule': _mod.SELECTION_RULE,
+            **over,
+        }
+
+    def test_matching_rules_produce_no_drift_fragment(self):
+        """Never invents a failure for a manifest this builder still agrees with."""
+        assert _mod._rule_drift(self._criteria()) == ''
+
+    @pytest.mark.parametrize(
+        'field,value',
+        [
+            ('builder_version', 0),
+            ('allocation_rule', 'pure proportional, no floor'),
+            ('selection_rule', 'top-n by score'),
+        ],
+    )
+    def test_a_moved_rule_is_named_with_both_values(self, field, value):
+        fragment = _mod._rule_drift(self._criteria(**{field: value}))
+        assert field in fragment
+        assert repr(value) in fragment
+
+    def test_a_manifest_that_records_no_rules_at_all_reads_as_drift(self):
+        """Silence is not agreement — an unstamped artifact predates the stamp."""
+        assert _mod._rule_drift({}) != ''
+
+    def test_the_id_mismatch_detail_carries_the_diagnosis(self):
+        """The reviewer reads the detail, not the constant."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        stale = {
+            **manifest,
+            'criteria': {
+                **manifest['criteria'],
+                'seed': 'whatever-the-old-builder-used',
+                'builder_version': 0,
+            },
+        }
+        report = _mod.verify_manifest(stale, population)
+        assert report.status == 'id_mismatch'
+        assert 'builder_version' in report.detail
+
+    def test_a_same_version_mismatch_is_not_blamed_on_the_builder(self):
+        """The control: real tampering must NOT be excused as an upgrade."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        tampered = {**manifest, 'criteria': {**manifest['criteria'], 'seed': 'x'}}
+        report = _mod.verify_manifest(tampered, population)
+        assert report.status == 'id_mismatch'
+        assert 'builder_version' not in report.detail
+
+    def test_a_version_bump_alone_still_verifies_green(self):
+        """A stamp bump with the rules unmoved is not a corpus failure.
+
+        The fragment rides on id_mismatch rather than being its own status
+        precisely so this case stays ok — otherwise every version bump would
+        red a corpus the new builder re-derives perfectly.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        bumped = {
+            **manifest,
+            'criteria': {**manifest['criteria'], 'builder_version': 99},
+        }
+        assert _mod.verify_manifest(bumped, population).status == 'ok'
+
+
 class TestVerifyCatchesContentDrift:
     """Hash drift is a DIFFERENT failure from an id mismatch."""
 
@@ -1420,6 +1624,17 @@ class TestVerifyStatusSemantics:
             'missing_episodes',
             'bad_manifest',
         }
+
+    def test_run_failed_is_disjoint_from_every_verification_status(self):
+        """1 is reserved for "no verdict was reached" and must stay unclaimed.
+
+        The two code spaces are only useful while they are disjoint: a caller
+        distinguishes "the corpus is wrong" from "the check never ran" by the
+        code alone. Pinned rather than left incidental, so a future status
+        cannot quietly take 1.
+        """
+        assert _mod.EXIT_RUN_FAILED == 1
+        assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
 
     def test_ok_is_zero_and_every_failure_is_distinctly_non_zero(self):
         codes = _mod.EXIT_CODES
@@ -1626,10 +1841,18 @@ class TestCliBuildMode:
     def test_an_unsatisfiable_n_exits_non_zero_and_writes_nothing(
         self, monkeypatch, tmp_path, capsys
     ):
-        """A too-large n is a loud usage error, never a quietly shorter corpus."""
+        """A too-large n is a loud usage error, never a quietly shorter corpus.
+
+        Pinned to EXIT_RUN_FAILED specifically, not merely non-zero: the module
+        contract is that 1 means "the run never produced a verdict" while
+        EXIT_CODES 2-5 mean "here is the verdict, and it is bad". A bare
+        `code != 0` would keep passing if this path started returning
+        bad_manifest — the exact conflation the two code spaces exist to
+        prevent.
+        """
         out = tmp_path / 'corpus_manifest.json'
         code, _ = _run_cli(monkeypatch, '--n', '99999', '--out', str(out))
-        assert code != 0
+        assert code == _mod.EXIT_RUN_FAILED
         assert not out.exists()
         assert capsys.readouterr().err.strip()
 
@@ -1732,6 +1955,52 @@ class TestCliVerifyMode:
         before = out.read_bytes()
         _run_cli(monkeypatch, '--verify', '--out', str(out))
         assert out.read_bytes() == before
+
+    def test_verify_reads_the_graph_the_manifest_names_not_the_flag(
+        self, monkeypatch, tmp_path
+    ):
+        """"Re-derive from the recorded criteria" includes WHICH population.
+
+        Verifying against a different graph would compare a corpus to a
+        population it was never drawn from — every id would look missing, and
+        the verdict would describe the operator's flag rather than the artifact.
+        Asserted on what the CLI actually asked the reader for, so a regression
+        that read args.graph here cannot pass.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        assert json.loads(out.read_text(encoding='utf-8'))['criteria']['graph'] == (
+            'dark_factory'
+        )
+        _, factory = _run_cli(
+            monkeypatch, '--verify', '--out', str(out), '--graph', 'other_graph'
+        )
+        assert factory.calls == [{'graph_name': 'dark_factory'}]
+
+    def test_the_graph_flag_is_the_fallback_for_a_manifest_recording_none(
+        self, monkeypatch, tmp_path
+    ):
+        """A manifest with no recorded graph is verifiable, not unverifiable."""
+        out = self._built_manifest(monkeypatch, tmp_path)
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        del manifest['criteria']['graph']
+        out.write_text(json.dumps(manifest), encoding='utf-8')
+        _, factory = _run_cli(
+            monkeypatch, '--verify', '--out', str(out), '--graph', 'other_graph'
+        )
+        assert factory.calls == [{'graph_name': 'other_graph'}]
+
+    def test_n_and_seed_flags_are_ignored_under_verify(self, monkeypatch, tmp_path):
+        """Verification re-derives from the RECORDED criteria, never the flags.
+
+        If --n/--seed steered the re-derivation, `--verify` would become a check
+        of whatever the caller typed and a good artifact would fail on a stale
+        shell history — while a tampered one could be made to pass.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        code, _ = _run_cli(
+            monkeypatch, '--verify', '--out', str(out), '--n', '30', '--seed', 'other'
+        )
+        assert code == 0
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
