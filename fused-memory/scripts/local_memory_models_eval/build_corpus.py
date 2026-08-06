@@ -973,7 +973,11 @@ class VerifyReport:
     detail: str
     checked: int = 0
     rederived: list[str] = dataclasses.field(default_factory=list)
-    id_mismatch: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    # The value type is a union because the diff carries two kinds of entry:
+    # the id lists naming each side, and ``order_differs`` — the boolean that
+    # separates "the same episodes in a different order" from "different
+    # episodes", which are different diagnoses with different remedies.
+    id_mismatch: dict[str, list[str] | bool] = dataclasses.field(default_factory=dict)
     hash_drift: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
     missing: list[str] = dataclasses.field(default_factory=list)
 
@@ -1086,7 +1090,7 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
                 'only_in_manifest': sorted(set(recorded_ids) - set(rederived)),
                 'only_in_rederivation': sorted(set(rederived) - set(recorded_ids)),
                 'order_differs': sorted(set(recorded_ids)) == sorted(set(rederived)),
-            },  # type: ignore[dict-item]
+            },
         )
 
     drift = {

@@ -388,7 +388,7 @@ def _record(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts', con
     )
 
 
-def _population(per_cell: dict[tuple[str, str], int]) -> list[_mod.EpisodeRecord]:
+def _population(per_cell: dict[tuple[str, str], int]):
     """A synthetic population with the requested per-cell counts.
 
     UUIDs are zero-padded and globally unique so canonical uuid sorting is
