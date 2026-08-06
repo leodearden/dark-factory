@@ -13,8 +13,9 @@ its commits live only on the unmerged task/3424 branch — so there is no
 portable checker this module could instead exercise against a fixture. A
 future run on a host with the unit installed and reconciled gets a live
 green answer about ITS install; a fresh checkout or CI runner with no
-installed unit and no user D-Bus session degrades to a skip (see the guards
-below), never a false failure.
+installed unit, no user D-Bus session, or a pre-254 systemd that has never
+heard of RestartSteps= degrades to a skip (see the guards below), never a
+false failure.
 
 Scope is deliberately narrow: two PROPERTIES of exactly one unit
 (orchestrator-know-live.service), at two layers — not a byte-parity sweep
@@ -152,6 +153,16 @@ def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
     user D-Bus session). Callers treat None as "skip", not "fail": this
     invariant requires a live systemd --user manager to answer, and its
     absence is an environment fact rather than a defect in the unit.
+
+    A property systemd does not implement at all (verified: `-p
+    SomeUnknownProperty` against a live unit exits 0 with EMPTY stdout, on
+    this host's systemd 255.4) is NOT surfaced as None here — it is simply
+    absent from the returned dict, distinct from a recognised-but-blank
+    value. Callers that care about that distinction (e.g. RestartSteps=,
+    unsupported before systemd 254) must check `"Prop" not in shown`
+    themselves; collapsing "unsupported" into the same falsy shape as
+    "supported and empty" is how a guard meant to skip cleanly on an old
+    systemd instead fails loudly and misleadingly on one.
     """
     argv = ["systemctl", "--user", "show", unit]
     for prop in properties:
@@ -255,6 +266,16 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
         pytest.skip(
             "systemctl --user show could not be queried (no user D-Bus "
             "session in this runner)"
+        )
+    if "RestartSteps" not in shown:
+        pytest.skip(
+            f"systemctl --user show {UNIT_BASENAME} -p RestartSteps returned "
+            "no RestartSteps= property at all (empty stdout, not merely an "
+            "empty value) — most likely this host's systemd predates 254, "
+            "which introduced RestartSteps=/RestartMaxDelaySec=. Verified: "
+            "`systemctl --user show <unit> -p <unsupported-property>` exits "
+            "0 with empty stdout, so there is nothing for this guard to "
+            "assert against an unsupported property."
         )
     steps = shown.get("RestartSteps")
     assert steps == "4", (
