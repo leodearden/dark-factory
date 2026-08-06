@@ -53,7 +53,9 @@ records the verdict each yields against the expected slug. Columns:
 | Verdict | The disposition the as-landed gate/review text actually yields when walked against the fixture |
 | Match | `Y` if the verdict's slug equals the expected slug, else `N` |
 
-Acceptance: every fixture flags with the correct slug — all 10 rows `Y`.
+Acceptance: every fixture flags with the correct slug. The base table
+holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7) and
+the 2026-08-06 addendum adds 2 (INV-8) — 16 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -404,6 +406,43 @@ copy contradicting the doc) and the Step 5.5 audit text:
 **Addendum result: 4/4 match** (cumulative 14/14). No wording changes to
 the gate/review text were needed — both consumers read the normative
 doc's questions at run time.
+
+### Addendum — INV-8 walk (2026-08-06)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the commit that landed them
+(steps 1-2 of task 3779) rather than from the drafting context. Two G7
+paths now exist for a PRD-shaped fixture and both were walked: the
+normative path (G7's "walk every task in the batch against each
+invariant's checkable question", which Reads the doc at run time and
+auto-extended to INV-8 with no edit) and the no-invariants-file fallback
+path (G7's trigger-shape list, which does NOT auto-extend and gained an
+INV-8 entry in the same change — same reasoning as the 2026-08-02
+family-row update above).
+
+The same snapshot caveat applies: the Verdict column transcribes
+phrasing as it read on 2026-08-06, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-8-PRD` | PRD | INV-8 loop-thread-occupancy-bounded | `loop-thread-occupancy-bounded` | Normative path: G7's walk of the checkable question ("who bounds that collection's size?", "does the process spawn itself run on the loop thread?") fires — the row bounds `board.active_tasks` nowhere and its plain `def` called from the payload coroutine puts the fork/exec on the loop thread, while its own justification cites only the per-item ~30 ms, which is the per-item-cost-vs-occupancy confusion the rule names. Fallback path: the new trigger-shape entry ("a coroutine doing blocking or unbounded per-item work on the event-loop thread") fires on the same row → `flag: loop-thread-occupancy-bounded` | Y |
+| `INV-8-CODE` | CODE | INV-8 loop-thread-occupancy-bounded | `loop-thread-occupancy-bounded` | Step 5.5 ("Read it and audit the modules in scope against each invariant's checkable question" — unchanged, Reads the doc generically) applies INV-8's question to `build_status_payload`: the `subprocess.run` is neither non-blocking nor offloaded, `board.active_tasks` is uncapped, and nothing is hoisted out of the body, so worst-case occupancy scales with board size → `invariant_findings` entry with `invariant="loop-thread-occupancy-bounded"`, `severity="high"` per Step 5.5's blast-radius classification | Y |
+
+**Addendum result: 2/2 match** (cumulative 16/16). No wording change to
+`docs/legibility/design-invariants.md`'s INV-8 checkable question, to
+G7's walk instruction, or to Step 5.5 was needed — the walk matched on
+its first pass. The one gate-text edit this change did require (G7's
+trigger-shape entry) is not a rehearsal miss: that list is the
+enumerated fallback for projects with no invariants file, so it never
+auto-extends on any invariant addition.
+
+Isolation re-checked while walking: no other trigger shape fires on
+either INV-8 fixture — there is no fallback or suppressor (INV-4), no
+copied constant (INV-5), no prose contract or undeclared tool envelope
+(INV-1), no log-scrape of emitter-known facts (`--format=%cI` reads git
+ground truth rather than re-deriving a fact a local emitter already held,
+so not INV-2), and reading live git is corroboration rather than action
+on a snapshot (not INV-3).
 
 ## Reconciliation
 
