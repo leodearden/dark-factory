@@ -2892,14 +2892,31 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
     ``queries: 0`` is a legitimate result and every metric under it is
     ``None`` — an empty subset is "not asked", never a measured zero.
     """
+    import statistics  # noqa: PLC0415
+
     canonical_ranks = [
         row['canonical_rank'] for row in rows if row['canonical_rank'] is not None
     ]
     median_rank: float | None = None
     if canonical_ranks:
-        import statistics  # noqa: PLC0415
-
         median_rank = float(statistics.median(canonical_ranks))
+    #: The TRANSFORM-BLIND half of the same question.  `canonical_rank` above
+    #: is measured over the read window, so under `b_grouped` it credits a
+    #: synthesised grouped document that wears the canonical's `record_id` —
+    #: any child hit folding upward is scored as "the canonical was found".
+    #: These ranks are measured over the RAW store hits, before grouping and
+    #: before the pin, and so answer the strictly narrower question: did the
+    #: canonical's own STORED record rank?  Both are reported because both
+    #: are true; the gap between them is the read transform's contribution,
+    #: and folding it invisibly into one column is what made the headline
+    #: `b_grouped` number unreadable.
+    stored_ranks = [
+        row['stored_canonical_rank'] for row in rows
+        if row['stored_canonical_rank'] is not None
+    ]
+    stored_median_rank: float | None = None
+    if stored_ranks:
+        stored_median_rank = float(statistics.median(stored_ranks))
     return {
         'queries': len(rows),
         'claim_recall': {
@@ -2923,6 +2940,18 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
             # run actually looked. That is the same class of defect as the
             # censored median this field exists to disclose.
             'canonical_rank_window': limit,
+            # The transform-blind counterpart of the three keys above, in the
+            # same order and with the same contracts: rate through `_mean`
+            # (so a query with no canonical is a non-observation, not a 0.0),
+            # median over successes only, and the censored denominator that
+            # median is taken over.  `canonical_candidates` is shared — both
+            # halves ask about the same queries, only through different
+            # windows — so it is not duplicated.
+            'stored_canonical_in_top_5_rate': _mean(
+                [row['stored_canonical_in_5'] for row in rows],
+            ),
+            'stored_canonical_median_rank': stored_median_rank,
+            'stored_canonical_found_count': len(stored_ranks),
         },
     }
 
