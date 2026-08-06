@@ -28,26 +28,27 @@ test_scan_provenance_note_log_leaks.py and test_audit_wiped_metadata_files.py.
 Those files keep their own copies as the untouched regression gate for the
 extraction; this file pins the shared implementation directly.
 
-COVERAGE CAVEAT — this file is NOT executed by any verify chain.
-Every chain runs ``tests/scripts/`` (scripts/orchestrator.yaml:13,
-tests/scripts/orchestrator.yaml:47, and the root
-dark-factory-orchestrator.yaml:41 fleet command), which is a DIFFERENT
-directory from the ``scripts/tests/`` this file lives in — the near-identical
-names are the trap. So run it explicitly:
+COVERAGE — this file IS executed by the verify chains that matter for it
+(task 3384 closed the gap a former caveat here recorded; re-verified
+2026-08-06). Both of these run the directory this file lives in:
+
+    scripts/orchestrator.yaml (test_command)
+        uv run --project shared pytest tests/scripts/ scripts/tests/ \\
+            --tb=short -q --timeout=300
+    dark-factory-orchestrator.yaml (test_command, tail segment)
+        uv run --project shared pytest tests/scripts/ scripts/tests/ \\
+            --timeout=300
+
+STILL THE TRAP, so it is kept: ``scripts/tests/`` (this directory) and
+``tests/scripts/`` (a suite at the repo root) are near-homographs but DIFFERENT
+directories. A command naming only one of them covers only one of them — which
+is exactly how the original gap arose. ``tests/scripts/orchestrator.yaml`` is
+correctly scoped to ``tests/scripts/`` alone and does not collect this file;
+the two chains above are what gate it.
+
+To run just this suite:
 
     uv run --project shared pytest scripts/tests/test_task_db_scan.py -q
-
-The gap is pre-existing (44 files already sat here before task 3336) and was
-out of that task's scope to fix — it holds no lock on any orchestrator.yaml.
-It is recorded rather than assumed away: ticket tkt_0RRZ2N8MTQ8GCC4VVGTJ1PMDKB
-proposes either adding ``scripts/tests/`` to the chains or relocating these
-suites to ``tests/scripts/`` (whose conftest.py already puts ``scripts/`` on
-sys.path, so ``import _task_db_scan`` would resolve there unchanged — but see
-this module's IMPORT-RESOLUTION CONTRACT: the tests may move, the module
-may not). Until then the only gated signal touching _task_db_scan.py is
-indirect: tests/scripts/test_repair_wiped_metadata_files.py imports
-audit_wiped_metadata_files, which imports this module, so a hard ImportError
-surfaces there but a behavioural regression does not.
 """
 from __future__ import annotations
 
