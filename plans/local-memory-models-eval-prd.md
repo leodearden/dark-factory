@@ -199,6 +199,13 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
     - **Consequence** (not a decision — see Open Q3): the three dense LLM arms (~6, ~9, ~14 GiB) and
       all embedding arms still fit inside ~16.4 GiB; the MoE stretch arm (~17GB) does not. Flagged at
       the arm table (line 127) and Open Q3; sizing left open for α/η.
+    - **Subject, made explicit:** ~16.4 GiB above is measured **free** VRAM — the pool an arm's own
+      footprint draws from — and is **not** a ceiling on total card usage. Total usage necessarily
+      includes the ~7.2 GiB whisper-writer + KDE/X11 desktop baseline, so a `total_used ≤ 16.4 GiB`
+      reading is a different, much stricter claim that this correction does **not** make. Which of
+      the two readings α's health verdict should enforce is the open question at the task-α row's
+      Signal cell (Decomposition plan) and in `scripts/local-model-serving/README.md`'s
+      `OPEN: the budget verdict's subject is miscalibrated` section on `task/3713` — not decided here.
     - Cites: memory `c01e7d1b-2916-4a8d-8f6e-c5e42692ce3d` (authoritative measurement),
       `38a4fcf2-30ba-4884-82f9-412737ddda13` (contradiction resolution).
 11. **Long runs in transient `systemd --user` units**, never bare background shells.
@@ -300,7 +307,7 @@ manifest at decompose time.
 
 | # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` within the measured ~16.4 GiB operating budget (D10) | — |
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: whether the health verdict judges arm-footprint-vs-free or total-card-usage-vs-ceiling is unresolved — see α's README `OPEN: the budget verdict's subject is miscalibrated`; this signal is not green until that lands. | — |
 | **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
 | **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
