@@ -144,6 +144,26 @@ class DoneProvenance(BaseModel):
     ``kind`` is the *only* place the valid-kinds vocabulary is declared;
     fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
     importing this model (see PRD §5, I2).
+
+    ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
+    (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
+    by fused-memory's ``_validate_done_provenance`` chokepoint and is never
+    supplied by a caller — a caller-supplied value is discarded with a
+    warning. It exists because ``updatedAt`` is bumped by *any* later write
+    to the task (a re-tag, an audit annotation, a dependency edit), so it
+    cannot answer "when was this attribution asserted?"; the found_on_main
+    soak-gate predicate needs that question answered to distinguish a
+    genuinely new spurious stamp from legacy backlog.
+
+    It is deliberately OPTIONAL rather than conditionally-required for
+    ``found_on_main`` (i.e. ``_check_conditional_requirements`` is
+    deliberately NOT extended) for two reasons: ~193 historical stamps
+    predate the field and must keep validating at read time, and — more
+    importantly — its ABSENCE is itself load-bearing signal. Because every
+    write after task 3576 lands populates it at the chokepoint, a blob
+    lacking it provably predates that landing, which is exactly how
+    ``fused-memory/scripts/check_found_on_main_spurious_rate.py`` separates
+    legacy backlog from new stamps.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -163,6 +183,9 @@ class DoneProvenance(BaseModel):
     unit: str | None = None
     active_enter_timestamp: str | None = None
     escalation_id: str | None = None
+    # Server-written; see the class docstring. Optional by design — absence
+    # means "predates task 3576", which the soak-gate predicate relies on.
+    stamped_at: str | None = None
 
     @model_validator(mode='after')
     def _check_conditional_requirements(self) -> DoneProvenance:
