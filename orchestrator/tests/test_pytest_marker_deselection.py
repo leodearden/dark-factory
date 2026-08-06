@@ -22,10 +22,13 @@ including the real-config incident golden — at the end.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
+from test_verify import _real_worktree_reader
 from test_verify_plan import DATA_MODULE_DIFF, ROOT_CONFTEST_DIFF, SOURCE_ONLY_DIFF
+from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -35,6 +38,7 @@ from orchestrator.pytest_markers import (
     module_level_marker_names,
     resolve_marker_expression,
 )
+from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
     ScopeKind,
@@ -1283,3 +1287,136 @@ class TestExecutedFallbackPlanRecordsTheWidening:
             pytest_reason=self._WIDENED_REASON,
         )
         assert executed.runs == plan.runs
+
+
+#: A worktree-root pyproject whose addopts deselect ``smoke`` — the ingredient
+#: dark-factory's own root pyproject.toml carries, and the reason this defect
+#: class is reachable in any project that registers no module_configs.
+_SMOKE_DESELECTING_PYPROJECT = _pyproject('"-m \'not smoke\'"')
+_SMOKE_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.smoke\n\n\ndef test_s():\n    pass\n'
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestRunScopedVerificationWidensTheFallback:
+    """End-to-end through ``verify.run_scoped_verification``'s FALLBACK branch.
+
+    The layer that matters: unlike the module-config branch (plan-authoritative
+    via ``_executed_module_configs_from_plan``), this branch hands
+    ``run_verification`` the ModuleConfig, NOT the plan.  A fix confined to the
+    plan record would produce an honest record and the SAME rc=5 false RED, so
+    these assertions are on what was actually handed to the executor.
+
+    ``code_default_config`` is required — see
+    ``TestExecutedFallbackPlanRecordsTheWidening``'s docstring for why the
+    ambient config would otherwise take the "configured suite runs verbatim" arm.
+    """
+
+    @staticmethod
+    async def _run(tmp_path: Path, sources: dict[str, str], pyproject_text: str | None):
+        """Drive the fallback branch over a real worktree; return (executed_mc, result)."""
+        if pyproject_text is not None:
+            (tmp_path / 'pyproject.toml').write_text(pyproject_text)
+        for rel, text in sources.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.test_command == 'pytest', (
+            'premise: only the bare default reaches the file-scoped fallback arm'
+        )
+        spy = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=spy):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=list(sources),
+            )
+        executed = _executed_module_configs(spy)
+        assert len(executed) == 1, 'the fallback branch runs exactly one config'
+        return executed[0], result
+
+    @staticmethod
+    def _plan_pytest_run(result) -> dict:
+        """The ``'__fallback__'`` pytest run recorded on ``VerifyResult.plan``."""
+        assert result.plan is not None
+        return next(
+            r for r in result.plan['runs']
+            if r['module_prefix'] == '__fallback__' and r['reason'].startswith('pytest:')
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_executed_command_is_widened_not_zero_collecting(self, tmp_path: Path):
+        """Without the fix this executes 'pytest tests/test_smoke.py' and rc=5 REDs."""
+        executed, _ = await self._run(
+            tmp_path,
+            {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest'
+        assert executed.prefix == '__fallback__'
+        # pytest-only concern: the other slots keep whatever
+        # _build_fallback_config rendered for them.
+        assert executed.lint_command is not None
+        assert 'tests/test_smoke.py' in executed.lint_command
+        assert executed.type_check_command is not None
+        assert 'tests/test_smoke.py' in executed.type_check_command
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_plan_matches_what_executed(self, tmp_path: Path):
+        """Both layers must move together, or the plan describes a run that never happened."""
+        _, result = await self._run(
+            tmp_path,
+            {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        run = self._plan_pytest_run(result)
+        assert run['scope_kind'] == str(ScopeKind.FULL_SUITE)
+        assert run['scoped_targets'] == []
+        assert 'tests/test_smoke.py' in run['reason']
+        assert 'not smoke' in run['reason']
+        assert 'NOT executed' in run['reason']
+
+    @pytest.mark.asyncio
+    async def test_an_unmarked_target_still_runs_file_scoped(self, tmp_path: Path):
+        """CONTROL: a target that genuinely vanishes must still rc=5 RED.
+
+        Widening only ever on positive proof — never a blanket "file-scoped
+        pytest is risky, run everything".
+        """
+        executed, result = await self._run(
+            tmp_path,
+            {'tests/test_plain.py': _UNMARKED_PLAIN_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest tests/test_plain.py'
+        run = self._plan_pytest_run(result)
+        assert run['scope_kind'] == str(ScopeKind.FILE_SCOPED)
+        assert run['scoped_targets'] == ['tests/test_plain.py']
+
+    @pytest.mark.asyncio
+    async def test_a_marked_target_without_addopts_does_not_widen(self, tmp_path: Path):
+        """CONTROL: the marker alone proves nothing — the -m expression is the proof."""
+        executed, result = await self._run(
+            tmp_path, {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE}, _PLAIN_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest tests/test_smoke.py'
+        assert self._plan_pytest_run(result)['scope_kind'] == str(ScopeKind.FILE_SCOPED)
+
+    def test_the_decision_function_itself_stays_pure(self, tmp_path: Path):
+        """The fix lives in the EXECUTED layer: derive_verify_plan is unmoved.
+
+        Its raw return value is still the idealized FILE_SCOPED decision — it
+        cannot see the rescoping ``_build_fallback_config`` performs, which is
+        exactly why the widening cannot live there.
+        """
+        (tmp_path / 'pyproject.toml').write_text(_SMOKE_DESELECTING_PYPROJECT)
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 'test_smoke.py').write_text(_SMOKE_MARKED_SOURCE)
+
+        plan = derive_verify_plan(
+            ['tests/test_smoke.py'], [], OrchestratorConfig(project_root=tmp_path),
+            _real_worktree_reader(tmp_path),
+        )
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == ('tests/test_smoke.py',)
