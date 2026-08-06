@@ -222,4 +222,19 @@ def durable_archive_path(
     #     luck today; the filter makes returning a directory as "the
     #     transcript" structurally impossible instead of incidentally avoided.
     matches = [p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()]
-    return matches[0] if matches else None
+    if not matches:
+        return None
+    # Newest mtime wins: a resumed session's transcript only ever grows, so the
+    # newest archive is the most complete one. The `str(p)` tiebreak is not
+    # decoration — mtime alone is NOT a total order here, because _archive_one
+    # mirrors the SOURCE mtime onto the archived copy via os.utime (:124), so
+    # one session archived from two lanes can tie exactly. Under a tie max()
+    # would fall back to filesystem-dependent glob order; appending the path
+    # string makes the answer reproducible, which is what makes a later resume
+    # reproducible.
+    #
+    # p.stat() can raise (a file unlinked between glob and stat — e.g. task
+    # 2731's GC sweep landing mid-lookup). That is deliberately NOT caught
+    # per-file: the function-wide I-A guard is what keeps this total, so there
+    # is exactly one place totality is enforced rather than several.
+    return max(matches, key=lambda p: (p.stat().st_mtime, str(p)))
