@@ -162,11 +162,19 @@ def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
     """Run `systemctl --user show <unit> -p <prop> ...`, parsed to a dict.
 
     Returns None — never raises — when the query cannot be answered at all:
-    a non-zero exit, or output naming a bus connection failure ("Failed to
+    a non-zero exit, output naming a bus connection failure ("Failed to
     connect to bus" — the shape seen from a container/CI sandbox with no
-    user D-Bus session). Callers treat None as "skip", not "fail": this
-    invariant requires a live systemd --user manager to answer, and its
-    absence is an environment fact rather than a defect in the unit.
+    user D-Bus session), or the query timing out — a wedged systemd --user
+    manager or a stuck D-Bus leaving this call hung past its 30s timeout,
+    which surfaces as subprocess.TimeoutExpired. That last case is caught
+    deliberately and degrades to the same skip: subprocess.TimeoutExpired
+    is a subprocess.SubprocessError, NOT an OSError (verified MRO:
+    TimeoutExpired -> SubprocessError -> Exception), so the handler below
+    must name both classes — narrowing it back to `except OSError` alone
+    is the exact regression a prior review caught here. Callers treat None
+    as "skip", not "fail": this invariant requires a live systemd --user
+    manager to answer, and its absence is an environment fact rather than
+    a defect in the unit.
 
     A property systemd does not implement at all (verified: `-p
     SomeUnknownProperty` against a live unit exits 0 with EMPTY stdout, on
@@ -185,7 +193,7 @@ def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=30, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return None
     combined = f"{result.stdout}{result.stderr}"
     if result.returncode != 0 or "failed to connect to bus" in combined.lower():
