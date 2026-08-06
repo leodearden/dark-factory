@@ -1778,17 +1778,24 @@ def create_server(
             - ``released``: True if ``cancel_workflow`` accepted the request.
             - ``slot_cleared``: True if no slot is live by the end of the call
               (either it finished within ``timeout_secs``, or there was never
-              one to begin with).
+              one to begin with).  False also covers a slot the scheduler
+              dispatched while this call was in flight.
             - ``parked``: the status the task was parked into (``'blocked'``),
               or ``None`` if no park occurred.  ``None`` means exactly one of:
-              a slot was still active at the deadline, or the task was not at
+              a slot was still active at the deadline, the task was not at
               ``in-progress`` (already terminal, parked elsewhere, or the
-              status read failed).  Callers should CONFIRM the park by reading
-              this field rather than assuming it.
+              status read failed), or the scheduler dispatched a fresh
+              workflow while the status was being read (``slot_cleared`` comes
+              back False in that case too).  Callers should CONFIRM the park by
+              reading this field rather than assuming it.
         """
         if harness is None:
             return {
                 'released': False, 'was_active': False, 'slot_cleared': False,
+                # Every return path must satisfy the documented shape — callers
+                # are told to read `parked` unconditionally, so a standalone
+                # server must hand back an explicit None, not a missing key.
+                'parked': None,
                 'error': 'No orchestrator harness wired in — running in standalone mode',
             }
         was_active = harness.is_workflow_active(task_id)
@@ -1823,21 +1830,49 @@ def create_server(
         if not harness.is_workflow_active(task_id):
             cur = await harness.scheduler.get_status(task_id)
             if cur == 'in-progress':
-                if not released:
-                    # No slot existed, so Harness.cancel_workflow returned False on its
-                    # `event is None` arm without reaching note_workflow_cancelled — this
-                    # park would land with ZERO grace and the scheduler's
-                    # _phase_redispatch_stranded_blocked phase would flip it back to
-                    # 'pending' within one 15 s idle tick.  Stamp it here so the orphan
-                    # park gets the same _RECONCILE_CANCEL_GRACE_S window a slot-cancel
-                    # park gets.  Sync call — note_workflow_cancelled is a plain `def`.
-                    # Guarded on `not released`: on the slot-cancel arm cancel_workflow
-                    # already stamped, and re-stamping would re-anchor that window.
-                    # Must precede the write below — the scheduler tick can observe the
-                    # 'blocked' row the instant it is persisted.
-                    harness.scheduler.note_workflow_cancelled(task_id)
-                await harness.scheduler.set_task_status(task_id, 'blocked')
-                parked = 'blocked'
+                if harness.is_workflow_active(task_id):
+                    # Re-check liveness AFTER the status read.  `get_status` is
+                    # an MCP round-trip that yields the event loop, and the
+                    # Harness runs on that same loop, so the scheduler is free
+                    # to dispatch task_id behind the guard above: _run_slot
+                    # registers a cancel event (and calls
+                    # scheduler.clear_workflow_cancel, which would wipe the
+                    # grace stamp below).  The no-slot arm makes this
+                    # materially more likely than before — a task with no slot
+                    # is precisely the one the scheduler may pick up on its
+                    # next tick.  Parking here would write 'blocked' out from
+                    # under a live agent while still reporting
+                    # slot_cleared/parked as though the caller owned the task,
+                    # which is exactly how both /unblock skills read this
+                    # result.  Report the live slot instead and park nothing.
+                    slot_cleared = False
+                else:
+                    if not released:
+                        # No slot existed, so Harness.cancel_workflow returned False on its
+                        # `event is None` arm without reaching note_workflow_cancelled — this
+                        # park would land with ZERO grace and the scheduler's
+                        # _phase_redispatch_stranded_blocked phase would flip it back to
+                        # 'pending' within one 15 s idle tick.  Stamp it here so the orphan
+                        # park gets the same _RECONCILE_CANCEL_GRACE_S window a slot-cancel
+                        # park gets.  Sync call — note_workflow_cancelled is a plain `def`.
+                        # Guarded on `not released`: on the slot-cancel arm cancel_workflow
+                        # already stamped, and re-stamping would re-anchor that window.
+                        # Must precede the write below — the scheduler tick can observe the
+                        # 'blocked' row the instant it is persisted.
+                        #
+                        # Known asymmetry, deliberately left alone (out of scope): the
+                        # slot-cancel arm's stamp is anchored at cancel_workflow time and
+                        # never re-anchored, so a slot that takes ~25 s to exit parks with
+                        # only ~5 s of _RECONCILE_CANCEL_GRACE_S left.  Extending it here
+                        # would silently change the slot-cancel path's timing.  The durable
+                        # protection for a long human /unblock session is the
+                        # pending-escalation gate in
+                        # Scheduler._phase_redispatch_stranded_blocked, NOT this 30 s
+                        # stamp — a caller that resolves the escalation before finishing
+                        # the merge loses the hold on BOTH arms.
+                        harness.scheduler.note_workflow_cancelled(task_id)
+                    await harness.scheduler.set_task_status(task_id, 'blocked')
+                    parked = 'blocked'
 
         return {
             'released': released,
