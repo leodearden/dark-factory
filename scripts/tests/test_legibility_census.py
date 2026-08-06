@@ -3239,7 +3239,28 @@ def _make_recording_probe(*results):
     return probe
 
 
-def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_every_real_cli_cap_message_fails_to_parse_as_a_verdict(message):
+    """The load-bearing premise of detector (a), pinned directly.
+
+    (a) scans for a banner ONLY on the parse-failure path, and that loses no
+    detection precisely because a real CLI cap banner is plain prose that
+    `parse_coder_output` cannot turn into a verdict. Nothing pinned that
+    premise: a newly-observed cap phrasing that happened to embed a `{...}`
+    fragment (parse_coder_output brace-slices prose) would PARSE, bypass (a)
+    entirely, and fall through to the weaker (c) backstop with every test
+    still green.
+
+    Parametrized over the whole corpus so the "one corpus edit turns both
+    suites red until the markers cover it" property holds for the in-verify
+    detector too, not just the preflight probe.
+    """
+    with pytest.raises(coder.CoderParseError):
+        coder.parse_coder_output(message)
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
     """Detector (a): the cap text arrives as the verify reply itself.
 
     This is the common case -- the CLI prints its cap banner to stdout, which
@@ -3247,8 +3268,12 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
     rejection. The banner-matching CONTENT is only the TRIGGER: a probe
     CONFIRMS the cap before the run is aborted, so the detector can never
     decide from content alone that the account is capped.
+
+    Parametrized over every recorded real-CLI cap message, so adding a newly
+    observed phrasing to the corpus exercises this detector too rather than
+    only the marker list.
     """
-    cap = REAL_CLI_CAP_MESSAGES[0]
+    cap = message
     replies = [_verdict(), _verdict(), cap, _verdict(), _verdict()]
     calls = []
 

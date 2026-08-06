@@ -1980,7 +1980,12 @@ def _build_default_verify_fn(
 
         Splitting on parse success loses no detection -- a real CLI cap banner
         is plain prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
-        ``CoderParseError``, so all of them still reach the scan. The probe is
+        ``CoderParseError``, so all of them still reach the scan. That premise
+        is load-bearing, so it is pinned directly rather than asserted here:
+        ``test_every_real_cli_cap_message_fails_to_parse_as_a_verdict``
+        parametrizes the whole corpus, and the detector's own test does too --
+        a newly-observed phrasing that happened to embed a ``{...}`` fragment
+        would parse, bypass this detector and go red there. The probe is
         reliable in BOTH directions here: ``preflight_headroom`` folds any
         probe exception into ``HeadroomResult(ok=False)``, so a genuinely
         capped account confirms whether its probe returns a banner or raises.
