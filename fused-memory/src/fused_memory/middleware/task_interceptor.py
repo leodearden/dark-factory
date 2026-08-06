@@ -4876,6 +4876,19 @@ _DONE_PROVENANCE_KINDS_TEXT = (
 )
 
 
+def _provenance_stamp_now() -> str:
+    """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
+
+    Same convention as the module's other timestamp sites (``reopen_at``,
+    ``combined_at``): ``datetime.now(UTC).isoformat()``. Broken out as a
+    named module-level function purely so tests can monkeypatch it and
+    assert an exact string — here the timestamp IS the artifact under test,
+    so a loose "is parseable / within a range" assertion would let a
+    wrong-timezone or wrong-format regression through.
+    """
+    return datetime.now(UTC).isoformat()
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -5126,6 +5139,28 @@ async def _validate_done_provenance(
                 resolved['transient_unit'] = transient_unit_stripped
         if isinstance(fire_delay_secs, int):
             resolved['fire_delay_secs'] = fire_delay_secs
+
+    if kind == 'found_on_main':
+        # THE SINGLE WRITE SITE for done_provenance.stamped_at (task 3576).
+        #
+        # Every found_on_main producer funnels through this function: the
+        # fresh-done path (_apply_status_transition), the same-status repair
+        # seam (_repair_done_provenance_same_status), agent-authored
+        # set_task_status calls, and the orchestrator's
+        # Scheduler.mark_done(kind='found_on_main', ...) which reaches here
+        # via set_task_status. So no producer-side change is needed, and no
+        # future producer can forget to stamp. That matters: this defect
+        # class's history (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 ->
+        # 2787 -> 2794 -> 3057) is a chain of point fixes each reopened by an
+        # unguarded seam the previous fix missed.
+        #
+        # Scoped to found_on_main deliberately — it is the
+        # attribution-by-inference kind the soak gate watches. `merged`
+        # already carries independent landing evidence (merge-queue journal +
+        # is_ancestor + commit citation), and stamping it would perturb the
+        # exact-equality merged-kind assertions across the existing suites
+        # for no benefit.
+        resolved['stamped_at'] = _provenance_stamp_now()
 
     return None, resolved
 
