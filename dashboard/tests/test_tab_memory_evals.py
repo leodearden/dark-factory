@@ -695,15 +695,14 @@ def test_index_html_registers_tab_memory_evals_load_order(
 
     # (b2) memory_evals_fmt.js specifically must be a CLASSIC script — no type
     #      at all, not even text/babel. _assert_script_loads_before already
-    #      rejects defer/async/type=module (the three ways document order stops
-    #      implying execution order), but a `type="text/babel"` .js would ALSO
-    #      break this file two ways it cannot see: Babel-standalone would
-    #      transform it and it would no longer join the classic-script shared
-    #      global lexical scope, and
-    #      dashboard/tests/js/classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE
-    #      — which matches only `<script src="/static/redux/NAME.js?v=NN"></script>`
-    #      — would stop seeing it at all, silently dropping the module from
-    #      every collision and DF_*-assignment check in that suite.
+    #      rejects defer/async/type=module; what this adds is the failure MODE a
+    #      `type="text/babel"` .js has, which is silence: Babel-standalone would
+    #      transform it out of the classic-script shared global scope, and
+    #      classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE (which matches only
+    #      `<script src="/static/redux/NAME.js?v=NN"></script>`) would stop
+    #      seeing the file at all. That suite does catch it — its registry entry
+    #      would go unmatched — but it reports a missing script, not a wrong
+    #      tag shape, so this names the actual cause.
     fmt_found = _find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
     assert fmt_found is not None, (
         'No <script src="/static/redux/memory_evals_fmt.js..."> tag in '
@@ -945,25 +944,12 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     #     asserted EXECUTABLY by node — see memory_evals_fmt.test.mjs
     #     'chartForKind: tripwire is step-shaped' and its three siblings (one
     #     named test per kind), plus 'chartForKind: an unknown kind gets NO
-    #     chart, never a guessed primitive'. What remains checkable HERE is the
-    #     .jsx half: that the tag this file receives is mapped back to a real
-    #     chart primitive rather than rendered raw.
-    assert re.search(r'\bME_CHART_BY_TAG\b', code), (
-        'tab_memory_evals.jsx must map chartForKind\'s TAG to a chart component '
-        'via ME_CHART_BY_TAG. chartForKind returns \'step\'/\'spark\'/null now '
-        '(it used to return the component itself, which is what pinned it '
-        'inside this .jsx and out of reach of any runner), so without the '
-        'lookup the row would try to render a bare string as a component.'
-    )
-    tag_map = _extract_const_object(code, 'ME_CHART_BY_TAG')
-    assert tag_map, 'could not extract the ME_CHART_BY_TAG object.'
-    for tag in ('step', 'spark'):
-        assert re.search(rf'\b{tag}\s*:', tag_map), (
-            f"ME_CHART_BY_TAG must map the '{tag}' tag to a chart primitive; "
-            f'a tag chartForKind can return but this table does not name would '
-            f'resolve to undefined and silently disable the chart. Table was:\n'
-            + tag_map
-        )
+    #     chart, never a guessed primitive'. The remaining .jsx half — that the
+    #     tag this file receives is routed through a component lookup rather
+    #     than rendered raw — is asserted once, in
+    #     `test_pure_helpers_are_consumed_from_the_fmt_module`, which is where
+    #     the rest of this file's consumption contract lives. A second copy here
+    #     was two assertions about one fact.
 
     # (i) the truncation disclosure names both counts
     assert re.search(r'\btruncated\b', body), (
@@ -1465,23 +1451,40 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
             'in this file read it from there.'
         )
 
-    # (4) The tag->component resolver: chartForKind returns 'step'/'spark'/null
-    #     now, so the .jsx must map the tag back to the charts.jsx primitives it
-    #     aliases as MEStep/MESpark.
-    tag_map = _extract_const_object(code, 'ME_CHART_BY_TAG')
+    # (4) The tag->component resolver. chartForKind returns 'step'/'spark'/null
+    #     since task 3481 (DD-1) — it used to return the component itself, and
+    #     that dependency on window.DF_CHARTS is what pinned it inside this .jsx
+    #     and out of reach of any runner — so the tag has to be routed back
+    #     through a component lookup rather than rendered as a bare string.
+    #
+    #     Asserted on the SHAPE of the call site, not on identifier spellings.
+    #     The lookup's name and the local chart aliases are renameable with zero
+    #     behaviour change, so pinning them would fail a test for a rename while
+    #     adding nothing over the claim actually being made here.
+    indexed = re.search(r'\b(\w+)\s*\[\s*chartForKind\s*\(', code)
+    assert indexed, (
+        "tab_memory_evals.jsx must use chartForKind's return value to INDEX a "
+        'component lookup (`SOMETABLE[chartForKind(m.kind)]`). Rendering the '
+        'tag directly would hand React a bare string where a component belongs.'
+    )
+    tag_map = _extract_const_object(code, indexed.group(1))
     assert tag_map, (
-        'tab_memory_evals.jsx must define ME_CHART_BY_TAG mapping chartForKind\'s '
-        'tag to a chart component.'
+        f'could not extract the `{indexed.group(1)}` object that chartForKind '
+        'is indexed into — it must be a module-scope `const NAME = {...}` '
+        'literal so this test can check it names every tag.'
     )
-    assert re.search(r'\bstep\s*:\s*MEStep\b', tag_map), (
-        "ME_CHART_BY_TAG must map 'step' to the StepSpark alias (MEStep); the "
-        'tripwire kind is the only step-shaped one and would otherwise lose its '
-        'chart. Table was:\n' + tag_map
-    )
-    assert re.search(r'\bspark\s*:\s*MESpark\b', tag_map), (
-        "ME_CHART_BY_TAG must map 'spark' to the Sparkline alias (MESpark) — "
-        'proportion, count and scalar all resolve through it. Table was:\n' + tag_map
-    )
+    #     The TAG vocabulary is still pinned, because it is a contract between
+    #     two files rather than a local name: a tag chartForKind can return but
+    #     this table does not name resolves to undefined and silently disables
+    #     the chart. The tags themselves are asserted executably in
+    #     memory_evals_fmt.test.mjs ('chartForKind: the tag vocabulary is
+    #     exactly {step, spark, null}').
+    for tag in ('step', 'spark'):
+        assert re.search(rf'\b{tag}\s*:', tag_map), (
+            f"the chart lookup must name the '{tag}' tag chartForKind can "
+            f'return; an unnamed tag resolves to undefined and silently '
+            f'disables the chart. Table was:\n' + tag_map
+        )
 
 
 def test_no_client_side_alarm_derivation(
