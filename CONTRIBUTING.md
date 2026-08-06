@@ -146,6 +146,28 @@ Other top-level dirs:
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
   `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
   the full chain.
+- **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
+  of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
+  not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
+
+  As of task 3441, 1125 of 1357 first-party package `.py` files (83%) are not
+  `ruff format`-clean. **That is the expected steady state, not debt.** A task
+  proposing to "fix formatting" over some subset of files is correctly closable
+  as won't-fix. A repo-wide sweep was considered and declined for three
+  reasons: it reverses the deliberate `ignore = ["E501"]` that every package
+  sets, which tolerates long lines on purpose while the formatter exists to
+  rewrap them; a 1125-file diff conflicts with every in-flight branch in a repo
+  whose normal mode is many concurrent agent branches against a
+  continuously-draining merge queue; and it rewrites the blame history that
+  this repo's incident forensics and reconciliation lean on.
+
+  The `[tool.ruff.format]` block in each package's `pyproject.toml` is **style
+  config, not a gate**. It is retained so that an ad-hoc or editor-on-save
+  `ruff format` produces a single-quoted, repo-consistent diff — measured
+  ~4.5x smaller than the same run under ruff's own defaults.
+
+  Reversing this decision means updating this section, `CLAUDE.md` and
+  `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
   ```bash
