@@ -213,6 +213,83 @@ except (KeyError, ValueError):
 FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 
 
+# --- fm liveness streak + restart cap (task 3764) ---
+# fused_memory_liveness_pass() below used to restart fused-memory on a SINGLE
+# non-healthy verdict, uncapped. The measured evidence says that is wrong: a
+# controlled experiment (2026-08-06 07:14-09:14Z, kill path disconnected)
+# recorded six /health stalls >=8s, four >15s, three exceeding a 25s probe cap
+# — and every one SELF-RECOVERED, with 0 restarts needed over 20 cycles. The
+# knobs below add the missing TEMPORAL dimension to the kill decision in two
+# independent layers: a streak (make a wrong verdict RARE) and a min-interval
+# cap on the restart itself (make a wrong verdict HARMLESS).
+
+# How many CONSECUTIVE non-healthy verdicts are required before a restart.
+# Derivation, not a guess: orchestrator-watchdog.timer is OnUnitActiveSec=60,
+# so N=3 demands ~180s of CONTINUOUS non-response — ~7x the longest observed
+# (25s+) self-recovering stall, so no observed transient can reach it, while a
+# genuinely wedged asyncio loop (which stays wedged by definition) reaches it
+# on the third tick. Env-with-try/except-fallback exactly like
+# FM_RESTART_MIN_INTERVAL_SECS above: a typo'd env var must not crash the
+# oneshot watchdog.
+try:
+    FM_LIVENESS_STREAK_THRESHOLD = int(os.environ["FM_LIVENESS_STREAK_THRESHOLD"])
+except (KeyError, ValueError):
+    FM_LIVENESS_STREAK_THRESHOLD = 3
+
+# Maximum age of a persisted streak entry before it is treated as expired and
+# the count restarts at 1. 300s = 5x the 60s tick cadence: a larger gap means
+# >=4 ticks were missed (watchdog stopped, timer disabled, host suspended,
+# unit disabled and re-enabled), so the "CONSECUTIVE" claim is no longer true
+# and continuity must be re-established from scratch. This is what stops a
+# streak from hours ago masquerading as a fresh one — and it fails in the safe
+# direction: an unusually slow tick sequence expires the streak and SUPPRESSES
+# a restart rather than manufacturing one.
+try:
+    FM_LIVENESS_STREAK_MAX_AGE_SECS = int(os.environ["FM_LIVENESS_STREAK_MAX_AGE_SECS"])
+except (KeyError, ValueError):
+    FM_LIVENESS_STREAK_MAX_AGE_SECS = 300
+
+# Minimum wall-clock seconds between successive watchdog-initiated fm LIVENESS
+# restarts — the second layer, bounding the blast radius of a verdict that is
+# wrong anyway. 3600s strictly exceeds the 3180s (53 min) worst observed
+# pathological instance lifetime, so even a wrong verdict cannot reproduce that
+# pathology, and it bounds watchdog-initiated fm restarts to <=24/day versus
+# today's unbounded. Deliberately 8x SHORTER than the staleness pass's
+# FM_RESTART_MIN_INTERVAL_SECS (28800s): a brokenness revive must react faster
+# than a scheduled deploy (I5). 0 disables the cap entirely.
+try:
+    FM_LIVENESS_RESTART_MIN_INTERVAL_SECS = int(
+        os.environ["FM_LIVENESS_RESTART_MIN_INTERVAL_SECS"]
+    )
+except (KeyError, ValueError):
+    FM_LIVENESS_RESTART_MIN_INTERVAL_SECS = 3600
+
+# Where the consecutive-failure streak is PERSISTED. Persistence is mandatory
+# rather than stylistic: orchestrator-watchdog.service is Type=oneshot on a 60s
+# timer, so the process EXITS between probes and an in-memory counter could
+# never accumulate. Same env-overridable REPO_DIR/data/fused-memory/ shape as
+# FM_DEPLOY_CLOCK_PATH so tests can point it at a tmp file without touching
+# real data/.
+FM_LIVENESS_STREAK_PATH = os.environ.get(
+    "FM_LIVENESS_STREAK",
+    os.path.join(REPO_DIR, "data", "fused-memory", "fm_liveness_streak.json"),
+)
+
+# The liveness restart cap's OWN clock — a DIFFERENT file from
+# FM_DEPLOY_CLOCK_PATH, preserving I5 in BOTH directions. Sharing one file
+# would mean a liveness revive silences the fm STALENESS backstop for 8h (a
+# merged fm change sitting undeployed because the watchdog once revived a
+# wedge), and conversely a scheduled deploy would license an immediate extra
+# liveness kill. Stamped ONLY by a liveness revive, read ONLY by the liveness
+# pass.
+FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
+    "FM_LIVENESS_RESTART_CLOCK",
+    os.path.join(
+        REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
+    ),
+)
+
+
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``.
 
