@@ -383,3 +383,84 @@ def sweep_project_roots(
         )
 
     return audits, unreadable
+
+
+def run_audit_cli(
+    argv: list[str] | None,
+    *,
+    parser: argparse.ArgumentParser,
+    audit_fn: Callable[[str, argparse.Namespace], Any],
+    render: Callable[[list[Any], argparse.Namespace], str],
+    is_dirty: Callable[[list[Any]], bool],
+    on_roots: Callable[[list[str], argparse.Namespace], None] | None = None,
+) -> int:
+    """Shared audit-script ``main()`` body.
+
+    Exit codes: :data:`AUDIT_EXIT_OK` (0) = audited, nothing dirty;
+    :data:`AUDIT_EXIT_FINDINGS` (1) = *is_dirty* fired;
+    :data:`AUDIT_EXIT_NO_ROOT` (2) = no project root resolved to a readable
+    tasks.db; :data:`AUDIT_EXIT_NOTHING_AUDITED` (3) = roots resolved but EVERY
+    one failed to audit, so NOTHING was audited (never treat 3 as a clean run).
+
+    A SINGLE unreadable project among several is not exit 3: it stays a
+    warn-and-continue skip, and the readable remainder decides 0 vs 1.
+
+    STDOUT ON EXIT 3 STILL LOOKS CLEAN — read this before writing a consumer.
+    The report is rendered before the exit-3 branch (preserving both audit
+    scripts' pre-extraction ordering), so a total-failure sweep still emits a
+    well-formed EMPTY payload: an empty projects list under ``--json``, or the
+    script's ordinary "nothing found" report otherwise. A pipeline that reads
+    only stdout — ``... --json | jq -e '.projects | length == 0'`` and friends
+    — therefore CANNOT distinguish "audited everything, found nothing" from
+    "audited NOTHING at all". Every consumer MUST branch on the exit code
+    (and/or read the stderr error line); treating a parseable empty payload as
+    a clean result is exactly the false green this exit code exists to kill.
+
+    WHY THE EXIT-3 GATE IS SPELLED ``unreadable and not audits`` here, unlike
+    :func:`run_scan_cli`'s ``len(unreadable) == len(db_paths)``: that tier's
+    first return element is MATCHES, so one unreadable db beside a readable
+    CLEAN one would wrongly trip a "nothing found" gate. THIS tier's first
+    element IS the successfully-audited list, so the condition is exactly
+    "every root failed" — but only while :func:`sweep_project_roots`'
+    one-audit-per-root contract holds. An *audit_fn* that returned None to skip
+    a root would silently break it.
+
+    *audit_fn* takes ``(root, args)`` because both adopters need a parsed flag
+    inside the per-root call that the calling script cannot close over (argv is
+    parsed here): ``--min-fidelity`` for one, ``--project-id`` for the other.
+    It is bound to a one-argument closure at the :func:`sweep_project_roots`
+    call below so that function keeps a signature parallel to
+    :func:`sweep_databases`. *is_dirty* deliberately does NOT take *args* —
+    neither adopter's predicate reads a flag.
+
+    *on_roots*, when supplied, is called with the RESOLVED root list BEFORE the
+    empty-roots return, so a hook can observe the empty case. That is where
+    ``audit_combine_gate_marker_loss.py``'s multi-root ``--project-id`` warning
+    has always sat: a once-per-run warning computed from the resolved roots,
+    which fits neither *audit_fn* (per-root) nor *render* (post-sweep).
+    """
+    args = parser.parse_args(argv)
+
+    roots = discover_project_roots(project_roots=args.project_roots)
+
+    if on_roots is not None:
+        on_roots(roots, args)
+
+    if not roots:
+        print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
+        return AUDIT_EXIT_NO_ROOT
+
+    audits, unreadable = sweep_project_roots(roots, lambda root: audit_fn(root, args))
+
+    print(render(audits, args))
+
+    if unreadable and not audits:
+        # Nothing was audited at all — never report that as a clean sweep.
+        print(
+            "error: every resolved project was unreadable; NOTHING was "
+            "audited (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return AUDIT_EXIT_NOTHING_AUDITED
+
+    return AUDIT_EXIT_FINDINGS if is_dirty(audits) else AUDIT_EXIT_OK

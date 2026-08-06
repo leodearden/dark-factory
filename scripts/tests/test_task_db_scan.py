@@ -666,7 +666,7 @@ def _audit_cli(
     )
 
 
-def _unreadable(root):
+def _unreadable(root, args):
     raise sqlite3.Error("file is not a database")
 
 
