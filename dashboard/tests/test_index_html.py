@@ -745,6 +745,15 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'assets in index.html — a tag added without a cache-buster misses '
         'already-open browsers; bump all /static/redux/* ?v= uniformly.'
     )
+    assert re.search(r'/static/redux/memory_evals_fmt\.js\?v=\d+', index_html_body), (
+        'memory_evals_fmt.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tab_memory_evals.jsx destructures '
+        'window.DF_MEMORY_EVALS_FMT at top level with no fallback, so a missing '
+        'tag throws at its evaluation, which in turn leaves window.DF_MEMORY_EVALS '
+        'undefined for the tabs.jsx top-level destructure and blanks EVERY tab '
+        'defined in that file. An unversioned tag would both miss an already-open '
+        'browser and break the single-shared-version invariant this test asserts.'
+    )
     assert re.search(r'/static/redux/spark_path\.js\?v=\d+', index_html_body), (
         'spark_path.js is not present among the versioned /static/redux/* '
         'assets in index.html — charts.jsx destructures window.DF_SPARK_PATH at '
