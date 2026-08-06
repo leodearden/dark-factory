@@ -45,6 +45,25 @@ plain-Enum gotcha into a loud failure: if a future edit regressed to the bare
 string, the parse would blow up rather than silently yield the wrong expected
 set.  Do not relax the patterns to "be tolerant" — the intolerance IS the check.
 
+Why the two sides differ in strictness (and why that is not a fail-soft)
+-----------------------------------------------------------------------
+The expected side RAISES on anything it does not recognise; the actual side
+PROJECTS onto the normal form and emits no tuple for an index type the form
+cannot represent (today: ``VECTOR``).  They fail in opposite directions, so they
+want opposite defaults:
+
+* An unparsed UPSTREAM statement makes the expected set SHORT — under-provisioning,
+  this PRD's own failure mode recurring.  Must be loud.
+* An ACTUAL index the normal form cannot represent is not a surprise and not drift
+  to repair.  The PRD defines ``index_type in {RANGE, FULLTEXT}``, VECTOR indices
+  legitimately exist on real graphs (``reindex.py`` drops them), and the PRD says
+  ``unexpected`` is reported but never acted on.  Raising there would turn the
+  detector into a false-alarm generator on every real graph.
+
+The projection is NOT a blanket skip.  Every genuine SHAPE surprise still raises
+:class:`IndexRecordShapeError`: an ``entity_type`` outside ``{NODE, RELATIONSHIP}``,
+or a property present in ``field`` with no entry in ``type``.
+
 This module deliberately imports nothing from ``graphiti_client`` so the rules
 stay unit-testable with a plain import and no client/LLM/embedder stack.  That
 isolation is also a HAZARD control: ``FalkorDriver.__init__`` fire-and-forgets
@@ -260,3 +279,112 @@ def expected_index_set() -> set[IndexSpec]:
         get_fulltext_indices(GraphProvider.FALKORDB)
     )
     return {spec for statement in statements for spec in parse_index_statement(statement)}
+
+
+# --- The ACTUAL side -------------------------------------------------------
+
+#: The index types the PRD's normal form can represent.  Anything else (VECTOR
+#: today) is projected away rather than raised on -- see the module docstring's
+#: "why the two sides differ in strictness".
+_REPRESENTABLE_INDEX_TYPES = frozenset({'RANGE', 'FULLTEXT'})
+
+_VALID_ENTITY_TYPES = frozenset({'NODE', 'RELATIONSHIP'})
+
+
+class IndexRecordShapeError(ValueError):
+    """A ``list_indices()`` record did not have the measured live shape.
+
+    Distinct from :class:`UnparsedIndexStatementError` because the two name
+    different problems with different fixes.  An unparsed STATEMENT means
+    graphiti changed its syntax (or the wrong provider was passed).  A bad
+    RECORD means FalkorDB's ``CALL db.indexes()`` result changed shape, or a
+    caller bound its columns wrongly — which is exactly how this was found:
+    ``list_indices()`` bound ``entity_type`` to the ``options`` column and
+    handed over an ``OrderedDict`` where ``'NODE'``/``'RELATIONSHIP'`` belonged.
+
+    Raised only for genuine SHAPE violations.  An unrepresentable index TYPE is
+    not one — that is projected away deliberately (see the module docstring).
+    """
+
+
+def normalize_index_record(record) -> list[IndexSpec]:
+    """Project one ``list_indices()`` record onto the normal form.
+
+    Fan-out is driven by the record's ``field`` list (the authoritative property
+    membership), with each property's index types read from the ``type`` mapping.
+    Driving it off ``type.keys()`` instead would silently under-report if the two
+    ever disagreed — the same class of silent-omission bug this module exists to
+    catch.  Measured live 2026-08-06, the two are keyed identically today; the
+    raise below makes any future divergence loud.
+
+    Because FalkorDB merges every index on a label into ONE record, emission is
+    one spec per (property, index_type) pair: an ``Entity`` record carrying
+    ``name: ['RANGE', 'FULLTEXT']`` correctly yields both tuples.
+
+    Args:
+        record: A mapping with ``label``, ``entity_type``, ``field`` and ``type``
+            keys, as returned by ``GraphitiBackend.list_indices()``.
+
+    Returns:
+        One spec per (property, representable index type) pair.  May legitimately
+        be empty — e.g. a VECTOR-only record.
+
+    Raises:
+        IndexRecordShapeError: ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``,
+            or a property in ``field`` has no entry in ``type``.
+    """
+    label = record.get('label')
+    entity_type = record.get('entity_type')
+
+    # Catches the options-column mis-binding: an OrderedDict is not a valid
+    # entity_type, and tolerating it would yield a set missing every record.
+    # The isinstance check is load-bearing, not defensive noise -- the value this
+    # is most likely to receive IS a dict (the options column), and a bare
+    # `not in frozenset` would raise TypeError: unhashable type instead of the
+    # IndexRecordShapeError that names what actually went wrong.
+    if not isinstance(entity_type, str) or entity_type not in _VALID_ENTITY_TYPES:
+        raise IndexRecordShapeError(
+            f'index record for label {label!r} has entity_type {entity_type!r}, '
+            f'expected one of {sorted(_VALID_ENTITY_TYPES)}. CALL db.indexes() '
+            'changed shape, or the caller bound the wrong column (the options '
+            'column is a dict; entitytype is the string one). '
+            f'Record: {record!r}'
+        )
+
+    fields = record.get('field')
+    # A bare str is accepted as a single-element list so a future FalkorDB scalar
+    # shape degrades to "one property" rather than silently to zero tuples.
+    if isinstance(fields, str):
+        fields = [fields]
+    elif fields is None:
+        fields = []
+
+    types = record.get('type') or {}
+
+    specs: list[IndexSpec] = []
+    for prop in fields:
+        if prop not in types:
+            raise IndexRecordShapeError(
+                f'property {prop!r} is listed in the field list of the {label!r} '
+                f'index record but has no entry in its type mapping '
+                f'({sorted(types)}). Refusing to drop it: a dropped property '
+                'silently under-reports what is actually indexed. '
+                f'Record: {record!r}'
+            )
+        raw_types = types[prop]
+        if isinstance(raw_types, str):
+            raw_types = [raw_types]
+        for index_type in raw_types:
+            # Unrepresentable types (VECTOR) are projected away, NOT raised on.
+            if index_type in _REPRESENTABLE_INDEX_TYPES:
+                specs.append((label, entity_type, prop, index_type))
+    return specs
+
+
+def normalize_index_records(records) -> set[IndexSpec]:
+    """Union :func:`normalize_index_record` over an iterable of records.
+
+    Returns a set so the caller can diff it directly against
+    :func:`expected_index_set`; duplicates arriving from two records collapse.
+    """
+    return {spec for record in records for spec in normalize_index_record(record)}
