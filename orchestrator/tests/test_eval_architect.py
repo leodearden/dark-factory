@@ -1589,6 +1589,18 @@ def _arch_task() -> dict:
     }
 
 
+def _arch_task_no_reference() -> dict:
+    """``_arch_task()`` minus the ``reference`` key.
+
+    The shape the three back-filled fixtures had before task 3628 — a
+    top-level ``post_task_commit`` with no ``reference`` block — which
+    ``run_architect_eval`` reduces to an EMPTY reference diff.
+    """
+    task = _arch_task()
+    task.pop('reference', None)
+    return task
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -1600,6 +1612,8 @@ async def _run_architect_eval_hermetic(
     arch_result=None,
     orch_prices: dict | None = None,
     orch_config_side_effect=None,
+    task_override=None,
+    reference_diff: str = '--- a/x\n+++ b/x\n+ landed change\n',
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1631,6 +1645,12 @@ async def _run_architect_eval_hermetic(
     the price table) is never bound at all. It has to live here rather than in
     a caller-side ``patch``: this helper patches the same name from inside, so
     an outer patch would be shadowed.
+
+    ``task_override`` replaces the task dict ``load_task`` returns (e.g.
+    ``_arch_task_no_reference()``), and ``reference_diff`` is what the patched
+    ``get_diff_between_commits`` returns — both defaulting to today's hardcoded
+    values so every existing caller keeps byte-identical behavior. Together
+    they drive the ``judged_without_reference`` cases (task 3628).
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -1663,7 +1683,7 @@ async def _run_architect_eval_hermetic(
                 AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
         p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock()))
         p(patch('orchestrator.evals.snapshots.get_diff_between_commits',
-                AsyncMock(return_value='--- a/x\n+++ b/x\n+ landed change\n')))
+                AsyncMock(return_value=reference_diff)))
         p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
         p(patch('orchestrator.artifacts.TaskArtifacts',
                 MagicMock(return_value=artifacts_instance)))
@@ -1679,7 +1699,9 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
-                MagicMock(return_value=_arch_task())))
+                MagicMock(return_value=(
+                    _arch_task() if task_override is None else task_override
+                ))))
         p(patch('orchestrator.verify.run_verification', mock_verify))
         result = await runner.run_architect_eval(
             Path('/fake/task.json'), cfg, base_config=MagicMock(),
@@ -2829,6 +2851,158 @@ class TestSteplessPlanIsNeverJudged:
         persisted = mocks['save'].call_args.args[0].metrics
 
         assert produced_a_plan(persisted) is is_scorable_plan(plan)
+
+
+# ---------------------------------------------------------------------------
+# judged_without_reference — the validity marker (eval-revival σ, task 3628)
+#
+# True on EXACTLY the cells whose persisted plan_quality is the LLM judge's own
+# number produced from an EMPTY reference_diff. The three negative twins below
+# define the predicate as much as the positive does: a cap-tainted cell has no
+# plan_quality to bound, and both floor paths score via score_plan_structure,
+# which never consults a reference. Keying on `not reference_diff` at the
+# materialization site alone would fire on ~every no-plan cell in a hard
+# campaign — precisely the population the consumer must see PAST — so the
+# negatives are what lock the semantics against that over-broad implementation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestJudgedWithoutReference:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_judged_blind_cell_is_marked_and_still_scored(self):
+        """POSITIVE: the judge ran without ground truth — mark it, keep it.
+
+        The cell is NOT excluded: plan_quality is still the judge's float and
+        the cell stays in every pool at that score. The marker bounds VALIDITY,
+        not membership.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        # Assert on the dict handed to save_result — that dict is what both the
+        # report layer and the downstream campaign driver actually read.
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['judged_without_reference'] is True
+        assert persisted['plan_quality'] == 0.77
+        assert persisted['cap_tainted'] is False
+
+    async def test_healthy_cell_carries_the_key_as_false(self):
+        """NEGATIVE (healthy) — and the key must be PRESENT, not omitted.
+
+        The presence assertion is the cross-consumer contract:
+        ``scripts/run_fable_trial_v2_campaign.py`` (task 3632) reads per-cell
+        reference validity by KEY PRESENCE, so a healthy cell must carry the
+        key with False rather than omit it. Omitting it would make every
+        healthy cell read as "never measured" downstream — forever, and
+        silently. This is the assertion that catches a conditional-emit
+        implementation, which every other case in this class would pass.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert 'judged_without_reference' in persisted
+        assert persisted['judged_without_reference'] is False
+
+    async def test_cap_tainted_cell_is_not_marked(self):
+        """NEGATIVE (cap-tainted): nothing was scored, so nothing to bound.
+
+        The judge is skipped entirely, plan_quality is None, and the cell is
+        already counted — disjointly — by cap_excluded. Marking it too would
+        double-count one cell across two counts that must stay disjoint.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_result=_cap_agent_result(),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['plan_quality'] is None
+        assert persisted['cap_tainted'] is True
+        assert persisted['judged_without_reference'] is False
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_structural_floor_cell_is_not_marked(self, plan):
+        """NEGATIVE (structural floor): the floor never consults a reference.
+
+        ``score_plan_structure`` derives its number from the plan alone, so the
+        score is valid ground-truth-independently — there is no validity to
+        bound. The judge-not-called assertion ties the marker to the judge path
+        rather than to the emptiness of reference_diff.
+
+        Parametrized over ``_STEPLESS_PLANS``, not the wider
+        ``_UNSCORABLE_PLAN_SHAPES``: this is a RUNNER-level test, and
+        ``run_architect_eval`` does ``plan = artifacts.read_plan() or {}``, so
+        it can only ever be handed a dict (see the note above
+        ``TestSteplessPlanIsNeverJudged``, which scopes itself the same way).
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['judged_without_reference'] is False
+        mocks['judge'].assert_not_called()
+
+    async def test_judge_degraded_to_floor_is_not_marked(self):
+        """NEGATIVE (judge failed → floor): the PERSISTED number is the floor.
+
+        The judge WAS asked without a reference, but its answer was discarded,
+        so the score that landed is again reference-independent. The marker
+        asserts something about the persisted score, not about what was asked.
+        """
+        from orchestrator.evals.judge import score_plan_structure
+
+        plan = _well_formed_plan()
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_side_effect=RuntimeError('judge exploded'),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['plan_quality'] == score_plan_structure(plan)
+        assert persisted['judged_without_reference'] is False
+
+    async def test_missing_reference_is_logged_loudly(self, caplog):
+        """The INV-2 log half beside the structured half.
+
+        A fixture with no reference block must be loud at RUN time — the whole
+        point of σ is that the v1 degradation was findable only by archaeology.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'df_task_2605' in m and 'reference' in m.lower() for m in warnings
+        ), f'no warning naming the task and the missing reference: {warnings}'
 
 
 # ---------------------------------------------------------------------------
