@@ -730,6 +730,105 @@ class TestDbPool:
             gate_b.set()
             await _reap(opened)
 
+    async def test_close_all_does_not_return_while_adopted_close_is_in_flight(
+        self, tmp_path
+    ):
+        """close_all() must not RETURN while a close it caused is still running.
+
+        ``_close_once`` early-returns on ``conn in self._closing`` — it SKIPS
+        rather than WAITS.  During ``close_all()`` the ordering is deterministic:
+        the landing connect fires ``_adopt_or_close`` (whose done-callback was
+        registered in ``get()``, hence ahead of ``asyncio.wait``'s own), which
+        with ``_closed`` already True schedules a FIRE-AND-FORGET ``_close_once``
+        task; that task's first step is queued via ``call_soon`` ahead of
+        ``_drain_inflight``'s resumption, so it enters ``await conn.close()``
+        first and ``_drain_inflight``'s own ``_close_once(...)`` then hits the
+        ``_closing`` guard and returns instantly.  Nothing awaits the scheduled
+        task, so ``close_all()`` returns with the close still in flight.
+
+        Why that is a real bug and not just untidy: under uvicorn — or a
+        ``TestClient`` portal that closes the loop promptly after shutdown — the
+        pending close task is destroyed mid-flight and the aiosqlite worker
+        thread is stranded.  That is the ORIGINAL task-3466 defect reached by a
+        new route.
+
+        The assertions below run with NO intervening sleep, and the ABSENCE of
+        that sleep is the whole point: the step-1/step-7 durability guards pass
+        today only because they sleep after the lifespan block.  Do not add one.
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        inside_connect = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def wrapper(*args, **kwargs):
+            inside_connect.set()
+            await gate.wait()
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                getter = asyncio.create_task(pool.get(db_path))
+                await asyncio.wait_for(inside_connect.wait(), timeout=2.0)
+                getter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter
+
+                closer = asyncio.create_task(pool.close_all())
+                # Let close_all() reach _drain_inflight before the connect lands,
+                # so the landing happens MID-DRAIN (the deterministic ordering
+                # described above).  _INFLIGHT_DRAIN_TIMEOUT is deliberately NOT
+                # shrunk: this case needs the connect to land INSIDE the budget,
+                # and it lands as soon as `gate` is set.
+                await asyncio.sleep(0)
+                gate.set()
+                await asyncio.wait_for(closer, timeout=5.0)
+
+            assert len(opened) == 1, (
+                f'expected exactly 1 physical connect, got {len(opened)}'
+            )
+            conn = opened[0]
+            # NO sleep here — see the docstring.
+            assert conn._running is False, (
+                'close_all() returned while a connection it owned was still '
+                'being closed; if the loop closes now the aiosqlite worker '
+                f'thread is stranded (_running is {conn._running!r})'
+            )
+            assert conn._connection is None, (
+                'close_all() returned while a connection it owned was still '
+                'being closed; if the loop closes now the aiosqlite worker '
+                f'thread is stranded (_connection is {conn._connection!r})'
+            )
+            # The thread's own exit happens just after the STOP sentinel is
+            # processed, so join() the brief post-STOP window before asserting —
+            # exactly as the close_all race test above does.
+            conn._thread.join(timeout=2.0)
+            assert not conn._thread.is_alive(), (
+                'aiosqlite worker thread did not exit after close_all returned'
+            )
+        finally:
+            gate.set()
+            # _reap() cannot be called blind here.  On a RED run the close this
+            # test is about is STILL IN FLIGHT, and a second concurrent close()
+            # queues a second STOP sentinel that nothing will ever resolve — the
+            # permanent hang _close_once exists to prevent.  Let the in-flight
+            # close settle first (it needs no help; it is already running), then
+            # reap only what is genuinely still open.
+            for conn in opened:
+                with contextlib.suppress(TimeoutError):
+                    await _wait_until(
+                        lambda c=conn: not getattr(c, '_running', False),
+                        timeout=2.0,
+                    )
+            await _reap(opened)
+
     async def test_close_all_warns_when_inflight_connect_exceeds_drain_budget(
         self, tmp_path, caplog, monkeypatch
     ):
