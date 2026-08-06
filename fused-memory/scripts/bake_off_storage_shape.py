@@ -62,6 +62,19 @@ the real guard.  ``guard_adequacy`` therefore returns
      so nobody trends it across embedding-config changes as if it were
      stable.
 
+Rank-based is not the same as transform-blind, and discoverability is
+reported in BOTH forms for that reason.  ``canonical_in_top_5_rate`` is
+measured over the read window, where ``apply_grouped_read`` has already
+synthesised a grouped document carrying the CANONICAL's ``record_id`` — so
+under ``b_grouped`` a child hit that folds upward is scored as "the
+canonical was found", and ``apply_topic_anchor`` injects it too.
+``stored_canonical_in_top_5_rate`` (with its median rank and censored
+denominator) is measured over the RAW store hits, before either transform,
+and so answers the narrower question: did the canonical's own stored record
+rank?  Neither is corrected toward the other; the gap between them is the
+read transform's contribution, stated rather than folded invisibly into one
+column.  See ``render_markdown``'s reading guide.
+
 BLIND-AUTHORING PROTOCOL (resolves PRD §10's open tactical question
 "Blind-authoring protocol for ζ's arms (two-agent cross-check vs
 single-author-blind-to-metrics)")
@@ -2125,6 +2138,28 @@ def render_markdown(report: dict[str, Any]) -> str:
         'the handful of queries where it did.  Rank is measured over the '
         'full fetch depth, not the k=5 read window, so "outside top-5" and '
         '"absent entirely" stay distinguishable.',
+        '',
+        '`canonical in top-5` is measured over the READ window, and under '
+        '`b_grouped` that is not the same question it is under the other two '
+        'shapes.  `apply_grouped_read` synthesises its grouped document '
+        'carrying the CANONICAL\'s `record_id`, and the metric identifies the '
+        'canonical by `record_id` — so any child hit that folds upward is '
+        'scored as "the canonical was found", whereas under `c_peers` and '
+        '`status_quo` the canonical\'s own stored record must itself have '
+        'ranked.  That is a property of the READ TRANSFORM, not purely of '
+        'retrieval.  It is also arguably the right thing to credit: a grouped '
+        'read genuinely does put the canonical body in the reader\'s window, '
+        'which is what a reader of that window cares about.',
+        '',
+        '`canonical in top-5 (stored)` is the transform-blind counterpart — '
+        'the canonical\'s OWN stored record, measured over the raw store hits '
+        'before grouping and before the pin.  It is therefore identical '
+        'across a shape\'s two pin variants by construction, and comparable '
+        'across all six arms.  **Read the two together: the gap between them '
+        'IS the grouping effect.**  This is DISCLOSURE, not correction — no '
+        'arm, pin, window or threshold was re-tuned to move either column, '
+        'and both numbers are recorded exactly as measured (gate G6/D10 '
+        'assert no threshold on any of them).',
         '',
         '`pin changed window` is the diagnostic that makes the `+pin` rows '
         'readable.  Every variant is scored over a window of the SAME size '
