@@ -464,3 +464,70 @@ def run_audit_cli(
         return AUDIT_EXIT_NOTHING_AUDITED
 
     return AUDIT_EXIT_FINDINGS if is_dirty(audits) else AUDIT_EXIT_OK
+
+
+# --- Tier 3 reporting primitives (LAYOUT only, never the prose) -------------
+
+# Width of the coverage block's label column. Every label in both audit scripts
+# is <= 31 characters, so all of their values land at column 40 — this constant
+# is the MEASURED, byte-exact reproduction of both existing blocks, not a new
+# choice. A label at or past the gutter falls back to a single separating
+# space rather than colliding with its value.
+_COVERAGE_LABEL_WIDTH = 36
+
+
+def format_kv_line(pairs: Sequence[tuple[str, Any]], *, indent: str = "  ") -> str:
+    """Render *pairs* as one indented ``key=value key=value`` line.
+
+    The enforced form of the "precedent's ``key=value`` style" that
+    ``audit_combine_gate_marker_loss.py``'s ``_format_finding_line`` docstring
+    previously only asserted in prose. Values go through ``str()``, exactly as
+    the f-strings this replaces did, so an int, a str and a ``len()`` result
+    all render identically to before.
+
+    The FIELD SET stays per-script: the two adopters name different columns,
+    and several of their keys deliberately differ from the underlying attribute
+    names (``source`` for ``expected_source``, and so on).
+    """
+    return indent + " ".join(f"{key}={value}" for key, value in pairs)
+
+
+def format_coverage_block(
+    caveat: str | Sequence[str],
+    rows: Sequence[tuple[str, Any]],
+    details: Sequence[str] = (),
+) -> list[str]:
+    """Render an always-printed COVERAGE block: caveat, aligned rows, details.
+
+    *caveat* is emitted verbatim above the rows and accepts either a single
+    pre-joined string (``audit_combine_gate_marker_loss.py``'s
+    ``_COVERAGE_CAVEAT`` constant) or a sequence of lines
+    (``audit_wiped_metadata_files.py``'s three-line literal). Each row renders
+    as ``f"    {label:<36}{value}"``; each detail as ``f"      - {detail}"``,
+    with the detail section omitted entirely when *details* is empty.
+
+    ONLY THE ALIGNMENT IS SHARED, deliberately. The 36-character gutter is the
+    measured, byte-exact reproduction of BOTH scripts' existing coverage blocks
+    (every label in both files is <= 31 chars, so every value already lands at
+    column 40), and a drifting gutter is the failure mode this helper exists to
+    prevent. The caveat PROSE and the label/field sets stay per-script: wiped's
+    caveat is about unrecoverable plan scope, combine's about combine targets
+    with no comparison source, and folding them into one string here would
+    delete exactly the semantics each block carries.
+    """
+    lines = [caveat] if isinstance(caveat, str) else list(caveat)
+
+    for label, value in rows:
+        if len(label) < _COVERAGE_LABEL_WIDTH:
+            lines.append(f"    {label:<{_COVERAGE_LABEL_WIDTH}}{value}")
+        else:
+            # Past the gutter: keep a separator rather than rendering an
+            # unreadable "label:value" collision.
+            lines.append(f"    {label} {value}")
+
+    # NAME what is missing, never just count it — a count alone tells an
+    # operator that coverage is incomplete but not where to look.
+    for detail in details:
+        lines.append(f"      - {detail}")
+
+    return lines
