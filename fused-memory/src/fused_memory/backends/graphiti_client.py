@@ -32,6 +32,7 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -169,7 +170,10 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # check is both unnecessary here and actively harmful — it
                 # would abort an otherwise-valid local endpoint on a
                 # requirement that endpoint does not have.
-                llm_client = OpenAIGenericClient(config=llm_config)
+                if cfg.llm.structured_output_mode == 'json_object':
+                    llm_client = ForceJsonObjectOpenAIGenericClient(config=llm_config)
+                else:
+                    llm_client = OpenAIGenericClient(config=llm_config)
             else:
                 check_openai_responses_api()
                 llm_client = OpenAIClient(config=llm_config)
