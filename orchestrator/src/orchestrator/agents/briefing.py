@@ -76,13 +76,43 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     when nothing survives, so the existing ``if section:`` guards in
     ``_get_memory_context`` skip an all-foreign section the same way they
     skip an empty one.
+
+    Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
+    object, or a missing/non-list ``results`` — returning ``(payload_text,
+    0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
+    a serialisation surprise would be a silent capability loss across every
+    prompt builder; preserving today's (unfiltered) behaviour with a loud
+    warning is the safer failure direction. A stray non-dict entry, or a
+    non-dict ``metadata`` on an otherwise-well-formed entry, is kept rather
+    than raising — treated the same as an untagged result.
     """
-    payload = json.loads(payload_text)
-    results = payload['results']
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f'filter_foreign_project_results: payload is not valid JSON ({e}); keeping unfiltered')
+        return payload_text, 0
+
+    if not isinstance(payload, dict):
+        logger.warning(
+            f'filter_foreign_project_results: payload is a {type(payload).__name__}, '
+            'not a JSON object; keeping unfiltered'
+        )
+        return payload_text, 0
+
+    results = payload.get('results')
+    if not isinstance(results, list):
+        logger.warning(
+            f"filter_foreign_project_results: payload['results'] is a "
+            f'{type(results).__name__}, not a list; keeping unfiltered'
+        )
+        return payload_text, 0
 
     kept = []
     dropped = 0
     for entry in results:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
         metadata = entry.get('metadata')
         tag = metadata.get('project_id') if isinstance(metadata, dict) else None
         if tag and tag != project_id:
