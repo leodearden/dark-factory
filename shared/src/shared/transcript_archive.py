@@ -30,6 +30,15 @@ Each transcript is streamed source → gzip in fixed-size chunks rather than
 slurped whole, so peak memory stays bounded even for the multi-MB transcripts a
 long or resumed session produces; the producer additionally offloads the whole
 call to a worker thread so the CPU-bound compression never stalls the event loop.
+
+The module also owns the **read** side of that archive:
+:func:`durable_archive_path` is the single session-id-keyed locator into it
+(task 3727 / plans/session-resume-eligibility-seam-prd.md §8), so every reader
+resolves the layout from the same place the writer defines it and the two
+cannot drift. It is strictly read-only — glob and ``stat``, nothing created,
+moved, deleted or decompressed. *Restoring* an archived transcript back into a
+live config dir is task 3578's, under task 3619's archive-before-delete guard;
+that restore reuses this locator rather than growing a second glob.
 """
 
 from __future__ import annotations
@@ -184,7 +193,8 @@ def durable_archive_path(
       ``except Exception`` → ``None``, not an enumeration of ``OSError``
       subclasses. Callers on the dispatch path (the orchestrator's
       session-resume guard and its fallback emit) lean on that totality to
-      stay total themselves.
+      stay total themselves. A plain *miss* is silent (it is the common case);
+      only a genuine fault is swallowed, and that is logged loudly.
     * **I-B cwd-agnostic** — the encoded-cwd component is *globbed*, never
       assumed, so a session archived from one worktree lane is still found
       after re-dispatch into a different lane.
@@ -204,37 +214,73 @@ def durable_archive_path(
     spelled ``is not None``, and task 3578's restore reuses the very path
     returned here instead of growing a second glob that would have to agree
     with this one byte-for-byte forever.
-
-    .. note::
-       Built up across task 3727's steps: this initial body satisfies only
-       I-B/I-D/I-E. Steps 4, 6 and 8 widen it to satisfy I-C (format span and
-       the directory-decoy filter), I-F (newest-mtime + tiebreak) and I-A
-       (the blanket guard and input coercion) respectively.
     """
-    archive_root = Path(archive_root)
-    # Two load-bearing details in this one line:
-    #   * the trailing `*` on `.jsonl*` spans task 3618's gzip drop — it
-    #     matches today's `.jsonl.gz` AND tomorrow's plain `.jsonl`, so the
-    #     cutover needs no flag day and this locator no dependency on it;
-    #   * `is_file()` excludes the SUBAGENT directory, which _archive_one
-    #     names for the session itself (`<enc>/<sid>/subagents/agent-*.gz`).
-    #     That dir carries no `.jsonl` suffix so the pattern misses it by
-    #     luck today; the filter makes returning a directory as "the
-    #     transcript" structurally impossible instead of incidentally avoided.
-    matches = [p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()]
-    if not matches:
+    try:
+        # Coerce inside the try: a caller can easily hold a numeric task_id or
+        # a str archive_root, and neither may raise from path composition.
+        archive_root = Path(archive_root)
+        task_id = str(task_id)
+        session_id = str(session_id)
+        # Two load-bearing details in this one line:
+        #   * the trailing `*` on `.jsonl*` spans task 3618's gzip drop — it
+        #     matches today's `.jsonl.gz` AND tomorrow's plain `.jsonl`, so the
+        #     cutover needs no flag day and this locator no dependency on it;
+        #   * `is_file()` excludes the SUBAGENT directory, which _archive_one
+        #     names for the session itself (`<enc>/<sid>/subagents/agent-*.gz`).
+        #     That dir carries no `.jsonl` suffix so the pattern misses it by
+        #     luck today; the filter makes returning a directory as "the
+        #     transcript" structurally impossible, not incidentally avoided.
+        matches = [
+            p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()
+        ]
+        if not matches:
+            return None
+        # Newest mtime wins: a resumed session's transcript only ever grows, so
+        # the newest archive is the most complete one. The `str(p)` tiebreak is
+        # not decoration — mtime alone is NOT a total order here, because
+        # _archive_one mirrors the SOURCE mtime onto the archived copy via
+        # os.utime (:124), so one session archived from two lanes can tie
+        # exactly. Under a tie max() would fall back to filesystem-dependent
+        # glob order; appending the path string makes the answer reproducible,
+        # which is what makes a later resume reproducible.
+        #
+        # p.stat() can raise (a file unlinked between glob and stat — e.g. task
+        # 2731's GC sweep landing mid-lookup). That is deliberately NOT caught
+        # per-file: the blanket guard below is the single place totality is
+        # enforced, so a miss and a race degrade to the same answer.
+        return max(matches, key=lambda p: (p.stat().st_mtime, str(p)))
+    except Exception as exc:
+        # I-A: one blanket swallow, mirroring cli_invoke._resolve_transcript_path
+        # rather than enumerating OSError subclasses — the whole point of the
+        # contract is that NOTHING escapes, which is what lets the orchestrator's
+        # session-resume guard and its fallback emit stay total on the dispatch
+        # path.
+        #
+        # Level: WARNING, and note what does NOT reach here. The COMMON case —
+        # this session simply has no archive (the PRD §2 reference measurement
+        # puts ~36% of sessions there) — returns None from the empty-`matches`
+        # branch above and logs nothing at all, so the ~36% can never become log
+        # noise. Only a genuine fault lands in this handler: a glob that raised
+        # (archive root unreadable/unmounted), a stat that raised (task 2731's
+        # GC unlinking mid-lookup), or a non-coercible id from a caller bug.
+        # Each of those is a real breakage an operator should see, so silence or
+        # DEBUG here would be exactly the silent degradation design-invariants
+        # INV-2/INV-4 forbid — and shared/tests/test_silent_fallthrough_gate.py
+        # enforces that for new code (its baseline allowlist is a burn-down
+        # ratchet for pre-existing sites like _resolve_transcript_path, not a
+        # hatch new code may add to). Structured extra=, matching the shape
+        # _record_failure already emits, so both archive-side failure signals
+        # are greppable the same way.
+        logger.warning(
+            'durable_archive_path: lookup failed for session %s (task %s) under %s: %s',
+            session_id,
+            task_id,
+            archive_root,
+            exc,
+            extra={
+                'path': str(archive_root),
+                'task_id': str(task_id),
+                'errno': getattr(exc, 'errno', None),
+            },
+        )
         return None
-    # Newest mtime wins: a resumed session's transcript only ever grows, so the
-    # newest archive is the most complete one. The `str(p)` tiebreak is not
-    # decoration — mtime alone is NOT a total order here, because _archive_one
-    # mirrors the SOURCE mtime onto the archived copy via os.utime (:124), so
-    # one session archived from two lanes can tie exactly. Under a tie max()
-    # would fall back to filesystem-dependent glob order; appending the path
-    # string makes the answer reproducible, which is what makes a later resume
-    # reproducible.
-    #
-    # p.stat() can raise (a file unlinked between glob and stat — e.g. task
-    # 2731's GC sweep landing mid-lookup). That is deliberately NOT caught
-    # per-file: the function-wide I-A guard is what keeps this total, so there
-    # is exactly one place totality is enforced rather than several.
-    return max(matches, key=lambda p: (p.stat().st_mtime, str(p)))
