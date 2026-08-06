@@ -1338,6 +1338,45 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     return render(rewritten)
 
 
+def _with_pytest_numprocesses_str(cmd: str | None, n: str) -> str | None:
+    """Inject a ``-n <n>`` pytest-xdist worker cap into *cmd*, via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``apply_pytest_numprocesses`` -> ``render`` (mirrors
+    ``_with_pytest_timeout_str`` / ``_with_junitxml_str``). Returns *cmd*
+    unchanged — BYTE-identically, via the ``is`` identity check, since a
+    from-scratch render of an untouched parse is only argv-equivalent — when
+    it is ``None`` or when the mutation is a no-op.
+
+    All three of ``apply_pytest_numprocesses``' fail-safe guards ride along
+    unchanged: a non-PYTEST tool (which covers OPAQUE), *n* in ``{'',
+    'auto'}`` (the shipped default, so this is inert until an operator
+    configures a numeric cap), and an already-serial-forced command (``-p
+    no:xdist`` — injecting ``-n`` there would fail the run with
+    ``unrecognized arguments: -n`` and defeat the serial-recovery safety
+    net).
+
+    Unlike ``_with_junitxml_str`` this does NOT log its no-op. A suppressed
+    junit injection means an expected report will not be written, degrading
+    named downstream capabilities; a suppressed ``-n`` just leaves the
+    command at its configured worker count, which is the pre-cap status quo
+    and not a lost capability.
+
+    Task 3478 extracted this so the cap has ONE rewrite site with two
+    callers — ``_run_or_skip_timed``'s non-segmented branch and the
+    per-segment application inside ``_run_one_segment``. Two copies of the
+    parse/mutate/identity/render dance would be free to drift (INV-5
+    no-lockstep-duplication).
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = apply_pytest_numprocesses(parsed, n)
+    if rewritten is parsed:
+        return cmd
+    return render(rewritten)
+
+
 def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     """Inject ``--junitxml <junit_path>`` into a structured ``pytest`` command, via VerifyCmd.
 
@@ -4460,6 +4499,17 @@ async def run_verification(
     every module_configs run. When the segmenter REFUSES, this is a no-op
     and the chain runs exactly as it does today.
 
+    Each segment is its own subprocess, so the per-execution details are
+    re-applied per segment rather than once for the chain: cpu-governance,
+    the admission nice prefix, its own streamed log path (keyed off the
+    index-suffixed ``ChainSegment.label``, so two segments sharing a cwd
+    cannot collide) and — since task 3478 — the ``verify_admission_pytest_n``
+    ``-n`` worker cap. ``CheckRun.cmd`` stays the operator's configured
+    chain throughout; all of the above are execution details layered onto
+    the segment, not rewrites of what was configured. Per-segment junitxml
+    is deliberately NOT among them: see the guard and the CheckRun comment
+    at the construction site.
+
     When *module_config* is provided, a ``None`` command means "skip that check"
     (the subproject doesn't define it).  When *module_config* is ``None``,
     global config commands are used for every check.
@@ -4639,34 +4689,53 @@ async def run_verification(
         if junit_path is not None and label == 'test':
             cmd = _with_junitxml_str(cmd, str(junit_path))
             assert cmd is not None  # None only when the input is None; guarded above
+        # Admission gate (task 2390 T2): only the pytest ('test') leg is
+        # gated by the shared.verify_admission flock semaphore + role nice
+        # tier; lint/type ride alongside within the same verify, ungated.
+        # Resolved here rather than after the governance wrap below because
+        # the `-n` gate reads it and must itself precede that wrap; it
+        # depends on nothing but config/label, so the move is inert.
+        admission = _verify_admission_active(config) and label == 'test'
+        # -n cap (task 2394 T6): applies only to roles {task, background} —
+        # 'merge' is never -n-capped (bypasses admission slot-counting,
+        # latency-critical). No-op when the knob is '' or 'auto' (the
+        # apply_pytest_numprocesses no-op guard) — byte-identical to today.
+        # config_cmd above intentionally stays un-rewritten (same treatment
+        # as the nice prefix: an execution detail layered onto cmd, not the
+        # persisted config command).
+        #
+        # Hoisted into ONE local (task 3478) because the segmented branch
+        # below applies the same cap per segment: a second copy of this
+        # predicate could drift, letting role/admission/knob eligibility
+        # disagree between the segmented and unsegmented paths.
+        pytest_n_capped = (
+            admission
+            and role in {'task', 'background'}
+            and config.verify_admission_pytest_n not in {'', 'auto'}
+        )
+        # _with_pytest_numprocesses_str identity-checks the mutation before
+        # rendering (mirrors _govern_cpu_str's `governed is parsed` guard
+        # below), so a no-op leaves cmd byte-identical rather than
+        # reformatting a command that wasn't actually touched.
+        #
+        # MUST run before the cpu-governance wrap immediately below and after
+        # the junitxml injection above — the same ordering constraint, for
+        # the same reason: once governed, cmd is an opaque outer `<exec> --
+        # /bin/bash -c '...'` string that parse_config_command can no longer
+        # see as pytest, so the cap would silently vanish. Both gates are
+        # disjoint today (governance resolves only for role=='merge', the cap
+        # only for role in {'task','background'}), so this is defence in
+        # depth; ordering it identically to _run_one_segment below is what
+        # keeps the two paths from disagreeing if either gate ever widens.
+        if pytest_n_capped:
+            cmd = _with_pytest_numprocesses_str(cmd, config.verify_admission_pytest_n)
+            assert cmd is not None  # None only when the input is None; guarded above
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
         # so a misconfig never makes a verify spawn fail.
         cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))
         assert cmd is not None  # _govern_cpu_str returns None only when cmd is None; guarded above
-        # Admission gate (task 2390 T2): only the pytest ('test') leg is
-        # gated by the shared.verify_admission flock semaphore + role nice
-        # tier; lint/type ride alongside within the same verify, ungated.
-        admission = _verify_admission_active(config) and label == 'test'
-        # -n cap (task 2394 T6): applies only to roles {task, background} —
-        # 'merge' is never -n-capped (bypasses admission slot-counting,
-        # latency-critical). No-op when the knob is '' or 'auto' (the
-        # apply_pytest_numprocesses no-op guard) — byte-identical to today.
-        # Must precede the nice-prefix bash-wrap below, and config_cmd above
-        # intentionally stays un-rewritten (same treatment as the nice
-        # prefix: an execution detail layered onto cmd, not the persisted
-        # config command).
-        # Identity-check the mutation before rendering (mirrors
-        # _govern_cpu_str's `governed is parsed` guard above): a non-pytest
-        # test leg (cmd.tool is not PYTEST) makes apply_pytest_numprocesses
-        # return the same object, so skip the parse->render round-trip
-        # entirely rather than reformatting a command that wasn't actually
-        # touched.
-        if admission and role in {'task', 'background'} and config.verify_admission_pytest_n not in {'', 'auto'}:
-            parsed = parse_config_command(cmd)
-            mutated = apply_pytest_numprocesses(parsed, config.verify_admission_pytest_n)
-            cmd = cmd if mutated is parsed else render(mutated)
         if admission:
             prefix = _resolve_nice_prefix(config, role)
             if prefix:
@@ -4711,6 +4780,39 @@ async def run_verification(
                 if segment_chained_test and label == 'test'
                 else None
             )
+            # Co-occurrence guard (task 3478). These two are mutually
+            # exclusive by construction today: junit_path is computed only
+            # when role=='merge' and breadth=='full', while segmentation is
+            # opted into only as `segment_chained_test=role != 'merge'`. So
+            # per-segment junitxml is deliberately UNWIRED — with no writer
+            # and no consumer it would be dead code, and node-id attribution
+            # on this path comes from _extract_failing_test_ids over the
+            # aggregated segment stdout instead.
+            #
+            # If a future change ever relaxes either gate, the tempting
+            # "fix" is to hand every segment the SAME --junitxml path, which
+            # is last-writer-wins: N pytest runs, one report, silently
+            # describing only the last segment. Say so at the point it
+            # becomes observable rather than letting it look like it worked.
+            # Storm-safe without extra machinery: at most once per test leg,
+            # and only in a configuration that does not exist today.
+            if chain_segments is not None and junit_path is not None:
+                logger.warning(
+                    'Segmented verify (%d segments) co-occurs with a junit report '
+                    'path at %s, which will NOT be written: per-segment junitxml is '
+                    'deliberately unwired (task 3478). These two were mutually '
+                    'exclusive by construction — junit_path requires role==\'merge\' '
+                    'with merge_verify_breadth==\'full\', segmentation requires '
+                    'role!=\'merge\' — so reaching here means one of those gates '
+                    'changed. Do NOT resolve this by injecting one shared '
+                    '--junitxml: %d pytest runs writing one path is last-writer-wins, '
+                    'a report describing only the final segment. Node-id attribution '
+                    'for THIS run remains available via _extract_failing_test_ids '
+                    'over the aggregated segment stdout.',
+                    len(chain_segments),
+                    junit_path,
+                    len(chain_segments),
+                )
             if chain_segments is not None:
                 async def _run_one_segment(
                     segment_cmd: str,
@@ -4718,10 +4820,43 @@ async def run_verification(
                     segment_timeout: float,
                     segment_label: str,
                 ) -> tuple[int, str, bool]:
-                    # cpu-governance and the nice prefix are per-segment: each
-                    # segment is its own subprocess, so each needs its own wrap.
+                    # The `-n` cap, cpu-governance and the nice prefix are all
+                    # per-segment: each segment is its own subprocess, so each
+                    # needs its own wrap.
+                    #
+                    # Per SEGMENT is the right granularity, not N times the
+                    # parallelism (task 3478, correcting task 3338's comment):
+                    # _run_segmented awaits `run_one` once per loop iteration,
+                    # so segments run SEQUENTIALLY. A per-segment `-n N`
+                    # therefore caps N workers at any instant — exactly what
+                    # `-n N` means for a single pytest command. Without this
+                    # the cap was silently dropped on this path, since the
+                    # rewrite above lands on `cmd` while segments are built
+                    # from `config_cmd`.
+                    #
+                    # BEFORE _govern_cpu_str — the SAME order as the
+                    # unsegmented site above (and as the junitxml injection,
+                    # which documents the constraint first): a governed
+                    # command is an opaque outer `<exec> -- /bin/bash -c
+                    # '...'` string that parse_config_command can no longer
+                    # see as pytest. Governance is inert here
+                    # (_resolve_governed_exec_path returns None for role !=
+                    # 'merge', and segmentation only happens for role !=
+                    # 'merge'), so ordering it first is defence in depth
+                    # against a future change to that gate rather than a live
+                    # dependency — but it is deliberately the same defence the
+                    # unsegmented path takes, so widening the governance gate
+                    # cannot make one path honour the operator's cap while the
+                    # other silently discards it (the asymmetry task 3478
+                    # exists to remove).
+                    capped = segment_cmd
+                    if pytest_n_capped:
+                        capped = _with_pytest_numprocesses_str(
+                            segment_cmd, config.verify_admission_pytest_n,
+                        )
+                        assert capped is not None  # None only for a None input
                     governed = _govern_cpu_str(
-                        segment_cmd, _resolve_governed_exec_path(config, worktree, role),
+                        capped, _resolve_governed_exec_path(config, worktree, role),
                     )
                     assert governed is not None  # None only for a None input
                     if admission:
@@ -4797,12 +4932,30 @@ async def run_verification(
             # _summarize_checks, so preserving it keeps every persisted
             # artifact and every failure classification identical. Task 3338
             # changes execution TOPOLOGY and REPORTING, not what any command
-            # is. For the same reason the junitxml and apply_pytest_numprocesses
-            # branches above stay the no-ops they already are on an OPAQUE
-            # chain — both are recorded follow-ups, not smuggled in here: one
-            # junit path shared by 8 pytest runs is last-writer-wins (worse
-            # than today's no-op), and a per-segment `-n` would silently change
-            # verify parallelism for task/background roles.
+            # is. The per-segment `-n` cap below is layered onto the SEGMENT
+            # for the same reason the nice prefix and cpu-governance are: an
+            # execution detail, not the persisted config command.
+            #
+            # Task 3478 settled the two dispositions task 3338 recorded here
+            # as follow-ups:
+            #
+            # - junitxml is NOT wired per segment, and not because it is a
+            #   harmless no-op: junit_path requires role=='merge' while
+            #   segmentation requires role!='merge', so it is unreachable by
+            #   construction — dead code with no writer and no consumer
+            #   (_extract_failing_test_ids_from_junit runs only `if junit_path
+            #   is not None`). Node-id attribution here comes from
+            #   _extract_failing_test_ids over the aggregated segment stdout.
+            #   The guard above warns if either gate ever relaxes.
+            #
+            # - apply_pytest_numprocesses IS now applied per segment, inside
+            #   _run_one_segment. Its gate's roles ({'task','background'}) are
+            #   exactly the segmented-path roles, so it was never exempt —
+            #   just silently dropped, the rewrite landing on `cmd` while
+            #   segments are built from `config_cmd`. Segments run
+            #   sequentially, so a per-segment `-n N` keeps its single-command
+            #   meaning (N workers at any instant) rather than multiplying
+            #   parallelism by the segment count.
             cmd=config_cmd,
             rc=rc,
             output=out,

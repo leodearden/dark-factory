@@ -675,6 +675,100 @@ class TestSerialPytest:
         assert serial_pytest(cmd) == cmd
 
 
+class TestRawRewriteDoesNotSwallowSubshellTerminator:
+    """The raw-retained rewrite must append INSIDE a subshell, not after its `)`.
+
+    Task 3478. Both raw-path mutators — ``serial_pytest`` and
+    ``apply_pytest_numprocesses`` — share one rewrite closure,
+    ``_append_to_raw_pytest_invocations``, whose span regex is
+    ``\\bpytest\\b[^&|;]*``. That character class excludes the chain
+    operators ``&``/``|``/``;`` but NOT ``)``, so on a clause like
+    ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ )`` the
+    match runs PAST the subshell's closing paren and the flags are appended
+    after it: ``( ... pytest tests/ ) -p no:xdist``. bash rejects that
+    outright with ``syntax error near unexpected token``, so the clause does
+    not merely lose its flags — the WHOLE chain becomes unrunnable.
+
+    This is live today at the shipped defaults, with no knob set, via
+    ``serial_pytest``: the committed fleet ``test_command`` contains exactly
+    such a cockpit subshell, and ``serial_pytest`` drives both the
+    env-transient recovery re-run and the flaky-scoped isolated re-run. So
+    the two safety nets that exist to rescue a verify currently hand bash a
+    syntax error on this repo's own configured chain.
+
+    ``bash -n`` (parse only, never execute) is the assertion of record here:
+    a substring check on flag placement would pass for several wrong
+    renderings, whereas syntactic validity is the property that actually
+    broke.
+    """
+
+    COCKPIT_SUBSHELL = (
+        '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+    )
+
+    @staticmethod
+    def _assert_valid_bash(rendered: str) -> None:
+        """Fail with the rendered command when bash cannot even PARSE it."""
+        import subprocess  # noqa: PLC0415
+
+        result = subprocess.run(
+            ['bash', '-n', '-c', rendered], capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, (
+            f'rendered command is not valid bash:\n{rendered}\n{result.stderr}'
+        )
+
+    def test_dash_n_lands_inside_the_subshell_not_after_its_paren(self):
+        rendered = render(
+            apply_pytest_numprocesses(parse_config_command(self.COCKPIT_SUBSHELL), '4'),
+        )
+        self._assert_valid_bash(rendered)
+        assert rendered.endswith(')'), f'the subshell must still close last: {rendered}'
+        assert '-n 4 )' in rendered or '-n 4)' in rendered
+
+    def test_serial_flags_land_inside_the_subshell_not_after_its_paren(self):
+        rendered = render(serial_pytest(parse_config_command(self.COCKPIT_SUBSHELL)))
+        self._assert_valid_bash(rendered)
+        assert rendered.endswith(')'), f'the subshell must still close last: {rendered}'
+        assert 'no:xdist' in rendered
+
+    def test_committed_fleet_chain_survives_serial_recovery_as_valid_bash(self):
+        """The live-today regression: default config, no knob, recovery path.
+
+        Read from the committed YAML rather than hand-copied so this cannot
+        drift from the chain the fleet actually runs.
+        """
+        fleet = load_config_scalar(DF_CONFIG_PATH, 'test_command')
+        self._assert_valid_bash(render(serial_pytest(parse_config_command(fleet))))
+
+    def test_committed_fleet_chain_survives_a_numeric_dash_n_cap_as_valid_bash(self):
+        fleet = load_config_scalar(DF_CONFIG_PATH, 'test_command')
+        self._assert_valid_bash(
+            render(apply_pytest_numprocesses(parse_config_command(fleet), '4')),
+        )
+
+    def test_nested_subshells_keep_every_terminator_after_the_flags(self):
+        nested = '( ( cd a && uv run pytest tests/ ) )'
+        rendered = render(apply_pytest_numprocesses(parse_config_command(nested), '4'))
+        self._assert_valid_bash(rendered)
+        assert rendered.rstrip().endswith(')')
+        assert rendered.count(')') == 2
+
+    def test_a_balanced_paren_inside_an_argument_is_not_peeled(self):
+        """Guard against over-correcting: only an UNBALANCED trailing `)` moves.
+
+        ``-k 'test_a and (b or c)'`` ends in a paren that belongs to the
+        argument, not to a subshell. Peeling it — or excluding `(` from the
+        span regex, the other tempting fix — would splice the flags into the
+        middle of the ``-k`` expression. The suffix belongs at the END here.
+        """
+        expr = "uv run pytest tests/ -k 'test_a and (b or c)'"
+        rendered = render(apply_pytest_numprocesses(parse_config_command(expr), '4'))
+        self._assert_valid_bash(rendered)
+        assert "'test_a and (b or c)'" in rendered, (
+            f'the -k expression must survive intact: {rendered}'
+        )
+
 # Module level (not class level) so the cross-product comprehension below
 # can see both names from its nested `for` clause — a comprehension nested
 # inside a class body cannot see other class-body names except through the
@@ -726,6 +820,21 @@ _PAREN_PRESERVING_CASES = [
         'quoted-close-paren',
         'pytest -k "a)" tests/ && true',
         'pytest -k "a)" tests/{suffix} && true',
+    ),
+    (
+        # The MIRROR of quoted-close-paren, and the case that decided the
+        # task 3650 / task 3478 merge. A quoted '(' is not a structural open,
+        # so the subshell's ')' here IS unbalanced and must be peeled. A
+        # quote-blind counter (task 3478's competing fix scored
+        # `count(')') > count('(')` over the whole span) sees this span as
+        # balanced, never peels, and leaves `... tests/ ) -n 4` — the very
+        # bash syntax error both tasks set out to fix, silently unrepaired.
+        # quoted-close-paren alone cannot catch that direction: it pins a
+        # quoted ')' being wrongly treated AS a closer, not a quoted '('
+        # masking a real one.
+        'quoted-open-paren',
+        '( cd x && pytest -k "foo(" tests/ )',
+        '( cd x && pytest -k "foo(" tests/{suffix} )',
     ),
     (
         # Two independently-parenthesised pytest invocations in one chain —

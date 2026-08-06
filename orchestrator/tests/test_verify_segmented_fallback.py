@@ -678,8 +678,33 @@ class TestRunVerificationSegmentChainedTestWiring:
         )
 
     @staticmethod
-    async def _run(tmp_path, test_command: str, **kwargs):
-        """Drive run_verification with _run_cmd stubbed; return (result, calls)."""
+    async def _run(
+        tmp_path,
+        test_command: str,
+        *,
+        config_overrides: dict | None = None,
+        run_cmd_result=None,
+        **kwargs,
+    ):
+        """Drive run_verification with _run_cmd stubbed; return (result, calls).
+
+        *config_overrides* is merged over this harness's inline
+        ``OrchestratorConfig`` construction, overrides winning. The default
+        ``None`` leaves the constructed config — and therefore every existing
+        caller — byte-identical; it exists because the admission-gated knobs
+        (``verify_admission_enabled``, ``verify_admission_pytest_n``,
+        ``verify_admission_slots_dir``) are otherwise unreachable through this
+        driver, which hardcodes admission OFF. Task 3478's per-segment ``-n``
+        tests need admission ON with a numeric cap.
+
+        *run_cmd_result* is a ``(cmd) -> (rc, output, timed_out)`` callable
+        deciding what the stub returns for each spawn. The default ``None``
+        keeps the unconditional green ``(0, 'ok', False)`` every existing
+        caller relies on; it exists because run_verification's RECOVERY paths
+        (the env-transient serial retry, task 3478's round-trip pin) are only
+        reachable from a first pass that actually goes red with recognisable
+        output, which an always-green stub can never produce.
+        """
         from unittest.mock import patch  # noqa: PLC0415
 
         from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
@@ -690,9 +715,13 @@ class TestRunVerificationSegmentChainedTestWiring:
 
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
             calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'log_path': log_path})
-            return 0, 'ok', False
+            if run_cmd_result is None:
+                return 0, 'ok', False
+            return run_cmd_result(cmd)
 
-        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        config_kwargs: dict = {'project_root': tmp_path, 'verify_admission_enabled': False}
+        config_kwargs.update(config_overrides or {})
+        config = OrchestratorConfig(**config_kwargs)
         runs_capture: list = []
 
         def spy_persist(*args, **kwargs):
@@ -797,6 +826,459 @@ class TestRunVerificationSegmentChainedTestWiring:
 
         assert len([c for c in calls if 'ruff check' in c['cmd']]) == 1
         assert len([c for c in calls if 'pyright' in c['cmd']]) == 1
+
+
+class TestSegmentsAreDashNCapped:
+    """An operator's configured `-n` cap must reach each SEGMENT (task 3478).
+
+    Task 2394 T6's `-n` gate is ``admission and role in {'task','background'}
+    and verify_admission_pytest_n not in {'', 'auto'}`` — and those roles are
+    EXACTLY the segmented-path roles, since ``run_scoped_verification`` opts
+    in with ``segment_chained_test=role != 'merge'``. So unlike junitxml (see
+    TestPerSegmentJunitIsDeliberatelyUnwired) the cap is not structurally
+    excluded here; it is live and silently DROPPED, because the rewrite lands
+    on `cmd` while the segmented branch builds its segments from `config_cmd`.
+
+    Task 3338's comment framed wiring this as a risk — "a per-segment `-n`
+    would silently change verify parallelism". That inverts on inspection:
+    ``_run_segmented`` runs segments SEQUENTIALLY, so a per-segment `-n N`
+    caps N workers at any instant, which is exactly what `-n N` means for a
+    single pytest command — not N times the parallelism. Silently discarding
+    a cap the operator configured is the degradation; honouring it is the fix.
+
+    Blast radius on this repo is zero: ``verify_admission_pytest_n`` ships as
+    'auto', which ``apply_pytest_numprocesses`` already no-ops, and the
+    committed YAML does not override it. Only a project that deliberately set
+    a numeric cap — i.e. one currently being ignored — is affected. The last
+    two tests pin that zero, so a future change cannot start rewriting
+    commands at the default.
+    """
+
+    _CAPPED_OVERRIDES = {
+        'verify_admission_enabled': True,
+        'verify_admission_pytest_n': '4',
+    }
+
+    @staticmethod
+    async def _run_capped(tmp_path, *, role: str = 'task', **overrides):
+        """Drive the shared harness with admission really ON and a numeric cap.
+
+        ``verify_admission_slots_dir`` goes under tmp_path so these tests do
+        not contend on the shared ``/tmp/df-verify-slots-<uid>`` directory
+        across xdist workers, matching what
+        test_verify_admission_pytest_n.py::TestPytestNWiring already does.
+
+        *role* is a real parameter, not a constant, because the cap's gate is
+        ``role in {'task', 'background'}`` and BOTH are segmented-path roles
+        (``run_scoped_verification`` opts in as ``segment_chained_test=role !=
+        'merge'``). Exercising only 'task' would leave half the gate's live
+        surface unpinned.
+        """
+        config_overrides = {
+            **TestSegmentsAreDashNCapped._CAPPED_OVERRIDES,
+            'verify_admission_slots_dir': str(tmp_path / 'slots'),
+            **overrides,
+        }
+        return await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides=config_overrides,
+            segment_chained_test=True,
+            role=role,
+        )
+
+    @staticmethod
+    def _unwrap_nice(cmd: str) -> str:
+        """Strip the per-segment admission nice wrap, returning the real command.
+
+        With admission genuinely ON (these tests carry
+        ``real_verify_admission``), ``_run_one_segment`` wraps each segment as
+        ``nice -n 15 ionice -c2 -n7 /bin/bash -c <shlex.quote(segment)>``
+        (task 2390 T2). That wrap is pre-existing and orthogonal to the `-n`
+        cap, but it hides the command inside a quoted argument — so a
+        substring assertion would still pass on a mis-rewritten segment, and
+        a ``bash -n`` check would pass on ANY inner text at all. Unwrapping
+        first is what keeps those assertions about the command that actually
+        runs.
+        """
+        import shlex  # noqa: PLC0415
+
+        tokens = shlex.split(cmd)
+        if len(tokens) >= 3 and tokens[-3].endswith('bash') and tokens[-2] == '-c':
+            return tokens[-1]
+        return cmd
+
+    @classmethod
+    def _segment_cmds(cls, calls: list) -> list[str]:
+        return [cls._unwrap_nice(c['cmd']) for c in calls if 'pytest' in c['cmd']]
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.parametrize('role', ['task', 'background'])
+    @pytest.mark.asyncio
+    async def test_every_structured_segment_carries_the_cap(self, tmp_path, role):
+        """Both gated roles, because both reach the segmented path.
+
+        'background' is in the cap's ``role in {'task','background'}`` gate
+        and is a segmented-path role exactly as 'task' is; pinning only
+        'task' would let a future narrowing of the gate to one role pass
+        unnoticed.
+        """
+        _result, calls, _runs = await self._run_capped(tmp_path, role=role)
+
+        cmds = self._segment_cmds(calls)
+        assert len(cmds) == 8
+        for cmd in cmds:
+            assert '-n 4' in cmd, f'segment was not -n capped under role={role}: {cmd}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_cockpit_subshell_is_capped_inside_its_parens(self, tmp_path):
+        """The mixed-chain segment degrades CORRECTLY, not merely gracefully.
+
+        This clause — ``( [ -d cockpit ] || exit 0; cd cockpit && uv run
+        pytest tests/ --timeout=300 )`` — parses PYTEST raw-retained, NOT
+        opaque, so it does get rewritten. Task 3478 step-0b is what makes
+        that safe: the raw rewrite used to append after the closing paren,
+        producing a command bash refuses to parse. Assert the flag lands
+        INSIDE the subshell and the result is still valid bash.
+        """
+        import subprocess  # noqa: PLC0415
+
+        _result, calls, _runs = await self._run_capped(tmp_path)
+
+        cockpit = next(c for c in self._segment_cmds(calls) if 'cockpit' in c)
+        assert cockpit.rstrip().endswith(')'), f'subshell must close last: {cockpit}'
+        assert '-n 4' in cockpit
+        syntax = subprocess.run(
+            ['bash', '-n', '-c', cockpit], capture_output=True, text=True, check=False,
+        )
+        assert syntax.returncode == 0, f'segment is not valid bash:\n{cockpit}\n{syntax.stderr}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_3338_segmentation_contract_is_untouched(self, tmp_path):
+        """Capping must not disturb segment count, order or per-segment cwd."""
+        _result, calls, _runs = await self._run_capped(tmp_path)
+        segments = _fleet_segments()
+
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        assert len(test_calls) == 8
+        assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
+        assert len({c['log_path'] for c in test_calls}) == 8
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_check_run_cmd_is_still_the_unrewritten_chain(self, tmp_path):
+        """CheckRun.cmd stays the operator's configured chain, uncapped.
+
+        Same treatment the nice prefix and cpu-governance already get: an
+        execution detail layered onto the segment, not the persisted config
+        command that feeds _persist_attempt_logs/_build_summary_payload/
+        _summarize_checks.
+        """
+        _result, _calls, runs = await self._run_capped(tmp_path)
+
+        assert _test_run_entry(runs)['cmd'] == _FLEET_TEST_COMMAND
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_shipped_auto_default_rewrites_nothing(self, tmp_path):
+        """Blast-radius guard: this repo's live value must stay byte-identical."""
+        _result, calls, _runs = await self._run_capped(
+            tmp_path, verify_admission_pytest_n='auto',
+        )
+
+        assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_admission_disabled_rewrites_nothing(self, tmp_path):
+        """The other half of the gate: no admission, no cap, even with '4'.
+
+        Carries the marker like its siblings so the gate is driven by the
+        CONFIG value under test, not by conftest's autouse neutraliser —
+        which would force admission off and make the assertion vacuous.
+        """
+        _result, calls, _runs = await self._run_capped(
+            tmp_path, verify_admission_enabled=False,
+        )
+
+        assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
+
+
+class TestTheSerialRecoveryRoundTripStaysUncapped:
+    """`-p no:xdist` must survive serial -> segment -> cap (task 3478).
+
+    Task 3478 made the per-segment `-n` cap reachable, and that newly composes
+    it with a path no earlier test covers: on an ENV_TRANSIENT red,
+    `run_verification` re-enters `_run_or_skip_timed` with
+    ``_serial_pytest_str(attempt.test.cmd)``, and on a task/background-role
+    verify THAT chain is segmented too — so every recovery segment is now
+    handed to the cap.
+
+    ``apply_pytest_numprocesses`` guards this with ``_is_serial_forced``, but
+    the guard is only as good as ``no:xdist`` surviving the round trip. If
+    segmentation or the detection ever changed shape, each recovery segment
+    would gain ``-n <n>`` on an xdist-DISABLED pytest and die with ``pytest:
+    error: unrecognized arguments: -n`` — which is itself an
+    ``_ENV_TRANSIENT_PATTERNS`` match. The safety net would not merely stop
+    working: it would fail as a guaranteed red wearing the mask of the very
+    transient it exists to recover from, and the merge lane would read that
+    back as an infra hold. That self-reinforcing misattribution is why this
+    composition gets its own pin rather than riding on the unit-level
+    ``_is_serial_forced`` test.
+
+    The composition is CORRECT today (all recovery segments no-op). This class
+    is a regression pin, not a bug report.
+    """
+
+    # The task-2045 grounded form of the vanished-xdist transient. Matched by
+    # `_ENV_TRANSIENT_PATTERNS`, so a first pass emitting it classifies
+    # ENV_TRANSIENT and arms the serial retry — which is the only way to reach
+    # the round trip under test.
+    _XDIST_VANISHED = "ModuleNotFoundError: No module named 'xdist'"
+
+    @classmethod
+    async def _run_recovering(cls, tmp_path, *, role: str = 'task'):
+        """Drive the REAL env-transient recovery, capped, segmented.
+
+        The stub reds every pytest spawn that still has xdist enabled and
+        greens the ones that do not, so the first (capped) pass fails
+        ENV_TRANSIENT and the serial retry passes — exercising
+        run_verification's own recovery wiring rather than hand-feeding
+        `_run_or_skip_timed` a pre-serialised chain.
+        """
+        def result_for(cmd: str):
+            if 'pytest' not in cmd:
+                return 0, 'ok', False
+            if 'no:xdist' in cmd:
+                return 0, 'ok', False
+            return 4, cls._XDIST_VANISHED, False
+
+        return await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides={
+                **TestSegmentsAreDashNCapped._CAPPED_OVERRIDES,
+                'verify_admission_slots_dir': str(tmp_path / 'slots'),
+            },
+            run_cmd_result=result_for,
+            segment_chained_test=True,
+            role=role,
+        )
+
+    @staticmethod
+    def _recovery_chain_segments() -> list[str]:
+        """What the recovery pass's segments must be, derived not hardcoded.
+
+        Computed as ``split_and_chain_segments(_serial_pytest_str(chain))`` —
+        the same two transforms production composes — so if `serial_pytest`'s
+        emitted form ever changes, this expectation follows it and the test
+        keeps asserting "the cap added nothing" rather than freezing one
+        rendering of the recovery chain.
+        """
+        from orchestrator.verify import _serial_pytest_str  # noqa: PLC0415
+
+        serial = _serial_pytest_str(_FLEET_TEST_COMMAND)
+        # `_serial_pytest_str` is typed `str | None -> str | None` because it
+        # returns its argument unchanged on a None/non-parsing command; the
+        # None arm is unreachable for a str argument, so narrow it explicitly
+        # rather than leaving `split_and_chain_segments(str)` a type error.
+        assert serial is not None, 'serialising a str command must return a str'
+        assert serial != _FLEET_TEST_COMMAND, 'the fleet chain must actually serialise'
+        segments = split_and_chain_segments(serial)
+        assert segments is not None, 'the serialised chain must still be segmentable'
+        return [s.command for s in segments]
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_recovery_segments_are_byte_identical_to_the_uncapped_serial_chain(
+        self, tmp_path,
+    ):
+        """The strong form: the cap contributes NOTHING to the recovery pass.
+
+        Asserting equality against the independently-composed serial chain
+        catches every spelling a leaked cap could take (`-n 4`, `-n4`,
+        `--numprocesses 4`) — and equally catches a reformatting no-op, where
+        a from-scratch render of an untouched parse comes back merely
+        argv-equivalent instead of byte-identical.
+        """
+        n_segments = len(_fleet_segments())
+        result, calls, _runs = await self._run_recovering(tmp_path)
+
+        cmds = TestSegmentsAreDashNCapped._segment_cmds(calls)
+        assert len(cmds) == 2 * n_segments, (
+            f'expected one capped pass then one recovery pass, got {len(cmds)} spawns'
+        )
+        assert cmds[n_segments:] == self._recovery_chain_segments()
+        assert result.passed is True, 'the serial recovery must actually recover'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_first_pass_is_capped_so_the_round_trip_is_not_vacuous(self, tmp_path):
+        """Guards the test above from going green for the wrong reason.
+
+        If the cap ever stopped applying at all, the recovery assertions would
+        still pass while saying nothing. Pin the near half of the round trip:
+        the pre-recovery segments DO carry the cap, so the recovery segments'
+        lack of it is the `_is_serial_forced` guard working, not the feature
+        being dead.
+        """
+        n_segments = len(_fleet_segments())
+        _result, calls, _runs = await self._run_recovering(tmp_path)
+
+        first_pass = TestSegmentsAreDashNCapped._segment_cmds(calls)[:n_segments]
+        assert len(first_pass) == n_segments
+        for cmd in first_pass:
+            assert '-n 4' in cmd, f'first-pass segment was not -n capped: {cmd}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.parametrize('role', ['task', 'background'])
+    @pytest.mark.asyncio
+    async def test_no_recovery_segment_loses_no_xdist_or_gains_a_worker_flag(
+        self, tmp_path, role,
+    ):
+        """The two halves of the guard, stated directly and per gated role.
+
+        Equality above proves it globally; this says WHICH property has to
+        hold, so a failure reads as "the serial marker vanished" or "a worker
+        flag leaked" rather than as an opaque list diff. Both cap-gated roles
+        run it because both reach the segmented path.
+        """
+        import shlex  # noqa: PLC0415
+
+        n_segments = len(_fleet_segments())
+        _result, calls, _runs = await self._run_recovering(tmp_path, role=role)
+
+        for cmd in TestSegmentsAreDashNCapped._segment_cmds(calls)[n_segments:]:
+            assert 'no:xdist' in cmd, f'recovery segment lost its serial marker: {cmd}'
+            tokens = shlex.split(cmd)
+            assert '-n' not in tokens, f'recovery segment gained an xdist worker flag: {cmd}'
+            assert '--numprocesses' not in tokens, (
+                f'recovery segment gained an xdist worker flag: {cmd}'
+            )
+
+
+class TestPerSegmentJunitIsDeliberatelyUnwired:
+    """Per-segment junitxml stays unwired, and says so out loud (task 3478).
+
+    Task 3338 left the junitxml branch on the segmented path as a recorded
+    follow-up. Reading the two gates rather than the comment shows it is not
+    a deferred feature but STRUCTURALLY UNREACHABLE code:
+
+    - ``junit_path`` is computed only when ``role == 'merge'`` and breadth is
+      'full' (verify.py's ``_prepare_junit_report_path`` call site);
+    - segmentation is opted into by exactly one call site,
+      ``run_scoped_verification``'s fallback, as
+      ``segment_chained_test=role != 'merge'``.
+
+    So whenever ``chain_segments`` is not None, ``junit_path`` is None.
+    Wiring per-segment junit today would produce a writer with no consumer:
+    ``_extract_failing_test_ids_from_junit`` runs only ``if junit_path is not
+    None``. The stated motivation — node-id attribution for the triaging
+    agent — is already served here by ``_extract_failing_test_ids``, the
+    stdout-regex counterpart, over ``_run_segmented``'s aggregate output.
+
+    A decision that lives only in a comment is one nobody reads, so the
+    second half of this class pins the LOUD guard instead: construct the
+    otherwise-unreachable co-occurrence and assert verify warns rather than
+    silently handing 8 pytest runs one last-writer-wins path.
+    """
+
+    @staticmethod
+    async def _run_merge_role_segmented(tmp_path, *, caplog):
+        """Force the co-occurrence the two production gates make impossible.
+
+        ``run_verification``'s public signature accepts ``role='merge'`` and
+        ``segment_chained_test=True`` independently — only the single
+        production call site couples them — so this is the exact future
+        change the guard exists to catch: someone segmenting a merge-role
+        verify, where a junit path IS computed.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result, calls, runs = await TestRunVerificationSegmentChainedTestWiring._run(
+                tmp_path,
+                _FLEET_TEST_COMMAND,
+                config_overrides={'merge_verify_breadth': 'full'},
+                segment_chained_test=True,
+                role='merge',
+            )
+        # Preconditions, so neither guard test can pass vacuously: BOTH sides
+        # of the co-occurrence must really be present. `_prepare_junit_report_path`
+        # creates `.df-verify-junit` exactly when it returns a path, and 8
+        # `_run_cmd` calls mean the chain really did segment.
+        assert (tmp_path / '.df-verify-junit').exists(), 'no junit path was computed'
+        assert len([c for c in calls if 'pytest' in c['cmd']]) == 8, 'chain did not segment'
+        return result, calls, runs
+
+    @pytest.mark.asyncio
+    async def test_task_role_segmented_run_collects_no_junit_at_all(self, tmp_path):
+        """Status quo, green today and kept honest.
+
+        Even with breadth explicitly 'full', a task-role segmented run
+        computes no junit path, writes no report directory, and injects
+        ``--junitxml`` into no segment — because the breadth gate is
+        ``role == 'merge' and ...``. This is the mutual exclusion the
+        decision rests on; if it ever stops holding, this test says so.
+        """
+        _result, calls, _runs = await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides={'merge_verify_breadth': 'full'},
+            segment_chained_test=True,
+            role='task',
+        )
+
+        assert not (tmp_path / '.df-verify-junit').exists()
+        assert not any('--junitxml' in c['cmd'] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_task_role_segmented_run_reports_no_junit_derived_test_ids(self, tmp_path):
+        """The consumer half: no junit path means no junit-derived node ids."""
+        result, _calls, _runs = await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides={'merge_verify_breadth': 'full'},
+            segment_chained_test=True,
+            role='task',
+        )
+
+        assert result.failing_test_ids is None
+
+    @pytest.mark.asyncio
+    async def test_the_co_occurrence_warns_naming_the_unwritten_path(self, tmp_path, caplog):
+        """RED until the guard exists: segmentation + a junit path must be loud.
+
+        Silence here is the failure mode worth catching — a future change
+        that made these co-occur would otherwise hand every segment the same
+        junit path, last-writer-wins, and look like it was working.
+        """
+        await self._run_merge_role_segmented(tmp_path, caplog=caplog)
+
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        junit_warnings = [r for r in warnings if 'junit' in r.getMessage().lower()]
+        assert junit_warnings, (
+            'segmentation co-occurring with a junit path must warn; '
+            f'got warnings: {[r.getMessage() for r in warnings]}'
+        )
+        message = junit_warnings[0].getMessage()
+        assert '.df-verify-junit' in message, (
+            f'the warning must name the path that will NOT be written: {message}'
+        )
+        assert '8' in message, f'the warning must state how many segments: {message}'
+
+    @pytest.mark.asyncio
+    async def test_the_guard_warns_instead_of_injecting_a_shared_junit_path(
+        self, tmp_path, caplog,
+    ):
+        """It must not 'helpfully' inject: one path for 8 runs is last-writer-wins."""
+        _result, calls, _runs = await self._run_merge_role_segmented(
+            tmp_path, caplog=caplog,
+        )
+
+        assert not any('--junitxml' in c['cmd'] for c in calls)
 
 
 class _SegmentedBudgetClock:

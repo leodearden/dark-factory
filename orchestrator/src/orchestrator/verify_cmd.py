@@ -1422,6 +1422,24 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     whitespace re-attached so an immediately-following chain operator (e.g.
     `` && ``) survives untouched. *suffix* should include its own leading
     space (e.g. ``' -n 16'``).
+
+    Tasks 3650 and 3478 diagnosed this defect independently and landed
+    competing fixes; the merge kept 3650's quote-aware
+    ``_split_at_unbalanced_close`` split over 3478's quote-blind peel, which
+    trimmed trailing ``)`` while ``count(')') > count('(')`` over the whole
+    span. Counting parens inside quotes as structural breaks it both ways: a
+    quoted ``(`` masks a real closer (measured — on ``( cd x && pytest -k
+    "foo(" tests/ )`` the span scores balanced, the peel never fires, and the
+    rewrite stays the ``) -n 4`` bash syntax error this function exists to
+    prevent), and symmetrically a quoted ``)`` is mistaken for one (see
+    ``_split_at_unbalanced_close``'s docstring). Scanning only unquoted
+    characters is what removes both halves of that failure.
+
+    3478's independently-derived regression tests are retained in
+    ``TestRawRewriteDoesNotSwallowSubshellTerminator`` and pass against this
+    implementation — the operational impact they pin (``serial_pytest``
+    drives the env-transient and flaky-scoped recovery re-runs, so this
+    fired at shipped defaults with no knob set) is recorded there.
     """
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
