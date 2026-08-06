@@ -3673,7 +3673,10 @@ class TaskWorkflow:
         A deliberate mirror of ``run()``'s ESCALATED branch (workflow.py:
         2636-2647) — ``_enter_phase(ESCALATED)`` →
         :meth:`_ensure_steward_started` → :meth:`_wait_for_resolution` →
-        ``except _StewardReescalated`` → :meth:`_mark_blocked`.  PRD
+        ``except _StewardReescalated`` → :meth:`_mark_blocked`, plus that
+        branch's steward-terminal-decision guard (:2685-2709), which honours a
+        row the steward parked while resolving instead of proceeding over it.
+        PRD
         ``plans/task-escalation-state-graph-prd.md`` D1: uniformity is the
         point — ONE ESCALATED semantics, not two.  Before this, the gate did a
         bare ``return WorkflowOutcome.ESCALATED`` with no steward, no wait and
@@ -3683,9 +3686,12 @@ class TaskWorkflow:
         record with nothing running to advance it (spec
         ``docs/task-escalation-state-spec.md`` E1).
 
-        **Invariant (spec S1) — every non-``None`` return of this method is a
-        :meth:`_mark_blocked` return value**, so the successor status is
-        written BEFORE the caller ever sees an outcome.  There must be no bare
+        **Invariant (spec S1) — every non-``None`` return of this method
+        happens only once the successor status is ON THE ROW**: written by
+        :meth:`_mark_blocked` on the block paths, or already written by the
+        steward and deliberately preserved on the terminal-decision path.
+        Either way the caller never sees an outcome the row does not back.
+        There must be no bare
         ``return WorkflowOutcome.ESCALATED`` anywhere on this path; a future
         edit that reintroduces one reintroduces the strand.  Note that
         ``_mark_blocked`` may itself legitimately return ``ESCALATED`` (its
@@ -3702,7 +3708,9 @@ class TaskWorkflow:
         so a still-open or newly-filed gating record parks the task rather
         than buying another wait.  Two deliberate divergences from ``run()``'s
         ESCALATED branch are documented at the branches that differ — expiry
-        blocks here instead of resuming, and the re-check does not loop.
+        blocks here instead of resuming, and the re-check does not loop.  Two,
+        still: the terminal-decision guard is a MIRROR of ``run()``, not a
+        third divergence, so the count stays checkable.
 
         The gate PREDICATE is untouched (PRD out-of-scope fence): this method
         never re-decides what gates, only what happens next.  The post-wait
@@ -3738,6 +3746,56 @@ class TaskWorkflow:
                 detail=_format_reescalation_detail(reesc.escalations),
                 skip_escalation=True,
             )
+        # Honour a steward TERMINAL DECISION taken while resolving the gate.
+        # Mirrors run()'s guard at :2685-2709, carried across for the same
+        # reason: the steward is the only workflow role holding
+        # set_task_status, and its prompt directs it to park rows (done /
+        # cancelled / deferred / blocked) while resolving — e.g. queueing a
+        # follow-up task that is now the durable fix and deferring this one
+        # onto it.  That decision IS an adjudication of the gate, so honouring
+        # it costs nothing.
+        #
+        # This must run FIRST, before both branches below, because both call
+        # _mark_blocked(escalate_to_human=True): a steward that parks the row
+        # and then goes quiet would otherwise earn an L1 for a decision that
+        # WAS an adjudication, and _mark_blocked would also try
+        # set_task_status('blocked') over a terminal row, routing into
+        # _handle_terminal_exit_rejection's bypass-done detection.
+        #
+        # The merge-entry consequence run() does not have: without this guard
+        # the branch MERGES TO MAIN, and for a non-terminal park like
+        # `deferred` (not in TERMINAL_STATUSES, so no server rejection fires)
+        # _finalise_merged_done then silently overwrites the row to `done`.
+        # Strictly worse than the wasted-dispatch run() guards against —
+        # re-dispatch cannot un-merge a branch.
+        #
+        # Like run(), deliberately BYPASSES _mark_blocked: the status is
+        # already on the row, so nothing needs writing and no L1 is warranted.
+        current_status = await self.scheduler.get_status(self.task_id)
+        # Order is load-bearing, not stylistic.  WORKFLOW_PRESERVE_STATUSES is
+        # a superset of TERMINAL_STATUSES and CONTAINS 'done', so testing
+        # membership first would return BLOCKED for a done row — and
+        # outcome_allows_status(BLOCKED, 'done') is False, which makes run()'s
+        # SM-2 exit check (:3248) raise AssertionError.  Conversely
+        # outcome_allows_status(DONE, 'done') is True and
+        # outcome_allows_status(BLOCKED, x) is True for every other member of
+        # the set, so this exact split is the only SM-2-consistent one.
+        if current_status == 'done':
+            logger.info(
+                'Task %s: steward set status to done while resolving the '
+                'merge-entry gate — preserving, not merging again',
+                self.task_id,
+            )
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
+        if current_status in WORKFLOW_PRESERVE_STATUSES:
+            logger.info(
+                'Task %s: steward set status to %s while resolving the '
+                'merge-entry gate — preserving, not merging',
+                self.task_id, current_status,
+            )
+            self._enter_phase(WorkflowState.BLOCKED)
+            return WorkflowOutcome.BLOCKED
         if self._steward_wait_expired:
             # The wait ended by expiring, not by anyone adjudicating the gating
             # record — the backstop auto-dismissed the orphan L0(s) to unblock
