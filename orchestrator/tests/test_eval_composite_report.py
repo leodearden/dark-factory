@@ -225,6 +225,7 @@ def _mresult(
     plan_quality=None, role_under_test='implementer', plan_steps=0,
     judge_invocations=0, judge_cost_usd=0.0,
     cap_tainted=False, invocation_error=None,
+    judged_without_reference=False,
 ):
     """Build a synthetic EvalResult with a production-shaped metrics dict.
 
@@ -250,6 +251,7 @@ def _mresult(
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
         invocation_error=invocation_error,
+        judged_without_reference=judged_without_reference,
     )
     return EvalResult(
         task_id=task_id,
@@ -437,6 +439,108 @@ class TestBuildCompositeReport:
         # The tainted trial is still skipped as a passthrough SOURCE regardless
         # of role, so a healthy trial's measurement survives.
         assert rows['mixed']['plan_quality'] == pytest.approx(0.6)
+
+    # -- judged_without_reference (eval-revival σ, task 3628) ----------------
+    #
+    # The composite twin of the θ-surface count. Same accumulator idiom as
+    # plan_quality_cap_excluded, one decisive difference: it excludes nothing.
+
+    def test_judged_without_reference_is_counted_per_config(self):
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'blind-first', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'blind-first', 2, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+            _mresult('f1', 'healthy', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.55, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+
+        assert rows['blind-first']['plan_quality_judged_without_reference'] == 1
+        assert rows['healthy']['plan_quality_judged_without_reference'] == 0
+
+    def test_judged_blind_cell_stays_in_the_plan_quality_pool(self):
+        """POOL MEMBERSHIP: bounds validity, does NOT exclude.
+
+        The flagged cell's score is in the mean and the count never exceeds the
+        pool it is drawn from — the composite twin of the θ-surface's
+        "bounds, does not exclude".
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.9, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.5, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        row = rows['mixed']
+
+        # Over BOTH cells (0.9 + 0.5) / 2 — not just the healthy one.
+        assert row['plan_quality'] == pytest.approx(0.7)
+        assert row['plan_quality_judged_without_reference'] == 1
+        assert (
+            row['plan_quality_judged_without_reference'] <= row['plan_quality_n']
+        )
+
+    def test_judged_blind_counter_agrees_with_the_plan_quality_surface(self):
+        """The two accumulators describe the SAME cells and must not drift.
+
+        Follows the cap_excluded agreement assertion's idiom exactly; this is
+        the test that stops the composite and θ surfaces diverging.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        plan_report = build_plan_quality_report(results)
+
+        assert rows['mixed']['plan_quality_judged_without_reference'] == 1
+        assert plan_report['judged_without_reference'] == 1
+        assert (
+            rows['mixed']['plan_quality_judged_without_reference']
+            == plan_report['judged_without_reference']
+        )
+
+    def test_cap_tainted_cell_carrying_the_flag_is_only_cap_excluded(self):
+        """DISJOINT: a tainted cell has no plan_quality to bound."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'capped', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=None, cap_tainted=True,
+                     invocation_error='architect:cap_hit: session limit',
+                     judged_without_reference=True),
+            _mresult('f2', 'capped', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.7, plan_steps=6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+
+        assert rows['capped']['plan_quality_cap_excluded'] == 1
+        assert rows['capped']['plan_quality_judged_without_reference'] == 0
 
     def test_price_table_echo_and_sorted_rows(self):
         from orchestrator.evals.report import build_composite_report
