@@ -36,6 +36,22 @@ files.py:543). Deliberately NOT asserted: ActiveState — liveness is the
 watchdog's job (scripts/orchestrator-watchdog.py) and pinning it here would
 make this suite fail during any legitimate restart window.
 
+Marking: the four host-touching tests below (two FILE-layer, two
+MANAGER-layer) each carry `@pytest.mark.integration`, which is already
+registered and deselected by the ROOT pyproject.toml's default addopts
+(`-m 'not smoke and not integration and not warm_lane_bash'`) — the same
+mechanism fused-memory/tests/test_falkor_fulltext_integration.py and
+shared/tests/test_cli_invoke_integration.py use to keep host/service-coupled
+assertions out of the default, unmarked suite, so a legitimate operator
+action against ~/.config/systemd/user (a manual `systemctl --user stop`, a
+hand drop-in, a fleet redeploy in progress) can no longer turn every
+concurrent task worktree's default test run red. The marker is applied
+per-FUNCTION rather than as a single module-level `pytestmark`, because the
+small fixture-string parser tests in the PARSER layer section at the bottom
+of this module read no host state at all — marking them too would silently
+reintroduce the "zero coverage off-host" gap this module is otherwise
+written to avoid.
+
 Importable `from systemd_unit_invariants import ...` because
 tests/scripts/conftest.py puts this directory on sys.path — pytest's
 --import-mode=importlib (pyproject.toml addopts) deliberately does not do
@@ -73,7 +89,7 @@ INSTALLED_UNIT_PATH = UNIT_DIR / UNIT_BASENAME
 CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
 
 _SYSTEMCTL_SKIP_REASON = (
-    "systemctl is not installed; this module requires a live systemd --user "
+    "systemctl is not installed; this test requires a live systemd --user "
     "manager and has no fixture-based fallback (see module docstring)"
 )
 
@@ -144,7 +160,7 @@ def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
+@pytest.mark.integration
 def test_installed_unit_file_restart_backoff_effective() -> None:
     """The INSTALLED unit file's RestartMaxDelaySec= must be paired with RestartSteps=.
 
@@ -163,7 +179,7 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     assert_restart_backoff_effective(path)
 
 
-@pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
+@pytest.mark.integration
 def test_installed_unit_file_execstart_config_is_canonical() -> None:
     """The INSTALLED unit file's --config must name the canonical basename.
 
@@ -194,6 +210,7 @@ def test_installed_unit_file_execstart_config_is_canonical() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_restart_steps_effective() -> None:
     """systemd --user's LOADED view must report RestartSteps=4, not just the file.
@@ -224,6 +241,7 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
     )
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     """systemd --user's LOADED ExecStart= must carry the canonical --config path.
