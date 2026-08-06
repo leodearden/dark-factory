@@ -460,11 +460,19 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     `asyncio.wait(..., timeout=budget)` returns at the deadline WITHOUT
     awaiting the task, so a hung cleanup can never block this handler.
 
-    Cancelling the abandoned task does NOT stop aiosqlite's underlying
-    worker thread — a wedged connection stays wedged and will simply time
-    out again on the next /healthz call. That's intended: /healthz reports,
-    it does not repair, and per-DB caps mean a poisoned connection costs one
-    _DB_PROBE_TIMEOUT, never the whole handler.
+    Abandoning the task does not repair a wedged connection — it stays
+    wedged and will simply time out again on the next /healthz call. That's
+    intended: /healthz reports, it does not repair, and per-DB caps mean a
+    poisoned connection costs one _DB_PROBE_TIMEOUT, never the whole handler.
+
+    It does not LEAK one either, though it once did (task 3466). When the
+    abandoned task is cancelled inside `pool.get()`, DbPool keeps the
+    in-flight `aiosqlite.connect()` alive under `asyncio.shield` and adopts
+    the connection when it lands, so a slow open becomes a warm cached
+    connection for the next probe rather than a stranded (non-daemon)
+    aiosqlite worker thread. That matters here specifically: the
+    `_THREAD_LIMIT` check above exists to detect exactly such leaks, so
+    /healthz must not manufacture them itself.
     """
 
     async def _inner() -> str:

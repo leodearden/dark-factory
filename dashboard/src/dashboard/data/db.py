@@ -19,6 +19,8 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar('_T')
+
 # Fire-and-forget close() tasks for connections that landed with no owner (see
 # DbPool._adopt_or_close).  The event loop holds only a WEAK reference to a
 # Task, so an unreferenced one can be garbage-collected mid-flight; this set
@@ -32,7 +34,6 @@ def _discard_pending_close(task: asyncio.Task) -> None:
     if not task.cancelled():
         task.exception()  # consume so "exception was never retrieved" isn't logged
 
-_T = TypeVar('_T')
 
 # How long :meth:`DbPool.close_all` waits for in-flight ``aiosqlite.connect()``
 # calls to land before giving up on them and reporting them.  BOUNDED on
