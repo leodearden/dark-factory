@@ -26,6 +26,7 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
@@ -121,6 +122,66 @@ def check_openai_responses_api() -> None:
         "and restart the service to install a compatible openai version. "
         "(task 2053)"
     )
+
+
+def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+    """Construct the graphiti LLM client from unified config, or None.
+
+    Returns None when the configured provider block is absent or carries no
+    api_key — the same "run without an LLM" posture ``initialize()`` has always
+    had.
+
+    Deliberately module-level and public: this is the DRIVER-FREE construction
+    seam. Callers that need an LLM client for a single arm (e.g. an evaluation
+    harness building one client per candidate model) must not have to call
+    ``GraphitiBackend.initialize()`` to get one — that would construct a
+    ``_MultiTenantFalkorDriver``, and ``FalkorDriver.__init__`` fire-and-forgets
+    ``build_indices_and_constraints()``, creating indices on a real graph. That
+    is a binding project hazard (docs/prds/falkordb-index-provisioning.md), and
+    a seam that makes it structurally unreachable is a far stronger guarantee
+    than a monkeypatch at every call site.
+
+    ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
+    anthropic branch is unaffected by it.
+    """
+    if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+        api_key = cfg.llm.providers.openai.api_key
+        if api_key:
+            llm_config = GraphitiLLMConfig(
+                api_key=api_key,
+                model=cfg.llm.model,
+                small_model=cfg.llm.model,
+                temperature=cfg.llm.temperature or 0.0,
+                max_tokens=cfg.llm.max_tokens,
+                # Mirrors the embedder (see initialize()) and the reranker,
+                # which have always passed the configured endpoint. The LLM
+                # path was the outlier: a configured api_url was silently
+                # dropped in favour of the openai SDK default.
+                base_url=cfg.llm.providers.openai.api_url,
+            )
+            check_openai_responses_api()
+            llm_client = OpenAIClient(config=llm_config)
+            logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+            return llm_client
+    elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
+        api_key = cfg.llm.providers.anthropic.api_key
+        if api_key:
+            try:
+                from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+                llm_config = GraphitiLLMConfig(
+                    api_key=api_key,
+                    model=cfg.llm.model,
+                    temperature=cfg.llm.temperature or 0.0,
+                    max_tokens=cfg.llm.max_tokens,
+                )
+                llm_client = AnthropicClient(config=llm_config)
+                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                return llm_client
+            except ImportError:
+                logger.warning('Anthropic client not available for Graphiti')
+
+    return None
 
 
 def _canonicalize_group_args(func):
@@ -494,36 +555,7 @@ class GraphitiBackend:
         cfg = self.config
 
         # --- LLM client ---
-        llm_client = None
-        if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
-            api_key = cfg.llm.providers.openai.api_key
-            if api_key:
-                check_openai_responses_api()
-                llm_config = GraphitiLLMConfig(
-                    api_key=api_key,
-                    model=cfg.llm.model,
-                    small_model=cfg.llm.model,
-                    temperature=cfg.llm.temperature or 0.0,
-                    max_tokens=cfg.llm.max_tokens,
-                )
-                llm_client = OpenAIClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-        elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
-            api_key = cfg.llm.providers.anthropic.api_key
-            if api_key:
-                try:
-                    from graphiti_core.llm_client.anthropic_client import AnthropicClient
-
-                    llm_config = GraphitiLLMConfig(
-                        api_key=api_key,
-                        model=cfg.llm.model,
-                        temperature=cfg.llm.temperature or 0.0,
-                        max_tokens=cfg.llm.max_tokens,
-                    )
-                    llm_client = AnthropicClient(config=llm_config)
-                    logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-                except ImportError:
-                    logger.warning('Anthropic client not available for Graphiti')
+        llm_client = build_llm_client(cfg)
 
         # --- Embedder ---
         embedder_client = None
