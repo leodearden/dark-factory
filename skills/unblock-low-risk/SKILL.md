@@ -100,9 +100,13 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
 Run these strictly in order. Stop and ABORT at the first step that is not cleanly satisfied.
 
 1. **Release the orchestrator's grip.** `mcp__escalation__release_workflow(task_id, timeout_secs=30)`.
-   This soft-cancels any active workflow and parks the task as `blocked` (the reaper-immune holding
-   state). Inspect the result: if `was_active` is true but `slot_cleared` is false, the orchestrator
-   is still working the task — **ABORT** (do not race it).
+   This soft-cancels any active workflow; then, once no slot is live, if the task is still
+   `in-progress` the tool parks it as `blocked` (the reaper-immune holding state). That park
+   applies whether or not a slot was registered — an orphaned task whose lane was already reaped
+   (`was_active` false) is parked too. Inspect the result: if `was_active` is true but
+   `slot_cleared` is false, the orchestrator is still working the task — **ABORT** (do not race
+   it). Do not *assume* the park happened — **confirm** it by reading the returned `parked` field
+   (`"blocked"` if it landed, `null` if the task was not at `in-progress`).
 
 2. **Understand the issue.** In the worktree, read `latest['proposal_text']`, the review findings
    (`.task/reviews/*.json`), and the failing iteration (`.task/iterations.jsonl`). Treat the proposal
@@ -304,8 +308,10 @@ On any ABORT:
   session) from accumulating. `merge_cancel` never raises and is a safe no-op if the entry
   already finalized (it returns `cancelled: false` with the terminal state). A coalesced or
   `attached` `request_id` may resolve to `state: "unknown"` — treat the cancel as best-effort.
-- **Do NOT change the task status** beyond the `blocked` park that `release_workflow` already applied
-  (that is the safe, sweep-immune state — leave it there).
+- **Do NOT change the task status.** `release_workflow` parks an `in-progress` task to `blocked`
+  (including when there was no active slot at all) — that is the safe, sweep-immune state, so
+  leave it there. If it returned `parked: null` the task was not at `in-progress`: leave it
+  wherever it is rather than forcing it to `blocked`.
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
