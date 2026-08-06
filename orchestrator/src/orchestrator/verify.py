@@ -6075,6 +6075,8 @@ _FALLBACK_TOOLKIND_BY_ATTR: dict[str, ToolKind] = {
 def _executed_fallback_plan(
     plan: verify_plan.VerifyPlan,
     fallback: ModuleConfig,
+    *,
+    pytest_reason: str | None = None,
 ) -> verify_plan.VerifyPlan:
     """Rebuild *plan* (``derive_verify_plan``'s fallback-branch DECISION record)
     into the EXECUTED plan, using *fallback* — the ``ModuleConfig``
@@ -6111,6 +6113,24 @@ def _executed_fallback_plan(
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
 
+    *pytest_reason* is the ONE exception, and it exists because the fallback
+    branch's WHY genuinely changed at the execution layer (task 3513). When
+    ``verify_plan.widen_fallback_for_marker_deselection`` proves the decision's
+    file-scoped pytest run would collect zero items, the call site drops the
+    file targets from the ModuleConfig that is about to EXECUTE; passing that
+    function's reason here rebuilds the pytest slot as
+    ``FULL_SUITE``/``scoped_targets=()`` (``PlannedRun``'s invariant) so the
+    record matches. Without it the plan would still read FILE_SCOPED to files
+    the executed command no longer names — the very intent-vs-execution gap
+    this reconciliation exists to close.
+
+    It is an explicit keyword rather than re-derived from *fallback* because
+    after widening a ``test_command == 'pytest'`` is byte-identical to an
+    un-widened bare default suite: this layer cannot tell the two apart and
+    would have to re-run the probe, which is both a second read and a second
+    chance to disagree with what actually executed. Omitted (the default), this
+    function's output is byte-identical to its pre-3513 behaviour.
+
     A run with no recognised tool prefix — ``_derive_fallback_runs``'s single
     "no .py files touched" SKIPPED run, returned when *plan* was derived from
     an ``existing_files`` list with zero ``.py`` files (e.g. a diff touching
@@ -6136,6 +6156,16 @@ def _executed_fallback_plan(
             if executed_cmd_str is not None
             else None
         )
+        if pytest_reason is not None and attr == 'test_command':
+            executed_runs.append(replace(
+                run,
+                module_prefix=fallback.prefix,
+                cmd=cmd,
+                scope_kind=verify_plan.ScopeKind.FULL_SUITE,
+                reason=pytest_reason,
+                scoped_targets=(),
+            ))
+            continue
         executed_runs.append(replace(run, module_prefix=fallback.prefix, cmd=cmd))
     return replace(plan, runs=tuple(executed_runs))
 
@@ -6148,6 +6178,7 @@ def _safe_derive_verify_plan_dict(
     *,
     role: Literal['merge', 'task'],
     executed_fallback: ModuleConfig | None = None,
+    fallback_pytest_reason: str | None = None,
 ) -> dict | None:
     """Best-effort executed-plan dict for ``VerifyResult.plan``.
 
@@ -6161,7 +6192,12 @@ def _safe_derive_verify_plan_dict(
     already-executed ``ModuleConfig``), the derived DECISION plan is folded
     through :func:`_executed_fallback_plan` first, so the returned dict
     records what actually ran (module_prefix + rendered command) rather than
-    the idealized flat ``'__fallback__'`` decision alone. A bug in the
+    the idealized flat ``'__fallback__'`` decision alone.
+    *fallback_pytest_reason* rides along on that same path (and only that
+    path — it is meaningless without an *executed_fallback* to reconcile
+    against): it is ``widen_fallback_for_marker_deselection``'s reason, which
+    :func:`_executed_fallback_plan` needs in order to record a marker-deselection
+    widening the executed config already applied. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
     — must never fail an otherwise-passing verify attempt just because its
@@ -6174,7 +6210,9 @@ def _safe_derive_verify_plan_dict(
             existing_files, module_configs, config, worktree_reader, role=role,
         )
         if executed_fallback is not None:
-            plan = _executed_fallback_plan(plan, executed_fallback)
+            plan = _executed_fallback_plan(
+                plan, executed_fallback, pytest_reason=fallback_pytest_reason,
+            )
         return plan.to_dict()
     except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
