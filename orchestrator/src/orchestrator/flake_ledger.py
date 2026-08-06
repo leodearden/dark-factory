@@ -197,12 +197,15 @@ def ensure_schema(db_path: Path) -> None:
     handful per hour, so this is deliberately NOT memoized — a per-path cache would go
     stale the moment the DB file is replaced or removed.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = _connect(db_path)
     try:
-        conn.executescript(_SCHEMA)
-    finally:
-        conn.close()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = _connect(db_path)
+        try:
+            conn.executescript(_SCHEMA)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning('flake_ledger: schema init failed for %s', db_path, exc_info=True)
 
 
 def record_flake_occurrence(
@@ -242,49 +245,58 @@ def record_flake_occurrence(
         )
         return
 
-    ensure_schema(db_path)
-    detail = (
-        json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
-        if s.unconfirmable_reason
-        else '{}'
-    )
-    # Columns are named explicitly, never a positional `INSERT INTO t VALUES (...)`:
-    # run_store.py:53-58's ALTER-parity note — a migrated DB and a fresh one must both
-    # accept the same statement.
-    rows = [
-        (
-            s.observed_at,
-            test_id,
-            project_id,
-            s.verdict.value,
-            s.call_site,
-            s.runner,
-            merge_sha,
-            task_id,
-            s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
-            detail,
-        )
-        for test_id in test_ids
-    ]
-    conn = _connect(db_path)
     try:
-        # OR IGNORE, against the `idx_flake_occurrence_dedup` UNIQUE index, is §8.3's
-        # idempotency key `(test_id, observed_at, call_site)` enforced declaratively.
-        # Deliberately NOT left to the catch-all: a plain INSERT would (1) abort the
-        # rest of the batch on the first duplicate, silently LOSING the genuinely new
-        # rows beside it, and (2) turn every legitimate merge-path retry into a loud
-        # warning, training operators to ignore the log line B12 relies on. One
-        # executemany in one transaction, so the batch still lands atomically.
-        conn.executemany(
-            'INSERT OR IGNORE INTO flake_occurrence '
-            '(observed_at, test_id, project_id, verdict, call_site, runner, '
-            ' merge_sha, task_id, psi_cpu_some10, detail) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            rows,
+        ensure_schema(db_path)
+        detail = (
+            json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
+            if s.unconfirmable_reason
+            else '{}'
         )
-        conn.commit()
-    finally:
-        conn.close()
+        # Columns are named explicitly, never a positional `INSERT INTO t VALUES (...)`:
+        # run_store.py:53-58's ALTER-parity note — a migrated DB and a fresh one must both
+        # accept the same statement.
+        rows = [
+            (
+                s.observed_at,
+                test_id,
+                project_id,
+                s.verdict.value,
+                s.call_site,
+                s.runner,
+                merge_sha,
+                task_id,
+                s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
+                detail,
+            )
+            for test_id in test_ids
+        ]
+        conn = _connect(db_path)
+        try:
+            # OR IGNORE, against the `idx_flake_occurrence_dedup` UNIQUE index, is §8.3's
+            # idempotency key `(test_id, observed_at, call_site)` enforced declaratively.
+            # Deliberately NOT left to the catch-all: a plain INSERT would (1) abort the
+            # rest of the batch on the first duplicate, silently LOSING the genuinely new
+            # rows beside it, and (2) turn every legitimate merge-path retry into a loud
+            # warning, training operators to ignore the log line B12 relies on. One
+            # executemany in one transaction, so the batch still lands atomically.
+            conn.executemany(
+                'INSERT OR IGNORE INTO flake_occurrence '
+                '(observed_at, test_id, project_id, verdict, call_site, runner, '
+                ' merge_sha, task_id, psi_cpu_some10, detail) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to record occurrence for %d test(s) at call_site=%s',
+            len(test_ids),
+            s.call_site,
+            exc_info=True,
+        )
+        return None
 
 
 def _to_occurrence_row(row: sqlite3.Row) -> FlakeOccurrenceRow:
@@ -323,28 +335,36 @@ def read_occurrences(
     the sequence reads chronologically even though rows arrive out of order (a remote
     observation is written on the dispatcher after a local one that followed it).
     """
-    ensure_schema(db_path)
-    # Values are BOUND, never interpolated — a test_id is an arbitrary pytest node-id
-    # arriving from a remote host.
-    clauses: list[str] = []
-    params: list[str] = []
-    if test_id is not None:
-        clauses.append('test_id = ?')
-        params.append(test_id)
-    if since is not None:
-        clauses.append('observed_at >= ?')
-        params.append(since)
-    where = f' WHERE {" AND ".join(clauses)}' if clauses else ''
-
-    conn = _connect(db_path)
     try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id', params
-        ).fetchall()
-    finally:
-        conn.close()
-    return [_to_occurrence_row(r) for r in rows]
+        ensure_schema(db_path)
+        # Values are BOUND, never interpolated — a test_id is an arbitrary pytest node-id
+        # arriving from a remote host.
+        clauses: list[str] = []
+        params: list[str] = []
+        if test_id is not None:
+            clauses.append('test_id = ?')
+            params.append(test_id)
+        if since is not None:
+            clauses.append('observed_at >= ?')
+            params.append(since)
+        where = f' WHERE {" AND ".join(clauses)}' if clauses else ''
+
+        conn = _connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id', params
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_to_occurrence_row(r) for r in rows]
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read occurrences from %s',
+            db_path,
+            exc_info=True,
+        )
+        return []
 
 
 def _to_debt_row(row: sqlite3.Row) -> DebtRow:
@@ -368,14 +388,22 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
     trigger a lookup rather than a scan.  RESOLVED rows are returned too: they are
     retained deliberately (§5.2) because the recurrence trigger reads them.
     """
-    ensure_schema(db_path)
-    conn = _connect(db_path)
     try:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
-    finally:
-        conn.close()
-    return _to_debt_row(row) if row is not None else None
+        ensure_schema(db_path)
+        conn = _connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
+        finally:
+            conn.close()
+        return _to_debt_row(row) if row is not None else None
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read debt for test_id=%s',
+            test_id,
+            exc_info=True,
+        )
+        return None
 
 
 async def open_debt(
@@ -406,43 +434,52 @@ async def open_debt(
     *now* defaults to the current UTC time; it is injectable so §5.4's ledger-owned
     timestamps are deterministically testable.
     """
-    stamp = (now or datetime.now(UTC)).isoformat()
-    ensure_schema(db_path)
-    conn = _connect(db_path)
     try:
-        # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
-        # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
-        # even though the same clause sets it to NULL — which is what lets a re-entry
-        # (was resolved) and an ordinary repeat (still open) be distinguished without a
-        # prior SELECT.  Verified empirically on SQLite 3.50.4: open_count=2,
-        # prior_resolved_at=the old resolved_at, resolved_at=NULL, opened_at advanced.
-        #
-        # Splitting this into SELECT-then-UPDATE would reintroduce exactly the
-        # read-modify-write race §5.1 chose SQLite to avoid, inside the ledger itself:
-        # two merge lanes suppressing the same test could interleave and lose a cycle.
-        #
-        # `prior_resolving_commit` is deliberately NOT touched — `resolve_debt` already
-        # wrote it, and it must survive the re-open verbatim for η's
-        # regressed_after_resolution citation.
-        conn.execute(
-            'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
-            ' last_occurrence_at) '
-            'VALUES (?, ?, ?, 1, ?) '
-            'ON CONFLICT(test_id) DO UPDATE SET '
-            '    last_occurrence_at = excluded.last_occurrence_at, '
-            '    open_count        = open_count '
-            '                        + (CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END), '
-            '    opened_at         = CASE WHEN resolved_at IS NOT NULL '
-            '                        THEN excluded.opened_at ELSE opened_at END, '
-            '    prior_resolved_at = CASE WHEN resolved_at IS NOT NULL '
-            '                        THEN resolved_at ELSE prior_resolved_at END, '
-            '    resolved_at       = NULL',
-            (test_id, project_id, stamp, stamp),
+        stamp = (now or datetime.now(UTC)).isoformat()
+        ensure_schema(db_path)
+        conn = _connect(db_path)
+        try:
+            # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
+            # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
+            # even though the same clause sets it to NULL — which is what lets a re-entry
+            # (was resolved) and an ordinary repeat (still open) be distinguished without a
+            # prior SELECT.  Verified empirically on SQLite 3.50.4: open_count=2,
+            # prior_resolved_at=the old resolved_at, resolved_at=NULL, opened_at advanced.
+            #
+            # Splitting this into SELECT-then-UPDATE would reintroduce exactly the
+            # read-modify-write race §5.1 chose SQLite to avoid, inside the ledger itself:
+            # two merge lanes suppressing the same test could interleave and lose a cycle.
+            #
+            # `prior_resolving_commit` is deliberately NOT touched — `resolve_debt` already
+            # wrote it, and it must survive the re-open verbatim for η's
+            # regressed_after_resolution citation.
+            conn.execute(
+                'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
+                ' last_occurrence_at) '
+                'VALUES (?, ?, ?, 1, ?) '
+                'ON CONFLICT(test_id) DO UPDATE SET '
+                '    last_occurrence_at = excluded.last_occurrence_at, '
+                '    open_count        = open_count '
+                '                        + (CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END), '
+                '    opened_at         = CASE WHEN resolved_at IS NOT NULL '
+                '                        THEN excluded.opened_at ELSE opened_at END, '
+                '    prior_resolved_at = CASE WHEN resolved_at IS NOT NULL '
+                '                        THEN resolved_at ELSE prior_resolved_at END, '
+                '    resolved_at       = NULL',
+                (test_id, project_id, stamp, stamp),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return read_debt(db_path, test_id)
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to open debt for test_id=%s (project_id=%s)',
+            test_id,
+            project_id,
+            exc_info=True,
         )
-        conn.commit()
-    finally:
-        conn.close()
-    return read_debt(db_path, test_id)
+        return None
 
 
 async def resolve_debt(
@@ -473,17 +510,27 @@ async def resolve_debt(
     ``async`` for the same forward-compat reason as :func:`open_debt` — η adds the
     recurrence escalation inside this function.
     """
-    stamp = (now or datetime.now(UTC)).isoformat()
-    ensure_schema(db_path)
-    conn = _connect(db_path)
     try:
-        conn.execute(
-            'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? WHERE test_id = ?',
-            (stamp, resolving_commit, test_id),
+        stamp = (now or datetime.now(UTC)).isoformat()
+        ensure_schema(db_path)
+        conn = _connect(db_path)
+        try:
+            conn.execute(
+                'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
+                'WHERE test_id = ?',
+                (stamp, resolving_commit, test_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to resolve debt for test_id=%s (project_id=%s)',
+            test_id,
+            project_id,
+            exc_info=True,
         )
-        conn.commit()
-    finally:
-        conn.close()
+        return None
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:
@@ -492,13 +539,21 @@ def list_open_debt(db_path: Path) -> list[DebtRow]:
     Ordering is part of the contract (``opened_at`` then ``test_id``) because ι prints
     this list.
     """
-    ensure_schema(db_path)
-    conn = _connect(db_path)
     try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            'SELECT * FROM flake_debt WHERE resolved_at IS NULL ORDER BY opened_at, test_id'
-        ).fetchall()
-    finally:
-        conn.close()
-    return [_to_debt_row(r) for r in rows]
+        ensure_schema(db_path)
+        conn = _connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT * FROM flake_debt WHERE resolved_at IS NULL ORDER BY opened_at, test_id'
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_to_debt_row(r) for r in rows]
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to list open debt from %s',
+            db_path,
+            exc_info=True,
+        )
+        return []
