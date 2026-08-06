@@ -26,7 +26,11 @@ sanctions exactly this kind of "mandated token present in each role prompt"
 guard. Each assertion is an existence / containment / ordering / count check
 against a named constant, not a prose or regex pin — including the placement
 check, which compares against the prompt's first ``##`` heading rather than any
-particular heading's text.
+particular heading's text. The one exception in KIND is the config-drift
+tripwire, which asserts a config DEFAULT (``timeouts.working_idle_secs``) rather
+than anything about the prompts: the guidance's ~25-minute background threshold
+is derived from that 1800s bound, and the derivation going stale is checkable
+where the wording being "still correct" is not.
 """
 
 from __future__ import annotations
@@ -84,20 +88,28 @@ def test_wait_pattern_guidance_is_nonempty() -> None:
     assert WAIT_PATTERN_GUIDANCE.strip()
 
 
-def test_background_threshold_is_the_session_idle_bound_not_the_bash_cap() -> None:
-    """The background-vs-foreground threshold tracks the WATCHDOG, not the Bash cap.
+def test_session_idle_bound_config_drift_tripwire() -> None:
+    """``working_idle_secs`` still matches the bound the wait guidance was sized to.
 
     ``shared.cli_invoke``'s working-regime watchdog kills a whole session once
     ``idle_elapsed >= max(working_idle_secs, timeout_seconds)`` with no NEW
     transcript turn, and a blocking foreground ``Bash`` call emits no turn while
     it runs. So the operative ceiling on a foreground command is the role's idle
-    bound (stock 1800s = 30 min), NOT the harness's 3900000 ms (65 min) Bash cap.
-    Guidance that used 3900000 as the decision threshold actively instructed
+    bound (stock 1800s = 30 min), NOT the harness's 3900000 ms (65 min) Bash cap
+    — guidance that used 3900000 as its background-vs-foreground threshold told
     agents to size a 45-minute foreground verify to a 2700000 timeout and lose
-    the entire session at 30 minutes — the same lose-all-observations failure the
-    guidance's own ``until``-loop bullet warns against. Pinned because the wrong
-    number READS more authoritative (it is a real harness fact, just not the
-    binding one) and will be "restored" by a future editor otherwise.
+    the whole session at 30 minutes.
+
+    ``WAIT_PATTERN_GUIDANCE`` / ``WAIT_PATTERN_REMINDER`` state a ~25-minute
+    background threshold derived from that 1800s bound. This test does NOT
+    re-read those numbers out of the prose: a substring pin breaks on a harmless
+    rewording ('25 min', 'half an hour') and still passes if the sentence is
+    reworded to say the opposite, so it costs every future prompt edit without
+    buying correctness. What IS checkable is the premise the prose was derived
+    from — if the config default moves, the derivation is stale and an editor
+    has to revisit the wording deliberately. The standing instruction not to
+    "restore" 3900000 lives as a provenance comment above the constants in
+    roles.py, which is the right home for an editorial rule.
     """
     idle_secs = OrchestratorConfig.model_fields['timeouts'].default_factory().working_idle_secs  # type: ignore[misc]
     assert idle_secs == 1800, (
@@ -107,26 +119,30 @@ def test_background_threshold_is_the_session_idle_bound_not_the_bash_cap() -> No
         'to stay under the new bound, then update this assertion.'
     )
 
-    for name, text in (
-        ('WAIT_PATTERN_GUIDANCE', WAIT_PATTERN_GUIDANCE),
-        ('WAIT_PATTERN_REMINDER', WAIT_PATTERN_REMINDER),
-    ):
-        assert '25 minutes' in text, (
-            f'{name} no longer states the ~25-minute background threshold. Sizing a '
-            'long run to a large foreground `timeout` does not buy that time: the '
-            'working-regime watchdog kills the session after 30 minutes with no new '
-            'transcript turn. Do not replace this with the 3900000 harness cap.'
-        )
-        assert '30 minutes' in text, (
-            f'{name} no longer states the 30-minute session idle bound that JUSTIFIES '
-            'the threshold. A bare number with no stated reason gets "corrected" back '
-            'to the 3900000 Bash cap by the next editor.'
-        )
-        assert 'BashOutput' in text, (
-            f'{name} no longer names `BashOutput`. Polling is what makes a backgrounded '
-            'long run safe — each poll is a new transcript turn and resets the idle '
-            'clock — so the escape hatch must be named alongside the threshold.'
-        )
+
+@pytest.mark.parametrize(
+    'name',
+    ['WAIT_PATTERN_GUIDANCE', 'WAIT_PATTERN_REMINDER'],
+)
+def test_wait_pattern_constants_name_the_polling_tool(name: str) -> None:
+    """Both constants name ``BashOutput`` — a mandated TOKEN, not a wording pin.
+
+    Backgrounding is only safe because each ``BashOutput`` poll is itself a new
+    transcript turn and resets ``last_progress_monotonic``. Guidance that tells
+    an agent to background a long run without naming the tool that drains it
+    leaves the agent with the prohibition and no mechanism. Unlike a prose pin,
+    a tool name has exactly one correct spelling, so this cannot fail on a
+    stylistic rewrite.
+    """
+    text = {
+        'WAIT_PATTERN_GUIDANCE': WAIT_PATTERN_GUIDANCE,
+        'WAIT_PATTERN_REMINDER': WAIT_PATTERN_REMINDER,
+    }[name]
+    assert 'BashOutput' in text, (
+        f'{name} no longer names `BashOutput`. Polling is what makes a backgrounded '
+        'long run safe — each poll is a new transcript turn and resets the idle '
+        'clock — so the escape hatch must be named alongside the threshold.'
+    )
 
 
 def test_combined_guidance_composes_both_rules() -> None:
