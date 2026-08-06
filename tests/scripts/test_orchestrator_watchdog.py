@@ -4379,8 +4379,17 @@ def test_liveness_verdict_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_liveness_pass_revives_on_port_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """USER-SIGNAL: fused_memory_liveness_pass() restarts the unit when the port is down."""
+def test_liveness_pass_revives_on_port_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """USER-SIGNAL: fused_memory_liveness_pass() restarts the unit when the port is down.
+
+    Since task 3764 a restart requires FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE
+    non-healthy verdicts, so the port-down verdict is driven that many times.
+    The intent of this test is unchanged — "this verdict class leads to a
+    restart" — only the tick count. That the FIRST tick does not restart is
+    asserted separately in Part D.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
 
@@ -4392,15 +4401,22 @@ def test_liveness_pass_revives_on_port_down(monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
 
-    wdog.fused_memory_liveness_pass()
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
 
     assert restarted == ["fused-memory.service"], (
         f"Expected fused-memory.service restarted exactly once, got: {restarted}"
     )
 
 
-def test_liveness_pass_no_restart_when_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_liveness_pass_no_restart_when_healthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     """fused_memory_liveness_pass() must not restart when port is up and health succeeds."""
     wdog = _load_watchdog()
     restarted: list[str] = []
@@ -4411,14 +4427,23 @@ def test_liveness_pass_no_restart_when_healthy(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(wdog, "probe_health", lambda: True)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    # A healthy verdict CLEARS the streak file — point it at tmp so this test
+    # can never unlink the real data/fused-memory/ state.
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
 
     wdog.fused_memory_liveness_pass()
 
     assert restarted == [], "No restart expected when port is up and health succeeds"
 
 
-def test_liveness_pass_restarts_when_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """fused_memory_liveness_pass() restarts when the port is up but the health fetch fails."""
+def test_liveness_pass_restarts_when_wedged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """fused_memory_liveness_pass() restarts when the port is up but the health fetch fails.
+
+    Since task 3764 this needs FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE wedged
+    verdicts; the intent ("a wedge leads to a restart") is unchanged.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
 
@@ -4428,8 +4453,13 @@ def test_liveness_pass_restarts_when_wedged(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(wdog, "probe_health", lambda: False)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
 
-    wdog.fused_memory_liveness_pass()
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
 
     assert restarted == ["fused-memory.service"], (
         f"Expected fused-memory.service restarted when wedged, got: {restarted}"

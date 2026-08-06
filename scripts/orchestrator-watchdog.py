@@ -1282,10 +1282,29 @@ def fused_memory_liveness_pass() -> None:
             )
             return
         verdict = _fused_memory_liveness_verdict()
-        if verdict != "healthy":
-            log(f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}'; restarting")
-            restart_unit(FUSED_MEMORY_UNIT)
-            log(f"{FUSED_MEMORY_UNIT} restart issued")
+        if verdict == "healthy":
+            # Continuity is broken: whatever failures preceded this tick were
+            # transient and self-recovered, so they must not accumulate toward
+            # a kill.
+            _clear_fm_liveness_streak()
+            return
+        streak = _record_fm_liveness_failure(verdict)
+        if streak < FM_LIVENESS_STREAK_THRESHOLD:
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+                f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); not restarting yet"
+            )
+            return
+        log(
+            f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+            f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
+        )
+        restart_unit(FUSED_MEMORY_UNIT)
+        log(f"{FUSED_MEMORY_UNIT} restart issued")
+        # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
+        # pass would degrade back to one-verdict-per-kill immediately after
+        # the first restart.
+        _clear_fm_liveness_streak()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
 
