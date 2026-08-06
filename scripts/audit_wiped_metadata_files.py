@@ -39,6 +39,8 @@ from typing import NamedTuple
 # behaviour, not duplication.
 from _task_db_scan import (  # noqa: F401  (discover_project_roots re-exported for the tests)
     discover_project_roots,
+    format_coverage_block,
+    format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
@@ -667,14 +669,26 @@ _LOCK_LEVEL_CAVEAT = (
 )
 
 
+_COVERAGE_CAVEAT = (
+    "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+    "  full damaged population — tasks with no recoverable plan scope are",
+    "  UNKNOWN, neither clean nor damaged):",
+)
+
+
 def _format_candidate_line(candidate: WipeCandidate) -> str:
-    return (
-        f"  task_id={candidate.task_id} tag={candidate.tag} "
-        f"status={candidate.status} signature={candidate.wipe_signature} "
-        f"source={candidate.plan_files_source} "
-        f"fidelity={candidate.plan_files_fidelity} "
-        f"plan_files={len(candidate.plan_files)}"
-    )
+    # The KEYS are spelled explicitly rather than derived from the NamedTuple
+    # field names: signature/source/fidelity are deliberately shorter than
+    # wipe_signature/plan_files_source/plan_files_fidelity.
+    return format_kv_line([
+        ("task_id", candidate.task_id),
+        ("tag", candidate.tag),
+        ("status", candidate.status),
+        ("signature", candidate.wipe_signature),
+        ("source", candidate.plan_files_source),
+        ("fidelity", candidate.plan_files_fidelity),
+        ("plan_files", len(candidate.plan_files)),
+    ])
 
 
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
@@ -683,17 +697,21 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
     Never omitted, never abbreviated when there are no candidates: the whole
     point is that the candidate list is an observable subset, and a reader
     must be told the size of the unobservable remainder.
+
+    Only the ALIGNMENT is shared with audit_combine_gate_marker_loss.py (via
+    format_coverage_block); the caveat prose above and the labels below are
+    this script's, and say what this script could not see.
     """
-    return [
-        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
-        "  full damaged population — tasks with no recoverable plan scope are",
-        "  UNKNOWN, neither clean nor damaged):",
-        f"    total tasks scanned:                {coverage.total_tasks}",
-        f"    with a file-level plan signal:      {coverage.tasks_with_file_level_signal}",
-        f"    with only a lock-level signal:      {coverage.tasks_with_lock_level_signal_only}",
-        f"    with NO plan signal at all:         {coverage.tasks_without_plan_signal}",
-        f"    plan records with no such task:     {coverage.plan_records_without_task}",
-    ]
+    return format_coverage_block(
+        _COVERAGE_CAVEAT,
+        [
+            ("total tasks scanned:", coverage.total_tasks),
+            ("with a file-level plan signal:", coverage.tasks_with_file_level_signal),
+            ("with only a lock-level signal:", coverage.tasks_with_lock_level_signal_only),
+            ("with NO plan signal at all:", coverage.tasks_without_plan_signal),
+            ("plan records with no such task:", coverage.plan_records_without_task),
+        ],
+    )
 
 
 def format_report(audits: list[ProjectAudit]) -> str:
