@@ -4604,19 +4604,11 @@ class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
 # The transform-blind discoverability sub-metric
 # ---------------------------------------------------------------------------
 #
-# `apply_grouped_read` synthesises its grouped document wearing the
-# CANONICAL's `record_id`, and `topic_discoverability` identifies the
-# canonical by `record_id`.  So under `b_grouped` ANY child hit that folds
-# upward materialises a record carrying the canonical's id and is scored as
-# "the canonical was found" — whereas under `c_peers`/`status_quo` the
-# canonical's own stored record must itself have ranked.
-#
-# That is defensible (a grouped read genuinely does put the canonical body in
-# the reader's window) but it makes `canonical in top-5` a property of the
-# READ TRANSFORM, not purely of retrieval — and the table said nothing about
-# it.  The `stored_*` trio is the transform-blind counterpart, measured over
-# the RAW store hits before any read-side transform.  The gap between the two
-# columns IS the grouping effect, stated rather than folded in.
+# The mechanism is stated ONCE, in the script's module docstring under
+# "Rank-based is not transform-blind" — a transform can materialise a record
+# wearing the canonical's `record_id`, so `canonical in top-5` is a property
+# of the READ TRANSFORM and not purely of retrieval, and the `stored_*` trio
+# is the transform-blind counterpart that discloses the gap.
 #
 # This section covers the AGGREGATION half only.  `measure_arm` populating
 # the rows — and the b_grouped-vs-c_peers divergence itself — is the next.
@@ -4797,17 +4789,11 @@ def _credit_arm(shape, *, canonical_at=None, fillers=2):
 class TestGroupedReadCanonicalCreditIsDisclosed:
     """The mechanism behind `b_grouped`'s headline discoverability number.
 
-    A grouped document is synthesised with ``record_id=canonical.record_id``
-    (apply_grouped_read), and `topic_discoverability` identifies the canonical
-    by ``record_id`` — so a child folding upward is scored as "the canonical
-    was found" even when the store never returned the canonical's own record.
-    Under `c_peers`/`status_quo` there is no such transform and the canonical's
-    own record must itself have ranked.
-
-    This is not a bug to be corrected — a grouped read genuinely does put the
-    canonical body in the reader's window, and the numbers are recorded as
-    measured (G6/D10 assert no threshold).  It is a mechanism to be
-    DISCLOSED, and the transform-blind column is the disclosure.
+    Stated once in the script's module docstring, "Rank-based is not
+    transform-blind"; the tests below are that statement made executable.  Not
+    a bug to be corrected — the numbers are recorded as measured (G6/D10
+    assert no threshold) — a mechanism to be DISCLOSED, and the
+    transform-blind column is the disclosure.
     """
 
     def test_a_child_folding_upward_is_credited_as_the_canonical(self):

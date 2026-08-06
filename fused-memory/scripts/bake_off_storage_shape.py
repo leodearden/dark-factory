@@ -62,18 +62,36 @@ the real guard.  ``guard_adequacy`` therefore returns
      so nobody trends it across embedding-config changes as if it were
      stable.
 
-Rank-based is not the same as transform-blind, and discoverability is
-reported in BOTH forms for that reason.  ``canonical_in_top_5_rate`` is
+RANK-BASED IS NOT TRANSFORM-BLIND
+--------------------------------
+**The single statement of the credit mechanism.**  Every other site in this
+module and its tests points HERE rather than restating it, because five
+copies of one paragraph drift into five subtly different claims.
+
+Discoverability is reported in BOTH forms.  ``canonical_in_top_5_rate`` is
 measured over the read window, where ``apply_grouped_read`` has already
-synthesised a grouped document carrying the CANONICAL's ``record_id`` — so
-under ``b_grouped`` a child hit that folds upward is scored as "the
-canonical was found", and ``apply_topic_anchor`` injects it too.
+synthesised a grouped document carrying the CANONICAL's ``record_id`` — and
+``topic_discoverability`` identifies the canonical BY ``record_id``.  So
+under ``b_grouped`` any child hit that folds upward materialises a record
+wearing the canonical's id and is scored as "the canonical was found", while
+under ``c_peers``/``status_quo`` the canonical's own stored record must
+itself have ranked.  ``apply_topic_anchor`` credits it the same way, by
+injecting the canonical outright — so grouping is not the only transform
+that can move that column.
+
 ``stored_canonical_in_top_5_rate`` (with its median rank and censored
 denominator) is measured over the RAW store hits, before either transform,
 and so answers the narrower question: did the canonical's own stored record
-rank?  Neither is corrected toward the other; the gap between them is the
-read transform's contribution, stated rather than folded invisibly into one
-column.  See ``render_markdown``'s reading guide.
+rank?  It is therefore identical across a shape's two pin variants by
+construction.
+
+Neither number is corrected toward the other — the transform-credited one is
+arguably the right thing to credit, since a grouped read genuinely does put
+the canonical body in the reader's window.  The gap between them is the read
+transform's contribution, DISCLOSED rather than folded invisibly into one
+column.  See ``render_markdown``'s reading guide for the operator-facing
+statement of the same thing (the one legitimate second copy, because it is
+output rather than commentary).
 
 BLIND-AUTHORING PROTOCOL (resolves PRD §10's open tactical question
 "Blind-authoring protocol for ζ's arms (two-agent cross-check vs
@@ -1788,14 +1806,10 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
     # a median over successes only lets an arm that rarely finds the
     # canonical print the best rank, so the two must travel together.
     #
-    # The `stored_` trio travels with them for the same class of reason.  The
-    # first four are measured over the READ window, so under `b_grouped` they
-    # credit a synthesised document wearing the canonical's `record_id` — any
-    # child folding upward scores as "the canonical was found".  The trio is
-    # the transform-blind counterpart, measured over the raw store hits.  They
-    # answer different questions about the same column, and a table carrying
-    # only the transform-credited one is the undisclosed state this metric
-    # exists to fix: registered, so the renderer cannot drop it.
+    # The `stored_` trio travels with them for the same class of reason — see
+    # the module docstring, "Rank-based is not transform-blind".  Registered
+    # rather than merely produced, because a table carrying only the
+    # transform-credited half IS the undisclosed state it exists to fix.
     'discoverability': ('canonical_in_top_5_rate', 'median_canonical_rank',
                         'canonical_found_count', 'canonical_candidates',
                         'stored_canonical_in_top_5_rate',
@@ -1848,13 +1862,10 @@ DECISION_TABLE_COLUMNS: tuple[str, ...] = (
     'claim recall@5',
     'claim recall@10',
     'canonical in top-5',
-    # The same question, asked of the RAW store hits.  The column above is
-    # measured over the read window, so under `b_grouped` it credits the
-    # synthesised grouped document — which wears the canonical's `record_id`
-    # — for any child hit that folded upward.  This one asks only whether the
-    # canonical's own stored record ranked.  Adjacent on purpose: the gap
-    # between the two IS the read transform's contribution, and a qualifier
-    # placed anywhere else is not a qualifier on this number.
+    # The same question, asked of the RAW store hits — see the module
+    # docstring, "Rank-based is not transform-blind".  ADJACENT on purpose:
+    # the gap between the two IS the read transform's contribution, and a
+    # qualifier placed anywhere else is not a qualifier on this number.
     'canonical in top-5 (stored)',
     'median canonical rank',
     'tokens/query',
@@ -2202,18 +2213,14 @@ def _stored_gap_lines(report: dict[str, Any]) -> list[str]:
     lines += [
         '',
         'Where the two agree, `canonical in top-5` is reporting retrieval '
-        'alone on that arm.  Where they diverge, the gap is a READ '
-        'TRANSFORM\'s contribution rather than a retrieval difference: '
-        '`apply_grouped_read` credits a synthesised document wearing the '
-        'canonical\'s `record_id`, and `apply_topic_anchor` injects the '
-        'canonical outright, so either can move the credited column on a '
-        'query where the store never returned the canonical\'s own record.  '
-        'Which of the two moved it is what `pin changed window` disambiguates '
-        '— a shape whose pin never fired can only have been moved by '
-        'grouping.  Whether the gap is worth crediting is gate η\'s call, and '
-        'it is a different call from "this shape retrieves the canonical '
-        'better".  Read the same two columns on the `held_out` rows of the '
-        'by-kind table, which are the only rows measuring generalisation.',
+        'alone on that arm.  Where they diverge, the gap is a read '
+        'transform\'s contribution rather than a retrieval difference, and '
+        '`pin changed window` is what says WHICH transform: a row whose pin '
+        'never fired can only have been moved by grouping.  Whether the gap '
+        'is worth crediting is gate η\'s call, and it is a different call '
+        'from "this shape retrieves the canonical better".  Read the same two '
+        'columns on the `held_out` rows of the by-kind table, which are the '
+        'only rows measuring generalisation.',
     ]
     return lines
 
@@ -2283,17 +2290,21 @@ def render_markdown(report: dict[str, Any]) -> str:
         'canonical by `record_id` — so any child hit that folds upward is '
         'scored as "the canonical was found", whereas under `c_peers` and '
         '`status_quo` the canonical\'s own stored record must itself have '
-        'ranked.  That is a property of the READ TRANSFORM, not purely of '
-        'retrieval.  It is also arguably the right thing to credit: a grouped '
-        'read genuinely does put the canonical body in the reader\'s window, '
-        'which is what a reader of that window cares about.',
+        'ranked.  Grouping is not the only transform that credits it: '
+        '`apply_topic_anchor` injects the canonical outright, so a `+pin` row '
+        'whose pin fired can move this column too.  Either way it is a '
+        'property of the READ TRANSFORM, not purely of retrieval.  It is also '
+        'arguably the right thing to credit: a grouped read genuinely does '
+        'put the canonical body in the reader\'s window, which is what a '
+        'reader of that window cares about.',
         '',
         '`canonical in top-5 (stored)` is the transform-blind counterpart — '
         'the canonical\'s OWN stored record, measured over the raw store hits '
         'before grouping and before the pin.  It is therefore identical '
         'across a shape\'s two pin variants by construction, and comparable '
         'across all six arms.  **Read the two together: the gap between them '
-        'IS the grouping effect.**  This is DISCLOSURE, not correction — no '
+        'is what the read transforms added.**  This is DISCLOSURE, not '
+        'correction — no '
         'arm, pin, window or threshold was re-tuned to move either column, '
         'and both numbers are recorded exactly as measured (gate G6/D10 '
         'assert no threshold on any of them).',
@@ -3106,16 +3117,9 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
     median_rank: float | None = None
     if canonical_ranks:
         median_rank = float(statistics.median(canonical_ranks))
-    #: The TRANSFORM-BLIND half of the same question.  `canonical_rank` above
-    #: is measured over the read window, so under `b_grouped` it credits a
-    #: synthesised grouped document that wears the canonical's `record_id` —
-    #: any child hit folding upward is scored as "the canonical was found".
-    #: These ranks are measured over the RAW store hits, before grouping and
-    #: before the pin, and so answer the strictly narrower question: did the
-    #: canonical's own STORED record rank?  Both are reported because both
-    #: are true; the gap between them is the read transform's contribution,
-    #: and folding it invisibly into one column is what made the headline
-    #: `b_grouped` number unreadable.
+    #: The TRANSFORM-BLIND half of the same question — see the module
+    #: docstring, "Rank-based is not transform-blind".  Same aggregation, over
+    #: ranks the caller measured on the raw store hits.
     stored_ranks = [
         row['stored_canonical_rank'] for row in rows
         if row['stored_canonical_rank'] is not None
@@ -3223,18 +3227,9 @@ def measure_arm(
         canonical_in_5: float | None = None
         canonical_rank: int | None = None
         #: The SAME question asked of the raw store hits, before any
-        #: read-side transform ran.  It exists because the transformed
-        #: numbers above are not purely a property of retrieval:
-        #: `apply_grouped_read` synthesises its grouped document with
-        #: `record_id=canonical.record_id` and `topic_discoverability`
-        #: identifies the canonical by `record_id`, so under `b_grouped` any
-        #: child hit that folds upward is scored as "the canonical was
-        #: found" — while under `c_peers`/`status_quo` the canonical's own
-        #: stored record must itself have ranked.  `apply_topic_anchor`
-        #: injects it too.  Measured over `[hit.record for hit in hits]`,
-        #: this pair is blind to BOTH transforms and so answers the strictly
-        #: narrower question: did the canonical's own STORED record rank?
-        #: Disclosure, not correction — see the reading guide.
+        #: read-side transform ran — see the module docstring, "Rank-based is
+        #: not transform-blind".  Measured over `[hit.record for hit in
+        #: hits]`, so this pair is blind to grouping AND to the pin.
         stored_canonical_in_5: float | None = None
         stored_canonical_rank: int | None = None
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
