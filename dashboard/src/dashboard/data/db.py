@@ -103,7 +103,7 @@ class DbPool:
         # sentinels while the worker thread breaks on the first — so the second
         # close() would await a future nothing will ever resolve.  See
         # _close_once.
-        self._closing: set[aiosqlite.Connection] = set()
+        self._closing: dict[aiosqlite.Connection, asyncio.Future[None]] = {}
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
         # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
@@ -246,21 +246,40 @@ class DbPool:
         legitimately race here (a resuming getter, ``close_all``'s drain, and
         the ``_adopt_or_close`` handoff), so they all funnel through this guard.
 
-        The membership check and ``add`` straddle no ``await``, so this is
+        The guard SERIALISES rather than DROPS: a second caller JOINS the
+        in-flight close instead of returning while it is still running.
+        :meth:`close_all` depends on that, because the first closer is often the
+        fire-and-forget task ``_adopt_or_close`` scheduled and ``close_all`` has
+        no other handle on it — a skipping guard would let ``close_all`` return
+        with a close still in flight, and a loop closed at that moment strands
+        the worker thread (the very leak this pool exists to prevent).
+
+        The membership check and insert straddle no ``await``, so this is
         race-free on a single event loop.  The entry is removed afterwards to
-        keep the set bounded; a later close then finds ``_connection is None``
+        keep the map bounded; a later close then finds ``_connection is None``
         and returns immediately, which is safe precisely because it is
         sequential.
         """
-        if conn in self._closing:
+        existing = self._closing.get(conn)
+        if existing is not None:
+            # shield(), not a bare `await existing`: the future is SHARED, so a
+            # bare await would let one cancelled waiter cancel it out from under
+            # every other waiter.
+            await asyncio.shield(existing)
             return
-        self._closing.add(conn)
+        finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._closing[conn] = finished
         try:
             await conn.close()
         except Exception:
             logger.debug('DbPool: error closing connection for %s', path, exc_info=True)
         finally:
-            self._closing.discard(conn)
+            # Resolved in the `finally`, not after the await: if the FIRST closer
+            # is itself cancelled mid-close the joiners must still be released,
+            # or the join deadlocks on a future nobody will ever resolve.
+            self._closing.pop(conn, None)
+            if not finished.done():
+                finished.set_result(None)
 
     def _adopt_or_close(self, task: asyncio.Task, *, path: Path) -> None:
         """Take ownership of a connection whose getter was cancelled mid-connect.
