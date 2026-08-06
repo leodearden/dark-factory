@@ -51,7 +51,12 @@ from typing import NamedTuple
 
 from _task_db_scan import (
     _DEFAULT_PROJECT_ROOTS,
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
     NO_DB_RESOLVED_MESSAGE,
+    NO_PROJECT_ROOT_RESOLVED_MESSAGE,
     add_db_discovery_args,
     discover_db_paths,
     discover_project_roots,
@@ -60,6 +65,7 @@ from _task_db_scan import (
     resolve_project_roots,
     run_scan_cli,
     sweep_databases,
+    sweep_project_roots,
     tasks_db_path,
     truncate,
 )
@@ -506,6 +512,128 @@ def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):
 
     assert _cli(["--db", str(db), "--json"], lambda db_path: [], render=render) == 0
     assert capsys.readouterr().out == "custom body\nsecond line\n"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — audit-script CLI plumbing (the two audit scripts).
+#
+# Adopted by audit_wiped_metadata_files.py and audit_combine_gate_marker_loss.py
+# (task 3616). Unlike Tier 2, this tier sweeps PROJECT ROOTS rather than db
+# paths, and its per-root callback returns exactly ONE audit object per root —
+# that difference is what lets the exit-3 gate be spelled `unreadable and not
+# audits` here while Tier 2 must count (see run_scan_cli's comment).
+# ---------------------------------------------------------------------------
+
+# --- AUDIT_EXIT_* constants ------------------------------------------------
+
+def test_audit_exit_constants_carry_the_documented_values():
+    assert AUDIT_EXIT_OK == 0
+    assert AUDIT_EXIT_FINDINGS == 1
+    assert AUDIT_EXIT_NO_ROOT == 2
+    assert AUDIT_EXIT_NOTHING_AUDITED == 3
+
+
+def test_audit_exit_constants_are_pairwise_distinct():
+    """3 must never collapse into 0.
+
+    Each constant denotes EXACTLY ONE outcome. Folding "audited nothing at all"
+    into "audited everything, found nothing" is the silent fail-soft that
+    docs/legibility/design-invariants.md's no-silent-fail-soft rule forbids, and
+    a careless renumbering is exactly how it would come back.
+    """
+    codes = [
+        AUDIT_EXIT_OK,
+        AUDIT_EXIT_FINDINGS,
+        AUDIT_EXIT_NO_ROOT,
+        AUDIT_EXIT_NOTHING_AUDITED,
+    ]
+
+    assert len(set(codes)) == len(codes)
+
+
+def test_no_project_root_resolved_message_is_the_verbatim_audit_script_string():
+    """Pinned as an exact literal, not a substring.
+
+    This is the exit-2 signal both audit scripts printed inline before the
+    extraction; a reworded constant would silently change operator-facing (and
+    grep-able) output, which is why it is asserted whole.
+    """
+    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE == (
+        "no project root resolvable with a readable tasks.db (checked "
+        "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+        "dark-factory default)"
+    )
+
+
+# --- sweep_project_roots(roots, audit_fn) -> (audits, unreadable) ----------
+
+def test_sweep_project_roots_returns_one_audit_per_root_in_root_order():
+    audits, unreadable = sweep_project_roots(
+        ["/proj/b", "/proj/a"], lambda root: f"audit:{root}"
+    )
+
+    assert audits == ["audit:/proj/b", "audit:/proj/a"]
+    assert unreadable == []
+
+
+def test_sweep_project_roots_skips_unreadable_root_and_warns_on_stderr(capsys):
+    def audit(root):
+        if root == "/proj/bad":
+            raise sqlite3.Error("file is not a database")
+        return f"audit:{root}"
+
+    audits, unreadable = sweep_project_roots(
+        ["/proj/bad", "/proj/good"], audit
+    )
+
+    # The BAD root is first on purpose: the sweep must CONTINUE past a failure
+    # so every later root is still audited.
+    assert audits == ["audit:/proj/good"]
+    assert unreadable == ["/proj/bad"]
+
+    err = capsys.readouterr().err
+    assert (
+        "warning: skipping unreadable project /proj/bad: file is not a database" in err
+    )
+
+
+def test_sweep_project_roots_warns_once_in_aggregate_that_results_are_incomplete(capsys):
+    def audit(root):
+        raise sqlite3.Error("file is not a database")
+
+    sweep_project_roots(["/proj/a", "/proj/b"], audit)
+
+    err = capsys.readouterr().err
+    aggregate = (
+        "warning: 2 project(s) skipped due to read errors (see warnings above); "
+        "results below are incomplete"
+    )
+    assert aggregate in err
+    assert err.count("results below are incomplete") == 1
+
+
+def test_sweep_project_roots_omits_the_aggregate_warning_when_all_readable(capsys):
+    audits, unreadable = sweep_project_roots(["/proj/a"], lambda root: "audit")
+
+    assert (audits, unreadable) == (["audit"], [])
+    assert "incomplete" not in capsys.readouterr().err
+
+
+def test_sweep_project_roots_does_not_swallow_non_sqlite_errors():
+    """Mirrors test_sweep_databases_does_not_swallow_non_sqlite_errors.
+
+    A real bug in *audit_fn* must surface, never be silently downgraded to
+    "unreadable project" — that would turn a crash into a quietly incomplete
+    report.
+    """
+    def audit(root):
+        raise ValueError("a real bug, not an unreadable project")
+
+    try:
+        sweep_project_roots(["/proj/a"], audit)
+    except ValueError:
+        return
+    raise AssertionError("a non-sqlite3 error must propagate, not be skipped")
 
 
 # ---------------------------------------------------------------------------
