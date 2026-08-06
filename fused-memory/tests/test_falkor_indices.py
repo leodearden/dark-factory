@@ -35,13 +35,18 @@ evidence (the current absence of indices on real graphs).
 
 from __future__ import annotations
 
+from collections import OrderedDict, defaultdict
+
 import pytest
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
 from fused_memory.backends.falkor_indices import (
+    IndexRecordShapeError,
     UnparsedIndexStatementError,
     expected_index_set,
+    normalize_index_record,
+    normalize_index_records,
     parse_index_statement,
 )
 
@@ -363,3 +368,219 @@ class TestPlainEnumGotcha:
         for statement in get_range_indices('falkordb'):
             with pytest.raises(UnparsedIndexStatementError):
                 parse_index_statement(statement)
+
+
+class TestNormalizeIndexRecords:
+    """The ACTUAL side: project a ``list_indices()`` record onto the normal form.
+
+    Fixtures here are SYNTHETIC dicts built to the shape measured live on
+    2026-08-06 via ``GRAPH.RO_QUERY dark_factory "CALL db.indexes()"``: ``field``
+    is a LIST of property names and ``type`` is a DICT of property -> list of
+    index-type strings.  ``TestListIndicesColumnBinding`` below then drives the
+    same normalizer from a mock shaped like the real 9-column response, so the
+    two halves are checked against a real-shaped row and not only against these
+    hand-written dicts.
+
+    Why this side is a PROJECTION while the expected side RAISES: the two fail in
+    opposite directions.  An unparsed UPSTREAM statement shortens the expected
+    set (under-provisioning — must be loud).  An ACTUAL index the normal form
+    cannot represent is not drift to repair: the PRD defines
+    ``index_type in {RANGE, FULLTEXT}``, VECTOR indices legitimately exist on
+    real graphs, and the PRD says ``unexpected`` is reported but never acted on.
+    Raising there would make the detector a false-alarm generator on every real
+    graph.  Genuine SHAPE surprises still raise — see the IndexRecordShapeError
+    tests.
+    """
+
+    def test_boundary_4_a_four_property_record_yields_four_distinct_tuples(self):
+        """THE named signal: one multi-property record fans out to one tuple per property.
+
+        The caveat this guards: a naive comparison that treated the record's
+        ``field`` list as a single value would report EVERY multi-property index
+        as missing, forever.
+        """
+        record = {
+            'label': 'Entity',
+            'field': ['uuid', 'group_id', 'name', 'created_at'],
+            'type': {
+                'uuid': ['RANGE'],
+                'group_id': ['RANGE'],
+                'name': ['RANGE'],
+                'created_at': ['RANGE'],
+            },
+            'entity_type': 'NODE',
+        }
+        specs = normalize_index_record(record)
+        assert set(specs) == {
+            ('Entity', 'NODE', 'uuid', 'RANGE'),
+            ('Entity', 'NODE', 'group_id', 'RANGE'),
+            ('Entity', 'NODE', 'name', 'RANGE'),
+            ('Entity', 'NODE', 'created_at', 'RANGE'),
+        }
+        # Tied to the record, not to a literal 4.
+        assert len(specs) == len(record['field'])
+        assert len(set(specs)) == len(specs)
+
+    def test_the_naive_whole_list_as_one_field_reading_is_dead(self):
+        """Regression guard: no emitted tuple carries a LIST where a property belongs."""
+        record = {
+            'label': 'Entity',
+            'field': ['uuid', 'group_id', 'name', 'created_at'],
+            'type': {p: ['RANGE'] for p in ('uuid', 'group_id', 'name', 'created_at')},
+            'entity_type': 'NODE',
+        }
+        specs = normalize_index_record(record)
+        assert all(isinstance(spec[2], str) for spec in specs)
+        assert ('Entity', 'NODE', ['uuid', 'group_id', 'name', 'created_at'], 'RANGE') not in specs
+
+    def test_merged_range_and_fulltext_record_emits_one_tuple_per_property_type_pair(self):
+        """FalkorDB merges per-label indices into ONE record, so a property can carry both types."""
+        record = {
+            'label': 'Entity',
+            'field': ['uuid', 'group_id', 'name', 'created_at', 'summary'],
+            'type': {
+                'uuid': ['RANGE'],
+                'group_id': ['RANGE', 'FULLTEXT'],
+                'name': ['RANGE', 'FULLTEXT'],
+                'created_at': ['RANGE'],
+                'summary': ['FULLTEXT'],
+            },
+            'entity_type': 'NODE',
+        }
+        specs = normalize_index_record(record)
+        assert set(specs) == {
+            ('Entity', 'NODE', 'uuid', 'RANGE'),
+            ('Entity', 'NODE', 'group_id', 'RANGE'),
+            ('Entity', 'NODE', 'group_id', 'FULLTEXT'),
+            ('Entity', 'NODE', 'name', 'RANGE'),
+            ('Entity', 'NODE', 'name', 'FULLTEXT'),
+            ('Entity', 'NODE', 'created_at', 'RANGE'),
+            ('Entity', 'NODE', 'summary', 'FULLTEXT'),
+        }
+        assert len(specs) == 7
+
+    def test_relationship_entity_type_passes_through_unchanged(self):
+        record = {
+            'label': 'RELATES_TO',
+            'field': ['uuid', 'group_id'],
+            'type': {'uuid': ['RANGE'], 'group_id': ['RANGE']},
+            'entity_type': 'RELATIONSHIP',
+        }
+        assert set(normalize_index_record(record)) == {
+            ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+            ('RELATES_TO', 'RELATIONSHIP', 'group_id', 'RANGE'),
+        }
+
+    def test_vector_only_record_projects_to_zero_tuples(self):
+        """PROJECTION, not fail-soft — the normal form cannot represent VECTOR.
+
+        A vector index added by an operator or by graphiti is not drift to
+        repair; the PRD reports ``unexpected`` but never acts on it.  Raising
+        here would make the detector alarm on every real graph.
+        """
+        record = {
+            'label': 'Entity',
+            'field': ['name_embedding'],
+            'type': {'name_embedding': ['VECTOR']},
+            'entity_type': 'NODE',
+        }
+        assert normalize_index_record(record) == []
+
+    def test_mixed_vector_and_range_record_keeps_only_the_representable_tuple(self):
+        record = {
+            'label': 'Entity',
+            'field': ['name_embedding', 'uuid'],
+            'type': {'name_embedding': ['VECTOR'], 'uuid': ['RANGE']},
+            'entity_type': 'NODE',
+        }
+        assert normalize_index_record(record) == [('Entity', 'NODE', 'uuid', 'RANGE')]
+
+    def test_unknown_entity_type_raises(self):
+        record = {
+            'label': 'Entity',
+            'field': ['uuid'],
+            'type': {'uuid': ['RANGE']},
+            'entity_type': 'NODE_OR_SOMETHING',
+        }
+        with pytest.raises(IndexRecordShapeError):
+            normalize_index_record(record)
+
+    def test_the_mis_bound_options_dict_raises(self):
+        """DIRECT pin on the step-9/10 defect.
+
+        Today's ``list_indices()`` binds ``entity_type`` to ``row[3]`` — the
+        ``options`` column — so it hands the normalizer an OrderedDict like
+        ``{'uuid': {}}`` where ``'NODE'``/``'RELATIONSHIP'`` belongs.  That must
+        raise here rather than being coerced or skipped, because a normalizer
+        that tolerated it would produce a set silently missing every record.
+        """
+        record = {
+            'label': 'RELATES_TO',
+            'field': ['uuid'],
+            'type': {'uuid': ['RANGE']},
+            'entity_type': OrderedDict({'uuid': OrderedDict()}),
+        }
+        with pytest.raises(IndexRecordShapeError):
+            normalize_index_record(record)
+
+    def test_property_present_in_field_but_absent_from_type_raises(self):
+        """A genuine SHAPE surprise — dropping it would silently under-report."""
+        record = {
+            'label': 'Entity',
+            'field': ['uuid', 'group_id'],
+            'type': {'uuid': ['RANGE']},
+            'entity_type': 'NODE',
+        }
+        with pytest.raises(IndexRecordShapeError) as excinfo:
+            normalize_index_record(record)
+        assert 'group_id' in str(excinfo.value)
+
+    def test_normalize_index_records_unions_and_deduplicates(self):
+        records = [
+            {
+                'label': 'Entity', 'field': ['uuid'],
+                'type': {'uuid': ['RANGE']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['uuid'],
+                'type': {'uuid': ['RANGE']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'RELATES_TO', 'field': ['uuid'],
+                'type': {'uuid': ['RANGE']}, 'entity_type': 'RELATIONSHIP',
+            },
+        ]
+        result = normalize_index_records(records)
+        assert isinstance(result, set)
+        assert result == {
+            ('Entity', 'NODE', 'uuid', 'RANGE'),
+            ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+        }
+
+    def test_seam_round_trip_a_fully_provisioned_graph_diffs_to_empty(self):
+        """The α↔β seam: derive records mechanically FROM the expected set and normalize back.
+
+        Records are DERIVED, never hand-copied, so this cannot drift from the
+        parser.  A green here means the diff β and δ compute is empty for a
+        fully-provisioned graph — i.e. the two halves genuinely speak the same
+        normal form rather than merely looking similar.
+        """
+        expected = expected_index_set()
+
+        grouped: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for label, entity_type, field, index_type in expected:
+            grouped[(label, entity_type)][field].append(index_type)
+
+        derived = [
+            {
+                'label': label,
+                'entity_type': entity_type,
+                'field': list(types_by_field),
+                'type': {f: list(ts) for f, ts in types_by_field.items()},
+            }
+            for (label, entity_type), types_by_field in grouped.items()
+        ]
+
+        assert normalize_index_records(derived) == expected
