@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
@@ -558,6 +558,33 @@ def widen_fallback_for_marker_deselection(
     :func:`deselecting_expression_for_command` refuses any target it cannot
     read. The conftest branch's directory targets are therefore unprovable, and
     unprovable means unchanged.
+
+    THE REMEDY is the same as arm 4a's: ``replace(parsed, targets=())`` — the
+    unscope operation, whose two rendered forms are ``'pytest'`` and
+    ``'cd <sub> && uv run pytest'`` — re-rendered rather than hand-built, so
+    every other flag the executed command carries survives verbatim. Only
+    ``test_command`` moves; ``lint_command``/``type_check_command`` are
+    untouched, marker deselection being a pytest-only concern.
+
+    It is WIDENING, not SKIPPING, for the reason task 3494 chose the same: the
+    task-1852 SKIP precedent applies where there is NO suite at all to run,
+    whereas the proof that an ``-m`` expression exists at this rootdir is
+    itself evidence of a real marker-partitioned suite. Skipping would convert
+    a false RED into a silent no-coverage GREEN.
+
+    It is DEGRADATION, so it says so. The widened run applies the SAME
+    ``addopts``, which means the very files that triggered it remain deselected
+    and go UNRUN — the widening buys a run of the suite's OTHER tests, not
+    coverage of the changed lines. ``ScopeKind.FULL_SUITE`` forbids
+    ``scoped_targets`` (``PlannedRun``'s invariant), so the returned reason is
+    the only channel that can record which files went unexecuted, and it names
+    them explicitly rather than reading as "the change was verified".
+
+    RESIDUAL RISK, documented rather than hidden: if the widened suite ALSO
+    collects zero items, rc=5 remains a genuine RED. ``verify_classify
+    ._classify_opaque`` is deliberately untouched by this task — it carries the
+    task-1852 invariant verbatim and must stay RED for a target that vanished
+    for any other reason.
     """
     if not fallback.test_command:
         return fallback, None
@@ -566,10 +593,30 @@ def widen_fallback_for_marker_deselection(
         return fallback, None
     if not parsed.targets:
         return fallback, None
-    # The probe call and the widening itself land in step-6; until then every
-    # shape that survives the guards above still refuses, which is the
-    # pre-3513 FILE_SCOPED behaviour.
-    return fallback, None
+
+    # The executed command's targets are relative to ITS cwd, while
+    # *worktree_reader* reads worktree-root-relative paths. Resolve before
+    # probing, and reuse the resolved list in the reason so an operator sees the
+    # same paths the rest of the plan record uses.
+    cwd_rel = parsed.cwd_rel
+    resolved = [
+        t if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/{t}'
+        for t in parsed.targets
+    ]
+    deselecting = deselecting_expression_for_command(
+        fallback.test_command, resolved, worktree_reader,
+    )
+    if deselecting is None:
+        return fallback, None
+
+    unrun = ', '.join(resolved)
+    reason = (
+        f'pytest: touched test file(s) {unrun} are ALL deselected by the effective '
+        f'-m {deselecting!r} — fallback full suite instead of a zero-collecting '
+        f'file-scoped run (rc=5); those file(s) stay deselected in this run too '
+        f'and are NOT executed by it'
+    )
+    return replace(fallback, test_command=render(replace(parsed, targets=()))), reason
 
 
 def _derive_module_runs(
