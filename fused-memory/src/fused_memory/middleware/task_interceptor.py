@@ -10,7 +10,7 @@ import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_args
+from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
 try:
     from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
@@ -4724,6 +4724,31 @@ _DONE_PROVENANCE_KINDS_TEXT = (
 )
 
 
+# ── Git-probe failure carriers (task 3455) ──────────────────────────────
+#
+# Both git probes used by _validate_done_provenance (_resolve_commit_sha,
+# _verify_commit_on_main) can fail two ways that need OPPOSITE remedies:
+# git ran and affirmatively rejected the input, or the probe never
+# completed (timeout / missing binary / unexpected error). Each returns a
+# NamedTuple whose leading field names that distinction, so the semantics
+# travel with the value instead of living in a call-site variable name.
+# The authoritative branch-by-branch contract is each probe's docstring.
+
+
+class _CommitResolutionFailure(NamedTuple):
+    """`git rev-parse --verify` did not yield a SHA. See _resolve_commit_sha."""
+
+    confirmed_absent: bool
+    reason: str
+
+
+class _AncestorCheckFailure(NamedTuple):
+    """`git merge-base --is-ancestor` did not accept. See _verify_commit_on_main."""
+
+    confirmed_off_main: bool
+    detail: str
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -4916,11 +4941,13 @@ async def _validate_done_provenance(
     resolved: dict = {'kind': kind}
     if commit_input is not None:
         sha_or_err = await _resolve_commit_sha(project_root, commit_input)
-        if isinstance(sha_or_err, dict):
+        if isinstance(sha_or_err, _CommitResolutionFailure):
+            # Only a git-issued rejection is a "not found" verdict; see
+            # _resolve_commit_sha for the branch-by-branch contract.
+            verb = 'not found in' if sha_or_err.confirmed_absent else 'could not be resolved in'
             return _done_provenance_error(
                 task_id,
-                f'commit {commit_input!r} not found in {project_root}: '
-                f'{sha_or_err.get("reason", "rev-parse failed")}',
+                f'commit {commit_input!r} {verb} {project_root}: {sha_or_err.reason}',
             ), None
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
@@ -4931,20 +4958,17 @@ async def _validate_done_provenance(
         # above, so this check is always reached for any valid kind.
         ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
         if ancestor_result is not None:
-            confirmed_off_main, ancestor_detail = ancestor_result
-            # Only rc=1 (git affirmatively determined the SHA is not
-            # reachable from main) means "is not on main". Every other
-            # failure -- a non-1 git error, a timeout, a missing git
-            # binary -- means the check never completed, i.e.
-            # NOT-YET-CONFIRMED, and carries the opposite remedy (fetch /
-            # fix the checkout / retry, not re-derive the SHA). Task 3455:
-            # reporting those under the same "is not on main" wording as
-            # rc=1 is the same class of defect as task 3119's premature
-            # outcome assertions -- don't conflate them.
-            prefix = 'is not on main' if confirmed_off_main else 'could not be confirmed on main'
+            # rc=1 is the only confirmed off-main verdict; every other
+            # failure is NOT-YET-CONFIRMED and carries the opposite remedy.
+            # See _verify_commit_on_main for the full contract.
+            prefix = (
+                'is not on main'
+                if ancestor_result.confirmed_off_main
+                else 'could not be confirmed on main'
+            )
             return _done_provenance_error(
                 task_id,
-                f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_detail}.',
+                f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_result.detail}.',
             ), None
     if note is not None:
         resolved['note'] = note
@@ -4989,19 +5013,25 @@ async def _validate_done_provenance(
     return None, resolved
 
 
-async def _verify_commit_on_main(project_root: str, sha: str) -> tuple[bool, str] | None:
+async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckFailure | None:
     """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
 
-    Returns None on success (commit is on main). On failure, returns a
-    ``(confirmed_off_main, detail)`` tuple:
+    Returns None on success (commit is on main). On failure, returns an
+    :class:`_AncestorCheckFailure`:
 
     - ``confirmed_off_main=True`` only for rc=1 — git affirmatively
       determined ``sha`` is NOT reachable from ``main``. This is the only
-      case that actually means "not on main".
+      case that actually means "not on main", and the only one whose
+      remedy is to re-derive the landing SHA.
     - ``confirmed_off_main=False`` for every other failure (a non-1 git
-      error such as an unresolvable ``main`` ref, a timeout, or a missing
-      git binary) — the check never completed, so the caller must treat
-      this as NOT-YET-CONFIRMED rather than a not-on-main verdict.
+      error such as an unresolvable ``main`` ref, a timeout, a missing git
+      binary, or any unexpected exception) — the check never completed, so
+      the caller must treat it as NOT-YET-CONFIRMED rather than a
+      not-on-main verdict. The remedy there is the opposite one: fetch /
+      fix the checkout / retry. Task 3455: conflating the two under a
+      single "is not on main" wording is the same defect class as task
+      3119's premature outcome assertions. Any failure branch added later
+      inherits ``False``, i.e. the weaker (honest) claim, by default.
 
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
@@ -5022,11 +5052,11 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> tuple[bool, str
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
-            return False, 'git merge-base timed out'
+            return _AncestorCheckFailure(False, 'git merge-base timed out')
     except FileNotFoundError:
-        return False, 'git binary not found'
+        return _AncestorCheckFailure(False, 'git binary not found')
     except Exception as e:
-        return False, f'{type(e).__name__}: {e}'
+        return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
 
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
@@ -5035,15 +5065,28 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> tuple[bool, str
     if proc.returncode == 0:
         return None
     if proc.returncode == 1:
-        return True, 'commit is not an ancestor of main'
+        return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
     msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return False, msg
+    return _AncestorCheckFailure(False, msg)
 
 
-async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
+async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
     """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
 
-    Returns the SHA on success or a ``{'reason': ...}`` dict on failure.
+    Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
+    ``confirmed_absent`` flag says whether git actually rendered a verdict
+    (task 3455, mirroring :func:`_verify_commit_on_main`):
+
+    - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
+      evaluated the ref against this checkout, and rejected it. Only then
+      may the caller say the commit was "not found in <project_root>".
+    - ``confirmed_absent=False`` for a timeout, a missing git binary, an
+      unexpected exception, or empty output on rc=0 — rev-parse never
+      rendered a verdict on the ref, so the honest report is "could not be
+      resolved", with the same fetch / fix-the-checkout / retry remedy as
+      an unconfirmed ancestor check. Any failure branch added later
+      inherits ``False``, i.e. the weaker claim, by default.
+
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
@@ -5062,18 +5105,18 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
-            return {'reason': 'git rev-parse timed out'}
+            return _CommitResolutionFailure(False, 'git rev-parse timed out')
     except FileNotFoundError:
-        return {'reason': 'git binary not found'}
+        return _CommitResolutionFailure(False, 'git binary not found')
     except Exception as e:
-        return {'reason': f'{type(e).__name__}: {e}'}
+        return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
 
     if proc.returncode != 0:
         msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return {'reason': msg}
+        return _CommitResolutionFailure(True, msg)
     sha = stdout.decode('utf-8', errors='replace').strip()
     if not sha or len(sha) < 7:
-        return {'reason': 'empty rev-parse output'}
+        return _CommitResolutionFailure(False, 'empty rev-parse output')
     return sha
 
 
