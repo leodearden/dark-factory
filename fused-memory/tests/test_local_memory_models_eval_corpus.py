@@ -1180,6 +1180,60 @@ class TestVerifyIsPinnedToTheRecordedWindow:
         report = _mod.verify_manifest(manifest, restyled)
         assert report.status == 'ok', report.detail
 
+    def _mixed_spelling_population(self):
+        """A population whose true extremes sort to the WRONG end as text.
+
+        Both extra rows share a date prefix with the block they extend, so the
+        comparison actually reaches the spelling — a row in a different month
+        would sort identically either way and prove nothing:
+
+        * `'2026-07-16 13:00'` is the latest instant, but `' '` (0x20) < `'T'`
+          puts it BELOW the 12:00 rows as a string, so a lexicographic `max`
+          records 12:00 and the 13:00 row falls outside its own frame.
+        * `'2026-04-16T12:00+05:00'` is 07:00Z — the earliest instant — but
+          `'+05'` > `'+00'` puts it ABOVE the other April rows as a string. A
+          non-UTC offset sorts by wall clock, not by instant.
+        """
+        return [
+            *_population(SYNTHETIC_CELLS),
+            self._later('99999999-0000-0000-0000-000000000000', '2026-07-16 13:00:00+00:00'),
+            self._later(
+                '00000001-1111-0000-0000-000000000000',
+                '2026-04-16T12:00:00+05:00',
+                kind='decisions_and_rationale',
+            ),
+        ]
+
+    def test_the_recorded_bounds_are_the_true_instant_extremes(self):
+        """The bound is computed on the instant, not on the text.
+
+        `build_manifest` writes this field and `verify_manifest` reads it back
+        through `parse_timestamp`. If the producer ranks by string while the
+        consumer ranks by instant, the two disagree about which episodes were
+        ever in frame.
+        """
+        window = _built(population=self._mixed_spelling_population())['criteria']['window']
+        assert _mod.parse_timestamp(window['max_created_at']) == _mod.parse_timestamp(
+            '2026-07-16T13:00:00+00:00'
+        )
+        assert _mod.parse_timestamp(window['min_created_at']) == _mod.parse_timestamp(
+            '2026-04-16T07:00:00+00:00'
+        )
+
+    def test_a_mixed_spelling_population_verifies_green_when_freshly_built(self):
+        """The regression, end to end.
+
+        A lexicographic `max` records a bound EARLIER than the true frame
+        maximum, so the windowed re-derivation silently drops the episodes
+        between the two, cell denominators shift, and largest-remainder moves a
+        seat — `id_mismatch` on an untampered artifact nobody has touched.
+        Restyling the population at verify time (above) cannot catch this: the
+        manifest there was built from uniformly-spelled records.
+        """
+        population = self._mixed_spelling_population()
+        report = _mod.verify_manifest(_built(population=population), population)
+        assert report.status == 'ok', report.detail
+
     def test_a_naive_timestamp_is_read_as_utc_not_rejected(self):
         """Aware-vs-naive comparison is a TypeError, not a verdict."""
         population = _population(SYNTHETIC_CELLS)

@@ -884,7 +884,24 @@ def build_manifest(
     could silently disagree with the first, and hash drift — the exact thing
     :func:`verify_manifest` exists to catch — would then be undetectable.
     """
-    created = [record.created_at for record in population]
+    # Both bounds are taken on the NORMALIZED instant, never on the raw string.
+    # The store spells one instant four ways (see :func:`parse_timestamp`) and
+    # those spellings do not sort consistently as text: ``' '`` (0x20) < ``'T'``,
+    # ``'Z'`` > ``'+'``, and a non-UTC offset sorts by wall clock rather than by
+    # instant. :func:`verify_manifest` consumes ``max_created_at`` through
+    # ``parse_timestamp``, so a lexicographic bound here would leave the producer
+    # and the consumer of this field disagreeing about which episodes were in
+    # frame — and a freshly built, untampered manifest could fail its own
+    # ``--verify``, the exact false alarm the window bound exists to prevent.
+    #
+    # The recorded VALUE keeps the store's own spelling rather than a normalized
+    # one, so the artifact still shows what the store literally holds and a
+    # reviewer can find the bounding row by the text in front of them.
+    def _instant(record: EpisodeRecord) -> datetime:
+        return parse_timestamp(record.created_at)
+
+    earliest = min(population, key=_instant).created_at
+    latest = max(population, key=_instant).created_at
     cells = {
         _cell_label(cell): {
             'population': count,
@@ -907,7 +924,7 @@ def build_manifest(
             'seed': seed,
             'selection_rule': SELECTION_RULE,
             'stratification_dimensions': list(STRATIFICATION_DIMENSIONS),
-            'window': {'min_created_at': min(created), 'max_created_at': max(created)},
+            'window': {'min_created_at': earliest, 'max_created_at': latest},
         },
         'episodes': [
             {
