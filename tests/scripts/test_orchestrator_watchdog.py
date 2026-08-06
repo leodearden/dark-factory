@@ -6480,6 +6480,107 @@ def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
 
 
 # ---------------------------------------------------------------------------
+# Part D: shared CLOCK-layer primitives (task 3764 amendment)
+#
+# _read_clock_epoch / _stamp_clock / _within_min_interval sit one level above
+# the JSON primitives and are now the SINGLE definition behind all eight clock
+# wrappers (fleet-deploy, fm-deploy, fm-liveness-restart). The wrappers' own
+# suites (Part A/C/D) are the behavioural regression net; these pin the
+# primitives' contracts directly so a drift between the three fail-open
+# contracts is caught at the source rather than in triplicate.
+# ---------------------------------------------------------------------------
+
+
+def test_read_clock_epoch_roundtrips_a_stamped_clock(tmp_path: pathlib.Path) -> None:
+    """_stamp_clock writes {ts, iso}; _read_clock_epoch reads it back as float."""
+    wdog = _load_watchdog()
+    clock = tmp_path / "nested" / "clock.json"
+    assert not clock.parent.exists(), "the stamp must create the parent dir"
+
+    wdog._stamp_clock(str(clock))
+
+    body = json.loads(clock.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    epoch = wdog._read_clock_epoch(str(clock), "test clock")
+    assert isinstance(epoch, float)
+    assert epoch == pytest.approx(float(body["ts"]))
+
+
+def test_read_clock_epoch_missing_file_returns_none_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An absent clock is the normal 'never stamped' case: None, and no log spam."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._read_clock_epoch(str(tmp_path / "absent.json"), "test clock") is None
+    assert logged == [], f"a never-stamped clock must not log every tick: {logged!r}"
+
+
+def test_read_clock_epoch_unusable_ts_returns_none_and_names_the_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A body with a missing/unusable `ts` fails open to None AND names the label.
+
+    The label is the whole reason it is a parameter: with three clocks now
+    sharing one reader, a journal line that did not say WHICH clock degraded
+    would be useless to an operator.
+    """
+    wdog = _load_watchdog()
+    for body in ('{"iso": "2026-08-06T00:00:00+00:00"}', '{"ts": "not-a-number"}'):
+        logged: list[str] = []
+        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
+        clock = tmp_path / "clock.json"
+        clock.write_text(body)
+
+        assert wdog._read_clock_epoch(str(clock), "fm-deploy clock") is None
+        assert any("fm-deploy clock" in m for m in logged), (
+            f"the log line must name the degraded clock: {logged!r}"
+        )
+
+
+def test_within_min_interval_uses_the_reader_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate compares now - reader() against secs, honouring the passed reader.
+
+    Taking the READER rather than a path is what keeps each wrapper's named
+    epoch function the single seam tests substitute at — a wrapper can never
+    silently bypass its own reader.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
+
+    assert wdog._within_min_interval(3600, lambda: 1_000_000.0) is True
+    assert wdog._within_min_interval(60, lambda: 1_000_000.0) is False
+
+
+def test_within_min_interval_disabled_does_not_read_the_clock() -> None:
+    """secs<=0 disables the cap outright — the reader is not even called.
+
+    A disabled cap must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+
+    def boom() -> float:
+        pytest.fail("a disabled min-interval must not read its clock")
+
+    assert wdog._within_min_interval(0, boom) is False
+    assert wdog._within_min_interval(-1, boom) is False
+
+
+def test_within_min_interval_absent_clock_is_outside_the_window() -> None:
+    """A None epoch counts as OUTSIDE the window (fail toward acting).
+
+    Failing the other way would let one unreadable file suppress every future
+    restart indefinitely.
+    """
+    wdog = _load_watchdog()
+    assert wdog._within_min_interval(3600, lambda: None) is False
+
+
+# ---------------------------------------------------------------------------
 # Part D: fm liveness streak file primitives (task 3764)
 #
 # _write_fm_liveness_streak / _read_fm_liveness_streak / _clear_fm_liveness_streak.

@@ -39,6 +39,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 # (port, systemd unit name) pairs to watch.  Port values match each
 # orchestrator's configured escalation.port (guarded by the drift test in
@@ -853,55 +854,6 @@ def _newest_fm_watched_commit_epoch() -> int | None:
         return None
 
 
-def _read_last_fleet_deploy_epoch() -> float | None:
-    """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
-
-    Reads the same ``{ts, iso}`` JSON schema
-    ``StaleServiceRestartCoordinator._load_last_fire_wall`` reads and
-    ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
-    all three tiers agree on the shared clock's format.
-
-    Fail-open, mirroring ``_load_last_fire_wall``: returns None (never
-    raises) when the file is missing (no fleet deploy has ever verified
-    fresh, or a fresh checkout with no data/ yet), or when it is corrupt,
-    unreadable, or missing its ``ts`` key. Callers must treat None as
-    "the min-interval cap does not apply" (fail toward restarting, not
-    toward silence).
-    """
-    try:
-        with open(FLEET_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
-        return float(raw["ts"])
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        log(
-            f"ignoring unreadable/corrupt fleet-deploy clock at "
-            f"{FLEET_DEPLOY_CLOCK_PATH}: {exc!r}"
-        )
-        return None
-
-
-def _within_fleet_deploy_min_interval() -> bool:
-    """Return True iff we are still inside the shared fleet-deploy min-interval window.
-
-    Reads the same on-disk clock ``restart-all-orchestrators.sh`` stamps only
-    on a verified-fresh fleet restart (never on mere fire/registration — see
-    the coordinator's ``stamp_clock_on_fire=False`` for the orchestrator's own
-    coordinator, task 2396). ORCH_RESTART_MIN_INTERVAL_SECS<=0 disables the
-    cap outright (the clock is not even read). A missing/unreadable clock
-    (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
-    the window" — fail toward letting the backstop run, not toward silencing
-    it indefinitely.
-    """
-    if ORCH_RESTART_MIN_INTERVAL_SECS <= 0:
-        return False
-    last = _read_last_fleet_deploy_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
-
-
 def _atomic_write_json(path: str, payload: dict) -> None:
     """Atomically write *payload* as JSON to *path*, creating its parent dir.
 
@@ -979,6 +931,124 @@ def _read_json_state(path: str) -> dict | None:
         return None
 
 
+def _read_clock_epoch(path: str, label: str) -> float | None:
+    """Return the ``ts`` epoch from the ``{ts, iso}`` clock file at *path*, or None.
+
+    The shared CLOCK-layer read primitive, one level above _read_json_state
+    (which owns the missing/corrupt/non-object branches) — extracted so the
+    three watchdog clocks cannot drift apart in their fail-open contracts.
+    All three write and read the same ``{ts, iso}`` schema that
+    restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
+    ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
+    single ``float(ts)`` extraction serves every tier.
+
+    *label* names the clock in the log line only ("fleet-deploy clock",
+    "fm-deploy clock", ...) so a journal reader can tell WHICH clock
+    degraded; nothing branches on it.
+
+    FAIL-OPEN, uniformly: returns None — never raises — when the file is
+    missing (nothing has ever been stamped, or a fresh checkout with no
+    data/ yet), corrupt, unreadable, or carrying an unusable ``ts``. Every
+    caller must treat None as "the min-interval cap does not apply" (fail
+    toward letting the restart/backstop run, never toward silencing it
+    indefinitely on the strength of one unreadable file).
+    """
+    state = _read_json_state(path)
+    if state is None:
+        return None
+    try:
+        return float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log(f"ignoring {label} at {path} with unusable 'ts': {exc!r}")
+        return None
+
+
+def _stamp_clock(path: str) -> None:
+    """Atomically stamp *path* with the current ``{ts, iso}`` time.
+
+    The shared CLOCK-layer write primitive paired with _read_clock_epoch.
+    Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock,
+    emitting the identical schema: an integer epoch plus a human-readable UTC
+    rendering that exists purely so an operator reading the file by hand does
+    not have to decode a bare number.
+
+    Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
+    error is logged and swallowed rather than raised. Callers whose SAFETY
+    depends on the stamp landing (rather than merely their convenience) must
+    say so at their own call site — see _stamp_fm_liveness_restart_clock.
+    """
+    now = time.time()
+    _atomic_write_json(
+        path,
+        {
+            "ts": int(now),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
+
+
+def _within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
+    """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
+
+    The shared min-interval GATE, extracted so all three caps share one
+    definition of "too soon" rather than three copies that could drift.
+
+    Takes the clock READER rather than a path on purpose: each cap's named
+    reader (_read_last_fleet_deploy_epoch, _read_last_fm_deploy_epoch,
+    _read_last_fm_liveness_restart_epoch) stays the single seam the tests
+    substitute at, so a wrapper can never silently bypass its own reader.
+
+    Two fail directions, both toward LETTING the caller act:
+      - *secs* <= 0 disables the cap outright, and the clock is not even read
+        (a disabled cap must not depend on a readable file);
+      - a None epoch (missing/corrupt/unreadable clock) counts as OUTSIDE the
+        window. Failing the other way would let one unreadable file suppress
+        every future restart indefinitely.
+    """
+    if secs <= 0:
+        return False
+    last = read_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < secs
+
+
+def _read_last_fleet_deploy_epoch() -> float | None:
+    """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
+
+    Reads the same ``{ts, iso}`` JSON schema
+    ``StaleServiceRestartCoordinator._load_last_fire_wall`` reads and
+    ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
+    all three tiers agree on the shared clock's format.
+
+    Fail-open via _read_clock_epoch, mirroring ``_load_last_fire_wall``:
+    returns None (never raises) when the file is missing (no fleet deploy has
+    ever verified fresh, or a fresh checkout with no data/ yet), or when it is
+    corrupt, unreadable, or missing its ``ts`` key. Callers must treat None as
+    "the min-interval cap does not apply" (fail toward restarting, not toward
+    silence). Reads FLEET_DEPLOY_CLOCK_PATH at CALL time, not at def time, so
+    tests that monkeypatch the module global still work.
+    """
+    return _read_clock_epoch(FLEET_DEPLOY_CLOCK_PATH, "fleet-deploy clock")
+
+
+def _within_fleet_deploy_min_interval() -> bool:
+    """Return True iff we are still inside the shared fleet-deploy min-interval window.
+
+    Reads the same on-disk clock ``restart-all-orchestrators.sh`` stamps only
+    on a verified-fresh fleet restart (never on mere fire/registration — see
+    the coordinator's ``stamp_clock_on_fire=False`` for the orchestrator's own
+    coordinator, task 2396). ORCH_RESTART_MIN_INTERVAL_SECS<=0 disables the
+    cap outright (the clock is not even read). A missing/unreadable clock
+    (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
+    the window" — fail toward letting the backstop run, not toward silencing
+    it indefinitely. Both behaviours live in the shared _within_min_interval.
+    """
+    return _within_min_interval(
+        ORCH_RESTART_MIN_INTERVAL_SECS, _read_last_fleet_deploy_epoch
+    )
+
+
 def _read_last_fm_deploy_epoch() -> float | None:
     """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
 
@@ -987,28 +1057,15 @@ def _read_last_fm_deploy_epoch() -> float | None:
     restart-all-orchestrators.sh's stamp_fleet_deploy_clock), so ``float(ts)``
     reads it identically.
 
-    Fail-open: returns None (never raises) when the file is missing (no fm
-    deploy has ever verified fresh, or a fresh checkout with no data/ yet), or
-    when it is corrupt, unreadable, or missing its ``ts`` key. Callers must
-    treat None as "the min-interval cap does not apply" (fail toward running
-    the backstop, not toward silence).
-
-    Thin wrapper over the shared _read_json_state helper (task 3764), which
-    owns the missing/corrupt/unreadable fail-open branches; only the ``ts``
-    extraction is fm-deploy-specific. Reads FM_DEPLOY_CLOCK_PATH at CALL time,
-    not at def time, so tests that monkeypatch the module global still work.
+    Fail-open via _read_clock_epoch: returns None (never raises) when the file
+    is missing (no fm deploy has ever verified fresh, or a fresh checkout with
+    no data/ yet), or when it is corrupt, unreadable, or missing its ``ts``
+    key. Callers must treat None as "the min-interval cap does not apply"
+    (fail toward running the backstop, not toward silence). Reads
+    FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work.
     """
-    state = _read_json_state(FM_DEPLOY_CLOCK_PATH)
-    if state is None:
-        return None
-    try:
-        return float(state["ts"])
-    except (KeyError, TypeError, ValueError) as exc:
-        log(
-            f"ignoring fm-deploy clock at {FM_DEPLOY_CLOCK_PATH} "
-            f"with unusable 'ts': {exc!r}"
-        )
-        return None
+    return _read_clock_epoch(FM_DEPLOY_CLOCK_PATH, "fm-deploy clock")
 
 
 def _within_fm_deploy_min_interval() -> bool:
@@ -1022,12 +1079,7 @@ def _within_fm_deploy_min_interval() -> bool:
     window" — fail toward letting the backstop run, not toward silencing it
     indefinitely.
     """
-    if FM_RESTART_MIN_INTERVAL_SECS <= 0:
-        return False
-    last = _read_last_fm_deploy_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < FM_RESTART_MIN_INTERVAL_SECS
+    return _within_min_interval(FM_RESTART_MIN_INTERVAL_SECS, _read_last_fm_deploy_epoch)
 
 
 def _stamp_fm_deploy_clock() -> None:
@@ -1048,19 +1100,12 @@ def _stamp_fm_deploy_clock() -> None:
     still self-heals via ActiveEnterTimestamp next tick, so the clock is only a
     secondary flap-guard.
 
-    Thin wrapper over the shared _atomic_write_json helper (task 3764): this
-    function owns only the ``{ts, iso}`` payload schema. Reads
+    Thin wrapper over the shared _stamp_clock helper (task 3764), which owns
+    the ``{ts, iso}`` payload schema and the atomic-write dance. Reads
     FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
     monkeypatch the module global still work.
     """
-    now = time.time()
-    _atomic_write_json(
-        FM_DEPLOY_CLOCK_PATH,
-        {
-            "ts": int(now),
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
-        },
-    )
+    _stamp_clock(FM_DEPLOY_CLOCK_PATH)
 
 
 def _read_last_fm_liveness_restart_epoch() -> float | None:
@@ -1068,21 +1113,13 @@ def _read_last_fm_liveness_restart_epoch() -> float | None:
 
     Sibling of _read_last_fm_deploy_epoch reading a DIFFERENT file
     (FM_LIVENESS_RESTART_CLOCK_PATH, task 3764) with the identical ``{ts, iso}``
-    schema and fail-open contract. Fail-open: a missing clock is the normal
-    "the watchdog has never revived fm" case; a corrupt one is logged by
-    _read_json_state. Callers must treat None as "the cap does not apply".
+    schema and fail-open contract. Fail-open via _read_clock_epoch: a missing
+    clock is the normal "the watchdog has never revived fm" case; a corrupt
+    one is logged. Callers must treat None as "the cap does not apply".
     """
-    state = _read_json_state(FM_LIVENESS_RESTART_CLOCK_PATH)
-    if state is None:
-        return None
-    try:
-        return float(state["ts"])
-    except (KeyError, TypeError, ValueError) as exc:
-        log(
-            f"ignoring fm liveness restart clock at "
-            f"{FM_LIVENESS_RESTART_CLOCK_PATH} with unusable 'ts': {exc!r}"
-        )
-        return None
+    return _read_clock_epoch(
+        FM_LIVENESS_RESTART_CLOCK_PATH, "fm liveness restart clock"
+    )
 
 
 def _within_fm_liveness_restart_min_interval() -> bool:
@@ -1098,17 +1135,15 @@ def _within_fm_liveness_restart_min_interval() -> bool:
     by the fm staleness deploy cadence: reviving a wedge never delays a merged
     fm change's deploy, and a scheduled deploy never licenses an extra kill.
 
-    Fail direction: an absent/unreadable clock counts as OUTSIDE the window.
-    Failing the other way would let one unreadable file suppress every future
-    revive indefinitely — worse than an extra restart the streak has already
+    Fail direction (inherited from the shared _within_min_interval): an
+    absent/unreadable clock counts as OUTSIDE the window. Failing the other
+    way would let one unreadable file suppress every future revive
+    indefinitely — worse than an extra restart the streak has already
     justified.
     """
-    if FM_LIVENESS_RESTART_MIN_INTERVAL_SECS <= 0:
-        return False
-    last = _read_last_fm_liveness_restart_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
+    return _within_min_interval(
+        FM_LIVENESS_RESTART_MIN_INTERVAL_SECS, _read_last_fm_liveness_restart_epoch
+    )
 
 
 def _stamp_fm_liveness_restart_clock() -> None:
@@ -1121,16 +1156,10 @@ def _stamp_fm_liveness_restart_clock() -> None:
 
     Called from fused_memory_liveness_pass() immediately after restart_unit()
     issues a revive, so the cap is armed even if the subsequent streak clear
-    fails. Fail-soft by inheritance from _atomic_write_json.
+    fails. Thin wrapper over the shared _stamp_clock helper, which owns the
+    ``{ts, iso}`` payload schema and the atomic-write dance.
     """
-    now = time.time()
-    _atomic_write_json(
-        FM_LIVENESS_RESTART_CLOCK_PATH,
-        {
-            "ts": int(now),
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
-        },
-    )
+    _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
 
 
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
