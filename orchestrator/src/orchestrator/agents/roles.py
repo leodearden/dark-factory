@@ -289,26 +289,43 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 
 
 # Layer-1 guard against the headless --print background-task footgun (task
-# 2761).  A single source of truth concatenated into the IMPLEMENTER and
-# DEBUGGER system prompts (and injected into build_amender_prompt) — like
-# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND, it is anchored by a
+# 2761).  A single source of truth, no longer spliced on its own: task 3607
+# folded it into BACKGROUND_WAIT_GUIDANCE (below), which is what the seven
+# Bash-capable role prompts now embed — see constraint (b) there.  Like
+# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND it is anchored by a
 # regression test (test_roles_background_warning.py) so a prompt refactor can't
-# silently drop it.  Plain text, NO literal `{`/`}` braces, so it is safe both
-# concatenated via `+` and interpolated into build_amender_prompt's f-string.
+# silently drop it.
+#
+# The first bullet's "~25-minute threshold described below" forward-references
+# WAIT_PATTERN_GUIDANCE, and resolves ONLY because the two always ship together
+# as BACKGROUND_WAIT_GUIDANCE (constraint (b) already forbids splicing either
+# half alone).  Do NOT drop that qualifier back to the pre-3607 wording ("a
+# foreground command that legitimately runs long is fine", unqualified): in the
+# composed block it sat a few lines above the rule that a long FOREGROUND call
+# is exactly what gets the session killed, so the agent read "long foreground is
+# fine" immediately before "long foreground kills your session".
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing:
+# nothing interpolates this constant today (briefing.py takes
+# WAIT_PATTERN_REMINDER), and role prompts are plain `+` concatenation — see the
+# MANDATED_STAGING_COMMAND note above, they are deliberately NOT f-strings
+# because they contain literal braces.  Staying brace-free keeps it safe if a
+# future splice site does interpolate it.
 BACKGROUND_TASK_WARNING = """
 ## CRITICAL: Never end your turn while a backgrounded command is still running
 
 Do NOT launch a long-running command in the background (`Bash` with
 `run_in_background=true`) and then end your turn to "wait for it to finish" or
-"wait for the completion notification". This session is a headless, one-shot
-`claude --print` process: the moment you end your turn it exits reporting
-SUCCESS, and the still-pending background work is silently abandoned mid-task —
-leaving a half-done tree that is falsely recorded as a completed, successful run.
+"wait for the completion notification". This is a headless `claude --print`
+process: the moment you end your turn it exits reporting SUCCESS, and the
+still-pending background work is silently abandoned mid-task — leaving a
+half-done tree that is falsely recorded as a completed, successful run.
 
 - Run long commands (builds, full test suites, verification) in the FOREGROUND
-  and wait for them to complete. Per-role wall-clock ceilings exist for exactly
-  this — a foreground command that legitimately runs long is fine; an abandoned
-  background one is not.
+  and wait for them to complete — up to the ~25-minute threshold described
+  below, past which you must background it and poll instead. A foreground
+  command that legitimately runs that long is fine; an abandoned background one
+  never is.
 - If you genuinely must use `run_in_background=true`, you MUST poll it to
   completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
   your turn. Never end the turn with a background command still pending.
@@ -322,8 +339,15 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 # that get SIGTERMed at the Bash timeout.  This states the sanctioned wait
 # paths.  Anchored by test_roles_wait_pattern.py, which pins two HARD
 # constraints:
-#   (a) NO literal `{`/`}` braces — this text is interpolated into
-#       build_amender_prompt's f-string, same invariant as the constant above.
+#   (a) NO literal `{`/`}` braces.  Defensive, NOT load-bearing, and the
+#       distinction matters to whoever edits these next: this constant reaches
+#       role prompts only by plain `+` concatenation, which is brace-safe by
+#       construction (role prompts are deliberately not f-strings — see the
+#       MANDATED_STAGING_COMMAND note above — precisely because they DO contain
+#       literal braces).  The one constant here that genuinely must stay
+#       brace-free is WAIT_PATTERN_REMINDER, which briefing.py interpolates into
+#       build_amender_prompt's f-string.  Keeping this one brace-free too costs
+#       nothing and keeps it interpolation-safe if a future splice site needs it.
 #   (b) BACKGROUND_WAIT_GUIDANCE (defined below) is the ONLY thing that may be
 #       spliced into a role prompt.  Splicing either half on its own reopens
 #       the exact footgun-trade the composition mandate exists to prevent: the

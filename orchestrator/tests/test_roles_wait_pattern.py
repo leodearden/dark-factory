@@ -173,11 +173,15 @@ def test_combined_guidance_composes_both_rules() -> None:
 def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     """No literal ``{``/``}`` — same invariant ``BACKGROUND_TASK_WARNING`` holds.
 
-    Both constants reach an f-string: ``WAIT_PATTERN_REMINDER`` is interpolated
-    into ``build_amender_prompt`` directly, and ``WAIT_PATTERN_GUIDANCE`` is
-    concatenated into ``BACKGROUND_WAIT_GUIDANCE``, which is spliced into role
-    prompts. A literal brace would raise at format time or silently mangle the
-    rendered prompt.
+    Only ONE of these is load-bearing, and conflating them misleads the next
+    editor about which constants may contain braces. ``WAIT_PATTERN_REMINDER``
+    genuinely must stay brace-free: ``briefing.py`` interpolates it into
+    ``build_amender_prompt``'s f-string, where a literal brace raises at format
+    time or silently mangles the rendered prompt. ``WAIT_PATTERN_GUIDANCE``
+    reaches role prompts only via plain ``+`` concatenation, which is brace-safe
+    by construction — role prompts are deliberately NOT f-strings precisely
+    because they contain literal braces. It is held brace-free defensively, so
+    it stays interpolation-safe if a future splice site needs it.
     """
     value = {
         'WAIT_PATTERN_GUIDANCE': WAIT_PATTERN_GUIDANCE,
@@ -185,8 +189,10 @@ def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     }[name]
 
     assert '{' not in value and '}' not in value, (
-        f'{name} contains a literal brace. It reaches an f-string in '
-        'briefing.py — braces must be removed or the prompt breaks at runtime.'
+        f'{name} contains a literal brace. WAIT_PATTERN_REMINDER is interpolated '
+        'into build_amender_prompt in briefing.py, and WAIT_PATTERN_GUIDANCE is '
+        'held brace-free so it stays safe at any future interpolating splice '
+        'site — remove the brace or the prompt breaks at runtime.'
     )
 
 
@@ -222,6 +228,32 @@ def test_background_capable_roles_carry_combined_guidance() -> None:
         f'Roles missing BACKGROUND_WAIT_GUIDANCE from their system_prompt: {offenders}. '
         'These roles can launch a build or a full test suite, so they will hit '
         'background work with no sanctioned wait pattern to reach for.'
+    )
+
+
+def test_excluded_roles_do_not_carry_combined_guidance() -> None:
+    """The negative half: a role without unqualified Bash must NOT carry the block.
+
+    The two tests above catch a role GAINING Bash and a capable role LOSING the
+    block. Neither catches an accidental splice into an excluded role. The
+    exclusion is justified on token cost — the block is ~3.2 kB paid on every
+    invocation — and ``reviewer_comprehensive`` is among the highest-frequency
+    roles in the system, so an errant splice there is expensive and would ship
+    silently. This makes the stated rationale enforced rather than aspirational.
+    """
+    offenders = sorted(
+        name
+        for name in ROLES
+        if name not in _BACKGROUND_CAPABLE_ROLES
+        and BACKGROUND_WAIT_GUIDANCE in ROLES[name].system_prompt
+    )
+
+    assert offenders == [], (
+        f'Roles carrying BACKGROUND_WAIT_GUIDANCE without unqualified `Bash`: '
+        f'{offenders}. These roles cannot launch a long-running command, so the '
+        'block is dead weight in every one of their sessions. Either remove the '
+        'splice, or — if the role genuinely gained the capability — grant it '
+        '`Bash` and add it to _BACKGROUND_CAPABLE_ROLES.'
     )
 
 
