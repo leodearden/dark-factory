@@ -167,6 +167,13 @@ _SKILLS_TOKEN = "skills/"
 # exactly one of the two sets turns "someone wrote a new test that reads
 # skills/" from invisible drift into a failure whose fix is a one-line triage
 # decision: real consumer -> inventory, prose/synthetic -> here, with a reason.
+#
+# STALENESS IS DELIBERATELY NOT GATED. An entry whose file no longer mentions
+# the token is INERT, not a failure — a staleness assertion was shipped, then
+# removed on review because it made other packages' comment prose a
+# merge-blocking gate here. Prune such entries opportunistically; the full
+# record and the "do not reintroduce it" rationale live in
+# test_no_unlisted_skills_mentioning_test_escapes_triage's docstring.
 _SKILLS_MENTION_NON_CONSUMERS = {
     # Builds '/repo/skills/spawn/spawn-claude.sh' as a FAKE argv string against
     # a synthetic repo root; never touches this repo's tree.
@@ -932,9 +939,29 @@ def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
     literal ``skills/``; every hit must be in ``SKILLS_CONSUMING_TESTS`` or in
     ``_SKILLS_MENTION_NON_CONSUMERS``. A new file in neither fails with a
     one-line triage instruction. The exclusion set is not a free suppression
-    channel: each entry carries its reason, and a stale entry — one that no
-    longer mentions ``skills/`` at all — also fails, so the set cannot silently
-    accumulate.
+    channel: each entry carries its reason.
+
+    CORRECTED, NOT SILENTLY REWRITTEN — task 3460's correct-rather-than-delete
+    precedent, the house convention this file's own DECIDED block follows and
+    which is already used twice in this module. This paragraph previously
+    claimed that "a stale entry — one that no longer mentions ``skills/`` at
+    all — also fails, so the set cannot silently accumulate". A staleness
+    assertion WAS shipped here and was REMOVED on review. WHY: it made comment
+    and docstring PROSE in five unrelated packages a load-bearing gate on this
+    module, so a cosmetic reword elsewhere red-walled a merge-blocking config —
+    measured, by rewording one comment in
+    ``scripts/tests/test_legibility_sampling.py``, as ``1 failed, 5 passed``
+    here from a diff touching nothing this file gates. WHY REMOVAL IS SAFE: an
+    unmatched exclusion key is INERT. ``untriaged`` only ever consults
+    ``triaged`` for MEMBERSHIP, so a key that matches no file cannot make any
+    file that still mentions the token pass.
+
+    THE REPLACEMENT POLICY IS OPPORTUNISTIC PRUNING, and it is a policy rather
+    than an oversight: drop stale entries when this file is next touched for
+    another reason. Do NOT reintroduce a staleness check, and do NOT "fix" the
+    coupling with a word-boundary or regex variant — that keeps the identical
+    dependency on other packages' prose while hiding it behind a cleverer
+    matcher.
 
     A SUBSET ASSERTION, NOT AN EQUALITY, AND THE MEASUREMENT SAYS WHY. A
     literal-token sweep is a LOWER BOUND on the consumer set, with a measured
@@ -947,15 +974,8 @@ def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
     equality would go red on a correct inventory. Only the direction that can
     hide a new consumer is asserted.
 
-    WHAT THIS COSTS, recorded rather than left for someone to hit. Dropping a
-    ``skills/`` mention from an excluded file (e.g. renaming the
-    ``skills/foo.md`` tmp_path fixture) fails this guard from another
-    project's diff. That is deliberate — a stale exclusion is how a
-    suppression list rots — and the fix is deleting one line, which the
-    failure message says outright.
-
-    MEASURED RED, both halves, at base main ``7c6039327d``, each against its
-    own uncommitted scratch mutation. An untriaged new consumer
+    MEASURED RED at base main ``7c6039327d`` against a single uncommitted
+    scratch mutation — an untriaged new consumer
     (``orchestrator/tests/test_scratch_skills_consumer.py`` containing
     ``skills/spawn/spawn-claude.sh``), ``git add -N``'d::
 
@@ -963,12 +983,14 @@ def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
         the consumer inventory NOR the non-consumer exclusion set (task 3554):
         ['orchestrator/tests/test_scratch_skills_consumer.py'].
 
-    And a stale exclusion, by removing the ``skills/`` mentions from
-    ``scripts/tests/test_legibility_sampling.py``::
-
-        AssertionError: _SKILLS_MENTION_NON_CONSUMERS lists file(s) that no
-        longer mention 'skills/' (task 3554):
-        ['scripts/tests/test_legibility_sampling.py'].
+    RE-MEASURED AGAINST THE POST-REMOVAL BODY at base main ``0f65bf916d``,
+    because surgery on a guard can cut away its bite along with its cost. With
+    that same scratch consumer recreated, the failure text above reproduces
+    VERBATIM. And in the other direction, with
+    ``scripts/tests/test_legibility_sampling.py``'s comment reworded to drop
+    its ``skills/`` mention, this module now reports all-passed where it
+    reported ``1 failed, 5 passed`` before the removal. Both scratch mutations
+    were reverted before commit.
     """
     mentioning = sorted(
         rel
@@ -1001,16 +1023,4 @@ def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
         f"it to _SKILLS_MENTION_NON_CONSUMERS with its reason. A growing real "
         f"consumer set makes CORRECTION 1's cost argument against option (b) "
         f"stronger, not weaker — but only if it is recorded."
-    )
-
-    stale_exclusions = sorted(
-        rel for rel in _SKILLS_MENTION_NON_CONSUMERS if rel not in mentioning
-    )
-    assert not stale_exclusions, (
-        f"_SKILLS_MENTION_NON_CONSUMERS lists file(s) that no longer mention "
-        f"{_SKILLS_TOKEN!r} (task 3554): {stale_exclusions}. Either the file "
-        f"was deleted or renamed, or its mention was removed. DELETE the "
-        f"entry — an exclusion kept past its justification is how a "
-        f"suppression list rots into one nobody can audit, which is the same "
-        f"defect class as the ungated prose this whole file replaced."
     )
