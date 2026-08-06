@@ -36,6 +36,7 @@ evidence (the current absence of indices on real graphs).
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from unittest.mock import MagicMock
 
 import pytest
 from graphiti_core.driver.driver import GraphProvider
@@ -584,3 +585,179 @@ class TestNormalizeIndexRecords:
         ]
 
         assert normalize_index_records(derived) == expected
+
+
+# --- The MEASURED live CALL db.indexes() shape -----------------------------
+#
+# Measured read-only 2026-08-06 via
+#   docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY dark_factory "CALL db.indexes()"
+# and via a raw falkordb.asyncio client on the ro path.  No graphiti driver was
+# constructed and no index was created, dropped or modified anywhere.
+#
+# The header is 9 two-tuples; note that `entitytype` is index 6 and `options` is
+# index 3.  That gap is the defect these tests pin: list_indices() bound
+# entity_type to row[3].
+
+LIVE_HEADER = [
+    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
+    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
+]
+
+LIVE_ROW_RELATES_TO = [
+    'RELATES_TO',
+    ['uuid'],
+    OrderedDict({'uuid': ['RANGE']}),
+    OrderedDict({'uuid': OrderedDict()}),
+    'english',
+    [],
+    'RELATIONSHIP',
+    'OPERATIONAL',
+    {},
+]
+
+LIVE_ROW_ENTITY = [
+    'Entity',
+    ['uuid', 'group_id', 'name', 'created_at'],
+    OrderedDict({
+        'uuid': ['RANGE'], 'group_id': ['RANGE'],
+        'name': ['RANGE'], 'created_at': ['RANGE'],
+    }),
+    OrderedDict({'uuid': OrderedDict()}),
+    'english',
+    [],
+    'NODE',
+    'OPERATIONAL',
+    {},
+]
+
+
+class TestListIndicesColumnBinding:
+    """``list_indices()`` must resolve ``CALL db.indexes()`` columns BY NAME.
+
+    MEASURED 2026-08-06: the live header is
+    ``[label, properties, types, options, language, stopwords, entitytype, status, info]``,
+    so ``entitytype`` sits at index 6 while ``options`` sits at index 3.
+    ``list_indices()`` bound ``'entity_type': row[3]`` — the OPTIONS column — and
+    therefore returned ``OrderedDict({'uuid': OrderedDict()})`` where
+    ``'NODE'``/``'RELATIONSHIP'`` belonged.  The PRD's normal form REQUIRES
+    ``entity_type``, so the normalizer cannot be built on top of that.
+
+    The defect survived because the existing live test asserts only key
+    PRESENCE, never the value.
+
+    By-name resolution — not a corrected index — is the fix, mirroring
+    ``_fm_helpers.await_index_operational``, which resolves ``status`` by name
+    precisely so a FalkorDB column reorder fails loudly instead of silently
+    reading the wrong column.  ``test_by_name_resolution_survives_a_column_reorder``
+    is what a merely-positional fix cannot pass.
+
+    HAZARD: driven entirely through ``make_graph_mock``.  No live FalkorDB, no
+    driver construction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entity_type_binds_to_the_entitytype_column(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=LIVE_HEADER)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        records = await backend.list_indices(group_id='test')
+
+        assert len(records) == 1
+        assert records[0]['entity_type'] == 'RELATIONSHIP'
+
+    @pytest.mark.asyncio
+    async def test_by_name_resolution_survives_a_column_reorder(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A positional fix (row[3] -> row[6]) passes the test above by accident; not this one."""
+        reordered_header = [
+            [1, 'status'], [1, 'entitytype'], [1, 'label'], [1, 'info'],
+            [1, 'types'], [1, 'language'], [1, 'properties'], [1, 'stopwords'],
+            [1, 'options'],
+        ]
+        reordered_row = [
+            'OPERATIONAL',
+            'RELATIONSHIP',
+            'RELATES_TO',
+            {},
+            OrderedDict({'uuid': ['RANGE']}),
+            'english',
+            ['uuid'],
+            [],
+            OrderedDict({'uuid': OrderedDict()}),
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([reordered_row], header=reordered_header)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        records = await backend.list_indices(group_id='test')
+
+        assert records[0]['label'] == 'RELATES_TO'
+        assert records[0]['field'] == ['uuid']
+        assert records[0]['type'] == {'uuid': ['RANGE']}
+        assert records[0]['entity_type'] == 'RELATIONSHIP'
+
+    @pytest.mark.asyncio
+    async def test_missing_required_column_raises_naming_it_and_the_header(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Never return a record with a silently-wrong or absent value (INV-2/INV-4).
+
+        Mirrors ``_fm_helpers.IndexHeaderError``: a shape change means the caller
+        cannot be trusted at all, so it fails closed and names what it saw.
+        """
+        header_without_entitytype = [c for c in LIVE_HEADER if c[1] != 'entitytype']
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=header_without_entitytype)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(ValueError) as excinfo:
+            await backend.list_indices(group_id='test')
+
+        message = str(excinfo.value)
+        assert 'entitytype' in message
+        assert 'label' in message  # the header it actually saw is named
+
+    @pytest.mark.asyncio
+    async def test_composition_with_the_normalizer_over_real_shaped_rows(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """What β and δ actually call — proving the two halves compose.
+
+        Checked against a REAL-shaped response rather than only against
+        hand-written synthetic dicts, which is the whole point: a normalizer
+        validated only against fiction would be validated against the exact
+        failure shape this PRD exists to remove.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(
+            [LIVE_ROW_RELATES_TO, LIVE_ROW_ENTITY], header=LIVE_HEADER,
+        )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        actual = normalize_index_records(await backend.list_indices(group_id='test'))
+
+        assert actual == {
+            ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+            ('Entity', 'NODE', 'uuid', 'RANGE'),
+            ('Entity', 'NODE', 'group_id', 'RANGE'),
+            ('Entity', 'NODE', 'name', 'RANGE'),
+            ('Entity', 'NODE', 'created_at', 'RANGE'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_read_only_path_is_unchanged(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Guards the read-only guarantee test_list_indices_integration.py pins live."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=LIVE_HEADER)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.list_indices(group_id='test')
+
+        assert graph.ro_query.called
+        assert not graph.query.called
