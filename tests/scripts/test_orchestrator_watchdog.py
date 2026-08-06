@@ -6376,3 +6376,168 @@ def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
     assert "ts" in body and "iso" in body, f"clock body must still carry ts+iso: {body}"
     assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
     assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm liveness streak file primitives (task 3764)
+#
+# _write_fm_liveness_streak / _read_fm_liveness_streak / _clear_fm_liveness_streak.
+# Every test here points FM_LIVENESS_STREAK_PATH at a REAL file under tmp_path
+# and asserts against its actual on-disk bytes — never against a mock. A mock
+# would happily satisfy an implementation that kept the counter in memory,
+# which is the exact regression this task must prevent (the watchdog is a
+# Type=oneshot: the process EXITS between ticks).
+#
+# The fail direction is uniformly toward NOT restarting: unreadable, corrupt,
+# absent or nonsensical state means "no streak", which means no restart. This
+# task exists because the old code's only bias was toward killing fused-memory.
+# ---------------------------------------------------------------------------
+
+
+def test_write_fm_liveness_streak_creates_parent_dir_and_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_write_fm_liveness_streak writes {count, verdict, ts, iso}, creating the dir."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "data" / "fused-memory" / "fm_liveness_streak.json"
+    assert not streak_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._write_fm_liveness_streak(2, "wedged", 1783000000.5)
+
+    assert streak_file.exists(), "the write must create the streak file and parent dir"
+    body = json.loads(streak_file.read_text())
+    assert body["count"] == 2
+    assert body["verdict"] == "wedged"
+    assert float(body["ts"]) == pytest.approx(1783000000.5)
+    assert "iso" in body, f"streak body must carry a human-readable iso field: {body}"
+
+
+def test_read_fm_liveness_streak_roundtrips_a_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A write immediately followed by a read round-trips exactly, via the real file."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._write_fm_liveness_streak(3, "port-down", 1783000123.0)
+    result = wdog._read_fm_liveness_streak()
+
+    assert result is not None
+    count, ts = result
+    assert count == 3
+    assert isinstance(count, int)
+    assert ts == pytest.approx(1783000123.0)
+    assert isinstance(ts, float)
+
+
+def test_read_fm_liveness_streak_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """FAIL-OPEN: an absent streak file means "no streak", not an error."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_fm_liveness_streak() is None
+
+
+@pytest.mark.parametrize(
+    ("body", "label"),
+    [
+        ('{"count": 2, "ts": 1783', "truncated json"),
+        ('{"verdict": "wedged", "ts": 1783000000}', "missing count"),
+        ('{"count": 2, "verdict": "wedged"}', "missing ts"),
+        ('{"count": "two", "ts": 1783000000}', "non-integer count"),
+        ('{"count": 2, "ts": "yesterday"}', "non-numeric ts"),
+        ('{"count": 0, "ts": 1783000000}', "zero count"),
+        ('{"count": -4, "ts": 1783000000}', "negative count"),
+    ],
+)
+def test_read_fm_liveness_streak_fails_open_to_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, body: str, label: str
+) -> None:
+    """FAIL-OPEN: any unusable streak body yields None ("no streak" => no restart).
+
+    Corrupt/nonsensical state must never be read as "we already have N
+    failures" — the whole point of this task is that the watchdog's bias must
+    fall toward leaving fused-memory alone.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text(body)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    assert wdog._read_fm_liveness_streak() is None, f"must fail open for: {label}"
+
+
+def test_read_fm_liveness_streak_logs_on_corrupt_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A corrupt streak body is LOGGED, not silently swallowed.
+
+    Silently degrading persisted state that decides whether fused-memory gets
+    killed is exactly the silent-degradation the project's norms forbid.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text('{"count": 2, "ts": 1783')
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    assert wdog._read_fm_liveness_streak() is None
+    assert logged, "a corrupt streak file must be logged"
+
+
+def test_clear_fm_liveness_streak_removes_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_clear_fm_liveness_streak removes the real file from disk."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text('{"count": 2, "ts": 1783000000}')
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._clear_fm_liveness_streak()
+
+    assert not streak_file.exists(), "clearing must remove the streak file"
+    assert wdog._read_fm_liveness_streak() is None
+
+
+def test_clear_fm_liveness_streak_absent_file_is_silent_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Clearing an already-absent streak is a silent no-op, not a raise.
+
+    The overwhelmingly common case: fused-memory is healthy, so every 60s tick
+    clears a streak that does not exist. It must neither raise nor log.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "absent.json"))
+
+    # Must not raise.
+    wdog._clear_fm_liveness_streak()
+
+    assert logged == [], f"clearing an absent streak must not log every tick: {logged}"
+
+
+def test_clear_fm_liveness_streak_swallows_and_logs_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A non-FileNotFoundError OSError from unlink is logged and swallowed."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+
+    def boom(_path):  # noqa: ANN001
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr(wdog.os, "unlink", boom)
+
+    # Must not raise.
+    wdog._clear_fm_liveness_streak()
+
+    assert logged, "a swallowed unlink failure must be logged, not silent"
