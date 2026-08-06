@@ -83,8 +83,10 @@ from orchestrator.config import (
 )
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow_types import WorkflowState, outcome_allows_status
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_escalated_steward_stall.py:70-118)
@@ -451,6 +453,90 @@ def _make_silent_steward() -> type:
 
         async def stop(self) -> None:
             pass
+
+    _FakeSteward.instances = []
+    return _FakeSteward
+
+
+def _make_terminal_decision_steward(
+    queue: EscalationQueue,
+    task_id: str,
+    scheduler,
+    status: str,
+    *,
+    resolve: bool = True,
+) -> type:
+    """A steward that takes a TERMINAL DECISION on the row while resolving.
+
+    The steward is the ONLY workflow role holding
+    ``mcp__fused-memory__set_task_status`` (``roles.py:1131-1133``), and its
+    prompt (``roles.py:1277+``) explicitly directs it to mark tasks ``done``
+    via ``kind='found_on_main'``.  ``run()``'s own guard names the wider case
+    verbatim: the steward "may have set the task to done / cancelled /
+    deferred / blocked while resolving the L0 (e.g. queued a follow-up task
+    that is now the durable fix and deferred this one onto it)"
+    (``workflow.py:2685-2696``).
+
+    Such a decision IS an adjudication of the gate, and honouring it costs
+    nothing.  Ignoring it at MERGE entry is strictly worse than the
+    wasted-dispatch consequence ``run()`` guards against: the branch LANDS ON
+    MAIN, and for a non-terminal park like ``deferred`` / ``merge-deferred``
+    (which are NOT in ``TERMINAL_STATUSES``, so no server rejection fires)
+    ``_finalise_merged_done`` then silently overwrites the row to ``done`` —
+    a park erased unrecoverably, since re-dispatch cannot un-merge a branch.
+
+    *resolve* controls whether the gating record is ALSO consumed.  With
+    ``resolve=False`` the decision is taken but the record is left open, so the
+    only wake is the wait's own expiry — which is what makes the guard's
+    PLACEMENT observable: both sibling branches that case would otherwise
+    reach call ``_mark_blocked(..., escalate_to_human=True)``, filing an L1 for
+    a task the steward deliberately parked.
+
+    The work runs in a background ``_chain()`` task after a short delay, for
+    the same reason :func:`_make_chained_gating_steward` does: a synchronous
+    ``start()`` would leave it already done at wait entry, so the waiter would
+    never block and the production wake path would go unexercised.
+    """
+
+    class _FakeSteward:
+        instances: list[_FakeSteward] = []
+
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.started = False
+            self.chain_task: asyncio.Task | None = None
+            type(self).instances.append(self)
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def _chain(self) -> None:
+            await asyncio.sleep(0.05)
+            # The row write comes FIRST and through the scheduler, exactly as a
+            # real steward's set_task_status MCP call does — not through any
+            # workflow-side helper.
+            await scheduler.set_task_status(task_id, status)
+            if not resolve:
+                return
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected a pending L0 to adjudicate'
+            for esc in pending:
+                queue.resolve(
+                    esc.id, f'Steward parked the task {status}',
+                    resolved_by='fake-steward',
+                )
+
+        async def start(self) -> None:
+            self.started = True
+            self.chain_task = asyncio.create_task(self._chain())
+
+        async def stop(self) -> None:
+            if self.chain_task is not None:
+                await self.chain_task
 
     _FakeSteward.instances = []
     return _FakeSteward
@@ -839,20 +925,176 @@ class TestMergeGateWaitExpiry:
 
 
 # ---------------------------------------------------------------------------
+# Boundary #4 — a steward TERMINAL DECISION is honoured, not merged past
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardTerminalDecisionAtMergeGate:
+    """Boundary #4: a terminal decision the steward takes WHILE resolving the
+    merge-entry gate is an adjudication of that gate — honour it, never merge
+    past it.
+
+    The merge-entry handler is documented as a deliberate mirror of ``run()``'s
+    ESCALATED branch, and ``run()`` ends its wait with exactly this guard
+    (``workflow.py:2685-2709``): read ``scheduler.get_status`` and return DONE
+    on ``'done'`` / BLOCKED on ``WORKFLOW_PRESERVE_STATUSES``.  The steward is
+    the only workflow role holding ``set_task_status``, so this is not a
+    hypothetical race — it is the documented, prompted behaviour of the very
+    producer this gate waits on.
+
+    Checking only whether gating RECORDS are open is not enough: a steward that
+    resolves the record AND parks the row leaves ``still_gating`` empty and
+    ``_steward_wait_expired`` False, so the gate falls straight through to
+    ``_recover_before_merge`` → the retry loop → ``_submit_to_merge_queue``.
+    The measured consequences, per park status:
+
+    * ``deferred`` / ``merge-deferred`` — not in ``TERMINAL_STATUSES``, so no
+      server rejection fires: the branch lands and ``_finalise_merged_done``
+      overwrites the row to ``done``.  The steward's park is silently ERASED,
+      and unlike ``run()``'s wasted-dispatch consequence this is not
+      recoverable by re-dispatch — the branch is already on main.
+    * ``cancelled`` — the branch lands, ``set_task_status(..., 'done')`` is
+      rejected ``terminal_exit_rejected``, but ``scheduler.py:2303-2306``
+      swallows the rejection for terminal targets, so the row stays
+      ``cancelled`` while ``run()`` returns DONE — and the run()-exit SM-2
+      check (``workflow.py:3248``) then raises ``AssertionError``, because
+      ``outcome_allows_status(DONE, 'cancelled')`` is False.  A post-merge
+      crash exit.
+    * ``done`` — the branch is merged a SECOND time, for work the steward
+      already declared covered.
+
+    ``merge_queue.py``'s ``WORKFLOW_PRESERVE_STATUSES`` guard does not catch
+    any of this: it sits inside ``reconcile_landed_row`` (the crash-recovery
+    outbox path), not on the enqueue path.  Nothing downstream catches it.
+    """
+
+    @pytest.mark.parametrize('status', ['cancelled', 'deferred', 'done'])
+    async def test_terminal_decision_is_honoured_not_merged_past(
+        self, status, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_terminal_decision_steward(
+            queue, task_id, scheduler, status,
+        )
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        # The headline: the branch was NOT merged.
+        assert submit.await_count == 0, (
+            f'the steward parked the row {status!r} while resolving the gate — '
+            f'that is an adjudication, and merging past it lands the branch on '
+            f'main irrecoverably'
+        )
+        assert outcome is not None, (
+            'a steward terminal decision must terminate the slot, not fall '
+            'through to the merge'
+        )
+        expected = (
+            WorkflowOutcome.DONE if status == 'done' else WorkflowOutcome.BLOCKED
+        )
+        assert outcome == expected, f'expected {expected}; got {outcome}'
+        # The steward's decision survives verbatim — in particular the
+        # cancelled/deferred rows are NOT overwritten to 'done'.
+        assert scheduler.statuses[task_id][-1] == status, (
+            f'the steward\'s {status!r} decision must survive; got '
+            f'{scheduler.statuses[task_id]}'
+        )
+        # run()'s exit assertion `report.phase == self.machine.state`
+        # (workflow.py:3228) requires the phase to be entered before the
+        # terminal return.
+        assert wf.machine.state == (
+            WorkflowState.DONE if status == 'done' else WorkflowState.BLOCKED
+        ), f'phase not entered before the terminal return; at {wf.machine.state}'
+        # The run()-exit SM-2 consistency check (workflow.py:3248), pinned
+        # directly and cheaply without driving full run().  This is what makes
+        # the guard's branch ORDER load-bearing: WORKFLOW_PRESERVE_STATUSES
+        # CONTAINS 'done', so a guard testing membership first would return
+        # BLOCKED for a done row — and outcome_allows_status(BLOCKED, 'done')
+        # is False, which crashes run() on the way out.
+        assert outcome_allows_status(outcome, scheduler.statuses[task_id][-1]), (
+            f'{outcome} is not a legal pairing with row status '
+            f'{scheduler.statuses[task_id][-1]!r} — run()\'s SM-2 exit check '
+            f'would raise'
+        )
+
+    async def test_terminal_decision_wins_over_a_still_open_gating_record(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """The guard's PLACEMENT, pinned: it must precede BOTH block branches.
+
+        Here the steward parks the row and then goes silent on the queue, so
+        the wake comes from the wait's own expiry.  Without the guard running
+        FIRST, this lands in either the ``_steward_wait_expired`` branch or the
+        ``still_gating`` re-check — both of which call ``_mark_blocked(...,
+        escalate_to_human=True)``, filing an L1 for a task the steward
+        deliberately parked and attempting ``set_task_status('blocked')`` over
+        a terminal row (routing into ``_handle_terminal_exit_rejection``'s
+        bypass-done detection and risking a spurious ``bypass_done`` L1).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_terminal_decision_steward(
+            queue, task_id, scheduler, 'cancelled', resolve=False,
+        )
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: the record is still open AND the steward parked '
+            'the row — the merge must not proceed on either count'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED, f'got {outcome}'
+        assert scheduler.statuses[task_id][-1] == 'cancelled', (
+            f'the steward\'s cancel must not be overwritten by the gate\'s own '
+            f'park; got {scheduler.statuses[task_id]}'
+        )
+        assert queue.has_open_l1(task_id) is False, (
+            'no L1 may be filed for a task the steward deliberately parked — '
+            'the decision IS the adjudication, so there is nothing to ask a '
+            'human about'
+        )
+
+
+# ---------------------------------------------------------------------------
 # The no-strand exit property, across every disposition
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'disposition', ['resolving_steward', 'born_at_l2', 'silent_steward'],
+    'disposition',
+    ['resolving_steward', 'born_at_l2', 'silent_steward', 'terminal_decision'],
 )
 class TestNoStrandExitProperty:
-    """Spec S1, stated as one property over all three boundaries:
+    """Spec S1, stated as one property over every boundary:
 
         ``_run_merge_phase`` either returns ``None`` — it fell through to the
         in-slot merge with the slot still held and the claimant still live —
-        or its successor status was WRITTEN before the terminal return.
+        or the row carries a status the workflow must not overwrite
+        (``WORKFLOW_PRESERVE_STATUSES``) before the terminal return.
+
+    That status is written either by ``_mark_blocked`` on this path (the
+    ``blocked`` parks of boundaries #2/#3) or by the STEWARD and deliberately
+    preserved (boundary #4's terminal decision).  Both satisfy the property
+    the strand is the absence of: something durable is on the row.
 
     Never a terminal return with the row left at ``in-progress``.  That pair
     is the strand: ``harness._run_slot``'s ``finally``
@@ -887,6 +1129,11 @@ class TestNoStrandExitProperty:
         if disposition == 'born_at_l2':
             _submit_born_at_l2(queue, task_id)
             wf._steward_factory = _make_silent_steward()
+        elif disposition == 'terminal_decision':
+            _submit_gating_l0(queue, task_id)
+            wf._steward_factory = _make_terminal_decision_steward(
+                queue, task_id, scheduler, 'cancelled',
+            )
         else:
             _submit_gating_l0(queue, task_id)
             wf._steward_factory = (
@@ -912,9 +1159,10 @@ class TestNoStrandExitProperty:
                 f'written — the harness slot-finally would null the claimant '
                 f'and leave the row in-progress (spec E1 strand)'
             )
-            assert after[-1] == 'blocked', (
-                f'{disposition}: a terminal exit must land on a park status; '
-                f'got {after}'
+            assert after[-1] in WORKFLOW_PRESERVE_STATUSES, (
+                f'{disposition}: a terminal exit must leave a status the '
+                f'workflow must not overwrite — written by _mark_blocked here, '
+                f'or by the steward and preserved; got {after}'
             )
 
         # The exact defect, named as a negative: ESCALATED + no status write is
@@ -925,10 +1173,15 @@ class TestNoStrandExitProperty:
         )
 
         # A surviving orphan L0 re-strands the NEXT entry on the same record
-        # for another full window, so no exit may leave one pending.
-        assert queue.get_by_task(task_id, status='pending', level=0) == [], (
-            f'{disposition}: a pending level-0 record survived the exit'
-        )
+        # for another full window, so no exit may leave one pending.  Exempt
+        # for `terminal_decision` only: a steward that parks the row terminally
+        # has ended the workflow, so any record it leaves belongs to the
+        # orphan-L0 reaper — exactly as run()'s own guard leaves it when it
+        # bypasses _mark_blocked (and thus _mark_blocked's straggler cleanup).
+        if disposition != 'terminal_decision':
+            assert queue.get_by_task(task_id, status='pending', level=0) == [], (
+                f'{disposition}: a pending level-0 record survived the exit'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1318,7 @@ __all__ = [
     '_make_chained_gating_steward',
     '_make_resolving_steward',
     '_make_silent_steward',
+    '_make_terminal_decision_steward',
     '_steward_wait_timeouts',
     '_stub_merge_internals',
     '_submit_born_at_l2',
