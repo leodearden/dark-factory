@@ -58,7 +58,10 @@ AMEND_AND_EPISODE_TOOLS_BLOCK = """\
 - `mcp__fused-memory__update_memory` — in-place Mem0 content amend / metadata patch. \
 The Qdrant point id and created_at are PRESERVED, so nothing citing the record dangles. \
 PREFER THIS over delete + re-add when consolidating a cluster: delete + re-add mints a \
-new UUID and strands any task metadata citing the old one.
+new UUID and strands any task metadata citing the old one. Call with `store="mem0"` \
+(`store="graphiti"` is rejected — use `update_edge` instead) and a non-empty `reason` \
+whenever you pass `content`; the record payload goes in `metadata_patch` — `metadata` is \
+the causation envelope and is never stored on the record.
 - `mcp__fused-memory__redact_episode_content` — in-place replacement of ONE episode's raw \
 content. NON-destructive: the episode's extracted edges are deliberately left untouched.
 - `mcp__fused-memory__delete_episode` — IRREVERSIBLE. `cascade=True` (the default) also \
@@ -99,17 +102,17 @@ correctly resolves it — in this order:
 is actually RETRIEVABLE; an annotation buried in episode text is not.
 (b) **Episode text wrong ON ITS FACE** (a premature past-tense completion claim, a \
 corrupted or leaked fragment): use `mcp__fused-memory__redact_episode_content` ONLY for \
-this case. Annotate in place — e.g. prefix a dated `[SUPERSEDED: ...]` marker — do not \
-rewrite the surrounding narrative.
-(c) **Last resort**: `mcp__fused-memory__delete_episode` with `cascade=True` destroys \
-entities and edges exclusively sourced from that episode, which are usually valid because \
-they were extracted from the clean portion of the text. Use this only when (a) and (b) \
-cannot resolve the problem.
+this case. First call `get_episodes` and copy the episode's CURRENT content verbatim — \
+`new_content` REPLACES the stored text in full and the original is not recoverable; if \
+you cannot retrieve the full current text, do not redact. Annotate in place — e.g. \
+prefix a dated `[SUPERSEDED: ...]` marker — do not rewrite the surrounding narrative.
+(c) **Last resort**: `mcp__fused-memory__delete_episode` — see the tool listing above \
+for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve the \
+problem.
 (d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
-`mcp__fused-memory__update_memory` — its point id and created_at are preserved, so nothing \
-citing it dangles — and only THEN delete the redundant siblings. Never delete and re-add \
-the survivor. Each sibling delete still needs `replacement_memory_id` set to the \
-survivor's full 36-char UUID.
+`mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
+delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
+delete and re-add the survivor.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
