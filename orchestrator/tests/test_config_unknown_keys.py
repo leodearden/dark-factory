@@ -876,3 +876,110 @@ def test_widening_ignore_adds_no_new_green_tier_leaf():
     assert 'config_key_census.ignore' in RELOADABLE_FIELDS
     census_leaves = {f for f in RELOADABLE_FIELDS if f.startswith('config_key_census.')}
     assert census_leaves == {'config_key_census.ignore'}
+
+
+# --- (b) the reason reaches the classified key --------------------------------
+
+
+def test_reasoned_entry_threads_its_note_onto_the_ignored_key(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [
+                    {
+                        'path': 'cpu_governance.weights',
+                        'reason': 'read verbatim by scripts/cpu-governed-exec.sh',
+                    }
+                ]
+            },
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    census = census_config_keys(p)
+    assert census.unknown == []
+    assert ConfigIgnoredKey(
+        'cpu_governance.weights',
+        'allowlist',
+        'read verbatim by scripts/cpu-governed-exec.sh',
+    ) in census.ignored
+
+
+def test_bare_entry_yields_no_note(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['cpu_governance.weights']},
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    (ik,) = census_config_keys(p).ignored
+    assert ik.path == 'cpu_governance.weights'
+    assert ik.note is None
+
+
+def test_reserved_prefix_key_yields_no_note(tmp_path):
+    """A reserved-prefix key was never claimed by an operator assertion, so it
+    has nothing to justify — note stays None rather than being invented."""
+    p = _write_yaml(tmp_path, {'git': {'x_custom': 1}})
+    (ik,) = census_config_keys(p).ignored
+    assert (ik.path, ik.reason, ik.note) == ('git.x_custom', 'reserved_prefix', None)
+
+
+def test_positional_ignored_key_equality_still_holds(tmp_path):
+    """BACK-COMPAT: ``note`` is appended LAST and DEFAULTED, so every existing
+    two-argument construction and tuple-equality assertion in this suite, in
+    test_harness_config_unknown_keys.py, and in config.py itself stays valid."""
+    p = _write_yaml(
+        tmp_path,
+        {'config_key_census': {'ignore': ['warm_lane_pool']}, 'warm_lane_pool': 8},
+    )
+    assert ConfigIgnoredKey('warm_lane_pool', 'allowlist') in census_config_keys(p).ignored
+
+
+def test_first_matching_entry_supplies_the_note(tmp_path):
+    """fnmatch classification is first-match-wins, so the note must come from
+    the FIRST matching entry — otherwise a broad later glob could silently
+    overwrite a specific entry's justification."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [
+                    {'path': 'cpu_governance.weights', 'reason': 'specific first'},
+                    {'path': 'cpu_governance.*', 'reason': 'broad second'},
+                ]
+            },
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    (ik,) = census_config_keys(p).ignored
+    assert ik.note == 'specific first'
+
+
+def test_unknown_classification_is_identical_with_and_without_reasons(tmp_path):
+    """The .unknown half — which drives the WARNING, the born-at-L2 and the
+    exit-1 gate — must be byte-identical whether or not entries carry reasons.
+    Adding justifications is a documentation change, not a behaviour change."""
+    bare = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['cpu_governance.weights']},
+            'cpu_governance': {'weights': {'task': 100}},
+            'bogus_key': 1,
+        },
+        name='bare.yaml',
+    )
+    reasoned = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [{'path': 'cpu_governance.weights', 'reason': 'r'}]
+            },
+            'cpu_governance': {'weights': {'task': 100}},
+            'bogus_key': 1,
+        },
+        name='reasoned.yaml',
+    )
+    assert census_config_keys(bare).unknown == census_config_keys(reasoned).unknown
+    assert [uk.path for uk in census_config_keys(reasoned).unknown] == ['bogus_key']
