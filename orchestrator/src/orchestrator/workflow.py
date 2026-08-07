@@ -13502,20 +13502,32 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self, plan_files: list[str], metadata_files: list[str],
         uncovered_modules: list[str],
     ) -> None:
-        """Submit an ``infra_issue`` escalation for a plan.files/metadata.files
-        divergence caught by :meth:`_check_scope_invariant` (task 2505).
-        Mirrors :meth:`_escalate_plan_overwrite`'s submission shape.
+        """Submit an ``infra_issue`` escalation for the UNSAFE-direction
+        plan.files/metadata.files divergence caught by
+        :meth:`_check_scope_invariant` (task 2505; narrowed to this one
+        direction by task 3429) — the plan needs a lock module that
+        metadata.files does not cover. Mirrors :meth:`_escalate_plan_overwrite`'s
+        submission shape.
+
+        The ``summary`` string is load-bearing: ``harness._is_scope_divergence_orphan``
+        discriminates this entire escalation class on the substring
+        ``'plan.files/metadata.files divergence detected'``. Keep it verbatim;
+        only ``detail`` is free to evolve.
         """
         summary = (
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
         )
         detail = (
-            f'plan.files={plan_files} but metadata.files={metadata_files} — '
-            f'these derive DIFFERENT lock-module sets at lock_depth='
-            f'{self.config.lock_depth} (a benign same-module file delta does '
-            f'NOT reach here). The scope-reconciliation choke point '
-            f'(_reconcile_scope_locks/_set_task_scope) should keep the module '
-            f'sets in lockstep on every path that changes either.'
+            f'plan.files={plan_files} but metadata.files={metadata_files}. At '
+            f'lock_depth={self.config.lock_depth} the plan needs lock '
+            f'module(s) {uncovered_modules} that metadata.files does NOT '
+            f'cover. metadata.files is the only input the scheduler derives '
+            f"this task's file locks from, so this task is about to merge "
+            f'edits to module(s) it holds no lock on. Only this direction '
+            f'escalates (task 3429): a metadata.files module SUPERSET is '
+            f'benign — a wider lock cannot let two tasks collide, only '
+            f'over-serialise — and is logged at INFO with no escalation. A '
+            f'same-module file-level delta does not reach here at all.'
         )
         logger.error(f'Task {self.task_id}: {summary}')
 
