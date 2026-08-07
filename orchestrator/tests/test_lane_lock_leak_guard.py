@@ -50,6 +50,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1036,6 +1037,139 @@ def test_foreign_holder_fixture_fails_loudly_when_attribution_never_settles(
         'leak the held lane lock past this very test'
     )
     release_merge_verify_flock(probe)
+
+
+# ---------------------------------------------------------------------------
+# `_effective_per_test_timeout` — resolves the per-test timeout pytest-timeout
+# will actually enforce for THIS run, mirroring the installed plugin's own
+# precedence chain (`pytest_timeout.get_env_settings`) instead of a bare
+# `tomllib` read of a single pyproject.toml. The ceiling invariant below
+# needs this because which pyproject.toml governs a given run is not fixed
+# (task 3836 review amendment; precedent:
+# test_marker_registration_drift.py:734-757, which pins that "registered"
+# means the EFFECTIVE `getini(...)` set, not a bare TOML read).
+#
+# Pinned here in isolation against a stub config, so each precedence branch
+# is exercised deterministically without spawning a live pytest sub-run —
+# same convention as `TestWaitForLaneLockHolder` above.
+# ---------------------------------------------------------------------------
+
+
+def _stub_pytest_config(
+    *,
+    cli_timeout: float | None,
+    ini_timeout: str,
+    has_timeout_plugin: bool = True,
+) -> SimpleNamespace:
+    """A minimal stand-in for ``pytest.Config``, exposing only the surface
+    ``_effective_per_test_timeout`` reads: ``getvalue``, ``getini``, and
+    ``pluginmanager.hasplugin``.
+
+    When *has_timeout_plugin* is False, ``getvalue``/``getini`` raise
+    ``ValueError`` if called at all — mirroring the MEASURED ``-p
+    no:timeout`` behaviour, where ``getini('timeout')`` raises exactly
+    ``ValueError: unknown configuration value: 'timeout'`` because the
+    plugin never registered the ini option. A caller that skips the
+    ``hasplugin`` guard therefore surfaces as a test ERROR here, not a
+    silently wrong answer.
+    """
+    def _raise_if_disabled(name: str) -> None:
+        if not has_timeout_plugin:
+            raise ValueError(f'unknown configuration value: {name!r}')
+
+    def _getvalue(name: str) -> float | None:
+        _raise_if_disabled(name)
+        return cli_timeout if name == 'timeout' else None
+
+    def _getini(name: str) -> str:
+        _raise_if_disabled(name)
+        assert name == 'timeout'
+        return ini_timeout
+
+    return SimpleNamespace(
+        getvalue=_getvalue,
+        getini=_getini,
+        pluginmanager=SimpleNamespace(
+            hasplugin=lambda name: has_timeout_plugin if name == 'timeout' else False
+        ),
+    )
+
+
+class TestEffectivePerTestTimeout:
+    """Unit-pins for :func:`_effective_per_test_timeout`'s branches.
+
+    Each test is named for the concrete invocation mode it was MEASURED
+    against on this worktree (task 3836 review amendment), not a
+    hypothetical: probing ``getvalue('timeout')`` / ``getini('timeout')``
+    under the orchestrator inifile, a root-bound inifile, ``--timeout=N``,
+    ``-o timeout=N``, and ``-p no:timeout`` surfaced two behaviours a naive
+    ``pytestconfig.getini('timeout')``-only fix would have missed: the ini
+    value is a STRING (``'60'``, not ``60``), and its unset sentinel is the
+    EMPTY STRING (``''``), not ``None``.
+    """
+
+    def test_str_ini_timeout_is_coerced_to_float(self, monkeypatch):
+        """Measured: a normal orchestrator-inifile run. ``getini('timeout')``
+        returns the string ``'60'`` — ``0.6 * '60'`` raises ``TypeError``, so
+        this coercion is mandatory, not defensive.
+        """
+        monkeypatch.delenv('PYTEST_TIMEOUT', raising=False)
+        config = _stub_pytest_config(cli_timeout=None, ini_timeout='60')
+        result = _effective_per_test_timeout(config)
+        assert result == 60.0
+        assert isinstance(result, float), (
+            f'must coerce the ini string to float — got {result!r} '
+            f'({type(result)}), which raises TypeError when later '
+            f'multiplied by the 0.6 ceiling fraction'
+        )
+
+    def test_cli_timeout_beats_a_stale_ini(self, monkeypatch):
+        """Measured: ``--timeout=30`` alongside an orchestrator ini of 60.
+        ``getini('timeout')`` stays a STALE ``'60'`` under ``--timeout`` —
+        only ``getvalue`` reflects the CLI override.
+        """
+        monkeypatch.delenv('PYTEST_TIMEOUT', raising=False)
+        config = _stub_pytest_config(cli_timeout=30.0, ini_timeout='60')
+        assert _effective_per_test_timeout(config) == 30.0
+
+    def test_env_var_used_when_no_cli_timeout(self, monkeypatch):
+        """Measured: ``PYTEST_TIMEOUT`` set with no ``--timeout`` flag."""
+        monkeypatch.setenv('PYTEST_TIMEOUT', '45')
+        config = _stub_pytest_config(cli_timeout=None, ini_timeout='99')
+        assert _effective_per_test_timeout(config) == 45.0
+
+    def test_cli_timeout_beats_the_env_var(self, monkeypatch):
+        """CLI is checked before ``PYTEST_TIMEOUT`` in pytest-timeout's own
+        precedence chain, so it must win even when both are set.
+        """
+        monkeypatch.setenv('PYTEST_TIMEOUT', '45')
+        config = _stub_pytest_config(cli_timeout=30.0, ini_timeout='99')
+        assert _effective_per_test_timeout(config) == 30.0
+
+    def test_empty_ini_string_means_no_timeout_in_effect(self, monkeypatch):
+        """Measured: a root-bound run (``-c pyproject.toml``). The root
+        pyproject declares no ``timeout`` key, so ``getini('timeout')``
+        returns the EMPTY STRING, not ``None`` — a naive ``is not None``
+        guard would fall through to ``float('')`` and raise ``ValueError``.
+        """
+        monkeypatch.delenv('PYTEST_TIMEOUT', raising=False)
+        config = _stub_pytest_config(cli_timeout=None, ini_timeout='')
+        assert _effective_per_test_timeout(config) is None
+
+    def test_disabled_plugin_short_circuits_before_any_config_read(self, monkeypatch):
+        """Measured: ``-p no:timeout``. ``getini('timeout')`` raises
+        ``ValueError: unknown configuration value: 'timeout'`` in this mode —
+        an uncaught crash, not a legible failure. The implementation must
+        check ``hasplugin`` FIRST and never reach ``getvalue``/``getini`` at
+        all; the stub raises from both if that guard is skipped, so a
+        regression here surfaces as this test erroring, not silently
+        returning the wrong answer.
+        """
+        monkeypatch.delenv('PYTEST_TIMEOUT', raising=False)
+        config = _stub_pytest_config(
+            cli_timeout=None, ini_timeout='60', has_timeout_plugin=False,
+        )
+        assert _effective_per_test_timeout(config) is None
 
 
 def test_foreign_holder_bounds_clear_measured_spawn_latency():
