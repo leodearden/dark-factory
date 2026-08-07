@@ -9316,6 +9316,115 @@ class GitOps:
                 await self.cleanup_merge_worktree(merge_wt)
             raise
 
+    async def merge_branch_into_worktree(
+        self,
+        worktree: Path,
+        branch: str,
+    ) -> MergeResult:
+        """Merge a task branch into a CALLER-SUPPLIED worktree (task 3184, PRD β).
+
+        The chain-builder twin of :meth:`merge_to_main`.  Same merge semantics
+        — same ``git merge --no-ff``, same :func:`_merge_subject` (so
+        ``find_merge_marker`` idempotency is preserved), same
+        :meth:`resolve_queued_branch_ref` + :meth:`worktree_head_beyond_main`
+        source derivation, same :class:`MergeResult` return type — but the
+        worktree comes from the caller.  Used by
+        :func:`orchestrator.merge_queue.build_chain` to merge k queued items
+        sequentially into ONE scratch lane.
+
+        Three deliberate divergences from :meth:`merge_to_main`:
+
+        1. **Never provisions or removes a worktree.**  No
+           :meth:`_create_merge_worktree`, no :meth:`cleanup_merge_worktree` —
+           the caller owns the worktree's whole lifecycle.  ``merge_to_main``
+           calls ``_create_merge_worktree`` on EVERY invocation, so a
+           ``for req in chain: merge_to_main(...)`` loop would provision k
+           worktrees; taking the worktree from the caller is what makes the
+           "exactly one worktree per chain" invariant achievable.
+        2. **Always aborts on failure** (:meth:`abort_merge`), unlike
+           ``merge_to_main`` which RETAINS a conflicted worktree.  The chain
+           builder must leave the worktree at the last clean tip so that tip
+           stays verifiable; a residual conflicted index would poison it.
+           :meth:`get_conflict_details` is captured BEFORE the abort — the
+           abort clears the unmerged paths, so a capture after it returns
+           nothing, silently losing the conflicted-path list that
+           ``truncated_reason='conflict'`` diagnostics depend on.
+        3. **``merge_commit`` is ``.strip()``ed.**  ``merge_to_main`` returns
+           the raw ``_run`` stdout (with trailing newline) and several callers
+           strip defensively (e.g. ``_newest_frozen_commit``).  Stripping at
+           the source keeps ``ChainResult.links`` shas clean.
+
+        ``merge_worktree`` is populated on EVERY return path (including the
+        non-conflict failure arm, where ``merge_to_main`` omits it because it
+        has already cleaned its worktree up) so callers always know which
+        worktree to release.
+
+        Does NOT remove ``.task/``: the ``merge_to_main`` ``shutil.rmtree`` is
+        worktree-CREATION hygiene, and the spec lane's own ``git clean`` in
+        :meth:`acquire_spec_lane` already covers this path.
+
+        Not for train/group merges — ``GroupMergeRequest`` landing is owned by
+        ``merge_queue._do_train_merge``, which carries the member bookkeeping.
+        ``build_chain`` truncates at a train rather than merging it here.
+
+        Args:
+            worktree: An existing worktree, checked out at the base to merge
+                onto.  Created, reset, and removed entirely by the caller.
+            branch: The BARE branch id (e.g. ``'4778'``); the configured
+                ``branch_prefix`` is applied internally.
+
+        Returns:
+            :class:`MergeResult` with ``merge_worktree`` always set to
+            *worktree*.  On success ``merge_commit`` is the stripped 40-char
+            merge sha; on failure the merge has been aborted and the worktree
+            is back at ``pre_merge_sha`` with no unmerged paths.
+        """
+        resolved = await self.resolve_queued_branch_ref(branch)
+        full_branch = resolved or f'{self.config.branch_prefix}{branch}'
+
+        # Same source derivation as merge_to_main: prefer the named ref; when
+        # absent fall back to the worktree HEAD via the shared helper; when
+        # that too is unavailable fall back to full_branch so git fails loudly
+        # with "not something we can merge" (preserving the misroute signal).
+        _head_sha = (
+            None if resolved is not None
+            else await self.worktree_head_beyond_main(worktree)
+        )
+        merge_source: str = resolved or _head_sha or full_branch
+
+        _, pre, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        pre_merge_sha = pre.strip()
+
+        rc, out, err = await _run(
+            ['git', 'merge', '--no-ff', merge_source,
+             '-m', _merge_subject(full_branch, self.config.main_branch)],
+            cwd=worktree,
+        )
+
+        if rc != 0:
+            conflicts = 'CONFLICT' in out or 'CONFLICT' in err
+            # Capture BEFORE the abort — abort_merge clears the unmerged index.
+            details = (
+                await self.get_conflict_details(worktree) if conflicts
+                else f'{out}\n{err}'
+            )
+            await self.abort_merge(worktree)
+            return MergeResult(
+                success=False,
+                conflicts=conflicts,
+                details=details,
+                pre_merge_sha=pre_merge_sha,
+                merge_worktree=worktree,
+            )
+
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return MergeResult(
+            success=True,
+            merge_commit=sha.strip(),
+            pre_merge_sha=pre_merge_sha,
+            merge_worktree=worktree,
+        )
+
     async def _create_merge_worktree(
         self, base_sha: str | None = None,
     ) -> tuple[Path, str]:
