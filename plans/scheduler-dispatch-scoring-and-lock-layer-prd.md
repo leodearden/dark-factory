@@ -369,6 +369,42 @@ auto-pin carries `ttl_until` (default 24h) and is released at both dispatch site
 `_resolve_starvation_escalation` already runs), clearing **only** pins whose `source` is the
 watchdog.
 
+**Park-blocked discriminator (AMENDED 2026-08-07, post-csv-outage).** The clock above measures
+*eligibility*, which cannot separate two classes that need opposite responses:
+
+| class | example | auto-pin? |
+|---|---|---|
+| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for |
+| parked behind a live holder | 3248 — 16h parked, 9 of 10 modules free, one held by 3455 | **no**, provably inert |
+
+The second row is measured, not argued: during the 2026-08-06/07 outage
+`set_task_priority_override(pinned=True, boost_tier='critical')` + `reorder_pin_queue` to
+position 1 was applied **twice by two independent actors**, registered correctly both times
+(overrides, `pin_queue` position 1 of 13, `effective_priorities` critical), and dispatched
+nothing. Priority ordering selects among *dispatchable* candidates; it does not evict a lock
+holder. Firing an auto-pin here is a no-op that *looks* like a consequence — strictly worse
+than firing none, because it marks the condition handled. 3248 was in fact already pinned when
+it starved, so the step would have been a literal no-op.
+
+Therefore `gate` becomes `'dual' | 'idle_only' | 'park_blocked'`. A candidate is `park_blocked`
+when it owns a live reservation **and** one of its normalized modules conflicts with a
+different task's entry in `_held` — both inputs already exist (`snapshot_parks()`, the held
+map, `shared.locking.modules_conflict`). For that gate: **skip the auto-pin entirely and
+consume no cap slot**, escalate at L1, and extend the emitted facts with `blocking_holder`,
+`blocking_module` and `park_age_secs`. Naming the blocker is the whole diagnostic value — during
+the incident a human had to hand-join `parks[3248].modules` against `current_holders` to find
+the single held entry of ten, which is exactly the re-derivation INV-2 exists to prevent. The
+threshold is its own knob, `park_blocked_age_secs` (default 4h, green-tier): a 16h park behind
+a live holder is pathological where 72h of low-priority eligibility is routine.
+
+This does **not** introduce preemption of held locks — see §7. The escape route for a
+park_blocked task is to split the urgent leaf into a narrow charter, which became viable when
+dark-factory moved to `lock_depth: 12` (commit `094d634465`); at the incident's depth of 4 the
+leaf's file coarsened onto the held directory and the split was impossible.
+
+Note `park_age_secs` is bounded by the process era until task **θ** lands durable parks — a
+known under-report, not a blocking dependency (the incident's park ran 16h inside a 23h era).
+
 This supersedes task **2755**'s idle-only backstop, which is `done` but structurally
 unreachable as shipped.
 
@@ -472,6 +508,7 @@ Each row faces **both** sides of a seam. Rows 1–3 face the fused-memory ↔ or
 | Proposal | Why rejected (measured) |
 |---|---|
 | **Below-rank-1 park INSTALLATION** | Net-negative in every simulated variant: −4% to −11% throughput, idle reservation ×3.6–4.8, never-dispatched ×1.5–3. It gridlocks same-tier chains through INV-3 park collisions — 3534/3538 never dispatched across 4 seeds under K24-B32. A module budget trims the idle explosion ~2.7× but flips no sign. The safe discriminator would be park-set **disjointness**, not rank — that variant is **unsimulated**; it is named here as a gated follow-up only, not adopted. |
+| **Preemption / force-release of a HELD lock** (added 2026-08-07) | The obvious-looking fix for the csv deadlock, and it is rejected. Preemption already exists but is park-vs-park only (`install_parks` rank-shadowing); `request_park_eviction` acts on `_parked` and carries a D4 guard refusing live dispatchable owners; `reserve_now` installs reservations. Nothing evicts a holder, deliberately. The incident's holder (3455) was live work — claimant pid alive, heartbeat advancing, fresh merge commit — and the escalation's own steward recommended against yanking it; a forced release mid-edit corrupts an in-flight worktree to fix an unrelated problem, and re-introduces the df-1865 destructive-eviction starvation the D4 guard exists to prevent. The deadlock is broken at the granularity layer (`lock_depth`, where nothing is in flight) and at detection (C4's `park_blocked` gate), not by eviction. |
 | **Park leases / expiry** | A no-op at 2–3h median process eras (P3 ≡ P0 within noise in both projects); a 24h lease is literally dead code — the process dies first. Confirms task 1228's lease removal. |
 | **Naive chain-successor handoff** (reserve released modules across the merge window) | Worse on throughput **and** latency in both projects — the merge window's 0.5–2h median blocks more than it saves. |
 | **α-retune as the fix** | α=1 leaves 3534 at rank 29 (still outside 24); the tipping point is α ≤ 0.5 or β ≥ 200. α=0.33 causes 9/24 window churn demoting 5 previously-dispatched tasks, violating the continuity ruling and whipsawing policy. And `age_alpha` is not in `RELOADABLE_FIELDS`, so it is not even hot-tunable. |
