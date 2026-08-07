@@ -4410,6 +4410,263 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
     assert 'recon' in err['reason'].lower()
 
 
+# ── Task 3455: honest git-probe rejection wording ───────────────────────
+#
+# These tests pin the message prefix `_validate_done_provenance` emits for
+# each failure branch of its two git probes. The authoritative contract
+# lives in the probes' docstrings (`_resolve_commit_sha`,
+# `_verify_commit_on_main`): git-issued verdicts get the assertive wording
+# ("not found in" / "is not on main"), everything else gets the honest
+# NOT-YET-CONFIRMED wording. Each test fakes ONLY the probe under test, so
+# the other git call still runs for real.
+
+
+class _FakeGitProc:
+    """Stand-in for a git subprocess with a fixed rc/stdout/stderr."""
+
+    def __init__(self, returncode, stdout=b'', stderr=b''):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+    def kill(self):
+        pass
+
+
+class _TimeoutGitProc:
+    """Stand-in whose ``communicate()`` raises as if `wait_for` timed out."""
+
+    returncode = None
+
+    async def communicate(self):
+        raise TimeoutError
+
+    def kill(self):
+        pass
+
+
+# Back-compat alias: the merge-base tests below only ever need rc + stderr.
+_FakeMergeBaseProc = _FakeGitProc
+_TimeoutMergeBaseProc = _TimeoutGitProc
+
+
+def _patch_git_subcommand(monkeypatch, subcommand, fake_proc=None, raise_exc=None):
+    """Patch ``asyncio.create_subprocess_exec`` so only ``subcommand`` is
+    faked; any other git invocation goes to the real subprocess. Keeps the
+    untouched probe honest -- e.g. when faking `merge-base`, the earlier
+    `git rev-parse` in `_resolve_commit_sha` still resolves the SHA for
+    real, so execution genuinely reaches the ancestor check."""
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def fake_exec(*args, **kwargs):
+        if subcommand in args:
+            if raise_exc is not None:
+                raise raise_exc
+            return fake_proc
+        return await real_create_subprocess_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', fake_exec)
+
+
+def _patch_merge_base(monkeypatch, fake_proc=None, raise_exc=None):
+    """Fake only the `git merge-base --is-ancestor` call."""
+    _patch_git_subcommand(monkeypatch, 'merge-base', fake_proc=fake_proc, raise_exc=raise_exc)
+
+
+def _patch_rev_parse(monkeypatch, fake_proc=None, raise_exc=None):
+    """Fake only the `git rev-parse --verify` call."""
+    _patch_git_subcommand(monkeypatch, 'rev-parse', fake_proc=fake_proc, raise_exc=raise_exc)
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_merge_base_rc1_reports_not_on_main(tmp_path, monkeypatch):
+    """rc=1 is the ONLY branch that genuinely means off-main; keep the
+    "is not on main" prefix for it."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_merge_base(monkeypatch, fake_proc=_FakeMergeBaseProc(1))
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'is not on main:' in err['reason']
+    assert 'commit is not an ancestor of main' in err['reason']
+    assert 'could not be confirmed' not in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_merge_base_git_error_reports_unconfirmed(tmp_path, monkeypatch):
+    """A non-1 git exit (e.g. rc=128, unresolvable `main` ref) is NOT a
+    not-on-main verdict -- the check never actually completed."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_merge_base(
+        monkeypatch,
+        fake_proc=_FakeMergeBaseProc(128, stderr=b'fatal: Not a valid object name main\n'),
+    )
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'could not be confirmed on main:' in err['reason']
+    assert 'fatal: Not a valid object name main' in err['reason']
+    assert 'is not on main:' not in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_merge_base_timeout_reports_unconfirmed(tmp_path, monkeypatch):
+    """A merge-base timeout is NOT-YET-CONFIRMED, not off-main."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_merge_base(monkeypatch, fake_proc=_TimeoutMergeBaseProc())
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'could not be confirmed on main:' in err['reason']
+    assert 'git merge-base timed out' in err['reason']
+    assert 'is not on main:' not in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_merge_base_missing_binary_reports_unconfirmed(
+    tmp_path, monkeypatch
+):
+    """A missing git binary is NOT-YET-CONFIRMED, not off-main."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_merge_base(monkeypatch, raise_exc=FileNotFoundError('git'))
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'could not be confirmed on main:' in err['reason']
+    assert 'git binary not found' in err['reason']
+    assert 'is not on main:' not in err['reason']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('fake_proc', 'raise_exc', 'expected_detail'),
+    [
+        (_FakeGitProc(128, stderr=b''), None, 'merge-base failed'),
+        (None, PermissionError('denied'), 'PermissionError: denied'),
+    ],
+    ids=['git-error-empty-stderr', 'unexpected-exception'],
+)
+async def test_validate_done_provenance_merge_base_residual_failures_report_unconfirmed(
+    tmp_path, monkeypatch, fake_proc, raise_exc, expected_detail
+):
+    """The two fallback branches -- a non-1 exit with EMPTY stderr (detail
+    falls back to 'merge-base failed') and the catch-all `except Exception`
+    -- are NOT-YET-CONFIRMED too, not off-main verdicts."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_merge_base(monkeypatch, fake_proc=fake_proc, raise_exc=raise_exc)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert f'could not be confirmed on main: {expected_detail}' in err['reason']
+    assert 'is not on main:' not in err['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_rev_parse_rejection_reports_not_found(tmp_path):
+    """CONTROL for step 1: a ref git actually evaluated and rejected keeps
+    the assertive "not found in" wording."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    _init_git_repo(tmp_path)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'not found in' in err['reason']
+    assert 'could not be resolved in' not in err['reason']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('fake_proc', 'raise_exc', 'expected_detail'),
+    [
+        (_TimeoutGitProc(), None, 'git rev-parse timed out'),
+        (None, FileNotFoundError('git'), 'git binary not found'),
+        (None, PermissionError('denied'), 'PermissionError: denied'),
+        (_FakeGitProc(0, stdout=b'\n'), None, 'empty rev-parse output'),
+    ],
+    ids=['timeout', 'missing-binary', 'unexpected-exception', 'empty-output'],
+)
+async def test_validate_done_provenance_rev_parse_failure_reports_unresolved(
+    tmp_path, monkeypatch, fake_proc, raise_exc, expected_detail
+):
+    """A rev-parse that never rendered a verdict on the ref (timeout,
+    missing binary, unexpected error, empty output) must NOT be reported as
+    "not found in <project_root>" -- same honesty contract as the ancestor
+    check one step later."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_rev_parse(monkeypatch, fake_proc=fake_proc, raise_exc=raise_exc)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'could not be resolved in' in err['reason']
+    assert expected_detail in err['reason']
+    assert 'not found in' not in err['reason']
+
+
 # ── Tests for the server-written `stamped_at` field (task 3576) ──
 #
 # `_validate_done_provenance` is the SINGLE write site: every found_on_main
