@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1054,6 +1055,191 @@ class TestJudgePlanQuality:
 
 
 # ---------------------------------------------------------------------------
+# PlanQualityVerdict.cost_usd (step-1/2, eval-revival υ) — the judge's OWN
+# invocation spend
+#
+# run_architect_eval never sees the judge's AgentResult, only the returned
+# PlanQualityVerdict — so the judge invocation's cost has to ride the return
+# value. A trailing, defaulted field (mirroring invocation_error,
+# judge.py:458-463) keeps every existing 3-arg construction site — including
+# every judge test above predating this task — reading back cost_usd=0.0
+# rather than crashing.
+# ---------------------------------------------------------------------------
+
+class TestPlanQualityVerdictCarriesJudgeSpend:
+    @pytest.mark.asyncio
+    async def test_success_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = 0.42
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == pytest.approx(0.42)
+
+    # -- Amendment (reviewer design-coherence): the PRODUCER coerces too ----
+    # PlanQualityVerdict.cost_usd is declared ``float``; these pin that the
+    # declared type is actually true at construction, not just enforced by
+    # the runner's defensive read (_verdict_cost_usd / coerce_cost_usd).
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_unset_mock_cost_degrades_to_zero(self):
+        """A bare MagicMock invoke result that never sets ``cost_usd`` must
+        read back a real ``0.0`` float, not a Mock instance and not a
+        fabricated ``1.0`` (MagicMock's default ``__float__``).
+
+        This is what makes the producer-side coercion safe for the ~20
+        pre-existing judge tests that construct exactly this kind of bare
+        mock and never touch ``cost_usd``: none of them assert on the field,
+        and this pins the value they'd now get if they did.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        # cost_usd deliberately left UNSET — fake.cost_usd is an
+        # auto-generated MagicMock child.
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+        assert isinstance(verdict.cost_usd, float)
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_non_finite_cost_degrades_to_zero(self):
+        """A judge invocation reporting a non-finite cost_usd (NaN) must not
+        ride into the verdict unchanged — it would poison every downstream
+        sum/mean once folded into an architect cell's cost_usd."""
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = float('nan')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+
+    def test_legacy_three_arg_construction_reads_back_zero_spend(self):
+        """Every pre-existing construction site (and any older persisted /
+        monkeypatched verdict) must keep working and read back "no spend
+        recorded" rather than crashing."""
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        verdict = PlanQualityVerdict(
+            plan_quality=0.5, per_criterion={}, reasoning='ok',
+        )
+        assert verdict.cost_usd == 0.0
+
+    # -- Degraded POST-invoke paths still carry real spend (step-3/4) ------
+    # A refused/unparseable/non-finite judge answer still consumed whatever
+    # the provider charged — reporting $0 there would understate real spend
+    # exactly the way this task's bug does. Mirrors the content-failure /
+    # infra-failure discipline tasks 3118/3302/3303 already established.
+
+    @pytest.mark.asyncio
+    async def test_transport_refusal_path_carries_the_invocations_own_spend(self):
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.judge import judge_plan_quality
+
+        refused = AgentResult(
+            success=False,
+            output=_CAP_TEXT,
+            cost_usd=0.07,
+            duration_ms=1200,
+            turns=0,
+            subtype='error',
+            api_error_status=429,
+        )
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=refused),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.invocation_error, str) and verdict.invocation_error
+        assert verdict.cost_usd == pytest.approx(0.07)
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = MagicMock()
+        fake.structured_output = None
+        fake.output = 'not json at all {{{'
+        fake.cost_usd = 0.31
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.31)
+
+    @pytest.mark.asyncio
+    async def test_nan_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = _judge_result_scoring(float('nan'), via='structured_output')
+        fake.cost_usd = 0.29
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.29)
+
+    # -- The PRE-invoke refusal fabricates no spend (step-3/4) --------------
+    # Nothing to judge, so invoke_agent is never awaited — recording spend
+    # here would fabricate a cost for an invocation that never happened.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_pre_invoke_refusal_records_no_fabricated_spend(self, plan):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        mock_invoke = AsyncMock()
+        with patch('orchestrator.evals.judge.invoke_agent', mock_invoke):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        mock_invoke.assert_not_awaited()
+        assert verdict.cost_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
 # The plan judge REFUSES an unjudgeable artifact (task 3303)
 #
 # The reported defect, from the 2026-07-29 corpus cell
@@ -1510,6 +1696,20 @@ class TestRunArchitectEval:
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['plan_quality'] is not None
 
+        # Amendment (reviewer test-coverage): a judge that RAISES must not
+        # fabricate spend — no invocation credited, no cost, and the cell's
+        # cost_usd is the architect's own spend alone (the harness's default
+        # invoke_agent mock reports cost_usd=1.23). A regression that moved
+        # judge_invocations=1 above the raise, or invented a cost inside the
+        # except block, would previously go unnoticed here.
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        # ...but the raise must not look identical to a judge that was
+        # SKIPPED either: it is recorded so the cell reads "spend unknown",
+        # not silently judge-free.
+        assert 'judge:raised' in (result.metrics['invocation_error'] or '')
+
     async def test_architect_timeout_maps_to_timeout_outcome(self):
         # A hung architect invoke surfaces as TimeoutError — what asyncio.wait_for
         # raises when the operator's --timeout expires. run_architect_eval must
@@ -1837,6 +2037,200 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
+#
+# run_architect_eval built its EvalMetrics from the architect's OWN spend
+# only, discarding the plan judge's opus/effort=max invocation cost entirely
+# — every architect cell persisted judge_cost_usd=0.0. judge_cost_usd is a
+# SUBSET of cost_usd, not disjoint (metrics.py:69-71), so the cell's cost_usd
+# must become architect spend + judge spend, with judge_cost_usd as the
+# subset breakdown — mirroring the implementer path's existing semantics
+# (metrics.py:597-598 / workflow.py:7872-7875).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectCellRecordsJudgeSpend:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_judge_spend_recorded_and_folded_into_cell_cost(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            judge_return=PlanQualityVerdict(
+                plan_quality=0.77, per_criterion={}, reasoning='good',
+                cost_usd=0.42,
+            ),
+        )
+
+        # The RETURNED result...
+        assert result.metrics['judge_cost_usd'] == pytest.approx(0.42)
+        assert result.metrics['judge_invocations'] == 1
+        # ...the SUBSET invariant: architect spend (1.23, the harness default)
+        # PLUS the judge spend, never the architect spend alone.
+        assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+        # ...and what was actually PERSISTED via save_result, not just what
+        # the function happens to return.
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['judge_invocations'] == 1
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+
+@pytest.mark.asyncio
+class TestArchitectRunnerJudgeCostReadIsDefensive:
+    """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
+    spend on a judge-skipped branch, and an unreadable verdict field must
+    degrade gracefully rather than crash the cell or mis-attribute the
+    failure to "the judge raised" (the judge DID run and DID answer; only
+    its cost figure is unreadable).
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    # -- (a) NO FABRICATED SPEND on every judge-skipped branch ----------------
+    # Each of these branches already asserts ``mocks['judge'].assert_not_called()``
+    # elsewhere in this file; here the pin is on the COST fields specifically —
+    # a judge that never ran must never leave a nonzero judge_cost_usd/
+    # judge_invocations behind, and the cell's cost_usd must equal the
+    # ARCHITECT's own spend for that branch, nothing more.
+
+    async def test_cap_tainted_branch_records_architect_spend_only(self):
+        """Cap landed right after ``create_plan``: header-only stub, tainted."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_stub_with_steps([]),
+            arch_result=_cap_agent_result(),
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        # _cap_agent_result() itself spends $0.00 — no fabricated judge
+        # dollars riding along with a refusal that burned nothing.
+        assert result.metrics['cost_usd'] == pytest.approx(0.0)
+
+    async def test_cap_refusal_with_a_plan_records_architect_spend_only(self):
+        """Cap landed MID-run, after a real plan with steps had landed."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_cap_agent_result(),
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['cost_usd'] == pytest.approx(0.0)
+
+    async def test_healthy_stepless_plan_records_architect_spend_only(self):
+        """Architect ran fine (no cap) but produced nothing worth judging."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_success=True,
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        # No arch_result override here — the harness's default architect
+        # mock reports cost_usd=1.23, and that must be the WHOLE cell cost.
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    # -- (b) an unreadable or nonsensical verdict.cost_usd must not damage
+    #    the cell ------------------------------------------------------------
+
+    @pytest.mark.parametrize('bad_verdict', [
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None,
+            ),
+            id='missing-cost_usd-field',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=None,
+            ),
+            id='cost_usd-is-None',
+        ),
+        # Amendment (reviewer robustness): a READABLE but NON-FINITE or
+        # negative cost_usd is just as dangerous as a missing one —
+        # `arch_cost_usd + judge_cost_usd` would otherwise poison the cell's
+        # cost_usd with NaN/Infinity (which json.dump emits as bare,
+        # non-standard tokens) or a nonsense negative total, and NaN
+        # propagates through every downstream report.py mean for the whole
+        # config row.
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('nan'),
+            ),
+            id='cost_usd-is-nan',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('inf'),
+            ),
+            id='cost_usd-is-infinite',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=-3.5,
+            ),
+            id='cost_usd-is-negative',
+        ),
+    ])
+    async def test_unreadable_verdict_cost_degrades_the_field_not_the_cell(
+        self, bad_verdict, caplog,
+    ):
+        """A legacy/monkeypatched verdict lacking a readable, or carrying a
+        nonsensical, ``cost_usd``.
+
+        Must not crash the cell (``arch_cost_usd + verdict.cost_usd`` when the
+        field is ``None`` raises ``TypeError`` today, outside any try/except),
+        must not lose the fact that the judge WAS called, and must not log
+        "plan judge raised" — that warning means the judge invocation itself
+        failed, which is false here: the judge ran and answered fine, only
+        this ONE field on its verdict is unreadable or nonsensical (NaN,
+        Infinity, negative).
+        """
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            judge_return=bad_verdict,
+        )
+
+        mocks['judge'].assert_awaited_once()
+        # The judge's real answer survives...
+        assert result.metrics['plan_quality'] == 0.77
+        # ...the unreadable cost degrades to 0.0, never a fabricated number...
+        assert result.metrics['judge_cost_usd'] == 0.0
+        # ...but the invocation itself is NOT lost: the judge DID run.
+        assert result.metrics['judge_invocations'] == 1
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+        assert not any(
+            'plan judge raised' in r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

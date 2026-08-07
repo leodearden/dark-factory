@@ -41,7 +41,12 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
-from .metrics import EvalMetrics, collect_metrics, detect_invocation_error
+from .metrics import (
+    EvalMetrics,
+    coerce_cost_usd,
+    collect_metrics,
+    detect_invocation_error,
+)
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
 
@@ -471,6 +476,37 @@ async def run_eval(
     return result
 
 
+def _verdict_cost_usd(verdict: object) -> float:
+    """Defensively read a plan-judge verdict's own invocation spend.
+
+    The cost twin of the sibling defensive read
+    ``getattr(verdict, 'invocation_error', None)`` in :func:`run_architect_eval`
+    (task 3118's rationale, repeated here for the same reason): a
+    monkeypatched, legacy, or third-party ``PlanQualityVerdict`` may not carry
+    a ``cost_usd`` field at all, or may carry a non-numeric one. Either case
+    must degrade exactly ONE field to ``0.0`` — never the whole eval cell, and
+    never mistaken for a judge invocation that raised. An unguarded
+    ``verdict.cost_usd`` read left inside the caller's ``try/except Exception``
+    would swallow an ``AttributeError`` there and log "plan judge raised",
+    mis-attributing an unreadable FIELD to a judge that actually ran and
+    answered; left unguarded entirely, a non-numeric value (e.g. ``None``)
+    would raise ``TypeError`` OUTSIDE that try/except, in the
+    ``EvalMetrics(...)`` construction, crashing the whole cell.
+
+    The ``getattr`` (missing-field / wrong-object) defense stays local to this
+    function — it is specific to reading an UNTRUSTED ``verdict``, which
+    ``coerce_cost_usd`` does not know how to do. Once a candidate value is in
+    hand, the actual "is it a usable dollar figure" check — including the
+    NaN/Infinity/negative guard (amendment, reviewer robustness: a judge
+    answering a non-finite or negative cost would otherwise poison
+    ``arch_cost_usd + judge_cost_usd`` and every downstream report.py mean) —
+    is delegated to :func:`~orchestrator.evals.metrics.coerce_cost_usd`, the
+    SAME helper the judge's own producer-side return paths use, so the two
+    sides of this contract cannot drift apart.
+    """
+    return coerce_cost_usd(getattr(verdict, 'cost_usd', 0.0))
+
+
 async def run_architect_eval(
     task_path: Path,
     config: EvalConfig,
@@ -553,6 +589,15 @@ async def run_architect_eval(
 
     The result carries ``role_under_test='architect'`` and is persisted via
     :func:`save_result`.
+
+    Cost accounting (eval-revival υ): the cell's ``cost_usd`` is the TOTAL
+    spend of producing and scoring the plan — the architect invocation plus
+    the plan judge's invocation, when the judge was actually called.
+    ``judge_cost_usd`` is the judge's share of that total, a SUBSET of
+    ``cost_usd`` and never a disjoint addend (metrics.py:69-71). Every
+    judge-skipped branch (tainted, refused-with-a-plan, unscorable plan)
+    spends nothing on the judge, so ``cost_usd`` there is architect spend
+    alone.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -581,7 +626,11 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
-    cost_usd = 0.0
+    # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
+    # architect invocation's spend. The cell's persisted ``cost_usd`` below
+    # additionally folds in the plan judge's spend (``judge_cost_usd``), so
+    # the two must never be confused under one name.
+    arch_cost_usd = 0.0
     arch_duration_ms = 0
     outcome = 'done'
     # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
@@ -646,7 +695,7 @@ async def run_architect_eval(
             ),
             timeout=timeout_minutes * 60,
         )
-        cost_usd = result.cost_usd
+        arch_cost_usd = result.cost_usd
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
@@ -713,6 +762,16 @@ async def run_architect_eval(
     #    failures qualify and why a timeout deliberately does not).
     plan_quality: float | None = None
     judge_error: str | None = None
+    # The plan judge's OWN spend + invocation count (eval-revival υ). Every
+    # judge-SKIPPED branch below (tainted, refused-with-a-plan, unscorable-
+    # plan) leaves these at their honest zero defaults with no extra code;
+    # only the healthy else-branch, where the judge is actually called, sets
+    # them from the returned verdict. judge_cost_usd is a SUBSET of the
+    # cell's cost_usd below, not disjoint (metrics.py:69-71) — invocations is
+    # stamped on the judge having been CALLED, not on the cost being nonzero,
+    # since a $0.00 refusal is still an invocation.
+    judge_cost_usd = 0.0
+    judge_invocations = 0
     # The taint decision consults whether the artifact is SCORABLE, not merely
     # whether one exists (reviewer: correctness). A session cap can land MID-run,
     # after the architect has already written plan.json through plan-tools MCP —
@@ -798,7 +857,34 @@ async def run_architect_eval(
             # getattr, not attribute access: a monkeypatched or legacy verdict
             # without the field must not break scoring.
             judge_error = getattr(verdict, 'invocation_error', None)
-        except Exception:
+            # The judge WAS called, whatever it answered — stamp the
+            # invocation before touching its cost, so a $0.00 refusal still
+            # counts as one call (report.py:806-809 reads the pair together;
+            # a nonzero cost beside invocations=0 would be self-contradictory).
+            # _verdict_cost_usd is a DEFENSIVE read (like the getattr above):
+            # an unreadable cost field degrades to 0.0 rather than raising
+            # here (mis-attributing the failure to "the judge raised") or
+            # later in the EvalMetrics construction (crashing the cell).
+            judge_invocations = 1
+            judge_cost_usd = _verdict_cost_usd(verdict)
+        except Exception as e:
+            # judge_invocations/judge_cost_usd stay at their 0.0/0 defaults —
+            # NOT bumped to 1 here (amendment, reviewer robustness): whether
+            # invoke_agent was even reached before the raise is NOT
+            # determinable from this side (the raise could be pre-invoke, in
+            # prompt assembly, or post-invoke, in parsing/logging inside
+            # judge_plan_quality's own try/except), so crediting an
+            # invocation that may never have happened would be its own
+            # fabrication. But leaving BOTH fields at zero would make this
+            # cell byte-indistinguishable from one where the judge was
+            # SKIPPED (tainted / cap-refusal-with-a-plan / unscorable-plan) —
+            # exactly the illegibility this task exists to remove, just moved
+            # one level up. So record the fact on judge_error instead: it
+            # rides into stage_markers → invocation_error below as
+            # "judge:raised: ...", so the cell reads "judge raised, spend
+            # unknown" rather than silently looking judge-free.
+            reason = ' '.join(str(e).split())[:80]
+            judge_error = f'raised: {type(e).__name__}: {reason}'
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
                 exc_info=True,
@@ -844,10 +930,24 @@ async def run_architect_eval(
         # would crash the cell OUTSIDE the try above — turning a marked,
         # recoverable cap cell into a lost run.
         plan_steps=len(plan.get('steps') or []),
-        cost_usd=cost_usd,
+        # cost_usd is the cell's TOTAL spend, architect + plan judge — the
+        # SUBSET invariant metrics.py:69-71 declares (judge_cost_usd is a
+        # subset of cost_usd, not disjoint). judge_cost_usd below is the
+        # breakdown, never an addend a report generator should sum again. A
+        # judge that RAISES (the except above) leaves judge_cost_usd AND
+        # judge_invocations at their 0.0/0 defaults, so that spend is
+        # unknowable from here and is a documented under-report, never a
+        # fabricated number — but it is NOT silently indistinguishable from
+        # a judge that was SKIPPED: judge_error is set in the except block,
+        # so invocation_error below reads "judge:raised: ...", telling a
+        # reader "spend unknown", not "judge-free" (amendment, reviewer
+        # robustness).
+        cost_usd=arch_cost_usd + judge_cost_usd,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,
         cap_tainted=tainted,
+        judge_cost_usd=judge_cost_usd,
+        judge_invocations=judge_invocations,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -862,7 +962,8 @@ async def run_architect_eval(
     save_result(result_obj)
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
-        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
+        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s, '
+        f'${metrics.cost_usd:.2f} incl. ${judge_cost_usd:.2f} judge)'
         + (
             f' [{"cap_tainted" if tainted else "invocation_error"}: '
             f'{metrics.invocation_error}]'
