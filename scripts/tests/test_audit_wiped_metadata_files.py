@@ -1167,9 +1167,12 @@ def test_format_report_renders_every_coverage_line_verbatim():
     are vacuous: test_audit_combine_gate_marker_loss.py:1208 records that
     ``"2" in report`` went green off the "25" on the neighbouring line, so a
     regression that DROPPED a whole coverage row still passed. Here the five
-    counts are pairwise non-substring (8123/415/662/1990/37) and each rendered
-    line is asserted whole, INCLUDING its padding — so a dropped row, a
-    reordered row, a relabelled row or a drifted gutter all fail.
+    rows are asserted as an ORDERED, ADJACENT slice, whole lines INCLUDING
+    padding — so a dropped row, a reordered row, a relabelled row, a drifted
+    gutter, and a line interleaved between the caveat and the rows all fail.
+    (Membership — ``expected in lines`` — would not catch the reorder or the
+    interleave, which is why the slice is spelled out positionally, matching
+    how the caveat immediately below is already checked.)
 
     This is a characterization test: it passes against the pre-extraction
     formatter by design. That is the point — it is what makes the shared
@@ -1195,14 +1198,13 @@ def test_format_report_renders_every_coverage_line_verbatim():
     ]
     start = lines.index(caveat[0])
     assert lines[start:start + 3] == caveat
-    for expected in (
+    assert lines[start + 3:start + 8] == [
         "    total tasks scanned:                8123",
         "    with a file-level plan signal:      415",
         "    with only a lock-level signal:      662",
         "    with NO plan signal at all:         1990",
         "    plan records with no such task:     37",
-    ):
-        assert expected in lines
+    ]
 
 
 def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():

@@ -1655,25 +1655,36 @@ def test_exit_constants_alias_the_shared_tier_3_codes():
 
 
 def test_main_exit_2_when_no_project_root_resolves(tmp_path):
-    """Nothing resolvable -> exit 2, empty stdout, reason on stderr."""
+    """Nothing resolvable -> exit 2, empty stdout, reason on stderr.
+
+    The 2 is HARDCODED on purpose, unlike the in-process Tier-3 tests. This
+    observes a real process exit code, i.e. the boundary _build_parser's epilog
+    promises to an operator ("2 = no project root resolved..."). Asserting
+    ``== EXIT_NO_ROOT`` would import the expected value from the module under
+    test, so renumbering the shared code to 7 would leave this green while the
+    epilog kept promising 2 -- the one place a literal is stronger than a name.
+    """
     result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
 
-    assert result.returncode == EXIT_NO_ROOT
+    assert result.returncode == 2
     assert result.stdout.strip() == ""
     assert "no project root" in result.stderr.lower()
 
 
 def test_main_exit_3_when_roots_resolve_but_nothing_is_scanned(tmp_path):
     """A resolvable-but-unreadable tasks.db is NOT a clean run. Exit 3 keeps it
-    distinct from 0, per docs/legibility/design-invariants.md."""
+    distinct from 0, per docs/legibility/design-invariants.md.
+
+    3 hardcoded for the reason the exit-2 sibling above spells out: this is the
+    externally-observed code the epilog promises, not an in-process constant.
+    """
     root = tmp_path / "corrupt"
     (root / ".taskmaster" / "tasks").mkdir(parents=True)
     (root / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
 
     result = _run_cli("--project-root", str(root))
 
-    assert result.returncode == EXIT_NOTHING_SCANNED
-    assert result.returncode != EXIT_OK
+    assert result.returncode == 3
     assert "not a clean result" in result.stderr.lower()
 
 
