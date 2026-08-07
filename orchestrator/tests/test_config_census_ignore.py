@@ -17,11 +17,13 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import yaml
 
 from orchestrator.config_census_ignore import (
     CensusIgnoreFinding,
     CensusIgnoreSpec,
     TaskCiteStatus,
+    audit_census_ignore_entries,
     audit_census_ignore_specs,
     parse_census_ignore_entries,
     read_task_statuses,
@@ -457,3 +459,105 @@ def test_absent_probe_yields_zero_liveness_findings():
     assert {f.kind for f in without} & liveness == set()
     # Structural findings are byte-identical with and without the probe.
     assert [f for f in with_probe if f.kind not in liveness] == without
+
+
+# --- (d) end-to-end from a config path ----------------------------------------
+
+
+def _write_config(tmp_path: Path, tree: dict, name: str = 'orchestrator.yaml') -> Path:
+    p = tmp_path / name
+    p.write_text(yaml.dump(tree))
+    return p
+
+
+def test_audit_from_config_path_combines_structural_and_liveness(tmp_path):
+    """The operator-facing entry point: read the YAML, resolve project_root off
+    the RAW tree, probe that project's task store, return everything."""
+    project = tmp_path / 'proj'
+    project.mkdir()
+    _seed_tasks_db(project)
+    p = _write_config(tmp_path, {
+        'project_root': str(project),
+        'config_key_census': {'ignore': [
+            'bare.entry',
+            {'path': 'self.refuting', 'reason': 'the orchestrator reads this'},
+            {'path': 'stale.cite', 'reason': f'temporary — pending #{_DONE_ID}'},
+        ]},
+    })
+    findings = audit_census_ignore_entries(p)
+    by_pattern = {}
+    for f in findings:
+        by_pattern.setdefault(f.pattern, set()).add(f.kind)
+    assert by_pattern['bare.entry'] == {'unreasoned'}
+    assert by_pattern['self.refuting'] == {'self-refuting'}
+    assert by_pattern['stale.cite'] == {'orphaned'}
+
+
+def test_audit_reads_raw_tree_despite_a_value_level_validation_error(tmp_path):
+    """Must work on a config pydantic would REJECT: the audit reads the raw
+    tree, exactly as census_config_keys does, so a lint still reports entry
+    debt on a config that cannot currently be loaded."""
+    p = _write_config(tmp_path, {
+        'max_concurrent_tasks': 'definitely-not-an-int',
+        'config_key_census': {'ignore': ['bare.entry']},
+    })
+    assert [f.kind for f in audit_census_ignore_entries(p)] == ['unreasoned']
+
+
+@pytest.mark.parametrize('tree', [
+    {'max_concurrent_tasks': 4},
+    {'config_key_census': {'ignore': []}},
+])
+def test_audit_returns_empty_for_a_config_with_nothing_to_audit(tmp_path, tree):
+    assert audit_census_ignore_entries(_write_config(tmp_path, tree)) == []
+
+
+@pytest.mark.parametrize('project_root', [
+    None,                      # absent from the tree
+    'relative/path',           # not absolute
+    '/nonexistent/dir/xyz',    # absolute but not there
+    'no_db',                   # a real dir with no .taskmaster/
+])
+def test_structural_findings_survive_an_unresolvable_project_root(tmp_path, project_root):
+    """FAIL-OPEN, the strong form: when the task store cannot be reached the
+    liveness half goes quiet but the structural half is still returned IN
+    FULL — the audit degrades in one dimension only."""
+    tree = {'config_key_census': {'ignore': [
+        'bare.entry',
+        {'path': 'stale.cite', 'reason': f'temporary — pending #{_DONE_ID}'},
+    ]}}
+    if project_root == 'no_db':
+        (tmp_path / 'no_db').mkdir()
+        tree['project_root'] = str(tmp_path / 'no_db')
+    elif project_root is not None:
+        tree['project_root'] = project_root
+
+    findings = audit_census_ignore_entries(_write_config(tmp_path, tree))
+    kinds = {f.kind for f in findings}
+    assert 'unreasoned' in kinds, 'structural findings must survive in full'
+    assert kinds & {'orphaned', 'unknown-id', 'parked-on-anchor'} == set()
+
+
+def test_audit_never_raises_on_a_non_str_project_root(tmp_path):
+    p = _write_config(tmp_path, {
+        'project_root': 12345,
+        'config_key_census': {'ignore': ['bare.entry']},
+    })
+    assert [f.kind for f in audit_census_ignore_entries(p)] == ['unreasoned']
+
+
+@pytest.mark.parametrize('content', [
+    'this: [is: not: valid: yaml',   # malformed
+    'just a bare scalar',            # non-dict document
+    '',                              # empty -> None document
+])
+def test_audit_returns_empty_for_an_unusable_config_file(tmp_path, content):
+    p = tmp_path / 'broken.yaml'
+    p.write_text(content)
+    assert audit_census_ignore_entries(p) == []
+
+
+def test_audit_returns_empty_for_a_missing_config_file(tmp_path):
+    """A broken lint must never become a crash — load_config calls this on
+    every startup and every hot-reload."""
+    assert audit_census_ignore_entries(tmp_path / 'nope.yaml') == []
