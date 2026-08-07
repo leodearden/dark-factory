@@ -28,7 +28,6 @@ every test in this module is ``async def`` under ``@pytest.mark.asyncio``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -749,11 +748,14 @@ class TestHeartbeatLoopReapWiring:
             while calls < 2 and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.02)
             worker._running = False
-            # Guard-regression case: if the first hung reap is still
-            # sleeping unbounded, let the assertion below report it cleanly
-            # instead of surfacing a raw TimeoutError.
-            with contextlib.suppress(TimeoutError):
+            timed_out = False
+            try:
                 await asyncio.wait_for(task, timeout=2.0)
+            except TimeoutError:
+                # Guard-regression case: the first hung reap is still
+                # sleeping unbounded. Let the assertions below report
+                # it cleanly instead of surfacing a raw TimeoutError.
+                timed_out = True
         finally:
             if not task.done():
                 task.cancel()
@@ -763,6 +765,7 @@ class TestHeartbeatLoopReapWiring:
             f'keeps polling instead of blocking on the first hung sweep '
             f'forever; got {calls} call(s) in the observation window'
         )
+        assert not timed_out, '_heartbeat_loop must exit promptly once _running is False'
 
     async def test_heartbeat_loop_reap_survives_raising_touch(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
