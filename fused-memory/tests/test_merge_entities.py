@@ -11,14 +11,21 @@ Covers:
 from __future__ import annotations
 
 import contextlib
-import os
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    assert_ro_query_only,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    make_rebuild_detail,
+    unique_graph_name,
+)
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import (
@@ -967,43 +974,19 @@ class TestDisallowListForMergeEntities:
 # tests in TestRedirectNodeEdges above can only pin the Cypher string/params
 # shape, not FalkorDB's actual per-uuid-count(*) semantics or whether ID()
 # enumeration + WHERE ID(old)=$eid keying genuinely rewrites the intended
-# edges. Duplicated (not shared via conftest.py) from
-# test_refresh_entity_summary.py:1213-1257, itself duplicated from
-# test_list_indices_integration.py, per the established per-module
-# duplication convention that sidesteps the `sys.modules['conftest']`
-# collision documented in _fm_helpers.py.
+# edges. The reachability probe, connection constants and per-run graph name
+# come from _fm_helpers (task 3502) — see its module docstring for why it is
+# not conftest.py. Only the fixture body below is per-module; do not re-fork
+# the shared helpers back into this file.
 #
 # Skipped automatically when FalkorDB is not reachable; the step-1/step-3
 # mock tests above guarantee coverage in that case.
 # ---------------------------------------------------------------------------
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_list_indices_integration.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest_asyncio.fixture
 async def merge_entities_live_graph():
-    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
-
-    A fresh graph name is minted on every invocation (rather than a shared
-    module-level constant) so this module's live tests never share state,
-    even under pytest-xdist or a shared FalkorDB instance.
-    """
-    graph_name = f'_test_2207_merge_entities_{uuid.uuid4().hex[:8]}'
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('2207_merge_entities')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -1018,7 +1001,7 @@ async def merge_entities_live_graph():
             await client.aclose()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestRedirectNodeEdgesLiveFalkorDB:

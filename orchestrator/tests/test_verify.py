@@ -5515,6 +5515,82 @@ class TestRunScopedVerificationForwardsWorktreeToFallback:
         )
 
 
+class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
+    """The fallback branch asks `run_verification` to SEGMENT its test chain (task 3338).
+
+    Segmentation is opt-in and default-OFF: making `run_verification` segment
+    any chain it is handed would silently change the global tail, the
+    cargo-scoped path, `merge_queue._run_unscoped_typechecks` and every
+    module_configs run — a wide, unrequested change in a function dozens of
+    tests stub. The reported defect (esc-3062-2) is the FALLBACK path, so only
+    this call site opts in.
+
+    The flag goes on the `run_verification` call, NOT on
+    `_build_fallback_config`'s: the NOTE at that call site records (and
+    `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
+    test double is a fixed `(task_files, config=None, worktree=None)` fake with
+    no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+
+    `role='merge'` is deliberately EXCLUDED (amendment). The trade inverts on
+    the merge lane: the per-segment diagnostic exists so a task agent can read
+    its own result rather than prove an unrelated red unrelated, but a merge
+    failure goes to a human who has the whole chain anyway — while the cost
+    (running seven more suites, up to the full budget, with the queue blocked)
+    lands on the path this module already treats as latency-critical.
+    """
+
+    @staticmethod
+    async def _await_kwargs(tmp_path: Path, role) -> dict:
+        (tmp_path / 'shared').mkdir(exist_ok=True)
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command='cd shared && uv run pytest tests/ && uv run pytest tests/scripts/',
+            lint_command=None,
+            type_check_command=None,
+        )
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        run_verification_double = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify.run_verification', new=run_verification_double):
+            await run_scoped_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path),
+                [],
+                task_files=['shared/thing.py'],
+                role=role,
+            )
+
+        assert run_verification_double.await_count == 1
+        await_args = run_verification_double.await_args
+        assert await_args is not None, 'run_verification was not awaited'
+        # `.kwargs` is a Mapping; copy so the annotation is an honest dict.
+        return dict(await_args.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        assert (await self._await_kwargs(tmp_path, 'task')).get('segment_chained_test') is True
+
+    @pytest.mark.asyncio
+    async def test_merge_role_fallback_keeps_the_fail_fast_chain(self, tmp_path: Path) -> None:
+        """A red merge verify must still stop at the first subproject.
+
+        Not a style preference: without the gate, a merge verify whose first
+        subproject goes red runs the remaining seven suites before reporting,
+        holding the merge queue for up to the full resolved budget (3600s warm /
+        5400s cold) on every red attempt — and budget exhaustion is strictly
+        MORE likely once every segment always runs.
+        """
+        kwargs = await self._await_kwargs(tmp_path, 'merge')
+        assert kwargs.get('segment_chained_test') is False
+        # The gate must key on `role`, not on some other merge-ish signal that
+        # a caller could set independently.
+        assert kwargs.get('role') == 'merge'
+
+
 class TestBuildFallbackConfigDataModule:
     """``_build_fallback_config`` must not pass non-test data modules to pytest.
 

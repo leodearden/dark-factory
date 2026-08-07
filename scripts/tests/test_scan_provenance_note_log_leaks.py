@@ -11,8 +11,9 @@ DB at the time of writing). The source is fixed; this scanner is the durable
 recurrence guard, mirroring the 2939 precedent.
 
 Mirrors test_scan_task_toolcall_leaks.py: pure functions (detect_log_leak,
-scan_db, discover_db_paths, format_report, format_json) get direct pytest
-coverage; main() gets subprocess coverage.
+scan_db, format_report, format_json) get direct pytest coverage; main()
+gets subprocess coverage. Discovery helpers (discover_db_paths et al.) are
+covered in scripts/tests/test_task_db_scan.py (task 3336).
 
 This module — and the scanner it tests — never mutate task text. Task 2902's
 note is a preserved forensic specimen; the fixture below is a shape-faithful
@@ -26,11 +27,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-# discover_db_paths is imported from its DEFINING module rather than re-exported
-# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
-# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
-# Same function object either way — these tests exercise an identical callable.
-from _task_db_scan import discover_db_paths
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
@@ -265,51 +261,6 @@ class TestScanDb:
         assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
 
 
-class TestDiscoverDbPaths:
-    """Same precedence contract as the 2939 precedent scanner."""
-
-    def test_explicit_dbs_pass_through_existing_only(self, tmp_path):
-        existing = tmp_path / 'a.db'
-        existing.write_text('')
-        missing = tmp_path / 'missing.db'
-
-        result = discover_db_paths(explicit_dbs=[str(existing), str(missing)])
-
-        assert result == [str(existing)]
-
-    def test_project_root_maps_to_taskmaster_tasks_db(self, tmp_path, project_root_with_tasks_db):
-        root = tmp_path / 'proj'
-        root.mkdir()
-        db_file = str(project_root_with_tasks_db(root))
-
-        assert discover_db_paths(project_roots=[str(root)]) == [db_file]
-
-    def test_parses_dashboard_known_project_roots_env(self, tmp_path, project_root_with_tasks_db):
-        root_a, root_b = tmp_path / 'a', tmp_path / 'b'
-        root_a.mkdir()
-        root_b.mkdir()
-        db_a, db_b = str(project_root_with_tasks_db(root_a)), str(project_root_with_tasks_db(root_b))
-
-        # Whitespace padded, with an empty entry (",,") that must be dropped
-        # rather than mapped to a bogus db path.
-        env = {'DASHBOARD_KNOWN_PROJECT_ROOTS': f' {root_a} , {root_b} ,, '}
-
-        assert discover_db_paths(env=env) == [db_a, db_b]
-
-    def test_falls_back_to_dark_factory_default(self, monkeypatch):
-        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
-
-        assert discover_db_paths() == [
-            '/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db'
-        ]
-
-    def test_skips_project_root_without_tasks_db(self, tmp_path):
-        root = tmp_path / 'empty'
-        root.mkdir()
-
-        assert discover_db_paths(project_roots=[str(root)]) == []
-
-
 class TestFormatting:
     """The human report truncates; --json carries the full line."""
 
@@ -376,7 +327,8 @@ def _run_cli(*args, env=None, timeout=30):
 
 
 class TestCli:
-    """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable."""
+    """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable,
+    3 = every resolved tasks.db was unreadable so NOTHING was scanned."""
 
     def test_clean_db_exits_0_with_no_leaks_message(self, make_tasks_db):
         db_path = str(make_tasks_db([{'id': 1, 'metadata': _provenance('merged', commit='abc')}]))
@@ -432,3 +384,62 @@ class TestCli:
         assert '2902' in result.stdout
         assert 'corrupt.db' in result.stderr
         assert 'incomplete' in result.stderr
+
+    def test_every_db_unreadable_exits_3_not_0(self, tmp_path):
+        """EVERY resolved database failing to open is not a clean sweep.
+
+        Covered at the layer a cron job actually observes — a process exit
+        status — because that is where the false green did its damage: stdout
+        still reads "no leaked log lines" while nothing at all was scanned.
+        """
+        bad1 = tmp_path / 'bad1.db'
+        bad2 = tmp_path / 'bad2.db'
+        bad1.write_text('this is not a sqlite database at all')
+        bad2.write_text('neither is this')
+
+        result = _run_cli(
+            '--db', str(bad1), '--db', str(bad2),
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+
+        assert result.returncode == 3, result.stderr
+        assert str(bad1) in result.stderr
+        assert str(bad2) in result.stderr
+        assert 'NOTHING was scanned' in result.stderr
+        # The clean-looking report is still printed — that is the false-green
+        # shape the exit code now disagrees with.
+        assert 'no leaked log lines' in result.stdout
+
+        # Same under --json, and pinned deliberately: stdout is a WELL-FORMED
+        # EMPTY payload, indistinguishable from a genuinely clean sweep. So a
+        # `... --json | jq -e 'length == 0'` pipeline that ignores $? still
+        # reads a total failure as clean. That residual gap is documented on
+        # run_scan_cli (and matches audit_wiped_metadata_files.py); this
+        # asserts it rather than leaving it to be rediscovered as a surprise.
+        json_result = _run_cli(
+            '--db', str(bad1), '--db', str(bad2), '--json',
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+        assert json_result.returncode == 3, json_result.stderr
+        assert json.loads(json_result.stdout) == []
+
+    def test_one_unreadable_db_beside_a_clean_one_still_exits_0(
+        self, tmp_path, make_tasks_db
+    ):
+        """Partial failure is NOT exit 3: a database was genuinely scanned."""
+        corrupt = tmp_path / 'corrupt.db'
+        corrupt.write_text('this is not a sqlite database at all')
+        clean = str(make_tasks_db(
+            [{'id': 1, 'metadata': _provenance('merged', commit='abc')}],
+            name='clean.db',
+        ))
+
+        result = _run_cli(
+            '--db', str(corrupt), '--db', clean,
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert 'no leaked log lines' in result.stdout
+        assert 'corrupt.db' in result.stderr
+        assert 'NOTHING was scanned' not in result.stderr

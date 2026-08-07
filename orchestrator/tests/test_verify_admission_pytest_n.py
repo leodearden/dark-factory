@@ -184,6 +184,61 @@ class TestApplyPytestNumprocesses:
         assert apply_pytest_numprocesses(cmd, '16') == cmd
 
 
+class TestWithPytestNumprocessesStr:
+    """The string-level wrapper `verify._with_pytest_numprocesses_str` (task 3478).
+
+    Sibling of ``_with_pytest_timeout_str`` / ``_with_junitxml_str``: parse ->
+    mutate -> ``is`` identity check -> render. It exists because task 3478
+    applies the `-n` cap at a SECOND site (per segment, inside
+    ``_run_one_segment``) as well as the original non-segmented one, and two
+    copies of the parse/render/identity dance would be free to drift
+    (INV-5 no-lockstep-duplication).
+
+    The identity check is the load-bearing part: a from-scratch ``render`` of
+    an untouched parse is only argv-EQUIVALENT, not byte-identical (flag
+    order and spacing get normalised), so a no-op that round-tripped would
+    silently rewrite every operator's configured command. These tests assert
+    ``is``, not ``==``, for exactly that reason.
+    """
+
+    @staticmethod
+    def _wrapper():
+        from orchestrator.verify import _with_pytest_numprocesses_str  # noqa: PLC0415
+
+        return _with_pytest_numprocesses_str
+
+    @pytest.mark.parametrize(
+        ('cmd', 'n', 'why'),
+        [
+            (
+                'cd shared && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/',
+                'auto',
+                "n='auto' is the shipped default and an apply_pytest_numprocesses no-op",
+            ),
+            ('uv run pytest tests/', '', "n='' is the other no-op value"),
+            ('uv run ruff check src/', '4', 'a non-pytest tool is never -n capped'),
+            ('mypy src/', '4', 'an OPAQUE command has no structure to mutate'),
+            (
+                "uv run pytest -p no:xdist -o addopts='' tests/",
+                '4',
+                'serial-forced: xdist is off, so -n would fail the run outright',
+            ),
+        ],
+    )
+    def test_noop_returns_the_very_same_object(self, cmd, n, why):
+        assert self._wrapper()(cmd, n) is cmd, why
+
+    def test_structured_pytest_gains_dash_n_and_keeps_its_flags(self):
+        result = self._wrapper()('uv run pytest tests/ --timeout=300', '4')
+        assert result is not None
+        assert '-n 4' in result
+        assert '--timeout=300' in result
+        assert 'tests/' in result
+
+    def test_none_in_none_out(self):
+        assert self._wrapper()(None, '4') is None
+
+
 class TestApplyPytestNumprocessesSerialRecoveryCollision:
     """Regression: `-n` must NOT be injected onto a command already forced
     serial (``-p no:xdist``). verify.py's env-transient recovery

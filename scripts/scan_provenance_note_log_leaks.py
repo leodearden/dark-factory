@@ -199,6 +199,24 @@ def _build_parser() -> argparse.ArgumentParser:
             "check's raw stdout tail). Detection/reporting only -- never "
             'mutates task data.'
         ),
+        # The 0/1/2/3 codes below are RETURNED BY run_scan_cli() in
+        # _task_db_scan.py, not by anything in this file -- this epilog is only
+        # a --help-visible copy of that contract. It is the fourth copy, beside
+        # run_scan_cli()'s docstring, main()'s docstring below, and the
+        # byte-parallel epilog in scan_task_toolcall_leaks.py. Nothing
+        # enforces the lockstep, so change all four together. The standing fix
+        # is to hoist the shared wording into a SCAN_EXIT_CODE_EPILOG constant
+        # beside NO_DB_RESOLVED_MESSAGE in _task_db_scan.py, which task 3547
+        # held no lock on. (audit_wiped_metadata_files.py's epilog is NOT a
+        # copy -- it documents its own main()'s distinct codes.)
+        epilog=(
+            'exit codes: 0 = clean, no leaks found; 1 = at least one leak '
+            'found; 2 = no tasks.db could be resolved from --db / '
+            '--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the '
+            'dark-factory default; 3 = every resolved tasks.db was '
+            'unreadable, so NOTHING was scanned (never treat 3 as a clean '
+            'run).'
+        ),
     )
     add_db_discovery_args(
         parser,
@@ -217,12 +235,20 @@ def main(argv: list[str] | None = None) -> int:
 
     Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db could
     be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
-    the dark-factory default.
+    the dark-factory default, 3 = every resolved tasks.db was unreadable, so
+    NOTHING was scanned (never treat 3 as a clean run).
 
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort
     the sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported.
+    database is still scanned and reported. That warn-and-continue skip is
+    exit 0/1 on the readable remainder — it is only when ALL of them fail,
+    leaving nothing scanned at all, that the run is exit 3.
+
+    On exit 3 stdout STILL looks clean: the report is printed before the exit
+    code is decided, so --json emits an empty ``[]`` and the plain report emits
+    its ordinary "nothing found" line. A consumer that reads only stdout cannot
+    tell a total failure from a clean sweep — branch on the exit code.
     """
     def _render(matches: list[NoteLeakMatch], args: argparse.Namespace) -> str:
         if args.json:

@@ -21,11 +21,16 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client / httpx / live models, so every
-seam is ALWAYS faked in this module's own test suite; the deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network.
+--project shared``) has no MCP client and no live models, so every seam is
+ALWAYS faked in this module's own test suite; the deterministic core
+(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
+manifestation matrix, census-state advance, codebook lifecycle transforms,
+report rendering) is unit-tested with no network. Note that httpx IS
+available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
+what keep the suite off the network, not an absent HTTP client: an
+un-faked poster would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -623,6 +628,16 @@ def advance_census_state(
         "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
+    # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
+    # writer -- deliberately belt-and-braces with run_census's own
+    # _ensure_output_parents, which serves a different purpose. That call
+    # buys FAIL-FAST (an un-creatable output path must cost nothing rather
+    # than a whole ~$100 mining run) and only covers run_census's four
+    # paths; this line makes the guarantee hold for EVERY caller of this
+    # function, present and future, so nobody can reintroduce the
+    # FileNotFoundError that mkstemp(dir=<missing>) raises just by writing
+    # census state from somewhere new. Idempotent, so the two do not fight.
+    os.makedirs(directory, exist_ok=True)
     fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -936,6 +951,13 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     )
 
 
+def _ensure_output_parents(*paths) -> None:
+    """Create the parent directory of every non-``None`` output path."""
+    for path in paths:
+        if path is not None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
 _VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
 """codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
 since codebook.py is NOT modified by this module (see the module
@@ -1138,6 +1160,50 @@ def run_census(
         )
         return CensusOutcome(status="deferred", reason=reason)
 
+    # Every output parent, created ONCE, here -- not at each of the four
+    # write sites below. Three reasons, in order of how much they cost when
+    # ignored:
+    #
+    # (1) FAIL-FAST. On 2026-08-03 a census of /home/leo/src/reify mined to
+    #     saturation (~12.5h, ~$100) and only THEN died on its first output
+    #     write: `[Errno 2] No such file or directory:
+    #     '/home/leo/src/reify/plans/confusion-census-2026-08-02-payloads.json'`
+    #     -- reify simply has no plans/ directory. Creating (or failing to
+    #     create) the parents before mining means an un-creatable output path
+    #     costs nothing instead of a whole mining run.
+    # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
+    #     census_state_path are four writers of the SAME run's outputs; a
+    #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
+    #     a fifth output is added. Note this covers codebook.dump and
+    #     advance_census_state too, not just the two write_text calls: both
+    #     write atomically via `tempfile.mkstemp(dir=os.path.dirname(path))`,
+    #     which raises the same FileNotFoundError on a missing directory as
+    #     write_text does. reify tripped only the plans/ pair because main()
+    #     loads its config from <root>/docs/legibility/legibility.yaml, so
+    #     that directory necessarily existed; a target reached via --config
+    #     pointing elsewhere trips the codebook/state pair identically.
+    #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
+    #     none of this was ever hit before.
+    #     This "one place" argument is honest only for run_census's OWN four
+    #     paths, so it is not the whole guard: advance_census_state also
+    #     creates its parent writer-side (mirroring trickle_state), which
+    #     covers every OTHER caller too. codebook.dump has no such
+    #     writer-side guard yet -- codebook.py sits outside this task's lock
+    #     scope -- so nightly.py's codebook.dump call remains exposed to the
+    #     same FileNotFoundError. Follow-up, not fixed here.
+    # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
+    #     at the top of run_census keeps the DEFER branch side-effect-free --
+    #     a deferred census creates no empty directories in the target
+    #     project.
+    #
+    # Creating an empty directory is not persisted census state, so the
+    # documented report -> codebook.dump -> advance_census_state ordering
+    # invariant (see this function's docstring and the comments at those
+    # three sites) is untouched by this call.
+    _ensure_output_parents(
+        report_path, codebook_path, census_state_path, dry_run_payloads_path,
+    )
+
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
@@ -1175,6 +1241,48 @@ def run_census(
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
+
+    # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
+    # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
+    # detector for the class. _build_default_verify_fn fails CLOSED per
+    # cluster -- correctly, an unverifiable claim must reject rather than
+    # crash -- so ANY systemic failure (model unreachable mid-run, a
+    # different permission denial, a persistent parse failure) still
+    # presents as an ordinary all-rejected run, and the report below states
+    # zero verified clusters in the same voice it would use for a genuinely
+    # unremarkable census. "clusters were offered and NONE survived" is the
+    # observable signature of that incident, so say it out loud.
+    #
+    # Not an error and not a defer: an all-rejected run is legitimately
+    # possible, so this must not fail a census whose mining is already
+    # paid for. The escalate_fn call is wrapped because, unlike the
+    # defer-path escalation above (which returns immediately afterwards),
+    # this one sits between the mining spend and the output writes -- a
+    # raising escalate_fn must not be what discards the run's results.
+    if clusters_to_verify and not verified:
+        suspect = (
+            f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
+            "REJECTED and none survived -- suspect a systemic verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) rather "
+            "than genuinely unfounded claims. This is the observable signature of the "
+            "2026-08-03 sandbox incident, where the verify subprocess was rooted "
+            "outside the censused tree and every read was permission-denied. Check "
+            "the per-cluster 'verify failed' warnings above; a run with real findings "
+            "is being reported as an empty census if this is systemic."
+        )
+        logger.warning("%s", suspect)
+        try:
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=(
+                    f"legibility census: all {len(clusters_to_verify)} cluster(s) rejected "
+                    "-- possible systemic verifier failure"
+                ),
+                detail=suspect,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+            logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
 
@@ -1523,10 +1631,17 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
 def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads.
-    Absolute paths only -- this function never sets a subprocess cwd, so a
-    relative path in the model's own tool calls would resolve against
-    whatever directory the CLI process happens to inherit. Asks for an
-    OBSERVATION, never a diagnosis (codebook lesson
+
+    The CLI subprocess this prompt is delivered to runs with its cwd set to
+    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: ``claude -p``
+    SANDBOXES tool access to the cwd tree, so a verifier launched from
+    anywhere else has every Read/Bash against this tree permission-denied,
+    with no interactive prompt to approve (proven 2026-08-03). The
+    absolute-paths instruction below is retained as belt-and-braces on top
+    of that scoping, not as a substitute for it.
+
+    Asks for an OBSERVATION, never a diagnosis (codebook lesson
     guards-assert-unverified-diagnoses)."""
     return (
         "You are the periodic-census verifier for the dark-factory "
@@ -1565,7 +1680,23 @@ def _build_default_verify_fn(project_root: str, invoke):
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
-    prompt is designed to elicit)."""
+    prompt is designed to elicit).
+
+    That fail-closed default is correct, and it is also what made the
+    2026-08-03 sandbox gap SILENT: with the CLI subprocess rooted outside
+    the censused tree, every permission-denied verifier read became an
+    ordinary per-cluster rejection, so a whole census mass-rejected without
+    a single error surfacing. What keeps the default honest rather than
+    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    *project_root* -- a rejection then means the claim really could not be
+    verified, not that the verifier could not see the tree.
+
+    Scoping the cwd removed one CAUSE, not the class: a model that goes
+    unreachable mid-run, a different permission denial, or persistently
+    unparseable verdicts all still land here as ordinary rejections. So
+    ``run_census`` additionally DETECTS the signature -- clusters offered,
+    none verified -- and says so loudly rather than quietly reporting an
+    empty census."""
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         for cluster in clusters:
@@ -1609,9 +1740,12 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
     result via ``census_trigger._extract_tool_result`` (reused rather than
     reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
+    codebase). ``httpx`` is imported lazily so importing this module for its
+    unit-tested pure core never needs it, and so the tests can substitute a
+    stub for the real POST -- not for availability, since httpx is a direct
+    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
+    runs under ``uv run --project shared``. Mirrors
+    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
     import httpx
 
     response = httpx.post(
@@ -1730,11 +1864,11 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _build_stage_invokes(cfg):
+def _build_stage_invokes(cfg, *, project_root):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
     carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
     (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget).
+    own budget) and each scoped to *project_root* as its subprocess cwd.
 
     Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
     census stage calls its invoke as ``invoke(prompt, model)`` with two
@@ -1743,14 +1877,50 @@ def _build_stage_invokes(cfg):
     ``mining_invoke`` also backs the headroom probe (``run_census`` routes
     both through its single ``invoke`` param).
 
+    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
+    alone. VERIFY is where the gap was proven fatal (fleet session
+    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
+    directs the model to read the target tree, and ``claude -p`` sandboxes
+    tool access to its cwd tree, so censusing a project from some other
+    directory permission-denied every verifier read. Scoping only verify
+    would nonetheless leave mining and synthesis silently rooted in
+    whatever directory the operator launched from — an asymmetry with no
+    defensible reason that a later reader would file as a bug. Binding all
+    three makes "the census subprocess runs inside the censused project" a
+    uniform invariant instead of a verify-only patch.
+
+    That uniformity is NOT free, and the cost belongs on the record.
+    Mining and synthesis take no tool action, but their cwd is still
+    observable: ``claude -p`` assembles context from the directory it runs
+    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
+    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
+    censused project therefore prepends THAT project's CLAUDE.md to every
+    mining call — and mining is both the highest-volume stage (hundreds of
+    calls) and the dominant cost of a ~$100 census — and can fire that
+    project's session hooks inside the census subprocess. It is still the
+    right trade: reading the censused project's own conventions is if
+    anything more correct for mining, and the alternative is two stages
+    silently rooted in an arbitrary directory. But if the added per-call
+    context ever measures material, the lever is an explicit
+    ``--settings``/``--strict-mcp-config``-style flag on the mining and
+    synthesis partials — NOT un-scoping their cwd, which would restore the
+    asymmetry this paragraph exists to rule out.
+
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
     monkeypatching ``coder._invoke_cli`` in tests takes effect.
     """
+    cwd = str(project_root)
     return (
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        ),
     )
 
 
@@ -1865,7 +2035,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    project_root = Path(args.project_root)
+    # Resolved, not used raw: --project-root defaults to "." and is routinely
+    # passed relative. An unresolved relative root would make the stage cwd
+    # binding below vacuous (cwd="." IS the launcher's cwd — exactly the bug
+    # that binding exists to close) and would silently falsify
+    # _verify_prompt's own "ABSOLUTE paths only" contract, since it
+    # interpolates str(project_root) straight into the prompt. One resolve()
+    # at the CLI boundary makes the prompt text, the subprocess cwd and all
+    # four output paths name the same absolute tree.
+    project_root = Path(args.project_root).resolve()
+
+    # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
+    # somewhere downstream. Now that project_root is also the stage
+    # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
+    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # deliberately folds ANY probe exception into HeadroomResult(ok=False).
+    # Without this check `census --project-root /typo --config <real one>`
+    # would exit 0 with "census deferred: headroom probe invocation
+    # failed: ..." plus an INFO escalation: an operator typo wearing the
+    # exact costume of a usage-limit defer, on every subsequent run. A
+    # non-existent root is never a deferral -- it is a bad argument.
+    if not project_root.is_dir():
+        print(
+            f"census: --project-root {args.project_root!r} resolves to "
+            f"{project_root}, which is not an existing directory",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path = (
         Path(args.config) if args.config
         else project_root / "docs" / "legibility" / "legibility.yaml"
@@ -1911,7 +2108,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Each census stage gets its OWN claude-CLI subprocess timeout; see
     # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+        cfg, project_root=project_root,
+    )
 
     # One escalate_fn closure shared by BOTH consumers: run_census's
     # headroom-defer path (lines ~800) and main()'s hard-failure catch-all

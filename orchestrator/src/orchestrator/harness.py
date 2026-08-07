@@ -1619,12 +1619,23 @@ class Harness:
         # dir path as a string. Kept separate from the adopted sidecar dict
         # (which flows into build_workflow) to keep the resume payload clean.
         self._recovered_session_config_dirs: dict[str, str] = {}
-        # Consecutive-per-boot session_resume_fallback streak (task γ storm
-        # escape, INV-4). Incremented on each reason-carrying fallback in
-        # _run_slot; reset to 0 on any eligible resume. When it reaches
+        # session_resume_fallback streak (task γ storm escape, INV-4).
+        # Incremented in _run_slot on each UNEXPLAINED fallback ('stale' /
+        # 'no_transcript'); reset to 0 on any eligible resume. When it reaches
         # session_resume.fallback_storm_threshold, one deduped L1 is filed.
-        # Capped/disabled degradations do NOT feed it (by design).
+        # By-design degradations do NOT feed it: disabled, capped, and (task
+        # 3256) reseeded.
+        #
+        # The run is a ROLLING WINDOW, not a cumulative per-boot count: each
+        # increment must chain within session_resume.storm_window_secs of the
+        # previous fallback, else the streak decays to 0 first (task 3256 — a
+        # slow drip of isolated failures must never accumulate into a false
+        # storm). The stamp below is the chain's comparison point, on the
+        # MONOTONIC clock — 'stale' is itself produced by clock skew, so a
+        # wall-clock decay would be corrupted by the very failure it detects.
+        # None means "no run in progress" (boot, or after an eligible resume).
         self._session_resume_fallback_streak: int = 0
+        self._last_session_resume_fallback_at: float | None = None
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -3067,13 +3078,28 @@ class Harness:
         input degrades to an ineligible ``(False, <reason>)`` so the caller
         falls back to a fresh dispatch — this method NEVER raises.
 
-        Reasons (checked in this order):
+        Reasons, in branch order:
           - 'disabled'      — the session_resume kill switch is off (B6).
           - 'stale'         — (now - started_at) >= freshness_window_secs, OR
                               started_at is missing/unparseable (fail-safe).
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-          - 'no_transcript' — no stashed config_dir, no session_id, or the
-                              transcript is absent on disk (B4 reseed/wipe).
+        Then transcript corroboration, which resolves three ways. Note
+        'no_transcript' is listed first because it is reached BOTH before the
+        transcript glob (nothing to corroborate with) and after it (the store
+        survived but this session's file is missing):
+          - 'no_transcript' — no stashed config_dir, no session_id, the config
+                              dir survives but this session's transcript is
+                              absent, or the dir is present-but-unreadable
+                              (a filesystem fault is NOT a wipe) — a genuine
+                              corroboration failure.
+          - 'reseeded'      — the stashed config dir is PROVABLY gone on disk
+                              (ENOENT/ENOTDIR): warm-lane acquire ALWAYS
+                              re-seeds from base
+                              (docs/prds/warm-lane-pool-cow-seeding.md §9.3/
+                              §9.5), which wipes <lane>/.task/ and the whole
+                              transcript store with it. An EXPECTED fallback,
+                              not a corroboration failure (task 3256) — it
+                              does not feed the fallback-storm streak.
           - 'eligible'      — all corroboration passed; inject the session.
         """
         cfg = self.config.session_resume
@@ -3100,12 +3126,42 @@ class Harness:
         # reseed/wipe of .task between boot and re-dispatch is detected.
         # transcript_exists is itself total (any glob error → False), so no
         # outer try/except is needed here to uphold this method's I3 totality:
-        # a non-empty config_dir str makes Path() safe, and a missing/absent
-        # transcript degrades to the 'no_transcript' fallback below.
+        # a non-empty config_dir str makes Path() safe, and any absent
+        # transcript degrades to one of the two ineligible reasons below.
+        #
+        # A failed corroboration is then split (task 3256) on whether the
+        # config dir that HELD the transcript is PROVABLY gone: its absence is
+        # positive evidence that the whole store was wiped by an acquire
+        # reseed ('reseeded', expected), while a surviving dir missing only
+        # this session's transcript is a genuine failure ('no_transcript').
+        # A never-stashed config_dir / session_id stays 'no_transcript': a
+        # reseed clears the out-of-lane meta root together with the lane
+        # (PRD I2), so it destroys the sidecar WITH the transcript and yields
+        # no adoption at all — an adopted session with no config dir is
+        # pathological and must stay loud.
         session_id = session.get('session_id')
         if not config_dir or not session_id:
             return (False, 'no_transcript')
         if not transcript_exists(Path(config_dir), session_id):
+            # Discriminate "PROVABLY gone" from "there but unreadable", and do
+            # it with an explicit stat rather than Path.exists(), which is
+            # wrong for this seam in both directions: it swallows exactly
+            # {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a symlink loop
+            # or bad fd would read as a wipe and land in the SILENT,
+            # storm-exempt 'reseeded' arm — and it RE-RAISES every other
+            # OSError (EACCES on a parent, ESTALE, EIO), which would escape
+            # this method and break the never-raises I3 contract above.
+            # Either way a genuine filesystem fault stops surfacing as the
+            # systematic breakage INV-4 exists to catch. So: only ENOENT/
+            # ENOTDIR earns 'reseeded'; everything else falls through to the
+            # LOUD arm, caught here so the method stays total (ValueError
+            # covers the NUL-bearing path that os.stat rejects outright).
+            try:
+                Path(config_dir).stat()
+            except (FileNotFoundError, NotADirectoryError):
+                return (False, 'reseeded')
+            except (OSError, ValueError):
+                pass  # unreadable/faulted != wiped — stay loud
             return (False, 'no_transcript')
         return (True, 'eligible')
 
@@ -5853,6 +5909,10 @@ class Harness:
         worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
+        # The config dir must be dropped in lockstep with its session (task
+        # 3256): a stale stash paired with a later adoption would classify as
+        # 'reseeded' and be silently suppressed instead of surfacing.
+        self._recovered_session_config_dirs.pop(tid, None)
         if worktree_path.exists():
             try:
                 await self.git_ops.cleanup_worktree(worktree_path, tid)
@@ -6059,13 +6119,17 @@ class Harness:
     def _file_session_resume_storm_escalation(self) -> None:
         """File an L1 when session-resume fallbacks storm (task γ, INV-4).
 
-        Called from the _run_slot guard once the consecutive-per-boot
+        Called from the _run_slot guard once the
         ``_session_resume_fallback_streak`` reaches
         ``session_resume.fallback_storm_threshold``. A single isolated
-        fallback (a lone foreign-acquire) never trips this — only a RUN does,
-        which is the signature of SYSTEMATIC corroboration breakage (clock
-        skew, wiped transcripts, mass reseed). Deduped by ``has_open_l1`` so
-        the operator sees exactly one open storm L1 at a time.
+        fallback never trips this — only a RUN does, which is the signature of
+        SYSTEMATIC corroboration breakage. Only UNEXPLAINED failures feed the
+        streak: since task 3256 a lane reseed is classified ``reseeded`` and
+        excluded by construction (as ``capped`` already was), so the causes
+        that can still trip this are clock skew making every sidecar look
+        stale, or transcripts vanishing while their config dir survives.
+        Deduped by ``has_open_l1`` so the operator sees exactly one open storm
+        L1 at a time.
 
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
         failure is swallowed so filing never breaks the guard path (I3).
@@ -6085,29 +6149,39 @@ class Harness:
                 category='infra_issue',
                 summary=(
                     'Session-resume fallback storm — '
-                    f'{threshold}+ consecutive resume corroboration failures '
-                    'this boot; resume degraded to fresh dispatch for all'
+                    f'{threshold}+ UNEXPLAINED resume corroboration failures '
+                    'in a row; resume degraded to fresh dispatch for all'
                 )[:200],
                 detail=(
-                    f'{threshold} or more consecutive session-resume '
-                    'eligibility failures occurred this boot without an '
+                    f'{threshold} or more session-resume eligibility failures '
+                    'occurred in a chained run — each within '
+                    'session_resume.storm_window_secs of the previous, with no '
                     'intervening successful resume. Every recovered agent '
-                    'session was rejected (stale sidecar or absent transcript) '
-                    'and degraded to a fresh dispatch — safe, but a RUN this '
-                    'long suggests a systematic cause rather than isolated '
-                    'foreign-acquires: clock skew making every sidecar look '
-                    'stale, a reseed/`git clean` wiping transcripts out from '
-                    'under adopted sessions, or a mass lane reseed.\n\n'
+                    'session was rejected and degraded to a fresh dispatch — '
+                    'safe, but a RUN this tight suggests a systematic cause.\n\n'
+                    'By-design degradations are EXCLUDED BY CONSTRUCTION and '
+                    'cannot have contributed: a lane reseed (which always wipes '
+                    '.task/ and its transcript store) is classified '
+                    "reason='reseeded', and the per-task cap is "
+                    'session_resume_capped. So the remaining causes are:\n'
+                    "  - reason='stale' — host clock skew (NTP) making every "
+                    'sidecar look older than freshness_window_secs;\n'
+                    "  - reason='no_transcript' — transcripts vanishing while "
+                    'their claude-config dir SURVIVES, or an adopted sidecar '
+                    'with no config dir at all.\n\n'
                     'Fresh dispatch loses the in-flight agent context that '
                     'resume would have preserved, so throughput/cost is '
-                    'degraded until the cause is fixed. Check host clock skew '
-                    '(NTP) and whether warm-lane reseeds are wiping '
-                    '.task/claude-config transcripts.'
+                    'degraded until the cause is fixed. Query the reasons: '
+                    "select json_extract(data,'$.reason'), count(*) from events "
+                    "where event_type='session_resume_fallback' group by 1."
                 ),
                 suggested_action=(
-                    'Investigate clock skew (NTP) and transcript-wiping '
-                    'reseeds; the streak resets on the next successful resume, '
-                    'so resolve this L1 once the underlying cause is fixed.'
+                    'Check host clock skew (NTP) first, then whether '
+                    'transcripts are disappearing from a surviving '
+                    '.task/claude-config dir. The streak resets on the next '
+                    'successful resume, or decays after a storm_window_secs '
+                    'gap, so resolve this L1 once the underlying cause is '
+                    'fixed.'
                 ),
                 level=1,
             )
@@ -7626,9 +7700,16 @@ class Harness:
             # fresh, under its per-task resume cap, and its transcript is
             # corroborated on disk. Any ineligible session degrades to a fresh
             # dispatch WITH the recovered plan (I3 — never a stall, never a
-            # scheduler-visible error), emitting a reason-carrying event. The
-            # kill switch (enabled=False) degrades silently (B6). Streak
-            # bookkeeping / storm-escape is layered in by task 2774 step-6.
+            # scheduler-visible error), emitting a reason-carrying event.
+            #
+            # The outcome is a FOUR-way split (task 3256):
+            #   eligible                     → inject; resets the storm streak.
+            #   disabled                     → silent: no event, no streak (B6).
+            #   BY DESIGN {capped, reseeded} → own event, streak untouched
+            #                                  (neither fed nor reset).
+            #   GENUINE {stale, no_transcript} → session_resume_fallback, feeds
+            #                                  the streak, storm-escape at
+            #                                  fallback_storm_threshold (INV-4).
             if recovered_session is not None:
                 eligible, reason = self._session_resume_eligible(
                     recovered_session, recovered_config_dir
@@ -7640,6 +7721,10 @@ class Harness:
                 }
                 if eligible:
                     self._session_resume_fallback_streak = 0  # break any storm run
+                    # Drop the chain's comparison point too, so the next
+                    # fallback starts a fresh run instead of chaining off a
+                    # pre-reset stamp (task 3256).
+                    self._last_session_resume_fallback_at = None
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,
@@ -7659,6 +7744,21 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data=resume_event_data,
                             )
+                    elif reason == 'reseeded':
+                        # By-design lane reseed (task 3256) — the acquire that
+                        # re-seeds from base wiped the transcript store, so this
+                        # fallback is EXPECTED, not a corroboration failure.
+                        # Keeps the session_resume_fallback event (the fallback
+                        # rate stays measurable — PRD open question 3) but, like
+                        # 'capped', neither feeds nor resets the storm streak:
+                        # a drip of reseeds must not mask a genuine systematic
+                        # failure interleaved between them.
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.session_resume_fallback,
+                                task_id=assignment.task_id,
+                                data={**resume_event_data, 'reason': reason},
+                            )
                     else:  # 'stale' / 'no_transcript' — genuine corroboration fail
                         if self.event_store:
                             self.event_store.emit(
@@ -7666,6 +7766,21 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data={**resume_event_data, 'reason': reason},
                             )
+                        # Rolling-window decay (task 3256): "consecutive" means
+                        # CHAINED within storm_window_secs, not merely
+                        # cumulative-per-boot — which is what makes this a
+                        # storm DETECTOR rather than a running total. A gap at
+                        # least as long as the window means the previous run
+                        # ended, so start counting over. Monotonic, not
+                        # wall-clock: 'stale' is itself produced by clock skew.
+                        now = time.monotonic()
+                        window = self.config.session_resume.storm_window_secs
+                        if (
+                            self._last_session_resume_fallback_at is not None
+                            and (now - self._last_session_resume_fallback_at) >= window
+                        ):
+                            self._session_resume_fallback_streak = 0
+                        self._last_session_resume_fallback_at = now
                         self._session_resume_fallback_streak += 1
                         if (
                             self._session_resume_fallback_streak

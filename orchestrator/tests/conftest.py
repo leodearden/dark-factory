@@ -5,6 +5,8 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import itertools
+import json
 import os
 import sys
 from pathlib import Path
@@ -58,6 +60,7 @@ from _orch_helpers import (  # noqa: E402
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
+    stamp_stock_routing_config,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -740,17 +743,185 @@ def _drain_async_mock_coroutines():
 
 
 @pytest.fixture
-def steward_worktree(tmp_path: Path) -> Path:
-    """Single-source the ``tmp_path``-rooted worktree dir for the ``_make_steward`` helpers.
+def make_steward(tmp_path: Path):
+    """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    This single-sources the literal; it is a convention, not an enforced
-    invariant — a test can still build its own path and pass that instead.
-    Lives in conftest.py because that is the only module every call-site file
-    reaches without a cross-module import, which would collide with their
-    function-local-import convention.  Does NOT create the directory —
-    ``_make_steward`` mkdir's it.
+    This is the suite's ONLY steward factory.  Task 3461 merged the two
+    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
+    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
+    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
+    ``mock_briefing`` names survive there as one-line views onto this factory's
+    build).  If you are here to add another, EXTEND this one instead.
+
+    Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
+    non-fixture helpers — because it must close over ``tmp_path`` to own the
+    worktree directory; ``mock_orch_config`` below is the same shape and the
+    precedent for it.
+
+    Worktree ownership — an ENFORCED invariant, not a convention: with no
+    ``worktree=`` argument the fixture picks a per-call directory (``tmp_path /
+    'wt'``, then ``'wt-2'``, ``'wt-3'``, …) and creates it plus a ``.task`` subdir,
+    so the common case is structurally safe, no caller needs to name a path, and
+    two default builds in one test never share mutable state (``.task/`` and the
+    ``.task-meta`` sibling that holds ``verdicts/triage.json``).  A
+    caller-supplied path is asserted to resolve *strictly below* ``tmp_path``
+    before anything is created, because the steward derives its artifacts root as
+    a SIBLING of the worktree — ``<worktree.parent>/.task-meta/<worktree.name>``,
+    see ``TASK_META_DIRNAME`` in ``orchestrator/config.py`` and
+    ``TaskArtifacts.meta_root_for`` in ``orchestrator/artifacts.py`` — so
+    ``worktree=tmp_path`` would put that sibling outside the directory pytest's
+    retention policy reclaims.
+
+    Optional keyword arguments, all defaulting to the common case:
+      - ``worktree`` — a caller-owned path (must be strictly below ``tmp_path``;
+        omit it and let the fixture own the directory)
+      - ``config_overrides`` — a dict applied LAST, so it wins over every default
+        below (``test_steward.py``'s ``steward_max_attempts=1`` rides this channel)
+      - ``task`` — the task dict; ``task_id`` is derived from ``task['id']`` so
+        the two can never disagree
+      - ``event_store`` / ``cost_store`` — forwarded verbatim
+      - ``escalation_queue`` — substitutes a caller-built queue (e.g. a real
+        filesystem-backed ``EscalationQueue``) for the mock one; when supplied,
+        no mock queue is built and the caller's own ``queue_dir`` is left alone
+
+    Config defaults applied (union of what all four former factories set; a
+    caller overrides any of them via ``config_overrides``, applied last):
+      - ``project_root`` = ``tmp_path / 'project'`` (created)
+      - ``steward_lifetime_budget`` = 12.0, ``steward_max_attempts`` = 3
+      - ``steward_max_timeouts_per_escalation`` = 3,
+        ``steward_max_empty_outputs_per_escalation`` = 2
+      - ``suggestion_triage_threshold`` = 10
+      - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
+      - ``escalation.host`` / ``escalation.port``
+      - ``timeouts.steward`` / ``steward_completion_timeout`` — the
+        spawn/completion-timeout path
+      - ``fused_memory.url`` / ``fused_memory.project_id``
+      - ``stamp_stock_routing_config(config)`` — real ``routing.*`` containers, so
+        anything NOT patching the invoke seam reaches the real ``resolve_route``
+        (which does membership/dict ops a bare ``MagicMock`` cannot satisfy)
+
+    Collaborator defaults: the mock queue's ``queue_dir`` is derived from the
+    fixture-owned worktree (``<worktree.parent>/<worktree.name>-escalations``,
+    created) so it is unique per build and inside the sandbox — ``steward.py``
+    reads it into the escalation-watcher argv, making it real mutable state.
+    ``mcp.url``, both briefing prompt builders (as ``AsyncMock``s), and a
+    ``.task/`` seeded with ``metadata.json`` + ``plan.json`` round out the union.
+
+    The config mock is ``spec_set``'d against ``OrchestratorConfig`` so a typo'd
+    field name raises ``AttributeError`` on both read and write.
     """
-    return tmp_path / 'wt'
+    # Per-call counter so repeated default builds get isolated directories.
+    default_worktree_count = itertools.count(1)
+
+    def _make(
+        *,
+        worktree: Path | None = None,
+        config_overrides: dict | None = None,
+        task: dict | None = None,
+        event_store=None,
+        cost_store=None,
+        escalation_queue=None,
+    ):
+        from orchestrator.steward import TaskSteward
+
+        if task is None:
+            task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
+
+        if worktree is None:
+            n = next(default_worktree_count)
+            worktree = tmp_path / ('wt' if n == 1 else f'wt-{n}')
+        else:
+            # Checked BEFORE any mkdir, so a rejected path is never created.
+            resolved, root = worktree.resolve(), tmp_path.resolve()
+            if resolved == root or not resolved.is_relative_to(root):
+                raise AssertionError(
+                    f'make_steward(worktree={worktree!r}) must be strictly below this '
+                    f"test's tmp_path ({tmp_path}). The steward derives its .task-meta "
+                    'artifacts root as <worktree.parent>/.task-meta/<worktree.name> '
+                    '(orchestrator/config.py:TASK_META_DIRNAME, artifacts.meta_root_for), '
+                    'so a worktree AT tmp_path lands them in tmp_path.parent — outside '
+                    'the directory pytest reclaims. Pass a sub-path, or omit the kwarg '
+                    'and let the fixture own the dir.'
+                )
+        worktree.mkdir(parents=True, exist_ok=True)
+        task_dir = worktree / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'metadata.json').write_text(json.dumps({'task_id': task['id']}))
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': []}))
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        project_root = tmp_path / 'project'
+        project_root.mkdir(parents=True, exist_ok=True)
+        config.project_root = project_root
+        config.steward_lifetime_budget = 12.0
+        config.steward_max_attempts = 3
+        config.steward_max_timeouts_per_escalation = 3
+        config.steward_max_empty_outputs_per_escalation = 2
+        config.suggestion_triage_threshold = 10
+        config.models.triage = 'sonnet'
+        config.budgets.triage = 2.0
+        config.max_turns.triage = 25
+        config.effort.triage = 'medium'
+        config.backends.triage = 'claude'
+        config.models.steward = 'opus'
+        config.budgets.steward = 5.0
+        config.max_turns.steward = 100
+        config.effort.steward = 'high'
+        config.backends.steward = 'claude'
+        config.escalation.host = '127.0.0.1'
+        config.escalation.port = 8100
+        config.timeouts.steward = 1800.0
+        config.steward_completion_timeout = 300.0
+        config.fused_memory.url = 'http://localhost:8002'
+        config.fused_memory.project_id = 'dark_factory'
+        # Real routing.* containers: anything not patching the invoke seam reaches
+        # the real resolve_route, which does membership/dict ops a bare MagicMock
+        # child cannot satisfy.  Stock values => byte-equivalent role_default routes.
+        stamp_stock_routing_config(config)
+        for k, v in (config_overrides or {}).items():
+            setattr(config, k, v)
+
+        if escalation_queue is None:
+            queue = MagicMock()
+            queue.make_id.return_value = 'esc-42-1'
+            queue.get_by_task.return_value = []
+            queue.get.return_value = None
+            # Derived from the (already per-build) fixture-owned worktree rather
+            # than a flat tmp_path literal: steward.py reads queue_dir into the
+            # escalation-watcher argv, so two builds sharing one would be shared
+            # mutable state.  A caller-supplied queue owns its own directory and
+            # is never re-stamped.
+            queue.queue_dir = worktree.parent / f'{worktree.name}-escalations'
+            queue.queue_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            queue = escalation_queue
+
+        briefing = AsyncMock()
+        briefing.build_steward_initial_prompt = AsyncMock(return_value='initial prompt')
+        briefing.build_steward_continuation_prompt = AsyncMock(
+            return_value='continuation prompt'
+        )
+
+        mcp = MagicMock()
+        mcp.url = 'http://localhost:8002'
+        mcp.mcp_config_json.return_value = {'mcpServers': {}}
+
+        return TaskSteward(
+            task_id=task['id'],
+            task=task,
+            worktree=worktree,
+            config=config,
+            mcp=mcp,
+            escalation_queue=queue,
+            briefing=briefing,
+            usage_gate=None,
+            event_store=event_store,
+            cost_store=cost_store,
+        )
+
+    return _make
 
 
 @pytest.fixture

@@ -622,6 +622,43 @@ class TestScorePlanStructure:
 
 
 # ---------------------------------------------------------------------------
+# clamp_unit_score — THE single output-range contract for BOTH plan-quality
+# instruments (task 3410)
+#
+# score_plan_structure and judge_plan_quality reduce onto the SAME axis
+# (EvalMetrics.plan_quality), so — exactly as is_scorable_plan (below) is the
+# ONE scorability predicate both instruments call — clamp_unit_score is the
+# ONE range/rounding contract both instruments call. Pinning it directly here
+# is the anti-drift anchor: a future edit to either instrument cannot drift
+# the range behaviour without also breaking this class.
+# ---------------------------------------------------------------------------
+
+class TestClampUnitScore:
+    @pytest.mark.parametrize('score', [0.0, 0.5, 1.0])
+    def test_in_range_values_pass_through_unchanged(self, score):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(score) == score
+
+    def test_above_range_clamps_to_the_upper_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(1.5) == 1.0
+        assert clamp_unit_score(42) == 1.0
+
+    def test_below_range_clamps_to_the_lower_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(-0.4) == 0.0
+
+    def test_result_is_rounded_to_four_decimal_places(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        # Exact — verified by execution, not a tuned tolerance.
+        assert clamp_unit_score(0.123456789) == 0.1235
+
+
+# ---------------------------------------------------------------------------
 # is_scorable_plan — THE single "does this artifact carry model content?" test
 # (3118 step-19/20)
 #
@@ -685,6 +722,33 @@ def _judge_task() -> dict:
         'name': 'implement the widget',
         'task_definition': {'description': 'implement the widget correctly'},
     }
+
+
+def _judge_result_scoring(raw, *, via: str) -> MagicMock:
+    """A judge invoke_agent result reporting ``plan_quality=raw``, delivered via
+    *via* (``'structured_output'`` or ``'json_output'``).
+
+    That delivery choice is the ONLY difference between the two mocks. It
+    matters in PRODUCTION — ``PLAN_QUALITY_SCHEMA``'s ``{'minimum': 0.0,
+    'maximum': 1.0}`` binds a real ``structured_output`` response but not the
+    ``json.loads(result.output)`` fallback (see ``clamp_unit_score``'s
+    docstring in judge.py) — but NOT in this mock: a ``MagicMock`` enforces no
+    schema either way, so both deliveries reach the parser with *raw*
+    unchecked here. What the ``via`` parametrization actually pins is that the
+    clamp/NaN handling lives AFTER the ``structured_output or
+    json.loads(...)`` merge point, so neither delivery path can regress
+    independently of the other.
+    """
+    payload = {'plan_quality': raw, 'per_criterion': {}, 'reasoning': 'r'}
+    fake = MagicMock()
+    if via == 'structured_output':
+        fake.structured_output = payload
+    elif via == 'json_output':
+        fake.structured_output = None
+    else:
+        raise ValueError(f'unknown via: {via!r}')
+    fake.output = json.dumps(payload)
+    return fake
 
 
 @pytest.mark.asyncio
@@ -821,6 +885,172 @@ class TestJudgePlanQuality:
                 _well_formed_plan(), 'diff', _judge_task(),
             )
         assert verdict.plan_quality is None
+
+    # -- Output-range contract (task 3410) --------------------------------
+    # score_plan_structure has always clamped+rounded to [0, 1]/4dp
+    # (judge.py:396). judge_plan_quality's parse block did not (see
+    # clamp_unit_score's docstring in judge.py for why the schema bound alone
+    # is not enough). Both delivery paths are covered so that hole cannot
+    # hide behind a structured-output-only test.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range-clamps-high'),
+        pytest.param(42, 1.0, id='far-above-range-clamps-high'),
+        pytest.param(-0.4, 0.0, id='below-range-clamps-low'),
+        pytest.param(0.123456789, 0.1235, id='rounds-to-4dp-parity-with-floor'),
+    ])
+    async def test_parsed_score_is_clamped_and_rounded_regardless_of_delivery_path(
+        self, raw, expected, via,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.plan_quality, float)
+        assert 0.0 <= verdict.plan_quality <= 1.0
+        assert verdict.plan_quality == expected
+
+    # -- Loud-over-silent: an out-of-contract answer leaves a WARNING (3410) --
+    # docs/legibility/design-invariants.md loud-over-silent /
+    # structured-facts-at-failure — the same discipline the unjudgeable-
+    # artifact guard's WARNING already follows (judge.py:514).
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range'),
+        pytest.param(-0.4, 0.0, id='below-range'),
+    ])
+    async def test_out_of_range_answer_leaves_exactly_one_warning_naming_it(
+        self, via, raw, expected, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        # Both clamp directions are pinned, not just the above-range case —
+        # the warning text is built from raw_quality!r / plan_quality!r, so a
+        # future edit that only warns on raw_quality > 1.0 would keep every
+        # above-range assertion green while silently dropping the low-side
+        # signal.
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]  # WHICH cell to go look at
+        assert repr(raw) in warnings[0]       # the raw out-of-range value
+        assert repr(expected) in warnings[0]  # the substituted value
+
+        # The verdict is otherwise intact: a corrected CONTENT answer, never
+        # an infra refusal (3118 exclusion shape) or a parse failure.
+        assert verdict.plan_quality == expected
+        assert verdict.invocation_error is None
+        assert verdict.per_criterion == {}
+        assert verdict.reasoning == 'r'
+
+    async def test_in_range_answer_emits_no_warning(self, caplog):
+        """CONTROL — without this, the warning fires on every judge call and
+        stops meaning anything.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(
+                return_value=_judge_result_scoring(0.83, via='structured_output'),
+            ),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == 0.83
+        assert _judge_warnings(caplog) == []
+
+    # -- The hole a bare clamp leaves open: NaN (task 3410) ----------------
+    # NaN is unordered, so a bare clamp does NOT keep plan_quality in [0, 1]
+    # (see clamp_unit_score's docstring in judge.py for the mechanics). A NaN
+    # would be persisted verbatim by runner.py and poison
+    # report._mean_plan_quality. json.loads('{"plan_quality": NaN}')
+    # SUCCEEDS in CPython, so this is reachable through the same
+    # schema-bypassing path the rest of this task is about — not
+    # hypothetical.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    async def test_nan_answer_degrades_to_the_none_sentinel_not_a_nan(
+        self, via, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(float('nan'), via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        # The existing sentinel run_architect_eval already degrades to the
+        # deterministic structural floor on — never a NaN laundered into a
+        # number a downstream mean could be poisoned by.
+        assert verdict.plan_quality is None
+        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
+        # exclusion shape.
+        assert verdict.invocation_error is None
+        # Same degraded shape the parse-failure fallback uses — pinned here
+        # too, not just plan_quality, so a future edit can't quietly leave
+        # per_criterion/reasoning out of step with that documented shape.
+        assert verdict.per_criterion == {}
+        assert 'nan' in verdict.reasoning.lower()
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]           # WHICH cell
+        assert 'nan' in warnings[0].lower()            # WHAT was wrong
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(float('inf'), 1.0, id='positive-infinity-clamps-high'),
+        pytest.param(float('-inf'), 0.0, id='negative-infinity-clamps-low'),
+    ])
+    async def test_infinity_clamps_because_it_is_orderable_unlike_nan(
+        self, raw, expected, via, caplog,
+    ):
+        """DELIBERATE asymmetry, documented in one place: infinity IS
+        orderable, so the clamp has a defined answer; NaN is not, so it has
+        none. Parametrized over both delivery paths like the sibling
+        range/NaN tests above, so this path isn't only covered on the
+        structured_output mock.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == expected
+        # Infinity is out-of-range-but-orderable, so it takes the SAME
+        # clamp-and-warn path as any other out-of-contract answer (e.g.
+        # 1.5) — exactly one WARNING, never silent.
+        assert len(_judge_warnings(caplog)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1048,9 +1278,10 @@ class TestArchitectEvalConfigs:
         assert cfg.role == 'architect'
 
     def test_architect_fable_candidate_added_existing_byte_unchanged(self):
-        """eval-revival π: architect-fable-high joins ARCHITECT_EVAL_CONFIGS.
+        """eval-revival π/ρ: architect-fable-high and architect-fable-max join
+        ARCHITECT_EVAL_CONFIGS.
 
-        Parity discipline (eval-revival decision 11): the three pre-existing
+        Parity discipline (eval-revival decision 11): the four pre-existing
         candidates stay byte-unchanged (dataclass equality) when a new
         candidate is appended; the new candidate is config-only — it rides
         run_ofat_stage's existing generic role='architect' branch (task 2478).
@@ -1061,6 +1292,7 @@ class TestArchitectEvalConfigs:
             EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
             EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
             EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
         ]
         by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
         for expected in existing:
@@ -1072,11 +1304,48 @@ class TestArchitectEvalConfigs:
         assert fable.effort == 'high'
         assert fable.role == 'architect'
 
+        # architect-fable-max's field-level shape (backend/model/effort/role)
+        # is pinned by test_architect_fable_max_is_effort_matched_to_opus_incumbent
+        # below, not duplicated here — this test's job is parity + membership.
         assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
             'architect-opus-high',
             'architect-opus-max',
             'architect-sonnet-high',
             'architect-fable-high',
+            'architect-fable-max',
+        }
+
+    def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
+        """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
+
+        Per the OFAT methodology (mirroring JUDGE_EVAL_CONFIGS: "effort fixed →
+        ONLY the model varies"), architect-fable-max holds effort/role/backend
+        equal to its architect-opus-max incumbent and varies EXACTLY the model
+        axis. v1's screen compared fable@high against opus@max — a confound —
+        so fable-trial-v2 δ's stage-2 screen needs this effort-matched pair to
+        isolate the model delta cleanly.
+        """
+        from orchestrator.evals.configs import get_config_by_name, ofat_candidates
+
+        cfg = get_config_by_name('architect-fable-max')
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5'
+        assert cfg.effort == 'max'
+        assert cfg.role == 'architect'
+        # A native cloud claude candidate, never a proxied bundle (the same
+        # discriminator _cloud_implementer_incumbents uses).
+        assert not cfg.env_overrides
+
+        incumbent = get_config_by_name('architect-opus-max')
+        assert incumbent is not None
+        assert cfg.effort == incumbent.effort
+        assert cfg.role == incumbent.role
+        assert cfg.backend == incumbent.backend
+        assert cfg.model != incumbent.model
+
+        assert 'architect-fable-max' in {
+            c.name for c in ofat_candidates() if c.role == 'architect'
         }
 
 

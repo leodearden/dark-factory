@@ -82,6 +82,7 @@ _EXPECTED_SWEPT_PATHS = frozenset(
         "scripts/orchestrator-dark-factory.service",
         "scripts/orchestrator-know-live.service",
         "scripts/orchestrator-my-solar-challenge.service",
+        "scripts/orchestrator-pump-web-ui.service",
         "scripts/orchestrator-reify.service",
         "scripts/orchestrator-solar-challenge-platform.service",
     }

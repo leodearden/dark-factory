@@ -1453,12 +1453,16 @@ async def invoke_with_cap_retry(
                     # whether r2 recalls the codeword given a transcript that is
                     # present after r1.
                     #
-                    # CAVEAT worth knowing before trusting a future red run: the
-                    # cap message above is NOT matched by that module's
-                    # _looks_like_capacity_failure (its marker is "you've hit your
-                    # usage", the real text is "you've hit your weekly limit"), so
-                    # a capped second account does not skip — it fails the ZEPPELIN
-                    # assertion loudly and looks exactly like lost context.
+                    # That re-run is now trustworthy: when this measurement was
+                    # taken, the cap message above was NOT matched by the test
+                    # module's skip guard (its marker was "you've hit your usage",
+                    # the real text is "you've hit your weekly limit"), so a
+                    # capped second account failed the ZEPPELIN assertion loudly
+                    # and looked exactly like lost context. Task 3483 closed that
+                    # gap — the guard now lives in tests/_capacity_skip.py, is
+                    # pinned against this exact string, and is cross-checked
+                    # against invocation_outcome.classify_invocation so the two
+                    # cannot drift apart again. A capped account SKIPS.
                     # ------------------------------------------------------------------
                     # Resume the capped session on the next account if possible.
                     #

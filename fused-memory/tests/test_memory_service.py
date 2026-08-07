@@ -80,6 +80,17 @@ def service(mock_config):
     # Default read payload carries BOTH mem0-owned keys and custom provenance
     # keys, so the preservation assertions have something to preserve.
     svc.mem0.get_point_by_id = AsyncMock(return_value=dict(DEFAULT_POINT_PAYLOAD))
+    # REQUIRED SETUP, not decoration (task 3198, leaf ε) — do not delete.
+    # `svc.mem0` is a bare MagicMock, so the canonical-uniqueness re-check at
+    # `_apply_memory_metadata_validation` would hit
+    # `await svc.mem0.count_by_metadata(...)` → `TypeError: object MagicMock
+    # can't be used in 'await' expression`, breaking already-green tests that
+    # merely write `canonical: True` (e.g.
+    # TestMemoryMetadataValidationAtSeam::test_valid_metadata_round_trips_to_the_backend).
+    # `0` / `[]` mean "no incumbent", the correct default for every
+    # pre-existing test; `_mm_set_canonical_incumbent` flips them per-test.
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     # Mock durable queue
     svc.durable_queue = MagicMock()
@@ -9119,6 +9130,159 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         )
 
 
+class TestScanMemoryContent:
+    """MemoryService.scan_memory_content delegates to mem0.scan_payload_text.
+
+    Task 3083, WORK (b): a LITERAL substring scan over Qdrant payload text.
+    Neither semantic (`search`) nor metadata equality (`scroll_by_metadata`) —
+    the gap that made the tool-call XML leak corpus unsweepable, since a
+    leaked fragment carries almost no semantic signal.
+
+    Sentinel literals use the \x3c escape for "<" (plan pre-1).
+    """
+
+    _CLOSE_CONTENT = '\x3c/content>'
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_scan_payload_text_with_scope(self, mock_config):
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 3, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(
+            project_id='dark_factory',
+            needles=[self._CLOSE_CONTENT],
+            filters={'category': 'procedural_knowledge'},
+            exhaustive=True,
+            limit=500,
+        )
+
+        svc.mem0.scan_payload_text.assert_awaited_once()
+        call = svc.mem0.scan_payload_text.call_args
+        scope = call.kwargs.get('scope') or call.args[0]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+        assert call.kwargs['needles'] == [self._CLOSE_CONTENT]
+        assert call.kwargs['filters'] == {'category': 'procedural_knowledge'}
+        assert call.kwargs['exhaustive'] is True
+        assert call.kwargs['limit'] == 500
+
+    @pytest.mark.asyncio
+    async def test_returns_the_backend_result_unchanged(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        expected = {
+            'matches': [{'id': 'a', 'created_at': None, 'matched_fragments': [],
+                         'excerpt': 'x', 'metadata': {}}],
+            'scanned': 19321,
+            'truncated': False,
+        }
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(return_value=expected)
+
+        assert await svc.scan_memory_content(project_id='dark_factory') == expected
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_semantic_search(self, mock_config):
+        """This is deterministic detection, not similarity ranking. Falling back
+        to search would silently drop matches off the bottom of a top-N cut."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        svc.mem0.search = AsyncMock(return_value={'results': []})
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        svc.mem0.search.assert_not_called()
+        svc.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_mutate_the_callers_collections(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        needles = [self._CLOSE_CONTENT]
+        filters = {'category': 'procedural_knowledge'}
+
+        await svc.scan_memory_content(
+            project_id='dark_factory', needles=needles, filters=filters
+        )
+
+        assert needles == [self._CLOSE_CONTENT]
+        assert filters == {'category': 'procedural_knowledge'}
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is not needles
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is not filters
+
+    @pytest.mark.asyncio
+    async def test_none_needles_and_filters_pass_through_as_none(self, mock_config):
+        """Defaulting belongs to the backend, which reads the shared sentinels —
+        the service must not invent a second default list."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is None
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with pytest.raises(TimeoutError):
+            await svc.scan_memory_content(project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_an_int_task_id_filter_is_normalized_to_str(self, mock_config):
+        """Matches the sibling metadata-matching read paths
+        (count_memories_by_metadata / get_memories_by_metadata).
+
+        The backend turns each filter entry into a MatchValue equality
+        condition and Qdrant's payload filter is TYPE-SENSITIVE, while the
+        write paths store task_id normalized to str. Without this,
+        `filters={'task_id': 3083}` returns zero matches with no error — a
+        silently-wrong empty result, which is the exact failure class this tool
+        exists to eliminate.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        filters = {'task_id': 3083}
+
+        await svc.scan_memory_content(project_id='dark_factory', filters=filters)
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] == {'task_id': '3083'}
+        # The normalization happens on the COPY, never the caller's dict.
+        assert filters == {'task_id': 3083}
+
+
 class TestGetMemoriesByMetadata:
     """MemoryService.get_memories_by_metadata delegates to mem0.scroll_by_metadata."""
 
@@ -10182,6 +10346,28 @@ def _mm_install_journal(svc):
     return journal
 
 
+def _mm_set_canonical_incumbent(svc, incumbent_id, *, topic='some-topic', count=1):
+    """Make *svc* report an existing canonical record and return it.
+
+    REQUIRED SETUP for every canonical-uniqueness case, not decoration — do
+    not delete it.  The shared ``service`` fixture stubs
+    ``mem0.count_by_metadata``/``scroll_by_metadata`` to ``0``/``[]``, i.e.
+    "no incumbent", which is the right default for every OTHER test but makes
+    the uniqueness branch UNREACHABLE.  Without this flip a
+    ``pytest.raises(CanonicalUniquenessViolation)`` case would fail, and an
+    ``assert_not_called()`` case would pass for the wrong reason — proving
+    nothing about the re-check while looking like it did.
+
+    *count* is settable independently of the scroll result so the count/scroll
+    race (count says 1, scroll comes back empty) can be staged explicitly.
+    """
+    record = {'id': incumbent_id, 'created_at': '2026-01-01T00:00:00Z',
+              'metadata': {'topic': topic, 'canonical': True}}
+    svc.mem0.count_by_metadata = AsyncMock(return_value=count)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[record])
+    return record
+
+
 def _mm_configure_project_root(svc, root):
     """Give *svc* a ``taskmaster.project_root`` and return it.
 
@@ -10556,3 +10742,383 @@ class TestMemoryMetadataValidationAtSeam:
         service.config.memory_metadata.enforce = True
         with pytest.raises(MemoryMetadataValidationError):
             await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+
+class TestCanonicalUniquenessAtSeam:
+    """<=1 canonical memory per (project, topic) — the live INV-3 re-check.
+
+    Task 3198 (leaf ε). This is the only half of `canonical` that needs
+    live store state, so it lives at the async seam rather than in the
+    pure validator. Every case runs against BOTH entry points: D8/§2 pin
+    enforcement here precisely so `add_system_record` cannot bypass it.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_second_canonical_is_rejected_and_names_the_incumbent(
+        self, service, entry_point
+    ):
+        """V1: the incumbent is NAMED, not merely counted.
+
+        A bare "a canonical already exists" would leave the operator with
+        nothing to go look at; naming the id is the contract-fixed
+        obligation, and the reason the seam scrolls after counting.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert self._INCUMBENT in str(excinfo.value)
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_rejection_happens_before_any_persistence(self, service, entry_point):
+        """Nothing may reach the backend once the write is doomed."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejection_leaves_no_pending_mem0_intent(self, service):
+        """A rejected write must leave nothing for `recover_mem0_intents`.
+
+        The write-ahead intent is logged before the backend call, so a
+        check that ran too late would reject the write and STILL leave a
+        pending intent that recovery would later replay — resurrecting
+        precisely the duplicate canonical this rule forbids.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_uniqueness_is_scoped_to_project_and_topic(self, service, entry_point):
+        """INV-3 scoping is exact: the key is (project, topic), not global.
+
+        A filter missing `canonical` would count every memory in the
+        topic; one missing `topic` would make the rule global and reject
+        the SECOND canonical anywhere. Both would pass a laxer assertion
+        that only checked that a count happened.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+
+        expected_filters = {'topic': self._TOPIC, 'canonical': True}
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == expected_filters
+        scope = call.kwargs.get('scope', call.args[0] if call.args else None)
+        assert 'dark_factory' in str(scope), f'the count must be project-scoped, got {scope!r}'
+
+        # The follow-up scroll must be scoped IDENTICALLY and bounded.
+        # Unasserted, a regression that dropped `canonical` from these
+        # filters would name a non-canonical record as the incumbent, and
+        # one that dropped the limit would scroll the 1000-row default on
+        # the failing path — both stay green against the stub, which
+        # returns the same record no matter what it is asked for.
+        service.mem0.scroll_by_metadata.assert_awaited_once()
+        scroll = service.mem0.scroll_by_metadata.await_args
+        scroll_filters = scroll.kwargs.get(
+            'filters', scroll.args[1] if len(scroll.args) > 1 else None
+        )
+        assert scroll_filters == expected_filters
+        scroll_scope = scroll.kwargs.get('scope', scroll.args[0] if scroll.args else None)
+        assert 'dark_factory' in str(scroll_scope), (
+            f'the scroll must be project-scoped, got {scroll_scope!r}'
+        )
+        scroll_limit = scroll.kwargs.get(
+            'limit', scroll.args[2] if len(scroll.args) > 2 else None
+        )
+        assert scroll_limit == 1, (
+            f'the incumbent lookup needs exactly one row, got limit={scroll_limit!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_first_canonical_for_a_topic_succeeds(self, service, entry_point):
+        """POSITIVE CONTROL — without it the assert_not_called cases above
+        cannot distinguish "correctly rejected" from "this branch is dead".
+
+        The fixture default is count=0, i.e. no incumbent.
+        """
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+        meta = _mm_backend_meta(service, entry_point)
+        assert meta['canonical'] is True
+        assert meta['topic'] == self._TOPIC
+        if entry_point == 'add_memory':
+            journal.log_mem0_intent.assert_called()
+
+    # -- shipped default: warn, do not reject -----------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_warn_mode_censuses_but_does_not_reject(
+        self, service, entry_point, caplog
+    ):
+        """THE regression that protects the live fleet.
+
+        Uniqueness must honour the same `enforce` flag every sibling fatal
+        check honours. The one real `canonical: true` record in
+        dark_factory carries topic `eval_worktree_plan_tools_missing`
+        (snake_case), so a shipped-on enforce would start rejecting
+        canonical writes against a corpus leaf θ has not normalized yet --
+        exactly the census-refuted-premise outage the warn default exists
+        to prevent.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'canonical_uniqueness_violation' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_enforce_is_read_per_call_not_captured(self, service):
+        """A config edit must take effect on the NEXT write."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        meta = {'topic': self._TOPIC, 'canonical': True}
+
+        await _mm_write(service, 'add_memory', metadata=dict(meta))
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(service, 'add_memory', metadata=dict(meta))
+
+    # -- no wasted I/O on the ordinary path --------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize(
+        ('metadata', 'expected_code'),
+        [
+            ({'topic': 'some-topic'}, None),
+            ({'kind': 'cycle_summary'}, None),
+            ({'canonical': False, 'topic': 'some-topic'}, None),
+            ({'canonical': True}, 'canonical_without_topic'),
+            ({'canonical': True, 'topic': 'bad_slug'}, 'invalid_topic_slug'),
+        ],
+    )
+    async def test_no_round_trip_on_the_ordinary_path(
+        self, service, entry_point, metadata, expected_code, caplog
+    ):
+        """The guards must short-circuit BEFORE any await.
+
+        The last two cases also assert their census code, so "no query
+        issued" is proven to be the guard working rather than the whole
+        check being dead — an assertion that would otherwise pass just as
+        happily against a deleted feature.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(service, entry_point, metadata=dict(metadata))
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        if expected_code is not None:
+            assert expected_code in _mm_census_codes(caplog)
+
+    # -- race resilience ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_count_scroll_race_still_yields_a_structured_rejection(
+        self, service, entry_point
+    ):
+        """Count says 1, scroll comes back empty (concurrent delete).
+
+        The rejection must survive with a sentinel id rather than dying on
+        `records[0]` — an IndexError on the live write path would turn a
+        clean policy rejection into an unhandled crash.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.incumbent_id  # a sentinel, never empty or absent
+
+    # -- the probe itself failing ------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_does_not_fail_the_write_in_warn_mode(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """A Qdrant blip must not fail an otherwise-valid canonical write.
+
+        Both probes hit Qdrant and `count_by_metadata` PROPAGATES a read
+        timeout by contract, so without handling, an unrelated Mem0 outage
+        turns a valid write into an error at the MCP boundary — under the
+        SHIPPED default, whose documented contract is "census the
+        violation and let the write proceed". Worse, this seam runs before
+        store routing, so it could fail a Graphiti-primary write that
+        never touches Mem0 at all.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'canonical_uniqueness_check_unavailable' in codes, (
+            'degradation must be LOUD — a swallowed probe failure is '
+            'indistinguishable from a clean uniqueness check'
+        )
+        # It must NOT claim a duplicate it never observed.
+        assert 'canonical_uniqueness_violation' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_fails_closed_under_enforce(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """Under enforce the operator asked for the invariant to HOLD.
+
+        Admitting a canonical whose uniqueness could not be verified would
+        be the silent fail-soft the house norm forbids. The real backend
+        error surfaces as itself rather than as a
+        CanonicalUniquenessViolation — "the store was unreachable" and "a
+        duplicate exists" are different facts.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert not isinstance(excinfo.value, CanonicalUniquenessViolation)
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        assert 'canonical_uniqueness_check_unavailable' in _mm_census_codes(caplog)
+
+    # -- scope: the invariant is Mem0-scoped -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_only_checked_against_mem0(
+        self, service, caplog
+    ):
+        """PINS the known scope limit so the silence cannot read as coverage.
+
+        Both probes are Qdrant payload filters, but the seam deliberately
+        runs BEFORE the write_graphiti/write_mem0 branching. So for a
+        Graphiti-primary category the probe still runs (dual_write can
+        route any category into Mem0, which is why it is not skipped on
+        category alone) but can only ever see Mem0 rows — a
+        previously-written Graphiti-only canonical is invisible to it and
+        the <=1-per-(project, topic) rule does NOT hold there.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        # No Mem0 twin: exactly the state a Graphiti-only canonical leaves.
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category='decisions_and_rationale',
+        )
+
+        # The probe IS issued even though this write never reaches Mem0...
+        service.mem0.count_by_metadata.assert_awaited_once()
+        # ...and, seeing no Mem0 row, admits the write. Documented residual,
+        # not an oversight: closing it needs a Graphiti-side count the PRD
+        # does not specify. See _check_canonical_uniqueness's SCOPE note.
+        assert 'canonical_uniqueness_violation' not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_rejected_when_a_mem0_twin_exists(
+        self, service
+    ):
+        """POSITIVE CONTROL for the scope test above.
+
+        Without it, "no rejection for decisions_and_rationale" could not
+        distinguish the documented Mem0 scope from the check simply being
+        dead for Graphiti-primary categories.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category='decisions_and_rationale',
+            )

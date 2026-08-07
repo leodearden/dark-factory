@@ -264,6 +264,91 @@ class TestDoneProvenance:
             DoneProvenance(kind='operational-bogus')  # type: ignore[arg-type]
 
 
+class TestDoneProvenanceStampedAt:
+    """``stamped_at`` — the server-written stamp-write timestamp (task 3576).
+
+    Declared (not merely tolerated via ``extra='allow'``) so it gets type
+    enforcement, a ``None`` default on attribute access, and ``model_fields``
+    visibility. Deliberately OPTIONAL: ~193 historical ``found_on_main``
+    blobs predate the field, and its ABSENCE is load-bearing signal meaning
+    "this stamp predates task 3576" for the found_on_main soak-gate predicate.
+    """
+
+    def test_stamped_at_is_a_declared_field(self):
+        # Not just tolerated as an `extra` — declared, so it carries a type
+        # and a default rather than being an untyped passthrough.
+        assert 'stamped_at' in DoneProvenance.model_fields
+
+    def test_absent_stamped_at_reads_as_none(self):
+        # A legacy blob supplies no stamped_at; attribute access must yield
+        # None rather than raising AttributeError (which is what an
+        # extra='allow' passthrough would do).
+        dp = DoneProvenance(kind='found_on_main', commit='abc123', note='landed in 999')
+        assert dp.stamped_at is None
+
+    def test_stamped_at_string_is_retained(self):
+        dp = DoneProvenance(
+            kind='found_on_main',
+            commit='abc123',
+            note='landed in 999',
+            stamped_at='2026-08-06T01:00:00+00:00',
+        )
+        assert dp.stamped_at == '2026-08-06T01:00:00+00:00'
+        assert dp.model_dump()['stamped_at'] == '2026-08-06T01:00:00+00:00'
+
+    def test_non_string_stamped_at_rejected(self):
+        # extra='allow' would happily accept an int epoch; the declared
+        # `str | None` must reject it.
+        with pytest.raises(ValidationError):
+            DoneProvenance(
+                kind='found_on_main',
+                commit='abc123',
+                note='landed in 999',
+                stamped_at=1754179200,  # type: ignore[arg-type]
+            )
+
+    def test_stamped_at_not_required_for_found_on_main(self):
+        # The conditional-requirements validator must NOT be extended: a
+        # required stamped_at would fail every one of the ~193 historical
+        # blobs at read time.
+        DoneProvenance(kind='found_on_main', commit='abc123', note='landed in 999')
+
+    def test_legacy_blob_round_trips_through_parse_metadata_without_warnings(self):
+        blob = {
+            'done_provenance': {
+                'kind': 'found_on_main',
+                'commit': 'abc123',
+                'note': 'landed in 999',
+            }
+        }
+        model, warnings = parse_metadata(copy.deepcopy(blob), direction='read')
+        assert warnings == []
+        assert isinstance(model.done_provenance, DoneProvenance)
+        assert model.done_provenance.stamped_at is None
+        # exclude_none mirrors how fused-memory persists the blob, so an
+        # absent stamped_at stays absent rather than materialising as null.
+        dumped = model.model_dump(exclude_none=True)['done_provenance']
+        assert dumped == blob['done_provenance']
+        assert 'stamped_at' not in dumped
+
+    @pytest.mark.parametrize('direction', ['read', 'write'])
+    def test_stamped_at_round_trips_through_parse_metadata(self, direction):
+        blob = {
+            'done_provenance': {
+                'kind': 'found_on_main',
+                'commit': 'abc123',
+                'note': 'landed in 999',
+                'stamped_at': '2026-08-06T01:23:45.678901+00:00',
+            }
+        }
+        model, warnings = parse_metadata(copy.deepcopy(blob), direction=direction)
+        assert warnings == []
+        assert isinstance(model.done_provenance, DoneProvenance)
+        assert model.done_provenance.stamped_at == '2026-08-06T01:23:45.678901+00:00'
+        # I1 round-trip preservation: the exact string survives verbatim.
+        assert model.model_dump(exclude_none=True)['done_provenance'] == blob['done_provenance']
+
+
 class TestMemoryHints:
     def test_constructs_with_values(self):
         mh = MemoryHints(entities=['E'], queries=['Q'])

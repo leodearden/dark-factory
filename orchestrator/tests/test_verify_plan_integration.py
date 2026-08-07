@@ -281,7 +281,7 @@ class TestVerifyCmdRoundTrip:
         shutil.which('uv') is None,
         reason='requires uv on PATH (and a synced orchestrator venv) to exec the real scoped pytest command',
     )
-    @pytest.mark.slow  # heavyweight: real `uv run ... pytest` subprocess; deselect with -m "not slow"
+    @pytest.mark.slow  # heavyweight: real `uv run ... pytest` subprocess; deselect with -m "not slow and not warm_lane_bash"
     def test_scoped_pytest_producer_and_runner_agree_on_scope(self, tmp_path):
         """scope_to's structured output (producer) IS what render+exec (runner) runs.
 
@@ -295,27 +295,13 @@ class TestVerifyCmdRoundTrip:
         This is the only scenario in the module that shells a real external
         toolchain (uv + a synced orchestrator venv) instead of driving the
         decision layer in-process, so it is environment-coupled: marked
-        ``@pytest.mark.slow`` for deselection (``-m "not slow"``) and skipped
+        ``@pytest.mark.slow`` for deselection (``-m "not slow and not warm_lane_bash"``) and skipped
         outright when `uv` isn't on PATH, rather than flaking a fast/offline
         run. The in-process argv assertions above (scenario 1a) already prove
         producer<->runner scope agreement and remain the always-run portion.
-        The `slow` marker is intentionally left unregistered in
-        orchestrator/pyproject.toml's `markers` list — that file is outside
-        this task's locked scope (orchestrator/tests/test_verify_plan_integration.py
-        only) — mirroring test_plan_tools_startup_load.py's identical
-        unregistered-marker precedent; today's addopts doesn't set
-        --strict-markers, so this only emits a PytestUnknownMarkWarning, not
-        a failure. This is a PRE-EXISTING, repo-wide condition, not something
-        newly introduced here: test_plan_tools_startup_load.py already ships
-        the identical unregistered marker with the same caveat, so a future
-        --strict-markers flip would break both files together, not just this
-        one. The fix is therefore a single shared registration in
-        orchestrator/pyproject.toml's `markers` list (covering both files at
-        once), not a per-file workaround — and none of that list's five
-        currently-registered markers are a semantic fit for "slow" (each
-        opts one specific test class in or out of its own autouse behavioral
-        patch), so reusing one here would mislabel the test rather than
-        close the gap.
+        The `slow` marker is registered in orchestrator/pyproject.toml's
+        `markers` list as of task 3506 — see that entry for the deselect-
+        composition rationale.
         """
         probe = tmp_path / 'test_verify_cmd_scope_probe.py'
         probe.write_text('def test_probe_passes():\n    assert True\n')

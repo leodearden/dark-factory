@@ -37,6 +37,28 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/dark-factory"
 )
 
+# WorkingDirectory= is load-bearing on its own terms: ExecStart runs
+# `uv run --project dashboard python -m uvicorn dashboard.app:app`, and
+# `--project dashboard` is a RELATIVE path resolved against the unit's
+# process cwd. systemd sets that cwd only from WorkingDirectory= (it does not
+# inherit an interactive shell's), so dropping or repointing this directive
+# makes uv resolve the wrong project directory, or fail outright. Both files
+# also pin an ABSOLUTE path, which systemd requires: an unsubstituted
+# __REPO_ROOT__ sentinel trips a fatal "WorkingDirectory= path is not
+# absolute" error, corroborated in this file's
+# test_systemd_analyze_verify_reports_no_ignored_directives.
+# check_dashboard_unit_parity.py treats WorkingDirectory as presence-only by
+# design (it compares committed-vs-installed, where the directive's value can
+# legitimately diverge across hosts), so it does not guard the
+# template/hardcoded pair asserted below — that guard is
+# _assert_working_directory_line, an anchored check (not a substring check),
+# so a repointed or commented-out directive still fails.
+TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
+
+HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
+    "WorkingDirectory=/home/leo/src/dark-factory"
+)
+
 # These are the literal paths baked into the committed hardcoded service file;
 # the render test verifies the template expands to exactly those values.
 # setup-host.sh computes REPO_ROOT and UV_PATH at runtime (from $(dirname $0)/..
@@ -84,6 +106,31 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     )
 
 
+def _assert_working_directory_line(path: pathlib.Path, expected_line: str) -> None:
+    """Assert *expected_line* appears in *path* as a whole, anchored line.
+
+    A plain substring check (``expected_line in content``) is satisfied by a
+    repointed value that merely starts with the expected text — e.g.
+    ``WorkingDirectory=__REPO_ROOT__/dashboard`` still contains
+    ``WorkingDirectory=__REPO_ROOT__`` — and by the same text sitting inside a
+    ``#`` comment, which systemd never parses as a directive.  Both leave the
+    unit's real cwd wrong or unset while a substring check stays green.
+    Anchoring the full line with ``^...$`` under ``re.MULTILINE`` rejects
+    both: a suffix breaks the ``$`` boundary, and a leading ``#`` breaks the
+    ``^`` boundary.  See the module comment on
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above for why the directive
+    itself is load-bearing.
+    """
+    content = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{re.escape(expected_line)}\s*$", re.MULTILINE)
+    assert pattern.search(content) is not None, (
+        f"No line matching {expected_line!r} found in {path}. See the "
+        "WorkingDirectory= rationale comment above "
+        "TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE for why this directive is "
+        "load-bearing."
+    )
+
+
 def test_template_sets_known_project_roots() -> None:
     """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
 
@@ -111,6 +158,25 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
+
+
+def test_working_directory_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must pin WorkingDirectory= to the repo root, exactly.
+
+    See the module comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above
+    for why the directive is load-bearing, and
+    _assert_working_directory_line's docstring for why the check is anchored
+    rather than a substring match.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    file's WorkingDirectory= line broke without inspecting a full-file diff.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE),
+    ):
+        _assert_working_directory_line(path, expected_line)
 
 
 def test_comma_separator_helper_rejects_empty_value(
@@ -175,6 +241,47 @@ def test_comma_separator_helper_detects_colon_in_any_position(
         encoding="utf-8",
     )
     _assert_known_project_roots_comma_separated(good_file)
+
+
+def test_working_directory_helper_rejects_suffix_or_comment(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_working_directory_line must not be satisfied by a substring match.
+
+    A plain ``expected in content`` check stays green if WorkingDirectory= is
+    repointed to a subdirectory (``.../dashboard``) or survives only inside a
+    ``#`` comment — both leave the unit's real cwd wrong while every
+    substring-based assertion keeps passing.  This pins the anchored check
+    against exactly those two regressions.
+    """
+    expected_line = "WorkingDirectory=/home/leo/src/dark-factory"
+
+    # Bad: repointed to a subdirectory — `expected_line in content` is still
+    # True, but the unit's cwd is now wrong.
+    suffixed = tmp_path / "suffixed.service"
+    suffixed.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory/dashboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_working_directory_line(suffixed, expected_line)
+
+    # Bad: directive only present inside a comment — systemd never parses it.
+    commented = tmp_path / "commented.service"
+    commented.write_text(
+        "[Service]\n# WorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_working_directory_line(commented, expected_line)
+
+    # Good: exact, uncommented line — helper must not raise.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_working_directory_line(good, expected_line)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:

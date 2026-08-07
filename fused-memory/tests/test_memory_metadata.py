@@ -18,6 +18,7 @@ from fused_memory.memory_metadata import (
     KIND_REGISTRY,
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
+    MemoryMetadataValidationError,
     normalize_supersedes,
 )
 
@@ -47,7 +48,7 @@ class TestTopicSlug:
     """`topic` slug shape — PRD D4 (one topic namespace, one shared regex)."""
 
     def test_accepts_every_seeded_topic_cluster_id(self):
-        """PRD §10 hard requirement: the regex MUST accept all 5 seeded
+        """PRD §10 hard requirement: the regex MUST accept all 6 seeded
         ``ProceduralTopicCluster.topic_id`` values.
 
         The seeded ids are imported rather than hand-copied so this stays
@@ -56,7 +57,7 @@ class TestTopicSlug:
         seeded id would split the namespace it exists to unify).
         """
         clusters = _default_topic_guard_clusters()
-        assert len(clusters) == 5, 'seeded cluster set changed — re-verify the regex'
+        assert len(clusters) == 6, 'seeded cluster set changed — re-verify the regex'
         for cluster in clusters:
             assert TOPIC_SLUG_RE.match(cluster.topic_id), (
                 f'seeded cluster id {cluster.topic_id!r} must match the slug regex'
@@ -452,6 +453,89 @@ class TestErrorTypes:
         assert 'fused_memory.memory_metadata' in text
 
 
+class TestCanonicalUniquenessViolationType:
+    """The second contract-fixed rejection type (V1, task 3198 leaf ε).
+
+    Pure type contract only -- no service. The type is raised from the
+    async seam (it needs live store state), but its SHAPE is pinned here,
+    next to its sibling, because that is what callers program against.
+    """
+
+    #: The live record leaf α measured; used as a realistic incumbent id.
+    _INCUMBENT = '0929cff6-8efc-4a49-a672-e83f0a41bbfb'
+
+    def test_is_importable_and_exported(self):
+        import fused_memory.memory_metadata as mm
+
+        assert hasattr(mm, 'CanonicalUniquenessViolation')
+        assert 'CanonicalUniquenessViolation' in mm.__all__
+
+    def _make(self):
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        return CanonicalUniquenessViolation(
+            project_id='dark_factory',
+            topic='some-topic',
+            incumbent_id=self._INCUMBENT,
+        )
+
+    def test_carries_the_structured_fields(self):
+        """INV-2: a rejection carries structured facts, not just prose."""
+        exc = self._make()
+        assert exc.project_id == 'dark_factory'
+        assert exc.topic == 'some-topic'
+        assert exc.incumbent_id == self._INCUMBENT
+
+    def test_str_names_the_incumbent_verbatim(self):
+        """V1's contract-fixed obligation: NAME the existing canonical's id.
+
+        Counting is not enough -- an operator who trips this must be able
+        to go look at the record that already holds the topic. This is
+        also why the seam counts first and then scrolls: an int cannot
+        carry an id.
+        """
+        text = str(self._make())
+        assert self._INCUMBENT in text
+        assert 'some-topic' in text
+
+    def test_str_names_the_registry_location(self):
+        """Asserted via the constant, not a literal, so it tracks a rename."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in str(self._make())
+
+    def test_is_a_sibling_of_the_shape_error_not_a_subclass(self):
+        """Deliberate: the two rejection contracts must be distinguishable.
+
+        Subclassing would let the five pre-existing
+        `pytest.raises(MemoryMetadataValidationError)` sites in
+        test_memory_service.py silently swallow a uniqueness violation --
+        a test passing for the wrong reason. Keeping them siblings makes
+        "which contract rejected this write" observable at the `except`.
+        """
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        assert issubclass(CanonicalUniquenessViolation, Exception)
+        assert not issubclass(CanonicalUniquenessViolation, MemoryMetadataValidationError)
+        assert not issubclass(MemoryMetadataValidationError, CanonicalUniquenessViolation)
+
+    def test_shape_error_handler_does_not_catch_it(self):
+        """The sibling relationship, asserted behaviourally rather than by type."""
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            try:
+                raise self._make()
+            except MemoryMetadataValidationError:  # pragma: no cover - must not catch
+                pytest.fail('the shape-error handler swallowed a uniqueness violation')
+
+
 _UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 _UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 
@@ -531,7 +615,87 @@ class TestValidateMemoryMetadata:
 
     @pytest.mark.parametrize('good', [True, False])
     def test_bool_canonical_accepted(self, good):
-        assert self._validate({'canonical': good}) == []
+        """A bool ``canonical`` passes the TYPE check (§2b).
+
+        ``True`` is paired with a topic here because task 3198 (leaf ε)
+        additionally makes a bare ``{'canonical': True}`` a shape
+        violation -- see ``TestCanonicalRequiresTopic`` below. Keeping the
+        topic in this case preserves what this test is actually for (the
+        bool type check) instead of letting it double as an assertion that
+        a topic-less canonical is legal, which it no longer is.
+        """
+        meta = {'canonical': good}
+        if good:
+            meta['topic'] = 'a-good-slug'
+        assert self._validate(meta) == []
+
+    # -- canonical requires a topic (task 3198, leaf ε) -------------------
+
+    def test_canonical_true_without_topic_is_fatal(self):
+        """``canonical: true`` is meaningless outside a topic.
+
+        ``canonical`` asserts "this is THE entry for its topic", so
+        without a topic there is no set for it to be canonical OF, and the
+        per-(project, topic) uniqueness rule has no key to check. Caught
+        in the PURE validator because it needs no store access at all.
+        """
+        violations = _by_key(self._validate({'canonical': True}), 'canonical')
+        assert [v.code for v in violations] == ['canonical_without_topic']
+        assert violations[0].fatal is True
+        assert 'topic' in violations[0].message
+        # Asserted via the constant, not a hard-coded literal, so the message
+        # tracks a rename of the registry's advertised location.
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in violations[0].message
+
+    def test_canonical_false_without_topic_is_legal(self):
+        """Only an ASSERTED canonical is meaningless without a topic.
+
+        Writers that stamp the key uniformly (``canonical: False`` on
+        every record) must keep working -- rejecting an explicit False
+        would break them for no benefit.
+        """
+        assert self._validate({'canonical': False}) == []
+
+    def test_canonical_true_with_a_good_topic_is_legal(self):
+        assert self._validate({'canonical': True, 'topic': 'a-good-slug'}) == []
+
+    def test_malformed_topic_is_not_double_counted_as_missing(self):
+        """A present-but-invalid topic is ONE defect, reported once.
+
+        The ``topic`` key IS present, so §2a's slug violation already
+        describes the problem. Also emitting ``canonical_without_topic``
+        would report one defect twice and imply the writer forgot a key
+        they did supply.
+        """
+        codes = _codes(self._validate({'canonical': True, 'topic': 'bad_slug'}))
+        assert 'invalid_topic_slug' in codes
+        assert 'canonical_without_topic' not in codes
+
+    def test_topic_without_canonical_is_legal(self):
+        """A topic needs no canonical marker; the implication is one-way."""
+        assert self._validate({'topic': 'a-good-slug'}) == []
+
+    def test_validator_does_not_short_circuit_on_canonical(self):
+        """Every applicable violation comes back in ONE pass (contract).
+
+        An int ``canonical`` with no topic is two independent defects. A
+        validator that returned at the first would hide the second, and
+        the caller would fix one, re-submit, and be rejected again.
+        """
+        codes = _codes(self._validate({'canonical': 1}))
+        assert codes == {'invalid_canonical_type'}, (
+            'a non-bool canonical is a TYPE defect; canonical_without_topic is '
+            'reserved for a genuine `is True`, per §2b\'s isinstance-not-truthiness rule'
+        )
+        codes = _codes(
+            self._validate(
+                {'canonical': True, 'kind': 'not_in_registry_xyz'},
+                enforce_kind_registry=True,
+            )
+        )
+        assert codes == {'canonical_without_topic', 'unknown_kind'}, (
+            'unrelated violations must still be reported alongside, in one pass'
+        )
 
     # -- kind ------------------------------------------------------------
 

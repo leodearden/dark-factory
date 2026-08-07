@@ -59,10 +59,12 @@ const EXPECTED_WINDOW_GLOBALS = {
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
   'prd_grouping.js': 'DF_PRD_GROUPING',
+  'task_status_counts.js': 'DF_TASK_STATUS_COUNTS',
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'orch_filter.js': 'DF_ORCH_FILTER',
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
   'spark_path.js': 'DF_SPARK_PATH',
+  'memory_evals_fmt.js': 'DF_MEMORY_EVALS_FMT',
 };
 
 function readIndexHtml() {

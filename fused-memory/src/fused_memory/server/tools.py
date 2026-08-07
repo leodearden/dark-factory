@@ -379,6 +379,7 @@ Read operations:
 - search: Unified search across both stores with automatic routing
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
+- scan_memory_content: Literal substring scan over Mem0 memory TEXT (deterministic, not semantic) — use when search cannot find a string because it carries no semantic signal
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
@@ -390,6 +391,7 @@ Task operations (when Taskmaster is connected):
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
 - delete_episode: Remove a Graphiti episode (with optional cascade)
+- redact_episode_content: Replace a Graphiti episode's raw content in place (non-destructive; PREFER over delete_episode(cascade=True) for corrupted text — preserves the extracted entities/edges a cascade would destroy)
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - set_entity_summary: Overwrite an entity node's summary with explicit text (empty clears); bypasses edge-derivation — use to force-clear baked-in stale narrative
@@ -399,8 +401,8 @@ Management:
 - delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
 - get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
-- replay_dead_letters: Reset dead-lettered queue items to pending for retry (use for retriable transient failures)
-- delete_dead_letters: Permanently delete dead-lettered items by id (use for non-retriable errors such as NodeNotFoundError after a graph wipe)
+- replay_dead_letters: Reset dead-lettered queue items to pending for retry (the safe default, once the underlying cause is fixed)
+- delete_dead_letters: Permanently delete dead-lettered items by id — DESTRUCTIVE; discards the payload and the only evidence of the failure. Only once the cause is identified and the item is known unrecoverable
 
 Reconciliation:
 - Task status transitions (done/blocked/cancelled/deferred) trigger targeted reconciliation
@@ -2467,6 +2469,90 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def scan_memory_content(
+        project_id: str,
+        needles: list[str] | None = None,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Scan memory TEXT for literal substrings (deterministic substring match, not semantic).
+
+        Complements ``search`` and ``get_memories_by_metadata`` by covering the
+        third axis: ``search`` ranks by EMBEDDING SIMILARITY, and
+        ``get_memories_by_metadata`` matches payload KEYS by equality — neither can
+        find a literal string embedded inside a memory's text. That is not a
+        theoretical gap: a leaked serialized tool-call XML fragment carries almost no
+        semantic signal, so a live 2026-07-26 semantic probe for the known corrupted
+        records returned ZERO, and the corpus was structurally unsweepable until this
+        tool existed (task 3083).
+
+        Every record returned by the store-side prefilter is RE-VERIFIED in Python
+        with the shared detector (``fused_memory.utils.toolcall_xml_leak``), which is
+        the authoritative verdict — the prefilter is a speed optimisation only.
+
+        **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries,
+        preferences_and_norms, procedural_knowledge). It does NOT scan Graphiti
+        episodes or edges; a leaked episode must be found and remediated separately.
+
+        **No silent caps:** the walk paginates to the end of the collection. When an
+        explicit *limit* stops it early, the response self-discloses this via
+        ``truncated`` (bool) alongside ``scanned`` (the number of records actually
+        examined, and the correct denominator for an incidence rate).
+
+        Example call:
+            scan_memory_content(
+                project_id="dark_factory",
+                exhaustive=True,
+            )
+
+        This tool is intentionally read-only and is NOT included in any DISALLOW_*
+        list, so it is auto-allowed in Stage 3's read-only integrity-check mode (the
+        same property ``get_memories_by_metadata`` documents).
+
+        Args:
+            project_id: Project scope (required)
+            needles: Literal substrings for the store-side prefilter. Omit (None) to
+                use the shared tool-call-leak sentinels. Ignored when *exhaustive*.
+            filters: Optional exact metadata key-value pairs narrowing the scan
+                (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
+            exhaustive: Skip the prefilter and walk every record. Slower, but the
+                answer then depends on nothing but the Python detector — use this
+                when establishing a true incidence rate.
+            limit: Maximum records to WALK (default: no limit).
+
+        Returns:
+            {'matches': [{'id', 'created_at', 'matched_fragments', 'excerpt',
+            'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
+            'limit': ..., 'project_id': ...} on success, or {'error': ...,
+            'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
+            scan of a clean corpus, not an error.
+        """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        result = await memory_service.scan_memory_content(
+            project_id=project_id,
+            needles=needles,
+            filters=filters,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+        return {
+            'matches': result.get('matches', []),
+            'scanned': result.get('scanned', 0),
+            'truncated': result.get('truncated', False),
+            'exhaustive': exhaustive,
+            'limit': limit,
+            'project_id': project_id,
+        }
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def get_memories_by_metadata(
         project_id: str,
         filters: dict,
@@ -3199,6 +3285,73 @@ def create_mcp_server(
             episode_id=episode_id,
             project_id=project_id,
             cascade=cascade,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def redact_episode_content(
+        episode_uuid: str,
+        new_content: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Replace one Graphiti episode's raw content in place. NON-destructive.
+
+        The counterpart to delete_episode for an episode whose stored text is
+        corrupted — most concretely, one carrying a leaked serialized
+        tool-call fragment (task 3083). Use this INSTEAD of
+        ``delete_episode(cascade=True)``, which would also destroy the
+        entities and edges exclusively sourced from that episode: those were
+        extracted from the CLEAN portion of the text and are usually valid,
+        so cascading deletes real knowledge to fix appearance.
+
+        Only the ``content`` property is written. EpisodicNodes carry no
+        embedding of their own, so nothing is left stale by an in-place set,
+        and the extracted edges are deliberately untouched.
+
+        Refuses LOUDLY rather than half-succeeding: a blank replacement, a
+        replacement that itself still carries a leaked fragment, or an
+        episode uuid absent from this project's graph all raise.
+
+        Args:
+            episode_uuid: Graphiti episode UUID (must already be identified —
+                this tool does not search for corrupted episodes)
+            new_content: Replacement text. Non-empty, leak-free.
+            project_id: Project scope (required)
+            agent_id: Which agent is redacting (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        if not episode_uuid or not episode_uuid.strip():
+            return {'error': 'episode_uuid is required', 'error_type': 'ValidationError'}
+        if not new_content or not new_content.strip():
+            return {
+                'error': (
+                    'new_content must be non-empty — redaction is '
+                    'content-preserving, not content-erasing'
+                ),
+                'error_type': 'ValidationError',
+            }
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.redact_episode_content(
+            episode_uuid=episode_uuid,
+            new_content=new_content,
+            project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,
@@ -4033,6 +4186,12 @@ def create_mcp_server(
         This resets them so workers can try again (e.g. after fixing the
         underlying issue).
 
+        Prefer this over ``delete_dead_letters``: a replay that fails again
+        is non-destructive and leaves the row — and its payload — intact for
+        diagnosis.  Note that a permanently-unsatisfiable failure will simply
+        re-fail and re-dead-letter; that outcome is information, not a reason
+        to delete the row.
+
         Note: project_id is NOT canonicalized here (no hyphen/underscore
         normalization) — dead-letter tools are intentionally out of scope
         for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
@@ -4185,9 +4344,30 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Permanently delete dead-lettered durable-queue items by id.
 
-        Use this tool for non-retriable errors (e.g. NodeNotFoundError after a
-        graph wipe) where replaying would always fail.  For retriable transient
-        failures use ``replay_dead_letters`` instead.
+        DESTRUCTIVE, and usually the wrong first move.  A dead-lettered row is
+        the only durable record that a write was attempted and failed: it
+        carries the full payload, the error, and the attempt count.  The write
+        journal retains only the first 200 characters of the original params,
+        so deleting the row makes the lost content unrecoverable and destroys
+        the evidence needed to diagnose the cause.
+
+        Delete only once the cause is IDENTIFIED and the item is known to be
+        unrecoverable.  If the cause is not yet understood, leave the row in
+        place and investigate it.  If it is understood and fixed, use
+        ``replay_dead_letters`` instead.
+
+        This docstring previously named "NodeNotFoundError after a graph wipe"
+        as the canonical delete-me case.  That guidance was withdrawn on
+        2026-08-03 (esc-3561-3) because NodeNotFoundError has several causes
+        with opposite remedies: a stale or typo'd uuid, a uuid belonging to a
+        different graph (for FalkorDB, group_id *is* the database), a genuine
+        visibility race, or a code bug in which an operation references its own
+        not-yet-created uuid.  graphiti_core's exception carries only the
+        message string — no uuid attribute, no group_id, no node label — so it
+        cannot tell you which you are looking at.  Acting on the old advice
+        deleted 26 of the 28 known instances of the last cause, which is what
+        made a three-and-a-half-month silent failure look like two isolated
+        rows.
 
         Only rows with ``status='dead'`` that belong to ``project_id`` are
         eligible.  Cross-project ids, non-existent ids, and non-dead-status
@@ -5406,6 +5586,13 @@ def create_mcp_server(
           is the target task's id.
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
+        - ``refused``  — a deterministic guard (cancelled-premise blocklist /
+          recon premise registry) rejected the candidate. **NO TASK WAS
+          CREATED and NO ``task_id`` is returned** — the key is absent, not
+          null, so a refusal can never be read as a creation. ``reason``
+          carries the refusal justification. This is terminal and a SUCCESS,
+          not an error: do NOT retry it (a retry re-hits the same
+          deterministic guard) and do NOT record any task id for it.
 
         Callers that receive ``status=failed, reason=timeout`` should either
         retry or report an error.
@@ -5470,7 +5657,9 @@ def create_mcp_server(
         Args:
             project_root: Absolute path to project root.
             status: Optional status filter ('pending', 'created', 'failed',
-                'combined'). When None, all statuses are returned.
+                'combined', 'refused'). 'refused' means a deterministic guard
+                rejected the candidate and no task was created.
+                When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
                 ``created_at >= since`` are returned. Default: now − 7 days.
             limit: Max rows to return. Clamped to [1, 2000].

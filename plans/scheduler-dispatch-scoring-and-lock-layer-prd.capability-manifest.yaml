@@ -1,0 +1,396 @@
+prd: plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3816
+  title: Durable pending_since anchor + back-fill
+  capabilities:
+  - name: pending-since-blessed-tier-a-key
+    binding: capability→producer (self) — _BLESSED_METADATA_KEYS at shared/src/shared/task_metadata.py:746;
+      key confirmed absent from the tree at decompose
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pending_since
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: single-shared-stamp-helper
+    binding: capability→producer (self) — one helper called from every pending-landing
+      write path (INV-5); chokepoint sqlite_task_backend.py:1938 reads old_status
+      at :1993
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def stamp_pending_since\(
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: backfill-marks-its-population
+    binding: capability→producer (self) — every back-filled row stamped so the distortion
+      is countable (D4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pending_since_backfilled
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: cancelled-to-pending-is-the-only-reset
+    binding: rejection-mechanism (D3) — the write-rule table is enforced by tests
+      over all four transition classes
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: transition-table correctness is a test property; no ERE distinguishes
+        the four arms
+- label: β
+  task_id: 3819
+  title: Scoring restructure + non-saturation known-answer test
+  capabilities:
+  - name: three-term-score-budgets
+    binding: capability→producer (self) — replaces the saturating min() at scheduler.py:4739;
+      floor I-1 920 <= 998 stated
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CPM_BUDGET|AGE_BUDGET|AGE_HALF_SECS|CONTINUITY_CREDIT
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: anchor-coverage-arming-gate
+    binding: capability→producer (self) — D12/I-6; coverage is live-measured, not
+      assumed from deployment order (INV-3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: new_scoring_min_anchor_coverage
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: arming-gate-emits-its-fallback
+    binding: capability→producer (self) — the legacy-formula fallback is loud, with
+      a consecutive-tick streak escalation (INV-4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: scoring_anchor_coverage_low
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: durable-anchor-available-at-score-time
+    binding: DAG-direction — producer:α is UPSTREAM (β depends α); verified non-inverted
+    verdict: PASS
+  - name: baseline-derived-not-hardcoded
+    binding: numeric floor (R1) — 46/249 are NOT reproducible from candidates_scored.csv
+      (recomputes 47/251 over its 294 rows); baseline metrics are derived from the
+      CSV at test time, with the 117-way tie group and the fixture-shape floors as
+      the pinned literals
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the assertion is a derived-vs-derived comparison inside the test, not
+        a greppable literal
+- label: γ
+  task_id: 3820
+  title: Continuity credit via work-product detection
+  capabilities:
+  - name: single-fork-branch-probe
+    binding: capability→producer (self) — git 2.43.0 for-each-ref %(ahead-behind:main)
+      RUN LIVE against this repo at decompose; bounded occupancy, not merely async
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ahead-behind
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: durable-zero-progress-gate
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/event_store.py:221
+      zero_progress_requeue, :697 fetch_events_by_type_all_runs (the in-memory tracker
+      must NOT be consulted)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: zero_progress_requeue
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: ttl-cached-off-thread-refresh
+    binding: capability→producer (self) — C3 bounded-occupancy requirement
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: continuity_probe_ttl_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: probe-failure-storm-escape
+    binding: 'capability→producer (self) — ADDED AT DECOMPOSE (G7/INV-4): a probe
+      failing every refresh would silently zero the continuity term fleet-wide'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the streak threshold is a behavioural property of the escalation path,
+        verified by test
+  - name: credit-is-exactly-additive
+    binding: closed-form exactness — continuity is an additive constant term; identity
+      holds with tier/D/anchor/now fixed (frozen-clock test configuration)
+    verdict: PASS
+- label: δ
+  task_id: 3821
+  title: 'Starvation watchdog repair: durable clock, auto-pin, emitted event'
+  capabilities:
+  - name: starvation-event-type-exists
+    binding: 'capability→producer (self) — confirmed absent today: no starvation member
+      in EventType; _file_starvation_info emits nothing'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: starvation_detected
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: overrides-source-column
+    binding: capability→producer (self) — overrides.py:38-49 schema confirmed to have
+      NO source column; additive migration
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: source\s+TEXT
+      paths:
+      - orchestrator/src/orchestrator/overrides.py
+      expect: present
+  - name: pin-source-visible-in-get-pin-queue
+    binding: 'capability→producer (self) — RESOLVED AT DECOMPOSE (R2): was producer-absent.
+      get_pin_queue (tools.py:6618) SELECTs a NAMED column list excluding source,
+      so the operator read path would never surface it. MANDATED literal: source follows
+      ttl_until in the SELECT and in the returned dict'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ttl_until,\s*source
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: auto-pin-is-bounded-and-owned
+    binding: 'capability→producer (self) — INV-7: cap + ttl_until + source-scoped
+      release; the cap itself escalates at L1 (INV-4)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: auto_pin_max_concurrent
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: durable-idle-clock
+    binding: DAG-direction — producer:α (pending_since) and producer:β (fixed scorer)
+      are both UPSTREAM; verified non-inverted
+    verdict: PASS
+  - name: live-status-recheck-before-pinning
+    binding: corroborate-before-acting (INV-3) — a task gone terminal between candidate-build
+      and fire must not be pinned
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ordering of the re-read relative to the pin write is a test property,
+        not a greppable literal
+- label: ε
+  task_id: 3818
+  title: 'Truthful lock release: route the one bypass through the emitting path'
+  capabilities:
+  - name: single-bypass-site-routed
+    binding: 'capability→producer (self) — enumerated lock_table.release( across orchestrator/src:
+      EXACTLY two sites, :7038 (bypass) and :7050 (inside Scheduler.release). PRD''s
+      ''only bypass'' claim confirmed at decompose'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: self\.release\(task_id, requeued=True\)
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: bypass-emits-nothing-today
+    binding: rejection-check — read scheduler.py:7036-7042 directly at decompose;
+      the bypass is a bare call with no adjacent emit. Observed absence, not inferred
+    verdict: PASS
+  - name: single-writer-assertion-is-authorable
+    binding: 'capability→producer (self) — SCOPING CONSTRAINT: lock_table.release(
+      also appears 6x in orchestrator/tests/test_scheduler.py, so the grep-anchored
+      test must scope to orchestrator/src/ and permit the one site inside Scheduler.release,
+      or it fails against itself'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the assertion is itself a grep-anchored test; mechanizing it here would
+        duplicate the test (INV-5)
+- label: ζ
+  task_id: 3822
+  title: Module hold-history predictor
+  capabilities:
+  - name: truthful-lock-release-pairs
+    binding: 'DAG-direction — producer:ε is UPSTREAM (ζ depends ε). D11: a missing
+      release reads as an infinite hold and would make η refuse every backfill — silent
+      and total'
+    verdict: PASS
+  - name: era-boundary-span-closing
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/event_store.py:399
+      service_restart; ONE shared helper (INV-5), never per-consumer
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: service_restart
+      paths:
+      - orchestrator/src/orchestrator/hold_history.py
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: predictor-surface
+    binding: capability→producer (self) — exposes predicted_hold(task) and predicted_remaining(holder),
+      the two η consumes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def predicted_hold\(
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: empty-history-refuses
+    binding: numeric floor — below backfill_min_samples the predictor returns NO prediction
+      rather than a fabricated one; a predicate accepting the empty case certifies
+      structure, not capability
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the refusal is a return-value property under a seeded-empty fixture
+  - name: design-basis-is-committed-evidence
+    binding: 'numeric floor — grep:plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126,
+      module-history median R2 0.26 (DF) / 0.68 (reify), verified present at decompose.
+      NOTE: the test oracle is the median computed from ZETA''s own fixture trace
+      — the evidence publishes R2/coverage, not per-module medians'
+    verdict: PASS
+- label: η
+  task_id: 3823
+  title: EASY-backfill admission through parks
+  capabilities:
+  - name: hold-predictor-available
+    binding: DAG-direction — producer:ζ is UPSTREAM (η depends ζ); verified non-inverted
+    verdict: PASS
+  - name: admission-knobs
+    binding: capability→producer (self) — safety factor 2.5 bracketed by measured
+      x2.9 (DF) / x2.0 (reify) at PARKING_MODEL_REPORT.md:126
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: backfill_safety_factor|backfill_min_samples|backfill_max_park_age_secs
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: grant-and-overstay-observable
+    binding: capability→producer (self) — measured 7-9% overstay at x2.5 is TRACKED
+      in production rather than assumed, with a rate-threshold escalation (INV-4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: park_backfill_granted
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: acquisition-still-goes-through-try-acquire
+    binding: corroborate-before-acting (INV-3) — grep:orchestrator/src/orchestrator/scheduler.py:6327
+      _phase_select_scored; the free-module set read during scoring is never the acting
+      basis
+    verdict: PASS
+- label: θ
+  task_id: 3824
+  title: Durable fairness state across restarts
+  capabilities:
+  - name: sibling-table-not-a-migration
+    binding: capability→producer (self) — grep:orchestrator/src/orchestrator/run_store.py:70,
+      scheduler_state is the 4-column pause-only table; a migration would be wrong
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: scheduler_fairness_state
+      paths:
+      - orchestrator/src/orchestrator/run_store.py
+      expect: present
+  - name: no-restore-path-today
+    binding: rejection-check — scheduler.py:6829 writes scheduler_state.json; the
+      only reader is fused-memory read_scheduler_state. Confirmed absent restore at
+      decompose
+    verdict: PASS
+  - name: restored-parks-re-corroborated
+    binding: corroborate-before-acting (INV-3/INV-7) — owner-state park-GC runs immediately
+      after rehydrate, dropping a now-terminal owner's park with reservation_expired
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: GC-on-restore ordering is a restart-simulation test property
+  - name: backfill-lands-before-park-persistence
+    binding: DAG-direction (D10) — producer:η is UPSTREAM (θ depends η). Park persistence
+      AMPLIFIES the current regime and is NOT simulated; the compensator must land
+      first, enforced by a real edge rather than a config flag
+    verdict: PASS
+- label: ι
+  task_id: 3825
+  title: Below-rank-1 passed-over counting (observability only)
+  capabilities:
+  - name: pass-over-is-unrecorded-today
+    binding: capability→producer (self) — grep:orchestrator/src/orchestrator/scheduler.py:6425,6436;
+      _bump_skip_and_maybe_park (defined :4506) is called ONLY for top_id, so ranks
+      2..k leave no record at all
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _passed_over_count
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: stride-gated-emission
+    binding: storm escape (INV-4) — ~291 candidates x 4 ticks/min makes per-tick-per-task
+      events a storm; default stride 100
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_passed_over
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: counter-never-feeds-park-installation
+    binding: rejection-mechanism — feeding it would silently convert observability
+      into below-rank-1 park INSTALLATION, which PRD §7 rejects on measured grounds
+      (-4% to -11% throughput, never-dispatched x1.5-3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a plain ERE cannot express 'this counter is not an argument to that
+        function'; asserted on the call graph by test
+  - name: scoring-in-place
+    binding: DAG-direction — producer:β is UPSTREAM (ι depends β); verified non-inverted
+    verdict: PASS
+- label: κ
+  task_id: 3826
+  title: 'Integration gate: the whole seam, end to end'
+  capabilities:
+  - name: all-legs-produced-upstream
+    binding: DAG-direction — producer:β,γ,δ,η,θ,ι are ALL upstream of κ; no inversion.
+      This is the G5 B+H integration gate and the batch leaf
+    verdict: PASS
+  - name: qualifying-chain-head-observable
+    binding: 'end-to-end capability — RESOLVED AT DECOMPOSE (R3): task 3534 is pinned
+      at pin_order 1 and will likely dispatch before κ runs, and nothing guarantees
+      another (high, D>=9, >=48h) candidate is live at that moment. The script takes
+      a candidate source, defaulting to live and falling back to β''s committed regenerated
+      fixture, and reports which it used'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the assertion is the script's recorded output in done-provenance, not
+        a repo-state grep
+  - name: boundary-sketch-green-e2e
+    binding: capability→producer (self) — the task IS the check suite; PRD §6 rows
+      1/2/6/7/8 driven through the REAL scheduler, lock table and override store
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is the CI-green boundary matrix plus the script output

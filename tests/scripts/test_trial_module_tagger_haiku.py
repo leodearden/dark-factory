@@ -15,7 +15,7 @@ import pytest
 
 from orchestrator import module_tagger_prompt
 
-import trial_module_tagger_haiku as mod  # pyright: ignore[reportMissingImports]
+import trial_module_tagger_haiku as mod
 
 
 def _extract_json_block(md: str) -> dict:

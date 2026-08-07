@@ -145,11 +145,29 @@ tasks:
     binding: capability→consumer (wired) — eta's gate escalation cites this report
       path
     verdict: PASS
+    # FIXED 2026-08-06 (esc-3200-1). The previous spelling was
+    # `pattern: e2-storage-shape-bakeoff-report` over `paths: [plans/]`, which was
+    # UNSATISFIABLE BY CONSTRUCTION: _run_grep_check shells out to
+    # `git grep -E -e <pattern> <ref> -- <paths>`, which searches file CONTENTS,
+    # but `e2-storage-shape-bakeoff-report` only ever existed as a FILENAME.
+    # plans/e2-storage-shape-bakeoff-report.{md,json} are both committed on main,
+    # yet no file under plans/ contains that string in its body — so the check
+    # failed at every ref forever and blocked task 3200 (and, behind it, 3133 ->
+    # 3625 -> the whole duplicate-consolidation gate batch) with a
+    # DEP_CAPABILITY_NOT_DELIVERED that had nothing to do with the delivery.
+    # The schema offers no exists/path predicate (kind is Literal['grep',
+    # 'script', 'manual']), so the fix anchors on CONTENT that is actually in the
+    # artifact. `^## Decision table` is chosen deliberately: it is this
+    # capability's own subject — the decision table is what `eta` reads — and a
+    # structural heading is far more stable than prose. Scoped to the single file
+    # so the check still fails if the report is deleted (a pathspec matching
+    # nothing exits 1, same as no-match). Verified: rc=0 at main, and exactly one
+    # file under plans/ matches. Do NOT "restore" the filename pattern.
     delivered_check:
       kind: grep
-      pattern: e2-storage-shape-bakeoff-report
+      pattern: ^## Decision table
       paths:
-      - plans/
+      - plans/e2-storage-shape-bakeoff-report.md
       expect: present
   - name: audit-recall-measured
     binding: 'capability→producer (PRD D10) — audit_duplicate_memories.py recall vs

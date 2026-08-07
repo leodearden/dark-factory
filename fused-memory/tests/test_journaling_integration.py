@@ -195,3 +195,99 @@ async def test_targeted_recon_source_tag(service, write_journal):
     write_ops = [o for o in ops if o['layer'] == 'write_op']
     assert len(write_ops) == 1
     assert write_ops[0]['source'] == 'targeted_recon'
+
+
+# ------------------------------------------------------------------
+# Terminal queue outcome write-back (task 3582)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_queue_terminal_outcome_stamps_journal(service, write_journal):
+    """The queue's on_terminal hook lands on the write_ops row."""
+    op_id = str(uuid.uuid4())
+    await write_journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    await service._record_queue_terminal_outcome(
+        op_id, 'dead', 'RuntimeError: boom'
+    )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'dead'
+    assert 'boom' in row['terminal_error']
+    # "Enqueue accepted" is still true and still recorded.
+    assert row['success'] == 1
+
+
+@pytest.mark.asyncio
+async def test_record_queue_terminal_outcome_without_journal_is_noop(mock_config):
+    """The hook must resolve self._write_journal at CALL time, not capture it.
+
+    server/main.py calls memory_service.initialize() — where the
+    DurableWriteQueue is constructed — BEFORE set_write_journal(), so the
+    journal is None when the queue (and hence the hook) is wired.
+    """
+    svc = MemoryService(mock_config)
+    assert svc._write_journal is None
+    # Must not raise.
+    await svc._record_queue_terminal_outcome('W-none', 'completed', None)
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_on_failure(service, write_journal):
+    """A dead-lettering mem0_add must still leave a Layer-1 row behind.
+
+    This used to journal only after a successful await, so a queued mem0_add
+    that failed its way to 'dead' produced no write_ops row at all — the
+    terminal write-back then had nothing well-formed to land on and the
+    failure was invisible to the journal.
+    """
+    op_id = str(uuid.uuid4())
+    service.mem0.add = AsyncMock(side_effect=RuntimeError('mem0 exploded'))
+
+    with pytest.raises(RuntimeError):
+        await service._execute_mem0_write(
+            {
+                'content': 'a fact that never lands',
+                'project_id': 'test',
+                '_write_op_id': op_id,
+                'metadata': {'category': 'preferences_and_norms'},
+            }
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a failed queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0
+    assert 'mem0 exploded' in row['error']
+
+    # ...and the queue's terminal write-back now has a real row to complete.
+    await service._record_queue_terminal_outcome(
+        op_id, 'dead', 'RuntimeError: mem0 exploded'
+    )
+    row = await write_journal.get_write_op(op_id)
+    assert row['terminal_status'] == 'dead'
+    assert row['operation'] == 'add_memory'
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_still_journals_on_success(service, write_journal):
+    """The success path keeps its Layer-1 row, result summary and all."""
+    op_id = str(uuid.uuid4())
+
+    await service._execute_mem0_write(
+        {
+            'content': 'a fact that lands',
+            'project_id': 'test',
+            '_write_op_id': op_id,
+            'metadata': {'category': 'preferences_and_norms'},
+        }
+    )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 1
+    assert row['error'] is None
+    assert row['result_summary'] is not None

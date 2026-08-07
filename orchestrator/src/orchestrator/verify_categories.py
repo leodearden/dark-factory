@@ -86,8 +86,14 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         severity_rank=1, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
+    # archive=True (task 3679): unlike its DISK_FULL sibling this category is
+    # infra-transient but NOT self-clearing — retry_kind=NONE means no serial
+    # re-run is attempted, so it terminates in a blocking human escalation, and
+    # the archived log is then the only triage artifact that human has. Both
+    # live incidents blocked on exactly that (reify data/verify-logs/5848 and
+    # /5893 were never written).
     FailureCategory.SEMAPHORE_TIMEOUT: CategoryPolicy(
-        severity_rank=2, archive=False, preexisting_probe=False,
+        severity_rank=2, archive=True, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.CARGO_CLI_ERROR: CategoryPolicy(

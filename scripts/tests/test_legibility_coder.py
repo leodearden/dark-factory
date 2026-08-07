@@ -328,6 +328,10 @@ def test_code_digest_happy_path_success(tmp_path):
     )
 
     assert result.ok is True
+    # result.record is Optional on the CodingResult — an unparseable or
+    # schema-invalid coding record is SKIPPED and leaves it None. ok is True
+    # here, so it is populated; narrowed rather than subscripted blind.
+    assert result.record is not None
     assert result.record["session"] == meta["session"]
     assert result.record["date"] == meta["date"]
     assert result.record["agent_class"] == meta["agent_class"]
@@ -563,6 +567,24 @@ def _write_fake_claude_capturing(bin_dir, *, argv_file, stdin_file, stdout_path)
     p.chmod(0o755)
 
 
+def _write_fake_claude_recording_cwd(bin_dir, *, cwd_file, stdout_path):
+    """Fake `claude` binary: records the directory it was RUN IN to
+    *cwd_file*, then echoes the contents of *stdout_path* and exits 0.
+
+    Separate from _write_fake_claude_capturing so the cwd tests assert the
+    one thing they are about; `pwd` is the honest probe here because the
+    working directory is a property of the spawned process, not of anything
+    _invoke_cli could report about itself."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'pwd > "{cwd_file}"\n'
+        f'cat > /dev/null\n'
+        f'cat "{stdout_path}"\n'
+    )
+    p.chmod(0o755)
+
+
 def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated failure"):
     p = bin_dir / "claude"
     p.write_text(
@@ -636,6 +658,94 @@ def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=0.2,
+        )
+
+
+def _cwd_probe(tmp_path, monkeypatch):
+    """Set up the two-sibling-directory fixture the cwd tests share:
+    chdir into `launcher/`, and return (target_dir, cwd_file, claude_bin)
+    for a fake `claude` that records where it ran."""
+    bin_dir = tmp_path / "bin"
+    launcher = tmp_path / "launcher"
+    target = tmp_path / "target"
+    for d in (bin_dir, launcher, target):
+        d.mkdir()
+
+    cwd_file = tmp_path / "cwd.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    _write_fake_claude_recording_cwd(bin_dir, cwd_file=cwd_file, stdout_path=stdout_path)
+
+    monkeypatch.chdir(launcher)
+    return launcher, target, cwd_file, str(bin_dir / "claude")
+
+
+def test_invoke_cli_runs_in_given_cwd(tmp_path, monkeypatch):
+    """A caller can scope the headless CLI subprocess to a directory other
+    than the launcher's — the knob census needs to verify a project that is
+    not the one it was launched from."""
+    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    mod._invoke_cli(
+        "prompt text", "haiku", claude_bin=claude_bin, timeout=10, cwd=str(target),
+    )
+
+    # .resolve() on both sides: a symlinked tmp dir (/tmp -> /private/tmp on
+    # non-Linux hosts) must not make this flaky.
+    recorded = Path(cwd_file.read_text().strip()).resolve()
+    assert recorded == target.resolve()
+    assert recorded != launcher.resolve()
+
+
+def test_invoke_cli_without_cwd_inherits_the_launcher_cwd(tmp_path, monkeypatch):
+    """The new parameter's default is EXACTLY today's behavior, so the
+    existing callers (code_digest, the trickle, nightly) are provably
+    unchanged by its introduction."""
+    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    mod._invoke_cli("prompt text", "haiku", claude_bin=claude_bin, timeout=10)
+
+    recorded = Path(cwd_file.read_text().strip()).resolve()
+    assert recorded == launcher.resolve()
+    assert recorded != target.resolve()
+
+
+def test_invoke_cli_missing_cwd_raises_invocation_error(tmp_path, monkeypatch):
+    """A cwd that does not exist must fail as a CoderInvocationError, not
+    as a raw FileNotFoundError escaping the documented contract.
+
+    This is not cosmetic typing. census's first invoke is the headroom
+    probe, and preflight_headroom folds ANY probe exception into
+    HeadroomResult(ok=False) — so an unwrapped OSError from a typo'd
+    --project-root would exit 0 as "census deferred", indistinguishable
+    from a usage-limit banner.
+    """
+    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=claude_bin, timeout=10, cwd=str(target / "does-not-exist"),
+        )
+
+    # The message must NAME the directory, so an operator reading the
+    # failure does not have to infer which path was rejected.
+    assert "does-not-exist" in str(excinfo.value)
+
+
+def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeypatch):
+    """Same contract for the not-a-directory case (NotADirectoryError on
+    Linux), which is a different OSError subclass than the missing-dir
+    one — pinning both keeps the except-arm from being narrowed to
+    FileNotFoundError alone."""
+    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+    not_a_dir = target / "regular-file.txt"
+    not_a_dir.write_text("i am not a directory", encoding="utf-8")
+
+    with pytest.raises(mod.CoderInvocationError):
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
         )
 
 
