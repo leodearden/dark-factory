@@ -26,8 +26,8 @@ class TestIdentityLockFor:
     """GraphitiBackend._identity_lock_for(group_id) returns a per-group_id asyncio.Lock.
 
     Synchronous accessor (returns the Lock, not a coroutine); lazily creates and
-    caches one Lock per group_id, mirroring DurableWriteQueue._group_locks
-    (durable_queue.py:136, 259-260). Needs no initialized driver.
+    caches one Lock per group_id, mirroring DurableWriteQueue._group_locks in
+    fused_memory/services/durable_queue.py. Needs no initialized driver.
     """
 
     def test_returns_asyncio_lock(self, mock_config):
