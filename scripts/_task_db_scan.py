@@ -165,6 +165,20 @@ def discover_db_paths(
 # docs/legibility/design-invariants.md's no-silent-fail-soft rule) is common
 # to both tiers as of task 3474, which is what makes this shared plumbing
 # consistent with the invariant rather than an exception to it.
+#
+# WHY THIS TIER RETURNS BARE 0/1/2/3 while Tier 3 returns named AUDIT_EXIT_*
+# constants: the two tiers' NUMBERS are identical and must stay in lockstep
+# (0 clean / 1 found something / 2 nothing resolved / 3 resolved but nothing
+# scanned-or-audited), but each number's SENTENCE is per-tier -- here 2 is "no
+# tasks.db resolvable" and 3 is "every resolved DATABASE was unreadable",
+# where Tier 3 speaks of project ROOTS. run_scan_cli's four returns all sit
+# inside one ~30-line body next to the comment that names each outcome, so the
+# literals stay readable in place; Tier 3 needed names because
+# audit_combine_gate_marker_loss.py ALIASES them into its own EXIT_* vocabulary
+# across a module boundary, where a re-spelled literal could silently drift
+# from what is actually returned. Left inline deliberately, not overlooked --
+# a shared tier-neutral set would have to be vague enough to cover both
+# wordings, losing exactly the precision AUDIT_EXIT_* carries.
 # ---------------------------------------------------------------------------
 
 # The exit-2 signal, emitted verbatim by both leak scanners.
@@ -444,6 +458,17 @@ def run_audit_cli(
     one-audit-per-root contract holds. An *audit_fn* that returned None to skip
     a root would silently break it.
 
+    PARSER CONTRACT — *parser* MUST define the roots under
+    ``dest="project_roots"`` (an ``action="append"`` ``--project-root``, as
+    both adopters spell it); that attribute is read off the parsed Namespace
+    below. Unlike Tier 2, where :func:`add_db_discovery_args` owns the flag
+    definitions outright, this tier leaves each adopter to hand-roll its own
+    ``--project-root``/``--json`` because their help text names different
+    resolved paths — so the dest name is a convention the two sides must agree
+    on rather than something the shared code guarantees. A third adopter that
+    spells ``dest="roots"`` gets an ``AttributeError`` from inside this
+    function; the fix is the dest, not this function.
+
     *audit_fn* takes ``(root, args)`` because both adopters need a parsed flag
     inside the per-root call that the calling script cannot close over (argv is
     parsed here): ``--min-fidelity`` for one, ``--project-id`` for the other.
@@ -460,6 +485,7 @@ def run_audit_cli(
     """
     args = parser.parse_args(argv)
 
+    # dest="project_roots" is the PARSER CONTRACT above, not an accident.
     roots = discover_project_roots(project_roots=args.project_roots)
 
     if on_roots is not None:
