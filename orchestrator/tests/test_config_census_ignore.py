@@ -12,10 +12,31 @@ The census WALK itself is correct and gets no coverage change here; these tests
 cover the new entry grammar, the violation taxonomy, and citation liveness.
 """
 
+import pytest
+
 from orchestrator.config_census_ignore import (
+    CensusIgnoreFinding,
     CensusIgnoreSpec,
+    audit_census_ignore_specs,
     parse_census_ignore_entries,
 )
+
+
+def _spec(reason: str | None, pattern: str = 'a.b') -> CensusIgnoreSpec:
+    """One spec carrying *reason*, with citations parsed the same way the real
+    parser would (so the audit sees exactly what production hands it)."""
+    (parsed,) = parse_census_ignore_entries(
+        {'config_key_census': {'ignore': [
+            {'path': pattern, 'reason': reason} if reason is not None else pattern
+        ]}}
+    )
+    return parsed
+
+
+def _kinds(reason: str | None, pattern: str = 'a.b') -> set[str]:
+    return {
+        f.kind for f in audit_census_ignore_specs([_spec(reason, pattern)], None)
+    }
 
 
 def _tree(ignore) -> dict:
@@ -137,3 +158,110 @@ def test_fail_open_non_str_reason_keeps_the_pattern():
 
 def test_fail_open_empty_ignore_list():
     assert parse_census_ignore_entries(_tree([])) == []
+
+
+# --- (b) structural audit -----------------------------------------------------
+#
+# status_probe=None throughout, so ONLY structural kinds can fire — the liveness
+# half is covered in section (c).  Taxonomy adopted from PTODO §8.3/§8.4.
+
+
+@pytest.mark.parametrize('reason', [None, '   ', '\n\t '])
+def test_unreasoned_is_advisory(reason):
+    """ACCEPTANCE (a): a new un-reasoned entry is visible as debt.  A bare
+    string and a blank reason are the same defect — an assertion with no
+    content — so they must not be distinguished."""
+    (finding,) = audit_census_ignore_specs([_spec(reason)], None)
+    assert finding.kind == 'unreasoned'
+    assert finding.severity == 'advisory'
+    assert 'a.b' in finding.detail
+
+
+@pytest.mark.parametrize(
+    'reason',
+    [
+        'dark-factory reads this',
+        'dark factory reads this',
+        'consumed by the orchestrator',
+        'OrchestratorConfig picks this up',
+    ],
+)
+def test_self_refuting_is_hard(reason):
+    """The one check that would have caught cpu_governance.DF_AGENT_CPU_GOVERN
+    at the moment it was added, ~6 weeks before the outage was found by hand.
+    Wrong BY CONSTRUCTION: dark-factory owns the schema, so a key it consumed
+    would be a FIELD on the model, hence known, hence never in need of an
+    ignore entry.  Certain with no external state — hence hard."""
+    findings = audit_census_ignore_specs([_spec(reason)], None)
+    (finding,) = [f for f in findings if f.kind == 'self-refuting']
+    assert finding.severity == 'hard'
+    assert 'a.b' in finding.detail
+    # The remediation must name the schema-field route, not just say "wrong".
+    assert 'field' in finding.detail.lower()
+
+
+@pytest.mark.parametrize(
+    'reason',
+    [
+        'pending the consumer landing',
+        'until the consumer lands',
+        'will be read once the new runner ships',
+        'not yet consumed, planned for the next cycle',
+    ],
+)
+def test_missing_cite_is_hard(reason):
+    """A not-yet-landed claim with no citation has no expiry: nothing will ever
+    prompt a re-check.  This is precisely the shape of the entry that made the
+    reify outage permanent."""
+    findings = audit_census_ignore_specs([_spec(reason)], None)
+    (finding,) = [f for f in findings if f.kind == 'missing-cite']
+    assert finding.severity == 'hard'
+    assert 'a.b' in finding.detail
+    assert '#' in finding.detail, 'detail must name the canonical #NNNN remedy'
+
+
+@pytest.mark.parametrize(
+    'reason',
+    ['blocked on task 5908', 'see task-5', 'tracked by task δ'],
+)
+def test_malformed_cite_is_advisory(reason):
+    """PTODO §6.4: the canonical form is #NNNN strictly, so a legacy reference
+    form is itself a finding — but advisory, since the operator did leave a
+    pointer and the entry is not unfalsifiable."""
+    findings = audit_census_ignore_specs([_spec(reason)], None)
+    (finding,) = [f for f in findings if f.kind == 'malformed-cite']
+    assert finding.severity == 'advisory'
+    assert 'a.b' in finding.detail
+
+
+def test_well_formed_project_owned_reason_yields_no_finding():
+    assert _kinds('read verbatim by scripts/cpu-governed-exec.sh') == set()
+
+
+def test_pending_prose_with_a_canonical_cite_yields_no_finding():
+    """The positive case the whole mechanism exists to enable: a temporary
+    entry IS legitimate, provided it cites a live tracking task.  #5908 is
+    reify's real, still-pending entry-cleanup task."""
+    assert _kinds('temporary — pending #5908, which deletes this entry') == set()
+
+
+def test_one_spec_can_yield_two_findings():
+    """Kinds are independent defects, not a single classification: an entry can
+    be both self-refuting AND uncited, and suppressing either would hide a real
+    problem."""
+    findings = audit_census_ignore_specs(
+        [_spec('dark-factory will read this once it lands')], None
+    )
+    assert {f.kind for f in findings} == {'self-refuting', 'missing-cite'}
+
+
+def test_findings_carry_the_pattern_so_the_entry_can_be_located():
+    findings = audit_census_ignore_specs(
+        [_spec(None, 'cpu_governance.weights'), _spec(None, 'warm_lane_pool')], None
+    )
+    assert {f.pattern for f in findings} == {'cpu_governance.weights', 'warm_lane_pool'}
+    assert all(isinstance(f, CensusIgnoreFinding) for f in findings)
+
+
+def test_no_specs_yields_no_findings():
+    assert audit_census_ignore_specs([], None) == []
