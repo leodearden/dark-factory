@@ -66,8 +66,15 @@ class EvalMetrics:
     iterations: int = 0          # implementer re-invocations
     debug_cycles: int = 0        # debugger invocations
 
-    # Completion judge (ζ) — judge_cost_usd is a SUBSET of cost_usd, not
-    # disjoint. Report generators should not double-count.
+    # Judge spend, populated by TWO producers: ``collect_metrics`` copies it
+    # from ``workflow.metrics`` on the implementer path (the completion judge,
+    # ζ), and ``run_architect_eval`` sets it from the plan judge's verdict on
+    # the architect path (θ, eval-revival υ). judge_cost_usd is a SUBSET of
+    # cost_usd on BOTH paths, not disjoint — report generators should not
+    # double-count. A $0.00 judge_cost_usd on an architect cell does not mean
+    # the judge ran for free; it means the judge was SKIPPED (tainted,
+    # refused-with-a-plan, or an unscorable plan) — see judge_invocations for
+    # whether it ran at all.
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
