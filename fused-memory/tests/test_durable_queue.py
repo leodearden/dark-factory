@@ -1522,6 +1522,128 @@ class TestTransientErrorRetryPolicy:
 
 
 # ------------------------------------------------------------------
+# Not-found family membership (task 3585)
+#
+# _is_transient matches by class NAME walked over type(exc).__mro__, so a
+# module-local class named NodeNotFoundError IS the contract — importing
+# graphiti_core.errors here would test the identical code path while adding
+# exactly the dependency the name-based scheme exists to avoid. It is also the
+# honest model of production: fused-memory defines its own unrelated
+# NodeNotFoundError at graphiti_client.py:219, so two distinct classes already
+# answer to this name and a name-level assertion covers both.
+# ------------------------------------------------------------------
+
+
+class NodeNotFoundError(Exception):
+    """Stand-in for any class answering to this name (graphiti_core's, or
+    fused-memory's own at graphiti_client.py:219)."""
+
+
+class EdgeNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgeNotFoundError (live: raised in
+    edges.py and the neo4j edge driver ops)."""
+
+
+class EdgesNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgesNotFoundError (defined in
+    errors.py, never raised anywhere in the library)."""
+
+
+class TestNotFoundFamilyIsNotTransient:
+    """Task 3585: the not-found family is NOT in DEFAULT_TRANSIENT_ERROR_NAMES,
+    so it dead-letters at the plain ``max_attempts`` ceiling rather than the
+    extended ``transient_max_attempts`` budget.
+
+    Membership, not mechanism — every queue here is built WITHOUT a
+    ``transient_error_names=`` override precisely so the shipped default
+    governs. TestTransientErrorRetryPolicy covers the mechanism.
+    """
+
+    @staticmethod
+    def _queue(tmp_path, execute):
+        """The shared config: plain budget 5, extended budget 12, and no
+        transient_error_names= override so DEFAULT_TRANSIENT_ERROR_NAMES
+        decides which one applies."""
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            retry_max_delay_seconds=0.05,
+            write_timeout_seconds=2.0,
+            transient_max_attempts=12,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_cls',
+        [NodeNotFoundError, EdgeNotFoundError, EdgesNotFoundError],
+        ids=lambda c: c.__name__,
+    )
+    async def test_not_found_family_dead_letters_at_plain_max_attempts(
+        self, tmp_path, exc_cls
+    ):
+        """A not-found error gets max_attempts (5), not transient_max_attempts (12).
+
+        The esc-3561-3 evidence: 304 execution attempts across 28 recorded
+        add_episode calls produced 0 successes. A visibility race converges;
+        this never did at any budget.
+        """
+        execute = AsyncMock(side_effect=exc_cls('uuid abc-123 not found'))
+        q = self._queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            # 20s budget for slow CI runners, matching the rest of this file;
+            # 12 attempts at a 0.05s delay ceiling costs well under a second,
+            # so the pre-3585 behaviour fails on the COUNT, not by timing out.
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 5, (
+                f'{exc_cls.__name__} must dead-letter at the plain max_attempts (5); '
+                f'got {dead[0]["attempts"]} — it is still being treated as transient.'
+            )
+            assert exc_cls.__name__ in dead[0]['error']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_connection_reset_still_gets_extended_budget(self, tmp_path):
+        """Control: the removal is narrow. ConnectionResetError stays in the
+        default set (and matches twice over, via its ConnectionError base), so
+        under the identical config it must still reach transient_max_attempts.
+
+        This is what fails if a later edit prunes the set too broadly.
+        """
+        execute = AsyncMock(side_effect=ConnectionResetError('connection reset by peer'))
+        q = self._queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 12, (
+                'ConnectionResetError must keep the extended transient budget (12); '
+                f'got {dead[0]["attempts"]}.'
+            )
+            assert 'ConnectionResetError' in dead[0]['error']
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
 # Terminal hook (task 3582)
 #
 # The queue's two terminal transitions — _mark_completed and the dead branch of
