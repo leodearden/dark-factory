@@ -230,7 +230,7 @@ async def _drive_advance(
 
 
 async def _run_lane(
-    worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = 5.0,
+    worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = 30.0,
 ) -> None:
     """Drive worker.run() as a real background task until *expected_passes*
     full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
@@ -257,6 +257,18 @@ async def _run_lane(
     rerun burst uses N=2). Requires ``worker._dirty`` (or the wake event) to
     already be set by a prior trigger, exactly as production wiring would
     leave it.
+
+    ``timeout`` defaults to 30.0, not a tight bound: the clock starts at
+    ``asyncio.create_task`` above, so it also covers the real-git test-body
+    work the caller does between entering the held pass and releasing it
+    (each :func:`_drive_advance` is a git add + commit + rev-parse, i.e. 3+
+    subprocess spawns) — not just the lane pass(es) themselves. Task 3451
+    measured worst-case single subprocess spawn latency at 4.71s on this
+    host under load; a caller can easily need several spawns inside this
+    window. Same load-sensitive full-suite-flake class as
+    1335/1836/2819/3451/3491 (task 3832); 30s is the ceiling task 3491
+    settled on for it. Widening this can never make a broken staging pass —
+    it only lengthens how long a genuinely broken one takes to fail.
     """
     inner_run_once = worker._run_once
     done = asyncio.Event()
@@ -280,7 +292,7 @@ async def _run_lane(
         worker._run_once = inner_run_once
 
 
-async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
+async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 30.0) -> None:
     """Drive worker.run() as a real background task for exactly one pass (B1)."""
     await _run_lane(worker, 1, timeout=timeout)
 
@@ -348,6 +360,14 @@ async def _assert_never_a_gate(
 
     base_sha = await git_ops.get_main_sha()
     head_sha = await _advance_main(repo)
+    # Left at 0.5s (task 3832 assessment, NOT the _run_lane flake class):
+    # unlike _run_lane's budget, this window covers only
+    # ``harness._note_merge_all`` -> ``worker.on_post_merge``, which is a bare
+    # enqueue-and-return (sets ``_dirty`` + an event, no subprocess spawn) —
+    # the real-git ``_advance_main`` call above already returned before this
+    # wait_for starts. This bound is instead a genuine promptness assertion
+    # (proves the synchronous fan-out never blocks on the in-flight run);
+    # widening it would weaken what it's testing.
     await asyncio.wait_for(
         harness._note_merge_all('task-2', base_sha, head_sha), timeout=0.5,
     )
