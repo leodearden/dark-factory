@@ -1096,6 +1096,90 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
         )
         assert verdict.cost_usd == 0.0
 
+    # -- Degraded POST-invoke paths still carry real spend (step-3/4) ------
+    # A refused/unparseable/non-finite judge answer still consumed whatever
+    # the provider charged — reporting $0 there would understate real spend
+    # exactly the way this task's bug does. Mirrors the content-failure /
+    # infra-failure discipline tasks 3118/3302/3303 already established.
+
+    @pytest.mark.asyncio
+    async def test_transport_refusal_path_carries_the_invocations_own_spend(self):
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.judge import judge_plan_quality
+
+        refused = AgentResult(
+            success=False,
+            output=_CAP_TEXT,
+            cost_usd=0.07,
+            duration_ms=1200,
+            turns=0,
+            subtype='error',
+            api_error_status=429,
+        )
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=refused),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.invocation_error, str) and verdict.invocation_error
+        assert verdict.cost_usd == pytest.approx(0.07)
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = MagicMock()
+        fake.structured_output = None
+        fake.output = 'not json at all {{{'
+        fake.cost_usd = 0.31
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.31)
+
+    @pytest.mark.asyncio
+    async def test_nan_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = _judge_result_scoring(float('nan'), via='structured_output')
+        fake.cost_usd = 0.29
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.29)
+
+    # -- The PRE-invoke refusal fabricates no spend (step-3/4) --------------
+    # Nothing to judge, so invoke_agent is never awaited — recording spend
+    # here would fabricate a cost for an invocation that never happened.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_pre_invoke_refusal_records_no_fabricated_spend(self, plan):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        mock_invoke = AsyncMock()
+        with patch('orchestrator.evals.judge.invoke_agent', mock_invoke):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        mock_invoke.assert_not_awaited()
+        assert verdict.cost_usd == 0.0
+
 
 # ---------------------------------------------------------------------------
 # The plan judge REFUSES an unjudgeable artifact (task 3303)
