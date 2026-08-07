@@ -1054,6 +1054,50 @@ class TestJudgePlanQuality:
 
 
 # ---------------------------------------------------------------------------
+# PlanQualityVerdict.cost_usd (step-1/2, eval-revival υ) — the judge's OWN
+# invocation spend
+#
+# run_architect_eval never sees the judge's AgentResult, only the returned
+# PlanQualityVerdict — so the judge invocation's cost has to ride the return
+# value. A trailing, defaulted field (mirroring invocation_error,
+# judge.py:458-463) keeps every existing 3-arg construction site — including
+# every judge test above predating this task — reading back cost_usd=0.0
+# rather than crashing.
+# ---------------------------------------------------------------------------
+
+class TestPlanQualityVerdictCarriesJudgeSpend:
+    @pytest.mark.asyncio
+    async def test_success_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = 0.42
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == pytest.approx(0.42)
+
+    def test_legacy_three_arg_construction_reads_back_zero_spend(self):
+        """Every pre-existing construction site (and any older persisted /
+        monkeypatched verdict) must keep working and read back "no spend
+        recorded" rather than crashing."""
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        verdict = PlanQualityVerdict(
+            plan_quality=0.5, per_criterion={}, reasoning='ok',
+        )
+        assert verdict.cost_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
 # The plan judge REFUSES an unjudgeable artifact (task 3303)
 #
 # The reported defect, from the 2026-07-29 corpus cell
