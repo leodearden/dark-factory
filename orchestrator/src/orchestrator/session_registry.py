@@ -1150,6 +1150,8 @@ class MigratedDecision:
 
 def migrate_decision_project_tokens(
     root: Path | str | None = None,
+    *,
+    dry_run: bool = False,
 ) -> list[MigratedDecision]:
     """One-shot, idempotent backfill of DecisionRecord.project onto the canonical token.
 
@@ -1193,23 +1195,46 @@ def migrate_decision_project_tokens(
         ``df-`` prefix on ids like ``df-esc-3524-1`` and every cockpit
         cross-link survive intact.
 
+    (f) ``dry_run=True`` PREVIEWS, guaranteed side-effect-free. It computes
+        and returns the exact same MigratedDecision list the real run would,
+        but takes no lock and performs no write -- so an operator can see the
+        full rewrite of the live population before committing to it. It does
+        not even materialize a ``<id>.json.lock`` sidecar, which matters
+        because ``decision_id_lock`` documents that merely TAKING a lock
+        creates one (its ORPHAN SIDECARS note); a preview that littered one
+        per record across the whole fleet would not be side-effect-free.
+
     Iterates ``list_decisions`` rather than doing its own scan, inheriting
-    its skip-a-corrupt-file tolerance for free. A record whose write fails is
-    simply absent from the returned list, mirroring
-    ``reap_answered_decisions``' "only record it when the update actually
-    succeeded" contract.
+    its skip-a-corrupt-file tolerance for free. FAIL-SOFT PER RECORD: the
+    lock/read/write span is guarded, so a record that is unreadable,
+    unwritable, or faults mid-write is logged at ERROR and skipped while the
+    sweep of the rest completes -- one bad record must never deny the
+    operator the repair of the other 390, matching the module-wide
+    convention (``write_decision``, ``update_decision_state`` and
+    ``list_decisions`` all self-guard). A record whose write fails is simply
+    absent from the returned list, mirroring ``reap_answered_decisions``'
+    "only record it when the update actually succeeded" contract.
     """
     migrated: list[MigratedDecision] = []
     for decision in list_decisions(root):
         new_project = normalize_project_token(decision.project)
         if new_project == decision.project:
             continue
-        path = decision_path_for_id(decision.id, root=root)
-        with decision_id_lock(decision.id, root=root):
-            # Re-read under the lock -- see invariant (b).
-            record = DecisionRecord.from_json(path.read_text())
-            record.project = new_project
-            if not write_decision(record, root=root):
+        if not dry_run:
+            try:
+                path = decision_path_for_id(decision.id, root=root)
+                with decision_id_lock(decision.id, root=root):
+                    # Re-read under the lock -- see invariant (b).
+                    record = DecisionRecord.from_json(path.read_text())
+                    record.project = new_project
+                    if not write_decision(record, root=root):
+                        continue
+            except Exception:
+                logger.error(
+                    'migrate_decision_project_tokens: skipping %s',
+                    decision.id,
+                    exc_info=True,
+                )
                 continue
         migrated.append(
             MigratedDecision(
