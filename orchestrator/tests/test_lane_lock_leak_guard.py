@@ -47,7 +47,6 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1055,6 +1054,43 @@ def test_foreign_holder_fixture_fails_loudly_when_attribution_never_settles(
 # ---------------------------------------------------------------------------
 
 
+def _effective_per_test_timeout(config) -> float | None:
+    """The per-test timeout ``pytest-timeout`` will actually enforce for
+    *config*'s run, or ``None`` if no timeout is in effect.
+
+    Mirrors the installed plugin's own ``get_env_settings`` precedence
+    chain (``getvalue('timeout')`` -> ``PYTEST_TIMEOUT`` env var ->
+    ``getini('timeout')``) rather than reading pyproject.toml directly, so
+    the result is correct regardless of which pyproject.toml pytest
+    resolved as its rootdir inifile, and honours ``--timeout``/``-o
+    timeout=``/``PYTEST_TIMEOUT`` overrides the way a bare TOML read
+    cannot (task 3836 review amendment).
+
+    The ``hasplugin`` check MUST run first and short-circuit before any
+    ``getvalue``/``getini`` call: with the plugin disabled (``-p
+    no:timeout``), ``getini('timeout')`` raises ``ValueError: unknown
+    configuration value: 'timeout'`` (measured) because the plugin never
+    registered the ini option in the first place.
+
+    The ini value is a STRING when present (``'60'``, not ``60``) and its
+    unset sentinel is the EMPTY STRING (``''``), not ``None`` (both
+    measured) — hence the explicit ``float()`` coercion and the falsiness
+    check rather than an ``is not None`` guard.
+    """
+    if not config.pluginmanager.hasplugin('timeout'):
+        return None
+    cli_timeout = config.getvalue('timeout')
+    if cli_timeout is not None:
+        return float(cli_timeout)
+    env_timeout = os.environ.get('PYTEST_TIMEOUT')
+    if env_timeout:
+        return float(env_timeout)
+    ini_timeout = config.getini('timeout')
+    if ini_timeout:
+        return float(ini_timeout)
+    return None
+
+
 def _stub_pytest_config(
     *,
     cli_timeout: float | None,
@@ -1203,7 +1239,7 @@ def test_foreign_holder_bounds_clear_measured_spawn_latency():
     )
 
 
-def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout():
+def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout(pytestconfig):
     """The foreign-holder bounds must also clear the global pytest-timeout.
 
     Mirrors :func:`test_foreign_holder_bounds_clear_measured_spawn_latency`
@@ -1221,10 +1257,23 @@ def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout():
     sequence, not in parallel, so every single test that uses this helper
     pays the full sum before its own body or fixture work even starts.
 
-    The global per-test timeout is read LIVE from orchestrator/pyproject.toml
-    (``[tool.pytest.ini_options].timeout``) instead of hardcoded, so this
-    invariant tracks the real config rather than silently drifting the way
-    the comments this task corrects did.
+    The effective per-test timeout is resolved via
+    :func:`_effective_per_test_timeout`, which mirrors pytest-timeout's own
+    precedence chain (``--timeout`` CLI flag, then ``PYTEST_TIMEOUT`` env
+    var, then the ini ``timeout`` key read through the EFFECTIVE pytest
+    config) rather than a bare ``tomllib`` read of a single pyproject.toml
+    (task 3836 review amendment) — so this invariant is correct regardless
+    of which pyproject.toml pytest resolved as its rootdir inifile, and
+    honours ``--timeout``/``-o timeout=``/``PYTEST_TIMEOUT`` overrides the
+    way a bare TOML read cannot. A run under a genuinely smaller effective
+    timeout (e.g. ``--timeout=30``, where the ceiling becomes 18.0s against
+    the 34.0s stack) correctly turns this test RED — that is the invariant
+    working, not a bug to be papered over by widening the 60% fraction.
+    When no timeout is in effect at all, this test either fails loudly
+    (orchestrator/pyproject.toml is the governing inifile — genuine drift)
+    or skips, naming the governing inifile (an invocation artifact, e.g. a
+    root-bound run whose pyproject.toml declares no ``timeout`` key at
+    all).
 
     Why 60% of the global timeout, not 100%: no test in this module opts out
     with ``@pytest.mark.timeout``, so once the unconditional stack collides
@@ -1240,18 +1289,27 @@ def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout():
     (``git_repo``/``real_git_ops``, ``_get_merge_commit``,
     ``reset_persistent_merge_worktree``) sharing the same per-test budget.
     """
-    pyproject_path = Path(__file__).resolve().parents[1] / 'pyproject.toml'
-    with pyproject_path.open('rb') as handle:
-        toml_data = tomllib.load(handle)
-    ini_options = toml_data['tool']['pytest']['ini_options']
-    assert 'timeout' in ini_options, (
-        f'{pyproject_path} [tool.pytest.ini_options] no longer declares '
-        f'timeout — this invariant reads the LIVE global per-test timeout '
-        f'so it cannot silently drift from reality the way the comments '
-        f'task 3836 corrected did; update this test if the global timeout '
-        f'moved elsewhere'
-    )
-    global_timeout = ini_options['timeout']
+    global_timeout = _effective_per_test_timeout(pytestconfig)
+    if global_timeout is None:
+        orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+        governing_inifile = pytestconfig.inipath
+        if governing_inifile is not None and governing_inifile.resolve() == orchestrator_pyproject:
+            pytest.fail(
+                f'{governing_inifile} is the governing inifile for this run, '
+                f'yet no per-test timeout is in effect (checked --timeout, '
+                f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — '
+                f'this is a genuine regression: the pytest-timeout / '
+                f'os._exit() premise the foreign-holder bounds in this '
+                f'module are sized against no longer holds. Either restore '
+                f'the timeout key or re-derive these bounds without it.'
+            )
+        pytest.skip(
+            f'no per-test timeout is in effect under the governing inifile '
+            f'{governing_inifile!r} — this is not {orchestrator_pyproject}, '
+            f'so this is an invocation artifact (e.g. a root-bound run), '
+            f'not drift; the pytest-timeout ceiling this invariant checks '
+            f'does not apply to this run'
+        )
 
     # The _kill_group kill-wait (child.wait(timeout=5)) runs unconditionally
     # on every exit path, in addition to the three named _FOREIGN_HOLDER_*
@@ -1268,14 +1326,15 @@ def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout():
         f'{unconditional_stack}s ({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
         f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
         f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait), which '
-        f'exceeds 60% of the global per-test timeout ({global_timeout}s, '
-        f'from {pyproject_path}) — only {ceiling}s of headroom is allowed. '
-        f'No test in this module opts out with @pytest.mark.timeout, so '
-        f'exceeding the global timeout does not merely delay a failure: '
-        f'pytest-timeout fires first and, under timeout_method="thread" '
-        f'with --max-worker-restart=0, os._exit()s the xdist worker instead '
-        f'of failing cleanly — discarding the helper\'s own pytest.fail '
-        f'diagnostics and every bit of structured evidence they carry.'
+        f'exceeds 60% of the effective per-test timeout ({global_timeout}s, '
+        f'resolved from {pytestconfig.inipath}) — only {ceiling}s of '
+        f'headroom is allowed. No test in this module opts out with '
+        f'@pytest.mark.timeout, so exceeding the effective timeout does not '
+        f'merely delay a failure: pytest-timeout fires first and, under '
+        f'timeout_method="thread" with --max-worker-restart=0, os._exit()s '
+        f'the xdist worker instead of failing cleanly — discarding the '
+        f"helper's own pytest.fail diagnostics and every bit of structured "
+        f'evidence they carry.'
     )
 
 
