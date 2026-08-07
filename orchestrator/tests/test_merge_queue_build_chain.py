@@ -331,3 +331,100 @@ class TestChainResultContract:
         assert ChainResult(
             links=[('101', 'a'), ('102', 'b')], tip='b',
         ).depth == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-03/05: RED — GitOps.merge_branch_into_worktree
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestMergeBranchIntoWorktree:
+    """merge_branch_into_worktree merges into a CALLER-SUPPLIED worktree.
+
+    The load-bearing divergence from ``merge_to_main``: that method calls
+    ``_create_merge_worktree`` (git_ops.py:9319) on EVERY call, provisioning a
+    fresh ``_merge-<hex8>`` worktree.  A ``for req in chain: merge_to_main(...)``
+    loop would create k worktrees — directly violating this task's
+    user-observable signal ("exactly one worktree used").
+    """
+
+    async def test_clean_merge_uses_the_supplied_worktree(self, git_repo: Path):
+        """A clean merge lands in the passed worktree and creates none of its own."""
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
+        main_sha = await _rev_parse(git_repo)
+
+        before = await _worktree_names(git_ops)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        pre_head = await _rev_parse(wt)
+
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        assert res.success is True
+        assert res.conflicts is False
+        assert res.merge_commit is not None
+        # Stripped at the source — merge_to_main returns raw _run stdout with a
+        # trailing newline, so this pins the divergence.
+        assert res.merge_commit == res.merge_commit.strip()
+        assert len(res.merge_commit) == 40
+        # The SAME path passed in — not a fresh one.
+        assert res.merge_worktree == wt
+        assert res.pre_merge_sha == pre_head
+
+        # ZERO worktrees created beyond the one the test itself made.
+        assert await _worktree_names(git_ops) == before | {wt.name}
+
+    async def test_clean_merge_is_a_two_parent_no_ff_merge(self, git_repo: Path):
+        """HEAD == merge_commit, HEAD^1 == pre-merge tip, HEAD^2 == branch tip."""
+        git_ops = _make_git_ops(git_repo)
+        branch_tip = await _create_branch_editing(
+            git_repo, 'task/101', 'disjoint.txt', 'edit-101\n',
+        )
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        pre_head = await _rev_parse(wt)
+
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        assert await _rev_parse(wt) == res.merge_commit
+        assert await _rev_parse(wt, 'HEAD^1') == pre_head
+        assert await _rev_parse(wt, 'HEAD^2') == branch_tip
+        assert (wt / 'disjoint.txt').read_text() == 'edit-101\n'
+
+    async def test_merge_subject_is_canonical(self, git_repo: Path):
+        """Subject comes from _merge_subject — find_merge_marker depends on it."""
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+
+        await git_ops.merge_branch_into_worktree(wt, '101')
+
+        _, subject, _ = await _run(['git', 'log', '-1', '--format=%s'], cwd=wt)
+        assert subject.strip() == 'Merge task/101 into main'
+
+    async def test_sequential_merges_reuse_the_same_worktree(self, git_repo: Path):
+        """Two merges into one worktree give a linear first-parent chain."""
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        main_sha = await _rev_parse(git_repo)
+
+        before = await _worktree_names(git_ops)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+
+        res1 = await git_ops.merge_branch_into_worktree(wt, '101')
+        assert res1.success is True
+        res2 = await git_ops.merge_branch_into_worktree(wt, '102')
+        assert res2.success is True
+        assert res2.merge_worktree == wt
+
+        # Linear first-parent chain in land order.
+        assert await _rev_parse(wt, 'HEAD^1') == res1.merge_commit
+        assert (wt / 'a.txt').read_text() == 'edit-101\n'
+        assert (wt / 'b.txt').read_text() == 'edit-102\n'
+
+        # Still exactly the one worktree the test created.
+        assert await _worktree_names(git_ops) == before | {wt.name}
