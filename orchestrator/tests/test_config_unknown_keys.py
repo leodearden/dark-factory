@@ -19,6 +19,7 @@ import orchestrator.config
 from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    CensusIgnoreEntry,
     ConfigIgnoredKey,
     ConfigKeyCensus,
     ConfigKeyCensusConfig,
@@ -29,6 +30,7 @@ from orchestrator.config import (
     config_unknown_keys_signature,
     load_config,
 )
+from orchestrator.config_census_ignore import CENSUS_IGNORE_ENTRY_KEYS
 
 
 def _write_yaml(tmp_path: Path, data, name: str = 'orchestrator.yaml') -> Path:
@@ -811,3 +813,66 @@ def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path, mon
     assert 'OK:' not in result.output
     assert 'excused from the census' not in result.output
     assert 'x_custom' not in result.output
+
+
+# ===== Reasoned ignore entries (task 3395) ===================================
+#
+# A bare-string ignore entry is an unfalsifiable assertion about a
+# non-OrchestratorConfig consumer that is never re-checked.  These pin the
+# widened {path, reason} grammar, the reason reaching the classified key, and
+# the check-config / load_config surfacing.
+
+
+# --- (a) the model accepts the reasoned form ---------------------------------
+
+
+def test_census_config_accepts_reasoned_entry():
+    cfg = ConfigKeyCensusConfig(
+        ignore=['a.b', {'path': 'c.d', 'reason': 'read by scripts/x.sh'}]
+    )
+    assert cfg.ignore[0] == 'a.b'
+    assert isinstance(cfg.ignore[0], str)
+    entry = cfg.ignore[1]
+    assert isinstance(entry, CensusIgnoreEntry)
+    assert entry.path == 'c.d'
+    assert entry.reason == 'read by scripts/x.sh'
+
+
+def test_load_config_accepts_reasoned_entry_end_to_end(tmp_path, monkeypatch):
+    """BACK-COMPAT HAZARD: if the model field stayed ``list[str]``, the first
+    operator to adopt the documented reasoned form would hard-fail pydantic
+    validation and take a LIVE unit down at load.  A widened field is not
+    optional — accepting the dict form is the whole point."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(tmp_path),
+            'config_key_census': {
+                'ignore': [{'path': 'cpu_governance.weights', 'reason': 'r'}]
+            },
+        },
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    config = load_config(p)
+    assert config.config_key_census.ignore
+
+
+def test_census_ignore_entry_keys_match_the_raw_parser():
+    """DRIFT GUARD (INV-5).  The entry shape necessarily lives in TWO places —
+    the pydantic model that validates the config, and the raw-tree parser the
+    census actually runs on (which cannot use the validated model, because it
+    must keep working when the config has an unrelated value-level validation
+    error).  They MUST agree byte-for-byte on the key names, so the expectation
+    is DERIVED from the model rather than hardcoded: adding a field to
+    CensusIgnoreEntry without teaching the parser fails right here."""
+    assert set(CensusIgnoreEntry.model_fields) == set(CENSUS_IGNORE_ENTRY_KEYS)
+
+
+def test_widening_ignore_adds_no_new_green_tier_leaf():
+    """Widening the element type must not change the RELOADABLE_FIELDS surface:
+    the field is still named ``ignore``, so _submodel_leaf_paths still yields
+    exactly one leaf and the hot-reload promise above is untouched."""
+    assert 'config_key_census.ignore' in RELOADABLE_FIELDS
+    census_leaves = {f for f in RELOADABLE_FIELDS if f.startswith('config_key_census.')}
+    assert census_leaves == {'config_key_census.ignore'}
