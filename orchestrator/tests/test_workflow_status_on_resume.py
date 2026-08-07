@@ -14,6 +14,7 @@ before the orchestrator burns another iteration's worth of budget.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -919,13 +920,22 @@ class TestCheckScopeInvariant:
         # top-level files 'a.py' and 'b.py' normalize to DISTINCT modules, so
         # {'a.py','b.py'} != {'a.py'} at module granularity too — the tripwire
         # (now module-granular, task 2505 reviewer amendment) still fires.
+        # PLAN-EXTRA / UNSAFE direction (task 3429): plan.files needs a lock
+        # module that metadata.files does not cover — this is the direction
+        # the narrowed containment check must still catch.
         plan_files = ['a.py', 'b.py']
         metadata_files = ['a.py']
-        assert files_to_modules(plan_files, config.lock_depth) != files_to_modules(
-            metadata_files, config.lock_depth,
-        ), (
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(files_to_modules(metadata_files, config.lock_depth))
+        assert plan_modules != metadata_modules, (
             'precondition: this test must exercise a genuine cross-MODULE '
             f'divergence at lock_depth={config.lock_depth}'
+        )
+        assert plan_modules - metadata_modules, (
+            'precondition: this must be a PLAN-EXTRA divergence — plan.files '
+            'needs a lock module metadata.files does not cover — at '
+            f'lock_depth={config.lock_depth}; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
         )
         workflow, scheduler, queue = self._build(
             config, git_ops, task_assignment, tmp_path,
@@ -1025,6 +1035,65 @@ class TestCheckScopeInvariant:
         assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
             'an unreadable task must be treated as "cannot check", not '
             '"divergent" — no escalation on a transient read failure'
+        )
+
+    async def test_metadata_module_superset_of_plan_no_escalation(
+        self, config, git_ops, task_assignment, tmp_path, caplog,
+    ):
+        """SAFE direction (task 3429): metadata.files a strict module
+        SUPERSET of plan.files must NOT escalate.
+
+        Mirrors the measured structural false-positive class (7 of the 9
+        PLAN-MISSING divergence strands on 2026-08-06): the extra file is the
+        task's OWN TEST FILE living in a sibling directory. metadata.files is
+        the sole input the scheduler derives this task's file locks from, so
+        a module SUPERSET means the held locks are wider than the plan
+        needs — that cannot let two tasks collide, it can only
+        over-serialise — so this must not fire the blocking L0 that gates
+        the merge. The safe direction must still stay observable, so it is
+        logged at INFO instead of vanishing silently.
+        """
+        plan_files = ['scripts/foo.sh']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert plan_modules < metadata_modules, (
+            'precondition: metadata_modules must be a STRICT superset of '
+            f'plan_modules at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': metadata_files},
+        }
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            await workflow._check_scope_invariant()
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'a metadata.files module SUPERSET is a wider-than-needed lock '
+            'set — it cannot let two tasks collide, only over-serialise — '
+            'so it must NOT file the blocking L0 that gates the merge'
+        )
+        extra_modules = sorted(metadata_modules - plan_modules)
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        matching = [
+            msg for msg in info_messages
+            if task_assignment.task_id in msg
+            and all(mod in msg for mod in extra_modules)
+        ]
+        assert matching, (
+            'expected an INFO log naming the task id and the extra metadata '
+            f'module(s) {extra_modules!r} so the benign-superset direction '
+            f'stays observable; INFO records: {info_messages!r}'
         )
 
 
