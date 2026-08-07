@@ -137,7 +137,7 @@ function rtProbe(status) {
 // fact is already fully recoverable from the rows, so a new key would carry
 // zero extra information while churning every exact-set payload assertion.
 // Returns null when there is nothing to ALARM about, else
-// {byStatus, probedCount, selfInflicted, tone, text}.
+// {byStatus, probedCount, degradedCount, selfInflicted, tone, text}.
 //
 // 'not_configured' is deliberately NOT an input to this banner. It is both
 // expected and PERMANENT — dashboard/config.py's _discover_escalation_urls
@@ -148,35 +148,58 @@ function rtProbe(status) {
 // still renders their (muted) per-row badge in TaskDetail, which is the right
 // altitude for a permanent, per-project, non-fault fact.
 function rtProbeSummary(rows) {
-  // Dedupe to one status per project — a project with 40 rows must not
-  // outvote a project with 1.
-  const byProject = new Map();
+  // ONE map, not two. Dedupe to one status per project — a project with 40
+  // rows must not outvote a project with 1 — and keep the HEALTHY probed
+  // projects in it, because they are the denominator (see below). Two
+  // independently-filtered maps could disagree if a project ever contributed
+  // both an 'ok' row and a degraded row, since first-seen would resolve
+  // differently in each; one map makes that state unrepresentable.
+  const probedProjects = new Map();
   for (const r of rows || []) {
     const status = normStatus(r && r.runtime_status);
-    if (status === 'ok' || status === 'not_configured') continue;
-    if (!byProject.has(r.project)) byProject.set(r.project, status);
+    if (status === 'not_configured') continue;
+    if (!probedProjects.has(r.project)) probedProjects.set(r.project, status);
   }
-  if (byProject.size === 0) return null;
 
   // Null-prototype so an unexpected status string cannot collide with an
   // inherited Object member (same reason as rtProbe's hasOwnProperty guard).
+  // byStatus stays degraded-only: it is the banner's LISTING, and healthy
+  // projects are not something to alarm about.
   const byStatus = Object.create(null);
-  for (const [project, status] of byProject) {
+  const degraded = [];
+  for (const [project, status] of probedProjects) {
+    if (status === 'ok') continue;
+    degraded.push(status);
     (byStatus[status] = byStatus[status] || []).push(project);
   }
+  if (degraded.length === 0) return null;
 
-  // Everything left here was actually probed — never-probed (not_configured)
-  // projects were filtered out above, so counting them can no longer make the
-  // all-at-once heuristic fire on a deployment where only one orchestrator is
-  // even configured.
-  const probed = [...byProject.values()];
-  const probedCount = probed.length;
-  // >= 2 matches task_runtime.fetch_task_runtime's aggregate WARNING exactly,
-  // so the log and this banner can never disagree. With ONE probed project the
-  // all-at-once pattern is degenerate — it is equally consistent with that one
-  // orchestrator being down, so claiming the dashboard is at fault would be an
-  // unfounded diagnosis in the other direction.
-  const selfInflicted = probedCount >= 2 && probed.every((s) => s === 'deadline_exceeded');
+  // probedCount MEANS what its name says: every project the dashboard
+  // actually probed, HEALTHY ONES INCLUDED. Omitting them is what let a
+  // PARTIAL timeout read as dashboard-wide starvation — with only the
+  // degraded projects in the denominator, "all probed projects timed out" is
+  // vacuously true of any pure-timeout subset, so two slow orchestrators
+  // alongside three healthy ones reported the dashboard as the fault. A
+  // project that answered is positive proof the dashboard was not too starved
+  // to ask, which is precisely the claim `selfInflicted` makes.
+  //
+  // never-probed (not_configured) projects are still excluded, so the
+  // heuristic cannot fire on a deployment where only one orchestrator is even
+  // configured.
+  const probedCount = probedProjects.size;
+  const degradedCount = degraded.length;
+  // The threshold (>= 2) and the all-probed-must-be-deadline_exceeded rule are
+  // now identical to task_runtime.fetch_task_runtime's aggregate WARNING. The
+  // two can still differ, but only in ONE way: this denominator is derived
+  // from ACTIVE_TASKS ROWS, so a probed project with zero task rows is
+  // invisible here while Python counts it in `labels`. (Do not restate this as
+  // "can never disagree" — that unqualified claim was asserted here once and
+  // was false.) With ONE probed project the all-at-once pattern is degenerate
+  // — equally consistent with that one orchestrator being down — so claiming
+  // the dashboard is at fault would be an unfounded diagnosis in reverse.
+  const selfInflicted = probedCount >= 2
+    && degradedCount === probedCount
+    && degraded.every((s) => s === 'deadline_exceeded');
 
   // Worst tone present, so the caller can colour the banner by what is
   // actually wrong. Deriving the accent from `selfInflicted` instead would
@@ -189,13 +212,17 @@ function rtProbeSummary(rows) {
 
   const describe = (status) => `${rtProbe(status).label}: ${byStatus[status].join(', ')}`;
   const parts = Object.keys(byStatus).map(describe).join(' · ');
+  // The self-inflicted branch reports the DENOMINATOR ("all N probed"), which
+  // is the whole point of that claim. The other branch reports the DEGRADED
+  // count, so its number and its listing describe the same set — using
+  // probedCount there would claim 5 projects while naming 2.
   const text = selfInflicted
     ? `The dashboard could not complete its own runtime probes for all ${probedCount} `
       + 'probed projects. The orchestrators may be healthy — a real outage is '
       + `per-project, so check the dashboard first. (${parts})`
-    : `Runtime state unavailable for ${probedCount} project(s) — ${parts}`;
+    : `Runtime state unavailable for ${degradedCount} project(s) — ${parts}`;
 
-  return { byStatus, probedCount, selfInflicted, tone, text };
+  return { byStatus, probedCount, degradedCount, selfInflicted, tone, text };
 }
 
 // Module-unique export const, never a bare `API` — see the

@@ -238,8 +238,14 @@ async def fetch_task_runtime(
     # pattern carries no information at all — "all projects timed out" is then
     # exactly "that one orchestrator might be down", and claiming the dashboard
     # is at fault would be the same unfounded diagnosis in the other direction.
-    # dashboard.static.redux.runtime_format.rtProbeSummary applies the IDENTICAL
-    # threshold so the log and the UI can never disagree.
+    # dashboard.static.redux.runtime_format.rtProbeSummary applies the same
+    # threshold and the same all-probed-must-be-deadline_exceeded rule, but the
+    # two are NOT guaranteed to agree: its denominator is derived from
+    # ACTIVE_TASKS rows, so a probed project with zero task rows is invisible
+    # to it while it is counted in `labels` here. Row-less projects are the one
+    # remaining source of divergence. (This comment previously claimed the two
+    # "can never disagree"; that was false for a second reason as well — the JS
+    # denominator omitted healthy projects entirely — and is not restored.)
     deadline = [
         lbl for lbl, snap in zip(labels, results, strict=True)
         if snap.offline_reason == 'deadline_exceeded'
