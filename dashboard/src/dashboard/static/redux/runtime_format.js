@@ -1,9 +1,10 @@
-// runtime_format.js — pure formatters for warm-lane runtime state, rendered by
-// the Orchestrators tab (OrchTab in tabs.jsx) and the Tasks tab's TaskDetail /
-// TasksTab (tab_tasks.jsx). Two related concerns live here:
+// runtime_format.js — pure formatters for warm-lane runtime state. Two
+// related concerns live here, with DIFFERENT consumer coverage:
 //
 //   1. The per-field offline-'—' degradation (rtCell/rtAge) — WHAT to render
-//      when a runtime field is null.
+//      when a runtime field is null. Consumed by BOTH the Orchestrators tab
+//      (OrchTab in tabs.jsx) and the Tasks tab's TaskDetail / TasksTab
+//      (tab_tasks.jsx).
 //   2. The probe-status discriminator (rtProbe/rtProbeSummary, task 3517) —
 //      WHY it is null. A dash alone cannot tell an operator whether the
 //      orchestrator is down, the dashboard was too starved to ask within its
@@ -11,6 +12,16 @@
 //      all. Those three demand opposite responses, and collapsing them into
 //      identical blank cells is what made the 2026-07-30 event get
 //      misdiagnosed as an orchestrator outage.
+//
+//      KNOWN GAP: (2) is wired into the Tasks tab ONLY. OrchTab still
+//      destructures just {rtCell, rtAge} and renders loops/attempts/lane/
+//      phase/lane_state as bare em-dashes with no probe explanation, so the
+//      2026-07-30 ambiguity survives one tab over — on arguably the tab an
+//      operator reaches for FIRST during a suspected orchestrator outage.
+//      Deliberately not fixed here: tabs.jsx's test surface
+//      (dashboard/tests/test_tab_orchestrators.py) is outside task 3517's
+//      locks, so the change could not be landed with tests. Do not read the
+//      list in (1) as claiming OrchTab coverage for (2).
 //
 // Load-bearing producer chain for (2): dashboard/data/task_runtime.py's
 // _probe_one synthesizes TaskRuntimeSnapshot.offline_reason, which
@@ -87,18 +98,36 @@ const PROBE_STATUS = {
   },
 };
 
+// Tone severity ordering, for picking the WORST tone in a set. Kept next to
+// PROBE_STATUS so a new member cannot be added without a rank.
+const TONE_RANK = { muted: 0, warn: 1, bad: 2 };
+
+// ── The single missing-value policy, shared by BOTH helpers below ──
+// They must agree, or the UI contradicts itself: every TaskDetail showing a
+// 'runtime state unknown' warn badge while the aggregate banner reports
+// nothing degraded at all. ABSENT (null/undefined) means the payload predates
+// `runtime_status` — an older cached response — and is read as 'ok', matching
+// the producing side's own default (active_tasks._build_task_row does
+// `rt.get('runtime_status', 'ok')`). The 'unknown' descriptor stays reserved
+// for the two cases that are genuinely informative: a value that IS present
+// but is not a vocabulary member (real drift), and the server reporting
+// offline without saying why.
+function normStatus(status) {
+  return status == null ? 'ok' : status;
+}
+
 // ── Per-row probe descriptor: 'ok' -> null, anything else -> a descriptor ──
-// Only the exact string 'ok' renders nothing. Every other value — including
-// null/undefined/garbage from an older or drifting payload — falls back to the
-// 'unknown' descriptor rather than throwing or silently vanishing into a blank
-// cell, which is the very failure mode this function exists to remove.
+// A present-but-unrecognized value falls back to the 'unknown' descriptor
+// rather than throwing or silently vanishing into a blank cell, which is the
+// very failure mode this function exists to remove.
 // hasOwnProperty, not a bare lookup: `PROBE_STATUS['constructor']` would
 // otherwise resolve up the prototype chain to a truthy non-descriptor and be
 // returned as if it were one.
 function rtProbe(status) {
-  if (status === 'ok') return null;
-  return Object.prototype.hasOwnProperty.call(PROBE_STATUS, status)
-    ? PROBE_STATUS[status]
+  const s = normStatus(status);
+  if (s === 'ok') return null;
+  return Object.prototype.hasOwnProperty.call(PROBE_STATUS, s)
+    ? PROBE_STATUS[s]
     : PROBE_STATUS.unknown;
 }
 
@@ -107,17 +136,24 @@ function rtProbe(status) {
 // frontend-side rather than as a new top-level payload key: the per-project
 // fact is already fully recoverable from the rows, so a new key would carry
 // zero extra information while churning every exact-set payload assertion.
-// Returns null when nothing is degraded, else
-// {byStatus, probedCount, selfInflicted, text}.
+// Returns null when there is nothing to ALARM about, else
+// {byStatus, probedCount, selfInflicted, tone, text}.
+//
+// 'not_configured' is deliberately NOT an input to this banner. It is both
+// expected and PERMANENT — dashboard/config.py's _discover_escalation_urls
+// explicitly anticipates "a legitimately non-orchestrator root" — so any
+// deployment tracking such a root would carry a never-clearing alert on the
+// Tasks tab, which is exactly how operators learn to ignore the banner that
+// carries the real diagnosis. Those rows are not silently dropped: rtProbe
+// still renders their (muted) per-row badge in TaskDetail, which is the right
+// altitude for a permanent, per-project, non-fault fact.
 function rtProbeSummary(rows) {
   // Dedupe to one status per project — a project with 40 rows must not
   // outvote a project with 1.
   const byProject = new Map();
   for (const r of rows || []) {
-    // A row predating `runtime_status` (older cached payload) is treated as
-    // healthy: absence of evidence is not evidence of a failed probe.
-    const status = (r && r.runtime_status) || 'ok';
-    if (status === 'ok') continue;
+    const status = normStatus(r && r.runtime_status);
+    if (status === 'ok' || status === 'not_configured') continue;
     if (!byProject.has(r.project)) byProject.set(r.project, status);
   }
   if (byProject.size === 0) return null;
@@ -129,10 +165,11 @@ function rtProbeSummary(rows) {
     (byStatus[status] = byStatus[status] || []).push(project);
   }
 
-  // A project is "probed" iff something was actually attempted against it —
-  // not_configured projects were never probed, so counting them would make the
-  // heuristic fire on a deployment where only one orchestrator is configured.
-  const probed = [...byProject.values()].filter((s) => s !== 'not_configured');
+  // Everything left here was actually probed — never-probed (not_configured)
+  // projects were filtered out above, so counting them can no longer make the
+  // all-at-once heuristic fire on a deployment where only one orchestrator is
+  // even configured.
+  const probed = [...byProject.values()];
   const probedCount = probed.length;
   // >= 2 matches task_runtime.fetch_task_runtime's aggregate WARNING exactly,
   // so the log and this banner can never disagree. With ONE probed project the
@@ -141,15 +178,24 @@ function rtProbeSummary(rows) {
   // unfounded diagnosis in the other direction.
   const selfInflicted = probedCount >= 2 && probed.every((s) => s === 'deadline_exceeded');
 
+  // Worst tone present, so the caller can colour the banner by what is
+  // actually wrong. Deriving the accent from `selfInflicted` instead would
+  // paint a lone timed-out project — a 'warn', quite possibly our own starved
+  // loop — in the same alarm colour as a confirmed orchestrator outage.
+  const tone = Object.keys(byStatus).reduce((worst, s) => {
+    const t = rtProbe(s).tone;
+    return TONE_RANK[t] > TONE_RANK[worst] ? t : worst;
+  }, 'muted');
+
   const describe = (status) => `${rtProbe(status).label}: ${byStatus[status].join(', ')}`;
   const parts = Object.keys(byStatus).map(describe).join(' · ');
   const text = selfInflicted
     ? `The dashboard could not complete its own runtime probes for all ${probedCount} `
       + 'probed projects. The orchestrators may be healthy — a real outage is '
       + `per-project, so check the dashboard first. (${parts})`
-    : `Runtime state unavailable for ${byProject.size} project(s) — ${parts}`;
+    : `Runtime state unavailable for ${probedCount} project(s) — ${parts}`;
 
-  return { byStatus, probedCount, selfInflicted, text };
+  return { byStatus, probedCount, selfInflicted, tone, text };
 }
 
 // Module-unique export const, never a bare `API` — see the

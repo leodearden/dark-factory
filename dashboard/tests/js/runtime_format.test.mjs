@@ -160,27 +160,40 @@ test('rtProbe: the four degraded labels are pairwise distinct', () => {
   assert.equal(new Set(labels).size, labels.length, `labels not distinct: ${labels}`);
 });
 
-test('rtProbe: deadline_exceeded points at the dashboard, unreachable at the orchestrator', () => {
-  const deadline = rtProbe('deadline_exceeded').hint.toLowerCase();
-  assert.ok(
-    deadline.includes('dashboard') || deadline.includes('probe'),
-    `deadline hint should name the dashboard/probe, got: ${deadline}`,
-  );
-  const unreachable = rtProbe('unreachable').hint.toLowerCase();
-  assert.ok(
-    unreachable.includes('orchestrator'),
-    `unreachable hint should name the orchestrator, got: ${unreachable}`,
-  );
+test('rtProbe: tone pins the fault domain, not merely a valid enum member', () => {
+  // `tone` is the machine-checkable half of the fault-domain contract — it
+  // decides whether a state renders muted (expected), warn (probably OUR
+  // fault) or bad (theirs), and it drives both the TaskDetail badge and the
+  // banner accent. Asserting only set membership would let not_configured
+  // swap to 'bad' and unreachable to 'muted' with every test still green,
+  // inverting the colours while the prose stayed reassuring. Pin the map.
+  assert.equal(rtProbe('not_configured').tone, 'muted');
+  assert.equal(rtProbe('unreachable').tone, 'bad');
+  assert.equal(rtProbe('deadline_exceeded').tone, 'warn');
+  assert.equal(rtProbe('unknown').tone, 'warn');
 });
 
-test('rtProbe: unknown/garbage input falls back to the unknown descriptor', () => {
-  // Never throw and never return null for a non-'ok' value: an unrenderable
-  // status must still tell the operator we do not know, not silently vanish
-  // into a blank cell.
+test('rtProbe: a present-but-unrecognized status falls back to unknown', () => {
+  // Never throw and never return null for a present non-'ok' value: an
+  // unrenderable status must still tell the operator we do not know, not
+  // silently vanish into a blank cell.
   const expected = rtProbe('unknown');
-  for (const bogus of [null, undefined, 'garbage', '', 42, {}]) {
+  for (const bogus of ['garbage', '', 42, {}]) {
     assert.deepEqual(rtProbe(bogus), expected, `rtProbe(${String(bogus)})`);
   }
+});
+
+test('rtProbe: an ABSENT status reads as ok, matching rtProbeSummary', () => {
+  // The two helpers share one missing-value policy (normStatus). null/
+  // undefined means the payload predates `runtime_status` — an older cached
+  // response — and the producer's own default is 'ok'
+  // (active_tasks._build_task_row). If rtProbe fell back to 'unknown' here
+  // while rtProbeSummary read 'ok', the UI would say two contradictory
+  // things at once: an 'unknown' warn badge on every TaskDetail alongside a
+  // banner reporting nothing degraded.
+  assert.equal(rtProbe(null), null);
+  assert.equal(rtProbe(undefined), null);
+  assert.equal(rtProbe({}.missing), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -265,4 +278,40 @@ test('rtProbeSummary: never-probed projects do not count toward "all probed"', (
   ]);
   assert.equal(summary.probedCount, 1);
   assert.equal(summary.selfInflicted, false);
+  // They are not listed in the banner either — the count and the listing
+  // must describe the same set, and this banner is an ALARM surface.
+  assert.ok(!('not_configured' in summary.byStatus), summary.text);
+  assert.ok(!summary.text.includes('beta'), summary.text);
+  assert.ok(summary.text.includes('1 project(s)'), summary.text);
+});
+
+test('rtProbeSummary: not_configured alone raises NO banner', () => {
+  // Expected AND permanent: dashboard/config.py's _discover_escalation_urls
+  // explicitly anticipates "a legitimately non-orchestrator root". Banner-ing
+  // it would pin a never-clearing alert to the Tasks tab of any deployment
+  // that tracks such a root — training operators to ignore the very banner
+  // meant to carry a real diagnosis. rtProbe's per-row muted badge still
+  // explains those rows in TaskDetail.
+  assert.equal(rtProbeSummary([row('a', 'not_configured')]), null);
+  assert.equal(
+    rtProbeSummary([row('a', 'not_configured'), row('b', 'not_configured'), row('c', 'ok')]),
+    null,
+  );
+});
+
+test('rtProbeSummary: tone is the WORST tone present, not the selfInflicted flag', () => {
+  // Deriving the banner accent from selfInflicted painted a lone timed-out
+  // project — our own probe budget, tone 'warn' — in the same alarm colour as
+  // a confirmed orchestrator outage.
+  assert.equal(rtProbeSummary([row('a', 'deadline_exceeded')]).tone, 'warn');
+  assert.equal(rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'deadline_exceeded'),
+  ]).tone, 'warn');
+  assert.equal(rtProbeSummary([row('a', 'unreachable')]).tone, 'bad');
+  // One genuinely-down orchestrator dominates a timeout.
+  assert.equal(rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'unreachable'),
+  ]).tone, 'bad');
 });

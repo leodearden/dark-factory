@@ -19,6 +19,15 @@ const PIP_DOT_COLOR_T = {
   'merge-deferred': 'var(--merge-deferred)',
 };
 
+// CSS accent per probe-status tone (runtime_format.js owns which tone each
+// status gets; this only translates a tone into a colour for the banner's
+// left rule). 'muted' means "expected, not a fault" — no accent at all.
+const PROBE_TONE_ACCENT_T = {
+  muted: 'var(--line)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
+};
+
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
   const [v, setV] = uS_T(() => {
@@ -687,7 +696,13 @@ function TasksTab({ projectFilter, search }) {
   // being reachable says nothing about whether we could probe the
   // orchestrators, and gating this on tasksOffline would hide a probe failure
   // in the common case where fused-memory is up. Both banners can show at once.
-  const probeSummary = rtProbeSummary(allTasks);
+  //
+  // Scoped to the VISIBLE projects: an operator who has filtered down to one
+  // healthy project is not looking at the rows the banner would be alarming
+  // about, and a banner that cannot be dismissed by narrowing the view is
+  // just noise. `projects` above already applies projectFilter.
+  const visibleProjectIds = new Set(projects.map(p => p.id));
+  const probeSummary = rtProbeSummary(allTasks.filter(t => visibleProjectIds.has(t.project)));
 
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
@@ -729,7 +744,11 @@ function TasksTab({ projectFilter, search }) {
              style={{
                padding: '8px 12px',
                border: '1px solid var(--line)',
-               borderLeft: `3px solid ${probeSummary.selfInflicted ? 'var(--warn)' : 'var(--bad)'}`,
+               // Accent by the WORST tone present, not by selfInflicted: a
+               // lone timed-out project is a 'warn' (quite possibly our own
+               // starved loop) and must not wear the same alarm colour as a
+               // confirmed orchestrator outage. rtProbe owns the mapping.
+               borderLeft: `3px solid ${PROBE_TONE_ACCENT_T[probeSummary.tone] || 'var(--warn)'}`,
                borderRadius: 4,
                background: 'var(--bg-2)',
                color: 'var(--fg-2)',

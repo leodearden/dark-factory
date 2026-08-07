@@ -208,6 +208,29 @@ class TestTasksTabRuntimeProbeBanner:
             f'probe banner must not be gated on tasksOffline; guard was {match.group(1)!r}'
         )
 
+    def test_banner_accent_derives_from_tone_not_selfinflicted(self, tasks_tab_body):
+        """Colour must track WHAT is wrong, not whether we blamed ourselves.
+
+        Keying the accent off `selfInflicted` painted a lone timed-out project
+        — tone 'warn', quite possibly our own starved loop — in the same alarm
+        colour as a confirmed orchestrator outage, and painted a purely
+        expected `not_configured` set red. runtime_format.js owns the
+        status -> tone map; this file only translates a tone to a CSS var.
+        """
+        assert 'PROBE_TONE_ACCENT_T[probeSummary.tone]' in tasks_tab_body
+        assert "probeSummary.selfInflicted ? 'var(--warn)' : 'var(--bad)'" not in tasks_tab_body
+
+    def test_summary_is_scoped_to_the_visible_projects(self, tasks_tab_body):
+        """An operator filtered down to one healthy project is not looking at
+        the rows the banner alarms about; a banner that narrowing the view
+        cannot dismiss is just noise."""
+        assert 'rtProbeSummary(allTasks)' not in tasks_tab_body, (
+            'summary must be computed over the projectFilter-visible rows, not allTasks'
+        )
+        assert re.search(r'rtProbeSummary\(\s*allTasks\.filter\(', tasks_tab_body), (
+            'expected rtProbeSummary over a filtered row set'
+        )
+
 
 class TestGraphNodeAgeRoutesThroughRtAge:
     """The task-graph node's in-progress runtime-age badge (task 2699) must
