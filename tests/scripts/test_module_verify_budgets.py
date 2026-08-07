@@ -171,12 +171,45 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 real resolver, (e) survives the plan->execution bridge and (f)
 #                 the cold fall-through. A reader must not infer a measurement
 #                 floor here that does not exist.
+#
+#   cockpit       6 runs, 321 passed / 3 deselected (addopts = "-m 'not smoke'",
+#                 so the smoke suite is excluded by construction).
+#                  71.06s @ loadavg 184.69 (convenient — warm-up)
+#                  81.82s @ loadavg 144.00
+#                  99.21s @ loadavg 156.86 <- rc=1, see (ii)
+#                 101.01s @ loadavg 148.42
+#                 123.71s @ loadavg 241.98
+#                 130.50s @ loadavg 191.12 (INCONVENIENT — concurrent wave)
+#
+#                 (i) TWO SPECIAL PROPERTIES, both verified at base main.
+#                 cockpit is the sole member of TIMEOUT_GUARD_EXCLUSIONS in
+#                 tests/scripts/test_fallback_verify_config.py, because its
+#                 test_command carries no `--timeout>=300`. That carve-out is
+#                 about pytest's PER-TEST cap; this guard is about the
+#                 PER-COMMAND budget, and the two are INDEPENDENT knobs — closing
+#                 one does not close the other, and this task closes neither by
+#                 touching the other. AND cockpit/pyproject.toml sets no
+#                 `timeout` ini value either, so cockpit is the ONE module where
+#                 nothing bounds a hung test at any level. The budget declared
+#                 for it is therefore its SOLE wall-clock bound, which makes this
+#                 task worth strictly more here than on any sibling.
+#
+#                 (ii) ONE RUN WAS RED and is recorded rather than dropped: the
+#                 99.21s run exited rc=1 with `1 failed, 320 passed` while the
+#                 five others reported 321 passed on the byte-identical command
+#                 and tree. THE FAILING TEST IS NOT KNOWN — a concurrent
+#                 duplicate driver overwrote the pytest log before it could be
+#                 read (see .task/measurements.md), so only the counts survive.
+#                 Hypothesis: a flake under that contention — plausible but NOT
+#                 established. W is taken from a GREEN run (130.50s), so nothing
+#                 here is sized from the red one.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
     'escalation': 354.56,
     'fused-memory': 439.80,
     'dashboard': 653.54,
     'sampler': 22.49,
+    'cockpit': 130.50,
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -190,6 +223,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'fused-memory': 'fused-memory/src/fused_memory/__init__.py',
     'dashboard': 'dashboard/src/dashboard/__init__.py',
     'sampler': 'sampler/src/sampler/__init__.py',
+    'cockpit': 'cockpit/src/cockpit/__init__.py',
 }
 
 
