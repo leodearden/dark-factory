@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 
+import pytest
+
 from shared import transcript_archive as transcript_archive_module
 from shared.transcript_archive import archive_task_transcripts, durable_archive_path
 
@@ -19,6 +21,14 @@ ENC = '-home-leo-src-dark-factory'
 # worktree lane (the observed re-dispatched-across-lanes case). ENC is a strict
 # prefix of ENC_B, so ENC sorts FIRST lexically — the multi-match rows below
 # rely on that known order to make "first match" and "newest mtime" differ.
+#
+# CAREFUL, and MEASURED rather than reasoned: that dirname order INVERTS once
+# the FULL path is compared, which is what I-F's `str(p)` tiebreak actually
+# keys on. After the shared prefix, the ENC path continues with the separator
+# '/' (0x2F) while the ENC_B path continues with '-' (0x2D), so
+# str(<...>/ENC/<sid>) > str(<...>/ENC_B/<sid>) and the tiebreak names the ENC
+# copy. The tie rows below assert that specific winner, so the direction is
+# stated here once instead of being re-derived (wrongly) at each call site.
 ENC_B = '-home-leo-src-dark-factory--worktrees-3727'
 
 
@@ -222,12 +232,15 @@ class TestDurableArchivePathLookup:
 
         found = durable_archive_path(root, task_id, sid)
 
-        assert found == archived
-        # D6: the locator returns a Path, never a bool — "does it exist" is
-        # spelled `is not None`, and 3578's restore reuses this same path
+        # D6: the locator returns the PATH, not a bool — "does it exist" is
+        # spelled `is not None`, and 3578's restore reuses this very path
         # rather than growing a second glob that must agree forever (INV-5).
+        # The equality below is what pins that: a bool return would fail it.
+        # (An `assert not isinstance(found, bool)` was deliberately dropped
+        # here — bool and Path are unrelated types, so it is vacuously true
+        # once the equality holds and pins nothing.)
+        assert found == archived
         assert isinstance(found, Path)
-        assert not isinstance(found, bool)
         assert found.exists()
 
     def test_b2_cross_lane_archive_is_found(self, tmp_path):
@@ -305,9 +318,13 @@ class TestDurableArchivePathLookup:
 
         :func:`_archive_one` mirrors subagent transcripts under a directory
         NAMED for the session (``<enc>/<sid>/subagents/agent-*.jsonl.gz``).
-        That dir carries no ``.jsonl`` suffix so today's pattern misses it by
-        luck; the ``is_file()`` filter makes returning it structurally
-        impossible.
+        Be precise about what this pins and what it does NOT: that dir carries
+        no ``.jsonl`` suffix, so it is the PATTERN — ``<sid>.jsonl*`` — that
+        excludes it, and this test would still pass with the ``is_file()``
+        filter deleted. What it guards is the pattern staying narrow: widening
+        it to ``<sid>*`` would start matching the subagent dir and this test
+        reddens. The ``is_file()`` filter is pinned separately, by
+        :meth:`test_b3_a_matching_directory_is_never_returned` below.
         """
         root = tmp_path / 'archive'
         sid = 'sess-b3-decoy'
@@ -324,6 +341,31 @@ class TestDurableArchivePathLookup:
         assert found is not None
         assert found == main
         assert found.is_file()
+
+    def test_b3_a_matching_directory_is_never_returned(self, tmp_path):
+        """The ``is_file()`` filter itself: a DIRECTORY that matches the glob.
+
+        The decoy is a directory named exactly ``<sid>.jsonl.gz`` under a
+        second lane, so the pattern matches it and only ``is_file()`` can
+        reject it. It is also given the NEWER mtime, so with the filter removed
+        the I-F newest-wins selection would actively prefer it and hand a
+        caller a directory as "the transcript" — which is what makes this a
+        discriminating test rather than a restatement of the pattern.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b3-dirdecoy'
+        task_id = '42'
+
+        main = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+        decoy_dir = root / task_id / ENC_B / f'{sid}.jsonl.gz'
+        decoy_dir.mkdir(parents=True)
+        os.utime(main, (1_000_000, 1_000_000))
+        os.utime(decoy_dir, (2_000_000, 2_000_000))
+
+        found = durable_archive_path(root, task_id, sid)
+
+        assert found == main
+        assert found is not None and found.is_file()
 
     def test_b6_newest_mtime_wins_across_lanes(self, tmp_path):
         """B6 (I-F): two lanes archived the same session — newest wins.
@@ -369,6 +411,15 @@ class TestDurableArchivePathLookup:
         alone is not a total order and max() falls back to filesystem-dependent
         glob iteration order — non-reproducible across calls and machines, and
         any resume built on it non-reproducible with it.
+
+        Scope, stated honestly: this row pins the winner (``a``, the ENC copy
+        — see the ENC/ENC_B note at module scope for why the FULL-path
+        comparison inverts the bare-dirname order) and that repeats agree. It
+        does NOT on its own discriminate the tiebreak: within one process glob
+        order is stable, so deleting ``str(p)`` leaves this row green. The
+        cross-process direction the tiebreak actually exists for is pinned by
+        :meth:`test_b6_tiebreak_beats_glob_order_in_both_directions` below,
+        which forces both orders — verified by mutation, not assumed.
         """
         root = tmp_path / 'archive'
         sid = 'sess-b6-tie'
@@ -381,8 +432,47 @@ class TestDurableArchivePathLookup:
 
         answers = {durable_archive_path(root, task_id, sid) for _ in range(5)}
 
-        assert len(answers) == 1
-        assert answers.pop() in {a, b}
+        assert answers == {a}
+        assert b not in answers
+
+    @pytest.mark.parametrize('glob_order_reversed', [False, True])
+    def test_b6_tiebreak_beats_glob_order_in_both_directions(
+        self, tmp_path, monkeypatch, glob_order_reversed
+    ):
+        """B6 (I-F): under a tie the answer does not depend on glob order.
+
+        The reproducibility claim I-F actually makes is ACROSS processes and
+        machines, where ``Path.glob``'s iteration order is filesystem- and
+        readdir-dependent. A same-process repeat cannot observe that, so the
+        order is forced here — once ascending, once descending — and the
+        tiebreak must name the same file (``a``, the lexicographically greater
+        FULL path) both times.
+
+        This is the discriminating direction: with the ``str(p)`` tiebreak
+        removed, ``max()`` degrades to first-encountered-maximum, so the
+        ASCENDING case yields ``b`` and the descending case ``a`` — the two
+        parameterisations disagree, which is precisely the cross-machine
+        non-reproducibility the tiebreak exists to prevent.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b6-order'
+        task_id = '42'
+
+        a = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'lane-a')
+        b = _write(root / task_id / ENC_B / f'{sid}.jsonl.gz', b'lane-b')
+        os.utime(a, (1_500_000, 1_500_000))
+        os.utime(b, (1_500_000, 1_500_000))
+
+        real_glob = Path.glob
+
+        def _ordered(self, pattern):
+            return iter(
+                sorted(real_glob(self, pattern), key=str, reverse=glob_order_reversed)
+            )
+
+        monkeypatch.setattr(Path, 'glob', _ordered)
+
+        assert durable_archive_path(root, task_id, sid) == a
 
     def test_b5_missing_root_returns_none(self, tmp_path):
         """B5 (I-A): an archive root that does not exist at all."""
