@@ -47,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -1037,6 +1038,82 @@ def test_foreign_holder_bounds_clear_measured_spawn_latency():
         f'both foreign-holder bounds must clear the measured worst-case '
         f'happy-path spawn latency (4.71s at load-per-core 6.6, task 3451) '
         f'with real margin; got {bounds!r}'
+    )
+
+
+def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout():
+    """The foreign-holder bounds must also clear the global pytest-timeout.
+
+    Mirrors :func:`test_foreign_holder_bounds_clear_measured_spawn_latency`
+    immediately above: that test pins the FLOOR (bounds must clear the
+    measured spawn latency); this test pins the CEILING (bounds must not
+    approach the global per-test timeout). Together they bound the same two
+    constants from both sides.
+
+    ``foreign_lane_lock_holder`` runs its startup poll
+    (``_FOREIGN_HOLDER_STARTUP_SECS``) then its attribution poll
+    (``_FOREIGN_HOLDER_ATTRIBUTION_SECS``) back-to-back and UNCONDITIONALLY
+    on every use, and on the way out — also unconditionally, via ``finally``
+    — the ``_kill_group`` kill-wait (``child.wait(timeout=5)``) followed by
+    the teardown poll (``_FOREIGN_HOLDER_TEARDOWN_SECS``). These run in
+    sequence, not in parallel, so every single test that uses this helper
+    pays the full sum before its own body or fixture work even starts.
+
+    The global per-test timeout is read LIVE from orchestrator/pyproject.toml
+    (``[tool.pytest.ini_options].timeout``) instead of hardcoded, so this
+    invariant tracks the real config rather than silently drifting the way
+    the comments this task corrects did.
+
+    Why 60% of the global timeout, not 100%: no test in this module opts out
+    with ``@pytest.mark.timeout``, so once the unconditional stack collides
+    with the global ceiling, pytest-timeout fires FIRST — and under
+    ``timeout_method = "thread"`` (with ``--max-worker-restart=0``) it
+    os._exit()s the xdist worker rather than failing the test cleanly.
+    That destroys the helper's own carefully-authored ``pytest.fail``
+    diagnostics (the "foreign-holder staging is broken" / "observed
+    holders=..." messages) and replaces them with an opaque worker death
+    carrying none of that structured evidence — exceeding the global timeout
+    does not merely delay a failure, it destroys the failure's diagnostic
+    content. The remaining 40% is headroom for the real-git fixture work
+    (``git_repo``/``real_git_ops``, ``_get_merge_commit``,
+    ``reset_persistent_merge_worktree``) sharing the same per-test budget.
+    """
+    pyproject_path = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+    with pyproject_path.open('rb') as handle:
+        toml_data = tomllib.load(handle)
+    ini_options = toml_data['tool']['pytest']['ini_options']
+    assert 'timeout' in ini_options, (
+        f'{pyproject_path} [tool.pytest.ini_options] no longer declares '
+        f'timeout — this invariant reads the LIVE global per-test timeout '
+        f'so it cannot silently drift from reality the way the comments '
+        f'task 3836 corrected did; update this test if the global timeout '
+        f'moved elsewhere'
+    )
+    global_timeout = ini_options['timeout']
+
+    # The _kill_group kill-wait (child.wait(timeout=5)) runs unconditionally
+    # on every exit path, in addition to the three named _FOREIGN_HOLDER_*
+    # bounds.
+    unconditional_stack = (
+        _FOREIGN_HOLDER_STARTUP_SECS
+        + _FOREIGN_HOLDER_ATTRIBUTION_SECS
+        + _FOREIGN_HOLDER_TEARDOWN_SECS
+        + 5.0
+    )
+    ceiling = 0.6 * global_timeout
+    assert unconditional_stack <= ceiling, (
+        f'the unconditional wait stack inside foreign_lane_lock_holder is '
+        f'{unconditional_stack}s ({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
+        f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
+        f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait), which '
+        f'exceeds 60% of the global per-test timeout ({global_timeout}s, '
+        f'from {pyproject_path}) — only {ceiling}s of headroom is allowed. '
+        f'No test in this module opts out with @pytest.mark.timeout, so '
+        f'exceeding the global timeout does not merely delay a failure: '
+        f'pytest-timeout fires first and, under timeout_method="thread" '
+        f'with --max-worker-restart=0, os._exit()s the xdist worker instead '
+        f'of failing cleanly — discarding the helper\'s own pytest.fail '
+        f'diagnostics and every bit of structured evidence they carry.'
     )
 
 
