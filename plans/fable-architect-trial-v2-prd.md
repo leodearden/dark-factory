@@ -421,3 +421,18 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
    permits it, extracting the logic half into `orchestrator/evals/` would
    restore the sibling shape — a future eval-revival-lane change, not a
    defect in β2.
+
+   Tests live in `scripts/tests/`, not `orchestrator/tests/`, because that
+   is the only placement that actually gates the driver.
+   `scripts/orchestrator.yaml` declares
+   `test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"`,
+   and `verify_plan._derive_module_runs` arm 3 — the task-3294 source-only
+   floor — runs the owning module's `test_command` VERBATIM at
+   `ScopeKind.FULL_SUITE` for ANY `scripts/` production diff. So an edit to
+   the driver runs that command, and only that command. `orchestrator/tests/`
+   is not named in it: counterpart tests placed there would collect only
+   under an `orchestrator/` diff, so a driver-only edit would clear the TEST
+   leg green with them never having run. That is the same silent coverage
+   gap `scripts/orchestrator.yaml`'s own "COVERAGE GAP CLOSED" block
+   records — opened by task 3445, closed by task 3460 — and placing β2's
+   tests under `orchestrator/tests/` would have reopened it for this file.
