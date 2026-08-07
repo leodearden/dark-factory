@@ -25,7 +25,6 @@ import types
 from pathlib import Path
 
 import pytest
-
 from shared.task_metadata import parse_metadata
 
 SCRIPT_PATH = (
@@ -134,7 +133,7 @@ def test_transform_does_not_mutate_the_caller_blob():
     to diff the read-back against, so mutating it would destroy the evidence."""
     before = json.loads(json.dumps(_TASK_3083_SHAPED_METADATA))
     plan_x_namespace_migration(_TASK_3083_SHAPED_METADATA, DEFAULT_KEYS)
-    assert _TASK_3083_SHAPED_METADATA == before
+    assert before == _TASK_3083_SHAPED_METADATA
 
 
 # --- case 3: idempotency ----------------------------------------------------
