@@ -151,11 +151,14 @@ fi
 #     only the timer is enabled below. `systemctl enable` on it would error.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
-# the running host into the repo, i.e. committed-follows-installed, so this
-# installer run is a no-op for them on THIS host. The sole line intentionally
-# ahead of the host is RestartSteps=4 in orchestrator-pump-web-ui.service, which
-# this run propagates outward — without it systemd ignores that unit's
-# RestartMaxDelaySec= cap and its advertised 10s->60s backoff never engages.
+# the running host into the repo, i.e. committed-follows-installed. Task 3642
+# (2026-08-06) reconciled know-live's host unit — reinstalled from the
+# committed template, daemon-reload + restart — so this installer run is now
+# a genuine no-op for know-live. pump-web-ui's RestartSteps=4 remains the one
+# line intentionally ahead of the host: a declared forward-fix (see that
+# template's own header, owned by task 3424) which this run still propagates
+# outward — without it systemd ignores that unit's RestartMaxDelaySec= cap and
+# its advertised 10s->60s backoff never engages.
 #
 # The orchestrator units run `uv run --frozen ...`, so process start never
 # implicitly re-syncs the shared dark-factory/.venv. After any dependency change
