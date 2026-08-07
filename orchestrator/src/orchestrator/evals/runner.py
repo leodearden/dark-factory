@@ -553,6 +553,15 @@ async def run_architect_eval(
 
     The result carries ``role_under_test='architect'`` and is persisted via
     :func:`save_result`.
+
+    Cost accounting (eval-revival υ): the cell's ``cost_usd`` is the TOTAL
+    spend of producing and scoring the plan — the architect invocation plus
+    the plan judge's invocation, when the judge was actually called.
+    ``judge_cost_usd`` is the judge's share of that total, a SUBSET of
+    ``cost_usd`` and never a disjoint addend (metrics.py:69-71). Every
+    judge-skipped branch (tainted, refused-with-a-plan, unscorable plan)
+    spends nothing on the judge, so ``cost_usd`` there is architect spend
+    alone.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -581,7 +590,11 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
-    cost_usd = 0.0
+    # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
+    # architect invocation's spend. The cell's persisted ``cost_usd`` below
+    # additionally folds in the plan judge's spend (``judge_cost_usd``), so
+    # the two must never be confused under one name.
+    arch_cost_usd = 0.0
     arch_duration_ms = 0
     outcome = 'done'
     # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
@@ -646,7 +659,7 @@ async def run_architect_eval(
             ),
             timeout=timeout_minutes * 60,
         )
-        cost_usd = result.cost_usd
+        arch_cost_usd = result.cost_usd
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
@@ -713,6 +726,16 @@ async def run_architect_eval(
     #    failures qualify and why a timeout deliberately does not).
     plan_quality: float | None = None
     judge_error: str | None = None
+    # The plan judge's OWN spend + invocation count (eval-revival υ). Every
+    # judge-SKIPPED branch below (tainted, refused-with-a-plan, unscorable-
+    # plan) leaves these at their honest zero defaults with no extra code;
+    # only the healthy else-branch, where the judge is actually called, sets
+    # them from the returned verdict. judge_cost_usd is a SUBSET of the
+    # cell's cost_usd below, not disjoint (metrics.py:69-71) — invocations is
+    # stamped on the judge having been CALLED, not on the cost being nonzero,
+    # since a $0.00 refusal is still an invocation.
+    judge_cost_usd = 0.0
+    judge_invocations = 0
     # The taint decision consults whether the artifact is SCORABLE, not merely
     # whether one exists (reviewer: correctness). A session cap can land MID-run,
     # after the architect has already written plan.json through plan-tools MCP —
@@ -798,6 +821,12 @@ async def run_architect_eval(
             # getattr, not attribute access: a monkeypatched or legacy verdict
             # without the field must not break scoring.
             judge_error = getattr(verdict, 'invocation_error', None)
+            # The judge WAS called, whatever it answered — stamp the
+            # invocation before touching its cost, so a $0.00 refusal still
+            # counts as one call (report.py:806-809 reads the pair together;
+            # a nonzero cost beside invocations=0 would be self-contradictory).
+            judge_invocations = 1
+            judge_cost_usd = verdict.cost_usd
         except Exception:
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
@@ -844,10 +873,19 @@ async def run_architect_eval(
         # would crash the cell OUTSIDE the try above — turning a marked,
         # recoverable cap cell into a lost run.
         plan_steps=len(plan.get('steps') or []),
-        cost_usd=cost_usd,
+        # cost_usd is the cell's TOTAL spend, architect + plan judge — the
+        # SUBSET invariant metrics.py:69-71 declares (judge_cost_usd is a
+        # subset of cost_usd, not disjoint). judge_cost_usd below is the
+        # breakdown, never an addend a report generator should sum again. A
+        # judge that RAISES (the except above) leaves judge_cost_usd at its
+        # 0.0 default, so that spend is unknowable from here and is a
+        # documented under-report, never a fabricated number.
+        cost_usd=arch_cost_usd + judge_cost_usd,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,
         cap_tainted=tainted,
+        judge_cost_usd=judge_cost_usd,
+        judge_invocations=judge_invocations,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -862,7 +900,8 @@ async def run_architect_eval(
     save_result(result_obj)
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
-        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
+        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s, '
+        f'${metrics.cost_usd:.2f} incl. ${judge_cost_usd:.2f} judge)'
         + (
             f' [{"cap_tainted" if tainted else "invocation_error"}: '
             f'{metrics.invocation_error}]'
