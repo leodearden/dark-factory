@@ -28,6 +28,7 @@ every test in this module is ``async def`` under ``@pytest.mark.asyncio``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -748,13 +749,11 @@ class TestHeartbeatLoopReapWiring:
             while calls < 2 and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.02)
             worker._running = False
-            try:
+            # Guard-regression case: if the first hung reap is still
+            # sleeping unbounded, let the assertion below report it cleanly
+            # instead of surfacing a raw TimeoutError.
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(task, timeout=2.0)
-            except asyncio.TimeoutError:
-                # Guard-regression case: the first hung reap is still
-                # sleeping unbounded. Let the assertion below report it
-                # cleanly instead of surfacing a raw TimeoutError.
-                pass
         finally:
             if not task.done():
                 task.cancel()
