@@ -401,3 +401,23 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
    (cross-referencing **D10** by label, which already names the driver as
    committed under `scripts/`; this entry supplies the filename D10 left
    generic).
+
+   The nearest committed sibling, `scripts/run_judge_ofat_pilot.py` (201
+   lines), is a thin CLI over `orchestrator.evals.judge_pilot` (339
+   lines): its own docstring states "all decision/render logic lives
+   there; this file only parses args, drives I/O, and maps the verdict
+   to a process exit code". β2 copies that sibling's NAME convention but
+   deliberately not its structure — the v2 campaign driver keeps decision
+   and render logic in the script itself.
+
+   The reason is not stylistic preference. Splitting logic out the
+   judge-pilot way requires a new module inside the instrument package
+   `orchestrator/src/orchestrator/evals/`, which D1 forbids from this
+   PRD's lane. The judge pilot could take that shape because
+   `judge_pilot.py` was authored in the eval-framework-revival lane that
+   owns the instrument; β2 was not. Stated honestly rather than sold as a
+   virtue: the driver is correspondingly larger, and is unit-tested as a
+   script rather than as a library module. If instrument ownership ever
+   permits it, extracting the logic half into `orchestrator/evals/` would
+   restore the sibling shape — a future eval-revival-lane change, not a
+   defect in β2.
