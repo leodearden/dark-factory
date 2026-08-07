@@ -6,3 +6,78 @@
 lint_command: "uv run --project shared --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
 test_command: "uv run --project shared --directory shared pytest tests/ --tb=short -q --timeout=300"
 type_check_command: "uv run --project shared --directory shared pyright src/ tests/"
+
+# Per-module verify budget (task 3473). Before this, shared declared nothing
+# here and fell HARD through to the repo-root whole-fleet ceiling — see the
+# cascade note below.
+#
+# (1) MEASUREMENT PROVENANCE. Four runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239. All rc=0, all reporting
+# 3222 passed / 12 skipped / 9 deselected. EVERY FIGURE IS CONTENDED — a
+# 32-core host running /proc/loadavg 85-223 throughout, ~3-7x oversubscribed —
+# and none is quoted as an unloaded one, per the norm at
+# orchestrator/tests/warm-lane/README.md (whose own argument abandoned
+# wall-clock for load-independent counters, calling it "nearly unusable" here).
+#
+#     79.04s wall / 74.43s pytest  @ loadavg  85.78   <- the CONVENIENT figure
+#     96.17s wall / 88.34s pytest  @ loadavg 133.65
+#    147.06s wall /135.59s pytest  @ loadavg 102.15
+#    219.08s wall /209.94s pytest  @ loadavg 191.12   <- the INCONVENIENT one
+#
+# The 219.08s run is recorded first-class rather than discarded as an outlier:
+# it is the 6-way CONCURRENT wave, which is the shape
+# verify.run_full_verification's asyncio.gather over module_configs.values()
+# actually produces in production. A purely serial measurement systematically
+# under-measures the real cost, so the concurrent figure is the one that
+# governs. (Full per-run table, including a disclosed procedural defect in that
+# sweep, in .task/measurements.md.)
+#
+# (2) SIZING. W = 219.08s, the WORST run, never the mean.
+#     B ~= 2.6 x W = 569.6 -> rounded up to 600.
+# Max-not-mean is forced by recorded evidence, not preference:
+# scripts/orchestrator.yaml logs a ~3x spread (310.33s -> 914.61s) for a
+# BYTE-IDENTICAL command on a BYTE-IDENTICAL tree, which is host load at
+# measurement time rather than suite variance. This sweep reproduced the effect
+# — shared itself spanned 79.04s -> 219.08s, ~2.8x. A mean (135.34s) would have
+# yielded ~400s and red-walled the honest green path on the next loaded day.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally. Both sibling configs already use 2.6x — tests/scripts' 600
+# ~= 2.6 x 233.50, scripts' 2400 ~= 2.6 x 930.59 — and scripts/orchestrator.yaml
+# states explicitly that it kept the multiple identical across the two on
+# purpose. 600s is additionally tests/scripts' own declared value, and is the
+# absolute floor this task applies underneath the arithmetic. For shared the
+# two agree: 2.6 x W rounds to exactly 600, so the floor is not doing the work
+# here (it is, for sampler and cockpit).
+#
+# (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
+# 600s, a 6x narrowing. A hang in this suite now surfaces in ~10 minutes
+# instead of ~60. It does NOT make the suite faster and does not detect suite
+# growth — see the GATED-BY guard's own scope note.
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed. Each leg gets its own
+# 600s.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: shared has
+# no build step whose cold cost would justify a separate cold budget. Note what
+# that actually means, because the cascade is counter-intuitive and reads the
+# opposite way at a glance. Per verify._resolve_verify_timeout, an unset module
+# cold knob does NOT inherit the 600 below — it falls through to the repo-root
+# verify_cold_command_timeout_secs (5400), and on a MERGE-cold verify falls
+# through first to config.merge_verify_cold_command_timeout_secs (7200, shipped
+# by the package-bundled orchestrator/src/orchestrator/defaults.yaml and not
+# overridden by the root yaml). A reader who assumes warm covers cold would
+# conclude this module is bounded at 600 on a cold run when it is bounded at
+# 5400/7200. Gated by assertion (f) of the guard named below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 600s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['shared'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one. That
+# exact pair has already rotted once undetected between the two sibling configs
+# and was caught only by a reviewer.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[shared].
+verify_command_timeout_secs: 600
