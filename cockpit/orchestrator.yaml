@@ -23,3 +23,94 @@ test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=s
 # identical chained check_bare_magicmock_config.py call.
 lint_command: "uv run --project cockpit --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
 type_check_command: "uv run --project cockpit --directory cockpit pyright src/ tests/"
+
+# Per-module verify budget (task 3473). Before this, cockpit declared nothing
+# here and fell HARD through to the repo-root whole-fleet ceiling.
+#
+# (1) MEASUREMENT PROVENANCE. Six runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239. 321 passed / 3 deselected
+# (pyproject's `addopts = "-m 'not smoke'"` excludes the smoke suite by
+# construction, so these figures are of the deselected-smoke form and nothing
+# else). EVERY FIGURE IS CONTENDED — a 32-core host running /proc/loadavg
+# 144-252 throughout — and none is quoted as an unloaded one, per
+# orchestrator/tests/warm-lane/README.md.
+#
+#     71.06s wall / 66.12s pytest @ loadavg 184.69  <- the CONVENIENT figure
+#     81.82s wall / 75.46s pytest @ loadavg 144.00
+#     99.21s wall / 93.85s pytest @ loadavg 156.86  <- rc=1, see (1a)
+#    101.01s wall / 88.01s pytest @ loadavg 148.42
+#    123.71s wall /116.36s pytest @ loadavg 241.98
+#    130.50s wall /117.27s pytest @ loadavg 191.12  <- the INCONVENIENT one
+#                                                      (6-way concurrent wave)
+#
+# (1a) ONE RUN WAS RED, recorded rather than quietly dropped. The 99.21s run
+# exited rc=1 with `1 failed, 320 passed, 3 deselected` while the five other runs
+# of the byte-identical command on the byte-identical tree all reported 321
+# passed. THE IDENTITY OF THAT FAILURE IS NOT KNOWN: a concurrently-running
+# duplicate measurement driver overwrote the pytest log before the failure could
+# be read (the defect is described in .task/measurements.md), so only the counts
+# survive. Stated as the observation it is — one run in six failed one test,
+# cause unidentified. Hypothesis: a flake under that contention; plausible but
+# NOT established. W below is taken from a GREEN run, so no part of this budget
+# is sized from the red one. Left recorded so a future cockpit flake
+# investigation has the data point rather than having to rediscover it.
+#
+# (2) SIZING. W = 130.50s, the worst GREEN run. 2.6 x W = 339.3, which rounds to
+# 400. The 600s ABSOLUTE FLOOR binds instead:
+#     B = max(600, ceil_to_100(2.6 x W)) = max(600, 400) = 600.
+# The floor exists because this host has a DOCUMENTED ~3x run-to-run spread for
+# byte-identical commands on byte-identical trees (scripts/orchestrator.yaml
+# records 310.33s -> 914.61s); cockpit's own six runs already span 1.8x. 600s is
+# tests/scripts/orchestrator.yaml's own declared value, so the floor is
+# precedent rather than a fresh guess.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally: tests/scripts' 600 ~= 2.6 x 233.50 and scripts' 2400 ~= 2.6 x
+# 930.59, and scripts/orchestrator.yaml states it kept the multiple identical
+# across the two on purpose.
+#
+# (4) WHAT THIS ACTUALLY BUYS — AND IT BUYS MORE HERE THAN ON ANY SIBLING.
+# 3600s -> 600s, a 6x narrowing: a hang surfaces in ~10 minutes instead of ~60.
+# The reason it is worth more here is (5a) below: on every other module this is
+# the OUTER of two bounds, but on cockpit it is the only one.
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed.
+#
+# (5a) ON THIS MODULE IT IS THE ONLY WALL-CLOCK BOUND THAT EXISTS. Every sibling
+# passes `--timeout=300` to pytest, so a single hung TEST is capped there and
+# this budget is a second, outer bound. cockpit passes no `--timeout` at all AND
+# cockpit/pyproject.toml sets no `timeout` ini value, so nothing bounds a hung
+# cockpit test at any level. This declaration is consequently cockpit's sole
+# wall-clock bound.
+#
+# That is a REASON TO CLOSE THE `--timeout` GAP SEPARATELY, NOT A SUBSTITUTE FOR
+# CLOSING IT. The two knobs are independent: `--timeout` is pytest's PER-TEST
+# cap, this is the PER-COMMAND budget, and a 600s command budget still lets one
+# hung test consume the whole 600s. Deliberately NOT done here: cockpit is the
+# sole member of TIMEOUT_GUARD_EXCLUSIONS in
+# tests/scripts/test_fallback_verify_config.py, whose documented deletion
+# condition is "once cockpit's test_command carries --timeout>=300". This task
+# does not satisfy that condition and does not touch test_command, so the
+# carve-out stays; removing it here would make
+# test_per_module_merge_verify_raises_per_test_timeout fail.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: no build step
+# whose cold cost would justify a separate cold budget. Per
+# verify._resolve_verify_timeout, an unset module cold knob does NOT inherit the
+# 600 below — it falls through to the repo-root verify_cold_command_timeout_secs
+# (5400), and on a MERGE-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml and not overridden
+# by the root yaml). Gated by assertion (f) of the guard below. Note this
+# interacts with (5a): on a merge-cold cockpit verify there is no per-test cap
+# AND the command bound is 7200s, not the 600 below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 600s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['cockpit'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[cockpit].
+verify_command_timeout_secs: 600
