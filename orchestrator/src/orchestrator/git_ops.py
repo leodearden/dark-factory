@@ -9408,6 +9408,14 @@ class GitOps:
                 await self.get_conflict_details(worktree) if conflicts
                 else f'{out}\n{err}'
             )
+            # Abort on ANY rc != 0, not just the conflict arm: a failed
+            # `git merge` can still leave MERGE_HEAD set (e.g. a merge stopped
+            # by a hook), and the chain builder must hand back a worktree that
+            # is clean at the last good tip.  Unconditional is safe because
+            # abort_merge discards _run's return value and _run reports a
+            # non-zero exit as a value rather than raising — so the
+            # "fatal: There is no merge to abort" case is a silent no-op and
+            # needs no MERGE_HEAD pre-check.
             await self.abort_merge(worktree)
             return MergeResult(
                 success=False,
