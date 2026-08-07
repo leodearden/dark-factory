@@ -4165,3 +4165,156 @@ def test_migrated_decision_is_a_frozen_result_record() -> None:
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         migrated.new_project = 'other'  # type: ignore[misc]
+
+
+def test_migrate_decision_project_tokens_dry_run_reports_without_writing(
+    tmp_path: Path,
+) -> None:
+    """dry_run=True previews the exact same work but touches nothing.
+
+    An operator must be able to see the full rewrite of the live population
+    -- 391 records at filing -- before committing to it. Compared as RAW FILE
+    TEXT before/after, so even a byte-identical re-serialization would fail:
+    "side-effect-free" means the files are not written at all, not that they
+    happen to round-trip.
+    """
+    _seed_mixed_spellings(tmp_path)
+    before_text = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert {(m.id, m.old_project, m.new_project) for m in previewed} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+    assert {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    } == before_text
+
+
+def test_migrate_decision_project_tokens_dry_run_does_not_consume_the_work(
+    tmp_path: Path,
+) -> None:
+    """A preview must not be mistaken for the migration: the real run
+    afterwards still reports and performs the identical set of rewrites.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+    performed = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in performed} == {
+        (m.id, m.old_project, m.new_project) for m in previewed
+    }
+    assert {d.id for d in sr.list_decisions(root=tmp_path) if d.project == 'dark_factory'} == {
+        'd-df',
+        'd-hyphen',
+        'd-mixed',
+        'd-canon',
+    }
+
+
+def test_migrate_decision_project_tokens_dry_run_creates_no_lock_sidecar(
+    tmp_path: Path,
+) -> None:
+    """dry_run takes no lock, so it leaves no ``<id>.json.lock`` sidecar.
+
+    decision_id_lock documents that merely TAKING a lock materializes a
+    sidecar (its ORPHAN SIDECARS note). A preview that littered one per
+    record across the whole fleet would not be the side-effect-free
+    operation its name promises.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert list((tmp_path / 'decisions').glob('*.lock')) == []
+
+
+def test_migrate_decision_project_tokens_skips_a_corrupt_neighbour(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One unparseable file must not abort the sweep of the rest.
+
+    list_decisions already skips it on the read side; this pins that the
+    whole call still migrates every good record and leaves the bad file
+    byte-for-byte alone rather than "repairing" something it cannot parse.
+    """
+    for decision_id in ('d-good-1', 'd-good-2'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    broken = tmp_path / 'decisions' / 'broken.json'
+    broken.write_text('{not json at all')
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-good-1', 'd-good-2'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-good-1': 'dark_factory',
+        'd-good-2': 'dark_factory',
+    }
+    assert broken.read_text() == '{not json at all'
+
+
+def test_migrate_decision_project_tokens_skips_an_unwritable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A record whose write fails is absent from the result and does not stop
+    the sweep -- mirrors reap_answered_decisions' "only record it when the
+    update actually succeeded" contract. Reporting a rewrite that never
+    landed would make the operator's audit trail lie.
+    """
+    for decision_id in ('d-ok', 'd-bad'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _flaky_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-bad':
+            return False
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _flaky_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-ok': 'dark_factory',
+        'd-bad': 'df',
+    }
+
+
+def test_migrate_decision_project_tokens_survives_a_raising_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A per-record fault mid-loop is logged and skipped, never propagated.
+
+    Matches the module-wide fail-soft convention (write_decision,
+    update_decision_state and list_decisions all self-guard): one record
+    faulting must not deny the operator the repair of the other 390.
+    """
+    for decision_id in ('d-ok', 'd-boom'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _exploding_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-boom':
+            raise OSError('disk on fire')
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _exploding_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
