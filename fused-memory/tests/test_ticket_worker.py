@@ -134,8 +134,23 @@ async def test_worker_processes_create_decision(
         )
         ticket_id = result['ticket']
 
-        # Let the worker drain the queue
-        await asyncio.sleep(0.1)
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flakes under `-n auto` CPU oversubscription when
+        # the worker is scheduled late (observed: status still 'pending').
+        # Same cause and same fix as the oversize-ticket test below.  Waiting
+        # on 'pending' clearing rather than on 'created' directly keeps a
+        # genuine regression loud: a ticket resolved to 'failed' leaves the
+        # poll immediately and trips the status assertion below with the real
+        # status, instead of burning the whole timeout first.
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the create-decision ticket',
+        )
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
@@ -585,10 +600,17 @@ async def test_worker_created_path_emits_journal_event(
         # runs. Close that narrow window with a short second bounded poll
         # on the emission itself: a genuine regression (event never
         # emitted) still fails fast, just in ~2s instead of the full 10s.
+        # The predicate matches the task_created event *specifically* rather
+        # than any journalled event, so an unrelated event landing first
+        # cannot let the `== 1` assertion below run before task_created has
+        # actually been emitted.
         await poll_until(
-            lambda: journal_calls,
+            lambda: any(
+                getattr(e, 'type', None) == EventType.task_created
+                for e in journal_calls
+            ),
             timeout=2.0,
-            message='ticket resolved but no journal event was emitted',
+            message='ticket resolved but no task_created event was emitted',
         )
 
     # Exactly one task_created event must have been journalled
