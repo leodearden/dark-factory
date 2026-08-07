@@ -30,6 +30,10 @@ required filename: it's what the dashboard's escalation-URL discovery
 a discovery fallback for not-yet-migrated projects, not a supported choice
 for new ones.
 
+This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
+and most files are not format-clean. Do not file or perform
+formatting-cleanup work — see `CONTRIBUTING.md` section 3 (task 3441).
+
 ## Prerequisites
 
 ```bash
