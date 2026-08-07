@@ -255,6 +255,14 @@ drain_await_fresh() {
     # DRAIN_POLL_INTERVAL_SECS for up to DRAIN_UNKNOWN_GRACE_SECS more --
     # an orphan observed running for ~27.8h in the wild before being
     # manually reaped (task 3852).
+    #
+    # Guard below enforces that contract: a caller who reintroduces
+    # command substitution gets a loud, immediate failure instead of the
+    # silent-empty-verdict regression described above.
+    if [[ ${BASH_SUBSHELL:-0} -ne 0 ]]; then
+        echo "BUG(task 3852): drain_await_fresh must run in the main shell, not a subshell (BASH_SUBSHELL=$BASH_SUBSHELL); its poll loop would survive a kill of the top-level script pid" >&2
+        return 1
+    fi
     local unit="$1"
     local grace_start elapsed_grace
     _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
