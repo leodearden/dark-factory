@@ -3124,6 +3124,100 @@ def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
     assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
 
 
+# ---------------------------------------------------------------------------
+# Project-token canonicalization (task 3807)
+# ---------------------------------------------------------------------------
+
+_PROJECT_TOKEN_CASES: list[tuple[str, str]] = [
+    # Separator/case folding: one project, five spellings, one token.
+    ('dark_factory', 'dark_factory'),
+    ('dark-factory', 'dark_factory'),
+    ('Dark-Factory', 'dark_factory'),
+    ('DARK_FACTORY', 'dark_factory'),
+    ('  dark-factory  ', 'dark_factory'),
+    # Alias: the one seeded PROJECT_TOKEN_ALIASES entry, itself folded first.
+    ('df', 'dark_factory'),
+    ('DF', 'dark_factory'),
+    (' df ', 'dark_factory'),
+    ('-df-', 'dark_factory'),
+    # Unset sentinel -- '' is never a token (mirrors normalize_escalations_dir).
+    ('', ''),
+    ('   ', ''),
+    ('\t\n', ''),
+    # Pass-through: an already-canonical token of another project is untouched.
+    ('reify', 'reify'),
+    # The cross-project split pairs fold WITHOUT needing an alias entry.
+    ('autopilot-video', 'autopilot_video'),
+    ('autopilot_video', 'autopilot_video'),
+    ('solar-challenge', 'solar_challenge'),
+    ('solar_challenge', 'solar_challenge'),
+]
+
+
+@pytest.mark.parametrize(('raw', 'expected'), _PROJECT_TOKEN_CASES)
+def test_normalize_project_token_table(raw: str, expected: str) -> None:
+    """One project must have ONE token, whatever spelling it was filed under.
+
+    The live population that motivated this (2026-08-06): 41 OPEN
+    dark-factory decisions split 22/17/2 across ``dark_factory``/``df``/
+    ``dark-factory``, each partition invisible to a reap scoped to either of
+    the others.
+    """
+    assert sr.normalize_project_token(raw) == expected
+
+
+def test_normalize_project_token_does_not_merge_solar_challenge_platform() -> None:
+    """COLLAPSE GUARD: folding must never merge two DIFFERENT projects.
+
+    ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge`` and
+    ``/home/leo/src/solar-challenge-platform`` declares
+    ``solar_challenge_platform`` -- separate project roots, separate
+    orchestrator configs, separate escalation queues, whose tokens merely
+    share a prefix. Merging them would let one project's reaper close the
+    other's decisions, which is strictly worse than the bug being fixed. Only
+    case and separator differences may ever fold.
+    """
+    assert sr.normalize_project_token('solar_challenge_platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar-challenge-platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar_challenge_platform') != sr.normalize_project_token(
+        'solar-challenge'
+    )
+
+
+@pytest.mark.parametrize('raw', [case[0] for case in _PROJECT_TOKEN_CASES])
+def test_normalize_project_token_is_idempotent(raw: str) -> None:
+    """f(f(x)) == f(x) for every token in the table.
+
+    Load-bearing twice over: the migration decides a record is already
+    canonical by comparing ``normalize_project_token(p) == p``, so a
+    non-idempotent fold would rewrite the same record on every run; and the
+    reaper normalizes an already-normalized stored token on every compare.
+    """
+    once = sr.normalize_project_token(raw)
+    assert sr.normalize_project_token(once) == once
+
+
+@pytest.mark.parametrize('raw', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_normalize_project_token_fail_soft_on_non_str(raw: object) -> None:
+    """Fail-soft, matching normalize_escalations_dir's contract for helpers a
+    C8 watch loop calls directly: a non-str value never raises into the
+    caller. It coerces to *some* str token, which simply matches no real
+    project -- the fail-OPEN direction, leaving a decision visible.
+    """
+    assert isinstance(sr.normalize_project_token(raw), str)
+
+
+def test_project_token_aliases_maps_folded_to_folded() -> None:
+    """Every PROJECT_TOKEN_ALIASES key AND value must already be canonical
+    under the fold, or a lookup would miss (key) or emit a non-canonical
+    token (value) -- the alias map is applied AFTER folding, never before.
+    """
+    assert sr.PROJECT_TOKEN_ALIASES['df'] == 'dark_factory'
+    for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
+        assert sr.normalize_project_token(alias) == canonical
+        assert sr.normalize_project_token(canonical) == canonical
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
