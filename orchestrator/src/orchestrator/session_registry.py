@@ -949,9 +949,26 @@ hand-typed ``df-`` prefix on ``--id`` (which is part of the id a human
 types, never derived from ``--project``), so aliasing it costs nothing
 elsewhere.
 
-Folding alone already merges the other observed splits
-(``autopilot-video`` = ``autopilot_video``, ``solar-challenge`` =
-``solar_challenge``), so only a TRUE alias needs an entry here."""
+Folding alone merges a split whose spellings differ ONLY by case or
+separator -- ``autopilot-video`` = ``autopilot_video`` -- so those need no
+entry here. It does NOT reconcile a project whose filed tokens fold to
+something OTHER than its declared ``memory.project_id``; only an alias can
+bridge that.
+
+KNOWN RESIDUAL GAP (measured 2026-08-07, 407 records):
+``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
+5 OPEN decisions are filed under ``solar-challenge`` (3) and
+``solar_challenge`` (2). Folding merges those two into ONE bucket --
+strictly better than before, when a reap scoped to either missed the other
+-- but the bucket is named ``solar_challenge``, so a reaper passing the
+config-declared ``my_solar_challenge`` matches ZERO of them. Adding
+``'solar_challenge': 'my_solar_challenge'`` would close it and the
+admission rule above already licenses it; that call is deliberately NOT
+made here because it is a cross-project behaviour change owned by its own
+filed decision task (3813). Until it lands, reap that project with a token
+that folds to ``solar_challenge`` -- and note the collapse guard is
+unaffected either way, since ``solar_challenge_platform`` is a distinct
+project root with a distinct folded token."""
 
 
 def normalize_project_token(value: object) -> str:
@@ -973,11 +990,11 @@ def normalize_project_token(value: object) -> str:
     The fold: strip, casefold, ``-`` -> ``_``, collapse ``_`` runs, strip
     edge ``_``, then apply PROJECT_TOKEN_ALIASES.
 
-    Returns ``''`` -- the "unset" sentinel, never a token -- for an empty or
-    whitespace-only *value*, mirroring normalize_escalations_dir's ``''``
-    contract so a reader learns ONE rule for both boundary normalizers. ``''``
-    only ever matches ``''``, so an unset token cannot accidentally join a
-    real project.
+    Returns ``''`` -- the "unset" sentinel, never a token -- for an empty,
+    whitespace-only or ``None`` *value*, mirroring normalize_escalations_dir's
+    ``''`` contract so a reader learns ONE rule for both boundary
+    normalizers. ``''`` only ever matches ``''``, so an unset token cannot
+    accidentally join a real project.
 
     IDEMPOTENT: ``f(f(x)) == f(x)`` for every input. Load-bearing --
     ``migrate_decision_project_tokens`` decides a record is already canonical
@@ -991,12 +1008,33 @@ def normalize_project_token(value: object) -> str:
     let one project's reaper close the other's decisions -- strictly worse
     than the bug being fixed. A named collapse-guard test pins that.
 
+    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
+    ``SessionRecord.project`` is the other half of the same fleet-global
+    project axis and is deliberately NOT normalized here -- the cockpit
+    unions the two (``known_projects`` over records + decisions, and one
+    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
+    so until the session side folds too, the picker can list one project
+    under two names and an operator-set weight keyed on the session spelling
+    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
+    not an oversight: the session population is ~39k records written on the
+    spawn path, and folding it is a strictly larger change than task 3807's
+    decision-registry fix. Do not read "canonical" here as "canonical
+    fleet-wide".
+
     Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
-    via ``str()`` rather than rejecting it. A coerced token simply matches no
-    real project -- the fail-OPEN direction, leaving a decision visible to
-    the human rather than risking a false close. Keeps this module's
+    via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
+    matches no real project (the fail-OPEN direction, leaving a decision
+    visible to the human rather than risking a false close). ``None`` is the
+    one coercion NOT left to ``str()``: it means "unset", but ``str(None)``
+    would fold to ``'none'`` -- an ordinary-looking token, not a sentinel --
+    so a hand-edited record carrying ``"project": null`` (which
+    ``DecisionRecord.from_dict`` accepts unguarded) would be migrated onto a
+    literal ``'none'`` bucket a reaper could then match. ``None`` therefore
+    maps to ``''`` alongside the empty string. Keeps this module's
     no-intra-orchestrator-imports rule (see module docstring).
     """
+    if value is None:
+        return ''
     raw = str(value).strip()
     if not raw:
         return ''
@@ -1170,11 +1208,23 @@ def migrate_decision_project_tokens(
         or watcher state-update on the SAME id is serialized rather than
         having one side's mutation dropped.
 
-    (b) RE-READ INSIDE THE LOCK. ``list_decisions`` returns a point-in-time
-        snapshot; a state transition landing between the scan and the write
-        would be ROLLED BACK by writing that stale snapshot. Re-reading from
-        disk under the lock is what prevents the sweep from resurrecting a
-        decision the human just answered.
+    (b) RE-READ INSIDE THE LOCK, AND RECOMPUTE FROM THE RE-READ. The scan is
+        a point-in-time snapshot; a state transition landing between the scan
+        and the write would be ROLLED BACK by writing that stale snapshot, so
+        re-reading under the lock is what stops the sweep resurrecting a
+        decision the human just answered. That argument only covers the
+        carried-through fields, so the ONE field this sweep writes is
+        recomputed from the re-read record too: both "does this still need
+        migrating?" and the new token come from what is actually on disk
+        under the lock, never from the snapshot. Otherwise a writer that
+        changed ``.project`` in that window would be clobbered by a value
+        derived from the old spelling, and the reported ``old_project`` would
+        name a value that was never on disk at write time -- an audit trail
+        that quietly lies. A record another writer already canonicalized in
+        the window is simply skipped. (The snapshot IS still used as a cheap
+        pre-filter, to avoid locking the already-canonical majority; a
+        pre-filter that lets through a record needing no work costs one
+        wasted lock, never a wrong write.)
 
     (c) ONLY ``.project`` IS TOUCHED. ``state`` and ``filed_at`` (and every
         other field) are carried through from the re-read record untouched,
@@ -1195,9 +1245,12 @@ def migrate_decision_project_tokens(
         ``df-`` prefix on ids like ``df-esc-3524-1`` and every cockpit
         cross-link survive intact.
 
-    (f) ``dry_run=True`` PREVIEWS, guaranteed side-effect-free. It computes
-        and returns the exact same MigratedDecision list the real run would,
-        but takes no lock and performs no write -- so an operator can see the
+    (f) ``dry_run=True`` PREVIEWS, guaranteed side-effect-free. It returns
+        the MigratedDecision list the real run would produce over a quiescent
+        tree, reporting off the scan snapshot because taking no lock is the
+        whole point -- so a record mutated between the preview and the real
+        run is reported as the preview saw it, which is what "preview" means.
+        It takes no lock and performs no write, so an operator can see the
         full rewrite of the live population before committing to it. It does
         not even materialize a ``<id>.json.lock`` sidecar, which matters
         because ``decision_id_lock`` documents that merely TAKING a lock
@@ -1217,32 +1270,53 @@ def migrate_decision_project_tokens(
     """
     migrated: list[MigratedDecision] = []
     for decision in list_decisions(root):
-        new_project = normalize_project_token(decision.project)
-        if new_project == decision.project:
+        # Cheap pre-filter off the scan snapshot -- avoids taking a lock for
+        # the (usually large) already-canonical majority. NOT the decision of
+        # record: for a real run that is re-made under the lock below.
+        if normalize_project_token(decision.project) == decision.project:
             continue
-        if not dry_run:
-            try:
-                path = decision_path_for_id(decision.id, root=root)
-                with decision_id_lock(decision.id, root=root):
-                    # Re-read under the lock -- see invariant (b).
-                    record = DecisionRecord.from_json(path.read_text())
-                    record.project = new_project
-                    if not write_decision(record, root=root):
-                        continue
-            except Exception:
-                logger.error(
-                    'migrate_decision_project_tokens: skipping %s',
-                    decision.id,
-                    exc_info=True,
+        if dry_run:
+            migrated.append(
+                MigratedDecision(
+                    id=decision.id,
+                    old_project=decision.project,
+                    new_project=normalize_project_token(decision.project),
                 )
-                continue
-        migrated.append(
-            MigratedDecision(
-                id=decision.id,
-                old_project=decision.project,
-                new_project=new_project,
             )
-        )
+            continue
+        try:
+            path = decision_path_for_id(decision.id, root=root)
+            with decision_id_lock(decision.id, root=root):
+                # Re-read under the lock -- see invariant (b). Both the
+                # decision to migrate AND the value written are recomputed
+                # from THIS record, never from the snapshot: a writer that
+                # changed .project between the scan and the lock must not
+                # have its value clobbered by one derived from the old
+                # spelling, and old_project must name what was actually on
+                # disk at write time or the audit trail lies.
+                record = DecisionRecord.from_json(path.read_text())
+                old_project = record.project
+                new_project = normalize_project_token(old_project)
+                if new_project == old_project:
+                    # A concurrent writer already canonicalized it.
+                    continue
+                record.project = new_project
+                if not write_decision(record, root=root):
+                    continue
+                migrated.append(
+                    MigratedDecision(
+                        id=decision.id,
+                        old_project=old_project,
+                        new_project=new_project,
+                    )
+                )
+        except Exception:
+            logger.error(
+                'migrate_decision_project_tokens: skipping %s',
+                decision.id,
+                exc_info=True,
+            )
+            continue
     return migrated
 
 
