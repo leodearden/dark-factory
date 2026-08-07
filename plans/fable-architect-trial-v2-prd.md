@@ -402,13 +402,13 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
    committed under `scripts/`; this entry supplies the filename D10 left
    generic).
 
-   The nearest committed sibling, `scripts/run_judge_ofat_pilot.py` (201
-   lines), is a thin CLI over `orchestrator.evals.judge_pilot` (339
-   lines): its own docstring states "all decision/render logic lives
-   there; this file only parses args, drives I/O, and maps the verdict
-   to a process exit code". β2 copies that sibling's NAME convention but
-   deliberately not its structure — the v2 campaign driver keeps decision
-   and render logic in the script itself.
+   The nearest committed sibling, `scripts/run_judge_ofat_pilot.py`, is
+   a thin CLI over `orchestrator.evals.judge_pilot`: its own docstring
+   states "all decision/render logic lives there; this file only parses
+   args, drives I/O, and maps the verdict to a process exit code". β2
+   copies that sibling's NAME convention but deliberately not its
+   structure — the v2 campaign driver keeps decision and render logic in
+   the script itself.
 
    The reason is not stylistic preference. Splitting logic out the
    judge-pilot way requires a new module inside the instrument package
@@ -426,10 +426,11 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
    is the only placement that actually gates the driver.
    `scripts/orchestrator.yaml` declares
    `test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"`,
-   and `verify_plan._derive_module_runs` arm 3 — the task-3294 source-only
-   floor — runs the owning module's `test_command` VERBATIM at
-   `ScopeKind.FULL_SUITE` for ANY `scripts/` production diff. So an edit to
-   the driver runs that command, and only that command. `orchestrator/tests/`
+   and `verify_plan._derive_module_runs` arm 3 — the task-3294
+   production-file floor, gated on `role == 'task'` — runs the owning
+   module's `test_command` VERBATIM at `ScopeKind.FULL_SUITE` for any
+   `scripts/` production diff at task role. So a task-role edit to the
+   driver runs that command, and only that command. `orchestrator/tests/`
    is not named in it: counterpart tests placed there would collect only
    under an `orchestrator/` diff, so a driver-only edit would clear the TEST
    leg green with them never having run. That is the same silent coverage
