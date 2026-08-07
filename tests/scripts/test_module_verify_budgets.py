@@ -135,10 +135,27 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 sensitive to host load and to the concurrent wave. A future
 #                 change to -n or to the dist mode INVALIDATES this measurement
 #                 rather than merely shifting it — re-measure, do not scale.
+#
+#   dashboard     6 runs, all rc=0, 1648 passed / 1 xfailed
+#                 283.47s @ loadavg 133.30 (convenient)
+#                 320.40s @ loadavg 141.24
+#                 341.70s @ loadavg 146.79
+#                 409.78s @ loadavg 137.33 (warm-up)
+#                 452.56s @ loadavg 106.94
+#                 653.54s @ loadavg 123.76 (INCONVENIENT — concurrent wave)
+#
+#                 NO PRIOR FIGURE OF ANY KIND EXISTED for this suite. Task 3062
+#                 attempt-2 timed out at 1800.66s BEFORE dashboard's segment
+#                 started, so unlike shared/escalation/fused-memory there is no
+#                 independent earlier measurement to reconcile these against —
+#                 the error bar is wider here and is stated rather than implied.
+#                 These six also show the widest spread of any module in the
+#                 sweep, 2.3x (283.47s -> 653.54s).
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
     'escalation': 354.56,
     'fused-memory': 439.80,
+    'dashboard': 653.54,
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -150,6 +167,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'shared': 'shared/src/shared/__init__.py',
     'escalation': 'escalation/src/escalation/__init__.py',
     'fused-memory': 'fused-memory/src/fused_memory/__init__.py',
+    'dashboard': 'dashboard/src/dashboard/__init__.py',
 }
 
 
