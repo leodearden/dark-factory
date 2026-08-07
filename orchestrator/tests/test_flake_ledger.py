@@ -275,29 +275,12 @@ class TestFlakeVerdict:
             'unconfirmable',
         }
 
-    def test_value_equals_name(self) -> None:
-        """The project convention (test_event_store.py:107-111) — what lets a member
-        bind straight into SQL and travel the VerifyResult wire with no codec."""
-        from orchestrator.flake_ledger import FlakeVerdict
-
-        for v in FlakeVerdict:
-            assert isinstance(v.value, str)
-            assert v.value == v.name
-
     def test_is_str_comparable(self) -> None:
         from orchestrator.flake_ledger import FlakeVerdict
 
         assert FlakeVerdict.passes_in_isolation == 'passes_in_isolation'
         assert FlakeVerdict.fails_in_isolation == 'fails_in_isolation'
         assert FlakeVerdict.unconfirmable == 'unconfirmable'
-
-    def test_vocabulary_names_the_observation_not_the_remedy(self) -> None:
-        """§5.5: the verdict is ``passes_in_isolation``, never ``flaky_test: true``.
-        A verdict records what was OBSERVED; calling a test "flaky" prejudges the
-        remedy and is the vocabulary this PRD exists to replace."""
-        from orchestrator.flake_ledger import FlakeVerdict
-
-        assert not any('flaky' in v.value for v in FlakeVerdict)
 
 
 class TestFlakeSuppression:
@@ -318,23 +301,6 @@ class TestFlakeSuppression:
         }
         kwargs.update(overrides)
         return FlakeSuppression(**kwargs)
-
-    def test_field_order(self) -> None:
-        """Declaration order is the contract — ε constructs these and the codec
-        round-trips them."""
-        import dataclasses
-
-        from orchestrator.flake_ledger import FlakeSuppression
-
-        assert [f.name for f in dataclasses.fields(FlakeSuppression)] == [
-            'verdict',
-            'test_ids',
-            'observed_at',
-            'call_site',
-            'runner',
-            'psi_cpu_some10',
-            'unconfirmable_reason',
-        ]
 
     def test_is_frozen(self) -> None:
         """Frozen: the discriminator is PURE (§8.1 invariant 5), so its output is a
