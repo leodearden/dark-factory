@@ -2876,13 +2876,129 @@ def test_main_write_decision_files_open_record(
     assert len(listed) == 1
     rec = listed[0]
     assert rec.id == 'dec-park-1'
-    assert rec.project == 'df'
+    # Stored CANONICAL, not verbatim: --project is normalized at the CLI
+    # boundary (task 3807, see test_main_write_decision_canonicalizes_project).
+    assert rec.project == 'dark_factory'
     assert rec.text == 'Approve risky merge?'
     assert rec.task_id == '2085'
     assert rec.escalation_id == 'esc-1'
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+@pytest.mark.parametrize(
+    'raw_project',
+    ['df', 'DF', 'dark-factory', 'Dark-Factory', '  DARK_FACTORY '],
+)
+def test_main_write_decision_canonicalizes_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw_project: str,
+) -> None:
+    """--project is stored NORMALIZED, not verbatim (task 3807).
+
+    Mirrors how --escalations-dir is already stamped normalized one line
+    below in _run_write_decision. Storing the raw argv string is what let one
+    project's decisions accumulate in three separate partitions, each
+    invisible to a reap scoped to either of the others.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'd-alias', '--project', raw_project, '--text', 'q?'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'dark_factory'
+
+
+def test_main_write_decision_canonicalizes_an_unaliased_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The fold applies to EVERY project, not just the one aliased token: a
+    genuinely new project must be able to file without a code change, so the
+    verb normalizes rather than rejecting an unrecognized spelling.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        ['write-decision', '--id', 'd-av', '--project', 'autopilot-video', '--text', 'q?']
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'autopilot_video'
+
+
+def test_main_write_decision_project_normalization_never_touches_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``df-`` prefix belongs to --id, which YOU type; write-decision
+    never derives it from, or rewrites it because of, --project.
+
+    Conflating the two is how the three-way split arose in the first place --
+    a human reading ``df-esc-3524-1`` inferred that ``--project df`` was the
+    right spelling. The id (and therefore the record's filename) must survive
+    project canonicalization byte-for-byte, or every cockpit cross-link to a
+    filed decision would break.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        ['write-decision', '--id', 'df-esc-3524-1', '--project', 'df', '--text', 'q?']
+    )
+
+    assert rc == 0
+    assert (tmp_path / 'decisions' / 'df-esc-3524-1.json').is_file()
+    assert 'df-esc-3524-1' in capsys.readouterr().out
+    listed = sr.list_decisions(root=tmp_path)
+    assert [(d.id, d.project) for d in listed] == [('df-esc-3524-1', 'dark_factory')]
+
+
+def test_main_write_decision_logs_a_project_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rewrite is LOUD, not silent (project norm: loud-over-silent
+    degradation) -- so an operator can see that what they typed is not what
+    was stored, and fix the spelling at the source.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        assert sr.main(['write-decision', '--id', 'd-w', '--project', 'df', '--text', 'q?']) == 0
+
+    assert any(
+        r.levelno >= logging.WARNING and 'df' in r.getMessage() and 'dark_factory' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_main_write_decision_already_canonical_project_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning fires only on an actual REWRITE. A watcher already passing
+    the canonical token -- which is what both SKILL.md files now tell it to
+    do -- must not emit a warning on every park, or the signal is noise.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            ['write-decision', '--id', 'd-ok', '--project', 'dark_factory', '--text', 'q?']
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'dark_factory'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_main_write_decision_stamps_severity(
