@@ -102,15 +102,26 @@ __all__ = [
 _FOREIGN_HOLDER_HOLD_SECS = 120
 
 #: Bound on how long :func:`foreign_lane_lock_holder` waits for the child to
-#: actually own the lock before failing the test.  The gate waits for a
-#: spawned ``flock(1)`` to acquire the lock, and task 3451 measured
-#: worst-case happy-path subprocess spawn latency at 4.71s (n=3:
-#: 2.13/3.10/4.71) at load-per-core 6.6 on this host — leaving the old 5.0s
-#: bound only ~6% headroom over a measured worst case.  This is the same
-#: load-sensitive full-suite-flake class as 1335/1836/2819/3451/3491, and
-#: 30s is the ceiling task 3491 settled on for it.  Widening this can never
-#: make a broken staging pass — it only lengthens how long a genuinely
-#: broken one takes to fail.
+#: actually own the lock before failing the test. The gate waits for a spawned
+#: ``flock(1)`` to acquire the lock. FLOOR: task 3451 measured worst-case
+#: happy-path subprocess spawn latency at 4.71s (n=3: 2.13/3.10/4.71) at
+#: load-per-core 6.6 on this host — the same load-sensitive full-suite-flake
+#: class as 1335/1836/2819/3451/3491; 12.0 is 2.55x that measured worst case,
+#: versus the original 5.0s bound's ~6% headroom. CEILING (task 3836): the 60s
+#: global pytest-timeout (orchestrator/pyproject.toml: timeout_method =
+#: "thread", --max-worker-restart=0). Task 3491 is precedent AGAINST a bound
+#: near that ceiling, not for one: it REJECTED a 30s ceiling for this exact
+#: collision and landed ``asyncio.wait_for(..., timeout=5)`` instead
+#: (test_usage_gate.py:328,790), warning that a ceiling closer to 60s "would
+#: trade one flake class for a worse one." No test in this module opts out of
+#: the global timeout, so past the ceiling, widening does NOT merely lengthen
+#: a broken staging's time to fail: pytest-timeout fires first and, under
+#: timeout_method="thread", os._exit()s the xdist worker, discarding this
+#: helper's own ``pytest.fail`` diagnostics. The bounds must clear the
+#: measured spawn latency AND stay narrow enough that the helper can still
+#: emit its own diagnostic when they are exhausted — see
+#: ``test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout`` for
+#: the executable check.
 _FOREIGN_HOLDER_STARTUP_SECS = 12.0
 
 #: Bound on how long :func:`foreign_lane_lock_holder` waits, on exit, for the
@@ -122,12 +133,24 @@ _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 
 #: Bound on how long :func:`wait_for_lane_lock_holder` polls for the kernel to
 #: ATTRIBUTE the lock to a specific pid (as opposed to merely being held by
-#: somebody).  Derivation: task 3451 measured worst-case happy-path subprocess
-#: spawn latency at 4.71s (n=3: 2.13/3.10/4.71) at load-per-core 6.6 on this
-#: host, and task 3491 settled on 30s as the ceiling for this same
-#: load-sensitive full-suite-flake class.  A longer bound only lengthens how
-#: long a genuinely broken staging takes to fail — it can never make a broken
-#: staging pass.
+#: somebody). FLOOR: task 3451 measured worst-case happy-path subprocess spawn
+#: latency at 4.71s (n=3: 2.13/3.10/4.71) at load-per-core 6.6 on this host,
+#: the same load-sensitive full-suite-flake class as 1335/1836/2819/3451/3491;
+#: 12.0 is 2.55x that measured worst case. CEILING (task 3836): the 60s global
+#: pytest-timeout (orchestrator/pyproject.toml: timeout_method = "thread",
+#: --max-worker-restart=0). Task 3491 is precedent AGAINST a bound near that
+#: ceiling, not for one: it REJECTED a 30s ceiling for this exact collision
+#: and landed ``asyncio.wait_for(..., timeout=5)`` instead
+#: (test_usage_gate.py:328,790), warning that a ceiling closer to 60s "would
+#: trade one flake class for a worse one." A longer bound does NOT merely
+#: lengthen a genuinely broken staging's time to fail: no test in this module
+#: opts out of the global timeout, so past the ceiling, pytest-timeout fires
+#: first and, under timeout_method="thread", os._exit()s the xdist worker,
+#: discarding this helper's own ``pytest.fail`` diagnostics. This bound must
+#: clear the measured spawn latency AND stay narrow enough that the helper can
+#: still emit its own diagnostic when it is exhausted — see
+#: ``test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout`` for
+#: the executable check.
 _FOREIGN_HOLDER_ATTRIBUTION_SECS = 12.0
 
 #: Bound on how long :func:`require_lane_lock_holders` retries an UNREADABLE
