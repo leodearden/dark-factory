@@ -31,6 +31,15 @@ from shared.task_metadata import KNOWN_ROLE_NAMES
 
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
+# Strictly one-way (config -> config_census_ignore): the census-ignore grammar
+# and audit are kept OUT of this already-oversized module, and that module
+# depends only on stdlib plus shared/, so there is no cycle.
+from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for the drift test)
+    CENSUS_IGNORE_ENTRY_KEYS,
+    CensusIgnoreSpec,
+    parse_census_ignore_entries,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -2837,6 +2846,43 @@ class ConfigKeyCensus(NamedTuple):
     parse_error: str | None = None
 
 
+class CensusIgnoreEntry(BaseModel):
+    """The REASONED form of a ``config_key_census.ignore`` entry (task 3395).
+
+    An ignore entry is an ASSERTION that some non-OrchestratorConfig consumer
+    reads the key.  In the bare-string form that assertion is unfalsifiable and
+    never re-checked — the failure mode behind reify's
+    ``cpu_governance.DF_AGENT_CPU_GOVERN`` entry, which was added on the
+    expectation that dark-factory eventually WOULD read the key and thereby
+    made the resulting outage permanent and silent.
+
+    ``reason`` names the actual consumer, so the claim can be checked by a
+    reader and audited by ``audit_census_ignore_entries``.
+
+    NOTE the field names here are pinned to
+    ``config_census_ignore.CENSUS_IGNORE_ENTRY_KEYS`` by a drift test: the raw
+    tree parser cannot use this validated model (it must keep working when the
+    config has an unrelated value-level validation error), so the two sites
+    must agree byte-for-byte on the key names.
+    """
+
+    path: str = Field(
+        description='Dotted key path, matched with fnmatch.fnmatchcase (globs allowed).'
+    )
+    reason: str = Field(
+        description=(
+            'Who actually consumes this key, e.g. "read verbatim by '
+            'scripts/cpu-governed-exec.sh". If the consumer has NOT landed yet, '
+            'the reason MUST cite its tracking task in the canonical form #NNNN '
+            '— an uncited "pending" claim has no expiry and cannot be audited. '
+            'A reason naming dark-factory / the orchestrator / OrchestratorConfig '
+            'as the consumer is rejected outright: dark-factory owns the schema, '
+            'so a key it consumed would be a FIELD on the model and would never '
+            'need excusing.'
+        )
+    )
+
+
 class ConfigKeyCensusConfig(BaseModel):
     """Operator escape hatch for the unknown-config-key census.
 
@@ -2846,18 +2892,26 @@ class ConfigKeyCensusConfig(BaseModel):
     trade one born-at-L2 for another.
     """
 
-    ignore: list[str] = Field(
+    ignore: list[str | CensusIgnoreEntry] = Field(
         default_factory=list,
         description=(
             'Dotted paths of project-YAML keys that are deliberately present for '
             'NON-OrchestratorConfig consumers (e.g. keys read by the project\'s own '
             'scripts) and must therefore not be reported as unknown config keys. '
+            'PREFER the reasoned mapping form `{path: <glob>, reason: <who reads '
+            'it>}`: an entry is an assertion about a consumer, and a bare string '
+            'makes that assertion unfalsifiable. A bare string is still accepted '
+            'for back-compat but reports as un-reasoned DEBT in check-config. If '
+            'the consumer has not landed yet, the reason must cite its tracking '
+            'task as `#NNNN` so the entry can be re-checked when that task closes '
+            '— an uncited "pending" reason is a hard finding. '
             'Entries are matched against the dotted key path with '
             'fnmatch.fnmatchcase, so shell-style globs work — NOTE that `*` spans '
             'dots, so `cpu_governance.*` opts out that whole namespace. The '
             'converse fnmatch trap: `<name>.*` does NOT match the bare parent key '
             '`<name>`, so opting out a top-level dict key requires listing it '
-            'exactly. Prefer renaming a new non-orchestrator knob under the '
+            'exactly. Matching is FIRST-match-wins, so source order is '
+            'load-bearing. Prefer renaming a new non-orchestrator knob under the '
             'reserved `x_`/`x-` prefix (auto-excused at any depth, no config '
             'ceremony) and reserve this list for existing key names that other '
             'tooling already greps for.'
