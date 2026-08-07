@@ -9,6 +9,7 @@ raw-YAML-vs-model pass.  These tests pin the pure census engine.
 
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -983,3 +984,134 @@ def test_unknown_classification_is_identical_with_and_without_reasons(tmp_path):
     )
     assert census_config_keys(bare).unknown == census_config_keys(reasoned).unknown
     assert [uk.path for uk in census_config_keys(reasoned).unknown] == ['bogus_key']
+
+
+# --- (c) check-config surfaces reasons, findings, and a three-way exit code ---
+
+
+def _seed_done_task(project_root: Path, task_id: int = 111) -> None:
+    """A real task store whose only task is DONE — the orphaned-cite fixture."""
+    db = project_root / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        'CREATE TABLE tasks (tag TEXT, id INTEGER, status TEXT, metadata TEXT, '
+        'PRIMARY KEY (tag, id))'
+    )
+    conn.execute(
+        'INSERT INTO tasks (tag, id, status, metadata) VALUES (?,?,?,?)',
+        ('master', task_id, 'done', None),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _check_config(p: Path):
+    return CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+
+def test_check_config_prints_reason_and_debt_marker(tmp_path):
+    """ACCEPTANCE (a): a new un-reasoned entry is VISIBLE as debt, and a
+    reasoned one shows the justification the operator actually wrote."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': [
+                {'path': 'cpu_governance.weights',
+                 'reason': 'read verbatim by scripts/cpu-governed-exec.sh'},
+                'fairness.scheduler_v2',
+            ]},
+            'cpu_governance': {'weights': {'task': 100}},
+            'fairness': {'scheduler_v2': True},
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert 'read verbatim by scripts/cpu-governed-exec.sh' in result.output
+    assert 'no reason' in result.output.lower()
+
+
+def test_check_config_prints_a_findings_section(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'config_key_census': {'ignore': ['warm_lane_pool']}, 'warm_lane_pool': 8},
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert 'unreasoned' in result.output
+    assert 'warm_lane_pool' in result.output
+
+
+def test_check_config_advisory_only_still_exits_zero(tmp_path):
+    """The five grandfathered bare entries must NOT turn a currently-green
+    config red on upgrade — advisory findings are exit-neutral and the existing
+    OK: contract still holds."""
+    p = _write_yaml(tmp_path, _reify_shape(), name='config.yaml')
+    result = _check_config(p)
+    assert result.exit_code == 0, result.output
+    assert 'OK' in result.output
+
+
+def test_check_config_hard_finding_exits_two(tmp_path):
+    """ACCEPTANCE (b): an entry whose cited task has CLOSED is reported loudly
+    with its own exit code, naming the id and the status."""
+    project = tmp_path / 'proj'
+    project.mkdir()
+    _seed_done_task(project)
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(project),
+            'config_key_census': {'ignore': [
+                {'path': 'warm_lane_pool', 'reason': 'temporary — pending #111'}
+            ]},
+            'warm_lane_pool': 8,
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert result.exit_code == 2, result.output
+    assert '#111' in result.output
+    assert 'done' in result.output
+    assert 'orphaned' in result.output
+
+
+def test_check_config_unknown_key_still_exits_one(tmp_path):
+    p = _write_yaml(tmp_path, {'bogus_key': 1}, name='config.yaml')
+    assert _check_config(p).exit_code == 1
+
+
+def test_unknown_keys_dominate_a_hard_finding(tmp_path):
+    """Exit 1 keeps its documented meaning — 'at least one genuinely-unknown
+    key' — so a caller can never mistake the two signals for each other."""
+    project = tmp_path / 'proj'
+    project.mkdir()
+    _seed_done_task(project)
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(project),
+            'config_key_census': {'ignore': [
+                {'path': 'warm_lane_pool', 'reason': 'temporary — pending #111'}
+            ]},
+            'warm_lane_pool': 8,
+            'bogus_key': 1,
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert result.exit_code == 1, result.output
+
+
+def test_check_config_survives_a_raising_audit(tmp_path, monkeypatch):
+    """A broken lint must never turn a working gate into a crash."""
+    def _boom(_path):
+        raise RuntimeError('audit exploded')
+
+    monkeypatch.setattr('orchestrator.cli.audit_census_ignore_entries', _boom)
+    p = _write_yaml(
+        tmp_path, {'max_concurrent_tasks': 3}, name='config.yaml'
+    )
+    result = _check_config(p)
+    assert result.exit_code == 0, result.output
+    assert 'OK' in result.output
