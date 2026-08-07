@@ -461,6 +461,15 @@ class PlanQualityVerdict:
     # Trailing and defaulted, so every existing 3-arg construction (including
     # the parse-failure fallback below) is unaffected and keeps reading None.
     invocation_error: str | None = None
+    # USD spend of THIS verdict's own judge invocation (eval-revival υ).
+    # ``0.0`` when no invocation happened (the pre-invoke unjudgeable-artifact
+    # refusal below) or when the caller constructed the verdict itself — the
+    # same trailing-defaulted shape as ``invocation_error`` immediately above,
+    # for the same reason: every existing construction site keeps working.
+    # ``run_architect_eval`` reads this to fold the judge's spend into the
+    # cell's own ``cost_usd`` (metrics.py's documented judge_cost_usd-is-a-
+    # SUBSET-of-cost_usd contract).
+    cost_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -717,4 +726,9 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         plan_quality=plan_quality,
         per_criterion=verdict.get('per_criterion', {}) or {},
         reasoning=verdict.get('reasoning', ''),
+        # Passed through VERBATIM, not coerced with float(): existing judge
+        # tests feed bare MagicMock results whose cost_usd is itself a Mock,
+        # and float(Mock) raises. The runner's read (run_architect_eval) is
+        # where an untrusted/non-numeric verdict.cost_usd gets coerced.
+        cost_usd=result.cost_usd,
     )
