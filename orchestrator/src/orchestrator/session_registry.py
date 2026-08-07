@@ -2483,7 +2483,20 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        (``~/.claude/fleet/decisions/``) but escalations are per-project
        (``<project_root>/data/escalations``), so a decision belonging to a
        DIFFERENT project is skipped. Scoping this way keeps the join correct
-       without fragile project_id -> path auto-discovery.
+       without fragile project_id -> path auto-discovery. The match is on the
+       CANONICAL token (see normalize_project_token, task 3807), with BOTH
+       sides normalized -- the reaper's own ``--project`` AND the decision's
+       stored value -- so a single run covers every historical spelling of
+       one project. A raw compare silently PARTITIONED one project's
+       decisions: measured 2026-08-06, 41 OPEN dark-factory decisions split
+       22/17/2 across ``dark_factory``/``df``/``dark-factory``, each
+       partition invisible to a reap scoped to either of the others, forcing
+       an L2 session to run this verb once per token. That
+       run-once-per-token workaround is now removed. Normalization only ever
+       WIDENS the axis-1 match to spellings of the SAME project; it never
+       widens ACROSS projects (``solar_challenge`` vs
+       ``solar_challenge_platform`` are different project roots and are
+       guarded from merging), so the fail-OPEN framing below is intact.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -2520,9 +2533,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     decision, mirroring `write-decision` printing the filed id.
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
+    reaper_project = normalize_project_token(project)
 
     def _status(decision: DecisionRecord) -> str | None:
-        if decision.project != project:
+        # Axis 1: normalize the decision's OWN stored token at compare time
+        # too, not just at write time -- for the same reason axis 2 already
+        # does. A raw compare fails open for any record write-decision did
+        # not produce (hand-repaired, migrated between checkouts, filed by an
+        # older build), which is exactly the 173 legacy records the migration
+        # verb exists to repair; comparing honestly means the fix holds even
+        # for a record the migration has not reached yet.
+        if normalize_project_token(decision.project) != reaper_project:
             return None
         if decision.escalation_id is None:
             # Belt-and-suspenders, not reachable via reap_answered_decisions
@@ -2631,7 +2652,15 @@ def _build_parser() -> argparse.ArgumentParser:
         'reap-decisions',
         help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
     )
-    reap_decisions_p.add_argument('--project', required=True)
+    reap_decisions_p.add_argument(
+        '--project',
+        required=True,
+        help=(
+            'project to scope the reap to; matched on the canonical token '
+            '(see normalize_project_token), so ONE run closes every '
+            'historical spelling of that project'
+        ),
+    )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
 
     return parser
