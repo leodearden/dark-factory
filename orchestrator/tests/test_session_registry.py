@@ -4033,3 +4033,134 @@ def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Decision project-token migration (task 3807)
+# ---------------------------------------------------------------------------
+
+
+def _seed_mixed_spellings(tmp_path: Path) -> dict[str, dict[str, Any]]:
+    """Seed the observed mixed-spelling population, one record per case.
+
+    Mirrors the live 2026-08-06 census in miniature: three dark-factory
+    spellings needing repair (one per DecisionState, so preservation is
+    checked against a row that must NOT be reopened), one already-canonical
+    dark-factory row, and one unrelated project. Returns each seeded record's
+    ``to_dict()`` keyed by id, so a test can diff the whole dict before/after
+    and catch a field a future change lets escape.
+    """
+    seeds = {
+        'd-df': ('df', sr.DecisionState.OPEN),
+        'd-hyphen': ('dark-factory', sr.DecisionState.ANSWERED),
+        'd-mixed': ('Dark_Factory', sr.DecisionState.DROPPED),
+        'd-canon': ('dark_factory', sr.DecisionState.OPEN),
+        'd-reify': ('reify', sr.DecisionState.OPEN),
+    }
+    before: dict[str, dict[str, Any]] = {}
+    for decision_id, (project, state) in seeds.items():
+        record = _make_decision(id=decision_id, project=project, state=state)
+        sr.write_decision(record, root=tmp_path)
+        before[decision_id] = record.to_dict()
+    return before
+
+
+def test_migrate_decision_project_tokens_reports_only_changed_records(tmp_path: Path) -> None:
+    """Returns one MigratedDecision per CHANGED record and nothing else.
+
+    An already-canonical row and an unrelated project's row are not
+    "migrated" -- reporting them would make the operator's `| wc -l` lie
+    about how much of the legacy population actually needed repair.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in migrated} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+
+
+def test_migrate_decision_project_tokens_canonicalizes_on_disk(tmp_path: Path) -> None:
+    """The point of the sweep: after it, every dark-factory row -- whatever
+    it was filed under -- reads back as the ONE canonical token, and an
+    unrelated project is untouched.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    on_disk = {d.id: d.project for d in sr.list_decisions(root=tmp_path)}
+    assert on_disk == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_migrate_decision_project_tokens_changes_only_the_project_field(tmp_path: Path) -> None:
+    """PRESERVATION: exactly one key may differ, on every record.
+
+    Asserted as a whole-dict diff rather than a field checklist so a future
+    field added to DecisionRecord cannot silently escape the check. This is
+    the invariant that makes the sweep safe to run against the live
+    population: an ANSWERED/DROPPED row must never be reopened, and filed_at
+    (the cockpit's age/ordering signal) must not be restamped.
+    """
+    before = _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    after = {d.id: d.to_dict() for d in sr.list_decisions(root=tmp_path)}
+    assert set(after) == set(before)
+    for decision_id, before_dict in before.items():
+        differing = {
+            key
+            for key in set(before_dict) | set(after[decision_id])
+            if before_dict.get(key) != after[decision_id].get(key)
+        }
+        assert differing <= {'project'}, decision_id
+    # Spelled out for the states that must survive, so the intent survives a
+    # future refactor of the diff above.
+    states = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert states['d-df'] == sr.DecisionState.OPEN
+    assert states['d-hyphen'] == sr.DecisionState.ANSWERED
+    assert states['d-mixed'] == sr.DecisionState.DROPPED
+
+
+def test_migrate_decision_project_tokens_is_idempotent(tmp_path: Path) -> None:
+    """A second sweep is a no-op: nothing reported, no file rewritten.
+
+    Follows from normalize_project_token's idempotence, and is what makes the
+    verb safe to keep as a permanent repair tool rather than a one-shot
+    script that must be deleted after use.
+    """
+    _seed_mixed_spellings(tmp_path)
+    sr.migrate_decision_project_tokens(root=tmp_path)
+    settled = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    assert sr.migrate_decision_project_tokens(root=tmp_path) == []
+    assert {path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))} == (
+        settled
+    )
+
+
+def test_migrated_decision_is_a_frozen_result_record() -> None:
+    """Mirrors the sibling ReapedDecision contract: a frozen dataclass, so a
+    caller cannot mutate the audit trail of what the sweep actually did.
+    """
+    migrated = sr.MigratedDecision(id='d-1', old_project='df', new_project='dark_factory')
+
+    assert (migrated.id, migrated.old_project, migrated.new_project) == (
+        'd-1',
+        'df',
+        'dark_factory',
+    )
+    with pytest.raises(Exception):
+        migrated.new_project = 'other'  # type: ignore[misc]
