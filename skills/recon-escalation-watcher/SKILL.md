@@ -538,6 +538,18 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `--project`. Conflating the two is what produced a three-way split of one project's decisions
   (41 open dark-factory rows spread across `dark_factory`/`df`/`dark-factory`, each invisible to a
   reap scoped to either of the others).
+  - **Caveat — check your project's existing rows before trusting the declared token.** Folding
+    merges spellings that differ only by case or separator; only an entry in
+    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
+    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
+    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
+    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
+    project, list the tokens its rows actually carry:
+    ```bash
+    python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
+    ```
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
@@ -589,7 +601,10 @@ that flag existed) falls back to project-only scoping and has no such protection
 
 The **project** axis matches on the canonical token (see `--project` above), so **ONE run per
 queue closes every historical spelling** of that project — there is no need to re-run the verb
-once per token (`df`, `dark_factory`, `dark-factory`) as was necessary before. Folding only ever
+once per token (`df`, `dark_factory`, `dark-factory`) as was necessary before. This holds as long
+as the token you pass folds into the same bucket its rows carry, which is not automatic for every
+project — read the `--project` caveat above before assuming a zero-row reap means "nothing to
+close". Folding only ever
 merges spellings of the *same* project; it never merges two different projects (e.g.
 `solar_challenge` and `solar_challenge_platform` stay separate), so this widens what a reap
 closes without ever letting one project's reaper close another's decisions. Note this is
