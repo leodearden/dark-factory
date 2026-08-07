@@ -90,6 +90,28 @@ class TestStagePromptsAdvertiseAmendAndEpisodeTools:
         built = build_stage2_system_prompt('autopilot_video')
         assert isinstance(built, str) and built
 
+    def test_amend_and_episode_tools_block_embedded_exactly_once_in_stage1_prompt(
+        self,
+    ) -> None:
+        """Identity pin, not just substring membership: the per-name membership
+        tests above pass equally if the three names were re-pasted inline in
+        stage1.py instead of interpolating the shared constant — exactly the
+        drift AMEND_AND_EPISODE_TOOLS_BLOCK exists to prevent (INV-5)."""
+        from fused_memory.reconciliation.prompts import AMEND_AND_EPISODE_TOOLS_BLOCK
+        assert STAGE1_SYSTEM_PROMPT.count(AMEND_AND_EPISODE_TOOLS_BLOCK) == 1, (
+            'STAGE1_SYSTEM_PROMPT must interpolate AMEND_AND_EPISODE_TOOLS_BLOCK '
+            'verbatim, exactly once.'
+        )
+
+    def test_amend_and_episode_tools_block_embedded_exactly_once_in_stage2_prompt(
+        self,
+    ) -> None:
+        from fused_memory.reconciliation.prompts import AMEND_AND_EPISODE_TOOLS_BLOCK
+        assert STAGE2_SYSTEM_PROMPT.count(AMEND_AND_EPISODE_TOOLS_BLOCK) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate AMEND_AND_EPISODE_TOOLS_BLOCK '
+            'verbatim, exactly once.'
+        )
+
 
 class TestDisallowListForAmendAndEpisodeTools:
     """Pins the grant the prompt now advertises, so a future disallow-list edit
@@ -256,3 +278,66 @@ class TestStagePromptsCarryTheAnnotationNorm:
         take" rule that render_escalation_boundary_note's docstring states."""
         from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
         assert STALE_KNOWLEDGE_ANNOTATION_NORM not in STAGE3_SYSTEM_PROMPT
+
+
+class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
+    """Regression pin for the premise cli_stage_runner.py's DISALLOW_MEMORY_WRITES
+    comment depends on (esc-3623-3 / task 3088): Stage 3's agent_id
+    'recon-stage-integrity_check' clears Mem0UpdateConfig's default
+    content_amend_allowed_agent_prefixes=['recon-stage-'], so the server-side
+    mem0_update authz gate does NOT turn Stage 3 away from `update_memory` on its
+    own — the CLI-level `--disallowed-tools` denial this task added to
+    DISALLOW_MEMORY_WRITES is the ONLY thing keeping Stage 3 read-only for that
+    tool, not defence-in-depth on top of an independent server-side refusal.
+
+    If either half of this premise silently changes — the schema default
+    narrows, or config/config.yaml's commented-out `mem0_update:` block is
+    uncommented with a narrower `content_amend_allowed_agent_prefixes` — the
+    cli_stage_runner.py comment's reasoning needs to be re-examined; that is
+    exactly what these three tests exist to catch.
+    """
+
+    def test_schema_default_content_amend_prefix_is_recon_stage(self) -> None:
+        from fused_memory.config.schema import Mem0UpdateConfig
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_shipped_config_yaml_leaves_mem0_update_at_the_schema_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config/config.yaml ships its `mem0_update:` block fully commented out
+        (verified: every line under it is a `#` comment), so the schema default
+        pinned above — not an operator override this test cannot see — is what
+        actually governs production. Loads the REAL on-disk config the same way
+        test_config_schema.py's TestConfigYamlEnablesRequireDoneProvenance does,
+        rather than trusting a text scan of the comment."""
+        from fused_memory.config.schema import FusedMemoryConfig, Mem0UpdateConfig
+
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert (
+            cfg.mem0_update.content_amend_allowed_agent_prefixes
+            == Mem0UpdateConfig().content_amend_allowed_agent_prefixes
+        ), (
+            'fused-memory/config/config.yaml must NOT set an active '
+            'mem0_update.content_amend_allowed_agent_prefixes override — if it '
+            'does, the schema-default assumption in cli_stage_runner.py\'s '
+            'DISALLOW_MEMORY_WRITES comment no longer describes production.'
+        )
+
+    def test_stage3_agent_id_clears_the_default_prefix(self) -> None:
+        """Stage 3's real agent_id (stages/base.py: f'recon-stage-{stage_id}')
+        starts with the default prefix, so the authz gate alone would admit it —
+        this is what makes the CLI-level denial load-bearing rather than
+        redundant with an independent server-side refusal."""
+        from fused_memory.config.schema import Mem0UpdateConfig
+        from fused_memory.models.reconciliation import StageId
+
+        stage3_agent_id = f'recon-stage-{StageId.integrity_check.value}'
+        prefixes = Mem0UpdateConfig().content_amend_allowed_agent_prefixes
+        assert any(stage3_agent_id.startswith(p) for p in prefixes), (
+            f'{stage3_agent_id!r} must clear the default content-amend prefix — '
+            'this is the premise that makes the CLI-level DISALLOW_MEMORY_WRITES '
+            'denial load-bearing rather than redundant.'
+        )
