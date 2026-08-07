@@ -46,6 +46,7 @@ pin is worse than no pin because it reads as authoritative.
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -472,3 +473,116 @@ def test_module_carries_its_own_measured_verify_budget(
         f'misreading assertion (f) exists to make un-silent: an unset cold '
         f'knob does NOT "inherit" the warm value'
     )
+
+
+# The floor set: module configs known to exist at base main 5a7770d239 that the
+# production walk must still resolve. Same purpose as
+# KNOWN_PER_MODULE_CONFIG_NAMES in test_fallback_verify_config.py — if discovery
+# silently regresses, the coverage loop below would pass VACUOUSLY on a shrunken
+# set, so it is asserted rather than trusted. Includes the six this task closed
+# plus the two sibling tasks 3350/3458 closed and the one excluded below.
+KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
+    {
+        'shared',
+        'escalation',
+        'fused-memory',
+        'dashboard',
+        'sampler',
+        'cockpit',
+        'orchestrator',
+        'scripts',
+        'tests/scripts',
+    }
+)
+
+
+def test_every_discovered_module_config_declares_its_own_verify_budget() -> None:
+    """Every module config defining a test_command must declare a warm budget.
+
+    THE ANTI-DRIFT HALF of this file, and the generalisation task 3473 exists
+    to make. The parametrized guard above covers exactly the six modules whose
+    figures are in ``MEASURED_MODULE_SUITE_WORST_SECS``; nothing there notices
+    a NEWLY-REGISTERED module config landing with no budget at all. This
+    walks what discovery actually registers, so a new subproject is covered
+    automatically with no edit here.
+
+    Written FRESH rather than generalised from an existing guard. Task 3473's
+    description points at ``test_the_dominant_fleet_segment_declares_its_own_
+    verify_budget`` as the thing to widen; that symbol DOES NOT EXIST anywhere
+    in this repo (task 3353, which would have written it, is still pending and
+    its scope has since been rewritten to sharding the orchestrator suite), so
+    there was nothing to generalise FROM.
+
+    Modelled instead on ``TIMEOUT_GUARD_EXCLUSIONS`` in
+    ``test_fallback_verify_config.py`` — a documented, single-entry carve-out
+    carrying its own stated deletion condition, consulted inside a
+    dynamic-discovery loop. WIDENED from that ``frozenset`` to a
+    ``dict[str, str]``, and the widening is the point: a frozenset lets an
+    exclusion be added as a BARE OPT-OUT with its reason living only in a
+    nearby comment that nothing checks. A dict makes the reason a checked
+    value, and the ``task \\d+`` assertion below makes it a reason with an
+    OWNER — so an exclusion cannot be used to silence this guard anonymously.
+
+    THE GUARD REPORTS THE REMAINING GAP RATHER THAN HIDING IT. Exactly one
+    entry is excluded today (``orchestrator``, task 3353), and that is the one
+    place where the repo-root yaml's "tight timeouts live on the per-module
+    budgets" claim is still false.
+    """
+    discovered = {
+        prefix: mc
+        for prefix, mc in _discovered().items()
+        if mc.test_command
+    }
+
+    # Floor: discovery must still resolve the known configs. Without this, a
+    # regression in the production walk would shrink the set and every
+    # assertion below would pass vacuously on what remained.
+    missing = KNOWN_MODULE_CONFIG_PREFIXES - set(discovered)
+    assert not missing, (
+        f'the production walk (config._discover_module_configs, filtered to '
+        f'configs defining a test_command) failed to resolve known module '
+        f'config(s) {sorted(missing)} (task 3473) — discovery has regressed, '
+        f'and the coverage loop below would pass vacuously on the shrunken '
+        f'set. Discovered: {sorted(discovered)}'
+    )
+
+    for prefix, mc in sorted(discovered.items()):
+        reason = MODULE_BUDGET_EXCLUSIONS.get(prefix)
+        if reason is not None:
+            assert reason.strip(), (
+                f'{prefix} is excluded from the per-module budget requirement '
+                f'with an EMPTY justification (task 3473). An exclusion must '
+                f'carry its reason as a checked value, not as a bare opt-out'
+            )
+            assert re.search(r'task \d+', reason), (
+                f"{prefix}'s MODULE_BUDGET_EXCLUSIONS justification names no "
+                f'owning task id (task 3473): {reason!r}. Every exclusion must '
+                f'name the task that owns closing it, so the carve-out has an '
+                f'owner and a deletion condition rather than being an anonymous '
+                f'way to silence this guard'
+            )
+            continue
+
+        assert mc.verify_command_timeout_secs is not None, (
+            f'{prefix}/orchestrator.yaml defines a test_command but declares no '
+            f'verify_command_timeout_secs (task 3473), so it silently inherits '
+            f'the repo-root whole-fleet ceiling — verify._resolve_verify_timeout '
+            f'falls HARD through to config.verify_command_timeout_secs. Either '
+            f'MEASURE this module\'s verbatim test_command and declare a budget '
+            f'(see any of the six closed by task 3473 for the provenance shape), '
+            f'or add a justified entry to MODULE_BUDGET_EXCLUSIONS naming the '
+            f'task that owns it'
+        )
+
+        # A budget with no recorded measurement behind it is a guess wearing a
+        # number's clothes. This is what stops a newly-registered config from
+        # landing with a plausible-looking value and no provenance.
+        assert prefix in MEASURED_MODULE_SUITE_WORST_SECS, (
+            f'{prefix}/orchestrator.yaml declares '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs} but '
+            f'has no entry in MEASURED_MODULE_SUITE_WORST_SECS (task 3473), so '
+            f'nothing records what it was sized from. Measure the module\'s own '
+            f'VERBATIM test_command, record the runs with their loadavg in the '
+            f'table above and in the yaml\'s provenance block, then add the '
+            f'worst wall-clock here'
+        )
