@@ -41,8 +41,10 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 # The canonical α/γ vector — update this list AND CODE_EXTENSIONS together.
 # Widened 36 -> 58 by the git-ls-files sweep 2026-07-28
 # (reify #5726 / dark_factory #3117); generated from α's --list-extensions.
+# Widened 58 -> 59 on 2026-08-06: `csv`, flagged by the corpus->allowlist guard
+# below once plans/evidence/scheduler-scoring-2026-08-06/*.csv landed on main.
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
@@ -163,6 +165,7 @@ _ACCEPT_PATHS = [
     'src/comp.cjs',
     'src/mod.cts',
     'src/styles.css',
+    'plans/evidence/scheduler-scoring-2026-08-06/candidates_scored.csv',
     'src/styles.scss',
     'src/icon.svg',
     'Cargo.toml',

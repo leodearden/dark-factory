@@ -68,6 +68,9 @@ __all__ = [
 #   conf diff envrc example example-systemd-config gitattributes gitignore gitkeep
 #   gitmodules golden grammar icns ico jq jsonl log manifest npmrc python-version
 #   template timer typed
+# Widened 58 -> 59 on 2026-08-06: `csv` — caught by the corpus->allowlist guard
+# (test_every_tracked_extension_is_allowlisted) once plans/evidence/
+# scheduler-scoring-2026-08-06/*.csv landed on dark-factory main (e1c51efa8d).
 # Drift guard (this shared copy): shared/tests/test_locking.py::TestCodeExtensionsDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
@@ -80,6 +83,7 @@ CODE_EXTENSIONS: frozenset[str] = frozenset(
         'conf',
         'cpp',
         'css',
+        'csv',
         'cts',
         'cxx',
         'diff',

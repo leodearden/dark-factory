@@ -106,7 +106,7 @@ __all__ = [
 ]
 
 CODE_EXTENSIONS: frozenset[str] = frozenset({
-    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
