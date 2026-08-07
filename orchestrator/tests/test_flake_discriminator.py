@@ -536,3 +536,234 @@ class TestConfirmIsolatedRerunVerdictMergeGate:
             )
 
         assert s.runner == 'builder-07', s.runner
+
+
+# ---------------------------------------------------------------------------
+# S5: TOTALITY (INV-2) — every non-pass path returns a FlakeSuppression, never
+# None, and `unconfirmable` is DISTINGUISHABLE from `fails_in_isolation`.
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmIsolatedRerunVerdictTotality:
+    """The whole point of β: the facts both gates drop today as a bare
+    `return None` become typed verdicts with named reasons."""
+
+    def _run(self, verify_module, config, module_configs, failing, worktree):
+        return asyncio.run(
+            verify_module.confirm_isolated_rerun_verdict(
+                worktree, config, module_configs, failing, call_site='merge_gate',
+            )
+        )
+
+    def test_no_recoverable_node_ids_is_unconfirmable(self, tmp_path: Path) -> None:
+        """A lint-shaped failure names no test — we examined NOTHING, so
+        test_ids is empty and no re-run is attempted."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(NO_NODEID_TEST_OUTPUT), tmp_path,
+            )
+
+        assert s is not None, s
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.test_ids == (), s.test_ids
+        assert s.unconfirmable_reason == 'no_recoverable_node_ids', (
+            s.unconfirmable_reason
+        )
+        rv.assert_not_awaited()
+
+    def test_unmapped_node_id_is_unconfirmable_and_keeps_the_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        """Nothing materialized on disk -> the real helper returns its None
+        sentinel. We DID examine specific tests, so they are named (PRD B6)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s is not None, s
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.unconfirmable_reason == 'node_ids_unmapped_to_subproject', (
+            s.unconfirmable_reason
+        )
+        rv.assert_not_awaited()
+
+    def test_grouping_none_sentinel_is_unconfirmable(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(
+                verify_module,
+                '_group_node_ids_by_subproject',
+                MagicMock(return_value=None),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == 'node_ids_unmapped_to_subproject', (
+            s.unconfirmable_reason
+        )
+        rv.assert_not_awaited()
+
+    def test_grouping_empty_dict_sentinel_is_unconfirmable(
+        self, tmp_path: Path,
+    ) -> None:
+        """An empty dict is ZERO evidence and must never reach the "all groups
+        confirmed" return — pins the `not groups` guard, not an `is None`
+        check. Falling through would suppress a genuinely red merge having run
+        zero isolated re-runs."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(
+                verify_module,
+                '_group_node_ids_by_subproject',
+                MagicMock(return_value={}),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == 'node_ids_unmapped_to_subproject', (
+            s.unconfirmable_reason
+        )
+        rv.assert_not_awaited()
+
+    def test_rerun_still_failing_is_fails_in_isolation(self, tmp_path: Path) -> None:
+        """A REAL red — the one verdict that means "this is not a flake"."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(False)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.unconfirmable_reason is None, s.unconfirmable_reason
+
+    def test_infra_sentinel_rerun_is_unconfirmable_naming_the_category(
+        self, tmp_path: Path,
+    ) -> None:
+        """An infra sentinel is never trusted as confirmation EITHER WAY — so
+        it must NOT be reported as a real red. Category-first, deliberately
+        independent of the passed flag."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        with patch.object(
+            verify_module,
+            'run_verification',
+            AsyncMock(return_value=_result(True, category=_INFRA_CATEGORY)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason is not None
+        assert s.unconfirmable_reason.startswith('infra_transient_rerun:'), (
+            s.unconfirmable_reason
+        )
+        assert _INFRA_CATEGORY in s.unconfirmable_reason, s.unconfirmable_reason
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+
+    def test_unconfirmable_is_never_conflated_with_not_a_flake(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE claim this task is built on, spelled out: for BOTH mapping
+        failures the answer is a verdict that is neither None nor
+        `fails_in_isolation`. "We could not tell" is not "it is really red"."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        config = _make_config(tmp_path)
+        module_configs = [_module_config('orchestrator')]
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            # (a) nothing to examine
+            no_ids = self._run(
+                verify_module, config, module_configs,
+                _failing_result(NO_NODEID_TEST_OUTPUT), tmp_path,
+            )
+            # (b) examined, but unmappable
+            unmapped = self._run(
+                verify_module, config, module_configs, _failing_result(), tmp_path,
+            )
+
+        for s in (no_ids, unmapped):
+            assert s is not None, 'the discriminator is TOTAL — never None'
+            assert s.verdict != FlakeVerdict.fails_in_isolation, s.verdict
+            assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+            assert s.unconfirmable_reason, s.unconfirmable_reason
+
+    def test_unmapped_path_still_logs_not_suppressing_with_the_node_id(
+        self, tmp_path: Path,
+    ) -> None:
+        """The merge-lane operator line survives the extraction verbatim —
+        `test_unmapped_node_id_logs_not_suppressing` in the existing suite
+        matches on exactly this."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        rendered = [_fmt_log(call) for call in mock_logger.info.call_args_list]
+        matching = [
+            msg for msg in rendered
+            if 'not suppressing' in msg and FAILED_ID in msg
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly ONE merge-lane INFO naming both the offending '
+            f'node-id and the "not suppressing" verdict; got {rendered!r}'
+        )
