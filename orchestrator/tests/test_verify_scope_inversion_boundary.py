@@ -1435,3 +1435,137 @@ class TestRow10PlanAuthorityBothRoles:
         assert result.plan == expected_plan.to_dict(), (
             f'VerifyResult.plan (role={role!r}) must reflect the EXECUTED plan'
         )
+
+
+# ---------------------------------------------------------------------------
+# Row 6b (task 3173): the SAME ν/I1 non-consumption contract as row 6, driven
+# by an EXTERNALLY KILLED leg — the category whose whole point is that the
+# gate produced no verdict at all.
+#
+# The measured incident surfaced this to the human as
+#   "Post-merge verification failed: Failures: lint issues"
+# — a branch-blaming, human-routed BRANCH verdict for a lint process that was
+# SIGKILLed at 0.31s having emitted zero diagnostics.  It must instead route
+# the loud transient-infra hold (an infra_issue that bypasses the steward and
+# consumes no merge attempt), and the reason must SAY what happened.
+#
+# The category AND summary here are produced by the real `_summarize_checks`
+# rather than hand-authored literals, so this row cannot drift from the
+# producer it is asserting on.
+# ---------------------------------------------------------------------------
+
+ROW6B_MAIN_SHA: str = 'r6bmain000000000000000000000000000000000'
+ROW6B_LINT_CMD: str = './scripts/verify.sh lint --scope branch --include-infra'
+ROW6B_LINT_OUT: str = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+ROW6B_LINT_DURATION: float = 0.31010722508654
+
+
+def _fake_run_verification_killed_lint(passed_prefixes: dict[str, bool]) -> AsyncMock:
+    """Row 6b's analogue of :func:`_fake_run_verification_by_module`, whose
+    failing result's ``category``/``summary`` come from the REAL
+    ``verify._summarize_checks`` for a lint leg killed by signal 9 at 0.31s.
+    """
+    from orchestrator.verify import _summarize_checks
+
+    # Five-tuple since the task-3173 review amendment: the fifth element is
+    # one category per FAILING leg, which merge_queue's veto gate reads instead
+    # of inferring verdict-lessness from the severity-ranked aggregate.
+    passed_flag, category, cause_hint, summary, failing_legs = _summarize_checks(
+        0, '', False, None,
+        -9, ROW6B_LINT_OUT, False, ROW6B_LINT_CMD,
+        0, '', False, None,
+        lint_duration=ROW6B_LINT_DURATION,
+    )
+    assert not passed_flag and category == 'infra_kill', (
+        f'sanity: the producer must classify this as infra_kill; got {category!r}'
+    )
+    assert failing_legs == ['infra_kill'], (
+        f'sanity: the only failing leg here is the killed lint leg; got {failing_legs!r}'
+    )
+
+    async def _fake(worktree, config, module_config=None, **kwargs):
+        if module_config is None or passed_prefixes.get(module_config.prefix, True):
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='All checks passed', failing_test_ids=[],
+            )
+        return VerifyResult(
+            passed=False, test_output='', lint_output=ROW6B_LINT_OUT, type_output='',
+            summary=summary, category=category, cause_hint=cause_hint,
+            failing_test_ids=[],
+        )
+    return AsyncMock(side_effect=_fake)
+
+
+class TestRow6bExternalKillIsAnInfraHoldNotABranchVerdict:
+    """Row 6b (task 3173): a PERSISTENT externally-killed merge verify routes
+    the loud transient-infra hold, consumes no attempt, and names the kill —
+    it never surfaces as a branch verdict.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.exercise_merge_verify
+    async def test_row6b_persistent_kill_routes_the_infra_hold_and_says_so(
+        self, tmp_path: Path,
+    ) -> None:
+        assert 'infra_kill' in INFRA_TRANSIENT_CATEGORIES, (
+            "sanity: 'infra_kill' must be an INFRA_TRANSIENT_CATEGORIES member "
+            'for this row to exercise the intended ν policy path'
+        )
+
+        mod_a, _mod_b, _config = _two_module_registry(tmp_path, breadth='full')
+        my_timeouts: dict[str, int] = {}
+        my_enospc_retries: dict[str, int] = {}
+        merge_fake = _fake_run_verification_killed_lint({mod_a.prefix: False})
+        outcome = await _drive_merge_gate(
+            tmp_path,
+            task_id='row6b-3173',
+            module_configs_registry={'moda': mod_a},
+            touched_module_configs=[mod_a],
+            task_files=['moda/thing.py'],
+            task_files_content={'moda/thing.py': 'x = 1\n'},
+            main_sha=ROW6B_MAIN_SHA,
+            run_verification_fake=merge_fake,
+            timeouts=my_timeouts,
+            enospc_retries=my_enospc_retries,
+        )
+
+        # (1) the loud transient-infra hold, NOT a branch verdict.
+        assert outcome is not None, (
+            'expected a blocked MergeOutcome (infra hold), got the '
+            'verify-passed sentinel'
+        )
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'a persistent externally-killed merge verify must route the loud '
+            f'transient-infra hold (infra_issue, bypasses the steward, consumes '
+            f'no attempt); got {outcome.reason!r}'
+        )
+
+        # (2) the reason SAYS what actually happened — every clause measured.
+        assert 'infra_kill' in outcome.reason
+        assert 'signal 9' in outcome.reason
+        assert 'no diagnostics produced' in outcome.reason
+        assert 'indeterminate' in outcome.reason
+
+        # (3) and never the two branch-blaming strings the incident surfaced.
+        assert 'Post-merge verification failed' not in outcome.reason, (
+            f'the incident surfaced the kill as a branch verdict; got '
+            f'{outcome.reason!r}'
+        )
+        assert 'Failures: lint issues' not in outcome.reason, (
+            f'the exact string the measured incident surfaced for a process '
+            f'that emitted ZERO diagnostics; got {outcome.reason!r}'
+        )
+
+        # (4) ν/I1 non-consumption, matching row 6's both-consumers assertions.
+        assert my_timeouts == {}, (
+            f'a persistent externally-killed outcome must not bump the merge '
+            f'timeout loop-breaker (no merge verify attempt consumed); got '
+            f'{my_timeouts}'
+        )
+        assert merge_fake.await_count == 2, (
+            f'expected the BOUNDED shared enospc/infra retry budget (one '
+            f'in-place retry) to exhaust rather than retry silently forever; '
+            f'got {merge_fake.await_count} call(s)'
+        )

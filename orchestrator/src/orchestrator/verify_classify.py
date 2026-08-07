@@ -20,9 +20,46 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import ToolKind
+
+# ---------------------------------------------------------------------------
+# EXTERNAL termination signals (task 3173). ``_run_cmd`` returns
+# ``proc.returncode`` verbatim and asyncio sets that to the NEGATIVE signal
+# number when a child is terminated by a signal, so ``rc == -9`` means SIGKILL.
+#
+# This is deliberately an ALLOW-LIST, not the blanket rule "rc < 0 means
+# killed". The four signals below are only ever delivered by something OUTSIDE
+# the process tree under test — the OOM killer, systemd, verify_cancel.py's
+# SIGTERM->grace->SIGKILL sweep, or an operator — so they carry no information
+# about the branch.
+#
+# CRASH signals are excluded on purpose: SIGSEGV (-11), SIGABRT (-6), SIGBUS
+# (-7), SIGILL (-4) and SIGFPE (-8) are genuine faults OF THE CODE UNDER TEST
+# (a segfaulting native extension, an assertion abort), and they must stay RED.
+# Swallowing them as retryable infra would be the false-GREEN inverse of the
+# defect this predicate exists to fix — the exact class tasks 2822/1700
+# hardened against.
+_EXTERNAL_KILL_SIGNALS: frozenset[int] = frozenset({
+    signal.SIGKILL,   # 9  — OOM killer, `kill -9`, verify_cancel.py's escalation
+    signal.SIGTERM,   # 15 — systemd stop, verify_cancel.py's polite first shot
+    signal.SIGINT,    # 2  — operator Ctrl-C / harness interrupt
+    signal.SIGHUP,    # 1  — controlling terminal or session went away
+})
+
+
+def is_external_kill_rc(rc: int) -> bool:
+    """Return True when *rc* is an asyncio returncode for an EXTERNAL kill.
+
+    See ``_EXTERNAL_KILL_SIGNALS`` for why this is an allow-list rather than
+    a blanket ``rc < 0``. Note this reads RAW asyncio returncodes only: a
+    shell-reported ``128 + N`` status (e.g. 137 for SIGKILL) is NOT treated as
+    a kill, because the predicate must not guess at shell conventions — a
+    plain positive rc is a real exit status the process chose to return.
+    """
+    return rc < 0 and -rc in _EXTERNAL_KILL_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Shared regex primitives — patterns that legitimately belong to more than
@@ -545,6 +582,18 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     2. ``timed_out`` -> ``FailureCategory.INFRA_TIMEOUT`` (wins over any
        output pattern — the root cause is the wall-clock limit, not the
        command output)
+    2.5. ``is_external_kill_rc(rc)`` -> ``FailureCategory.INFRA_KILL``. A
+       process terminated by an EXTERNAL signal never produced an exit
+       verdict, so no amount of output pattern-matching can make one up —
+       whatever it managed to flush before dying is not a diagnosis. Sits
+       ABOVE guard 3 for exactly that reason: a killed process's truncated
+       output can carry a misleading environmental marker (a half-written
+       ENOSPC line, a lock token) that would otherwise be mined for a root
+       cause the run never actually established. Sits BELOW guard 2 because
+       our own watchdog SIGKILLing a command it already timed out is a
+       timeout, and must keep ``RetryKind.TIMEOUT``. Crash signals
+       (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE) are deliberately NOT kills —
+       see ``_EXTERNAL_KILL_SIGNALS``.
     3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
        (broken ``_merge-verify`` worktree; or a mis-resolved pyright
@@ -595,13 +644,15 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     human log is unchanged by construction.
 
     CLOSED DOMAIN: the return value is always a ``FailureCategory`` member —
-    see that enum's docstring for the closed 14-value output domain its
+    see that enum's docstring for the closed 15-value output domain its
     ``CATEGORY_POLICY`` table enforces exhaustively at import time.
     """
     if rc == 0:
         return FailureCategory.PASSED
     if timed_out:
         return FailureCategory.INFRA_TIMEOUT
+    if is_external_kill_rc(rc):
+        return FailureCategory.INFRA_KILL
     environmental_category = _classify_environmental(output)
     if environmental_category is not None:
         return environmental_category
