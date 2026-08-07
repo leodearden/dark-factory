@@ -471,6 +471,29 @@ async def run_eval(
     return result
 
 
+def _verdict_cost_usd(verdict: object) -> float:
+    """Defensively read a plan-judge verdict's own invocation spend.
+
+    The cost twin of the sibling defensive read
+    ``getattr(verdict, 'invocation_error', None)`` in :func:`run_architect_eval`
+    (task 3118's rationale, repeated here for the same reason): a
+    monkeypatched, legacy, or third-party ``PlanQualityVerdict`` may not carry
+    a ``cost_usd`` field at all, or may carry a non-numeric one. Either case
+    must degrade exactly ONE field to ``0.0`` — never the whole eval cell, and
+    never mistaken for a judge invocation that raised. An unguarded
+    ``verdict.cost_usd`` read left inside the caller's ``try/except Exception``
+    would swallow an ``AttributeError`` there and log "plan judge raised",
+    mis-attributing an unreadable FIELD to a judge that actually ran and
+    answered; left unguarded entirely, a non-numeric value (e.g. ``None``)
+    would raise ``TypeError`` OUTSIDE that try/except, in the
+    ``EvalMetrics(...)`` construction, crashing the whole cell.
+    """
+    try:
+        return float(getattr(verdict, 'cost_usd', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 async def run_architect_eval(
     task_path: Path,
     config: EvalConfig,
@@ -825,8 +848,12 @@ async def run_architect_eval(
             # invocation before touching its cost, so a $0.00 refusal still
             # counts as one call (report.py:806-809 reads the pair together;
             # a nonzero cost beside invocations=0 would be self-contradictory).
+            # _verdict_cost_usd is a DEFENSIVE read (like the getattr above):
+            # an unreadable cost field degrades to 0.0 rather than raising
+            # here (mis-attributing the failure to "the judge raised") or
+            # later in the EvalMetrics construction (crashing the cell).
             judge_invocations = 1
-            judge_cost_usd = verdict.cost_usd
+            judge_cost_usd = _verdict_cost_usd(verdict)
         except Exception:
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
