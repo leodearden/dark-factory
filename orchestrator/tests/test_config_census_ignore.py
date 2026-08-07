@@ -12,13 +12,19 @@ The census WALK itself is correct and gets no coverage change here; these tests
 cover the new entry grammar, the violation taxonomy, and citation liveness.
 """
 
+import json
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from orchestrator.config_census_ignore import (
     CensusIgnoreFinding,
     CensusIgnoreSpec,
+    TaskCiteStatus,
     audit_census_ignore_specs,
     parse_census_ignore_entries,
+    read_task_statuses,
 )
 
 
@@ -265,3 +271,189 @@ def test_findings_carry_the_pattern_so_the_entry_can_be_located():
 
 def test_no_specs_yields_no_findings():
     assert audit_census_ignore_specs([], None) == []
+
+
+# --- (c) citation liveness ----------------------------------------------------
+#
+# Policy adopted from reconciliation/stale_status_snapshot_edge_sweep.py:28-32 —
+# invalidate ONLY on a positively-terminal answer, so the audit can under-fire
+# but can never invent a violation out of missing data.  check-config is an
+# offline tool routinely pointed at another project's YAML from a machine
+# without that project's .taskmaster/, so absence must mean "cannot know".
+
+_DONE_ID = 111
+_CANCELLED_ID = 222
+_PENDING_ID = 333
+_PARKED_ID = 444
+_PLAIN_DEFERRED_ID = 555
+_DO_NOT_DISPATCH_ID = 666
+
+
+def _seed_tasks_db(project_root: Path) -> Path:
+    """Real sqlite fixture in the MEASURED production shape: table ``tasks``,
+    PK ``(tag, id)``, tag ``master``."""
+    db = project_root / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        'CREATE TABLE tasks (tag TEXT, id INTEGER, title TEXT, status TEXT, '
+        'metadata TEXT, PRIMARY KEY (tag, id))'
+    )
+    conn.executemany(
+        'INSERT INTO tasks (tag, id, title, status, metadata) VALUES (?,?,?,?,?)',
+        [
+            ('master', _DONE_ID, 't', 'done', None),
+            ('master', _CANCELLED_ID, 't', 'cancelled', None),
+            ('master', _PENDING_ID, 't', 'pending', None),
+            ('master', _PARKED_ID, 't', 'deferred', json.dumps({'do_not_complete': True})),
+            ('master', _PLAIN_DEFERRED_ID, 't', 'deferred', None),
+            ('master', _DO_NOT_DISPATCH_ID, 't', 'deferred',
+             json.dumps({'do_not_dispatch': True})),
+            # A different tag must never leak into the master view.
+            ('other', 999, 't', 'done', None),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _probe(**overrides) -> dict[int, TaskCiteStatus]:
+    """Dict-backed fake probe — the taxonomy is testable with no sqlite at all."""
+    base = {
+        _DONE_ID: TaskCiteStatus('done', False),
+        _CANCELLED_ID: TaskCiteStatus('cancelled', False),
+        _PENDING_ID: TaskCiteStatus('pending', False),
+        _PARKED_ID: TaskCiteStatus('deferred', True),
+        _PLAIN_DEFERRED_ID: TaskCiteStatus('deferred', False),
+        _DO_NOT_DISPATCH_ID: TaskCiteStatus('deferred', False),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_read_task_statuses_reads_the_master_tag(tmp_path):
+    _seed_tasks_db(tmp_path)
+    statuses = read_task_statuses(tmp_path)
+    assert statuses is not None
+    assert statuses[_DONE_ID].status == 'done'
+    assert statuses[_PARKED_ID].do_not_complete is True
+    assert statuses[_PLAIN_DEFERRED_ID].do_not_complete is False
+    assert 999 not in statuses, 'a non-master tag must not leak into the view'
+    assert all(isinstance(k, int) for k in statuses)
+
+
+@pytest.mark.parametrize('broken', ['missing_dir', 'missing_db', 'corrupt'])
+def test_read_task_statuses_returns_none_and_never_raises(tmp_path, broken):
+    """FAIL-OPEN: absence means 'cannot know', never 'clean' and never a crash.
+    check-config is routinely pointed at a config whose project DB is not on
+    this machine at all."""
+    if broken == 'missing_db':
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+    elif broken == 'corrupt':
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b'this is definitely not a sqlite file' * 20)
+    assert read_task_statuses(tmp_path) is None
+
+
+def test_read_task_statuses_does_not_mutate_the_store(tmp_path):
+    """Opened strictly read-only (mode=ro) — a lint must never mutate the store
+    it measures.  Mirrors sandbox_soak._connect_ro / b3_gate."""
+    db = _seed_tasks_db(tmp_path)
+    before = db.stat().st_mtime_ns
+    read_task_statuses(tmp_path)
+    assert db.stat().st_mtime_ns == before
+    with pytest.raises(sqlite3.OperationalError):
+        conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        try:
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (_PENDING_ID,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize(
+    ('cited', 'status'), [(_DONE_ID, 'done'), (_CANCELLED_ID, 'cancelled')]
+)
+def test_orphaned_cite_is_hard(cited, status):
+    """The justification is provably spent: the task that was going to land the
+    consumer has closed, so either the consumer landed (and the key should be a
+    model field) or it never will (and the entry should go)."""
+    findings = audit_census_ignore_specs(
+        [_spec(f'temporary — pending #{cited}')], _probe()
+    )
+    (finding,) = [f for f in findings if f.kind == 'orphaned']
+    assert finding.severity == 'hard'
+    assert str(cited) in finding.detail
+    assert status in finding.detail, 'the detail must name the terminal status'
+
+
+def test_unknown_id_is_advisory():
+    """Advisory, not hard: a cite absent from the DB is more often a task-DB
+    sync artifact than a real defect, and a sync artifact must never hard-fail
+    a config gate (PTODO §8.4)."""
+    findings = audit_census_ignore_specs([_spec('pending #99999')], _probe())
+    (finding,) = [f for f in findings if f.kind == 'unknown-id']
+    assert finding.severity == 'advisory'
+    assert '99999' in finding.detail
+
+
+def test_parked_on_anchor_is_advisory():
+    findings = audit_census_ignore_specs([_spec(f'pending #{_PARKED_ID}')], _probe())
+    (finding,) = [f for f in findings if f.kind == 'parked-on-anchor']
+    assert finding.severity == 'advisory'
+    assert str(_PARKED_ID) in finding.detail
+
+
+@pytest.mark.parametrize('cited', [_PLAIN_DEFERRED_ID, _DO_NOT_DISPATCH_ID])
+def test_deferred_alone_is_not_parked(cited):
+    """FALSE-POSITIVE GUARDS (PTODO §9 scenarios 15/15b): parked keys on
+    metadata.do_not_complete SPECIFICALLY — not on bare `deferred` (an ordinary
+    non-terminal status) and not on `do_not_dispatch` (a scheduler knob that
+    says nothing about whether the task will ever complete)."""
+    findings = audit_census_ignore_specs([_spec(f'pending #{cited}')], _probe())
+    assert findings == []
+
+
+def test_live_pending_cite_yields_no_finding():
+    assert audit_census_ignore_specs([_spec(f'pending #{_PENDING_ID}')], _probe()) == []
+
+
+def test_one_live_cite_suppresses_orphaned():
+    """PTODO §8.2 — one live cite suffices.  A reason may legitimately reference
+    several tasks; the entry is still tracked as long as ONE of them is open."""
+    findings = audit_census_ignore_specs(
+        [_spec(f'pending #{_DONE_ID} and #{_PENDING_ID}')], _probe()
+    )
+    assert [f.kind for f in findings if f.kind == 'orphaned'] == []
+
+
+def test_all_cites_terminal_still_reports_orphaned():
+    """The converse of the above: 'one live cite suffices' must not degrade
+    into 'any cite suffices'."""
+    findings = audit_census_ignore_specs(
+        [_spec(f'pending #{_DONE_ID} and #{_CANCELLED_ID}')], _probe()
+    )
+    assert [f.kind for f in findings if f.kind == 'orphaned']
+
+
+def test_absent_probe_yields_zero_liveness_findings():
+    """PTODO §9 scenario 9.  With no probe the identical spec set produces the
+    SAME structural findings and NO liveness findings — the audit is loudest
+    where it knows most, never where it knows least."""
+    specs = [
+        _spec(f'pending #{_DONE_ID}', 'p.one'),
+        _spec('pending #99999', 'p.two'),
+        _spec(f'pending #{_PARKED_ID}', 'p.three'),
+        _spec(None, 'p.four'),
+        _spec('dark-factory reads this', 'p.five'),
+        _spec('pending the consumer landing', 'p.six'),
+    ]
+    with_probe = audit_census_ignore_specs(specs, _probe())
+    without = audit_census_ignore_specs(specs, None)
+
+    liveness = {'orphaned', 'unknown-id', 'parked-on-anchor'}
+    assert {f.kind for f in without} & liveness == set()
+    # Structural findings are byte-identical with and without the probe.
+    assert [f for f in with_probe if f.kind not in liveness] == without
