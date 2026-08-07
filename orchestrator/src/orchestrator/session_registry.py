@@ -2684,6 +2684,29 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         print(f'{reaped.id} {reaped.new_state}')
 
 
+def _run_migrate_decision_projects(dry_run: bool) -> None:
+    """Run the ``migrate-decision-projects`` verb (task 3807).
+
+    The one-shot backfill for DecisionRecords filed BEFORE ``write-decision``
+    canonicalized ``--project`` (see migrate_decision_project_tokens for the
+    preservation invariants -- ``state`` and ``filed_at`` are carried
+    through, so an already-answered row is never reopened, and the record's
+    id/filename is never rewritten).
+
+    It is IDEMPOTENT, so a re-run once the fleet is clean prints nothing.
+    That is what makes it safe to keep permanently rather than delete after
+    first use: it doubles as the repair tool for a hand-edited or
+    externally-written record, with no need to reason about whether it has
+    already run. Run it with ``--dry-run`` first to preview.
+
+    Prints one ``f'{id} {old_project} -> {new_project}'`` line per migrated
+    record, mirroring `reap-decisions` printing one line per closed decision.
+    Root resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+    """
+    for migrated in migrate_decision_project_tokens(dry_run=dry_run):
+        print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -2777,6 +2800,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
 
+    migrate_projects_p = sub.add_parser(
+        'migrate-decision-projects',
+        help='canonicalize DecisionRecord.project onto one token per project',
+    )
+    migrate_projects_p.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='print what would be migrated without writing anything',
+    )
+
     return parser
 
 
@@ -2823,6 +2856,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)
+        elif args.verb == 'migrate-decision-projects':
+            _run_migrate_decision_projects(args.dry_run)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0
