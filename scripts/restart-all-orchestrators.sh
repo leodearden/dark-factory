@@ -117,16 +117,9 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
-# Deliberate NON-stdout return channel for drain_await_fresh (task 3852):
-# that function's poll loop must run in the caller's own shell, not inside
-# a forked command-substitution subshell, or a SIGKILL of the top-level
-# script pid leaves the subshell running and orphaned (reparented to
-# systemd --user, PPID 2036) for up to DRAIN_UNKNOWN_GRACE_SECS more.
-# drain_await_fresh writes its verdict here instead of printing it to
-# stdout; callers MUST invoke it as a plain command (never via "$(...)")
-# and then read _DRAIN_VERDICT. NEVER declare this `local` anywhere --
-# doing so would silently break the channel for whichever caller shadowed
-# it.
+# Return channel for drain_await_fresh -- never declare 'local' anywhere
+# (full contract and incident rationale live in drain_await_fresh's own
+# docstring, task 3852).
 _DRAIN_VERDICT=""
 
 DRAIN_ENABLED=0
@@ -243,22 +236,25 @@ drain_await_fresh() {
     # reading appeared before the grace elapsed, or the original
     # stale/absent verdict if the grace elapsed with no fresh reading
     # (fail-toward-convergence: the caller proceeds with the restart) --
-    # always returns 0, and prints nothing to stdout.
+    # returns 0, and prints nothing to stdout.
     #
     # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
     # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
     # substitution (`verdict="$(drain_await_fresh "$unit")"`). Command
     # substitution runs this function's poll loop inside a forked
     # subshell; a SIGKILL of the top-level script pid does not reach that
-    # subshell, so it survives, reparents to systemd --user (PPID 2036),
-    # and keeps forking one `python3 drain_check.py` per
-    # DRAIN_POLL_INTERVAL_SECS for up to DRAIN_UNKNOWN_GRACE_SECS more --
-    # an orphan observed running for ~27.8h in the wild before being
-    # manually reaped (task 3852).
+    # subshell, so it survives, reparents to systemd --user, and keeps
+    # forking one `python3 drain_check.py` per DRAIN_POLL_INTERVAL_SECS
+    # for up to DRAIN_UNKNOWN_GRACE_SECS more -- an orphan observed
+    # running for ~27.8h in the wild before being manually reaped (task
+    # 3852).
     #
-    # Guard below enforces that contract: a caller who reintroduces
-    # command substitution gets a loud, immediate failure instead of the
-    # silent-empty-verdict regression described above.
+    # The reset below (before anything else, including the BASH_SUBSHELL
+    # check) and that check itself are this function's own two-part guard
+    # of the contract above; drain_gate's _drain_validate_verdict is a
+    # further, independent backstop -- see that function for why it is
+    # still needed even with this guard in place (task 3852).
+    _DRAIN_VERDICT=""
     if [[ ${BASH_SUBSHELL:-0} -ne 0 ]]; then
         echo "BUG(task 3852): drain_await_fresh must run in the main shell, not a subshell (BASH_SUBSHELL=$BASH_SUBSHELL); its poll loop would survive a kill of the top-level script pid" >&2
         return 1
@@ -276,6 +272,32 @@ drain_await_fresh() {
         _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     done
     return 0
+}
+
+_drain_validate_verdict() {
+    # $1 = unit name (for the error message only), $2 = verdict to check.
+    # Defensive backstop, independent of drain_await_fresh's own guard
+    # (task 3852): drain_gate must never branch on a verdict that is not
+    # one of the four tokens drain_check_verdict can produce -- mirroring
+    # the token-whitelist coercion drain_check_verdict already applies to
+    # its own python3 subprocess output. It earns its keep even with
+    # drain_await_fresh's BASH_SUBSHELL guard in place because that guard
+    # can be silently defeated: combining the declaration with the
+    # command substitution, e.g. `local verdict="$(drain_await_fresh
+    # "$unit")"`, makes bash report the exit status of `local` (always 0)
+    # rather than the subshell's, so `set -e` never sees the failure
+    # (shellcheck SC2155) and the run would otherwise continue on
+    # whatever verdict resulted. Aborting loudly here on any unrecognized
+    # value is the alternative to drain_gate silently falling through
+    # into its busy-defer branch (withholding a restart for up to
+    # FORCE_FIRE_AFTER_SECS) for a unit that was actually stale/absent.
+    case "$2" in
+        idle|busy|stale|absent) ;;
+        *)
+            echo "BUG(task 3852): drain_await_fresh produced verdict '$2' for unit $1" >&2
+            exit 1
+            ;;
+    esac
 }
 
 drain_gate() {
@@ -306,6 +328,7 @@ drain_gate() {
     local verdict start_secs elapsed
     drain_await_fresh "$unit"
     verdict="$_DRAIN_VERDICT"
+    _drain_validate_verdict "$unit" "$verdict"
 
     if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
         echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
@@ -336,6 +359,7 @@ drain_gate() {
             # grace instead of continuing to wait out the full busy grace.
             drain_await_fresh "$unit"
             verdict="$_DRAIN_VERDICT"
+            _drain_validate_verdict "$unit" "$verdict"
             if [[ "$verdict" == "idle" ]]; then
                 echo "resuming restart of ${unit}: drained"
                 return 0
