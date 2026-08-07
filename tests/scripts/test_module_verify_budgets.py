@@ -46,7 +46,6 @@ pin is worse than no pin because it reads as authoritative.
 from __future__ import annotations
 
 import pathlib
-import re
 
 import pytest
 
@@ -561,11 +560,15 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     ``test_fallback_verify_config.py`` — a documented, single-entry carve-out
     carrying its own stated deletion condition, consulted inside a
     dynamic-discovery loop. WIDENED from that ``frozenset`` to a
-    ``dict[str, str]``, and the widening is the point: a frozenset lets an
-    exclusion be added as a BARE OPT-OUT with its reason living only in a
-    nearby comment that nothing checks. A dict makes the reason a checked
-    value, and the ``task \\d+`` assertion below makes it a reason with an
-    OWNER — so an exclusion cannot be used to silence this guard anonymously.
+    ``dict[str, str]`` so each justification lives AT THE DEFINITION SITE,
+    next to the prefix it excuses, rather than in a detached comment that
+    drifts from the entry it describes. That is DOCUMENTATION, not an enforced
+    property: nothing here checks the reason, and deliberately so. Whether an
+    exclusion is legitimately owned is settled in REVIEW, by a human who can
+    tell whether the named task is real, open, and actually owns the module.
+    No in-file assertion could do that — a regex over this file's own string
+    literals cannot verify a task exists (``task 0`` would satisfy it), which
+    would make the check read as enforcement while enforcing nothing.
 
     THE GUARD REPORTS THE REMAINING GAP RATHER THAN HIDING IT. Exactly one
     entry is excluded today (``orchestrator``, task 3353), and that is the one
@@ -593,18 +596,6 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     for prefix, mc in sorted(discovered.items()):
         reason = MODULE_BUDGET_EXCLUSIONS.get(prefix)
         if reason is not None:
-            assert reason.strip(), (
-                f'{prefix} is excluded from the per-module budget requirement '
-                f'with an EMPTY justification (task 3473). An exclusion must '
-                f'carry its reason as a checked value, not as a bare opt-out'
-            )
-            assert re.search(r'task \d+', reason), (
-                f"{prefix}'s MODULE_BUDGET_EXCLUSIONS justification names no "
-                f'owning task id (task 3473): {reason!r}. Every exclusion must '
-                f'name the task that owns closing it, so the carve-out has an '
-                f'owner and a deletion condition rather than being an anonymous '
-                f'way to silence this guard'
-            )
             continue
 
         assert mc.verify_command_timeout_secs is not None, (

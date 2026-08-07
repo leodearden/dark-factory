@@ -563,8 +563,7 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # test_every_discovered_module_config_declares_its_own_verify_budget. It walks
 # what config._discover_module_configs actually REGISTERS rather than a frozen
 # list, so a newly-registered module config landing with no budget fails it with
-# no edit to the guard — and an exclusion cannot be added anonymously, since each
-# justification is a checked value that must name an owning task id.
+# no edit to the guard.
 #
 # The two values below are UNCHANGED by task 3473 and must stay that way. They
 # bound the whole-fleet fallback chain, and every per-module budget asserts
