@@ -697,12 +697,20 @@ function TasksTab({ projectFilter, search }) {
   // orchestrators, and gating this on tasksOffline would hide a probe failure
   // in the common case where fused-memory is up. Both banners can show at once.
   //
-  // Scoped to the VISIBLE projects: an operator who has filtered down to one
-  // healthy project is not looking at the rows the banner would be alarming
-  // about, and a banner that cannot be dismissed by narrowing the view is
-  // just noise. `projects` above already applies projectFilter.
-  const visibleProjectIds = new Set(projects.map(p => p.id));
-  const probeSummary = rtProbeSummary(allTasks.filter(t => visibleProjectIds.has(t.project)));
+  // Computed over the UNFILTERED rows, and deliberately NOT narrowable.
+  // `selfInflicted` is an assertion about the DASHBOARD's own health — that it
+  // finished none of the probes it started — so its denominator must be every
+  // probed project. This was previously scoped to the projectFilter-visible
+  // rows, which let an operator narrowed to two timed-out projects manufacture
+  // an all-at-once verdict and blame the dashboard for what was actually a
+  // per-project outage: the precise misdiagnosis this banner exists to prevent.
+  // The banner is therefore a global fact.
+  //
+  // Accepted tradeoff, so a future reader does not "fix" this back: an
+  // operator filtered down to one healthy project may still see a banner about
+  // a project they cannot see. That is strictly less harmful than a false "the
+  // orchestrators may be healthy — check the dashboard first" shown mid-triage.
+  const probeSummary = rtProbeSummary(allTasks);
 
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
