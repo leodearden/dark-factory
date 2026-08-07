@@ -13398,8 +13398,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _check_scope_invariant(
         self, *, backend_metadata: dict | None = None,
     ) -> None:
-        """Tripwire (task 2505): warn + escalate if ``plan.files`` and
-        ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
+        """Tripwire (task 2505): warn + escalate when ``plan.files`` needs a
+        LOCK MODULE that ``metadata.files`` does not cover, at MERGE entry.
 
         The scope-reconciliation choke point (``_reconcile_scope_locks`` /
         ``_set_task_scope``) keeps ``plan.files`` and ``metadata.files`` in
@@ -13429,6 +13429,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         check" and skipped, not "divergent" — a read failure must not wedge
         an otherwise-valid merge or false-escalate.
 
+        Directional, not symmetric (task 3429): ``metadata.files`` is the
+        sole input the scheduler derives this task's file locks from (see
+        ``Scheduler._get_modules``), so the only question this tripwire can
+        meaningfully answer at merge entry is whether the held locks COVER
+        every module the plan is about to edit — a containment question,
+        not an equality one. ``plan_modules - metadata_modules`` non-empty
+        (PLAN-EXTRA: the plan needs a module the locks do not cover) is
+        unsafe and escalates. A ``metadata.files`` module SUPERSET is safe —
+        wider locks cannot let two tasks collide, they can only
+        over-serialise — and is logged at INFO instead of escalating.
+        Measured basis: of the 11 plan.files/metadata.files divergence
+        strands observed on dark-factory (2026-08-06), 9 were
+        superset-shaped, 7 of those because the task's own test file lives
+        in a sibling directory (``scripts/foo.sh`` vs
+        ``scripts/tests/test_foo.py`` normalize to different modules at
+        ``lock_depth`` >= 2) — a structural false-positive class, not bad
+        luck.
+
         Args:
             backend_metadata: Optional pre-read backend metadata blob. The
                 merge-entry caller passes the blob
@@ -13456,21 +13474,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
         )
-        if plan_modules == metadata_modules:
+        uncovered = plan_modules - metadata_modules
+        if not uncovered:
+            if metadata_modules != plan_modules:
+                logger.info(
+                    'Task %s: metadata.files is a benign lock-module SUPERSET '
+                    'of plan.files at MERGE entry — locks %s are wider than '
+                    'the plan needs (extra: %s); not a divergence, no '
+                    'escalation. plan modules=%s, metadata modules=%s',
+                    self.task_id, sorted(metadata_modules),
+                    sorted(metadata_modules - plan_modules),
+                    sorted(plan_modules), sorted(metadata_modules),
+                )
             return
         logger.warning(
-            'Task %s: plan.files/metadata.files LOCK-MODULE divergence detected '
-            'at MERGE entry — plan modules=%s (files=%s), metadata modules=%s '
-            '(files=%s)',
-            self.task_id, sorted(plan_modules), sorted(plan_files),
-            sorted(metadata_modules), sorted(metadata_files),
+            'Task %s: plan.files needs lock module(s) %s that metadata.files '
+            'does NOT cover, at MERGE entry — plan modules=%s (files=%s), '
+            'metadata modules=%s (files=%s)',
+            self.task_id, sorted(uncovered), sorted(plan_modules),
+            sorted(plan_files), sorted(metadata_modules), sorted(metadata_files),
         )
         self._escalate_scope_invariant_violation(
-            sorted(plan_files), sorted(metadata_files),
+            sorted(plan_files), sorted(metadata_files), sorted(uncovered),
         )
 
     def _escalate_scope_invariant_violation(
         self, plan_files: list[str], metadata_files: list[str],
+        uncovered_modules: list[str],
     ) -> None:
         """Submit an ``infra_issue`` escalation for a plan.files/metadata.files
         divergence caught by :meth:`_check_scope_invariant` (task 2505).
