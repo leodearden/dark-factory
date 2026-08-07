@@ -1170,10 +1170,31 @@ class TestQueueConfigTransientErrorFields:
         # get a SHORTER budget than non-transient ones.
         assert cfg.transient_max_attempts >= cfg.max_attempts
 
-    def test_default_transient_error_names_contains_node_not_found(self):
+    def test_default_transient_error_names_excludes_not_found_family(self):
+        """Task 3585: the not-found family is out — esc-3561-3 refuted the
+        visibility-race premise (304 attempts across 28 add_episode calls, 0
+        successes), so these must not get the extended retry budget.
+
+        Both halves matter: the exclusion is what 3585 changed, and the
+        inclusion is what stops a future over-broad prune from quietly gutting
+        the genuinely-transient budget along with it.
+        """
         cfg = QueueConfig()
         assert isinstance(cfg.transient_error_names, list)
-        assert 'NodeNotFoundError' in cfg.transient_error_names
+        for name in ('NodeNotFoundError', 'EdgeNotFoundError', 'EdgesNotFoundError'):
+            assert name not in cfg.transient_error_names, (
+                f'{name} must not be classified transient (task 3585); see '
+                f'DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py for the '
+                f'evidence and the reinstatement condition.'
+            )
+        for name in (
+            'TimeoutError', 'ConnectionError', 'ConnectionResetError',
+            'ServerDisconnectedError', 'OperationalError',
+        ):
+            assert name in cfg.transient_error_names, (
+                f'{name} is genuinely transient and must keep the extended '
+                f'budget; 3585 removed only the not-found family.'
+            )
 
     def test_explicit_overrides_round_trip(self):
         cfg = QueueConfig(transient_max_attempts=20, transient_error_names=['X'])
