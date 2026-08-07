@@ -170,10 +170,28 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # check is both unnecessary here and actively harmful — it
                 # would abort an otherwise-valid local endpoint on a
                 # requirement that endpoint does not have.
+                #
+                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
+                # above, and must not be "simplified" away: OpenAIGenericClient
+                # .__init__ declares its own `max_tokens: int = 16384` and
+                # re-assigns `self.max_tokens = max_tokens` immediately after
+                # super().__init__() has correctly set it from the config
+                # object. _generate_response then sends `self.max_tokens`,
+                # ignoring its per-call argument — so this constructor kwarg is
+                # the ONLY lever that reaches the wire. Without it every request
+                # on this arm asks for 16384 output tokens regardless of
+                # configuration, which a local endpoint may reject outright or
+                # which may overrun its served context.
+                # ForceJsonObjectOpenAIGenericClient overrides only
+                # _generate_response, so it inherits this __init__ unchanged.
                 if cfg.llm.structured_output_mode == 'json_object':
-                    llm_client = ForceJsonObjectOpenAIGenericClient(config=llm_config)
+                    llm_client = ForceJsonObjectOpenAIGenericClient(
+                        config=llm_config, max_tokens=cfg.llm.max_tokens,
+                    )
                 else:
-                    llm_client = OpenAIGenericClient(config=llm_config)
+                    llm_client = OpenAIGenericClient(
+                        config=llm_config, max_tokens=cfg.llm.max_tokens,
+                    )
             else:
                 check_openai_responses_api()
                 llm_client = OpenAIClient(config=llm_config)
