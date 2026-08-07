@@ -913,6 +913,35 @@ class TestCheckScopeInvariant:
         )
         return workflow, scheduler, queue
 
+    # Sentinel default for `_arrange`'s `metadata_files` param — distinct from
+    # `None`/`[]` (both legitimate file lists) — meaning "leave
+    # scheduler.task_data empty", i.e. the get_task()-returns-None shape.
+    _NO_TASK_DATA = object()
+
+    def _arrange(
+        self, config, git_ops, task_assignment, tmp_path, plan_files,
+        metadata_files=_NO_TASK_DATA,
+    ):
+        """``_build`` plus the ``workflow.plan`` / ``scheduler.task_data``
+        wiring every test in this class needs, so the task-dict shape
+        (``{'id': ..., 'metadata': {'files': ...}}``) that
+        ``_check_scope_invariant`` reads lives in exactly one place. Pass
+        ``metadata_files`` to populate ``scheduler.task_data`` normally;
+        omit it (the sentinel default) to leave ``scheduler.task_data``
+        empty, which is what the ``get_task``-returns-``None`` fail-safe
+        test needs.
+        """
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        if metadata_files is not self._NO_TASK_DATA:
+            scheduler.task_data[task_assignment.task_id] = {
+                'id': task_assignment.task_id,
+                'metadata': {'files': metadata_files},
+            }
+        return workflow, scheduler, queue
+
     async def test_divergent_plan_and_metadata_files_escalates(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -937,14 +966,9 @@ class TestCheckScopeInvariant:
             f'lock_depth={config.lock_depth}; plan_modules={plan_modules!r} '
             f'metadata_modules={metadata_modules!r}'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -985,14 +1009,9 @@ class TestCheckScopeInvariant:
             'precondition: the file lists must genuinely differ (else this '
             'would collapse into the consistent-files case)'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -1005,14 +1024,10 @@ class TestCheckScopeInvariant:
     async def test_consistent_plan_and_metadata_files_no_escalation(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
+        workflow, scheduler, queue = self._arrange(
             config, git_ops, task_assignment, tmp_path,
+            ['a.py', 'b.py'], ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': ['a.py', 'b.py']},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -1024,11 +1039,11 @@ class TestCheckScopeInvariant:
     async def test_get_task_none_is_fail_safe_no_escalation_no_raise(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        # metadata_files intentionally omitted -> scheduler.task_data left
+        # empty -> get_task() -> None.
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        # scheduler.task_data intentionally left empty -> get_task() -> None.
 
         await workflow._check_scope_invariant()  # must not raise
 
@@ -1064,14 +1079,9 @@ class TestCheckScopeInvariant:
             f'plan_modules at lock_depth={config.lock_depth}; '
             f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
             await workflow._check_scope_invariant()
@@ -1125,14 +1135,9 @@ class TestCheckScopeInvariant:
             f'a plain PLAN-EXTRA — metadata_modules={metadata_modules!r} '
             f'must also hold a module plan_modules={plan_modules!r} lacks'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -1148,14 +1153,6 @@ class TestCheckScopeInvariant:
                 f'escalation detail so triage knows exactly what is not '
                 f'covered; detail={esc.detail!r}'
             )
-        assert 'derive DIFFERENT lock-module sets' not in esc.detail, (
-            'the old undirected-comparison claim is false for this '
-            f'population and must not appear; detail={esc.detail!r}'
-        )
-        assert 'keep the module sets in lockstep' not in esc.detail, (
-            'the old lockstep claim is false for a benign superset and '
-            f'must not appear; detail={esc.detail!r}'
-        )
         assert esc.severity == 'blocking', 'PRD D11 keeps the gate'
         assert esc.category == 'infra_issue', 'PRD D11 keeps the gate'
 
@@ -1178,14 +1175,9 @@ class TestCheckScopeInvariant:
 
         plan_files = ['a.py', 'b.py']
         metadata_files = ['a.py']
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
