@@ -92,8 +92,22 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                   wave, which is the shape verify.run_full_verification's
 #                   asyncio.gather actually produces in production, so it is the
 #                   figure that governs rather than an outlier to discard)
+#
+#   escalation    6 runs, all rc=0, 1077 passed / 2 xfailed
+#                 132.28s @ loadavg 96.01  (convenient — serial1)
+#                 158.99s @ loadavg 133.19
+#                 204.76s @ loadavg 223.17
+#                 325.85s @ loadavg 191.12 (concurrent wave)
+#                 336.60s @ loadavg 123.76 (concurrent wave)
+#                 354.56s @ loadavg 150.40 (INCONVENIENT — and note it is the
+#                   SERIAL warm-up run, LARGER than either concurrent-wave run.
+#                   Recorded because sizing against the wave alone, on the
+#                   reasoning that concurrency is the worst case, would have
+#                   UNDER-sized this module. The worst case is whichever run is
+#                   worst, not whichever sweep is theoretically harshest.)
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
+    'escalation': 354.56,
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -103,6 +117,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 # declared command verbatim.
 SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'shared': 'shared/src/shared/__init__.py',
+    'escalation': 'escalation/src/escalation/__init__.py',
 }
 
 
