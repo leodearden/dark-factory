@@ -1001,6 +1001,89 @@ class TestReadOccurrences:
             (self.T_LATE, self.TEST_B),
         ]
 
+    @pytest.mark.parametrize(
+        'spelling',
+        [
+            '2026-08-06T12:00:00+00:00',  # the canonical form the writer stores
+            '2026-08-06T12:00:00Z',  # a hand-built stamp — the regressed case
+            '2026-08-06T13:00:00+01:00',  # same instant, non-zero offset
+            '2026-08-06T07:00:00-05:00',  # same instant, negative offset
+            '2026-08-06T12:00:00',  # naive; documented as UTC, so UTC is ATTACHED
+        ],
+        ids=['utc_offset', 'zulu', 'plus_one', 'minus_five', 'naive'],
+    )
+    def test_since_accepts_any_spelling_of_the_boundary_instant(
+        self, tmp_path: Path, spelling: str
+    ) -> None:
+        """The write path canonicalises ``observed_at``, so the ``since`` boundary MUST be
+        canonicalised with the same function or the two halves of one key compare in
+        different alphabets.
+
+        This regressed once: with the boundary left raw, a ``'…Z'`` window against a
+        stored ``'…+00:00'`` row matched NOTHING.  It failed SILENT-EMPTY, which is the
+        dangerous direction — θ divides windowed rates by this count, so a broken query
+        reads as 'healthy' rather than as an error.  Every spelling below denotes the
+        SAME INSTANT as ``T_MID`` and must therefore select the same three rows.
+        """
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        rows = read_occurrences(db_path, since=spelling)
+        assert [(r.observed_at, r.test_id) for r in rows] == [
+            (self.T_MID, self.TEST_B),
+            (self.T_MID, self.TEST_A),
+            (self.T_LATE, self.TEST_B),
+        ]
+
+    @pytest.mark.parametrize(
+        ('written', 'queried'),
+        [
+            ('2026-08-06T12:00:00Z', '2026-08-06T12:00:00Z'),
+            ('2026-08-06T12:00:00Z', '2026-08-06T13:00:00+01:00'),
+            ('2026-08-06T12:00:00Z', '2026-08-06T12:00:00+00:00'),
+            ('2026-08-06T13:00:00+01:00', '2026-08-06T12:00:00Z'),
+        ],
+        ids=['z_z', 'z_plus_one', 'z_utc_offset', 'plus_one_z'],
+    )
+    def test_a_row_is_findable_by_any_spelling_it_was_written_with(
+        self, tmp_path: Path, written: str, queried: str
+    ) -> None:
+        """End-to-end round trip across the write/read seam, which is where the two
+        normalisations have to agree.  Both arguments denote one instant, so the row
+        written under *written* must be found by a window opening at *queried*
+        regardless of which spelling each side happened to use."""
+        from orchestrator.flake_ledger import read_occurrences, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(observed_at=written),
+            merge_sha=None,
+            task_id=None,
+        )
+
+        (row,) = read_occurrences(db_path, since=queried)
+        assert row.observed_at == '2026-08-06T12:00:00+00:00'
+
+    def test_a_malformed_since_degrades_through_b12(self, tmp_path: Path, caplog) -> None:
+        """Normalising the boundary can RAISE, so it must sit inside the guard.  The
+        honest degrade is ``[]`` plus a loud log — emphatically NOT 'ignore the filter
+        and return everything', which would hand a caller a whole-table count while it
+        believed it had a window."""
+        import logging
+
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_occurrences(db_path, since='last tuesday') == []
+        _assert_logged_loudly(caplog)
+
     def test_filters_compose(self, tmp_path: Path) -> None:
         from orchestrator.flake_ledger import read_occurrences
 

@@ -311,6 +311,13 @@ def _normalize_observed_at(raw: str) -> str:
     Raises on a malformed stamp, deliberately — the caller's B12 catch-all turns that
     into a loud warning and a dropped write, which beats persisting a stamp that breaks
     both dedup and the window scan.
+
+    BOTH SIDES OF THE COMPARISON MUST GO THROUGH HERE.  This is used on the WRITE path
+    (``record_flake_occurrence``) and on the READ path (:func:`read_occurrences`'s
+    ``since`` boundary), and normalising only one of them is worse than normalising
+    neither: it makes a correct-looking query against a correctly-stored row return
+    NOTHING, silently.  Any future window bound (an ``until``, a debt-age cutoff) must be
+    routed through here too.
     """
     parsed = datetime.fromisoformat(raw)
     if parsed.tzinfo is None:
@@ -481,11 +488,16 @@ def read_occurrences(
 
     Args:
         test_id: Only this test's observations — the recurrence chain for one test.
-        since: Only observations at or after this ISO-8601 UTC stamp.  INCLUSIVE at
-            the boundary.  The comparison is lexicographic on a TEXT column, which is
-            sound because ISO-8601 UTC strings with a fixed offset sort in the same
-            order as they do chronologically; ``idx_flake_occurrence_observed`` serves
-            the window scan.
+        since: Only observations at or after this ISO-8601 stamp.  INCLUSIVE at the
+            boundary.  ANY valid ISO-8601 spelling of the instant works — ``'…T12:00:00Z'``,
+            its ``'…T12:00:00+00:00'`` twin, and the equivalent ``'…T13:00:00+01:00'`` all
+            select the same rows — because the boundary is canonicalised through
+            :func:`_normalize_observed_at`, exactly as the stored stamp was on the way in.
+            The comparison is then lexicographic on a TEXT column, which is sound ONLY
+            because both sides are normalised to one fixed offset, at which point string
+            order matches chronological order; ``idx_flake_occurrence_observed`` serves
+            the window scan.  A malformed stamp degrades through B12 (warns, returns
+            ``[]``) rather than silently selecting everything.
         limit: At most this many rows — the MOST RECENT ones, still returned oldest
             first.  Composes with the other filters.  ``0`` (or negative) yields ``[]``.
 
@@ -510,8 +522,17 @@ def read_occurrences(
             clauses.append('test_id = ?')
             params.append(test_id)
         if since is not None:
+            # Canonicalised with the SAME function the write path uses, and that pairing
+            # is the whole point: `observed_at` is stored normalised, so comparing a raw
+            # caller-supplied spelling against it is comparing two different alphabets.
+            # A `'…T12:00:00Z'` window boundary against a stored `'…T12:00:00+00:00'`
+            # matches NOTHING — and it fails SILENT-EMPTY, which is the dangerous
+            # direction here: θ divides windowed rates by this count, so a zero-row
+            # answer reads as "healthy" rather than as a broken query.  Inside the try,
+            # so a malformed `since` degrades through B12 (loud warning, `[]`) instead of
+            # raising into a caller.
             clauses.append('observed_at >= ?')
-            params.append(since)
+            params.append(_normalize_observed_at(since))
         where = f' WHERE {" AND ".join(clauses)}' if clauses else ''
 
         sql = f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id'
