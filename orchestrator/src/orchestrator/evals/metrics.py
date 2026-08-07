@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,9 +73,13 @@ class EvalMetrics:
     # the architect path (θ, eval-revival υ). judge_cost_usd is a SUBSET of
     # cost_usd on BOTH paths, not disjoint — report generators should not
     # double-count. A $0.00 judge_cost_usd on an architect cell does not mean
-    # the judge ran for free; it means the judge was SKIPPED (tainted,
-    # refused-with-a-plan, or an unscorable plan) — see judge_invocations for
-    # whether it ran at all.
+    # the judge ran for free; it means the judge was either SKIPPED (tainted,
+    # refused-with-a-plan, or an unscorable plan — judge_invocations reads 0)
+    # or RAISED after being asked (judge_invocations ALSO reads 0 there,
+    # because whether ``invoke_agent`` was ever reached before the raise
+    # isn't determinable from the runner — but ``invocation_error`` then
+    # names ``judge:raised: ...``, so the cell is legible as "judge raised,
+    # spend unknown", not silently byte-indistinguishable from a skip).
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
@@ -537,6 +542,62 @@ def resolve_cost_usd(
         + output_tokens * _FALLBACK_PRICE['output_per_1m']
     ) / 1_000_000
     return cost, 'unpriced_proxy'
+
+
+def coerce_cost_usd(value: object) -> float:
+    """Safely coerce an untrusted ``cost_usd``-shaped *value* to a valid,
+    non-negative float, defaulting to ``0.0`` for anything that is not one.
+
+    Amendment (eval-revival υ, reviewer robustness + design-coherence): the
+    ONE shared home for the "is this actually a usable dollar figure?"
+    check, used at BOTH the plan judge's producer boundary
+    (:class:`~orchestrator.evals.judge.PlanQualityVerdict` construction, all
+    four POST-invoke return paths) and the architect runner's defensive read
+    (``runner._verdict_cost_usd``) — so a Mock, ``None``, NaN, Infinity, or
+    negative value degrades to ``0.0`` in exactly ONE place rather than two
+    independently maintained checks that could drift apart. This closes the
+    gap where the dataclass declared ``cost_usd: float`` but only the
+    RUNNER's read enforced it — a second future consumer (a backfill
+    script, ``prompt_opt``, ``verdict.to_dict()`` persisted anywhere) reading
+    the verdict directly would otherwise inherit an untrusted value with no
+    guard, the same "the instrument's coherence rests on its ONE caller
+    remembering" shape task 3303 already closed for the scorability gate.
+
+    isinstance-gated rather than a bare ``float(value or 0.0)`` coercion:
+    ``unittest.mock.MagicMock`` configures ``__float__`` to return ``1.0`` by
+    default, so a naive ``float()`` call would silently FABRICATE a dollar
+    figure for any test double that never set the attribute (verified: a
+    bare ``MagicMock()``'s ``float()`` returns ``1.0`` without raising) —
+    the opposite of loud-over-silent-degradation, and worse than the status
+    quo it would replace. ``isinstance`` correctly recognizes an
+    unconfigured Mock (or ``None``, or any other non-numeric placeholder) as
+    "not a real number" and returns the honest ``0.0`` default instead. This
+    is also why the ~20 pre-existing judge tests that construct a bare
+    ``MagicMock`` invoke result and never set ``cost_usd`` need no changes:
+    they now read back ``cost_usd=0.0`` instead of a raw ``Mock`` instance,
+    and none of them asserted on the field's value either way.
+
+    A numeric-but-nonsense value (NaN, +/-Infinity, negative) is caught too
+    — any of them would otherwise poison every downstream sum
+    (``EvalMetrics.cost_usd = arch_cost_usd + judge_cost_usd``) and mean
+    (report.py's per-config cost aggregation), and ``json.dump`` emits bare
+    ``NaN``/``Infinity`` tokens that strict JSON consumers reject on the
+    persisted result file. Logged, per the loud-over-silent norm — the
+    caller still gets a usable ``0.0`` back, but an operator can see that an
+    invocation answered with a nonsense cost rather than the figure quietly
+    vanishing into a plausible-looking zero.
+    """
+    if not isinstance(value, (int, float)):
+        return 0.0
+    v = float(value)
+    if not math.isfinite(v) or v < 0.0:
+        logger.warning(
+            f'cost_usd coercion received a non-finite or negative value '
+            f'({v!r}) — degraded to 0.0 rather than poisoning a downstream '
+            f'sum/mean or persisting invalid JSON.'
+        )
+        return 0.0
+    return v
 
 
 async def collect_metrics(

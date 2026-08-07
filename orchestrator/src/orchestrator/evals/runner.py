@@ -41,7 +41,12 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
-from .metrics import EvalMetrics, collect_metrics, detect_invocation_error
+from .metrics import (
+    EvalMetrics,
+    coerce_cost_usd,
+    collect_metrics,
+    detect_invocation_error,
+)
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
 
@@ -487,11 +492,19 @@ def _verdict_cost_usd(verdict: object) -> float:
     answered; left unguarded entirely, a non-numeric value (e.g. ``None``)
     would raise ``TypeError`` OUTSIDE that try/except, in the
     ``EvalMetrics(...)`` construction, crashing the whole cell.
+
+    The ``getattr`` (missing-field / wrong-object) defense stays local to this
+    function — it is specific to reading an UNTRUSTED ``verdict``, which
+    ``coerce_cost_usd`` does not know how to do. Once a candidate value is in
+    hand, the actual "is it a usable dollar figure" check — including the
+    NaN/Infinity/negative guard (amendment, reviewer robustness: a judge
+    answering a non-finite or negative cost would otherwise poison
+    ``arch_cost_usd + judge_cost_usd`` and every downstream report.py mean) —
+    is delegated to :func:`~orchestrator.evals.metrics.coerce_cost_usd`, the
+    SAME helper the judge's own producer-side return paths use, so the two
+    sides of this contract cannot drift apart.
     """
-    try:
-        return float(getattr(verdict, 'cost_usd', 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return coerce_cost_usd(getattr(verdict, 'cost_usd', 0.0))
 
 
 async def run_architect_eval(
@@ -854,7 +867,24 @@ async def run_architect_eval(
             # later in the EvalMetrics construction (crashing the cell).
             judge_invocations = 1
             judge_cost_usd = _verdict_cost_usd(verdict)
-        except Exception:
+        except Exception as e:
+            # judge_invocations/judge_cost_usd stay at their 0.0/0 defaults —
+            # NOT bumped to 1 here (amendment, reviewer robustness): whether
+            # invoke_agent was even reached before the raise is NOT
+            # determinable from this side (the raise could be pre-invoke, in
+            # prompt assembly, or post-invoke, in parsing/logging inside
+            # judge_plan_quality's own try/except), so crediting an
+            # invocation that may never have happened would be its own
+            # fabrication. But leaving BOTH fields at zero would make this
+            # cell byte-indistinguishable from one where the judge was
+            # SKIPPED (tainted / cap-refusal-with-a-plan / unscorable-plan) —
+            # exactly the illegibility this task exists to remove, just moved
+            # one level up. So record the fact on judge_error instead: it
+            # rides into stage_markers → invocation_error below as
+            # "judge:raised: ...", so the cell reads "judge raised, spend
+            # unknown" rather than silently looking judge-free.
+            reason = ' '.join(str(e).split())[:80]
+            judge_error = f'raised: {type(e).__name__}: {reason}'
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
                 exc_info=True,
@@ -904,9 +934,14 @@ async def run_architect_eval(
         # SUBSET invariant metrics.py:69-71 declares (judge_cost_usd is a
         # subset of cost_usd, not disjoint). judge_cost_usd below is the
         # breakdown, never an addend a report generator should sum again. A
-        # judge that RAISES (the except above) leaves judge_cost_usd at its
-        # 0.0 default, so that spend is unknowable from here and is a
-        # documented under-report, never a fabricated number.
+        # judge that RAISES (the except above) leaves judge_cost_usd AND
+        # judge_invocations at their 0.0/0 defaults, so that spend is
+        # unknowable from here and is a documented under-report, never a
+        # fabricated number — but it is NOT silently indistinguishable from
+        # a judge that was SKIPPED: judge_error is set in the except block,
+        # so invocation_error below reads "judge:raised: ...", telling a
+        # reader "spend unknown", not "judge-free" (amendment, reviewer
+        # robustness).
         cost_usd=arch_cost_usd + judge_cost_usd,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,

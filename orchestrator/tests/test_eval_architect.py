@@ -1086,6 +1086,63 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
 
         assert verdict.cost_usd == pytest.approx(0.42)
 
+    # -- Amendment (reviewer design-coherence): the PRODUCER coerces too ----
+    # PlanQualityVerdict.cost_usd is declared ``float``; these pin that the
+    # declared type is actually true at construction, not just enforced by
+    # the runner's defensive read (_verdict_cost_usd / coerce_cost_usd).
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_unset_mock_cost_degrades_to_zero(self):
+        """A bare MagicMock invoke result that never sets ``cost_usd`` must
+        read back a real ``0.0`` float, not a Mock instance and not a
+        fabricated ``1.0`` (MagicMock's default ``__float__``).
+
+        This is what makes the producer-side coercion safe for the ~20
+        pre-existing judge tests that construct exactly this kind of bare
+        mock and never touch ``cost_usd``: none of them assert on the field,
+        and this pins the value they'd now get if they did.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        # cost_usd deliberately left UNSET — fake.cost_usd is an
+        # auto-generated MagicMock child.
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+        assert isinstance(verdict.cost_usd, float)
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_non_finite_cost_degrades_to_zero(self):
+        """A judge invocation reporting a non-finite cost_usd (NaN) must not
+        ride into the verdict unchanged — it would poison every downstream
+        sum/mean once folded into an architect cell's cost_usd."""
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = float('nan')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+
     def test_legacy_three_arg_construction_reads_back_zero_spend(self):
         """Every pre-existing construction site (and any older persisted /
         monkeypatched verdict) must keep working and read back "no spend
@@ -1639,6 +1696,20 @@ class TestRunArchitectEval:
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['plan_quality'] is not None
 
+        # Amendment (reviewer test-coverage): a judge that RAISES must not
+        # fabricate spend — no invocation credited, no cost, and the cell's
+        # cost_usd is the architect's own spend alone (the harness's default
+        # invoke_agent mock reports cost_usd=1.23). A regression that moved
+        # judge_invocations=1 above the raise, or invented a cost inside the
+        # except block, would previously go unnoticed here.
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        # ...but the raise must not look identical to a judge that was
+        # SKIPPED either: it is recorded so the cell reads "spend unknown",
+        # not silently judge-free.
+        assert 'judge:raised' in (result.metrics['invocation_error'] or '')
+
     async def test_architect_timeout_maps_to_timeout_outcome(self):
         # A hung architect invoke surfaces as TimeoutError — what asyncio.wait_for
         # raises when the operator's --timeout expires. run_architect_eval must
@@ -2079,7 +2150,8 @@ class TestArchitectRunnerJudgeCostReadIsDefensive:
         # mock reports cost_usd=1.23, and that must be the WHOLE cell cost.
         assert result.metrics['cost_usd'] == pytest.approx(1.23)
 
-    # -- (b) an unreadable verdict.cost_usd must not damage the cell ---------
+    # -- (b) an unreadable or nonsensical verdict.cost_usd must not damage
+    #    the cell ------------------------------------------------------------
 
     @pytest.mark.parametrize('bad_verdict', [
         pytest.param(
@@ -2096,18 +2168,48 @@ class TestArchitectRunnerJudgeCostReadIsDefensive:
             ),
             id='cost_usd-is-None',
         ),
+        # Amendment (reviewer robustness): a READABLE but NON-FINITE or
+        # negative cost_usd is just as dangerous as a missing one —
+        # `arch_cost_usd + judge_cost_usd` would otherwise poison the cell's
+        # cost_usd with NaN/Infinity (which json.dump emits as bare,
+        # non-standard tokens) or a nonsense negative total, and NaN
+        # propagates through every downstream report.py mean for the whole
+        # config row.
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('nan'),
+            ),
+            id='cost_usd-is-nan',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('inf'),
+            ),
+            id='cost_usd-is-infinite',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=-3.5,
+            ),
+            id='cost_usd-is-negative',
+        ),
     ])
     async def test_unreadable_verdict_cost_degrades_the_field_not_the_cell(
         self, bad_verdict, caplog,
     ):
-        """A legacy/monkeypatched verdict lacking a readable ``cost_usd``.
+        """A legacy/monkeypatched verdict lacking a readable, or carrying a
+        nonsensical, ``cost_usd``.
 
         Must not crash the cell (``arch_cost_usd + verdict.cost_usd`` when the
         field is ``None`` raises ``TypeError`` today, outside any try/except),
         must not lose the fact that the judge WAS called, and must not log
         "plan judge raised" — that warning means the judge invocation itself
         failed, which is false here: the judge ran and answered fine, only
-        this ONE field on its verdict is unreadable.
+        this ONE field on its verdict is unreadable or nonsensical (NaN,
+        Infinity, negative).
         """
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
 
