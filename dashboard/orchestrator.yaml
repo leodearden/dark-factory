@@ -43,6 +43,73 @@ test_command: "uv run --project dashboard --directory dashboard pytest tests/ --
 lint_command: "uv run --project dashboard --directory dashboard ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests"
 type_check_command: "uv run --project dashboard --directory dashboard pyright src/ tests/"
 
+# Per-module verify budget (task 3473). Before this, dashboard declared nothing
+# here and fell HARD through to the repo-root whole-fleet ceiling.
+#
+# (1) MEASUREMENT PROVENANCE. Six runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239. All rc=0, all reporting
+# 1648 passed / 1 xfailed. EVERY FIGURE IS CONTENDED — a 32-core host running
+# /proc/loadavg 106-252 throughout — and none is quoted as an unloaded one, per
+# orchestrator/tests/warm-lane/README.md.
+#
+#    283.47s wall /274.87s pytest @ loadavg 133.30  <- the CONVENIENT figure
+#    320.40s wall /310.40s pytest @ loadavg 141.24
+#    341.70s wall /332.59s pytest @ loadavg 146.79
+#    409.78s wall /402.35s pytest @ loadavg 137.33
+#    452.56s wall /443.36s pytest @ loadavg 106.94
+#    653.54s wall /646.23s pytest @ loadavg 123.76  <- the INCONVENIENT one
+#                                                      (6-way concurrent wave)
+#
+# (1a) THESE ARE THE FIRST MEASUREMENTS THIS SUITE HAS EVER HAD, which is an
+# error bar worth stating rather than leaving implied. Task 3062 attempt-2 —
+# the run that produced the per-segment figures the repo-root yaml's own budget
+# derivation is built on — TIMED OUT at 1800.66s BEFORE dashboard's segment
+# started. The root yaml consequently carries only an ESTIMATE for this module
+# ("1393 collected @ ~0.137 s/test ~190"), and that estimate is now known to be
+# low by roughly 1.5x-3.4x against measurement. So unlike shared, escalation and
+# fused-memory, there is no independent earlier figure to cross-check these six
+# against; they stand alone. They also show the widest spread in the sweep,
+# 2.3x (283.47s -> 653.54s).
+#
+# (2) SIZING. W = 653.54s, the WORST run, never the mean.
+#     B ~= 2.6 x W = 1699.2 -> rounded up to 1700.
+# Max-not-mean is forced by recorded evidence: scripts/orchestrator.yaml logs a
+# ~3x spread (310.33s -> 914.61s) for a BYTE-IDENTICAL command on a
+# BYTE-IDENTICAL tree — host load at measurement time, not suite variance. With
+# no earlier figure to corroborate against, sizing against the max matters more
+# here than on any other module in this task.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally: tests/scripts' 600 ~= 2.6 x 233.50 and scripts' 2400 ~= 2.6 x
+# 930.59, and scripts/orchestrator.yaml states it kept the multiple identical
+# across the two on purpose. The 600s floor is not binding here.
+#
+# (4) WHAT THIS ACTUALLY BUYS: 3600s -> 1700s, a 2.1x narrowing — the most
+# modest of the six, because this is the most expensive suite of the six. A hang
+# now surfaces in ~28 minutes instead of ~60. Nothing tighter is declarable
+# without manufacturing infra_timeout on the honest green path under load.
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: no build step
+# whose cold cost would justify a separate cold budget. Per
+# verify._resolve_verify_timeout, an unset module cold knob does NOT inherit the
+# 1700 below — it falls through to the repo-root verify_cold_command_timeout_secs
+# (5400), and on a MERGE-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml and not overridden
+# by the root yaml). Gated by assertion (f) of the guard below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 1700s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['dashboard'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[dashboard].
+verify_command_timeout_secs: 1700
+
 # Fused memory HTTP server — port 8002
 fused_memory:
   url: "http://localhost:8002"
