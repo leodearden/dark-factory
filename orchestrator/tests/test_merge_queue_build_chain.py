@@ -253,3 +253,80 @@ def _shared_txt_with(line_no: int, text: str) -> str:
     lines = [f'line{i}\n' for i in range(1, 21)]
     lines[line_no - 1] = f'{text}\n'
     return ''.join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-01: RED — ChainResult contract
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestChainResultContract:
+    """ChainResult carries the PRD β contract shape.
+
+    Plain sync class (no @pytest.mark.asyncio) — none of these need a loop,
+    and a sync test inside a marked class is an ERROR under this file's
+    filterwarnings config.
+    """
+
+    def test_chain_result_importable_from_merge_types(self):
+        """ChainResult lives in merge_types, beside the classify_and_merge sum type."""
+        from orchestrator.merge_types import ChainResult
+
+        assert ChainResult is not None
+
+    def test_chain_result_reexported_from_merge_queue(self):
+        """ChainResult is reachable as orchestrator.merge_queue.ChainResult.
+
+        merge_queue is the module the PRD names and it already re-exports the
+        merge_types names through its shim; a missing entry would break the
+        `from orchestrator.merge_queue import X` convention every consumer uses.
+        """
+        from orchestrator.merge_queue import ChainResult as MQChainResult
+        from orchestrator.merge_types import ChainResult as MTChainResult
+
+        assert MQChainResult is MTChainResult
+
+    def test_links_and_tip_are_the_only_required_fields(self):
+        """ChainResult(links=[], tip='abc123') constructs with no other args."""
+        from orchestrator.merge_types import ChainResult
+
+        res = ChainResult(links=[], tip='abc123')
+        assert res.links == []
+        assert res.tip == 'abc123'
+
+    def test_links_round_trip_task_id_sha_pairs(self):
+        """links is a list[tuple[task_id, merge_commit]] in land order."""
+        from orchestrator.merge_types import ChainResult
+
+        pairs = [('101', 'sha1'), ('102', 'sha2')]
+        res = ChainResult(links=list(pairs), tip='sha2')
+        assert res.links == pairs
+
+    def test_optional_field_defaults(self):
+        """truncated_at/truncated_reason/lane default None; lane_warm defaults False."""
+        from orchestrator.merge_types import ChainResult
+
+        res = ChainResult(links=[], tip='abc123')
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        assert res.lane is None
+        assert res.lane_warm is False
+
+    def test_field_set_is_pinned(self):
+        """The exact field tuple is pinned so a later addition is a deliberate edit."""
+        import dataclasses
+
+        from orchestrator.merge_types import ChainResult
+
+        assert tuple(f.name for f in dataclasses.fields(ChainResult)) == (
+            'links', 'tip', 'truncated_at', 'truncated_reason', 'lane', 'lane_warm',
+        )
+
+    def test_depth_is_link_count(self):
+        """.depth == len(links) — the value γ will emit as chain_items."""
+        from orchestrator.merge_types import ChainResult
+
+        assert ChainResult(links=[], tip='x').depth == 0
+        assert ChainResult(
+            links=[('101', 'a'), ('102', 'b')], tip='b',
+        ).depth == 2
