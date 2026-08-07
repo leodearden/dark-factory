@@ -66,7 +66,6 @@ import tomllib
 from typing import Any
 
 import pytest
-
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 

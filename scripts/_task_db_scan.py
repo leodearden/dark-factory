@@ -44,8 +44,9 @@ import json
 import os
 import sqlite3
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, NamedTuple
 
 # ---------------------------------------------------------------------------
 # Tier 1 — tasks.db discovery (adopted by all three sweep scripts).

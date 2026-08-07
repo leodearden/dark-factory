@@ -341,11 +341,13 @@ def _edited_request(requests_dir, *, drop=None, **body_edits):
     is what lets the name-vs-body disagreement paths be reached at all.
     """
     path = write_request(requests_dir, 5, 'gate_closure')
-    body = json.load(open(path))
+    with open(path) as fh:
+        body = json.load(fh)
     if drop is not None:
         del body[drop]
     body.update(body_edits)
-    open(path, 'w').write(json.dumps(body, indent=2, sort_keys=True) + '\n')
+    with open(path, 'w') as fh:
+        fh.write(json.dumps(body, indent=2, sort_keys=True) + '\n')
     return path
 
 

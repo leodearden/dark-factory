@@ -455,9 +455,9 @@ class TestAsUnreadableFileError:
         # OSError. A shape wrongly added here would be caught and re-wrapped
         # rather than propagating, and gzip.BadGzipFile in particular must
         # keep reaching callers by its own inheritance.
-        assert inventory_mod.UNREADABLE_FILE_ERRORS == (
+        assert (
             EOFError, zlib.error, UnicodeDecodeError,
-        )
+        ) == inventory_mod.UNREADABLE_FILE_ERRORS
         assert not any(
             issubclass(exc_type, OSError)
             for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS
