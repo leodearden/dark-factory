@@ -98,8 +98,15 @@ class _Resp:
         return self._payload
 
 
-def _completion(content: str, finish_reason: str = 'stop') -> dict:
-    """An OpenAI chat-completions response body carrying *content*."""
+def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
+    """An OpenAI chat-completions response body carrying *content*.
+
+    `None` is a REAL shape, not a test convenience: vLLM returns
+    `content: null` when a reasoning parser consumes the whole generation,
+    where llama.cpp returns `''`. Typing this `str` would make the null case
+    unexpressible — and that case is exactly what made COMPLETION_TRUNCATED
+    unreachable on the vLLM stack.
+    """
     return {
         'id': 'cmpl-1',
         'object': 'chat.completion',
