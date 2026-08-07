@@ -64,145 +64,85 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 # MEASURED wall-clock, in seconds: the WORST run of each module's own VERBATIM
 # test_command, copied byte-for-byte out of that module's orchestrator.yaml.
-# Transcribed from .task/measurements.md, which carries the full per-run table.
 #
-# EVERY FIGURE IS CONTENDED and none is presented as an unloaded one. These were
-# taken on a 32-core host running /proc/loadavg 72-252 throughout — roughly 2x
-# to 8x oversubscribed — and the norm at orchestrator/tests/warm-lane/README.md
-# (whose own argument had to abandon wall-clock for load-independent counters,
-# calling it "nearly unusable" on this box) forbids quoting such a figure as
-# unloaded. Contended figures are ACCEPTABLE for this purpose specifically
-# because the error runs in the SAFE direction: an inflated worst-case yields a
-# LARGER budget, and the failure this task exists to prevent is an UNDER-sized
-# ceiling, not an over-sized one.
+# WHERE THE PROVENANCE LIVES — deliberately NOT here. Each module's own
+# orchestrator.yaml carries the full per-run table (every run's wall-clock,
+# loadavg, rc and pytest counts, convenient and inconvenient alike) in its
+# PER-MODULE VERIFY BUDGET block, and is the SINGLE durable home for those
+# numbers; .task/measurements.md holds the raw sweep log but is worktree-local
+# scratch and does not survive. Only the scalar W is duplicated here, and only
+# because the guard computes ``_min_budget(W)`` from it — which is exactly why
+# every one of those yaml blocks carries a RAISE-TOGETHER rule naming its entry
+# in this table. Reproducing the per-run tables here as well would create a
+# THIRD copy to raise in lockstep, which is the drift this file already declines
+# to create for the sibling-owned modules (see MEASURED_BY_SIBLING_GUARD) and
+# the drift the repo-root yaml's own paragraph refuses on the same grounds.
+#
+# EVERY FIGURE IS CONTENDED and none is presented as an unloaded one. The sweep
+# ran on a 32-core host at /proc/loadavg 72-252 throughout — roughly 2x to 8x
+# oversubscribed — and the norm at orchestrator/tests/warm-lane/README.md (whose
+# own argument had to abandon wall-clock for load-independent counters, calling
+# it "nearly unusable" on this box) forbids quoting such a figure as unloaded.
+# Contended figures are ACCEPTABLE here specifically because the error runs in
+# the SAFE direction: an inflated worst-case yields a LARGER budget, and the
+# failure this task exists to prevent is an UNDER-sized ceiling.
 #
 # SIZED AGAINST THE MAX, NEVER THE MEAN. scripts/orchestrator.yaml records a ~3x
 # spread (310.33s -> 914.61s) for a BYTE-IDENTICAL command on a BYTE-IDENTICAL
 # tree; that is host load at measurement time, not suite variance, and a mean
-# would have under-sized every budget here. This sweep reproduced the same
-# effect: dashboard alone spanned 283.47s -> 653.54s across six runs.
+# would have under-sized every budget here.
 #
-# BOTH the convenient and the inconvenient figure fed each entry, per module:
+# CAVEATS THAT CHANGE HOW A NUMBER MUST BE READ are kept here rather than left
+# only in the yamls, because they bear on whether this table may be reused at
+# all. Everything else — the run-by-run figures each is drawn from — is in the
+# owning yaml.
 #
-#   shared        4 runs, all rc=0, 3222 passed / 12 skipped / 9 deselected
-#                 79.04s @ loadavg 85.78  (convenient — serial1)
-#                 96.17s @ loadavg 133.65 (serial2)
-#                 147.06s @ loadavg 102.15 (warm-up)
-#                 219.08s @ loadavg 191.12 (INCONVENIENT — the 6-way concurrent
-#                   wave, which is the shape verify.run_full_verification's
-#                   asyncio.gather actually produces in production, so it is the
-#                   figure that governs rather than an outlier to discard)
+#   fused-memory  (i) NO GREEN RUN EXISTS. All six runs are rc=1 on the
+#                 PRE-EXISTING failure escalation esc-3473-1 records, red at
+#                 base main 5a7770d239 before this task touched anything. The
+#                 sizing rule says "worst across recorded GREEN runs"; here it
+#                 is applied to RED runs, on the grounds that the failure is one
+#                 fast assertion in a suite that ran to COMPLETION (no -x) and
+#                 adds no measurable wall-clock. An assumption with an error bar,
+#                 not a clean measurement; the 2.6x multiple absorbs it.
+#                 (ii) The ONLY in-scope module under pytest-xdist (addopts =
+#                 "-n auto --dist loadgroup -m 'not integration'"). W is an XDIST
+#                 figure, so a future change to -n or to the dist mode
+#                 INVALIDATES it rather than merely shifting it — RE-MEASURE, do
+#                 not scale.
 #
-#   escalation    6 runs, all rc=0, 1077 passed / 2 xfailed
-#                 132.28s @ loadavg 96.01  (convenient — serial1)
-#                 158.99s @ loadavg 133.19
-#                 204.76s @ loadavg 223.17
-#                 325.85s @ loadavg 191.12 (concurrent wave)
-#                 336.60s @ loadavg 123.76 (concurrent wave)
-#                 354.56s @ loadavg 150.40 (INCONVENIENT — and note it is the
-#                   SERIAL warm-up run, LARGER than either concurrent-wave run.
-#                   Recorded because sizing against the wave alone, on the
-#                   reasoning that concurrency is the worst case, would have
-#                   UNDER-sized this module. The worst case is whichever run is
-#                   worst, not whichever sweep is theoretically harshest.)
+#   dashboard     NO PRIOR FIGURE OF ANY KIND existed for this suite (task 3062
+#                 attempt-2 timed out before dashboard's segment started), so
+#                 unlike shared/escalation/fused-memory there is no independent
+#                 earlier measurement to reconcile W against. Widest spread in
+#                 the sweep, 2.3x. The error bar is wider here; stated, not
+#                 implied.
 #
-#   fused-memory  6 runs, EVERY ONE rc=1, 1 failed / 11350 passed / 2 skipped
-#                 181.12s @ loadavg 72.37  (convenient — serial1)
-#                 236.23s @ loadavg 229.40
-#                 273.52s @ loadavg 119.77
-#                 408.45s @ loadavg 191.12 (concurrent wave)
-#                 435.56s @ loadavg 123.76 (concurrent wave)
-#                 439.80s @ loadavg 120.09 (INCONVENIENT — warm-up)
+#   escalation    W is a SERIAL run, LARGER than either concurrent-wave run.
+#                 Sizing against the wave alone — on the reasoning that
+#                 concurrency must be the worst case — would have UNDER-sized
+#                 this module. The rule is the worst RUN, not the harshest
+#                 SWEEP.
 #
-#                 TWO CAVEATS, both load-bearing and neither hidden:
+#   cockpit       W is taken from a GREEN run. One run in the sweep was rc=1
+#                 with an unidentified failure (its log was lost to a concurrent
+#                 driver collision); nothing here is sized from it.
 #
-#                 (i) THIS MODULE HAS NO GREEN RUN. All six are rc=1 on the
-#                 PRE-EXISTING failure escalation esc-3473-1 records —
-#                 test_lock_charter_guard.py::
-#                 test_every_tracked_extension_is_allowlisted, a content-derived
-#                 allowlist check over tracked file extensions, red at base main
-#                 5a7770d239 before this task touched anything. The sizing rule
-#                 says "worst across recorded GREEN runs"; here it is applied to
-#                 RED runs, because the failure is one fast assertion in a suite
-#                 that ran to COMPLETION (no -x, no early exit) and adds no
-#                 measurable wall-clock. That is an assumption with an error bar,
-#                 not a clean measurement, and the 2.6x multiple absorbs it.
+#   sampler       MAKES ASSERTION (b)'s DEGENERACY CONCRETE, so it is stated
+#                 here as well as in the test docstring: `_min_budget(22.49)` ==
+#                 `(int(44.98) // 100) * 100` == 0, so (b) asserts `budget >= 0`
+#                 for sampler — literally unfalsifiable. What carries this module
+#                 is (a) declared-at-all, (c) strictly-below-root, (d) honoured
+#                 by the real resolver, (e) survives the plan->execution bridge
+#                 and (f) the cold fall-through. Do not infer a measurement floor
+#                 here that does not exist.
 #
-#                 (ii) fused-memory is the ONLY in-scope module running under
-#                 pytest-xdist (addopts = "-n auto --dist loadgroup -m 'not
-#                 integration'"). 11353 collected test functions in ~400s is an
-#                 XDIST figure, not a serial one, which makes it the module most
-#                 sensitive to host load and to the concurrent wave. A future
-#                 change to -n or to the dist mode INVALIDATES this measurement
-#                 rather than merely shifting it — re-measure, do not scale.
-#
-#   dashboard     6 runs, all rc=0, 1648 passed / 1 xfailed
-#                 283.47s @ loadavg 133.30 (convenient)
-#                 320.40s @ loadavg 141.24
-#                 341.70s @ loadavg 146.79
-#                 409.78s @ loadavg 137.33 (warm-up)
-#                 452.56s @ loadavg 106.94
-#                 653.54s @ loadavg 123.76 (INCONVENIENT — concurrent wave)
-#
-#                 NO PRIOR FIGURE OF ANY KIND EXISTED for this suite. Task 3062
-#                 attempt-2 timed out at 1800.66s BEFORE dashboard's segment
-#                 started, so unlike shared/escalation/fused-memory there is no
-#                 independent earlier measurement to reconcile these against —
-#                 the error bar is wider here and is stated rather than implied.
-#                 These six also show the widest spread of any module in the
-#                 sweep, 2.3x (283.47s -> 653.54s).
-#
-#   sampler       6 runs, all rc=0, 52 passed. Plus a planning-time trial of the
-#                 same verbatim command: 14.54s wall / 7.25s pytest @ loadavg
-#                 157.45.
-#                  8.78s @ loadavg 148.02 (convenient)
-#                  9.64s @ loadavg 191.12 (concurrent wave)
-#                 10.51s @ loadavg 195.51 (warm-up)
-#                 15.98s @ loadavg 252.01
-#                 18.94s @ loadavg 148.31
-#                 22.49s @ loadavg 139.53 (INCONVENIENT)
-#
-#                 THIS IS THE MODULE THAT MAKES ASSERTION (b)'s DEGENERACY
-#                 CONCRETE, so it is spelled out here as well as in the test
-#                 docstring. `_min_budget(22.49)` == `(int(44.98) // 100) * 100`
-#                 == 0, so (b) asserts `budget >= 0` for sampler — literally
-#                 unfalsifiable. What actually carries this module is (a)
-#                 declared-at-all, (c) strictly-below-root, (d) honoured by the
-#                 real resolver, (e) survives the plan->execution bridge and (f)
-#                 the cold fall-through. A reader must not infer a measurement
-#                 floor here that does not exist.
-#
-#   cockpit       6 runs, 321 passed / 3 deselected (addopts = "-m 'not smoke'",
-#                 so the smoke suite is excluded by construction).
-#                  71.06s @ loadavg 184.69 (convenient — warm-up)
-#                  81.82s @ loadavg 144.00
-#                  99.21s @ loadavg 156.86 <- rc=1, see (ii)
-#                 101.01s @ loadavg 148.42
-#                 123.71s @ loadavg 241.98
-#                 130.50s @ loadavg 191.12 (INCONVENIENT — concurrent wave)
-#
-#                 (i) TWO SPECIAL PROPERTIES, both verified at base main.
-#                 cockpit is the sole member of TIMEOUT_GUARD_EXCLUSIONS in
-#                 tests/scripts/test_fallback_verify_config.py, because its
-#                 test_command carries no `--timeout>=300`. That carve-out is
-#                 about pytest's PER-TEST cap; this guard is about the
-#                 PER-COMMAND budget, and the two are INDEPENDENT knobs — closing
-#                 one does not close the other, and this task closes neither by
-#                 touching the other. AND cockpit/pyproject.toml sets no
-#                 `timeout` ini value either, so cockpit is the ONE module where
-#                 nothing bounds a hung test at any level. The budget declared
-#                 for it is therefore its SOLE wall-clock bound, which makes this
-#                 task worth strictly more here than on any sibling.
-#
-#                 (ii) ONE RUN WAS RED and is recorded rather than dropped: the
-#                 99.21s run exited rc=1 with `1 failed, 320 passed` while the
-#                 five others reported 321 passed on the byte-identical command
-#                 and tree. THE FAILING TEST IS NOT KNOWN — a concurrent
-#                 duplicate driver overwrote the pytest log before it could be
-#                 read (see .task/measurements.md), so only the counts survive.
-#                 Hypothesis: a flake under that contention — plausible but NOT
-#                 established. W is taken from a GREEN run (130.50s), so nothing
-#                 here is sized from the red one.
+# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE. The concurrent arm of the sweep
+# was a 6-WAY wave (the six modules this task closed). Production's
+# ``verify.run_full_verification`` gathers over EVERY registered module config —
+# nine today, including the dominant `orchestrator` segment — so the measured
+# wave is a LOWER BOUND on the fully-concurrent cost, not a reproduction of it.
+# See the same note in each yaml's provenance block for what bounds the gap.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
     'escalation': 354.56,
@@ -299,7 +239,7 @@ def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=REPO_ROOT)
 
 
-def _executed_for_touched(prefix: str, files: list[str]):
+def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig):
     """Run the PRODUCTION plan->execution bridge and return the single executed config.
 
     ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
@@ -307,11 +247,21 @@ def _executed_for_touched(prefix: str, files: list[str]):
     executes. Asserting on THAT is what makes "the budget survives to
     execution" a structural claim rather than a claim about the yaml.
 
+    *cfg* IS A REQUIRED PARAMETER, not a convenience. It must be a config built
+    by ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
+    anchor is load-bearing: an unset anchor collapses every value to the
+    pydantic defaults, SILENTLY. This helper used to construct its own
+    ``OrchestratorConfig(project_root=REPO_ROOT)`` and read the right yaml only
+    because its caller happened to have called ``_root_config`` earlier in the
+    same test body, leaving the env var set as a SIDE EFFECT. Reordering the
+    assertions, or calling this helper from a new test, would have handed it a
+    defaults-collapsed config with no failure signal. Taking the config as an
+    argument makes the dependency structural instead of ordering-dependent.
+
     The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
     and nothing classifies STRUCTURAL.
     """
     mc = _discovered()[prefix]
-    cfg = OrchestratorConfig(project_root=REPO_ROOT)
     plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
     executed = verify._executed_module_configs_from_plan([mc], plan)
     assert len(executed) == 1, (
@@ -434,7 +384,7 @@ def test_module_carries_its_own_measured_verify_budget(
     # (e) Survives the PRODUCTION plan -> execution bridge, not just the
     # resolver in isolation. See the docstring for why _apply_cargo_scope makes
     # this a live risk rather than a formality.
-    executed = _executed_for_touched(prefix, [SAMPLE_TOUCHED_FILE[prefix]])
+    executed = _executed_for_touched(prefix, [SAMPLE_TOUCHED_FILE[prefix]], cfg)
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
         f'the production plan->execution bridge '
         f'(verify._executed_module_configs_from_plan) rendered '
@@ -495,33 +445,50 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 )
 
 
+# Modules whose budget IS measurement-backed, but whose figures are recorded in
+# the sibling guard or yaml that owns them rather than in this file's table.
+# Copying those numbers here would create a second copy of a measurement that
+# must be raised in lockstep — exactly the drift that has already occurred once
+# between these two configs and was caught only by a reviewer.
+#
+# These entries are NOT a statement that the owning guard is CURRENT. They
+# record only WHERE a module's provenance lives, so this file does not become a
+# second home for it; see the tests/scripts entry, which names a known staleness
+# in its own owner rather than papering over it.
+MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
+    'scripts': (
+        'MEASURED_SUITE_WORST_SECS = 930.59 in '
+        'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
+        "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block, whose "
+        'floor is DERIVED from that constant by the same expression _min_budget '
+        'uses.'
+    ),
+    'tests/scripts': (
+        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml. '
+        'NOTE THE OWNING GUARD IS STALE: '
+        'tests/scripts/test_tests_scripts_module_config.py (task 3350) still '
+        'pins MEASURED_SUITE_WORST_SECS = 127.0 with a HAND-SET '
+        'MIN_MODULE_BUDGET_SECS = 300, so the 233.50s figure in the yaml is '
+        'gated by nothing — this is the exact rot _min_budget\'s docstring '
+        'names, and it is why task 3458 made the floor derived rather than '
+        'hand-set. Excluded here to avoid creating a SECOND copy of the '
+        'measurement, NOT because the sibling floor is current. Fixing that '
+        'guard is not task 3473\'s scope (it does not hold the lock).'
+    ),
+}
+
+
 # Documented carve-outs from the coverage guard below: prefix -> justification.
 # Modelled on TIMEOUT_GUARD_EXCLUSIONS in test_fallback_verify_config.py, but a
-# dict rather than a frozenset so each justification is a CHECKED value naming
-# an owning task, not a bare opt-out with its reason in an adjacent comment.
+# dict rather than a frozenset so each justification lives AT THE DEFINITION
+# SITE rather than in a detached comment that drifts from the entry it excuses.
+# That is documentation, not an enforced property — see the coverage guard's
+# docstring for why no in-file assertion could enforce it.
 #
 # THIS IS THE ONE REMAINING GAP in the repo-root yaml's claim that "tight
 # timeouts surface hangs ... on the PER-MODULE budgets". Nine of ten configs
 # now declare their own; this is the tenth. Recorded here so the guard REPORTS
 # that gap on every run rather than hiding it.
-# Modules whose budget IS measurement-backed, but whose figures are recorded in
-# the sibling guard that owns them rather than in this file's table. Copying
-# those numbers here would create a second copy of a measurement that must be
-# raised in lockstep — exactly the drift that has already occurred once between
-# these two configs and was caught only by a reviewer.
-MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
-    'scripts': (
-        'MEASURED_SUITE_WORST_SECS = 930.59 in '
-        'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
-        "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block."
-    ),
-    'tests/scripts': (
-        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml '
-        'and gated by tests/scripts/test_tests_scripts_module_config.py '
-        '(task 3350).'
-    ),
-}
-
 MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
     'orchestrator': (
         'Owned by task 3353, which is still pending. Deliberately not fixed by '
@@ -574,6 +541,21 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     entry is excluded today (``orchestrator``, task 3353), and that is the one
     place where the repo-root yaml's "tight timeouts live on the per-module
     budgets" claim is still false.
+
+    AND THE CARVE-OUT EXPIRES ON ITS OWN TERMS. Each entry states a deletion
+    condition; this test enforces it, by asserting an excluded module still
+    declares NO budget. Without that, the day the owning task lands, the
+    ``continue`` would skip the prefix permanently — past the declared-at-all
+    check AND past the ``MEASURED_MODULE_SUITE_WORST_SECS`` provenance check —
+    so a budget could land for the dominant fleet segment with nothing recorded
+    behind it while this file stayed green and this docstring stayed wrong. A
+    dead-key check over all three prefix-keyed tables closes the mirror-image
+    hole: a renamed or removed module leaving an entry that suppresses coverage
+    for a prefix that no longer exists.
+
+    Both are assertions about CONFIG STATE, not about the prose of a string
+    literal in this file — the distinction that governs what belongs in a guard
+    here at all.
     """
     discovered = {
         prefix: mc
@@ -593,9 +575,56 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
         f'set. Discovered: {sorted(discovered)}'
     )
 
+    # DEAD KEYS FAIL LOUDLY. Every table in this file is keyed by a module
+    # prefix, and a module that is RENAMED or REMOVED leaves an entry behind
+    # that excuses nothing, records nothing, and breaks nothing — so nothing
+    # ever prompts its deletion. A stale MODULE_BUDGET_EXCLUSIONS key is the
+    # worst of the three: it would go on suppressing coverage for a prefix that
+    # no longer exists while reading, to anyone auditing the file, as a live and
+    # justified carve-out.
+    tabled = (
+        set(MODULE_BUDGET_EXCLUSIONS)
+        | set(MEASURED_BY_SIBLING_GUARD)
+        | set(MEASURED_MODULE_SUITE_WORST_SECS)
+    )
+    dead = tabled - set(discovered)
+    assert not dead, (
+        f'module prefix(es) {sorted(dead)} appear in this file\'s tables '
+        f'(MODULE_BUDGET_EXCLUSIONS / MEASURED_BY_SIBLING_GUARD / '
+        f'MEASURED_MODULE_SUITE_WORST_SECS) but are no longer registered by '
+        f'config._discover_module_configs with a test_command (task 3473). '
+        f'Either the module was renamed or removed — in which case delete the '
+        f'entries — or discovery has regressed. Discovered: {sorted(discovered)}'
+    )
+
     for prefix, mc in sorted(discovered.items()):
         reason = MODULE_BUDGET_EXCLUSIONS.get(prefix)
         if reason is not None:
+            # THE CARVE-OUT MUST STILL BE NEEDED. Every entry states its own
+            # deletion condition — "once <prefix>/orchestrator.yaml declares its
+            # own verify_command_timeout_secs, delete this entry" — and until
+            # this assertion existed, nothing enforced it. When the owning task
+            # landed, `continue` would have kept skipping the prefix forever, so
+            # it would have escaped BOTH the declared-at-all assertion and the
+            # measurement-provenance assertion below: a budget could land for
+            # the dominant fleet segment with no recorded measurement behind it
+            # and no guard, while this file still reported green and its
+            # docstring still claimed to REPORT the remaining gap.
+            #
+            # This asserts on real config state, not on the justification's
+            # prose — the distinction the amendment removing the `task \d+`
+            # regex turned on.
+            assert mc.verify_command_timeout_secs is None, (
+                f'{prefix} now declares '
+                f'verify_command_timeout_secs={mc.verify_command_timeout_secs}, '
+                f'so its MODULE_BUDGET_EXCLUSIONS entry is STALE and has met '
+                f'its own stated deletion condition (task 3473). Delete the '
+                f'entry: the coverage guard then covers this module '
+                f'automatically, which also makes the '
+                f'MEASURED_MODULE_SUITE_WORST_SECS provenance requirement below '
+                f'apply to it — the point of deleting it rather than leaving a '
+                f'harmless-looking key in place. Excluded for: {reason}'
+            )
             continue
 
         assert mc.verify_command_timeout_secs is not None, (
