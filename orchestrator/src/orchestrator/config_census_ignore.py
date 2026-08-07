@@ -48,16 +48,26 @@ FROM here, never the reverse, so there is no cycle.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+import sqlite3
+from pathlib import Path
 from typing import Any, NamedTuple
+
+from shared.task_statuses import TERMINAL
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'CENSUS_IGNORE_ENTRY_KEYS',
     'HARD_KINDS',
     'CensusIgnoreFinding',
     'CensusIgnoreSpec',
+    'TaskCiteStatus',
     'audit_census_ignore_specs',
     'parse_census_ignore_entries',
+    'read_task_statuses',
 ]
 
 
@@ -220,7 +230,7 @@ _LOOSE_REF_RE = re.compile(
 
 def audit_census_ignore_specs(
     specs: list[CensusIgnoreSpec],
-    status_probe: dict[int, Any] | None = None,
+    status_probe: dict[int, TaskCiteStatus] | None = None,
 ) -> list[CensusIgnoreFinding]:
     """Grade every spec against the taxonomy; pure and sync.
 
@@ -285,4 +295,183 @@ def audit_census_ignore_specs(
                 '#NNNN so the citation can be checked for liveness.',
             ))
 
+        # Liveness fires ONLY on a positively-terminal / positively-parked
+        # answer.  A None probe (task store absent or unreadable) or an id the
+        # probe has never heard of can therefore only ever UNDER-fire — the
+        # audit is loudest where it knows most, never where it knows least.
+        if status_probe is not None:
+            findings.extend(_liveness_findings(spec, status_probe))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Citation liveness: the ONLY I/O in this module
+# ---------------------------------------------------------------------------
+
+
+class TaskCiteStatus(NamedTuple):
+    """The two facts the audit needs about a cited task.
+
+    ``status`` is the raw DB string (compared against ``shared.task_statuses``'
+    canonical vocabulary rather than a fourth hardcoded ``{'done','cancelled'}``
+    copy).  ``do_not_complete`` is the deliberate-park marker read off the
+    task's ``metadata`` blob.
+    """
+
+    status: str
+    do_not_complete: bool
+
+
+# Per-process dedup for probe-failure breadcrumbs, mirroring
+# shared.safe_io._warned_corrupt_paths: a restart re-enables the warning.
+_warned_probe_paths: set[str] = set()
+
+
+def _warn_once(path: str, message: str, *args: Any) -> None:
+    """Emit *message* at WARNING at most once per *path* per process."""
+    if path in _warned_probe_paths:
+        return
+    _warned_probe_paths.add(path)
+    logger.warning(message, *args)
+
+
+def tasks_db_path(project_root: Path | str) -> Path:
+    """Conventional task-store location for *project_root*."""
+    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+
+def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | None:
+    """Read ``{id: TaskCiteStatus}`` for the ``master`` tag, or ``None``.
+
+    ``None`` means "cannot know" — NOT "clean".  ``check-config`` is an offline
+    operator tool routinely pointed at another project's YAML from a machine
+    that does not have that project's ``.taskmaster/tasks/tasks.db`` at all, so
+    absence must never be allowed to manufacture findings.  Every failure path
+    leaves a breadcrumb naming the path it looked for, so the degradation is
+    visible rather than silent (INV-4).
+
+    Opened strictly read-only via the ``mode=ro`` URI, mirroring
+    ``sandbox_soak._connect_ro`` and ``b3_gate`` — a predicate must never mutate
+    the store it measures.  Deliberately NOT a call into
+    ``sandbox_soak.read_task_status``: that one returns status only (we also
+    need ``metadata`` for ``do_not_complete``) and RAISES on a missing store,
+    whereas this caller must fail open.
+
+    Failure handling uses NARROW typed handlers plus a logged breadcrumb, never
+    a broad ``except Exception: return None`` — the latter is what
+    ``shared/tests/test_silent_fallthrough_gate.py`` exists to ratchet against.
+    """
+    db = tasks_db_path(project_root)
+    if not db.exists():
+        logger.debug('census-ignore audit: no task store at %s', db)
+        return None
+
+    try:
+        conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+    except sqlite3.Error as exc:
+        _warn_once(
+            str(db),
+            'census-ignore audit: cannot open task store %s (%s) — citation '
+            'liveness checks are SKIPPED for this config',
+            db, exc,
+        )
+        return None
+
+    try:
+        rows = conn.execute(
+            'SELECT id, status, metadata FROM tasks WHERE tag = ?', ('master',)
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _warn_once(
+            str(db),
+            'census-ignore audit: cannot query task store %s (%s) — citation '
+            'liveness checks are SKIPPED for this config',
+            db, exc,
+        )
+        return None
+    finally:
+        conn.close()
+
+    statuses: dict[int, TaskCiteStatus] = {}
+    for task_id, status, metadata in rows:
+        try:
+            key = int(task_id)
+        except (TypeError, ValueError):
+            continue
+        statuses[key] = TaskCiteStatus(
+            str(status or ''), _do_not_complete(metadata, db)
+        )
+    return statuses
+
+
+def _do_not_complete(metadata: Any, db: Path) -> bool:
+    """Read ``metadata.do_not_complete``, defaulting to False.
+
+    Keys on ``do_not_complete`` SPECIFICALLY — not on a bare ``deferred``
+    status (an ordinary non-terminal state) and not on ``do_not_dispatch`` (a
+    scheduler knob that says nothing about whether the task will ever
+    complete).  Both are documented false-positive guards.
+    """
+    if not isinstance(metadata, str) or not metadata:
+        return False
+    try:
+        parsed = json.loads(metadata)
+    except json.JSONDecodeError as exc:
+        _warn_once(
+            f'{db}:metadata',
+            'census-ignore audit: corrupt task metadata JSON in %s (%s) — '
+            'treating do_not_complete as unset',
+            db, exc,
+        )
+        return False
+    return isinstance(parsed, dict) and parsed.get('do_not_complete') is True
+
+
+def _liveness_findings(
+    spec: CensusIgnoreSpec, status_probe: dict[int, TaskCiteStatus]
+) -> list[CensusIgnoreFinding]:
+    """Grade *spec*'s citations against the probe (positively-terminal only)."""
+    findings: list[CensusIgnoreFinding] = []
+    known = {cid: status_probe[cid] for cid in spec.citations if cid in status_probe}
+
+    for cid in spec.citations:
+        if cid not in status_probe:
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_UNKNOWN_ID,
+                SEVERITY_ADVISORY,
+                f'{spec.pattern}: cited task #{cid} is not present in the task '
+                'store. Advisory only — most often a task-DB sync artifact '
+                'rather than a real defect. Confirm the id is right.',
+            ))
+
+    # PTODO §8.2: one live cite suffices. Only report the entry as orphaned
+    # when EVERY id the probe actually knows about is terminal — an entry
+    # tracked by any still-open task is still tracked.
+    terminal = {
+        cid: st.status for cid, st in known.items() if st.status in TERMINAL
+    }
+    if known and len(terminal) == len(known):
+        detail = ', '.join(f'#{cid} ({status})' for cid, status in terminal.items())
+        findings.append(CensusIgnoreFinding(
+            spec.pattern,
+            KIND_ORPHANED,
+            SEVERITY_HARD,
+            f'{spec.pattern}: every cited task has closed ({detail}), so this '
+            "entry's justification is spent — either the consumer landed (make "
+            'the key a field on the model) or it never will (delete the entry).',
+        ))
+        return findings
+
+    for cid, st in known.items():
+        if st.do_not_complete:
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_PARKED_ON_ANCHOR,
+                SEVERITY_ADVISORY,
+                f'{spec.pattern}: cited task #{cid} is parked '
+                '(metadata.do_not_complete), so it will not close on its own '
+                'and this entry has no realistic expiry date.',
+            ))
     return findings
