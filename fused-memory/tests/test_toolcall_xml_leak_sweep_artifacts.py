@@ -58,7 +58,8 @@ import json
 import re
 import sys
 import types
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -273,6 +274,98 @@ def _payload_record(memory_id: str, payload_path: Path, field: str) -> dict:
         'id. The tracking entry points at a report that cannot account for it.'
     )
     return matches[0]
+
+
+#: Keys that may only appear on an entry once ``recovered`` is true. Each one
+#: is a claim ABOUT a completed recovery, so its presence while nothing has
+#: been re-added is a partially-filled entry claiming provenance it has not
+#: earned.
+_RECOVERY_CLAIM_KEYS = ('new_id', 'recovered_via', 'recovered_at')
+
+
+def _recovery_claim_problems(memory_id: str, entry: dict) -> list[str]:
+    """Every way *entry*'s ``recovered`` claim fails to be CHECKABLE. Pure.
+
+    ``recovered: true`` is the one field in this tracker that can silently
+    convert a real, outstanding data loss into a closed one. A bare
+    "non-empty string" check on ``new_id`` is satisfied by ``"yes"``, so the
+    claim has to carry something a later reader can independently verify
+    against the store: a well-formed UUID, distinct from the id it replaced,
+    plus the mechanism and the timestamp that produced it.
+
+    Returns a list of problems (empty means the claim is checkable) rather
+    than asserting, so the contract itself can be exercised directly over
+    synthetic entries — see ``TestRecoveryClaimContract``. Without that, the
+    whole contract would sit behind ``if recovered:`` and never run while the
+    committed tracker still says false, i.e. it would report "passed" without
+    ever having been evaluated.
+    """
+    problems: list[str] = []
+    recovered = entry.get('recovered')
+    if not isinstance(recovered, bool):
+        return [f'{memory_id}: recovered={recovered!r} must be a bool']
+
+    if not recovered:
+        for key in _RECOVERY_CLAIM_KEYS:
+            if key in entry:
+                problems.append(
+                    f'{memory_id}: recovered=false but {key!r} is present. '
+                    'Nothing has been re-added, so the entry must not carry '
+                    'provenance for a recovery that never happened.'
+                )
+        return problems
+
+    new_id = entry.get('new_id')
+    if not isinstance(new_id, str) or not new_id.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but new_id={new_id!r}. A re-added '
+            'memory necessarily gets a NEW id; without it the recovery claim '
+            'cannot be checked against the store.'
+        )
+    else:
+        try:
+            uuid.UUID(new_id)
+        except (ValueError, AttributeError, TypeError):
+            problems.append(
+                f'{memory_id}: new_id={new_id!r} is not a well-formed UUID. '
+                'Mem0 ids are Qdrant point UUIDs, so a value that cannot be '
+                'parsed as one was typed by a human, not returned by a store.'
+            )
+        if new_id == memory_id:
+            problems.append(
+                f'{memory_id}: new_id equals the original id. A re-add mints a '
+                'NEW id, so equality means nothing was actually re-added.'
+            )
+
+    via = entry.get('recovered_via')
+    if not isinstance(via, str) or not via.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but recovered_via={via!r}. Name the '
+            'mechanism that performed the re-add, so a future reader can tell '
+            'a real recovery from an optimistic edit.'
+        )
+
+    at = entry.get('recovered_at')
+    if not isinstance(at, str) or not at.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but recovered_at={at!r}. A recovery '
+            'without a timestamp cannot be placed against the loss it undoes.'
+        )
+    else:
+        try:
+            parsed = datetime.fromisoformat(at)
+        except ValueError:
+            problems.append(
+                f'{memory_id}: recovered_at={at!r} is not ISO-8601 parseable.'
+            )
+        else:
+            if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(None):
+                problems.append(
+                    f'{memory_id}: recovered_at={at!r} is not UTC. Every other '
+                    'timestamp in these artifacts is UTC; a naive or '
+                    'locally-offset one cannot be ordered against them.'
+                )
+    return problems
 
 
 def _unrepaired_danger_records(report: dict) -> list[dict]:
@@ -846,6 +939,98 @@ class TestTheTrackingGateIsNotVacuous:
 
 
 # ---------------------------------------------------------------------------
+# The recovery claim itself: proof the contract can FIRE
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryClaimContract:
+    """Direct, hermetic cover for ``_recovery_claim_problems``.
+
+    ``recovered: true`` is the single field in this tracker that can convert a
+    real, outstanding data loss into an apparently-closed one. While the
+    committed tracker says false, every ``recovered=true`` assertion sits down
+    an untaken branch — so the contract that is supposed to keep the claim
+    honest would report "passed" without ever having been evaluated, and would
+    only be discovered to be wrong at the exact moment someone flipped the
+    flag. That is the wrong time to find out.
+
+    So the contract is exercised here over synthetic entries, independent of
+    what is committed: it must ACCEPT a genuine recovery and REJECT each way of
+    faking one.
+    """
+
+    ORIGINAL = '7d073281-4c5d-4ba3-a01c-3a167f4460f4'
+    REPLACEMENT = '0f2a9c31-6b4e-4d0a-9c77-1e5b8a2d4f60'
+
+    def _valid(self, **overrides) -> dict:
+        entry = {
+            'recovered': True,
+            'new_id': self.REPLACEMENT,
+            'recovered_via': 'mcp__fused-memory__add_memory',
+            'recovered_at': '2026-08-06T12:00:00+00:00',
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_a_genuine_recovery_claim_is_accepted(self) -> None:
+        """The contract must not be unsatisfiable — otherwise a real recovery
+        could never be recorded and the pressure would be to delete the test."""
+        assert _recovery_claim_problems(self.ORIGINAL, self._valid()) == []
+
+    def test_an_unrecovered_entry_is_accepted(self) -> None:
+        assert _recovery_claim_problems(self.ORIGINAL, {'recovered': False}) == []
+
+    @pytest.mark.parametrize('bogus', ['yes', 'recovered', '', '   ', 'new-id-1'])
+    def test_a_new_id_that_is_not_a_uuid_is_rejected(self, bogus: str) -> None:
+        """The precise hole this tightening closes: the previous contract asked
+        only for a non-empty string, which ``"yes"`` satisfies."""
+        problems = _recovery_claim_problems(self.ORIGINAL, self._valid(new_id=bogus))
+        assert problems, f'new_id={bogus!r} must not pass as a recovery claim'
+
+    def test_reusing_the_original_id_is_rejected(self) -> None:
+        """A re-add mints a NEW id, so equality proves nothing was re-added."""
+        problems = _recovery_claim_problems(
+            self.ORIGINAL, self._valid(new_id=self.ORIGINAL)
+        )
+        assert any('equals the original id' in p for p in problems)
+
+    @pytest.mark.parametrize('key', ['new_id', 'recovered_via', 'recovered_at'])
+    def test_a_missing_provenance_key_is_rejected(self, key: str) -> None:
+        entry = self._valid()
+        del entry[key]
+        assert _recovery_claim_problems(self.ORIGINAL, entry), (
+            f'recovered=true without {key!r} must be rejected'
+        )
+
+    @pytest.mark.parametrize('bad_at', ['yesterday', '2026-08-06', ''])
+    def test_an_unparseable_or_naive_timestamp_is_rejected(self, bad_at: str) -> None:
+        assert _recovery_claim_problems(self.ORIGINAL, self._valid(recovered_at=bad_at))
+
+    def test_a_non_utc_timestamp_is_rejected(self) -> None:
+        """Every other timestamp in these artifacts is UTC; a locally-offset one
+        cannot be ordered against the loss it undoes."""
+        problems = _recovery_claim_problems(
+            self.ORIGINAL, self._valid(recovered_at='2026-08-06T12:00:00+05:30')
+        )
+        assert any('not UTC' in p for p in problems)
+
+    @pytest.mark.parametrize('key', _RECOVERY_CLAIM_KEYS)
+    def test_provenance_on_an_unrecovered_entry_is_rejected(self, key: str) -> None:
+        """A partially-filled entry must not claim provenance for a recovery
+        that never happened — the half-edited-tracker failure mode."""
+        entry = {'recovered': False, key: self._valid()[key]}
+        assert _recovery_claim_problems(self.ORIGINAL, entry), (
+            f'recovered=false alongside {key!r} must be rejected'
+        )
+
+    @pytest.mark.parametrize('bad', ['true', 1, None, 'false'])
+    def test_a_non_boolean_recovered_flag_is_rejected(self, bad) -> None:
+        """``recovered: "false"`` is truthy in Python — a string here would
+        silently read as recovered by any naive consumer."""
+        assert _recovery_claim_problems(self.ORIGINAL, {'recovered': bad})
+
+
+# ---------------------------------------------------------------------------
 # Unrepaired live-corpus mutations: named owner + still-recoverable payload
 # ---------------------------------------------------------------------------
 
@@ -1032,10 +1217,17 @@ class TestUnrepairedMutationsAreTracked:
     def test_recovered_flag_and_new_id_agree(self, path: Path) -> None:
         """``recovered`` must never overstate what happened.
 
-        While it is False the entry carries no ``new_id`` (nothing was
-        re-added, so there is no id to carry). If a future session flips it to
-        True it MUST carry the id of the memory it re-added — otherwise
-        "recovered" is an unfalsifiable claim.
+        While it is False the entry carries no ``new_id``, no
+        ``recovered_via`` and no ``recovered_at`` (nothing was re-added, so
+        there is nothing to carry and no provenance to claim). If a future
+        session flips it to True it MUST carry a well-formed UUID distinct
+        from the id it replaced, plus the mechanism and the UTC timestamp of
+        the re-add — otherwise "recovered" is an unfalsifiable claim, and a
+        real outstanding data loss silently reads as closed.
+
+        The contract lives in the pure ``_recovery_claim_problems`` so it can
+        be exercised directly (``TestRecoveryClaimContract``) instead of only
+        ever running down the branch the committed tracker happens to take.
         """
         report = _load(path)
         outstanding = _unrepaired_danger_records(report)
@@ -1043,23 +1235,8 @@ class TestUnrepairedMutationsAreTracked:
             return
         tracking = _load(_recovery_tracking_path(path.parent))
         for record in outstanding:
-            entry = tracking[record['id']]
-            recovered = entry.get('recovered')
-            assert isinstance(recovered, bool), (
-                f'{record["id"]}: recovered={recovered!r} must be a bool'
-            )
-            if recovered:
-                new_id = entry.get('new_id')
-                assert isinstance(new_id, str) and new_id.strip(), (
-                    f'{record["id"]}: recovered=true but new_id={new_id!r}. '
-                    'A re-added memory necessarily gets a NEW id; without it '
-                    'the recovery claim cannot be checked against the store.'
-                )
-            else:
-                assert 'new_id' not in entry, (
-                    f'{record["id"]}: recovered=false but a new_id is present. '
-                    'Nothing has been re-added; the two disagree.'
-                )
+            problems = _recovery_claim_problems(record['id'], tracking[record['id']])
+            assert not problems, '\n'.join(problems)
 
     def test_recovery_payload_is_still_present_and_leak_free(
         self, path: Path
