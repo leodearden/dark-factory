@@ -3564,6 +3564,102 @@ def test_main_reap_decisions_scopes_to_project(
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
 
 
+def test_main_reap_decisions_closes_every_spelling_of_one_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3807): ONE run closes EVERY spelling of ONE project.
+
+    Measured live 2026-08-06: 41 OPEN dark-factory decisions split 22/17/2
+    across ``dark_factory``/``df``/``dark-factory``. The reaper compared
+    ``decision.project`` to ``--project`` as raw strings, so each partition
+    was invisible to a reap scoped to either of the others and an L2 session
+    had to run the verb once per token to close them all.
+
+    All four decisions share ONE queue and each pins its own resolved
+    escalation, so the axis-2 queue guard is satisfied and cannot short-
+    circuit this into a vacuous pass -- ``escalations_dir=`` is therefore
+    passed explicitly at each call site, per _make_decision's documented rule.
+
+    One test, both directions: the three dark-factory spellings must ALL
+    close, and the unrelated ``reify`` decision must stay OPEN -- so widening
+    the axis-1 match to spellings of the SAME project provably does not widen
+    it ACROSS projects.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    for esc_id in ('esc-a', 'esc-b', 'esc-c', 'esc-other'):
+        (archive_dir / f'{esc_id}.json').write_text(json.dumps({'status': 'resolved'}))
+    seeded = {
+        'dec-df': ('df', 'esc-a'),
+        'dec-hyphen': ('dark-factory', 'esc-b'),
+        'dec-canonical': ('dark_factory', 'esc-c'),
+        'dec-reify': ('reify', 'esc-other'),
+    }
+    for decision_id, (project, escalation_id) in seeded.items():
+        sr.write_decision(
+            _make_decision(
+                id=decision_id,
+                project=project,
+                escalation_id=escalation_id,
+                state=sr.DecisionState.OPEN,
+                escalations_dir=str(escalations_dir),
+            ),
+            root=tmp_path,
+        )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', 'dark_factory', '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-df'] == sr.DecisionState.ANSWERED
+    assert listed['dec-hyphen'] == sr.DecisionState.ANSWERED
+    assert listed['dec-canonical'] == sr.DecisionState.ANSWERED
+    assert listed['dec-reify'] == sr.DecisionState.OPEN
+
+
+@pytest.mark.parametrize('reaper_project', ['DF', 'df', 'dark-factory', ' Dark_Factory '])
+def test_main_reap_decisions_normalizes_the_reapers_own_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reaper_project: str,
+) -> None:
+    """BOTH sides of the join normalize, mirroring the axis-2 queue guard.
+
+    A watcher invoking with a stale ``--project`` spelling must still close a
+    decision stored under the canonical token -- otherwise the fix would be
+    half-applied and the caller's own spelling would become a new way to
+    silently miss rows.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-r.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-canon',
+            project='dark_factory',
+            escalation_id='esc-r',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=str(escalations_dir),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', reaper_project, '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canon'] == sr.DecisionState.ANSWERED
+
+
 def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
     """Build the observed two-queue collision on disk (task 3528).
 
