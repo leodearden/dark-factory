@@ -336,3 +336,203 @@ class TestRunIsolatedConfirmGroupBackCompat:
             got = self._run(verify_module, config, tmp_path)
 
         assert got is False, got
+
+
+# ---------------------------------------------------------------------------
+# S3: the ONE discriminator — `confirm_isolated_rerun_verdict` — and its
+# fully-populated FlakeSuppression on the happy path.
+# ---------------------------------------------------------------------------
+
+
+def _psi(cpu_some10: float, *, read_ok: bool = True):
+    """A shared.psi.PsiSample with only cpu_some10 / read_ok load-bearing."""
+    from shared.psi import PsiSample
+
+    return PsiSample(
+        cpu_some10=cpu_some10,
+        mem_some10=0.0,
+        mem_full10=0.0,
+        io_some10=0.0,
+        read_ok=read_ok,
+    )
+
+
+class TestConfirmIsolatedRerunVerdictMergeGate:
+    """`confirm_isolated_rerun_verdict(worktree, config, module_configs,
+    failing_result, *, call_site, ...) -> FlakeSuppression` at the merge gate.
+
+    RED today: confirm_isolated_rerun_verdict does not exist.
+    """
+
+    def _run(self, verify_module, config, module_configs, failing, worktree, **kw):
+        return asyncio.run(
+            verify_module.confirm_isolated_rerun_verdict(
+                worktree, config, module_configs, failing,
+                call_site='merge_gate', **kw,
+            )
+        )
+
+    def test_happy_path_returns_populated_flake_suppression(
+        self, tmp_path: Path,
+    ) -> None:
+        """A clean isolated re-run yields a FULLY-populated FlakeSuppression —
+        the whole point of β: the verdict is an object with provenance, not a
+        bare list."""
+        from datetime import datetime
+
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import (
+            FlakeCallSite,
+            FlakeSuppression,
+            FlakeVerdict,
+        )
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(
+                verify_module, 'read_psi_sample', MagicMock(return_value=_psi(12.5)),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert isinstance(s, FlakeSuppression), s
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
+        # RAW extracted node-ids in extraction order — never the
+        # prefix-qualified group ids the re-run command is built from.
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.call_site == FlakeCallSite.merge_gate, s.call_site
+        assert s.unconfirmable_reason is None, s.unconfirmable_reason
+        assert s.runner == 'local', s.runner
+        # ISO-8601 and TIMEZONE-AWARE — asserted by parsing, never by matching
+        # a literal string.
+        stamped = datetime.fromisoformat(s.observed_at)
+        assert stamped.tzinfo is not None, s.observed_at
+        assert s.psi_cpu_some10 == 12.5, s.psi_cpu_some10
+
+    def test_psi_read_not_ok_maps_to_none(self, tmp_path: Path) -> None:
+        """`read_ok=False` is shared.psi's documented fail-open sentinel; the
+        contract says psi_cpu_some10 is None in that case, NOT 0.0."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(
+                verify_module,
+                'read_psi_sample',
+                MagicMock(return_value=_psi(0.0, read_ok=False)),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
+        assert s.psi_cpu_some10 is None, s.psi_cpu_some10
+
+    def test_psi_is_optional_float_without_patching(self, tmp_path: Path) -> None:
+        """Unpatched, against the real host: still None-or-float, never a
+        crash and never a str."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.psi_cpu_some10 is None or isinstance(s.psi_cpu_some10, float), (
+            s.psi_cpu_some10
+        )
+
+    def test_isolated_command_shape_and_same_tree(self, tmp_path: Path) -> None:
+        """INV-3 (SAME-TREE) + INV-4 (serial, isolated, generous timeout), and
+        the merge gate's single-shot merge-role call shape."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        rv.assert_awaited_once()
+        # SAME-TREE: the discriminator judges the tree it was HANDED.
+        assert rv.call_args.args[0] is tmp_path, rv.call_args.args[0]
+        called_mc = rv.call_args.args[2]
+        assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+        assert '-o addopts=' in called_mc.test_command, called_mc.test_command
+        assert (
+            f'--timeout {verify_module._MERGE_FLAKE_CONFIRM_TIMEOUT_SECS}'
+            in called_mc.test_command
+        ), called_mc.test_command
+        assert FAILED_ID in called_mc.test_command, called_mc.test_command
+        assert called_mc.lint_command is None, called_mc.lint_command
+        assert called_mc.type_check_command is None, called_mc.type_check_command
+        # Merge-role, single-shot, cold-timeout semantics.
+        assert rv.call_args.kwargs['max_retries'] == 0, rv.call_args.kwargs
+        assert rv.call_args.kwargs['is_merge_verify'] is True, rv.call_args.kwargs
+        assert rv.call_args.kwargs['role'] == 'merge', rv.call_args.kwargs
+
+    def test_injected_now_is_used_verbatim(self, tmp_path: Path) -> None:
+        """`now=` is the determinism seam (α's own open_debt(..., now=None)
+        precedent), so a test can pin observed_at without a wall-clock race."""
+        from datetime import UTC, datetime
+
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        fixed = datetime(2026, 8, 7, 12, 34, 56, tzinfo=UTC)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path, now=fixed,
+            )
+
+        assert s.observed_at == fixed.isoformat(), s.observed_at
+
+    def test_runner_defaults_to_local_and_is_overridable(
+        self, tmp_path: Path,
+    ) -> None:
+        """`runner` exists so task ε can supply the true origin at the remote
+        boundary; 'local' is correct for both of β's in-process call sites."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path, runner='builder-07',
+            )
+
+        assert s.runner == 'builder-07', s.runner
