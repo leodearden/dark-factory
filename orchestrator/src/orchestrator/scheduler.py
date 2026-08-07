@@ -7035,7 +7035,13 @@ class Scheduler:
                 'reconcile to recover.', task_id, e,
             )
             return False
-        self.lock_table.release(task_id)
+        # Route through Scheduler.release (requeued=True — status was just set
+        # to 'pending'): the single writer that emits lock_released, clears the
+        # dispatch guard and arms the anti-hot-loop cooldown.  Stays AFTER that
+        # status write (INV-6).  Why a bare lock_table.release here was a
+        # stuck-lock hazard: contract C5 / task 3818, written up in
+        # orchestrator/tests/test_lock_release_single_writer_guard.py.
+        self.release(task_id, requeued=True)
         return False
 
     def release(self, task_id: str, *, requeued: bool = False) -> None:
