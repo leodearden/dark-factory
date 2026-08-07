@@ -1393,10 +1393,13 @@ class TestGetStatsScopedByGroup:
             await q.close()
 
 
-class FlakyVisibilityError(Exception):
-    """Module-local stand-in for graphiti_core's NodeNotFoundError — a
-    transient graph-visibility race that should receive an extended retry
-    budget instead of the plain ``max_attempts`` ceiling.
+class FlakyTransportError(Exception):
+    """Module-local stand-in for a genuinely-transient BACKEND TRANSPORT
+    failure — a reset connection or a backend timeout, i.e. the
+    ConnectionResetError / TimeoutError family that keeps the extended retry
+    budget. Such a failure is expected to clear on its own, so it should
+    receive ``transient_max_attempts`` rather than the plain ``max_attempts``
+    ceiling.
     """
 
 
@@ -1404,6 +1407,12 @@ class TestTransientErrorRetryPolicy:
     """Task 1936: known-transient errors get a longer retry budget
     (``transient_max_attempts``) than the plain ``max_attempts`` ceiling
     used for everything else.
+
+    Task 3585 removed the not-found family from the DEFAULT set. These tests
+    are unaffected: each passes an explicit ``transient_error_names={...}``
+    override, so they exercise the transient MECHANISM independently of which
+    names ship by default. Membership is covered by
+    TestNotFoundFamilyIsNotTransient.
     """
 
     @pytest.mark.asyncio
@@ -1420,7 +1429,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
@@ -1440,7 +1449,7 @@ class TestTransientErrorRetryPolicy:
     async def test_transient_error_uses_extended_budget(self, tmp_path):
         """A configured-transient error class dead-letters at transient_max_attempts,
         not the plain (smaller) max_attempts."""
-        execute = AsyncMock(side_effect=FlakyVisibilityError('node abc-123 not found'))
+        execute = AsyncMock(side_effect=FlakyTransportError('connection reset by peer'))
         q = DurableWriteQueue(
             data_dir=tmp_path / 'queue',
             execute_write=execute,
@@ -1450,7 +1459,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
@@ -1466,7 +1475,7 @@ class TestTransientErrorRetryPolicy:
             dead = await q.get_dead_items()
             assert len(dead) == 1
             assert dead[0]['attempts'] == 5
-            assert 'FlakyVisibilityError' in dead[0]['error']
+            assert 'FlakyTransportError' in dead[0]['error']
         finally:
             await q.close()
 
@@ -1483,7 +1492,7 @@ class TestTransientErrorRetryPolicy:
             nonlocal call_count
             call_count += 1
             if call_count <= 3:
-                raise FlakyVisibilityError('node abc-123 not found')
+                raise FlakyTransportError('connection reset by peer')
             return {'ok': True}
 
         q = DurableWriteQueue(
@@ -1495,7 +1504,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
