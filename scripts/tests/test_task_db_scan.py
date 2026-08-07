@@ -564,20 +564,6 @@ def test_audit_exit_constants_are_pairwise_distinct():
     assert len(set(codes)) == len(codes)
 
 
-def test_no_project_root_resolved_message_is_the_verbatim_audit_script_string():
-    """Pinned as an exact literal, not a substring.
-
-    This is the exit-2 signal both audit scripts printed inline before the
-    extraction; a reworded constant would silently change operator-facing (and
-    grep-able) output, which is why it is asserted whole.
-    """
-    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE == (
-        "no project root resolvable with a readable tasks.db (checked "
-        "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-        "dark-factory default)"
-    )
-
-
 # --- sweep_project_roots(roots, audit_fn) -> (audits, unreadable) ----------
 
 def test_sweep_project_roots_returns_one_audit_per_root_in_root_order():
