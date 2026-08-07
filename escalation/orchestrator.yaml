@@ -6,3 +6,74 @@ test_command: "uv run --project escalation --directory escalation pytest tests/ 
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project escalation --directory escalation ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests"
 type_check_command: "uv run --project escalation --directory escalation pyright src/ tests/"
+
+# Per-module verify budget (task 3473). Before this, escalation declared
+# nothing here and fell HARD through to the repo-root whole-fleet ceiling —
+# see the cascade note below.
+#
+# (1) MEASUREMENT PROVENANCE. Six runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239. All rc=0, all reporting
+# 1077 passed / 2 xfailed. EVERY FIGURE IS CONTENDED — a 32-core host running
+# /proc/loadavg 96-223 throughout — and none is quoted as an unloaded one, per
+# the norm at orchestrator/tests/warm-lane/README.md.
+#
+#    132.28s wall /100.25s pytest @ loadavg  96.01  <- the CONVENIENT figure
+#    158.99s wall                 @ loadavg 133.19
+#    204.76s wall /189.64s pytest @ loadavg 223.17
+#    325.85s wall /295.14s pytest @ loadavg 191.12  (6-way concurrent wave)
+#    336.60s wall                 @ loadavg 123.76  (6-way concurrent wave)
+#    354.56s wall /333.38s pytest @ loadavg 150.40  <- the INCONVENIENT one
+#
+# NOTE WHICH RUN IS WORST, because it falsifies the obvious assumption. The
+# 354.56s figure is a SERIAL run, and it is LARGER than either of the two
+# concurrent-wave runs. Sizing against the wave alone — on the reasoning that
+# the concurrent shape verify.run_full_verification's asyncio.gather produces
+# must be the worst case — would have UNDER-sized this module by ~30s of W and
+# ~80s of budget. The rule is the worst RUN, not the harshest-looking SWEEP.
+# (Two rows lost their pytest-reported duration to a plog collision described
+# in .task/measurements.md; their wall, rc and loadavg are intact, and neither
+# is the W this budget is sized from.)
+#
+# (2) SIZING. W = 354.56s, the WORST run, never the mean.
+#     B ~= 2.6 x W = 921.9 -> rounded up to 1000.
+# Max-not-mean is forced by recorded evidence, not preference:
+# scripts/orchestrator.yaml logs a ~3x spread (310.33s -> 914.61s) for a
+# BYTE-IDENTICAL command on a BYTE-IDENTICAL tree, which is host load at
+# measurement time rather than suite variance. Escalation's own six runs span
+# 132.28s -> 354.56s, ~2.7x. A mean (~252s) would have yielded ~700s.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally. Both sibling configs already use 2.6x — tests/scripts' 600
+# ~= 2.6 x 233.50, scripts' 2400 ~= 2.6 x 930.59 — and scripts/orchestrator.yaml
+# states explicitly that it kept the multiple identical across the two on
+# purpose. The 600s absolute floor is tests/scripts' own declared value; it is
+# not binding here, since the arithmetic already clears it.
+#
+# (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
+# 1000s, a 3.6x narrowing. A hang in this suite now surfaces in ~17 minutes
+# instead of ~60. It does NOT make the suite faster and does not detect suite
+# growth — see the GATED-BY guard's own scope note.
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: escalation
+# has no build step whose cold cost would justify a separate cold budget. Note
+# what that actually means, because the cascade is counter-intuitive. Per
+# verify._resolve_verify_timeout, an unset module cold knob does NOT inherit
+# the 1000 below — it falls through to the repo-root
+# verify_cold_command_timeout_secs (5400), and on a MERGE-cold verify falls
+# through first to config.merge_verify_cold_command_timeout_secs (7200, shipped
+# by the package-bundled orchestrator/src/orchestrator/defaults.yaml and not
+# overridden by the root yaml). Gated by assertion (f) of the guard below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 1000s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['escalation'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one. That
+# exact pair has already rotted once undetected between the two sibling configs
+# and was caught only by a reviewer.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[escalation].
+verify_command_timeout_secs: 1000
