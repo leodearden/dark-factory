@@ -428,3 +428,86 @@ class TestMergeBranchIntoWorktree:
 
         # Still exactly the one worktree the test created.
         assert await _worktree_names(git_ops) == before | {wt.name}
+    # ── step-05: conflict arm ────────────────────────────────────────────────
+
+    async def test_conflict_reports_and_leaves_worktree_clean_at_tip(
+        self, git_repo: Path,
+    ):
+        """A textual conflict is reported AND the merge is aborted.
+
+        Unlike ``merge_to_main`` (which RETAINS a conflicted worktree), the
+        chain builder must leave the lane at the last clean tip so that tip is
+        still verifiable — a residual conflicted index would poison it.
+        """
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(
+            git_repo, 'task/101', 'shared.txt', _shared_txt_with(1, 'from-101'),
+        )
+        await _create_branch_editing(
+            git_repo, 'task/102', 'shared.txt', _shared_txt_with(1, 'from-102'),
+        )
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+
+        ok = await git_ops.merge_branch_into_worktree(wt, '101')
+        assert ok.success is True
+        tip = await _rev_parse(wt)
+        assert tip == ok.merge_commit
+
+        res = await git_ops.merge_branch_into_worktree(wt, '102')
+
+        assert res.success is False
+        assert res.conflicts is True
+        assert res.merge_commit is None
+        assert res.details
+        assert 'shared.txt' in res.details
+        assert res.merge_worktree == wt
+        assert res.pre_merge_sha == tip
+
+        # Worktree left clean AND at the tip.
+        assert await _rev_parse(wt) == tip
+        _, unmerged, _ = await _run(
+            ['git', 'diff', '--name-only', '--diff-filter=U'], cwd=wt,
+        )
+        assert unmerged.strip() == ''
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', '-q', 'MERGE_HEAD'], cwd=wt)
+        assert rc != 0
+
+    async def test_worktree_reusable_after_an_aborted_conflict(self, git_repo: Path):
+        """A clean disjoint branch still merges after a conflict was aborted."""
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(
+            git_repo, 'task/101', 'shared.txt', _shared_txt_with(1, 'from-101'),
+        )
+        await _create_branch_editing(
+            git_repo, 'task/102', 'shared.txt', _shared_txt_with(1, 'from-102'),
+        )
+        await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+
+        first = await git_ops.merge_branch_into_worktree(wt, '101')
+        conflicted = await git_ops.merge_branch_into_worktree(wt, '102')
+        assert conflicted.success is False
+
+        third = await git_ops.merge_branch_into_worktree(wt, '103')
+        assert third.success is True
+        assert third.merge_commit is not None
+        assert await _rev_parse(wt, 'HEAD^1') == first.merge_commit
+        assert (wt / 'c.txt').read_text() == 'edit-103\n'
+
+    async def test_missing_ref_fails_loudly_without_conflict(self, git_repo: Path):
+        """A non-conflict merge failure is loud, conflicts=False, HEAD unchanged."""
+        git_ops = _make_git_ops(git_repo)
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        tip = await _rev_parse(wt)
+
+        res = await git_ops.merge_branch_into_worktree(wt, 'does-not-exist-999')
+
+        assert res.success is False
+        assert res.conflicts is False
+        assert res.merge_commit is None
+        assert res.details
+        assert res.merge_worktree == wt
+        assert await _rev_parse(wt) == tip
