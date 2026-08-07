@@ -25,12 +25,44 @@ type_check_command: "uv run --project shared --directory shared pyright src/ tes
 #    219.08s wall /209.94s pytest  @ loadavg 191.12   <- the INCONVENIENT one
 #
 # The 219.08s run is recorded first-class rather than discarded as an outlier:
-# it is the 6-way CONCURRENT wave, which is the shape
-# verify.run_full_verification's asyncio.gather over module_configs.values()
-# actually produces in production. A purely serial measurement systematically
-# under-measures the real cost, so the concurrent figure is the one that
-# governs. (Full per-run table, including a disclosed procedural defect in that
-# sweep, in .task/measurements.md.)
+# it is the 6-way CONCURRENT wave, and a purely serial measurement
+# systematically under-measures the real cost, so the concurrent figure governs.
+# (Full per-run table, including a disclosed procedural defect in that sweep, in
+# .task/measurements.md.)
+#
+# (1a) BE PRECISE ABOUT WHAT THAT WAVE IS — it is a LOWER BOUND on the
+# production shape, not a reproduction of it. This paragraph is the full
+# statement; the other five module yamls this task closed carry a one-line
+# pointer here rather than a sixth copy of it.
+#
+# verify.run_full_verification asyncio.gathers over module_configs.values(),
+# which is NINE registered configs today — the six this task closed plus
+# scripts, tests/scripts, and the dominant `orchestrator` segment measured at
+# 1366.23s in task 3062. A full nine-way gather is therefore materially heavier
+# than the six-way wave measured above, so W UNDER-states the fully-concurrent
+# cost, and this yaml does not claim otherwise.
+#
+# Two mechanisms cut the other way, so the residual gap is smaller than a naive
+# nine-versus-six comparison implies. NEITHER is credited in the sizing — they
+# are stated so a reader can see the gap is bounded, not to justify a tighter
+# number:
+#
+#   * verify_plan.derive_verify_plan scopes most verifies to the modules a
+#     change actually touches, so the all-nine gather is the exception (full
+#     verification) rather than the common case.
+#   * On the task and background roles the pytest leg is gated by the
+#     shared.verify_admission flock semaphore at verify_admission_task_slots
+#     (default 1), and shared.verify_admission._acquire takes that wait BEFORE
+#     the timeout clock starts. So the gather WIDTH is not the real pytest
+#     concurrency, and time spent queueing for a slot does not count against the
+#     budget below. (The merge role no-ops in acquire_task_slot and is not
+#     gated.)
+#
+# What remains after those is what the 2.6x multiple absorbs. That is an
+# ASSUMPTION with an error bar, not a measurement, and false infra_timeout on
+# the honest green path is precisely the defect these blocks exist to avoid — so
+# if this suite ever does time out under a full nine-way gather, RE-MEASURE with
+# all nine in flight rather than assuming the multiple still covers it.
 #
 # (2) SIZING. W = 219.08s, the WORST run, never the mean.
 #     B ~= 2.6 x W = 569.6 -> rounded up to 600.
@@ -51,9 +83,30 @@ type_check_command: "uv run --project shared --directory shared pyright src/ tes
 # here (it is, for sampler and cockpit).
 #
 # (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
-# 600s, a 6x narrowing. A hang in this suite now surfaces in ~10 minutes
-# instead of ~60. It does NOT make the suite faster and does not detect suite
-# growth — see the GATED-BY guard's own scope note.
+# 600s, a 6x narrowing. It does NOT make the suite faster and does not detect
+# suite growth — see the GATED-BY guard's own scope note.
+#
+# (4a) COUNT THE RETRIES — the wall-clock a hang really costs is a MULTIPLE of
+# the number below, not the number below. This paragraph is the full statement;
+# the other five module yamls this task closed carry their own arithmetic plus a
+# pointer here rather than a sixth copy of the mechanism.
+#
+# config.verify_timeout_retries defaults to 2 (orchestrator/src/orchestrator/
+# defaults.yaml) and dark-factory-orchestrator.yaml does NOT override it, and
+# verify.py's attempt loop re-runs a PURE TIMEOUT failure — it breaks only on
+# `attempt.passed or not attempt.pure_timeout_failure or retries >=
+# max_retries`. So on the TASK path a genuine hang burns up to 3 x 600s = ~30
+# minutes before it surfaces, not ~10. Before this declaration it burned up to
+# 3 x 3600s = ~3 hours, not ~60 minutes.
+#
+# The 6x RATIO is what the narrowing buys and is unaffected by the multiplier —
+# it divides out. The absolute minutes are 3x larger than the budget alone
+# suggests, and are written down here because a block that promises to state
+# things "plainly rather than oversold" cannot quietly be 3x optimistic about
+# the one number an operator would act on.
+#
+# The MERGE-verify and background-sweep paths pass max_retries=0 explicitly, so
+# on those the bound is a single 600s.
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed. Each leg gets its own

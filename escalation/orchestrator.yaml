@@ -34,6 +34,23 @@ type_check_command: "uv run --project escalation --directory escalation pyright 
 # in .task/measurements.md; their wall, rc and loadavg are intact, and neither
 # is the W this budget is sized from.)
 #
+# (1a) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
+# On THIS module the caveat lands softer than elsewhere: W is a SERIAL run
+# LARGER than either wave row (see the note above), so this module's W is not a
+# wave figure whose width is in question. The nine-way gather is still
+# unmeasured, though, so the concern is reduced here, not retired.
+#
 # (2) SIZING. W = 354.56s, the WORST run, never the mean.
 #     B ~= 2.6 x W = 921.9 -> rounded up to 1000.
 # Max-not-mean is forced by recorded evidence, not preference:
@@ -50,9 +67,17 @@ type_check_command: "uv run --project escalation --directory escalation pyright 
 # not binding here, since the arithmetic already clears it.
 #
 # (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
-# 1000s, a 3.6x narrowing. A hang in this suite now surfaces in ~17 minutes
-# instead of ~60. It does NOT make the suite faster and does not detect suite
-# growth — see the GATED-BY guard's own scope note.
+# 1000s, a 3.6x narrowing. It does NOT make the suite faster and does not
+# detect suite growth — see the GATED-BY guard's own scope note.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 1000s = ~50 minutes, not ~17, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 3.6x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests. The
+# merge-verify and background paths pass max_retries=0 and pay 1000s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed.

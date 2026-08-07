@@ -52,6 +52,25 @@ type_check_command: "uv run --project fused-memory --directory fused-memory pyri
 # wave. A future change to `-n` or to the dist mode INVALIDATES this measurement
 # rather than merely shifting it: re-measure, do not scale the number below.
 #
+# (1c) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
+# On THIS module the caveat lands softer: W (439.80s) is a SERIAL warm-up run,
+# LARGER than either wave row (408.45s / 435.56s), so W is not itself a wave
+# figure whose width is in question. The nine-way gather is still unmeasured,
+# and this is the module most sensitive to it — xdist under -n auto competes
+# for the same cores every other gathered segment wants — so the concern is
+# reduced here, not retired.
+#
 # (2) SIZING. W = 439.80s, the WORST run, never the mean.
 #     B ~= 2.6 x W = 1143.5 -> rounded up to 1200.
 # Max-not-mean is forced by recorded evidence: scripts/orchestrator.yaml logs a
@@ -64,9 +83,17 @@ type_check_command: "uv run --project fused-memory --directory fused-memory pyri
 # 930.59, and scripts/orchestrator.yaml states it kept the multiple identical
 # across the two on purpose. The 600s floor is not binding here.
 #
-# (4) WHAT THIS ACTUALLY BUYS: 3600s -> 1200s, a 3x narrowing. A hang in this
-# suite now surfaces in ~20 minutes instead of ~60. It does NOT make the suite
-# faster and does not detect suite growth.
+# (4) WHAT THIS ACTUALLY BUYS: 3600s -> 1200s, a 3x narrowing. It does NOT make
+# the suite faster and does not detect suite growth.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 1200s = ~60 minutes, not ~20, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 3x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests. The
+# merge-verify and background paths pass max_retries=0 and pay 1200s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed. That matters more here

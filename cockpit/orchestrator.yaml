@@ -55,6 +55,18 @@ type_check_command: "uv run --project cockpit --directory cockpit pyright src/ t
 # is sized from the red one. Left recorded so a future cockpit flake
 # investigation has the data point rather than having to rediscover it.
 #
+# (1b) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
 # (2) SIZING. W = 130.50s, the worst GREEN run. 2.6 x W = 339.3, which rounds to
 # 400. The 600s ABSOLUTE FLOOR binds instead:
 #     B = max(600, ceil_to_100(2.6 x W)) = max(600, 400) = 600.
@@ -70,9 +82,21 @@ type_check_command: "uv run --project cockpit --directory cockpit pyright src/ t
 # across the two on purpose.
 #
 # (4) WHAT THIS ACTUALLY BUYS — AND IT BUYS MORE HERE THAN ON ANY SIBLING.
-# 3600s -> 600s, a 6x narrowing: a hang surfaces in ~10 minutes instead of ~60.
-# The reason it is worth more here is (5a) below: on every other module this is
-# the OUTER of two bounds, but on cockpit it is the only one.
+# 3600s -> 600s, a 6x narrowing. The reason it is worth more here is (5a) below:
+# on every other module this is the OUTER of two bounds, but on cockpit it is
+# the only one.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 600s = ~30 minutes, not ~10, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 6x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests. That bites
+# hardest on this module precisely because of (5a): with no per-test cap
+# underneath it, a hung cockpit test occupies the full 600s on each of the three
+# attempts rather than being cut short by pytest-timeout first. The
+# merge-verify and background paths pass max_retries=0 and pay 600s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed.

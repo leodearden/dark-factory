@@ -71,6 +71,18 @@ type_check_command: "uv run --project dashboard --directory dashboard pyright sr
 # against; they stand alone. They also show the widest spread in the sweep,
 # 2.3x (283.47s -> 653.54s).
 #
+# (1b) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
 # (2) SIZING. W = 653.54s, the WORST run, never the mean.
 #     B ~= 2.6 x W = 1699.2 -> rounded up to 1700.
 # Max-not-mean is forced by recorded evidence: scripts/orchestrator.yaml logs a
@@ -85,9 +97,19 @@ type_check_command: "uv run --project dashboard --directory dashboard pyright sr
 # across the two on purpose. The 600s floor is not binding here.
 #
 # (4) WHAT THIS ACTUALLY BUYS: 3600s -> 1700s, a 2.1x narrowing — the most
-# modest of the six, because this is the most expensive suite of the six. A hang
-# now surfaces in ~28 minutes instead of ~60. Nothing tighter is declarable
-# without manufacturing infra_timeout on the honest green path under load.
+# modest of the six, because this is the most expensive suite of the six.
+# Nothing tighter is declarable without manufacturing infra_timeout on the
+# honest green path under load.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 1700s = ~85 minutes, not ~28, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 2.1x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests, and on this
+# module that is the difference between "surfaces within the hour" and does not.
+# The merge-verify and background paths pass max_retries=0 and pay 1700s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed.
