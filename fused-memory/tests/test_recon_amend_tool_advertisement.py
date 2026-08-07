@@ -209,3 +209,69 @@ class TestDisallowListForAmendAndEpisodeTools:
         finally:
             for path in temp_files:
                 Path(path).unlink(missing_ok=True)
+
+
+class TestStagePromptsCarryTheAnnotationNorm:
+    """Pins the WIRING of the shared stale/wrong-knowledge annotation norm —
+    constant identity, verbatim embedding, exactly-once, survives both
+    build_stage2_system_prompt branches, absent from Stage 3 — never its
+    prose. Same discipline test_recon_gate_closure_guidance.py's module
+    docstring states explicitly: "these tests pin the WIRING ... rather than
+    the prose ... Prose may be reworded freely; the wiring may not silently
+    break."
+
+    STALE_KNOWLEDGE_ANNOTATION_NORM does not exist yet. Each test below
+    imports it locally (rather than at module scope) so the ImportError is
+    isolated to this class — the other classes in this file, and their
+    already-passing assertions, stay unaffected and collectible.
+    """
+
+    def test_is_nonempty_str(self) -> None:
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert isinstance(STALE_KNOWLEDGE_ANNOTATION_NORM, str)
+        assert STALE_KNOWLEDGE_ANNOTATION_NORM
+
+    def test_embedded_exactly_once_in_stage1_prompt(self) -> None:
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert STAGE1_SYSTEM_PROMPT.count(STALE_KNOWLEDGE_ANNOTATION_NORM) == 1, (
+            'STAGE1_SYSTEM_PROMPT must interpolate STALE_KNOWLEDGE_ANNOTATION_NORM '
+            'verbatim, exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        )
+
+    def test_embedded_exactly_once_in_stage2_prompt(self) -> None:
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert STAGE2_SYSTEM_PROMPT.count(STALE_KNOWLEDGE_ANNOTATION_NORM) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate STALE_KNOWLEDGE_ANNOTATION_NORM '
+            'verbatim, exactly once (INV-5: stated once, interpolated, never re-pasted).'
+        )
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_survives_both_build_stage2_system_prompt_branches(self, project_id: str) -> None:
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        built = build_stage2_system_prompt(project_id)
+        assert STALE_KNOWLEDGE_ANNOTATION_NORM in built, (
+            f'build_stage2_system_prompt({project_id!r}) dropped '
+            'STALE_KNOWLEDGE_ANNOTATION_NORM.'
+        )
+
+    def test_absent_from_stage3_prompt(self) -> None:
+        """Stage 3 holds none of update_memory / redact_episode_content /
+        delete_episode after step-4 — it must not be told how to use them.
+        The "never tell a stage about an action it is not sanctioned to
+        take" rule that render_escalation_boundary_note's docstring states."""
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert STALE_KNOWLEDGE_ANNOTATION_NORM not in STAGE3_SYSTEM_PROMPT
+
+    def test_does_not_contain_the_available_tools_sentinel(self) -> None:
+        """build_stage2_system_prompt raises RuntimeError unless
+        '## Available Tools' appears exactly once in STAGE2_SYSTEM_PROMPT —
+        the constant must not introduce a second occurrence."""
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert '## Available Tools' not in STALE_KNOWLEDGE_ANNOTATION_NORM
+
+    def test_does_not_contain_a_bare_recon_report_example(self) -> None:
+        """test_recon_report_guidance_drift.py scans the assembled prompts and
+        requires every recon-report tool-call example to carry run_id=; the
+        norm must introduce none."""
+        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert 'mcp__recon-report__' not in STALE_KNOWLEDGE_ANNOTATION_NORM
