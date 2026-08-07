@@ -1,10 +1,16 @@
 """Guard test: exactly one ``lock_table.release(...)`` call under
 orchestrator/src, and it must live inside ``Scheduler.release``.
 
+This module docstring is the single canonical write-up of that rationale;
+the scheduler.py comment and the behavioural tests in test_scheduler.py
+point here rather than restating it.
+
 ``Scheduler.release`` (orchestrator/src/orchestrator/scheduler.py) is the
 single writer for freeing a task's module locks — see contract C5 of
-plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. It is the ONLY path
-that emits ``lock_released``, and it also snapshots the held modules before
+plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. It is the only path
+that emits a *full-release* ``lock_released`` (``lock_table.release_subset``
+emits the narrower ``reason='plan_refinement'`` partial, which closes only
+the modules it narrows away), and it also snapshots the held modules before
 releasing, clears ``_dispatched`` / ``_dispatched_priority``, arms the
 requeue cooldown, and runs the defensive ``clear_parks_for``.
 
@@ -34,6 +40,7 @@ of orchestrator/tests/test_prune_chokepoint_guard.py, whose
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import TypeGuard
 
@@ -47,20 +54,69 @@ _CHOKEPOINT_METHOD = 'release'
 _SRC_DIR = Path(__file__).parent.parent / 'src'
 
 
-def _is_lock_table_release(node: ast.AST) -> TypeGuard[ast.Call]:
-    """True if *node* is a ``<expr>.lock_table.release(...)`` call.
+def _lock_table_aliases(tree: ast.Module) -> frozenset[str]:
+    """Local names bound to the lock table by an alias assignment.
 
-    Three properties this matcher must have:
+    A bypass need not be spelled ``self.lock_table.release(...)``:
+    ``lt = self.lock_table`` followed by ``lt.release(task_id)`` frees the
+    same locks through an ``ast.Name`` receiver, which a receiver-anchored
+    Attribute matcher alone would silently miss while the total stayed at 1
+    and the guard stayed green. That alias idiom is live in this codebase
+    (``lt = scheduler.lock_table`` in test_scheduler.py), so the scanner
+    resolves it instead of trusting the spelling.
+
+    Collected module-wide rather than per-function: strictly broader, and a
+    false positive here fails the guard loudly (the safe direction) rather
+    than leaving a real bypass unseen.
+    """
+    aliases: set[str] = set()
+
+    def _record(target: ast.AST, value: ast.AST | None) -> None:
+        # `<name> = <expr>.lock_table` — the alias shape. Tuple/starred
+        # targets are deliberately not unpacked: `.lock_table` is not
+        # iterable, so no real alias can hide there.
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Attribute)
+            and value.attr == _GUARDED_RECEIVER
+        ):
+            aliases.add(target.id)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                _record(target, node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            # AnnAssign.value is Optional; _record's isinstance check drops it.
+            _record(node.target, node.value)
+
+    return frozenset(aliases)
+
+
+def _is_lock_table_release(
+    node: ast.AST, aliases: frozenset[str] = frozenset()
+) -> TypeGuard[ast.Call]:
+    """True if *node* is a ``release(...)`` call on the lock table.
+
+    Matches both the direct ``<expr>.lock_table.release(...)`` spelling and a
+    ``<name>.release(...)`` call whose receiver resolves to the lock table —
+    either the bare name ``lock_table`` (a parameter or module-level binding)
+    or one of *aliases*, the names :func:`_lock_table_aliases` found bound to
+    ``<expr>.lock_table` in the same module.
+
+    Four properties this matcher must have:
 
     - ``ast.Call``-only, so ``ModuleLockTable.release``'s own DEFINITION in
       scheduler.py (an ``ast.FunctionDef``) is not matched — the invariant
       is about call sites, not about the implementation they call.
     - ``attr == 'release'`` exactly, so ``lock_table.release_subset(...)``
-      — which already emits ``lock_released`` with
-      ``reason='plan_refinement'`` — is not matched.
-    - Receiver-anchored on ``lock_table``, so unrelated ``.release()``
-      calls elsewhere in the tree (semaphores, locks, connections) are not
+      — which emits its own ``reason='plan_refinement'`` partial — is not
       matched.
+    - Anchored on the lock table, so unrelated ``.release()`` calls
+      elsewhere in the tree (semaphores, permit ledgers, lane pools) are not
+      matched.
+    - Alias-aware, so the anchor cannot be sidestepped by binding the table
+      to a local first.
     """
     if not isinstance(node, ast.Call):
         return False
@@ -68,10 +124,11 @@ def _is_lock_table_release(node: ast.AST) -> TypeGuard[ast.Call]:
     if not isinstance(func, ast.Attribute) or func.attr != _GUARDED_METHOD:
         return False
     receiver = func.value
-    return (
-        isinstance(receiver, ast.Attribute)
-        and receiver.attr == _GUARDED_RECEIVER
-    )
+    if isinstance(receiver, ast.Attribute):
+        return receiver.attr == _GUARDED_RECEIVER
+    if isinstance(receiver, ast.Name):
+        return receiver.id == _GUARDED_RECEIVER or receiver.id in aliases
+    return False
 
 
 def _chokepoint_ranges(tree: ast.Module) -> list[tuple[int, int]]:
@@ -123,20 +180,31 @@ def _find_lock_table_releases(source: str) -> list[tuple[int, bool]]:
         return []
 
     chokepoint_ranges = _chokepoint_ranges(tree)
+    aliases = _lock_table_aliases(tree)
 
     results: list[tuple[int, bool]] = []
     for node in ast.walk(tree):
-        if _is_lock_table_release(node):
+        if _is_lock_table_release(node, aliases):
             lineno = node.lineno
             inside = any(start <= lineno <= end for start, end in chokepoint_ranges)
             results.append((lineno, inside))
+    # ast.walk is breadth-first, so hits come out in tree-depth order, not
+    # source order. Sort so offender lists and the synthetic-source
+    # assertions below read top-to-bottom.
+    results.sort(key=lambda hit: hit[0])
     return results
 
 
-def _scan_src() -> tuple[int, list[str], list[str]]:
+@functools.lru_cache(maxsize=1)
+def _scan_src() -> tuple[int, tuple[str, ...], tuple[str, ...]]:
     """Scan orchestrator/src, returning (total, offenders, outside_chokepoint).
 
     Entries are ``'<rel_path>:<lineno>: <line_text>'`` strings.
+
+    Cached: parsing the whole src tree (scheduler.py alone is ~7k lines) is
+    the module's dominant cost and every test here wants the same answer —
+    nothing that could change it moves within a session. Results are tuples
+    so a caller cannot mutate the shared cached value.
     """
     offenders: list[str] = []
     outside_chokepoint: list[str] = []
@@ -160,19 +228,20 @@ def _scan_src() -> tuple[int, list[str], list[str]]:
             if not inside:
                 outside_chokepoint.append(entry)
 
-    return total, offenders, outside_chokepoint
+    return total, tuple(offenders), tuple(outside_chokepoint)
 
 
 def test_no_lock_table_release_outside_scheduler_release() -> None:
     """Every ``lock_table.release(...)`` must route through
-    ``Scheduler.release`` — the single writer, and the only emitter of
-    ``lock_released``.
+    ``Scheduler.release`` — the single writer, and the only emitter of a
+    full-release ``lock_released``.
     """
     total, offenders, outside_chokepoint = _scan_src()
 
     remediation = (
         'route it through `Scheduler.release(task_id, ...)`, the only site '
-        'that emits `lock_released` — see contract C5 of '
+        'that emits a full-release `lock_released` (`release_subset` emits '
+        'only the narrower `plan_refinement` partial) — see contract C5 of '
         'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. A direct '
         '`lock_table.release` empties _held[task_id] first, so the later '
         'teardown release() snapshots modules == [] and skips its emit too, '
@@ -246,6 +315,57 @@ def test_guard_flags_a_synthetic_bypass() -> None:
     outside = [lineno for lineno, inside in hits if not inside]
     assert outside == [6], (
         f'expected exactly one outside-chokepoint hit at line 6; got {outside!r}'
+    )
+
+
+def test_guard_flags_a_bypass_laundered_through_an_alias() -> None:
+    """A bypass that binds the table to a local first must still be flagged.
+
+    ``lt = self.lock_table; lt.release(task_id)`` frees exactly the same
+    locks as the direct spelling, but presents an ``ast.Name`` receiver.
+    Without alias resolution the scanner would miss it while the total stayed
+    at 1 and the guard stayed silently green — and the alias idiom is live in
+    this codebase, so this is not a hypothetical shape.
+    """
+    synthetic_source = (
+        'class Scheduler:\n'
+        '    def release(self, task_id):\n'
+        '        self.lock_table.release(task_id)\n'   # line 3: sanctioned
+        '\n'
+        '    def sneaky(self, task_id):\n'
+        '        lt = self.lock_table\n'
+        '        lt.release(task_id)\n'                # line 7: aliased bypass
+        '\n'
+        '\n'
+        'def helper(lock_table, task_id):\n'
+        '    lock_table.release(task_id)\n'            # line 11: bare-name bypass
+    )
+
+    hits = _find_lock_table_releases(synthetic_source)
+
+    assert hits == [(3, True), (7, False), (11, False)], (
+        'the detector must resolve `lt = self.lock_table` and the bare '
+        f'`lock_table` parameter back to the lock table; got {hits!r}'
+    )
+
+
+def test_guard_ignores_unrelated_names_that_merely_have_release() -> None:
+    """Alias resolution must not turn every ``<name>.release()`` into a hit.
+
+    Only names actually bound to ``<expr>.lock_table`` (or literally named
+    ``lock_table``) count — otherwise the guard would fire on every semaphore
+    and permit ledger in the tree and stop meaning anything.
+    """
+    synthetic_source = (
+        'def unrelated(permits, task_id):\n'
+        '    sem = permits.semaphore\n'
+        '    sem.release()\n'
+        '    ledger = self._speculation_ledger\n'
+        '    ledger.release(task_id)\n'
+    )
+
+    assert _find_lock_table_releases(synthetic_source) == [], (
+        'a `.release()` on a name not bound to the lock table must not match'
     )
 
 
