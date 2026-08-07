@@ -527,19 +527,55 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # was consuming 76% of the old per-command ceiling.
 #
 # WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
-# each subproject's own orchestrator.yaml, plus tests/scripts/orchestrator.yaml's
-# 600s — not on starving the whole-fleet fallback chain. The tight-timeout
-# rationale still holds and is unchanged in KIND: a genuine hang should still
-# surface on the first verify that touches the module, not 8 days later at a
-# post-completion full review. But that property cannot hold at the FLEET level,
-# because a ceiling a green run cannot clear surfaces nothing but false
-# infra_timeouts. It holds per-module, where each suite's real cost is known.
+# each subproject's own orchestrator.yaml — not on starving the whole-fleet
+# fallback chain. The tight-timeout rationale still holds and is unchanged in
+# KIND: a genuine hang should still surface on the first verify that touches the
+# module, not 8 days later at a post-completion full review. But that property
+# cannot hold at the FLEET level, because a ceiling a green run cannot clear
+# surfaces nothing but false infra_timeouts. It holds per-module, where each
+# suite's real cost is known.
+#
+# THE ACTUAL DISPOSITION, because the sentence above used to overclaim it and
+# that is exactly how the gap went unnoticed (task 3473). When 3473 was filed
+# this claim was true for ONE discovered module config; when it was planned,
+# three. It is now true of EVERY discovered module config EXCEPT `orchestrator`.
+# Each declared budget is sized from that module's own measured worst run at
+# ~2.6x, floored at 600s, and they range from 600s to 2400s — the per-module
+# yamls carry the figures and the derivation, and are the single place those
+# numbers live. They are deliberately NOT copied here: a second copy of a
+# measurement is a second thing to raise in lockstep, which is the drift the
+# RAISE-TOGETHER rule in each provenance block exists to prevent.
+#
+# `orchestrator` is the one exception, and it is a REPORTED gap rather than a
+# hidden one: it declares no budget and so still falls through to the 3600 below
+# (verify._resolve_verify_timeout does not "inherit-ish" — an unset module knob
+# is a HARD fall-through to this value). Closing it is task 3353's scope, not
+# 3473's. That is not mere deference: 3353 has since been rewritten to split or
+# shard the orchestrator suite, so a budget sized now against today's unsharded
+# 1366.23s figure would be invalidated by 3353's own change rather than refined
+# by it. It is carried as the single documented entry in MODULE_BUDGET_EXCLUSIONS
+# with a stated deletion condition — once orchestrator/orchestrator.yaml declares
+# its own verify_command_timeout_secs, delete that entry and the coverage guard
+# picks it up with no further edit.
+#
+# WHAT KEEPS THAT PARAGRAPH TRUE rather than merely asserted:
+# tests/scripts/test_module_verify_budgets.py::
+# test_every_discovered_module_config_declares_its_own_verify_budget. It walks
+# what config._discover_module_configs actually REGISTERS rather than a frozen
+# list, so a newly-registered module config landing with no budget fails it with
+# no edit to the guard — and an exclusion cannot be added anonymously, since each
+# justification is a checked value that must name an owning task id.
+#
+# The two values below are UNCHANGED by task 3473 and must stay that way. They
+# bound the whole-fleet fallback chain, and every per-module budget asserts
+# strictly-below against 3600 — lowering it would break those assertions across
+# the board as well as the floor guard named next.
 # Guarded by tests/scripts/test_fallback_verify_config.py::
 # test_fallback_verify_budget_clears_the_measured_fleet_chain_floor.
 #
-# BE PRECISE ABOUT WHAT THAT GUARD DOES, because overclaiming it would repeat
-# this comment's own original sin. It asserts the measured floor rather than
-# pinning a value, so it catches anyone LOWERING this budget back below
+# BE PRECISE ABOUT WHAT THAT FLEET-CHAIN-FLOOR GUARD DOES, because overclaiming
+# it would repeat this comment's own original sin. It asserts the measured floor
+# rather than pinning a value, so it catches anyone LOWERING this budget below
 # 1838.60s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
 # frozen literal table, so if the orchestrator segment doubles tomorrow the
 # table still reads 1366.23, the floor still reads 1838.60, and the guard stays
