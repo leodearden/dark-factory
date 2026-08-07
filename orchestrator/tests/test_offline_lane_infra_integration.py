@@ -581,10 +581,12 @@ async def _assert_infra_never_a_gate(
     for the infra seam — same four assertions, held on the INFRA sub-run
     in-flight rather than the numeric one:
 
-    (1)+(2) ``harness._note_merge_all`` — the exact ``on_merge_landed``
-    callback ``SpeculativeMergeWorker`` invokes (``harness.py:4979``) —
-    must return promptly and must set ``worker._dirty`` (arming a
-    coalesced re-run).
+    (1)+(2) ``harness._note_offline_lane`` — the synchronous notifiee call
+    ``_note_merge_all`` (the exact ``on_merge_landed`` callback
+    ``SpeculativeMergeWorker`` invokes, ``harness.py:4979``) awaits AHEAD of
+    its diff fetch — must return promptly. ``_note_merge_all`` itself is
+    then exercised immediately after, unbounded, and must still set
+    ``worker._dirty`` (arming a coalesced re-run).
     (3) A raising notifiee is fail-open: ``_note_offline_lane``'s own
     try/except (``harness.py:5072-5079``) swallows it — the SAME shape
     ``SpeculativeMergeWorker`` independently wraps this exact call in
@@ -598,18 +600,31 @@ async def _assert_infra_never_a_gate(
 
     base_sha = await git_ops.get_main_sha()
     head_sha = await _advance_main(repo)
-    # Left at 0.5s (task 3832 assessment, NOT the _run_lane flake class):
-    # unlike _run_lane's budget, this window covers only
-    # ``harness._note_merge_all`` -> ``worker.on_post_merge``, which is a bare
-    # enqueue-and-return (sets ``_dirty`` + an event, no subprocess spawn) —
-    # the real-git ``_advance_main`` call above already returned before this
-    # wait_for starts. This bound is instead a genuine promptness assertion
-    # (proves the synchronous fan-out never blocks on the in-flight infra
-    # run); widening it would weaken what it's testing.
+    # Bounded at 0.5s (task 3832 assessment, NOT the _run_lane flake class):
+    # this window covers only ``harness._note_offline_lane`` ->
+    # ``worker.on_post_merge`` (harness.py:9333-9349, offline_lane.py:352-
+    # 366), a bare enqueue-and-return (sets ``_dirty`` + an event, no
+    # subprocess spawn) — exactly the documented "MUST enqueue-and-return
+    # promptly ... rather than perform the deep-test run inline" contract
+    # (harness.py:9342-9348). This is a genuine promptness assertion (proves
+    # the synchronous on_merge_landed fan-out never blocks on the in-flight
+    # infra run); widening it would weaken what it's testing.
+    #
+    # ``_note_merge_all`` is called separately, UNBOUNDED, right after:
+    # unlike ``_note_offline_lane`` alone, it unconditionally runs
+    # ``git_ops.get_merge_diff_files`` (a real ``git diff`` subprocess spawn)
+    # once ``_note_offline_lane`` returns, so bounding IT at 0.5s would sit
+    # in the same load-sensitive flake class this task (3832) exists to
+    # remove (task 3451 measured 4.71s worst-case single-spawn latency under
+    # load). The resulting double-invoke of ``on_post_merge`` is safe — it
+    # is idempotent (sets ``_dirty = True`` and an already-set
+    # ``asyncio.Event``) — so the assertions below still exercise the full
+    # fan-out unchanged.
     await asyncio.wait_for(
-        harness._note_merge_all('task-2', base_sha, head_sha),
+        harness._note_offline_lane('task-2', base_sha, head_sha),
         timeout=0.5,
     )
+    await harness._note_merge_all('task-2', base_sha, head_sha)
     assert worker._dirty is True, (
         'a landed advance during an in-flight infra run must arm a coalesced re-run'
     )
