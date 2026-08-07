@@ -181,9 +181,32 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     run_store.py:90) — no new pragma policy and no second durability story.  The 5s
     ``busy_timeout`` is what absorbs concurrent merge-lane contention, in place of a
     hand-rolled lock.
+
+    The close-on-failure guard exists because ``sqlite3.connect()`` succeeds LAZILY
+    even against a non-DB file: the failure surfaces on the first real statement — the
+    ``PRAGMA journal_mode=WAL`` inside ``apply_full_durability_pragmas_sync`` — by
+    which point ``conn`` already owns an open file descriptor that nothing else will
+    ever close.
     """
     conn = sqlite3.connect(str(db_path))
-    apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+    # The two sibling stores share the connect-then-pragma idiom WITHOUT this guard,
+    # and that is fine for them: they propagate the raise and the caller stops, so the
+    # process is dying anyway.  Do not "align" this back to them.  B12 makes every
+    # public entry point here deliberately SWALLOW the exception and return an honest
+    # degrade value, so a long-lived orchestrator keeps calling on every merge —
+    # turning a one-shot leak into an unbounded one.  Each entry point reaches
+    # `_connect` twice (once via `ensure_schema`, once for the statement itself), which
+    # is the measured 2-fds-per-call leak rate.
+    #
+    # BaseException, not Exception: this is resource cleanup, so a KeyboardInterrupt or
+    # SystemExit arriving mid-pragma must still release the fd.  The bare `raise`
+    # preserves the original exception and traceback, so the caller's B12 catch-all
+    # still logs the true cause with exc_info=True.
+    try:
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
