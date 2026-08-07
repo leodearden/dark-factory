@@ -72,12 +72,6 @@ def _column_names(db_path: Path, table: str) -> list[str]:
     return [r['name'] for r in _rows(db_path, f'PRAGMA table_info({table})')]
 
 
-def _table_sql(db_path: Path, name: str) -> str:
-    rows = _rows(db_path, 'SELECT sql FROM sqlite_master WHERE name = ?', (name,))
-    assert rows, f'no sqlite_master entry for {name!r}'
-    return rows[0]['sql'] or ''
-
-
 class TestEnsureSchema:
     """``ensure_schema`` creates both PRD §5.3 tables additively on an existing runs.db."""
 
@@ -124,15 +118,15 @@ class TestEnsureSchema:
         db_path = tmp_path / 'runs.db'
         ensure_schema(db_path)
 
-        assert 'AUTOINCREMENT' in _table_sql(db_path, 'flake_occurrence').upper()
-
         pk_columns = [
             r['name'] for r in _rows(db_path, 'PRAGMA table_info(flake_occurrence)') if r['pk']
         ]
         assert pk_columns == ['id']
 
         # AUTOINCREMENT (as opposed to plain INTEGER PRIMARY KEY) materialises
-        # sqlite_sequence on first insert — monotonic ids, never reused.
+        # sqlite_sequence on first insert — monotonic ids, never reused.  This is the
+        # BEHAVIOURAL proof and it is the whole assertion: an `'AUTOINCREMENT' in sql`
+        # substring check would also match the word sitting in a comment.
         conn = sqlite3.connect(str(db_path))
         try:
             conn.execute(
@@ -147,24 +141,42 @@ class TestEnsureSchema:
 
     def test_dedup_index_is_unique_on_the_idempotency_triple(self, tmp_path: Path) -> None:
         """§8.3's idempotency key ``(test_id, observed_at, call_site)`` is enforced
-        declaratively by a UNIQUE index, not by swallowing an IntegrityError."""
+        declaratively by a UNIQUE index, not by swallowing an IntegrityError.
+
+        Asserted STRUCTURALLY, via ``PRAGMA index_list``/``index_info``, not by grepping
+        the DDL text: ``'unique' in sql.lower()`` would still pass if the keyword were
+        dropped and the index merely NAMED ``..._unique``, and a substring check on the
+        column names cannot tell the correct triple from a superset or a different order.
+        The PRAGMAs report what SQLite actually built.
+        """
         from orchestrator.flake_ledger import ensure_schema
 
         db_path = tmp_path / 'runs.db'
         ensure_schema(db_path)
 
-        indexes = _rows(db_path, "SELECT name, sql FROM sqlite_master WHERE type='index'")
-        dedup = [
-            r
-            for r in indexes
-            if r['sql']
-            and 'flake_occurrence' in r['sql']
-            and 'test_id' in r['sql']
-            and 'observed_at' in r['sql']
-            and 'call_site' in r['sql']
-        ]
-        assert len(dedup) == 1, f'expected exactly one dedup index, got {indexes}'
-        assert 'unique' in dedup[0]['sql'].lower()
+        index_list = {r['name']: r for r in _rows(db_path, 'PRAGMA index_list(flake_occurrence)')}
+        assert 'idx_flake_occurrence_dedup' in index_list
+        assert index_list['idx_flake_occurrence_dedup']['unique'] == 1
+
+        # Exact ORDERED column list, so a reordered or widened key is a failure.
+        assert [
+            r['name'] for r in _rows(db_path, 'PRAGMA index_info(idx_flake_occurrence_dedup)')
+        ] == ['test_id', 'observed_at', 'call_site']
+
+    def test_observed_at_index_serves_the_window_scan(self, tmp_path: Path) -> None:
+        """``since``/``limit`` reads scan by ``observed_at``; the index is non-UNIQUE
+        because many tests are legitimately observed at the same instant."""
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        index_list = {r['name']: r for r in _rows(db_path, 'PRAGMA index_list(flake_occurrence)')}
+        assert 'idx_flake_occurrence_observed' in index_list
+        assert index_list['idx_flake_occurrence_observed']['unique'] == 0
+        assert [
+            r['name'] for r in _rows(db_path, 'PRAGMA index_info(idx_flake_occurrence_observed)')
+        ] == ['observed_at']
 
     def test_column_defaults(self, tmp_path: Path) -> None:
         """``open_count`` NOT NULL DEFAULT 1 and ``detail`` DEFAULT '{}', verified by
@@ -281,6 +293,33 @@ class TestFlakeVerdict:
         assert FlakeVerdict.passes_in_isolation == 'passes_in_isolation'
         assert FlakeVerdict.fails_in_isolation == 'fails_in_isolation'
         assert FlakeVerdict.unconfirmable == 'unconfirmable'
+
+
+class TestFlakeCallSite:
+    """PRD §5.3's ``call_site`` vocabulary, an enum for the same reason the verdict is.
+
+    Sharper edge than the verdict, in fact: ``call_site`` is one third of §8.3's dedup
+    key, so a typo at one producer ('merge-gate') would both defeat idempotency and split
+    θ's per-site rates into two half-populated buckets that read as a trend, not a bug.
+    """
+
+    def test_exact_member_set(self) -> None:
+        from orchestrator.flake_ledger import FlakeCallSite
+
+        assert {c.value for c in FlakeCallSite} == {
+            'merge_gate',
+            'main_probe',
+            'chronic_marker',
+        }
+
+    def test_is_str_comparable(self) -> None:
+        """String-comparability is what lets a member bind straight into a SQL
+        parameter with no codec."""
+        from orchestrator.flake_ledger import FlakeCallSite
+
+        assert FlakeCallSite.merge_gate == 'merge_gate'
+        assert FlakeCallSite.main_probe == 'main_probe'
+        assert FlakeCallSite.chronic_marker == 'chronic_marker'
 
 
 class TestFlakeSuppression:
@@ -761,6 +800,131 @@ class TestRecordFlakeOccurrenceWireDeserializedVerdict:
         _assert_logged_loudly(caplog)
 
 
+class TestRecordFlakeOccurrenceWireHardening:
+    """The other three key-bearing fields get the same treatment ``verdict`` gets.
+
+    ``FlakeSuppression`` rides the wire with NO runtime validation, and ``call_site`` and
+    ``observed_at`` are each one third of §8.3's ``(test_id, observed_at, call_site)``
+    idempotency key — so a malformed one does not merely look wrong, it silently DEFEATS
+    dedup and skews θ's rates.  ``test_ids`` is not in the key but is the evidence trail
+    itself.
+    """
+
+    def _record(self, db_path: Path, **overrides) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(**overrides),
+            merge_sha='abc123',
+            task_id='3785',
+        )
+
+    def test_str_call_site_round_trips(self, tmp_path: Path) -> None:
+        """A JSON round-trip hands ``call_site`` back as a plain str, exactly as it does
+        ``verdict``; the coercion must accept it, not reject it."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, call_site='main_probe')
+
+        assert _rows(db_path, 'SELECT call_site FROM flake_occurrence')[0]['call_site'] == (
+            'main_probe'
+        )
+
+    @pytest.mark.parametrize(
+        'bogus', ['merge-gate', 'MERGE_GATE', '', None], ids=['hyphen', 'upper', 'empty', 'none']
+    )
+    def test_an_unrecognised_call_site_degrades_through_b12(
+        self, tmp_path: Path, caplog, bogus
+    ) -> None:
+        """'merge-gate' for 'merge_gate' is the whole reason this is an enum: persisted
+        verbatim it would dedup against nothing and split θ's per-site rates in two."""
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path, call_site=bogus)
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+        _assert_logged_loudly(caplog)
+
+    def test_z_suffixed_and_offset_stamps_dedup_to_one_row(self, tmp_path: Path) -> None:
+        """The defect this closes: ``'…T12:00:00Z'`` and ``'…T12:00:00+00:00'`` are the
+        SAME instant in two valid spellings, so without normalisation one observation
+        lands twice — idempotency defeated — and the two forms sort apart inside a
+        ``since`` window, skewing θ's rates."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, observed_at='2026-08-06T12:00:00Z')
+        self._record(db_path, observed_at='2026-08-06T12:00:00+00:00')
+
+        rows = _rows(db_path, 'SELECT observed_at FROM flake_occurrence')
+        assert len(rows) == 1
+        # Canonicalised to the explicit-offset spelling, so the TEXT column's
+        # lexicographic order is the chronological order `since` relies on.
+        assert rows[0]['observed_at'] == '2026-08-06T12:00:00+00:00'
+
+    def test_a_non_utc_offset_is_converted_not_stored_verbatim(self, tmp_path: Path) -> None:
+        """13:00+01:00 IS 12:00Z.  Stored verbatim it would sort AFTER a 12:30Z
+        observation that actually happened later."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, observed_at='2026-08-06T13:00:00+01:00')
+
+        assert _rows(db_path, 'SELECT observed_at FROM flake_occurrence')[0]['observed_at'] == (
+            '2026-08-06T12:00:00+00:00'
+        )
+
+    def test_a_naive_stamp_is_read_as_utc_not_as_host_local_time(self, tmp_path: Path) -> None:
+        """The field is documented as UTC, so a missing offset is ATTACHED, never
+        ``.astimezone()``-ed — that would apply the DISPATCHER's local offset and
+        silently shift a remote host's observation."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, observed_at='2026-08-06T12:00:00')
+
+        assert _rows(db_path, 'SELECT observed_at FROM flake_occurrence')[0]['observed_at'] == (
+            '2026-08-06T12:00:00+00:00'
+        )
+
+    @pytest.mark.parametrize(
+        'bogus', ['not-a-date', '', None, 0], ids=['garbage', 'empty', 'none', 'int']
+    )
+    def test_a_malformed_observed_at_degrades_through_b12(
+        self, tmp_path: Path, caplog, bogus
+    ) -> None:
+        """Dropping the write is the lesser evil: a stamp that parses as nothing breaks
+        BOTH the dedup key and the window scan for every later read."""
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path, observed_at=bogus)
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+        _assert_logged_loudly(caplog)
+
+    def test_a_bare_str_test_ids_does_not_fan_out_per_character(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """One node-id passed unwrapped is an easy mistake at ε's call site, it is
+        TRUTHY, and ``tuple('a::t')`` explodes it into one row PER CHARACTER — a dozen
+        garbage test_ids written into the exact table this PRD exists to make
+        trustworthy.  Wrapped, not dropped: a single node-id string has one honest
+        reading, so the observation survives and the warning names the producer bug."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path, test_ids='tests/test_a.py::test_one')
+
+        assert [r.test_id for r in read_occurrences(db_path)] == ['tests/test_a.py::test_one']
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert 'test_ids' in warnings[0].getMessage()
+
+
 class TestReadOccurrences:
     """The reader filters ι (per-test recurrence chains) and θ (windowed rates) need,
     so neither hand-rolls SQL against these tables — §5.2's API-only rule."""
@@ -845,6 +1009,51 @@ class TestReadOccurrences:
 
         rows = read_occurrences(db_path, test_id=self.TEST_B, since=self.T_LATE)
         assert [(r.observed_at, r.test_id) for r in rows] == [(self.T_LATE, self.TEST_B)]
+
+    def test_limit_returns_the_most_recent_rows_still_oldest_first(self, tmp_path: Path) -> None:
+        """``flake_occurrence`` is append-only and UNPRUNED by design, so the reader has
+        to be boundable — and the only bound worth having on an ever-growing table is its
+        TAIL.  A bare ``LIMIT`` on the ascending contract order would hand a dashboard
+        asking "what happened lately?" the OLDEST rows, which is worse than no bound
+        because it looks like an answer."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        assert [(r.observed_at, r.test_id) for r in read_occurrences(db_path, limit=2)] == [
+            (self.T_MID, self.TEST_A),  # the later of the two T_MID rows (higher id)
+            (self.T_LATE, self.TEST_B),
+        ]
+
+    def test_limit_larger_than_the_table_returns_everything(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        assert read_occurrences(db_path, limit=99) == read_occurrences(db_path)
+
+    def test_limit_composes_with_the_other_filters(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        rows = read_occurrences(db_path, test_id=self.TEST_B, since=self.T_MID, limit=1)
+        assert [(r.observed_at, r.test_id) for r in rows] == [(self.T_LATE, self.TEST_B)]
+
+    @pytest.mark.parametrize('limit', [0, -1], ids=['zero', 'negative'])
+    def test_a_non_positive_limit_yields_nothing(self, tmp_path: Path, limit: int) -> None:
+        """SQLite reads a NEGATIVE ``LIMIT`` as "no limit at all" — the exact silent
+        opposite of the request, on the one read path whose point is to stay bounded.
+        Clamped, so ``limit=-1`` returns nothing rather than the whole table."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        assert read_occurrences(db_path, limit=limit) == []
 
     def test_missing_db_returns_empty(self, tmp_path: Path) -> None:
         from orchestrator.flake_ledger import read_occurrences
@@ -982,6 +1191,54 @@ class TestOpenDebt:
         assert row is not None
         assert row.owner_task_id is None
 
+    async def test_open_debt_refuses_the_unknown_sentinel(self, tmp_path: Path, caplog) -> None:
+        """``UNKNOWN_TEST_ID`` names no test, so it can own no de-flake task — and this
+        is REFUSED rather than merely documented, because ε/ζ plausibly iterate the
+        test_ids of a recorded occurrence batch, which is exactly where the sentinel
+        lives.  An accepted ``<unknown>`` row would show up in ι's report and, once ζ
+        lands, file a de-flake task against a test that does not exist."""
+        import logging
+
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, ensure_schema, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert await open_debt(db_path, 'dark_factory', UNKNOWN_TEST_ID, now=self.NOW) is None
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 0
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert UNKNOWN_TEST_ID in warnings[0].getMessage()
+
+    async def test_the_sentinel_still_records_as_an_occurrence(self, tmp_path: Path) -> None:
+        """The refusal is scoped to DEBT, not to the evidence trail: θ's class-1 health
+        check is an ``unconfirmable`` RATE, so the occurrence must still be counted."""
+        from orchestrator.flake_ledger import (
+            UNKNOWN_TEST_ID,
+            FlakeVerdict,
+            list_open_debt,
+            read_occurrences,
+            record_flake_occurrence,
+        )
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(
+                verdict=FlakeVerdict.unconfirmable,
+                test_ids=(),
+                unconfirmable_reason='node-ids mapped to no discovered subproject',
+            ),
+            merge_sha=None,
+            task_id=None,
+        )
+
+        assert [r.test_id for r in read_occurrences(db_path)] == [UNKNOWN_TEST_ID]
+        assert list_open_debt(db_path) == []
+
 
 @pytest.mark.asyncio
 class TestResolveDebt:
@@ -1079,7 +1336,13 @@ class TestResolveDebt:
         assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 0
         assert list_open_debt(db_path) == []
 
-    async def test_resolving_twice_is_idempotent(self, tmp_path: Path) -> None:
+    async def test_resolving_twice_keeps_the_first_resolution(self, tmp_path: Path) -> None:
+        """Genuinely idempotent, not last-write-wins.  A replayed "owning task went
+        terminal" event must not walk ``resolved_at`` FORWARD or overwrite
+        ``prior_resolving_commit`` on an already-closed cycle: those two fields are
+        carried into the next re-open and cited verbatim in η's
+        ``regressed_after_resolution`` L2, so last-write-wins would make them describe a
+        phantom resolution that happened after the fact."""
         from orchestrator.flake_ledger import open_debt, resolve_debt
 
         db_path = tmp_path / 'runs.db'
@@ -1092,10 +1355,35 @@ class TestResolveDebt:
         )
 
         (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
-        assert raw['resolved_at'] == self.LATEST.isoformat()
-        assert raw['prior_resolving_commit'] == 'c0ffee'
+        assert raw['resolved_at'] == self.LATER.isoformat()
+        assert raw['prior_resolving_commit'] == 'deadbee'
         # Resolving does not re-enter: only `open_debt` opens a cycle.
         assert raw['open_count'] == 1
+
+    async def test_the_guard_is_per_cycle_not_permanent(self, tmp_path: Path) -> None:
+        """Idempotence must not wedge the row shut: ``open_debt`` sets ``resolved_at``
+        back to NULL on re-entry, so the NEXT cycle resolves normally.  Without this the
+        first fix would be the only one the ledger could ever record."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+        )
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.LATEST)
+        await resolve_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            resolving_commit='c0ffee',
+            now=datetime(2026, 8, 6, 15, 0, tzinfo=UTC),
+        )
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['resolved_at'] == datetime(2026, 8, 6, 15, 0, tzinfo=UTC).isoformat()
+        assert raw['prior_resolving_commit'] == 'c0ffee'
+        assert raw['open_count'] == 2
 
 
 @pytest.mark.asyncio
@@ -1288,6 +1576,85 @@ class TestNeverRaisesAsync:
         _assert_logged_loudly(caplog)
 
 
+@pytest.mark.asyncio
+class TestOneConnectionPerCall:
+    """Every entry point opens exactly ONE sqlite3 connection.  ASYNC-ONLY CLASS.
+
+    Not a micro-optimisation: each connection pays the full five-pragma durability triad,
+    including a ``journal_mode=WAL`` switch and ``synchronous=FULL``, and these run on the
+    merge path.  The schema DDL is still issued on every call (deliberately un-memoized —
+    a per-path cache would go stale the moment the DB file is replaced), it just rides the
+    connection the statement was going to open anyway.
+
+    ``open_debt`` is the one that motivated this: it used to open FOUR — its own
+    ``ensure_schema`` plus upsert, then ``read_debt``'s ``ensure_schema`` plus SELECT.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    @staticmethod
+    def _count_connections(monkeypatch) -> list:
+        opened: list = []
+        real_connect = sqlite3.connect
+
+        def _recording_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
+        return opened
+
+    async def test_open_debt_opens_one_connection(self, tmp_path: Path, monkeypatch) -> None:
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        opened = self._count_connections(monkeypatch)
+        row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
+        # ...and it still returns the row, so the saving is not a dropped read-back.
+        assert row is not None
+        assert row.test_id == self.TEST_ID
+
+    async def test_resolve_debt_opens_one_connection(self, tmp_path: Path, monkeypatch) -> None:
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        opened = self._count_connections(monkeypatch)
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.NOW
+        )
+
+        assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
+
+    async def test_sync_entry_points_open_one_connection(self, tmp_path: Path, monkeypatch) -> None:
+        from orchestrator.flake_ledger import (
+            list_open_debt,
+            read_debt,
+            read_occurrences,
+            record_flake_occurrence,
+        )
+
+        db_path = tmp_path / 'runs.db'
+        opened = self._count_connections(monkeypatch)
+
+        for call in (
+            lambda: record_flake_occurrence(
+                db_path, 'dark_factory', _suppression(), merge_sha=None, task_id=None
+            ),
+            lambda: read_occurrences(db_path),
+            lambda: read_debt(db_path, self.TEST_ID),
+            lambda: list_open_debt(db_path),
+        ):
+            opened.clear()
+            call()
+            assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
+
+
 class TestConnectClosesOnPragmaFailure:
     """``_connect`` must not leak its sqlite3 connection when the pragma call raises.
 
@@ -1353,10 +1720,13 @@ class TestConnectClosesOnPragmaFailure:
         broken code when a collection happens to fire inside the window.
 
         Disabling the collector for the measurement window turns it into an exact
-        signal: measured at HEAD 5430cc0c8b the delta is EXACTLY +60 for 30 calls
-        (2 fds per call — ``ensure_schema``'s ``_connect`` plus the statement's own),
-        reproduced identically across 3 independent trials; against the fix it is
-        EXACTLY 0.  No tuned tolerance.
+        signal: measured at HEAD 5430cc0c8b the delta was EXACTLY +60 for 30 calls
+        (2 fds per call — back when ``ensure_schema`` opened its own connection beside
+        the statement's), reproduced identically across 3 independent trials; against the
+        fix it is EXACTLY 0.  No tuned tolerance.  Since the ``_open`` refactor an entry
+        point opens ONE connection, so an unfixed ``_connect`` would leak 30 here rather
+        than 60 — the RED signal is smaller but the assertion is unchanged, because the
+        bound is zero, not a threshold.
         """
         from orchestrator.flake_ledger import read_occurrences
 

@@ -34,7 +34,31 @@ because the recurrence trigger reads them, so deleting one would silently disarm
 ``flake_occurrence`` is append-only and UNPRUNED, bounded exactly the way ``events`` is
 — i.e. it isn't.  That is consistent with the rest of ``runs.db``, where nothing is
 pruned.  Do NOT add bespoke pruning for one table here; revisit repo-wide when ``events``
-retention is addressed.
+retention is addressed.  :func:`read_occurrences` therefore takes a ``limit`` — the read
+side is bounded even though the table is not.
+
+OWNERSHIP BOUNDARY vs ``chronic_flake.FilingLedger`` — a TRANSITIONAL overlap with a
+named owner, not a permanent second store.  ``chronic_flake.FilingLedger``
+(``data/orchestrator/chronic_flake_filings.json``, ``{test: last_filed_iso}``) is a
+per-test store of "when did we last auto-file a de-flake task for this test", backing
+the rate limit in ``maybe_file_chronic_flake_tasks``.  ``flake_debt`` covers
+substantially the same ground with a different clock and different dedup semantics, so
+during the overlap the boundary is:
+
+- ``FilingLedger`` answers *"may I file AGAIN yet?"* — a rate limit over the 3-in-20
+  chronic gate, keyed on a JSON file, still authoritative for that gate today.
+- ``flake_debt`` answers *"does this test currently OWE a de-flake task?"* — one row per
+  test with explicit open/resolve cycles and ``owner_task_id``.  It is the store the
+  §5.9 write-time invariant is enforced against.
+
+They converge in **task κ** (PRD §5.10, §10): κ migrates ``chronic_flake.py`` off JSONL
+onto this ledger, retires 3-in-20 from a filing GATE to a severity input — which is what
+makes ``FilingLedger``'s "may I file again yet?" question moot, since by then every
+suppressed test owes a task unconditionally — and turns ``CHRONIC-FLAKY`` markers into
+occurrence producers (``call_site='chronic_marker'``, which is why that member is already
+in :class:`FlakeCallSite`).  Boundary row B14 is κ's acceptance check: a marker with no
+JSONL present must produce an occurrence and **no second de-flake task**.  Until κ lands,
+do NOT wire a second filing path through this module — ζ owns the single filing seam.
 """
 
 from __future__ import annotations
@@ -115,6 +139,23 @@ class FlakeVerdict(StrEnum):
     unconfirmable = 'unconfirmable'  # could not map node-ids / could not re-run
 
 
+class FlakeCallSite(StrEnum):
+    """WHICH gate produced an observation (PRD §5.3's ``call_site`` vocabulary).
+
+    An enum for the same reason :class:`FlakeVerdict` is one, and with a sharper edge:
+    ``call_site`` is one third of §8.3's ``(test_id, observed_at, call_site)``
+    idempotency key, so a single typo at one call site ('merge-gate' for 'merge_gate')
+    would silently defeat dedup AND split θ's per-site rates into two half-populated
+    buckets — a drift that reads as a data trend rather than as a bug.  Coerced in
+    :func:`record_flake_occurrence`, so an unrecognised value degrades through B12
+    instead of being persisted verbatim.
+    """
+
+    merge_gate = 'merge_gate'  # the pre-merge verify gate
+    main_probe = 'main_probe'  # the periodic probe of main
+    chronic_marker = 'chronic_marker'  # a reify CHRONIC-FLAKY marker parsed from verify stdout
+
+
 @dataclass(frozen=True)
 class FlakeSuppression:
     """Discriminator output. Produced WHEREVER the worktree is (local or remote);
@@ -123,7 +164,7 @@ class FlakeSuppression:
     verdict: FlakeVerdict
     test_ids: tuple[str, ...]  # node-ids examined — EMPTY is legal only for `unconfirmable`
     observed_at: str  # ISO-8601 UTC, stamped by the DISCRIMINATOR at observation
-    call_site: str  # 'merge_gate' | 'main_probe' | 'chronic_marker'
+    call_site: FlakeCallSite  # WHICH gate observed this
     runner: str  # 'local' | remote host name — WHERE the re-run ran
     psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
@@ -194,9 +235,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     # process is dying anyway.  Do not "align" this back to them.  B12 makes every
     # public entry point here deliberately SWALLOW the exception and return an honest
     # degrade value, so a long-lived orchestrator keeps calling on every merge —
-    # turning a one-shot leak into an unbounded one.  Each entry point reaches
-    # `_connect` twice (once via `ensure_schema`, once for the statement itself), which
-    # is the measured 2-fds-per-call leak rate.
+    # turning a one-shot leak into an unbounded one.
     #
     # BaseException, not Exception: this is resource cleanup, so a KeyboardInterrupt or
     # SystemExit arriving mid-pragma must still release the fd.  The bare `raise`
@@ -210,25 +249,73 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _open(db_path: Path) -> sqlite3.Connection:
+    """Connect AND provision the schema on ONE connection — the only way in.
+
+    Every public entry point must guarantee the tables exist before its statement runs,
+    because the API is free functions taking a ``db_path`` (§8.3): the recorder is called
+    from stateless merge-path sites and a CLI, neither of which holds a long-lived store
+    object, so there is no constructor to run the DDL once.
+
+    The DDL is deliberately NOT memoized — a per-path cache would go stale the moment the
+    DB file is replaced or removed — but it does NOT need its own connection.  Running
+    ``CREATE TABLE IF NOT EXISTS`` on the connection the statement is about to use anyway
+    is what keeps a call at ONE connection instead of two (``open_debt`` was four: its
+    own pair plus ``read_debt``'s).  Each connection costs the full five-pragma
+    durability triad, including a ``journal_mode=WAL`` switch, so this is per-merge cost,
+    not a micro-optimisation.
+
+    The close-on-failure guard mirrors :func:`_connect`'s, for the same B12 reason: a
+    corrupt DB fails at ``executescript``, and a swallowed exception upstream would
+    otherwise leak this fd on every merge.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect(db_path)
+    try:
+        conn.executescript(_SCHEMA)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def ensure_schema(db_path: Path) -> None:
     """Create both ledger tables and their indexes if absent.  Additive and idempotent.
 
-    Called by every public entry point rather than once in a constructor: the API is
-    free functions taking a ``db_path`` (§8.3) because the recorder is called from
-    stateless merge-path sites and a CLI, neither of which holds a long-lived store
-    object.  ``CREATE TABLE IF NOT EXISTS`` is cheap and merge-path call frequency is a
-    handful per hour, so this is deliberately NOT memoized — a per-path cache would go
-    stale the moment the DB file is replaced or removed.
+    Public because ι and the tests want an explicit "provision this DB" verb; the other
+    entry points do NOT call it, they go through :func:`_open`, which provisions on the
+    connection they were opening regardless.
     """
     try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = _connect(db_path)
-        try:
-            conn.executescript(_SCHEMA)
-        finally:
-            conn.close()
+        _open(db_path).close()
     except Exception:
         logger.warning('flake_ledger: schema init failed for %s', db_path, exc_info=True)
+
+
+def _normalize_observed_at(raw: str) -> str:
+    """Canonicalise a discriminator stamp to ISO-8601 UTC.
+
+    ``observed_at`` is doubly load-bearing and arrives over the wire on a dataclass with
+    no runtime validation, so it gets the same coercion treatment as ``verdict``: it is
+    one third of §8.3's ``(test_id, observed_at, call_site)`` idempotency key, AND
+    :func:`read_occurrences`'s ``since`` window plus ``ORDER BY observed_at`` rely on
+    lexicographic order matching chronological order.  Two equally valid spellings of the
+    same instant — ``'…T12:00:00Z'`` from a hand-built stamp and ``'…T12:00:00+00:00'``
+    from ``datetime.isoformat()`` — would otherwise land the SAME observation twice and
+    sort apart inside a window.
+
+    A naive stamp gets UTC ATTACHED, never ``.astimezone()``: the field is documented as
+    UTC, and ``.astimezone()`` on a naive datetime applies the HOST's local offset, which
+    would silently shift a remote observation's stamp by the dispatcher's timezone.
+
+    Raises on a malformed stamp, deliberately — the caller's B12 catch-all turns that
+    into a loud warning and a dropped write, which beats persisting a stamp that breaks
+    both dedup and the window scan.
+    """
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
 
 
 def record_flake_occurrence(
@@ -245,7 +332,14 @@ def record_flake_occurrence(
     is both semantically right for the remote path (the observation happens on the
     remote host; the write happens later on the dispatcher) and mechanically required:
     §8.3's idempotency key is ``(test_id, observed_at, call_site)``, and a write-time
-    stamp would make every retry a distinct row.
+    stamp would make every retry a distinct row.  It is CANONICALISED on the way in (see
+    :func:`_normalize_observed_at`) so that two spellings of one instant cannot become
+    two observations.
+
+    *s* rides ``VerifyResult`` across the wire (§8) and carries NO runtime validation, so
+    all three key-bearing fields — ``verdict``, ``call_site``, ``observed_at`` — plus
+    ``test_ids`` are coerced/guarded here.  Anything that survives coercion is written;
+    anything that does not degrades through B12 (loud warning, nothing written, no raise).
     """
     # Bound BEFORE the try so the except handler's `len(test_ids)` can never itself
     # raise a NameError when the failure lands during triage — a B12 catch-all that
@@ -260,6 +354,26 @@ def record_flake_occurrence(
         # being written verbatim into the vocabulary column.  Everything downstream uses
         # `verdict`, never `s.verdict`.
         verdict = FlakeVerdict(s.verdict)
+        # Same hazard, same treatment: `call_site` is one third of the dedup key AND
+        # θ's per-site grouping key, so an unrecognised spelling must not be persisted.
+        call_site = FlakeCallSite(s.call_site)
+        observed_at = _normalize_observed_at(s.observed_at)
+
+        # A bare `str` where a tuple belongs is an easy mistake at ε's call site (one
+        # node-id passed unwrapped), it is TRUTHY, and `tuple('a::t')` explodes it into
+        # one row PER CHARACTER — a dozen garbage test_ids silently written into the
+        # evidence trail this PRD exists to make trustworthy.  Wrap rather than drop: a
+        # single node-id string has exactly one honest reading, so the observation is
+        # preserved, and the warning still surfaces the upstream bug.
+        supplied_test_ids: tuple[str, ...] | str = s.test_ids
+        if isinstance(supplied_test_ids, str):
+            logger.warning(
+                'flake_ledger: test_ids arrived as a bare str (%r) at call_site=%s; '
+                'treating it as ONE node-id — the producer should pass a tuple',
+                supplied_test_ids,
+                call_site.value,
+            )
+            supplied_test_ids = (supplied_test_ids,)
 
         # §8: EMPTY test_ids is legal only for `unconfirmable`.  An unconfirmable
         # observation that resolved no node-ids is still COUNTED, under the sentinel —
@@ -272,8 +386,8 @@ def record_flake_occurrence(
         # it into the silent-drop branch below — deleting exactly the class-1 signal the
         # sentinel exists to preserve.  The coercion above already makes them identical;
         # `==` is the belt to that braces, and is correct either way.
-        if s.test_ids:
-            test_ids = tuple(s.test_ids)
+        if supplied_test_ids:
+            test_ids = tuple(supplied_test_ids)
         elif verdict == FlakeVerdict.unconfirmable:
             test_ids = (UNKNOWN_TEST_ID,)
         else:
@@ -284,11 +398,10 @@ def record_flake_occurrence(
                 'flake_ledger: %s verdict with empty test_ids at call_site=%s; dropping '
                 '(a confirmed verdict about zero tests is meaningless)',
                 verdict.value,
-                s.call_site,
+                call_site.value,
             )
             return None
 
-        ensure_schema(db_path)
         detail = (
             json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
             if s.unconfirmable_reason
@@ -299,11 +412,11 @@ def record_flake_occurrence(
         # accept the same statement.
         rows = [
             (
-                s.observed_at,
+                observed_at,
                 test_id,
                 project_id,
                 verdict.value,
-                s.call_site,
+                call_site.value,
                 s.runner,
                 merge_sha,
                 task_id,
@@ -312,7 +425,7 @@ def record_flake_occurrence(
             )
             for test_id in test_ids
         ]
-        conn = _connect(db_path)
+        conn = _open(db_path)
         try:
             # OR IGNORE, against the `idx_flake_occurrence_dedup` UNIQUE index, is §8.3's
             # idempotency key `(test_id, observed_at, call_site)` enforced declaratively.
@@ -362,6 +475,7 @@ def read_occurrences(
     *,
     test_id: str | None = None,
     since: str | None = None,
+    limit: int | None = None,
 ) -> list[FlakeOccurrenceRow]:
     """Recorded occurrences, oldest first, optionally filtered.
 
@@ -372,17 +486,26 @@ def read_occurrences(
             sound because ISO-8601 UTC strings with a fixed offset sort in the same
             order as they do chronologically; ``idx_flake_occurrence_observed`` serves
             the window scan.
+        limit: At most this many rows — the MOST RECENT ones, still returned oldest
+            first.  Composes with the other filters.  ``0`` (or negative) yields ``[]``.
+
+    ``limit`` selects the TAIL, not the head, and that is deliberate: ``flake_occurrence``
+    is append-only and unpruned by design (see the module docstring), so the only bound
+    a caller ever wants on it is "the recent end".  Truncating the OLDEST *limit* rows —
+    what a bare ``LIMIT`` on this ascending order would give — would silently answer a
+    dashboard's "what happened lately?" with year-old rows, which is worse than no bound.
+    Callers doing rate math should still pass ``since``: a count over a ``limit``-capped
+    read is a count over an unknown window, and dividing by it is meaningless.
 
     Ordering is part of the contract, not incidental: ``observed_at`` then ``id``, so
     the sequence reads chronologically even though rows arrive out of order (a remote
     observation is written on the dispatcher after a local one that followed it).
     """
     try:
-        ensure_schema(db_path)
         # Values are BOUND, never interpolated — a test_id is an arbitrary pytest node-id
         # arriving from a remote host.
         clauses: list[str] = []
-        params: list[str] = []
+        params: list[Any] = []
         if test_id is not None:
             clauses.append('test_id = ?')
             params.append(test_id)
@@ -391,12 +514,22 @@ def read_occurrences(
             params.append(since)
         where = f' WHERE {" AND ".join(clauses)}' if clauses else ''
 
-        conn = _connect(db_path)
+        sql = f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id'
+        if limit is not None:
+            # Take the tail DESC, then re-sort ASC so the caller still gets the pinned
+            # oldest-first contract.  `max(0, ...)` because SQLite reads a NEGATIVE LIMIT
+            # as "no limit at all" — the exact silent opposite of what `limit=-1` asks
+            # for, on the one read path whose whole point is to stay bounded.
+            sql = (
+                f'SELECT * FROM (SELECT * FROM flake_occurrence{where} '
+                'ORDER BY observed_at DESC, id DESC LIMIT ?) ORDER BY observed_at, id'
+            )
+            params.append(max(0, limit))
+
+        conn = _open(db_path)
         try:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                f'SELECT * FROM flake_occurrence{where} ORDER BY observed_at, id', params
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         finally:
             conn.close()
         return [_to_occurrence_row(r) for r in rows]
@@ -431,8 +564,7 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
     retained deliberately (§5.2) because the recurrence trigger reads them.
     """
     try:
-        ensure_schema(db_path)
-        conn = _connect(db_path)
+        conn = _open(db_path)
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
@@ -471,15 +603,25 @@ async def open_debt(
     status but never WRITES it, except for the initial filing.
 
     ``UNKNOWN_TEST_ID`` must never be passed here: a sentinel names no test, so it can
-    own no de-flake task.
+    own no de-flake task.  That is REFUSED, not merely documented — ε/ζ plausibly iterate
+    the test_ids of a recorded occurrence batch, which is exactly where the sentinel
+    lives, and an accepted ``<unknown>`` debt row would surface in ι's report and, in ζ,
+    file a de-flake task against a test that does not exist.
 
     *now* defaults to the current UTC time; it is injectable so §5.4's ledger-owned
     timestamps are deterministically testable.
     """
     try:
+        if test_id == UNKNOWN_TEST_ID:
+            logger.warning(
+                'flake_ledger: refusing to open debt for the %s sentinel — it names no '
+                'test, so it can own no de-flake task',
+                UNKNOWN_TEST_ID,
+            )
+            return None
+
         stamp = (now or datetime.now(UTC)).isoformat()
-        ensure_schema(db_path)
-        conn = _connect(db_path)
+        conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
             # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
@@ -511,9 +653,15 @@ async def open_debt(
                 (test_id, project_id, stamp, stamp),
             )
             conn.commit()
+            # Read back on the SAME connection rather than re-entering `read_debt`,
+            # which would open two more (its `_open` plus its SELECT's).  Inside the
+            # same connection this also reads the row this transaction just committed,
+            # with no window for another lane to interleave a resolve between them.
+            conn.row_factory = sqlite3.Row
+            row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
         finally:
             conn.close()
-        return read_debt(db_path, test_id)
+        return _to_debt_row(row) if row is not None else None
     except Exception:
         logger.warning(
             'flake_ledger: failed to open debt for test_id=%s (project_id=%s)',
@@ -548,18 +696,27 @@ async def resolve_debt(
     the primary key.  *project_id* is accepted per the §8.3 signature and used only in
     log messages; it is NOT a dropped filter.
 
-    A zero-rowcount UPDATE (no debt for this test) is a legitimate no-op, not an error.
-    ``async`` for the same forward-compat reason as :func:`open_debt` — η adds the
-    recurrence escalation inside this function.
+    IDEMPOTENT, and the ``resolved_at IS NULL`` guard is what makes it so: a resolution
+    closes the CURRENT cycle exactly once, and a replayed "owning task went terminal"
+    event is a no-op rather than a second, later resolution.  Last-write-wins was the
+    alternative and is WRONG here — it would walk ``resolved_at`` forward and overwrite
+    ``prior_resolving_commit`` on an already-closed row, so the values carried into the
+    next re-open (and cited verbatim in η's ``regressed_after_resolution`` L2) would
+    describe a phantom resolution that never happened.  The guard is per-CYCLE, not
+    permanent: :func:`open_debt` sets ``resolved_at`` back to NULL on re-entry, so the
+    next cycle resolves normally.
+
+    A zero-rowcount UPDATE — no debt for this test, or its cycle is already closed — is a
+    legitimate no-op, not an error.  ``async`` for the same forward-compat reason as
+    :func:`open_debt` — η adds the recurrence escalation inside this function.
     """
     try:
         stamp = (now or datetime.now(UTC)).isoformat()
-        ensure_schema(db_path)
-        conn = _connect(db_path)
+        conn = _open(db_path)
         try:
             conn.execute(
                 'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
-                'WHERE test_id = ?',
+                'WHERE test_id = ? AND resolved_at IS NULL',
                 (stamp, resolving_commit, test_id),
             )
             conn.commit()
@@ -582,8 +739,7 @@ def list_open_debt(db_path: Path) -> list[DebtRow]:
     this list.
     """
     try:
-        ensure_schema(db_path)
-        conn = _connect(db_path)
+        conn = _open(db_path)
         try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
