@@ -1096,6 +1096,110 @@ class TestCheckScopeInvariant:
             f'stays observable; INFO records: {info_messages!r}'
         )
 
+    async def test_both_ways_divergence_escalates_and_detail_names_uncovered_modules(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """BOTH-WAYS divergence (the measured task-3105 shape): each side has
+        a module the other lacks. The narrowed containment predicate must
+        still catch this — plan_modules - metadata_modules is non-empty — and
+        the escalation detail must name exactly which modules the locks do
+        not cover, instead of the old false "these derive DIFFERENT
+        lock-module sets ... keep the module sets in lockstep" claim, which
+        is false for the benign-superset population this record class now
+        also has to describe accurately.
+        """
+        plan_files = ['scripts/foo.sh', 'pkg/impl.py']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        uncovered = plan_modules - metadata_modules
+        assert uncovered, (
+            'precondition: plan.files must need a module metadata.files '
+            f'does not cover at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        assert metadata_modules - plan_modules, (
+            'precondition: this must be a genuine BOTH-WAYS divergence, not '
+            f'a plain PLAN-EXTRA — metadata_modules={metadata_modules!r} '
+            f'must also hold a module plan_modules={plan_modules!r} lacks'
+        )
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': metadata_files},
+        }
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert len(infra_issues) == 1, (
+            f'expected exactly one infra_issue escalation; pending={pending!r}'
+        )
+        esc = infra_issues[0]
+        for module in sorted(uncovered):
+            assert module in esc.detail, (
+                f'expected uncovered module {module!r} to be named in the '
+                f'escalation detail so triage knows exactly what is not '
+                f'covered; detail={esc.detail!r}'
+            )
+        assert 'derive DIFFERENT lock-module sets' not in esc.detail, (
+            'the old undirected-comparison claim is false for this '
+            f'population and must not appear; detail={esc.detail!r}'
+        )
+        assert 'keep the module sets in lockstep' not in esc.detail, (
+            'the old lockstep claim is false for a benign superset and '
+            f'must not appear; detail={esc.detail!r}'
+        )
+        assert esc.severity == 'blocking', 'PRD D11 keeps the gate'
+        assert esc.category == 'infra_issue', 'PRD D11 keeps the gate'
+
+    async def test_divergence_escalation_still_matches_orphan_reaper_predicate(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Coupling pin (guards step-4's edit of the submission site): the
+        record filed by the unsafe-direction path must still match
+        ``harness._is_scope_divergence_orphan``, which discriminates the
+        whole plan.files/metadata.files divergence class on the summary
+        substring 'plan.files/metadata.files divergence detected'
+        (harness.py:696-722, documented there as the unique robust
+        discriminator). Without this pin a future summary re-word would
+        silently break the orphan-L0 reaper's handling of this class. This
+        test passes on the base branch by construction — a deliberate
+        characterization guard added while the submission site is in flux —
+        and must stay green through step-4.
+        """
+        from orchestrator.harness import _is_scope_divergence_orphan
+
+        plan_files = ['a.py', 'b.py']
+        metadata_files = ['a.py']
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': metadata_files},
+        }
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            f'expected an infra_issue escalation; pending={pending!r}'
+        )
+        assert _is_scope_divergence_orphan(infra_issues[0]), (
+            'the escalation filed by the unsafe-direction path must still '
+            'match the orphan-L0 reaper predicate — a future summary '
+            're-word would silently break its divergence-class handling'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Regression: workflow passes real prompt (not 'continue') to invoke_with_cap_retry
