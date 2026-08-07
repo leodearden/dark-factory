@@ -905,7 +905,7 @@ class TestIndeterminateExclusionsAreAdjudicated:
             classify_failure,
             is_external_kill_rc,
         )
-        assert INDETERMINATE_VERDICT_CATEGORIES == frozenset({FailureCategory.INFRA_KILL})
+        assert frozenset({FailureCategory.INFRA_KILL}) == INDETERMINATE_VERDICT_CATEGORIES
         assert is_external_kill_rc(-9) is True
         assert is_external_kill_rc(137) is False
         assert classify_failure(

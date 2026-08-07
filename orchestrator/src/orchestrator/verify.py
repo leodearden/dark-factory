@@ -1529,8 +1529,9 @@ def _summarize_checks(
     test_duration: float | None = None,
     lint_duration: float | None = None,
     type_duration: float | None = None,
-) -> tuple[bool, str, str, str]:
-    """Classify the three check results into (passed, category, cause_hint, summary).
+) -> tuple[bool, str, str, str, list[str]]:
+    """Classify the three checks into (passed, category, cause_hint, summary,
+    failing_leg_categories).
 
     Shared by ``run_verification``'s primary post-loop classification and its
     bounded env-recovery retry (task 2048) so the failure-reclassification
@@ -1564,6 +1565,20 @@ def _summarize_checks(
     ``f'Failures: {...}'`` envelope is preserved so every existing consumer
     that prefix- or substring-matches on it stays green.
 
+    CONTRACT (task 3173 review amendment): the returned ``category`` and
+    ``failing_leg_categories`` answer DIFFERENT questions and neither
+    substitutes for the other.  ``category`` is the severity-ranked worst leg
+    (``_worst_category``) — "how bad was this run", which the retry loop, the
+    archive and the transient-infra hold consume.  ``failing_leg_categories``
+    is what EACH failing leg actually decided, in test/lint/type order.
+    ``merge_queue``'s per-land veto gate needs the second and must never infer
+    it from the first: a rank-1 ``INFRA_KILL`` DOMINATES a co-occurring
+    rank-11 ``TEST_FAILURE``, so a run whose test leg completed and blamed the
+    branch reports ``category == 'infra_kill'``, and reading that single value
+    as "this run produced no verdict" would discard the completed evidence.
+    The list is empty on the passing short-circuit — no failing legs, which is
+    not the same claim as "every failing leg was verdict-less".
+
     ``test_duration``/``lint_duration``/``type_duration`` are keyword-only and
     default to ``None``, so the twelve positional parameters are untouched and
     every pre-existing caller is byte-identical (see the design decision on
@@ -1572,7 +1587,7 @@ def _summarize_checks(
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
-        return True, 'passed', '', 'All checks passed'
+        return True, 'passed', '', 'All checks passed', []
 
     hint_parts = []
     per_check_categories: list[str] = []
@@ -1606,7 +1621,7 @@ def _summarize_checks(
         else:
             parts.append(tool_verdict)
     summary = f'Failures: {", ".join(parts)}'
-    return passed, category, cause_hint, summary
+    return passed, category, cause_hint, summary, per_check_categories
 
 
 def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
@@ -3113,6 +3128,27 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 3173: one FailureCategory per FAILING leg, in test/lint/type order,
+    # exactly as `_summarize_checks` classified them (its fifth return
+    # element). Deliberately a plain JSON-native `list[str] | None` (mirrors
+    # `contention`/`plan`/`failing_test_ids` above), so it round-trips
+    # losslessly through the generic codec (asdict / VerifyResult(**d)).
+    #
+    # WHY IT EXISTS SEPARATELY FROM `category`: `category` is the
+    # severity-ranked WORST leg (_worst_category), which answers "how bad was
+    # this run" — what the retry loop, the archive and the transient-infra
+    # hold need. It cannot answer "did EVERY leg fail to produce a verdict",
+    # because a rank-1 infra_kill hides a co-occurring rank-11 test_failure.
+    # merge_queue's per-land cross-check needs the second question (only a run
+    # in which every failing leg is verdict-less may decline to veto a remote
+    # PASS), so the per-leg answer is CARRIED rather than inferred.
+    #
+    # None = NOT RECORDED, and is the fail-CLOSED default a consumer must
+    # never treat as indeterminate: an older remote's wire payload simply
+    # omits the key and lands here, as do `_trivial_pass`, the verify_runner
+    # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
+    # `[]` = "no failing legs" (a pass), which is likewise not a licence.
+    failing_leg_categories: list[str] | None = None
     # Task 2823: True IFF this result came from _trivial_pass — a config-only
     # (no .py/.rs) merge that short-circuited verification WITHOUT running any
     # suite. The merge worker's pass path keys on this to refuse advancing main
@@ -5119,7 +5155,7 @@ async def run_verification(
 
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
-    passed, category, cause_hint, summary = _summarize_checks(
+    passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
         attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
         attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
         attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
@@ -5211,7 +5247,7 @@ async def run_verification(
         attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
         timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
-        passed, category, cause_hint, summary = _summarize_checks(
+        passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
             attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
             attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
             attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
@@ -5373,6 +5409,7 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        failing_leg_categories=failing_leg_categories,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -5482,6 +5519,26 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
     )
 
+    # Task 3173 review amendment: union the per-leg categories across FAILING
+    # children only, order-preserved and de-duplicated (same deterministic
+    # style as the kill-note fragment merge above).  A PASSING child has no
+    # failing legs to report, so its value is irrelevant and never consulted.
+    #
+    # Deliberately UNLIKE failing_test_ids immediately above, which treats a
+    # None child as "contributed nothing": here a FAILING child whose value is
+    # None POISONS the aggregate to None.  The consumer (merge_queue's veto
+    # gate) may only decline to veto when EVERY failing leg is verdict-less, so
+    # an unrecorded failing child means the aggregate cannot make that claim —
+    # fail CLOSED rather than silently answering for legs it never saw.
+    failing_leg_categories: list[str] | None = []
+    for r in failing:
+        if r.failing_leg_categories is None:
+            failing_leg_categories = None
+            break
+        for leg_category in r.failing_leg_categories:
+            if leg_category not in failing_leg_categories:
+                failing_leg_categories.append(leg_category)
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -5498,6 +5555,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        failing_leg_categories=failing_leg_categories,
     )
 
 
