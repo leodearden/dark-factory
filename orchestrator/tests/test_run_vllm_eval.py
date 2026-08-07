@@ -1193,6 +1193,23 @@ class TestConcurrentLoop:
 
         attempted: list[str] = []
 
+        # Order the two initial-wave futures with a real happens-before edge
+        # rather than a sleep margin. A fixed delay cannot order threads: on a
+        # loaded box the failing task's thread can be descheduled past any
+        # margin, letting the *successful* task be the lone FIRST_COMPLETED
+        # completion, which refills the window with a third task before
+        # --stop-on-first-failure is ever noticed. Gating the success on the
+        # trip itself removes the window entirely.
+        tripped = threading.Event()
+        real_log = launcher.log
+
+        def capture_log(msg):
+            if "stop-on-first-failure tripped" in str(msg):
+                tripped.set()
+            return real_log(msg)
+
+        monkeypatch.setattr(launcher, "log", capture_log)
+
         def fake_run(cmd, *args, **kwargs):
             if (
                 isinstance(cmd, list)
@@ -1203,12 +1220,10 @@ class TestConcurrentLoop:
                 task_id = Path(task_arg).stem
                 attempted.append(task_id)
                 if task_id == "df_task_11":
-                    # Simulate failure: write a "blocked" outcome. Skip the
-                    # shared 0.1s sleep so this future is deterministically
-                    # the first FIRST_COMPLETED completion the executor loop
-                    # observes, instead of racing df_task_10's equal-duration
-                    # sleep to decide how many extra tasks get refilled
-                    # before --stop-on-first-failure is noticed.
+                    # Simulate failure: write a "blocked" outcome and return
+                    # at once. Every other task blocks below until this one's
+                    # failure has tripped the drain, so this future is always
+                    # the first completion the executor loop observes.
                     results.mkdir(parents=True, exist_ok=True)
                     _write_result(
                         results,
@@ -1219,7 +1234,9 @@ class TestConcurrentLoop:
                         metrics={"cost_usd": 5.0},
                     )
                     return SimpleNamespace(returncode=1)
-                _REAL_SLEEP(0.1)
+                # Bounded, so a regression that never trips the drain fails the
+                # assertion below instead of hanging the suite.
+                tripped.wait(timeout=30)
                 results.mkdir(parents=True, exist_ok=True)
                 _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
                 return SimpleNamespace(returncode=0)
@@ -1252,12 +1269,13 @@ class TestConcurrentLoop:
 
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # df_task_11 (the failure) skips the shared 0.1s sleep in fake_run,
-        # so it always wins the FIRST_COMPLETED race against df_task_10 by a
-        # wide margin. The executor loop therefore notices
-        # --stop-on-first-failure and drains `remaining` before a third task
-        # is ever refilled, so the attempted set is exactly the initial wave
-        # — deterministic, with no race window left to tolerate.
+        # df_task_10 cannot return from fake_run until df_task_11's failure has
+        # tripped the drain, so df_task_11 is necessarily the first completion
+        # the executor loop observes. The loop drains `remaining` while still
+        # inside that `for fut in done:` iteration — and the main thread is the
+        # only refiller — so no third task can be submitted. The attempted set
+        # is exactly the initial wave, ordered by a happens-before edge rather
+        # than by a timing margin.
         assert set(attempted) == {"df_task_10", "df_task_11"}
         # Summaries cover whatever was attempted.
         summary_ids = {s.task_id for s in captured["summaries"]}
