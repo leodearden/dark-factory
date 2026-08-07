@@ -267,6 +267,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
   landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
   second filer doesn't degrade the first one's record.)
+- **`--project`**: the project's **canonical token** — the `memory.project_id` its
+  `dark-factory-orchestrator.yaml` declares. For dark-factory that is **`dark_factory`**, not `df`
+  and not `dark-factory`. The value is normalized at the CLI boundary (case-folded, `-` and `_`
+  equivalent, `df` aliased to `dark_factory`), so a stale spelling can no longer create a hidden
+  partition — but pass the canonical token anyway, so what you type matches what the cockpit shows
+  and no rewrite warning is logged. **The `df-` prefix on ids like `df-esc-3524-1` is part of
+  `--id`, which YOU type**; `write-decision` never derives it from, or rewrites it because of,
+  `--project`. Conflating the two is what produced a three-way split of one project's decisions
+  (41 open dark-factory rows spread across `dark_factory`/`df`/`dark-factory`, each invisible to a
+  reap scoped to either of the others).
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
@@ -316,6 +326,28 @@ your own same-named escalations. A decision filed **without** `--escalations-dir
 predating that flag — falls back to project-only scoping and therefore has **no** such protection:
 it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
 pass the flag when filing.
+
+The **project** axis matches on the canonical token (see `--project` above), so **ONE run per
+queue closes every historical spelling** of that project — there is no need to re-run the verb
+once per token (`df`, `dark_factory`, `dark-factory`) as was necessary before. Folding only ever
+merges spellings of the *same* project; it never merges two different projects (e.g.
+`solar_challenge` and `solar_challenge_platform` stay separate), so this widens what a reap
+closes without ever letting one project's reaper close another's decisions.
+
+To repair the legacy population — records filed before `write-decision` canonicalized `--project`
+— run the one-shot backfill (dry-run first):
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py \
+  migrate-decision-projects --dry-run   # preview; writes nothing
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py \
+  migrate-decision-projects
+```
+
+It rewrites only the `project` field: `state` and `filed_at` are preserved, so an already-answered
+row is **never** reopened, and a record's id (and its cockpit cross-links) is never rewritten. It
+is idempotent — a re-run once the fleet is clean prints nothing — so it is also the repair tool if
+a record is ever hand-edited.
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
