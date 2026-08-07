@@ -26,11 +26,18 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
+from shared.psi import read_psi_sample
 from shared.verify_admission import acquire_task_slot, nice_prefix
 
 from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+# The discriminator's VOCABULARY only (flake-ledger PRD task β). Deliberately
+# NOT record_flake_occurrence / open_debt: `confirm_isolated_rerun_verdict` is
+# PURE (INV-5), and keeping every side-effecting name out of this import
+# surface is what makes that structural rather than a reviewing burden.
+# flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
+from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -7745,6 +7752,261 @@ async def confirm_main_tip_failure_is_real(
 #: override the isolated confirm re-run could itself starve under residual load
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
+
+
+# ---------------------------------------------------------------------------
+# The ONE isolated-rerun discriminator (flake-ledger PRD task β, §8.1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _RerunObservation:
+    """What ONE call-site engine actually saw re-running ONE subproject group.
+
+    Richer than a bare :class:`_RerunOutcome` because the discriminator has to
+    NAME why a re-run was uninformative (``infra_transient_rerun:<category>``),
+    and because the merge gate's existing log line renders the observed
+    ``category``/``passed`` pair verbatim.
+    """
+
+    outcome: _RerunOutcome
+    category: str  # last observed VerifyResult.category ('' when none was observed)
+    passed: bool  # last observed VerifyResult.passed (False when none was observed)
+
+
+def _classify_rerun_result(result: VerifyResult) -> _RerunObservation:
+    """Map ONE completed ``VerifyResult`` to a :class:`_RerunObservation`.
+
+    Category-FIRST, deliberately independent of the ``passed`` flag: an
+    infra-sentinel category is never trusted as confirmation EITHER WAY, even
+    in the (normally impossible) case it were paired with ``passed=True`` —
+    the same rule ``_run_isolated_confirm_group_outcome`` and
+    ``run_main_tip_sweep`` already apply.
+    """
+    if result.category in INFRA_TRANSIENT_CATEGORIES:
+        return _RerunObservation(
+            _RerunOutcome.unconfirmable, result.category, result.passed,
+        )
+    if result.passed:
+        return _RerunObservation(_RerunOutcome.passed, result.category, result.passed)
+    return _RerunObservation(_RerunOutcome.failed, result.category, result.passed)
+
+
+async def _merge_gate_isolated_rerun(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    scoped_mc: ModuleConfig,
+) -> _RerunObservation:
+    """The merge gate's re-run engine: ONE shot, merge-role (PRD §5.1).
+
+    Deliberately does NOT catch: an exception here belongs to
+    ``confirm_isolated_rerun_verdict``'s outer fail-CLOSED handler (INV-1), so
+    a merge stays red rather than being suppressed on an unobserved re-run.
+    """
+    result = await run_verification(
+        worktree, config, scoped_mc,
+        max_retries=0, is_merge_verify=True, role='merge',
+    )
+    return _classify_rerun_result(result)
+
+
+def _log_merge_gate_success(node_ids: list[str], worktree: Path) -> None:
+    logger.info(
+        'confirm_merge_verify_flake_suppressible: merge-verify flake '
+        'confirmed suppressible: %s failed under load, passed on isolated '
+        're-run in %s',
+        node_ids, worktree,
+    )
+
+
+def _log_merge_gate_group_not_confirmed(
+    prefix: str, observation: _RerunObservation,
+) -> None:
+    logger.info(
+        'confirm_merge_verify_flake_suppressible: isolated re-run '
+        'for %s did not confirm green (category=%r, passed=%s) — '
+        'not suppressing',
+        prefix, observation.category, observation.passed,
+    )
+
+
+@dataclass(frozen=True)
+class _RerunPolicy:
+    """Per-call-site knobs for the ONE discriminator.
+
+    INV-5 (no-lockstep-duplication) is about one IMPLEMENTATION of "passes in
+    isolation", NOT one set of tuning constants. The two gates differ in five
+    genuine, deliberately-calibrated ways — re-run engine, timeout constant,
+    log label, success log level, and the other-leg precondition — and every
+    one of those is pinned by an existing assertion. Capturing them as a
+    ``call_site -> policy`` table gives exactly ONE body to drift from while
+    keeping each site's calibration independent and visible in one place.
+    """
+
+    #: Caller name embedded in every log line so an operator can attribute a
+    #: message to the right call site. Also passed to
+    #: ``_group_node_ids_by_subproject`` as its ``log_label``.
+    log_label: str
+    #: Per-test timeout injected into the isolated re-run command. SEPARATE
+    #: per site by design — the two are retuned on different signals.
+    timeout_secs: int
+    #: Whether a non-clean lint/type leg on the failing result bails the whole
+    #: gate before any work (main_probe only — see the discriminator's
+    #: docstring for why it must NOT apply to the merge gate).
+    requires_clean_other_legs: bool
+    #: Verdict-vocabulary tail of the "mapping yielded nothing usable" line;
+    #: the caller's alone (the shared helper only knows 'unconfirmable').
+    unmapped_log_tail: str
+    #: How this site re-runs ONE scoped subproject group.
+    engine: Callable[
+        [Path, 'OrchestratorConfig', ModuleConfig], Awaitable[_RerunObservation],
+    ]
+    #: Emitted once when every group confirmed green.
+    log_success: Callable[[list[str], Path], None]
+    #: Emitted per non-confirming group, when the site has such a line today.
+    log_group_not_confirmed: Callable[[str, _RerunObservation], None] | None = None
+
+
+def _psi_cpu_some10_or_none() -> float | None:
+    """Host CPU pressure at observation, or ``None`` when it is not knowable.
+
+    ``read_ok=False`` is ``shared.psi``'s documented fail-open sentinel, and
+    maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
+    The ``except`` is belt to that braces: a TELEMETRY read must never change
+    a gate's verdict, so it may not raise into the discriminator.
+    """
+    try:
+        sample = read_psi_sample()
+    except Exception:
+        logger.debug('_psi_cpu_some10_or_none: PSI read failed', exc_info=True)
+        return None
+    return sample.cpu_some10 if sample.read_ok else None
+
+
+def _observe(
+    verdict: FlakeVerdict,
+    test_ids: Iterable[str],
+    *,
+    call_site: FlakeCallSite | str,
+    runner: str,
+    reason: str | None = None,
+    now: datetime | None = None,
+) -> FlakeSuppression:
+    """The ONLY construction site for a ``FlakeSuppression`` in this module.
+
+    Routing every return through one builder is what makes INV-2 (the
+    discriminator is TOTAL) structural rather than a reviewing burden: no
+    branch can construct a verdict that forgets ``observed_at`` or the psi
+    reading, and no branch can return ``None``.
+
+    ``observed_at`` is stamped HERE, at OBSERVATION time — not at record time
+    — because it is one third of §8.3's ``(test_id, observed_at, call_site)``
+    idempotency key: a replayed merge-path write must land one row, not two.
+    """
+    return FlakeSuppression(
+        verdict=verdict,
+        test_ids=tuple(test_ids),
+        observed_at=(now or datetime.now(UTC)).isoformat(),
+        call_site=call_site,  # type: ignore[arg-type]  # see coercion in the caller
+        runner=runner,
+        psi_cpu_some10=_psi_cpu_some10_or_none(),
+        unconfirmable_reason=reason,
+    )
+
+
+async def confirm_isolated_rerun_verdict(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: list[ModuleConfig],
+    failing_result: VerifyResult,
+    *,
+    call_site: FlakeCallSite | str,
+    runner: str = 'local',
+    now: datetime | None = None,
+) -> FlakeSuppression:
+    """THE isolated-rerun discriminator: did *failing_result*'s named failures
+    pass when re-run alone (PRD §8.1)?
+
+    ONE implementation of "passes in isolation", shared by every gate that
+    needs the question answered, so the gates cannot drift into different
+    answers (INV-5). Per-site calibration lives in ``_CALL_SITE_POLICY``; the
+    body is common.
+
+    Returns a ``FlakeSuppression`` ALWAYS — never ``None``, never a bare list
+    (INV-2). Both existing gates map every non-``passes_in_isolation`` verdict
+    back to ``None`` at their wrapper, so no gate's behaviour changes today;
+    what changes is that the reason is now stated instead of dropped.
+    """
+    policy = _CALL_SITE_POLICY[FlakeCallSite(call_site)]
+
+    node_ids = _extract_failing_test_ids(failing_result.test_output)
+    if not node_ids:
+        return _observe(
+            FlakeVerdict.fails_in_isolation, (),
+            call_site=call_site, runner=runner, now=now,
+        )
+
+    # Map each node-id to its owning subproject over the given module_configs
+    # + the on-disk worktree, via the SHARED helper (see its docstring for the
+    # probe rules and the ambiguity WARNING). mc_by_prefix is the single source
+    # for both the helper argument and the per-group lookup below.
+    mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+    groups = _group_node_ids_by_subproject(
+        worktree, mc_by_prefix, node_ids, log_label=policy.log_label,
+    )
+    if not groups:
+        return _observe(
+            FlakeVerdict.fails_in_isolation, node_ids,
+            call_site=call_site, runner=runner, now=now,
+        )
+
+    # Each subproject group gets its own scoped + forced-serial +
+    # generous-timeout isolated re-run in the SAME worktree (INV-3 — the
+    # discriminator judges the tree it was handed and never mints another).
+    # ALL groups must confirm green.
+    for prefix, group_node_ids in groups.items():
+        mc = mc_by_prefix[prefix]
+        scoped_cmd = _with_pytest_timeout_str(
+            _serial_pytest_str(
+                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+            ),
+            policy.timeout_secs,
+        )
+        scoped_mc = replace(
+            mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+        )
+        observation = await policy.engine(worktree, config, scoped_mc)
+        if observation.outcome is not _RerunOutcome.passed:
+            if policy.log_group_not_confirmed is not None:
+                policy.log_group_not_confirmed(prefix, observation)
+            return _observe(
+                FlakeVerdict.fails_in_isolation, node_ids,
+                call_site=call_site, runner=runner, now=now,
+            )
+
+    policy.log_success(node_ids, worktree)
+    return _observe(
+        FlakeVerdict.passes_in_isolation, node_ids,
+        call_site=call_site, runner=runner, now=now,
+    )
+
+
+#: call_site -> per-site calibration for the ONE discriminator. See
+#: :class:`_RerunPolicy` for why these differences are kept rather than
+#: flattened. ``chronic_marker`` is deliberately absent — task κ owns it, and
+#: the discriminator answers `unconfirmable` for it honestly rather than
+#: guessing.
+_CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
+    FlakeCallSite.merge_gate: _RerunPolicy(
+        log_label='confirm_merge_verify_flake_suppressible',
+        timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
+        requires_clean_other_legs=False,
+        unmapped_log_tail='not suppressing',
+        engine=_merge_gate_isolated_rerun,
+        log_success=_log_merge_gate_success,
+        log_group_not_confirmed=_log_merge_gate_group_not_confirmed,
+    ),
+}
 
 
 async def confirm_merge_verify_flake_suppressible(
