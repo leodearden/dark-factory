@@ -1210,6 +1210,36 @@ class TestQueueConfigTransientErrorFields:
         """
         assert set(QueueConfig().transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES
 
+    def test_config_yaml_pins_transient_retry_policy(self, monkeypatch):
+        """Task 3585: config.yaml carries the transient retry policy explicitly,
+        so an operator can retune it without a code edit.
+
+        That makes the YAML a THIRD copy of a default the two-way drift guard
+        above does not cover, so this test extends the same guarantee to it.
+        Both halves are needed: the literal-key assertion is what goes red when
+        the keys are missing, and the effective-value assertion is what keeps
+        the third copy honest afterwards. A config-object-only assertion would
+        pass vacuously off the schema defaults and could never fail.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+
+        raw = yaml.safe_load(yaml_path.read_text())
+        queue_block = raw['queue']
+        for key in ('transient_max_attempts', 'transient_error_names'):
+            assert key in queue_block, (
+                f'config.yaml queue block must pin {key!r} literally (task 3585) — '
+                f'the retry policy is operator-tunable, not code-only.'
+            )
+
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert set(cfg.queue.transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES, (
+            'config.yaml has drifted from durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES; '
+            'the deployed list must match the shipped default.'
+        )
+        assert cfg.queue.transient_max_attempts == QueueConfig().transient_max_attempts
+
     def test_transient_max_attempts_below_max_attempts_rejected(self):
         """A config that would give transient errors a SHORTER budget than
         ordinary errors is rejected at config-load time, not silently
