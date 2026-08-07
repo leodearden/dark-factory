@@ -5077,6 +5077,27 @@ class TestRunWorktreeMissing:
         assert not isinstance(exc.value, WorktreeMissing)
 
 
+async def _wait_for_child_pid(pid_file: Path) -> int:
+    """Poll for *pid_file* to contain a parseable pid, not merely exist.
+
+    The child writes via ``open(path, 'w').write(...)`` — ``open(..., 'w')``
+    creates/truncates the file as a separate syscall from the buffered
+    ``write()``, so under load the parent can observe the file between
+    creation and the flushed write and read ``''``. Waiting for non-empty
+    content (tolerating a not-yet-created file) closes that TOCTOU window
+    (task 3851).
+    """
+    for _ in range(50):
+        try:
+            content = pid_file.read_text().strip()
+        except FileNotFoundError:
+            content = ''
+        if content:
+            return int(content)
+        await asyncio.sleep(0.1)
+    pytest.fail('child never wrote its pid')
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -5105,12 +5126,7 @@ class TestRunCancellationReapsChild:
             )
 
         # Wait for the child to have written its pid (should be near-instant).
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         # The cancelled _run must have killed + reaped the child by now — no
         # zombie, no orphan still sleeping.
@@ -5131,12 +5147,7 @@ class TestRunCancellationReapsChild:
             'time.sleep(60)\n'
         )
         task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
