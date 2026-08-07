@@ -35,12 +35,10 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
-# NOT an enforced gate: nothing in hooks/project-checks, any orchestrator.yaml lint_command,
-# or verify runs `ruff format` (CONTRIBUTING.md section 3, task 3441). Retained deliberately —
-# ruff defaults to double quotes while this repo writes single, so an ad-hoc or editor-on-save
-# run on escalation/src is 317 changed lines with this block vs 1437 without it (~4.5x). Do not
-# delete it as "unused config", and do not add a `ruff format --check` gate, without first
-# reversing that policy; tests/scripts/test_ruff_format_policy.py guards both directions.
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
