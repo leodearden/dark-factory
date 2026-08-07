@@ -324,8 +324,20 @@ class _ControllableSuiteRunner:
         """Release the held first call."""
         self._hold.set()
 
-    async def wait_entered(self, timeout: float = 5.0) -> None:
-        """Block until the held first call has actually started (is in-flight)."""
+    async def wait_entered(self, timeout: float = 30.0) -> None:
+        """Block until the held first call has actually started (is in-flight).
+
+        ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
+        default above (see the derivation at this module's lines 261-271):
+        the ``_run_lane`` task created just before this call races the SAME
+        clock, and this call is entered only after
+        ``OfflineLaneWorker._run_once`` has already done its own real-git
+        work (``get_main_sha`` plus a persistent-worktree reset — 3-5
+        subprocess spawns) — a tighter bound here would fire before
+        ``_run_lane``'s ever could. Same safety property: widening can never
+        make a broken staging pass, it only lengthens how long a genuinely
+        wedged runner takes to fail.
+        """
         await asyncio.wait_for(self._entered.wait(), timeout=timeout)
 
 
