@@ -18,6 +18,14 @@ from pathlib import Path
 
 import pytest
 
+# The repo-wide deploy-clock guard's OWN snapshot/compare (task 3797), reused
+# rather than re-implemented here: two copies of the same "(bytes, mtime_ns) or
+# absent" comparison would drift the moment the guard tightens what it looks at.
+# Importable because conftest.py appends REPO_ROOT to sys.path for this
+# directory. Functions only -- importing one of that module's FIXTURES into a
+# test module would bind a module-scoped copy that shadows the conftest's.
+from df_pytest_isolation import deploy_clock_snapshot, deploy_clock_violation_reason
+
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
 UNIT_R = "orchestrator-reify.service"
 
@@ -317,7 +325,9 @@ def test_idle_unit_restarts_transparently_with_no_defer_line(tmp_path):
 # Hermeticity: this suite must never stamp the REAL fleet-deploy clock (3797)
 # ---------------------------------------------------------------------------
 
-def test_suite_never_stamps_the_repo_fleet_deploy_clock(tmp_path):
+def test_suite_never_stamps_the_repo_fleet_deploy_clock(
+    tmp_path, _df_fleet_deploy_clock_redirect,
+):
     """Driving the script must not touch the live checkout's deploy clock.
 
     ``restart-all-orchestrators.sh`` resolves ``CLOCK_FILE`` from
@@ -330,14 +340,28 @@ def test_suite_never_stamps_the_repo_fleet_deploy_clock(tmp_path):
     ``scripts/orchestrator-watchdog.py`` then believes, suppressing its
     staleness backstop for ``ORCH_RESTART_MIN_INTERVAL_SECS`` (8h default).
 
-    Both halves matter. The first asserts the repo clock is untouched; the
-    second asserts the script DID stamp somewhere harmless, so a future "fix"
-    that merely stops stamping cannot pass this test.
+    Both halves matter. The first asserts the repo clocks are untouched, reusing
+    the repo-wide guard's own comparison (``deploy_clock_snapshot`` /
+    ``deploy_clock_violation_reason``) rather than a second hand-rolled copy of
+    it that could drift. The second asserts the script DID stamp somewhere
+    harmless, so a future "fix" that merely stops stamping cannot pass.
+
+    That second half is deliberately TIME-RELATIVE -- "the redirected clock
+    changed across this run" -- not "it exists afterwards". The redirect is a
+    session-scoped shared file, so earlier exit-0 tests in this file have
+    already stamped it by the time this runs; an existence check would be
+    satisfied by THEIR stamp and would stay green if the exit-0 path stopped
+    stamping altogether. The redirect is taken from the fixture rather than
+    ``os.environ`` so that deleting the fixture is a collection error naming it,
+    not a bare KeyError.
     """
-    repo_clock = SCRIPT.parent.parent / "data" / "orchestrator" / "last_redeploy_orchestrator.json"
-    before = (
-        (repo_clock.read_bytes(), repo_clock.stat().st_mtime_ns)
-        if repo_clock.exists() else None
+    repo_root = SCRIPT.parent.parent
+    before = deploy_clock_snapshot(repo_root)
+
+    redirected = Path(_df_fleet_deploy_clock_redirect)
+    stamped_before = (
+        (redirected.read_bytes(), redirected.stat().st_mtime_ns)
+        if redirected.exists() else None
     )
 
     fleet_dir = tmp_path / "fleet"
@@ -351,31 +375,31 @@ def test_suite_never_stamps_the_repo_fleet_deploy_clock(tmp_path):
         env={"RESTART_VERIFY_TIMEOUT": "5"},
     )
 
-    # Non-vacuity: the assertion below is only meaningful if the run actually
+    # Non-vacuity: the assertions below are only meaningful if the run actually
     # reached the stamp, which happens only on the all-verified-fresh exit 0.
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 
-    after = (
-        (repo_clock.read_bytes(), repo_clock.stat().st_mtime_ns)
-        if repo_clock.exists() else None
+    reason = deploy_clock_violation_reason(
+        before, deploy_clock_snapshot(repo_root), root=repo_root,
     )
-    assert after == before, (
-        f"this suite falsified the REAL fleet-deploy clock at {repo_clock}: "
-        f"{before!r} -> {after!r}. scripts/orchestrator-watchdog.py reads that "
-        "file as 'the fleet was redeployed at <ts>' and skips its staleness "
-        "backstop for ORCH_RESTART_MIN_INTERVAL_SECS (8h default), so a test "
-        "stamp silently disarms fleet staleness recovery for the rest of the "
-        "day. Point ORCH_FLEET_DEPLOY_CLOCK at a tmp file "
+    assert reason is None, (
+        f"{reason}\nThe write came from THIS test spawning "
+        "restart-all-orchestrators.sh against a fake systemctl: point "
+        "ORCH_FLEET_DEPLOY_CLOCK at a tmp file "
         "(scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect)."
     )
 
-    redirected = Path(os.environ["ORCH_FLEET_DEPLOY_CLOCK"])
-    assert redirected.exists(), (
-        f"the script stamped nothing at all: {redirected} does not exist. "
-        "The clock must be REDIRECTED, not disabled -- stamping on a verified "
-        "fleet restart is the correct production behaviour (task 2396 I2)."
+    stamped_after = (
+        (redirected.read_bytes(), redirected.stat().st_mtime_ns)
+        if redirected.exists() else None
+    )
+    assert stamped_after is not None and stamped_after != stamped_before, (
+        f"the script stamped nothing on this run: {redirected} is unchanged "
+        f"({stamped_before!r} -> {stamped_after!r}). The clock must be "
+        "REDIRECTED, not disabled -- stamping on a verified fleet restart is "
+        "the correct production behaviour (task 2396 I2)."
     )
     stamp = json.loads(redirected.read_text())
     assert isinstance(stamp, dict) and "ts" in stamp and "iso" in stamp, (

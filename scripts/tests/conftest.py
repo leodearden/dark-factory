@@ -103,10 +103,22 @@ def _df_fleet_deploy_clock_redirect(tmp_path_factory):
     documents (df_pytest_isolation.py) — cost (an autouse function-scoped
     fixture runs once per test across ~50 files, times every xdist worker) and
     coverage (module-/session-scoped fixtures that spawn the script must be
-    covered too). One shared file across the session is safe here because no
-    test in this directory asserts on clock CONTENT; those assertions live in
-    ``tests/scripts/test_restart_all_orchestrators.py``, whose harness takes
-    ``clock_file`` as a required per-test parameter.
+    covered too).
+
+    One shared file across the session is safe DESPITE being shared, and the
+    distinction matters. It is not that nothing in this directory looks at the
+    clock: ``test_suite_never_stamps_the_repo_fleet_deploy_clock`` reads this
+    very file and asserts its ``{ts, iso}`` body. It is that no test may assert
+    on it ABSOLUTELY — every earlier exit-0 test in the session has already
+    stamped this path, so ``exists()`` and "the body is well-formed" are
+    satisfiable by someone else's stamp. Assertions here must therefore be
+    TIME-RELATIVE: snapshot ``(bytes, st_mtime_ns)`` before spawning and require
+    it to have CHANGED. A test that genuinely needs a pristine per-test clock
+    should not weaken this fixture; it should pass its own via ``_run_script``'s
+    ``env=``, which ``full_env.update(env)`` applies last — the shape
+    ``tests/scripts/test_restart_all_orchestrators.py`` uses, where
+    ``clock_file`` is a required per-test parameter precisely because those
+    suites do assert absolutely.
 
     Restores the previous value EXACTLY on teardown, popping the key when it
     was absent rather than setting an empty string — an empty
