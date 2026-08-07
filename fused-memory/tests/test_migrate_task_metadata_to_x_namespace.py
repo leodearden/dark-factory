@@ -529,23 +529,26 @@ def test_cli_exposes_force_to_override_key_validation():
     assert build_parser().parse_args(['--task-id', '3083', '--force']).force is True
 
 
-def test_unsafe_keys_abort_before_the_server_is_even_contacted(monkeypatch, capsys):
+@pytest.mark.asyncio
+async def test_unsafe_keys_abort_before_the_server_is_even_contacted(monkeypatch, capsys):
     """The guard's value is entirely in its POSITION.
 
     Validating after the fetch (or worse, after the write) would be useless: by
     then the damage is either imminent or done. This pins that `main_async`
     returns non-zero without ever constructing the JSON-RPC client — asserted by
     making client construction explode.
-    """
-    import asyncio
 
+    Awaited under pytest-asyncio (the suite runs `asyncio_mode = "strict"`)
+    rather than via a bare `asyncio.run`, which would build and tear down its
+    own loop inside a suite full of async tests.
+    """
     def _boom():
         raise AssertionError('the server must not be contacted with unsafe --keys')
 
     monkeypatch.setattr(_mod, '_load_sibling_client', _boom)
     args = build_parser().parse_args(['--task-id', '3083', '--keys', 'files', '--apply'])
 
-    assert asyncio.run(_mod.main_async(args)) == 1
+    assert await _mod.main_async(args) == 1
     assert 'files' in capsys.readouterr().err
 
 
