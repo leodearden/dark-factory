@@ -66,6 +66,59 @@ destroys entities and edges exclusively sourced from that episode.\
 """
 
 # ---------------------------------------------------------------------------
+# Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
+# ---------------------------------------------------------------------------
+# States the precedence order for annotating superseded, wrong, or corrupted
+# knowledge across both stores — lightest-touch first, last-resort last — plus
+# the ruling's option (b) cross-check rule against trusting episode prose at
+# face value. Shared between Stage 1 and Stage 2 because both hold every tool
+# named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
+# DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
+# Placed in the prompt rather than CLAUDE.md because the recon stages are the
+# only consumer of raw episode prose.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. MUST NOT contain a bare `mcp__recon-report__` call
+# example — test_recon_report_guidance_drift.py scans the assembled prompts
+# and requires every such example to carry `run_id=`; this section introduces
+# none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
+# stage2.py has no such section; refer to `replacement_memory_id` by
+# parameter name instead, a tool-level fact true in both stages. Not an
+# f-string: it is interpolated INTO f-strings, and braces inside an
+# interpolated value are not re-parsed by the enclosing f-string, so its own
+# text needs no {{/}} escaping (there are none below regardless).
+STALE_KNOWLEDGE_ANNOTATION_NORM = """\
+## Annotating Stale or Wrong Knowledge
+When you find stale, superseded, or wrong knowledge, use the LIGHTEST-touch tool that \
+correctly resolves it — in this order:
+
+(a) **Stale or superseded FACT**: write a superseding edge, or call `update_edge` with \
+`invalid_at` set on the stale edge. This is the house pattern and is already in live use. \
+`search` returns EDGES, not raw episode prose — a superseding edge is the annotation that \
+is actually RETRIEVABLE; an annotation buried in episode text is not.
+(b) **Episode text wrong ON ITS FACE** (a premature past-tense completion claim, a \
+corrupted or leaked fragment): use `mcp__fused-memory__redact_episode_content` ONLY for \
+this case. Annotate in place — e.g. prefix a dated `[SUPERSEDED: ...]` marker — do not \
+rewrite the surrounding narrative.
+(c) **Last resort**: `mcp__fused-memory__delete_episode` with `cascade=True` destroys \
+entities and edges exclusively sourced from that episode, which are usually valid because \
+they were extracted from the clean portion of the text. Use this only when (a) and (b) \
+cannot resolve the problem.
+(d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
+`mcp__fused-memory__update_memory` — its point id and created_at are preserved, so nothing \
+citing it dangles — and only THEN delete the redundant siblings. Never delete and re-add \
+the survivor. Each sibling delete still needs `replacement_memory_id` set to the \
+survivor's full 36-char UUID.
+
+**Episode prose is a point-in-time narration, not current truth.** An episode's content \
+may assert work as complete that is still in progress by the time you read it. Before \
+acting on an episode's claim, cross-check current entity/edge state (`search` / \
+`get_entity`) or live task status (`get_task`) rather than trusting the prose at face \
+value.\
+"""
+
+# ---------------------------------------------------------------------------
 # Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)
 # ---------------------------------------------------------------------------
 # The BODY below is identical for all three stages — store identity, the missing
