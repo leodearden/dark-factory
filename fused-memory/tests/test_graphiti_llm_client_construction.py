@@ -125,6 +125,33 @@ class TestBuildLLMClientDefaultOpenAIPath:
         with pytest.raises(RuntimeError, match='PREFLIGHT_SENTINEL'):
             build_llm_client(mock_config)
 
+    def test_no_max_tokens_kwarg_on_the_default_arm(self, mock_config, monkeypatch):
+        """Byte-identical regression guard for the default (shipped) arm.
+
+        The openai_generic arm passes ``max_tokens=cfg.llm.max_tokens`` to the
+        constructor because ``OpenAIGenericClient.__init__`` re-assigns
+        ``self.max_tokens`` from its own parameter (default 16384), discarding
+        the value ``super().__init__`` just took from the config.
+        ``BaseOpenAIClient.__init__`` performs the IDENTICAL override, so the
+        default arm has always sent upstream's default too. Adding the kwarg
+        here would change the wire request of every existing shipped-config
+        deployment — which this task must not do. Assert the absence of the
+        kwarg rather than pinning upstream's literal default, so a future wheel
+        bump that legitimately changes that constant does not break this guard.
+        """
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', lambda: None,
+        )
+        fake_openai_cls = MagicMock(name='OpenAIClient')
+        monkeypatch.setattr(graphiti_client_module, 'OpenAIClient', fake_openai_cls)
+        mock_config.llm.max_tokens = 2048
+
+        build_llm_client(mock_config)
+
+        fake_openai_cls.assert_called_once()
+        assert 'max_tokens' not in fake_openai_cls.call_args.kwargs
+        assert fake_openai_cls.call_args.args == ()
+
 
 class TestBuildLLMClientOpenAIGenericPath:
     """client_class='openai_generic' → graphiti's OpenAIGenericClient.
@@ -190,6 +217,35 @@ class TestBuildLLMClientOpenAIGenericPath:
 
         client = build_llm_client(generic_config)  # must NOT raise
         assert isinstance(client, OpenAIGenericClient)
+
+    @pytest.mark.parametrize('mode', ['json_object', 'auto'])
+    def test_configured_max_tokens_reaches_the_constructed_client(
+        self, generic_config, mode,
+    ):
+        """``cfg.llm.max_tokens`` must survive construction on BOTH sub-branches.
+
+        Measured against the installed graphiti-core 0.28.2 wheel:
+        ``OpenAIGenericClient.__init__`` (openai_generic_client.py:61-66,88)
+        declares its own ``max_tokens: int = 16384`` and, immediately after
+        ``super().__init__(config, cache)`` has correctly set
+        ``self.max_tokens = config.max_tokens`` (client.py:80), unconditionally
+        re-assigns ``self.max_tokens = max_tokens``. ``_generate_response`` then
+        sends ``max_tokens=self.max_tokens`` (:126), ignoring the per-call
+        argument — so the constructor kwarg is the ONLY lever that reaches the
+        wire, and a client built with ``config=`` alone asks for 16384 output
+        tokens no matter what the operator configured.
+
+        2048 is deliberately distinct from both the schema default (4096,
+        config/schema.py:214) and upstream's 16384, so a pass cannot be a
+        coincidence of either.
+        """
+        generic_config.llm.structured_output_mode = mode
+        generic_config.llm.max_tokens = 2048
+
+        client = build_llm_client(generic_config)
+
+        assert isinstance(client, OpenAIGenericClient)
+        assert client.max_tokens == 2048
 
     def test_missing_api_key_still_returns_none(self, generic_config):
         """The api_key guard is shared, not duplicated per client_class."""

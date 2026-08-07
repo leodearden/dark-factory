@@ -134,6 +134,33 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
             assert body['response_format'] == {'type': 'json_object'}
 
     @pytest.mark.asyncio
+    async def test_configured_max_tokens_reaches_the_wire(
+        self, no_ambient_openai_env,
+    ):
+        """The configured ``llm.max_tokens`` must actually leave the process.
+
+        ``OpenAIGenericClient.__init__`` re-assigns ``self.max_tokens`` from its
+        own parameter (default 16384) right after ``super().__init__`` took the
+        configured value off the config object, and ``_generate_response`` sends
+        ``self.max_tokens``. A construction-kwarg assertion alone cannot catch
+        that class of drop — same reason this whole file exists for base_url —
+        so this pins the recorded request body.
+        """
+        with mock_openai_server() as server:
+            cfg = _config(server.base_url, server.base_url)
+            cfg.llm.max_tokens = 2048  # distinct from schema default 4096 and upstream 16384
+            client = build_llm_client(cfg)
+            assert client is not None
+
+            await client.generate_response(
+                [Message(role='user', content='Alice knows Bob.')],
+                response_model=_Extraction,
+            )
+
+            body = server.requests_to('/chat/completions')[0]['json_body']
+            assert body['max_tokens'] == 2048
+
+    @pytest.mark.asyncio
     async def test_auto_mode_sends_json_schema_over_the_wire(
         self, no_ambient_openai_env,
     ):
