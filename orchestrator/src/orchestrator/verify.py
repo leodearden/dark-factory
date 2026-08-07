@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -7219,23 +7220,52 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 _SWEEP_CONFIRM_TIMEOUT_SECS: int = 300
 
 
-async def _run_isolated_confirm_group(
+class _RerunOutcome(StrEnum):
+    """What a bounded isolated re-run actually observed — verify's INTERNAL
+    engine vocabulary, deliberately distinct from the wire-facing
+    :class:`orchestrator.flake_ledger.FlakeVerdict`.
+
+    Exists because ``bool`` cannot say the third thing. ``_run_isolated_confirm_group``'s
+    own log line has always said ``'unconfirmable, not counted as a pass'`` for an
+    infra-sentinel attempt, while its return type collapsed that into the same
+    ``False`` a genuine red produces — the fact lived in a variable and died in a
+    log (INV-2, structured-facts-at-failure). ``confirm_isolated_rerun_verdict``
+    needs the distinction to map an infra-sentinel re-run to
+    ``FlakeVerdict.unconfirmable`` rather than mislabelling it as a real red.
+
+    PRECEDENCE, when attempts disagree: ``passed`` (a pass anywhere is proof the
+    group can run green) > ``failed`` (a genuine red observed anywhere is real
+    evidence) > ``unconfirmable`` (we never actually got a verdict). So
+    ``unconfirmable`` means EVERY attempt was uninformative, never "some were".
+    """
+
+    passed = 'passed'  # some attempt ran and PASSED — a confirmed flake for this group
+    failed = 'failed'  # some attempt ran and genuinely FAILED, none passed
+    unconfirmable = 'unconfirmable'  # no attempt produced a usable verdict at all
+
+
+async def _run_isolated_confirm_group_outcome(
     worktree: Path,
     config: 'OrchestratorConfig',
     module_config: ModuleConfig,
-) -> bool:
+) -> _RerunOutcome:
     """Run *module_config* (already scoped + forced-serial) up to
-    ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*.
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*, preserving WHICH
+    of the three outcomes was observed.
 
-    Returns ``True`` as soon as any attempt PASSES (that group is a confirmed
-    flake). Returns ``False`` if every attempt exhausts without a pass —
-    covers a genuine failure, a timeout (``VerifyResult.timed_out`` with
-    ``passed=False``), an infra-sentinel category
-    (``pytest_internalerror``/``env_transient`` — never trusted as
-    confirmation either way), and a raised exception (caught here so a
-    transient error on one attempt doesn't abort the remaining attempts).
-    Never raises.
+    The outcome-preserving source of truth behind ``_run_isolated_confirm_group``
+    (which is a ``outcome is passed`` bool shim over this).
+
+    Returns ``passed`` as soon as any attempt PASSES (that group is a confirmed
+    flake). Otherwise returns ``failed`` if any attempt produced a genuine red —
+    a real failure, or a timeout (``VerifyResult.timed_out`` with
+    ``passed=False``) — and ``unconfirmable`` only when EVERY attempt was
+    uninformative: an infra-sentinel category
+    (``pytest_internalerror``/``env_transient`` — never trusted as confirmation
+    either way) or a raised exception (caught here so a transient error on one
+    attempt doesn't abort the remaining attempts). Never raises.
     """
+    saw_genuine_failure = False
     for attempt in range(_SWEEP_CONFIRM_MAX_ATTEMPTS):
         try:
             result = await run_verification(worktree, config, module_config, max_retries=0)
@@ -7261,8 +7291,39 @@ async def _run_isolated_confirm_group(
             )
             continue
         if result.passed:
-            return True
-    return False
+            return _RerunOutcome.passed
+        # A completed, non-sentinel, non-passing attempt IS evidence of a real
+        # red — the one thing an exhausted loop must not report as "we could
+        # not tell".
+        saw_genuine_failure = True
+    return _RerunOutcome.failed if saw_genuine_failure else _RerunOutcome.unconfirmable
+
+
+async def _run_isolated_confirm_group(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_config: ModuleConfig,
+) -> bool:
+    """Run *module_config* (already scoped + forced-serial) up to
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*.
+
+    Returns ``True`` as soon as any attempt PASSES (that group is a confirmed
+    flake). Returns ``False`` if every attempt exhausts without a pass —
+    covers a genuine failure, a timeout (``VerifyResult.timed_out`` with
+    ``passed=False``), an infra-sentinel category
+    (``pytest_internalerror``/``env_transient`` — never trusted as
+    confirmation either way), and a raised exception (caught here so a
+    transient error on one attempt doesn't abort the remaining attempts).
+    Never raises.
+
+    A lossy shim over ``_run_isolated_confirm_group_outcome``, which is the
+    outcome-preserving source of truth: both ``failed`` and ``unconfirmable``
+    flatten to ``False`` here, deliberately, so this function's three existing
+    callers observe no behaviour change at all.
+    """
+    return await _run_isolated_confirm_group_outcome(
+        worktree, config, module_config,
+    ) is _RerunOutcome.passed
 
 
 def _group_node_ids_by_subproject(
