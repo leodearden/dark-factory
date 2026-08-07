@@ -496,6 +496,32 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 )
 
 
+# Documented carve-outs from the coverage guard below: prefix -> justification.
+# Modelled on TIMEOUT_GUARD_EXCLUSIONS in test_fallback_verify_config.py, but a
+# dict rather than a frozenset so each justification is a CHECKED value naming
+# an owning task, not a bare opt-out with its reason in an adjacent comment.
+#
+# THIS IS THE ONE REMAINING GAP in the repo-root yaml's claim that "tight
+# timeouts surface hangs ... on the PER-MODULE budgets". Nine of ten configs
+# now declare their own; this is the tenth. Recorded here so the guard REPORTS
+# that gap on every run rather than hiding it.
+MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
+    'orchestrator': (
+        'Owned by task 3353, which is still pending. Deliberately not fixed by '
+        'task 3473 to avoid scope creep onto files 3473 does not lock. The '
+        'exclusion is TECHNICALLY correct, not merely deferential: orchestrator '
+        'is the dominant fleet segment (measured 1366.23s and 1157.62s on one '
+        'day, ~18% apart, in task 3062 attempt-2 / esc-3062-3), and task 3353 '
+        "has since been rewritten to \"split or shard the orchestrator test "
+        'suite\" — so a budget declared now against an unsharded 1366s figure '
+        "would be invalidated by 3353's own change rather than merely refined "
+        'by it. DELETION CONDITION: once orchestrator/orchestrator.yaml declares '
+        'its own verify_command_timeout_secs, delete this entry — the coverage '
+        'guard then covers it automatically with no further edit.'
+    ),
+}
+
+
 def test_every_discovered_module_config_declares_its_own_verify_budget() -> None:
     """Every module config defining a test_command must declare a warm budget.
 
