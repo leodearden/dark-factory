@@ -1968,6 +1968,54 @@ class TestRunArchitectEval:
 
 
 # ---------------------------------------------------------------------------
+# Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
+#
+# run_architect_eval built its EvalMetrics from the architect's OWN spend
+# only, discarding the plan judge's opus/effort=max invocation cost entirely
+# — every architect cell persisted judge_cost_usd=0.0. judge_cost_usd is a
+# SUBSET of cost_usd, not disjoint (metrics.py:69-71), so the cell's cost_usd
+# must become architect spend + judge spend, with judge_cost_usd as the
+# subset breakdown — mirroring the implementer path's existing semantics
+# (metrics.py:597-598 / workflow.py:7872-7875).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectCellRecordsJudgeSpend:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_judge_spend_recorded_and_folded_into_cell_cost(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            judge_return=PlanQualityVerdict(
+                plan_quality=0.77, per_criterion={}, reasoning='good',
+                cost_usd=0.42,
+            ),
+        )
+
+        # The RETURNED result...
+        assert result.metrics['judge_cost_usd'] == pytest.approx(0.42)
+        assert result.metrics['judge_invocations'] == 1
+        # ...the SUBSET invariant: architect spend (1.23, the harness default)
+        # PLUS the judge spend, never the architect spend alone.
+        assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+        # ...and what was actually PERSISTED via save_result, not just what
+        # the function happens to return.
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['judge_invocations'] == 1
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+
+# ---------------------------------------------------------------------------
 # Task 3302: gate the LLM plan judge at the SOURCE.
 #
 # run_architect_eval's healthy branch called judge_plan_quality with no
