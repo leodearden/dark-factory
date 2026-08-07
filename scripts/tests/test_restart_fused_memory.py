@@ -153,7 +153,12 @@ _FAKE_JOURNALCTL_SRC = '''#!/usr/bin/env python3
 """Fake journalctl for the --drain drained-marker wait. Records every call;
 emits the shared `journalctl_marker` string once the call count exceeds
 `journalctl_marker_after` (so the wait must poll a few times first). An
-empty marker means "never emits" (drain-timeout path)."""
+empty marker means "never emits" (drain-timeout path). When
+`journalctl_marker_padding_bytes` is set, a large block of filler is
+written AFTER the marker line so a still-reading real `grep -q` consumer
+(which exits the instant it matches) would race SIGPIPE against this
+process for the trailing bytes it never reads — task 3838 companion
+regression for the drain-wait's journalctl|grep pipeline."""
 import json
 import os
 import sys
@@ -176,9 +181,15 @@ def main(argv):
     state.setdefault("journalctl_calls", []).append(argv[1:])
     marker = state.get("journalctl_marker", "")
     after = state.get("journalctl_marker_after", 0)
+    padding_bytes = state.get("journalctl_marker_padding_bytes", 0)
+    call_count = len(state["journalctl_calls"])
     _save(state)
-    if marker and len(state["journalctl_calls"]) > after:
-        print(marker)
+    if marker and call_count > after:
+        out = marker + "\\n"
+        if padding_bytes:
+            line = "x" * 200 + "\\n"
+            out += line * (padding_bytes // len(line) + 1)
+        sys.stdout.write(out)
     return 0
 
 
@@ -200,6 +211,7 @@ def _write_fakes(
     health_fail_remaining=0,
     journalctl_marker="",
     journalctl_marker_after=0,
+    journalctl_marker_padding_bytes=0,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -223,6 +235,7 @@ def _write_fakes(
         "health_fail_remaining": health_fail_remaining,
         "journalctl_marker": journalctl_marker,
         "journalctl_marker_after": journalctl_marker_after,
+        "journalctl_marker_padding_bytes": journalctl_marker_padding_bytes,
     }))
     return bin_dir, state_path
 
@@ -241,6 +254,7 @@ def _run_script(
     health_fail_remaining=0,
     journalctl_marker="",
     journalctl_marker_after=0,
+    journalctl_marker_padding_bytes=0,
 ):
     bin_dir, state_path = _write_fakes(
         tmp_path,
@@ -250,6 +264,7 @@ def _run_script(
         health_fail_remaining=health_fail_remaining,
         journalctl_marker=journalctl_marker,
         journalctl_marker_after=journalctl_marker_after,
+        journalctl_marker_padding_bytes=journalctl_marker_padding_bytes,
     )
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
@@ -345,11 +360,17 @@ def test_default_survives_large_busy_output_without_sigpipe(tmp_path):
     """With the old `verdict="$(printf '%s\\n' "$gate_output" | head -n1)"`
     pipeline, `head -n1` can close the pipe before `printf` finishes writing
     a large gate_output, taking SIGPIPE; under `set -euo pipefail` that
-    became exit 141 and aborted the whole script mid-gate, before the
-    restart, with no diagnostic. A single busy poll with 2000
+    would abort the whole script mid-gate, before the restart, with no
+    diagnostic — a pipeline that can SIGPIPE at all has no business in a
+    `set -euo pipefail` gate. A single busy poll with 2000
     `recon_busy_cycle` lines (~260KB, well past the 64KiB pipe buffer) makes
-    the race deterministic instead of load-sensitive. The fix
-    (`verdict="${gate_output%%$'\\n'*}"`) is pure bash and cannot SIGPIPE."""
+    the race deterministic instead of load-sensitive; this is a worst-case
+    hardening drill, not a reproduction of the real gate_output size behind
+    the observed task 3838 exit-141 incident, which remains unconfirmed
+    (recon_busy_snapshot() emits one entry per concurrently in-flight full
+    cycle — realistically 1-5, ~650 bytes — see task 3838 follow-up). The
+    fix (`verdict="${gate_output%%$'\\n'*}"`) is pure bash and cannot
+    SIGPIPE regardless of size."""
     result = _run_script(
         tmp_path,
         recon_busy_remaining=1,  # one large-busy poll, then idle
@@ -405,6 +426,54 @@ def test_drain_signals_sigusr1_and_waits_for_marker(tmp_path):
     assert len(state["journalctl_calls"]) >= 3, (
         f"expected the drained-marker wait to poll journalctl until the marker "
         f"appears; state={state!r}"
+    )
+    assert DRAIN_MARKER.lower() in result.stdout.lower(), f"stdout={result.stdout!r}"
+    assert ["restart", UNIT] in state["systemctl_calls"], f"state={state!r}"
+
+
+# ---------------------------------------------------------------------------
+# (e2) --drain survives a large post-marker journal burst without SIGPIPE
+# (regression, task 3838 amendment)
+# ---------------------------------------------------------------------------
+
+def test_drain_survives_large_journal_output_without_sigpipe(tmp_path):
+    """With the old
+    `journalctl ... | grep -q "$DRAIN_MARKER"` pipeline, `grep -q` exits
+    the instant it matches, so a burst larger than the 64KiB pipe buffer
+    queued behind the matching line (plausible during an active recon
+    cycle — exactly when --drain is used) can take journalctl SIGPIPE
+    after grep has already found the marker and exited 0. Under
+    `pipefail`, bash's own rule ("the last, i.e. rightmost, command to
+    exit non-zero") still surfaces journalctl's non-zero status even
+    though the rightmost command (grep) succeeded, so the pipeline as a
+    whole reads as failed. Because this pipeline is an `if` condition,
+    `set -e` does not abort — the condition just silently evaluates
+    false, so the old code would treat a marker it actually saw as
+    not-seen and spin polling until DRAIN_TIMEOUT. A marker on the very
+    first poll followed by 200KB of padding (well past the 64KiB pipe
+    buffer) makes the race deterministic instead of load-sensitive. The
+    fix (`journal="$(journalctl ... || true)"` then a pure-bash
+    `[[ "$journal" == *"$DRAIN_MARKER"* ]]`) captures the whole journal
+    via command substitution — bash reads to EOF rather than exiting
+    early — so it cannot SIGPIPE."""
+    result = _run_script(
+        tmp_path,
+        "--drain",
+        journalctl_marker=DRAIN_MARKER,
+        journalctl_marker_after=0,  # marker appears on the very first poll
+        journalctl_marker_padding_bytes=200_000,  # >> 64KiB pipe buffer
+        env={"DRAIN_TIMEOUT": "10", "DRAIN_POLL_INTERVAL": "0"},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    # The marker was present on the FIRST poll: the drain wait must detect
+    # it right away rather than (falsely, under the old SIGPIPE-prone
+    # pipeline) missing it and spinning toward DRAIN_TIMEOUT.
+    assert len(state["journalctl_calls"]) == 1, (
+        f"expected the drain wait to stop as soon as the marker was seen "
+        f"on the first poll, not spin looking for it again; state={state!r}"
     )
     assert DRAIN_MARKER.lower() in result.stdout.lower(), f"stdout={result.stdout!r}"
     assert ["restart", UNIT] in state["systemctl_calls"], f"state={state!r}"
