@@ -658,6 +658,109 @@ class TestRecordFlakeOccurrenceEmptyTestIds:
         assert verdict_name in warnings[0].getMessage()
 
 
+class TestRecordFlakeOccurrenceWireDeserializedVerdict:
+    """``FlakeSuppression`` "rides VerifyResult across the wire" (§8) and is a plain
+    dataclass with NO runtime validation, so a JSON round-trip hands ``verdict`` back as
+    a plain ``str`` rather than a ``FlakeVerdict``.
+
+    Two defects this pins, both on the remote-runner path:
+
+    (a) B12.  Triage used to sit OUTSIDE the try/except and reach ``s.verdict.value``,
+        so a str verdict raised ``AttributeError`` straight out of a public entry point.
+        The merge path has no ``VerifyInfraError`` handler, so that stalls the QUEUE.
+    (b) Misrouting.  An ``is``-comparison against the enum member is False for an
+        equal-valued str, so a wire-deserialized ``unconfirmable`` with no node-ids fell
+        through to the silent-drop branch — deleting exactly the class-1 signal the
+        sentinel exists to preserve, and under-counting θ's unconfirmable rate.
+    """
+
+    def _record(self, db_path: Path, **overrides) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(**overrides),
+            merge_sha='abc123',
+            task_id='3785',
+        )
+
+    def test_str_unconfirmable_with_no_test_ids_still_lands_the_sentinel(
+        self, tmp_path: Path
+    ) -> None:
+        """Defect (b): the class-1 signal survives the wire, verbatim str and all."""
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._record(
+            db_path,
+            verdict='unconfirmable',  # a plain str, exactly as JSON hands it back
+            test_ids=(),
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+
+        (row,) = read_occurrences(db_path)
+        assert row.test_id == UNKNOWN_TEST_ID
+        assert row.verdict == 'unconfirmable'
+
+    def test_str_verdict_with_test_ids_round_trips_identically(self, tmp_path: Path) -> None:
+        """A str verdict must be coerced, not written verbatim — the column carries the
+        §5.5 vocabulary, and one discriminator serves both merge gates."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, verdict='passes_in_isolation')
+
+        (row,) = read_occurrences(db_path)
+        assert row.verdict == 'passes_in_isolation'
+        assert row.test_id == 'tests/test_a.py::test_one'
+
+    @pytest.mark.parametrize('verdict_name', ['passes_in_isolation', 'fails_in_isolation'])
+    def test_str_confirmed_verdict_with_no_test_ids_degrades_loudly(
+        self, tmp_path: Path, caplog, verdict_name: str
+    ) -> None:
+        """Defect (a): the drop branch reaches ``.value``, so it must not see a raw str.
+        Returns None, writes nothing, WARNS — never raises."""
+        import logging
+
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path, verdict=verdict_name, test_ids=())
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert verdict_name in warnings[0].getMessage()
+
+    @pytest.mark.parametrize(
+        'bogus', ['flaky_test', '', None, 0], ids=['unknown_word', 'empty', 'none', 'int']
+    )
+    def test_an_unrecognised_verdict_degrades_through_b12(
+        self, tmp_path: Path, caplog, bogus
+    ) -> None:
+        """B12 applies to a MALFORMED payload too: an unrecognised verdict must not be
+        written verbatim into the vocabulary column, and must not raise ``ValueError``
+        out of the entry point.  ``flaky_test`` is the §5.5 anti-vocabulary — if it ever
+        reaches here it is a bug upstream, and the ledger's job is to log it, not to
+        fail the merge."""
+        import logging
+
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert self._record(db_path, verdict=bogus) is None
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+        _assert_logged_loudly(caplog)
+
+
 class TestReadOccurrences:
     """The reader filters ι (per-test recurrence chains) and θ (windowed rates) need,
     so neither hand-rolls SQL against these tables — §5.2's API-only rule."""
