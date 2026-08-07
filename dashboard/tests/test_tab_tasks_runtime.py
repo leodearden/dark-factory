@@ -220,15 +220,33 @@ class TestTasksTabRuntimeProbeBanner:
         assert 'PROBE_TONE_ACCENT_T[probeSummary.tone]' in tasks_tab_body
         assert "probeSummary.selfInflicted ? 'var(--warn)' : 'var(--bad)'" not in tasks_tab_body
 
-    def test_summary_is_scoped_to_the_visible_projects(self, tasks_tab_body):
-        """An operator filtered down to one healthy project is not looking at
-        the rows the banner alarms about; a banner that narrowing the view
-        cannot dismiss is just noise."""
-        assert 'rtProbeSummary(allTasks)' not in tasks_tab_body, (
-            'summary must be computed over the projectFilter-visible rows, not allTasks'
+    def test_summary_denominator_is_not_scoped_by_project_filter(self, tasks_tab_body):
+        """The banner is a GLOBAL fact, deliberately not narrowable.
+
+        This reverses an earlier decision to scope the summary to the
+        projectFilter-visible rows, so the why matters. `selfInflicted` is a
+        claim about the DASHBOARD's own health — it asserts the dashboard
+        finished none of the probes it started — so its denominator has to be
+        every probed project. Scoping the rows to `projectFilter` lets an
+        operator who has narrowed to two timed-out projects MANUFACTURE a
+        spurious all-at-once verdict, inventing the exact dashboard-blaming
+        misdiagnosis this task exists to prevent.
+
+        The listing being global too is the accepted cost. A banner naming a
+        filtered-out project is strictly less harmful than a false "the
+        orchestrators may be healthy — check the dashboard first" shown while
+        an operator is triaging a real per-project outage.
+        """
+        assert re.search(r'rtProbeSummary\(\s*allTasks\s*\)', tasks_tab_body), (
+            'summary must be computed over the UNFILTERED row set (allTasks)'
         )
-        assert re.search(r'rtProbeSummary\(\s*allTasks\.filter\(', tasks_tab_body), (
-            'expected rtProbeSummary over a filtered row set'
+        assert 'rtProbeSummary(allTasks.filter(' not in tasks_tab_body, (
+            'the projectFilter-scoped form must not come back — it lets a '
+            'narrowed view manufacture a false selfInflicted verdict'
+        )
+        assert 'visibleProjectIds' not in tasks_tab_body, (
+            'visibleProjectIds existed only to scope the summary; a lingering '
+            'binding invites the scoped form to be silently reintroduced'
         )
 
 

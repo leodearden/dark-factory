@@ -689,7 +689,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 44,
+    """All /static/redux/*?v= cache-busters must share a single version >= 45,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
@@ -699,15 +699,21 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     floor, which needs no uniformity precondition to be sound (the OLDEST
     asset is the one that would still serve stale code).
 
-    The floor tracks the newest bump — currently 44, for task 3517's
-    tab_tasks.jsx / runtime_format.js probe-status rendering. Raising it
-    matters more than a routine bump for the usual reason: an already-open
-    browser holds a cached copy of the BROKEN file, so without a new ?v= the
-    fix never reaches it. Here the cached copy renders "orchestrator
-    unreachable", "the dashboard was too starved to ask", and "no runtime
-    endpoint configured" as three IDENTICAL blank cells — precisely the
+    The floor tracks the newest bump. 44 carried task 3517's tab_tasks.jsx /
+    runtime_format.js probe-status rendering, replacing three IDENTICAL blank
+    cells ("orchestrator unreachable", "the dashboard was too starved to ask",
+    "no runtime endpoint configured") with a stated diagnosis — precisely the
     ambiguity that got the 2026-07-30 event misdiagnosed as an orchestrator
     outage.
+
+    45 is task 3517's amendment, and raising the floor matters here for the
+    usual reason squared: an already-open browser holds a cached copy of the
+    BROKEN file, and at v=44 that file computes the probe banner over a
+    denominator that omits the healthy projects and is scoped by the project
+    filter. Both defects make the banner assert "the orchestrators may be
+    healthy — check the dashboard first" during a real per-project outage. A
+    stale cache would keep serving that false diagnosis at exactly the moment
+    an operator is triaging, which is worse than the blank cells v=44 fixed.
     """
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
@@ -715,12 +721,13 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = next(iter(versions))
-    assert v >= 44, (
-        f'index.html cache-buster version is {v}, expected >= 44 — the bump '
-        "that carries task 3517's runtime-probe status rendering "
-        '(tab_tasks.jsx + runtime_format.js) to already-open browsers, which '
-        'would otherwise keep showing all three probe failure modes as '
-        'identical blank cells.'
+    assert v >= 45, (
+        f'index.html cache-buster version is {v}, expected >= 45 — the bump '
+        "that carries task 3517's probe-banner corrections (a denominator "
+        'that counts the HEALTHY probed projects, computed over the '
+        'unfiltered rows) to already-open browsers, which would otherwise '
+        'keep telling an operator to check the dashboard first during a real '
+        'per-project orchestrator outage.'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
