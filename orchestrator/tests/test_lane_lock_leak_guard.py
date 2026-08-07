@@ -111,7 +111,7 @@ _FOREIGN_HOLDER_HOLD_SECS = 120
 #: 30s is the ceiling task 3491 settled on for it.  Widening this can never
 #: make a broken staging pass — it only lengthens how long a genuinely
 #: broken one takes to fail.
-_FOREIGN_HOLDER_STARTUP_SECS = 30.0
+_FOREIGN_HOLDER_STARTUP_SECS = 12.0
 
 #: Bound on how long :func:`foreign_lane_lock_holder` waits, on exit, for the
 #: kernel to stop attributing the lock to the child.  Left UNCHANGED at 5.0:
@@ -128,7 +128,7 @@ _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 #: load-sensitive full-suite-flake class.  A longer bound only lengthens how
 #: long a genuinely broken staging takes to fail — it can never make a broken
 #: staging pass.
-_FOREIGN_HOLDER_ATTRIBUTION_SECS = 30.0
+_FOREIGN_HOLDER_ATTRIBUTION_SECS = 12.0
 
 #: Bound on how long :func:`require_lane_lock_holders` retries an UNREADABLE
 #: kernel lock table before failing loudly.  Deliberately NOT the 30s
