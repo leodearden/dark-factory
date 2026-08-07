@@ -2410,6 +2410,26 @@ def _run_write_decision(
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
 
+    ``project`` is stored NORMALIZED (see normalize_project_token, task
+    3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
+    the one canonical ``dark_factory`` and ``reap-decisions`` can no longer
+    miss a partition. This NORMALIZES an unrecognized spelling rather than
+    REJECTING it, deliberately: (1) this verb is fail-soft by contract --
+    main() always returns 0 and write_decision never raises -- so a rejection
+    would silently DROP the decision, which is precisely the
+    fail-into-invisibility harm the whole verb exists to prevent; a human's
+    parked question would vanish instead of appearing under a slightly-off
+    token. (2) An allowlist would mean a genuinely new project cannot file a
+    decision until someone ships a code change, turning a data-hygiene rule
+    into an availability dependency. A rewrite is logged at WARNING so it
+    stays LOUD rather than silent.
+
+    NOTE that ``decision_id`` is untouched by that normalization: the ``df-``
+    prefix on an id like ``df-esc-3524-1`` is part of ``--id``, which the
+    caller types, and is never derived from or rewritten because of
+    ``--project``. Conflating the two is how the three-way project split
+    arose.
+
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
     passes the SAME queue dir it later reaps with, so this fleet-global
@@ -2431,9 +2451,14 @@ def _run_write_decision(
     an optional repeatable ``--option`` flag here rather than widening this
     verb's other args.
     """
+    canonical_project = normalize_project_token(project)
+    if canonical_project != project:
+        logger.warning(
+            'write-decision: normalized --project %r -> %r', project, canonical_project
+        )
     record = DecisionRecord(
         id=decision_id,
-        project=project,
+        project=canonical_project,
         text=text,
         filed_at=datetime.now(UTC).isoformat(),
         task_id=task_id,
@@ -2575,7 +2600,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
     )
     write_decision_p.add_argument('--id', required=True, help="this decision's id")
-    write_decision_p.add_argument('--project', required=True)
+    write_decision_p.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "this decision's project; stored NORMALIZED to one canonical token "
+            '(see normalize_project_token), so df/dark-factory/Dark_Factory all '
+            'persist as dark_factory'
+        ),
+    )
     write_decision_p.add_argument('--text', required=True, help='the decision/question text')
     write_decision_p.add_argument('--task-id', default=None)
     write_decision_p.add_argument('--escalation-id', default=None)
