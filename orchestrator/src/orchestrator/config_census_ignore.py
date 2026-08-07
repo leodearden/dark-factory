@@ -55,6 +55,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import yaml
+
 from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ __all__ = [
     'CensusIgnoreFinding',
     'CensusIgnoreSpec',
     'TaskCiteStatus',
+    'audit_census_ignore_entries',
     'audit_census_ignore_specs',
     'parse_census_ignore_entries',
     'read_task_statuses',
@@ -475,3 +478,50 @@ def _liveness_findings(
                 'and this entry has no realistic expiry date.',
             ))
     return findings
+
+
+def audit_census_ignore_entries(config_path: Path | str) -> list[CensusIgnoreFinding]:
+    """Audit the ``config_key_census.ignore`` entries of the YAML at *config_path*.
+
+    The operator-facing entry point: parse the entries off the RAW tree, resolve
+    the project's task store from that same raw tree, and return the combined
+    structural + liveness findings.
+
+    Reads the raw tree rather than a validated ``OrchestratorConfig`` for the
+    same reason ``census_config_keys`` does — a lint must still report entry
+    debt on a config that currently fails validation for an unrelated
+    value-level reason.  This is a deliberate SECOND read of the YAML rather
+    than a threading of the parsed tree out of the census: keeping
+    ``census_config_keys(config_path)`` a pure function of the file is what
+    lets the born-at-L2 stay keyed on the config alone (the L2-decoupling
+    decision), so the census signature can never shift because a task's status
+    changed.
+
+    Fail-open throughout: an unreadable/malformed/non-dict YAML yields ``[]``,
+    and an unresolvable ``project_root`` yields a ``None`` probe — the liveness
+    half goes quiet (with a breadcrumb naming the DB path that was looked for)
+    while the structural half is still returned in full.
+    """
+    try:
+        with open(config_path) as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        logger.debug('census-ignore audit: cannot read %s (%s)', config_path, exc)
+        return []
+    if not isinstance(tree, dict):
+        return []
+
+    specs = parse_census_ignore_entries(tree)
+    if not specs:
+        return []
+
+    project_root = tree.get('project_root')
+    probe = (
+        read_task_statuses(project_root) if isinstance(project_root, str) else None
+    )
+    if probe is None and not isinstance(project_root, str):
+        logger.debug(
+            'census-ignore audit: %s has no usable project_root — citation '
+            'liveness checks are SKIPPED', config_path,
+        )
+    return audit_census_ignore_specs(specs, probe)
