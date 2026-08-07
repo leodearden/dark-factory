@@ -917,6 +917,93 @@ def normalize_escalations_dir(value: str | Path) -> str:
         return raw
 
 
+_PROJECT_TOKEN_UNDERSCORE_RE = re.compile(r'_+')
+"""Collapses a run of '_' to one, mirroring the _DECISION_ID_SANITIZE_RE
+idiom (module-level compiled regex, used by exactly one normalizer). Applied
+AFTER '-' has been translated to '_', so 'dark--factory' and 'dark-_factory'
+both land on 'dark_factory'."""
+
+
+PROJECT_TOKEN_ALIASES: dict[str, str] = {
+    'df': 'dark_factory',
+}
+"""Maps an ALREADY-FOLDED project token to its ALREADY-FOLDED canonical
+spelling, for the cases case/separator folding alone cannot merge (task
+3807). Applied as the LAST step of normalize_project_token, so both key and
+value must themselves already be canonical under the fold.
+
+ADMISSION RULE for a new entry -- the canonical value must be the
+``memory.project_id`` declared by a real project root's
+``dark-factory-orchestrator.yaml``. That keeps the table mechanical and
+auditable instead of a per-case judgement call, and it is the reason this
+table is deliberately NOT a config read: this module is stdlib-only with no
+intra-orchestrator imports (see module docstring), so the mapping is a
+hand-maintained constant kept in sync with those configs.
+
+EVIDENCE for the sole seeded entry: three independent declarations name
+``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
+.yaml`` (``memory.project_id``), ``orchestrator/src/orchestrator/config.py``
+(the ``project_id`` field default), and CLAUDE.md's write-tagging
+convention. ``df`` appears ONLY inside the decision registry and as a
+hand-typed ``df-`` prefix on ``--id`` (which is part of the id a human
+types, never derived from ``--project``), so aliasing it costs nothing
+elsewhere.
+
+Folding alone already merges the other observed splits
+(``autopilot-video`` = ``autopilot_video``, ``solar-challenge`` =
+``solar_challenge``), so only a TRUE alias needs an entry here."""
+
+
+def normalize_project_token(value: object) -> str:
+    """The ONE canonical spelling of a project token (task 3807).
+
+    Direct sibling of ``normalize_escalations_dir`` and wired the same way:
+    both sides of the (fleet-global decisions <-> per-project reaper) join
+    run their project token through this one helper -- the ``write-decision``
+    verb stamps the normalized form onto ``DecisionRecord.project``, and the
+    ``reap-decisions`` verb normalizes both its own ``--project`` and the
+    decision's stored value before comparing them. Routing both through one
+    function is what makes ``df``, ``dark-factory`` and ``Dark_Factory``
+    compare EQUAL; a raw string compare silently PARTITIONS one project's
+    decisions, which is the bug this exists to prevent (measured 2026-08-06:
+    41 OPEN dark-factory decisions split 22/17/2 across
+    ``dark_factory``/``df``/``dark-factory``, each partition invisible to a
+    reap scoped to either of the others).
+
+    The fold: strip, casefold, ``-`` -> ``_``, collapse ``_`` runs, strip
+    edge ``_``, then apply PROJECT_TOKEN_ALIASES.
+
+    Returns ``''`` -- the "unset" sentinel, never a token -- for an empty or
+    whitespace-only *value*, mirroring normalize_escalations_dir's ``''``
+    contract so a reader learns ONE rule for both boundary normalizers. ``''``
+    only ever matches ``''``, so an unset token cannot accidentally join a
+    real project.
+
+    IDEMPOTENT: ``f(f(x)) == f(x)`` for every input. Load-bearing --
+    ``migrate_decision_project_tokens`` decides a record is already canonical
+    by comparing ``normalize_project_token(p) == p``, so a non-idempotent
+    fold would rewrite every record on every run.
+
+    It deliberately merges ONLY case and separator differences (plus an
+    explicit alias). It does NOT merge tokens that differ by more than that:
+    ``solar_challenge`` and ``solar_challenge_platform`` are two DIFFERENT
+    project roots whose tokens merely share a prefix, and merging them would
+    let one project's reaper close the other's decisions -- strictly worse
+    than the bug being fixed. A named collapse-guard test pins that.
+
+    Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
+    via ``str()`` rather than rejecting it. A coerced token simply matches no
+    real project -- the fail-OPEN direction, leaving a decision visible to
+    the human rather than risking a false close. Keeps this module's
+    no-intra-orchestrator-imports rule (see module docstring).
+    """
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    folded = _PROJECT_TOKEN_UNDERSCORE_RE.sub('_', raw.casefold().replace('-', '_')).strip('_')
+    return PROJECT_TOKEN_ALIASES.get(folded, folded)
+
+
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
     """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
 
