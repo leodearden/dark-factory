@@ -2799,11 +2799,18 @@ async def _run_post_merge_verify(
     #                               and TRUST the remote green (never block a land
     #                               on a local infra hiccup — DriftDetector Invariant 5).
     #   local INDETERMINATE       → fail-SAFE (task 3173): the local leg returned
-    #                               NORMALLY with passed=False but its category says
-    #                               it never produced a verdict at all (killed, out of
-    #                               disk, semaphore timeout). Emit
+    #                               NORMALLY with passed=False, but EVERY failing leg
+    #                               it reported is verdict-less — today that means
+    #                               each was killed by an external signal
+    #                               (INDETERMINATE_VERDICT_CATEGORIES == {infra_kill};
+    #                               disk_full, semaphore_timeout and env_transient
+    #                               were adjudicated OUT and keep their veto). Emit
     #                               verify_cross_check_inconclusive and TRUST the
     #                               remote green — see the invariant on that arm.
+    #                               A MIXED run (one completed failing leg plus one
+    #                               killed leg) takes the DIVERGE arm, even though
+    #                               severity dominance makes its aggregate category
+    #                               'infra_kill'.
     if (
         runner is not None
         and verify.passed
@@ -2914,19 +2921,41 @@ async def _run_post_merge_verify(
             # land proceeds).  They are unreachable here only because a killed
             # leg returns NORMALLY with passed=False instead of raising.
             #
-            # infra_timeout and pytest_internalerror are deliberately NOT in
-            # the registry, even though both are infra-transient elsewhere: a
-            # hang and a collection-time INTERNALERROR are non-completions a
-            # diff can genuinely CAUSE (an introduced deadlock; a conftest or
-            # plugin that raises only on this host's interpreter), so both keep
-            # vetoing (fail CLOSED).  An EMPTY category is likewise not a
-            # licence to land.  The registry is derived per-row from
-            # CategoryPolicy.verdict_indeterminate, NOT from the infra-transient
-            # set — see INDETERMINATE_VERDICT_CATEGORIES, and note it is
-            # UNRELATED to merge_disposition.MergeFailureDisposition.INDETERMINATE,
-            # which is post-failure attribution one layer up.
-            if not local_verify.passed and (
-                (local_verify.category or '') in INDETERMINATE_VERDICT_CATEGORIES
+            # The registry names only `infra_kill`, and every exclusion is an
+            # adjudicated CategoryPolicy.verdict_indeterminate row rather than
+            # set arithmetic over the infra-transient set:
+            #   - infra_timeout / pytest_internalerror / disk_full fail the
+            #     "the branch could not have CAUSED this" half — an introduced
+            #     deadlock, a conftest that raises only on this host's
+            #     interpreter, and a diff whose build artifacts fill the disk
+            #     are all non-completions a diff can genuinely cause;
+            #   - env_transient / semaphore_timeout fail the "the evidence is
+            #     structural, not text the branch can forge" half — see the
+            #     residuals verify_classify's own docstrings document at
+            #     :498-508 and :438-453.
+            # All of those keep vetoing (fail CLOSED), as does an EMPTY
+            # category.  Note the registry is UNRELATED to
+            # merge_disposition.MergeFailureDisposition.INDETERMINATE, which is
+            # post-failure attribution one layer up.
+            #
+            # GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173
+            # review).  severity_rank makes `_worst_category` let a rank-1
+            # INFRA_KILL DOMINATE a co-occurring rank-11 TEST_FAILURE — correct
+            # for "how bad was this run" (retry budget, archival, the infra
+            # hold), catastrophic if read as "this run produced no verdict".  A
+            # trust anchor whose test leg COMPLETED and blamed the branch,
+            # alongside an unrelated SIGKILLed lint leg, aggregates to
+            # category='infra_kill'; keying the veto off that single value
+            # would discard the completed, branch-blaming evidence this
+            # cross-check exists to collect (task 2822) and land the remote
+            # PASS.  Only a run in which EVERY failing leg is verdict-less may
+            # decline to veto.  A None list ("not recorded" — an older remote's
+            # wire payload, or any result not produced by run_verification) and
+            # an empty one ("no legs recorded") both fall through to the
+            # `.passed ==` comparison below, i.e. fail CLOSED.
+            local_failing_legs = local_verify.failing_leg_categories or []
+            if not local_verify.passed and local_failing_legs and all(
+                c in INDETERMINATE_VERDICT_CATEGORIES for c in local_failing_legs
             ):
                 if event_store is not None:
                     event_store.emit(
@@ -2936,19 +2965,21 @@ async def _run_post_merge_verify(
                             'merge_sha': merge_sha,
                             'remote_runner': runner.name,
                             'local_category': local_verify.category,
+                            'local_failing_leg_categories': local_failing_legs,
                             'reason': (
-                                f'local trust-anchor produced no verdict '
-                                f'(category={local_verify.category!r}): '
+                                f'local trust-anchor produced no verdict on any '
+                                f'failing leg (legs={local_failing_legs!r}, '
+                                f'category={local_verify.category!r}): '
                                 f'{local_verify.summary}'
                             ),
                         },
                     )
                 logger.warning(
                     'Task %s: local cross-check trust-anchor produced NO verdict '
-                    'for %s (remote=%s, category=%s) — trusting the remote green '
-                    '(fail-safe, DriftDetector Invariant 5): %s',
+                    'for %s (remote=%s, category=%s, failing_legs=%s) — trusting '
+                    'the remote green (fail-safe, DriftDetector Invariant 5): %s',
                     req.task_id, merge_sha, runner.name,
-                    local_verify.category, local_verify.summary,
+                    local_verify.category, local_failing_legs, local_verify.summary,
                 )
             elif local_verify.passed == verify.passed:
                 # AGREE — both green.  Emit parity telemetry and proceed to land.
