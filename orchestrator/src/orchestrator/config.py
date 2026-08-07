@@ -2813,12 +2813,25 @@ class ConfigIgnoredKey(NamedTuple):
 
     Ignored keys are excluded from ``.unknown`` and therefore from the census
     signature and the born-at-L2, but are still reported informationally by
-    ``orchestrator check-config`` (at exit 0) so an over-broad glob stays
-    auditable rather than becoming an invisible blind spot.
+    ``orchestrator check-config`` so an over-broad glob stays auditable rather
+    than becoming an invisible blind spot.
+
+    ``note`` is the OPERATOR's justification — the ``reason:`` text of the
+    matching ``config_key_census.ignore`` entry, naming who actually consumes
+    the key (task 3395).  It is ``None`` for a reserved-prefix key (nobody
+    asserted anything about it) and for an un-reasoned bare-string entry, which
+    ``check-config`` then reports as debt.  Do not confuse it with ``reason``
+    above, which is the CLASSIFICATION label.
+
+    ``note`` is deliberately appended LAST and DEFAULTED so every existing
+    two-argument construction and tuple-equality assertion stays valid, and so
+    ``harness.py``'s ``ik._asdict()`` carries it into the hot-reload report
+    with no harness change.
     """
 
     path: str
     reason: str
+    note: str | None = None
 
 
 class ConfigKeyCensus(NamedTuple):
@@ -5075,7 +5088,7 @@ def _walk_unknown_keys(
     model_cls: type[BaseModel],
     prefix: str,
     shadow_index: dict[str, list[str]],
-    ignore_patterns: tuple[str, ...],
+    ignore_specs: tuple[CensusIgnoreSpec, ...],
     ignored: list[ConfigIgnoredKey],
 ) -> list[ConfigUnknownKey]:
     """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
@@ -5103,9 +5116,20 @@ def _walk_unknown_keys(
         match = fields_lower.get(key_lower)
         if match is None:
             if key_lower.startswith(_CENSUS_RESERVED_PREFIXES):
-                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix'))
-            elif any(fnmatch.fnmatchcase(dotted, pat) for pat in ignore_patterns):
-                ignored.append(ConfigIgnoredKey(dotted, 'allowlist'))
+                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix', None))
+            elif (
+                spec := next(
+                    (
+                        s
+                        for s in ignore_specs
+                        if fnmatch.fnmatchcase(dotted, s.pattern)
+                    ),
+                    None,
+                )
+            ) is not None:
+                # FIRST match wins, so a specific entry's justification is never
+                # overwritten by a broader glob listed after it.
+                ignored.append(ConfigIgnoredKey(dotted, 'allowlist', spec.reason))
             else:
                 candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
                 hint = ' or '.join(candidates) if candidates else None
@@ -5116,29 +5140,28 @@ def _walk_unknown_keys(
         if sub is not None and isinstance(value, dict):
             unknown.extend(
                 _walk_unknown_keys(
-                    value, sub, dotted + '.', shadow_index, ignore_patterns, ignored
+                    value, sub, dotted + '.', shadow_index, ignore_specs, ignored
                 )
             )
     return unknown
 
 
-def _census_ignore_patterns(tree: dict[Any, Any]) -> tuple[str, ...]:
+def _census_ignore_specs(tree: dict[Any, Any]) -> tuple[CensusIgnoreSpec, ...]:
     """Read ``config_key_census.ignore`` off the RAW project tree, fail-open.
 
     Read from the raw tree rather than a validated OrchestratorConfig so the
     census keeps working when the config has an unrelated value-level validation
     error (the same reason check-config calls the census directly).  A malformed
-    hatch — non-dict block, non-list ``ignore``, non-str entries — degrades to
-    "no allowlist" instead of raising: a broken escape hatch must never take out
-    the census that surfaces real phantom keys.
+    hatch — non-dict block, non-list ``ignore``, non-str/non-mapping entries —
+    degrades to "no allowlist" instead of raising: a broken escape hatch must
+    never take out the census that surfaces real phantom keys.
+
+    Thin adapter over ``parse_census_ignore_entries`` so there is still exactly
+    ONE reader of ``config_key_census.ignore`` off the raw tree; the grammar
+    (bare string vs reasoned ``{path, reason}`` mapping) lives in
+    ``config_census_ignore``.
     """
-    block = tree.get('config_key_census')
-    if not isinstance(block, dict):
-        return ()
-    raw = block.get('ignore')
-    if not isinstance(raw, list):
-        return ()
-    return tuple(entry for entry in raw if isinstance(entry, str))
+    return tuple(parse_census_ignore_entries(tree))
 
 
 def census_config_keys(config_path: Path) -> ConfigKeyCensus:
@@ -5190,7 +5213,7 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     ignored: list[ConfigIgnoredKey] = []
     unknown = _walk_unknown_keys(
         tree, OrchestratorConfig, '', shadow_index,
-        _census_ignore_patterns(tree), ignored,
+        _census_ignore_specs(tree), ignored,
     )
     return ConfigKeyCensus(unknown, ignored)
 

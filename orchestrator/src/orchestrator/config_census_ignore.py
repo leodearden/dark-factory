@@ -105,7 +105,7 @@ def parse_census_ignore_entries(tree: dict[Any, Any]) -> list[CensusIgnoreSpec]:
     validation error (the same reason ``check-config`` calls the census
     directly).
 
-    Inherits ``_census_ignore_patterns``' degradation contract verbatim and
+    Inherits ``config._census_ignore_specs``' degradation contract verbatim and
     extends it one level for the dict form: a malformed hatch — non-dict block,
     non-list ``ignore``, a non-str/non-dict entry, a dict missing ``path`` or
     carrying a non-str ``path`` — degrades to "that entry does not exist"

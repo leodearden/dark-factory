@@ -87,7 +87,7 @@ def test_citations_empty_when_reason_has_no_canonical_cite():
 
 # --- (a2) fail-open parsing ---------------------------------------------------
 #
-# Inherits _census_ignore_patterns' contract verbatim: a broken escape hatch
+# Inherits config._census_ignore_specs' contract verbatim: a broken escape hatch
 # must never take out the census that surfaces real phantom keys.  Each case is
 # asserted independently so a regression names the exact malformation.
 
