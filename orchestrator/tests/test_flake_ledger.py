@@ -14,7 +14,9 @@ mixed-colour (sync writer/readers, async debt functions); the split is structura
 
 from __future__ import annotations
 
+import gc
 import logging
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1215,3 +1217,95 @@ class TestNeverRaisesAsync:
                 is None
             )
         _assert_logged_loudly(caplog)
+
+
+class TestConnectClosesOnPragmaFailure:
+    """``_connect`` must not leak its sqlite3 connection when the pragma call raises.
+
+    ``sqlite3.connect()`` succeeds LAZILY even against a non-DB file, so the first real
+    statement — the ``PRAGMA journal_mode=WAL`` inside
+    ``apply_full_durability_pragmas_sync`` — is where the failure surfaces, by which
+    point ``conn`` already owns an open file descriptor.
+
+    This matters MORE here than in the sibling stores: event_store.py:509 and
+    run_store.py:87 share the same connect-then-pragma idiom but PROPAGATE the raise, so
+    the process is dying anyway.  B12 makes this module deliberately SWALLOW the
+    exception and return an honest-degrade value, so a long-lived orchestrator keeps
+    calling on every merge — turning a one-shot leak into an unbounded one.
+
+    Two layered assertions: the invariant itself (deterministic and portable), and the
+    real-resource regression that the leak was actually measured as.
+    """
+
+    def test_connection_is_closed_when_the_pragma_call_raises(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The invariant, immune to GC timing and to procfs availability."""
+        from orchestrator import flake_ledger
+
+        created: list[sqlite3.Connection] = []
+        real_connect = sqlite3.connect
+
+        def _recording_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            created.append(conn)
+            return conn
+
+        def _boom(conn, **kwargs):
+            raise RuntimeError('wal unsupported')
+
+        # flake_ledger.py does `from shared.sqlite_sync_base import
+        # apply_full_durability_pragmas_sync`, so the name is REBOUND in the
+        # flake_ledger module namespace — that is the correct patch target.  Patching
+        # `shared.sqlite_sync_base.apply_full_durability_pragmas_sync` would NOT take
+        # effect, because the from-import already captured the original object.
+        monkeypatch.setattr(flake_ledger, 'apply_full_durability_pragmas_sync', _boom)
+        monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
+
+        with pytest.raises(RuntimeError, match='wal unsupported'):
+            flake_ledger._connect(tmp_path / 'runs.db')
+
+        assert len(created) == 1, 'expected exactly one sqlite3 connection to be opened'
+        # 'Cannot operate on a closed database' is how a closed connection reports.
+        with pytest.raises(sqlite3.ProgrammingError, match='closed database'):
+            created[0].execute('SELECT 1')
+
+    @pytest.mark.skipif(not Path('/proc/self/fd').exists(), reason='needs procfs')
+    def test_repeated_calls_on_a_corrupt_db_leak_no_file_descriptors(self, tmp_path: Path) -> None:
+        """The regression as measured: repeated B12-swallowed failures must not grow fds.
+
+        ``gc.disable()`` IS LOAD-BEARING — do not "simplify" it away.  The leaked
+        connection is held by a reference CYCLE (exception → traceback → frame → local
+        ``conn``), so it is reclaimed by the generational collector, not by refcounting.
+        With the cyclic GC left enabled the fd count moves NON-MONOTONICALLY (measured
+        +100, then −54, then +65 across successive batches), which would make a plain
+        "loop N times and assert the count does not grow" test flaky in BOTH directions:
+        failing on fixed code when a batch straddles no collection, and passing on
+        broken code when a collection happens to fire inside the window.
+
+        Disabling the collector for the measurement window turns it into an exact
+        signal: measured at HEAD 5430cc0c8b the delta is EXACTLY +60 for 30 calls
+        (2 fds per call — ``ensure_schema``'s ``_connect`` plus the statement's own),
+        reproduced identically across 3 independent trials; against the fix it is
+        EXACTLY 0.  No tuned tolerance.
+        """
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = _corrupt_path(tmp_path)
+        # Warm imports and any lazy module state so the window measures per-call cost.
+        assert read_occurrences(db_path) == []
+
+        gc.collect()
+        gc.disable()
+        try:
+            before = len(os.listdir('/proc/self/fd'))
+            for _ in range(30):
+                read_occurrences(db_path)
+            after = len(os.listdir('/proc/self/fd'))
+        finally:
+            gc.enable()
+
+        assert after - before == 0, (
+            f'leaked {after - before} file descriptors across 30 calls '
+            f'(before={before}, after={after})'
+        )
