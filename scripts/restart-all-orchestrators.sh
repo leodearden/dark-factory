@@ -117,6 +117,17 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+# Deliberate NON-stdout return channel for drain_await_fresh (task 3852):
+# that function's poll loop must run in the caller's own shell, not inside
+# a forked command-substitution subshell, or a SIGKILL of the top-level
+# script pid leaves the subshell running and orphaned (reparented to
+# systemd --user, PPID 2036) for up to DRAIN_UNKNOWN_GRACE_SECS more.
+# drain_await_fresh writes its verdict here instead of printing it to
+# stdout; callers MUST invoke it as a plain command (never via "$(...)")
+# and then read _DRAIN_VERDICT. NEVER declare this `local` anywhere --
+# doing so would silently break the channel for whichever caller shadowed
+# it.
+_DRAIN_VERDICT=""
 
 DRAIN_ENABLED=0
 for arg in "$@"; do
@@ -227,25 +238,36 @@ drain_check_verdict() {
 drain_await_fresh() {
     # $1 = unit name.  Waits up to DRAIN_UNKNOWN_GRACE_SECS for a stale or
     # absent heartbeat to become fresh (idle or busy), re-polling every
-    # DRAIN_POLL_INTERVAL_SECS.  Prints the resulting verdict to stdout ONLY
-    # -- idle or busy if a fresh reading appeared before the grace elapsed,
-    # or the original stale/absent verdict if the grace elapsed with no
-    # fresh reading (fail-toward-convergence: the caller proceeds with the
-    # restart).  Emits no journal lines itself, so it is safe to call via
-    # command substitution from anywhere in drain_gate.
+    # DRAIN_POLL_INTERVAL_SECS.  Contract: sets the module-global
+    # _DRAIN_VERDICT to the resulting verdict -- idle or busy if a fresh
+    # reading appeared before the grace elapsed, or the original
+    # stale/absent verdict if the grace elapsed with no fresh reading
+    # (fail-toward-convergence: the caller proceeds with the restart) --
+    # always returns 0, and prints nothing to stdout.
+    #
+    # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
+    # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
+    # substitution (`verdict="$(drain_await_fresh "$unit")"`). Command
+    # substitution runs this function's poll loop inside a forked
+    # subshell; a SIGKILL of the top-level script pid does not reach that
+    # subshell, so it survives, reparents to systemd --user (PPID 2036),
+    # and keeps forking one `python3 drain_check.py` per
+    # DRAIN_POLL_INTERVAL_SECS for up to DRAIN_UNKNOWN_GRACE_SECS more --
+    # an orphan observed running for ~27.8h in the wild before being
+    # manually reaped (task 3852).
     local unit="$1"
-    local verdict grace_start elapsed_grace
-    verdict="$(drain_check_verdict "$unit")"
+    local grace_start elapsed_grace
+    _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     grace_start=$SECONDS
-    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
+    while [[ "$_DRAIN_VERDICT" == "stale" || "$_DRAIN_VERDICT" == "absent" ]]; do
         elapsed_grace=$((SECONDS - grace_start))
         if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
             break
         fi
         sleep "$DRAIN_POLL_INTERVAL_SECS"
-        verdict="$(drain_check_verdict "$unit")"
+        _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     done
-    printf '%s\n' "$verdict"
+    return 0
 }
 
 drain_gate() {
@@ -274,7 +296,8 @@ drain_gate() {
     #   indefinitely.
     local unit="$1"
     local verdict start_secs elapsed
-    verdict="$(drain_await_fresh "$unit")"
+    drain_await_fresh "$unit"
+    verdict="$_DRAIN_VERDICT"
 
     if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
         echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
@@ -303,7 +326,8 @@ drain_gate() {
         if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
             # Stopped heartbeating mid-defer -- apply the shorter bounded
             # grace instead of continuing to wait out the full busy grace.
-            verdict="$(drain_await_fresh "$unit")"
+            drain_await_fresh "$unit"
+            verdict="$_DRAIN_VERDICT"
             if [[ "$verdict" == "idle" ]]; then
                 echo "resuming restart of ${unit}: drained"
                 return 0
