@@ -226,8 +226,17 @@ type_check_command: "npx pyright tests/scripts/"
 #
 # verify_cold_command_timeout_secs is deliberately left UNSET here: this suite
 # has no build step whose cold cost would justify a separate cold budget. Note
-# what that actually means, per the _resolve_verify_timeout cascade
-# (verify.py:3634-3640) — an unset module cold knob falls through to
-# config.verify_cold_command_timeout_secs, which the repo root DOES set (3600),
-# NOT to the 600 below. The 600 is the warm budget only.
+# what that actually means, per the verify._resolve_verify_timeout cascade — a
+# SYMBOL citation, deliberately not file:line: this paragraph's own prior pin
+# (verify.py:3634-3640) had already rotted onto an unrelated clock-stop
+# `_cs_reason` block by the time task 3458 remeasured the function at
+# 4017-4062, and it has since drifted again to 4056-4101 — the same compounding
+# rot scripts/orchestrator.yaml's LINT block records for its own inherited
+# pins. An unset module cold knob falls through to
+# config.verify_cold_command_timeout_secs, which the repo root DOES set (5400),
+# NOT to the 600 below. The 600 is the warm budget only. This corrects, rather
+# than merely amends, the value previously named here (3600): that is
+# verify_command_timeout_secs, the WARM key one line above
+# verify_cold_command_timeout_secs in the root yaml — a near-identical adjacent
+# key the cold cascade never consults.
 verify_command_timeout_secs: 600
