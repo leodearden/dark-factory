@@ -1,7 +1,62 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
-max_concurrent_tasks: 24
+max_concurrent_tasks: 48
+
+# lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
+# Until now dark-factory never set this key at all — it silently inherited the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml:7 value of 4
+# (itself layered over the pydantic Field default of 2). That inheritance, not a
+# decision, is what set the granularity.
+#
+# THE MECHANISM. normalize_lock() truncates a path to its first N components, so
+# "directory-granular locking" is really depth-N truncation, and which files
+# coarsen is an accident of tree shape. Measured on the 2398-file tracked corpus:
+# 1859 files (77.5%) are ≤4 components and ALREADY take file-granular locks; the
+# 539 (22.5%) that coarsen are 507 SOURCE files / 32 fixtures, because CLAUDE.md's
+# <pkg>/src/<pkg>/<subpkg>/<file>.py convention pushes source to depth 5. Reify's
+# crates/<crate>/src/<file>.rs sits at exactly 4, so its coarsening lands on test
+# fixtures (660 of 880) instead. Same ratio, opposite blast radius.
+# The coarsening is ANTI-CORRELATED with coupling: shared/src/shared/locking.py —
+# imported by both orchestrator and fused_memory, the most cross-coupled file here
+# — is depth 4 and already file-locked, while middleware/lock_charter_guard.py
+# collapses into a 28-file directory. It was never buying semantic safety.
+#
+# MEASURED COST/BENEFIT (2026-08-07, 472 live pending+in-progress charters).
+# Cost: total lock keys 1969 → 2101, a 1.07x table growth (median keys/task stays
+# 3), because only the deep quarter is affected. At max_concurrent_tasks 48 the
+# realistic held-key count goes ~200 → ~214; _count_conflicts is O(held × keys).
+# Benefit: at that instant the 11 held coarsened keys locked 463 tracked files
+# while their holders declared 21 — 442 files (95.5%) locked as pure collateral,
+# 18.4% of the whole repo. Worst single key: orchestrator/src/orchestrator/evals,
+# 280 files locked by a task declaring 3.
+#
+# WHY 12 AND NOT REIFY'S 10. Same reasoning, re-measured for this tree: reify's
+# empirical max real path depth is 6 (hence 10 = pure headroom), dark-factory's is
+# 9 — one transcript_corpus fixture, with 106 files at depth 8. 12 leaves 3
+# components of headroom so no CURRENT path coarsens and generated fixture corpora
+# can deepen without silently re-introducing a coarse lock. Re-measure with
+# `git ls-files | awk -F/ '{print NF}' | sort -n | tail -1` if that stops holding.
+#
+# SAFE for the same reason it was safe at reify: correctness rests on BRE
+# (acquire-before-edit) + full-workspace merge-verify, NOT on lock coarseness.
+# Finer locks only shift more weight onto BRE re-pends and merge-verify
+# RED-requeue (accepted cost).
+#
+# WHAT THIS DOES NOT FIX, stated because the csv incident's own escalations got
+# this wrong. It does NOT unpark a task that genuinely shares a FILE with a
+# holder: task 3248 and holder 3455 both declared middleware/task_interceptor.py,
+# so they collide at any depth. What it fixes is the ESCAPE HATCH — esc-3536-8's
+# option (c), splitting the urgent leaf into its own task, was blocked at depth 4
+# (the leaf's guard file coarsened onto the held directory) and dispatches
+# cleanly at depth 12. A 17h unbreakable deadlock becomes one with a one-move out.
+# The residual — charters declaring files the task never edits (3248 declared 4
+# files containing ZERO occurrences of the symbol it renames) — is a task-authoring
+# and curator-combine problem, not a lock-depth one.
+#
+# RED TIER: lock_depth is not in RELOADABLE_FIELDS. This takes effect at the next
+# orchestrator restart, not on reload_config.
+lock_depth: 12
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its

@@ -1,29 +1,47 @@
 """Shared plumbing for the READ-ONLY tasks.db sweep scripts.
 
-Home of the tasks.db discovery ladder and the leak-scanner CLI skeleton that
-were previously copied into ``scan_task_toolcall_leaks.py``,
-``scan_provenance_note_log_leaks.py`` and ``audit_wiped_metadata_files.py``
-(task 3336, closing task 3286's "~134 identical lines" finding). Every
-function body here was lifted from those copies verbatim, so "pure extraction,
-no behaviour change" stays checkable by diff.
+Home of the tasks.db discovery ladder, the leak-scanner CLI skeleton and the
+audit-script CLI skeleton that were previously copied across
+``scan_task_toolcall_leaks.py``, ``scan_provenance_note_log_leaks.py``,
+``audit_wiped_metadata_files.py`` and ``audit_combine_gate_marker_loss.py``
+(tasks 3336 and 3616, closing task 3286's "~134 identical lines" finding).
+Every function body here was lifted from those copies verbatim, so "pure
+extraction, no behaviour change" stays checkable by diff.
 
 This module is NOT a CLI in its own right — the leading underscore marks it as
-importable-by-sibling-scripts only. It hosts two tiers:
+importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
   :func:`resolve_project_roots`, :func:`discover_project_roots`,
-  :func:`discover_db_paths`) — adopted by ALL THREE sweep scripts.
-* **Tier 2, leak-scanner CLI plumbing** — adopted by the two leak scanners
-  only. ``audit_wiped_metadata_files.py`` deliberately keeps its own
-  ``format_report``/``format_json``/``_build_parser``/``main``: its
-  ``--min-fidelity`` filter, its object-shaped rather than array-shaped JSON
-  and its different no-roots message are genuinely different behaviour, not
-  duplication. Folding them in here would silently delete those semantics.
-  Its exit 3 is NOT among those differences any more — task 3474 gave
-  :func:`run_scan_cli` the same "nothing was scanned/audited, so this is not
-  a clean run" semantics, so ``docs/legibility/design-invariants.md``'s
-  no-silent-fail-soft rule is now honoured by BOTH tiers rather than only by
-  the script that opted out of the shared plumbing.
+  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts.
+* **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
+  :func:`run_scan_cli`, :func:`add_db_discovery_args`,
+  :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
+  :func:`group_matches_by_db`) — adopted by the two LEAK SCANNERS only. It
+  sweeps DB PATHS and collects MATCHES; the audit scripts sweep PROJECT ROOTS
+  and collect one audit per root, which is Tier 3.
+* **Tier 3, audit-script CLI plumbing** (:func:`run_audit_cli`,
+  :func:`sweep_project_roots`, the ``AUDIT_EXIT_*`` codes,
+  :data:`NO_PROJECT_ROOT_RESOLVED_MESSAGE`, :func:`format_kv_line`,
+  :func:`format_coverage_block`) — adopted by ``audit_wiped_metadata_files.py``
+  and ``audit_combine_gate_marker_loss.py`` (task 3616).
+
+Both audit scripts deliberately keep their own ``format_report`` /
+``format_json`` / ``_build_parser``. What remains genuinely per-script, and
+must NOT be folded in here: the two ``--project-root``/``--json`` parsers and
+their two epilogs (one speaks of candidates, the other of ACTIONABLE findings
+and terminal-row suppression); wiped's ``--min-fidelity`` filter; both scripts'
+object-shaped rather than array-shaped JSON; combine's ``--project-id``
+handling; and each COVERAGE block's caveat PROSE and label set — only the
+block's alignment is shared, because those labels say what each script could
+not see. Folding any of them in would silently delete those semantics.
+
+Exit 3 is NOT among the differences: task 3474 gave :func:`run_scan_cli` the
+same "nothing was scanned/audited, so this is not a clean run" semantics that
+the audit scripts had, so ``docs/legibility/design-invariants.md``'s
+no-silent-fail-soft rule is honoured by every tier here. Tiers 2 and 3 spell
+the exit-3 GATE differently on purpose — see :func:`run_audit_cli`'s docstring
+for why the audit spelling does not port to Tier 2 and vice versa.
 
 IMPORT-RESOLUTION CONTRACT — read before moving this file.
 This module MUST stay a flat sibling at ``scripts/_task_db_scan.py``. The
@@ -137,16 +155,31 @@ def discover_db_paths(
 # ---------------------------------------------------------------------------
 # Tier 2 — leak-scanner CLI plumbing (the two leak scanners only).
 #
-# audit_wiped_metadata_files.py deliberately does NOT adopt this tier: its
-# main() carries a --min-fidelity filter, object-shaped rather than
-# array-shaped JSON, and a different no-roots message.
+# The AUDIT scripts do not adopt THIS tier, and should not: it sweeps db
+# PATHS and accumulates MATCHES, while they sweep project ROOTS and collect
+# exactly one audit object per root. That difference is load-bearing rather
+# than cosmetic — it is why the two tiers' exit-3 gates are spelled
+# differently (see run_scan_cli's comment below and run_audit_cli's
+# docstring). Their shared main() body is Tier 3 instead.
 #
-# Its exit 3 (roots resolved but every one failed to audit, kept distinct
-# from 0 per docs/legibility/design-invariants.md's no-silent-fail-soft rule)
-# used to be listed here too. It is no longer a differentiator: run_scan_cli
-# returns 3 for the same condition as of task 3474, which is what makes this
-# shared plumbing consistent with the invariant rather than an exception to
-# it.
+# Exit 3 (every resolved target failed, kept distinct from 0 per
+# docs/legibility/design-invariants.md's no-silent-fail-soft rule) is common
+# to both tiers as of task 3474, which is what makes this shared plumbing
+# consistent with the invariant rather than an exception to it.
+#
+# WHY THIS TIER RETURNS BARE 0/1/2/3 while Tier 3 returns named AUDIT_EXIT_*
+# constants: the two tiers' NUMBERS are identical and must stay in lockstep
+# (0 clean / 1 found something / 2 nothing resolved / 3 resolved but nothing
+# scanned-or-audited), but each number's SENTENCE is per-tier -- here 2 is "no
+# tasks.db resolvable" and 3 is "every resolved DATABASE was unreadable",
+# where Tier 3 speaks of project ROOTS. run_scan_cli's four returns all sit
+# inside one ~30-line body next to the comment that names each outcome, so the
+# literals stay readable in place; Tier 3 needed names because
+# audit_combine_gate_marker_loss.py ALIASES them into its own EXIT_* vocabulary
+# across a module boundary, where a re-spelled literal could silently drift
+# from what is actually returned. Left inline deliberately, not overlooked --
+# a shared tier-neutral set would have to be vague enough to cover both
+# wordings, losing exactly the precision AUDIT_EXIT_* carries.
 # ---------------------------------------------------------------------------
 
 # The exit-2 signal, emitted verbatim by both leak scanners.
@@ -302,3 +335,245 @@ def run_scan_cli(
         return 3
 
     return 1 if matches else 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — audit-script CLI plumbing (the two audit scripts).
+#
+# Adopted by audit_wiped_metadata_files.py and audit_combine_gate_marker_loss.py
+# (task 3616, closing task 3286's follow-on finding that the two audit main()s
+# were ~65 near-identical lines). This tier sweeps PROJECT ROOTS rather than db
+# paths, and its per-root callback returns exactly ONE audit object per root —
+# see sweep_project_roots' contract, which is what the exit-3 gate rests on.
+#
+# Each script keeps what genuinely differs: its own --project-root/--json
+# parser and epilog wording, its own report/JSON renderers, its own
+# "is this dirty?" predicate, and (for wiped) the --min-fidelity filter.
+# ---------------------------------------------------------------------------
+
+# The exit-2 signal, emitted verbatim by both audit scripts. Named to parallel
+# NO_DB_RESOLVED_MESSAGE above, which carries the db-flavoured spelling.
+NO_PROJECT_ROOT_RESOLVED_MESSAGE = (
+    "no project root resolvable with a readable tasks.db (checked "
+    "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+    "dark-factory default)"
+)
+
+# Named rather than spelled inline so each script's epilog, its main()
+# docstring and run_audit_cli's returns can never drift into disagreeing about
+# what a number means — the property audit_combine_gate_marker_loss.py's
+# per-script EXIT_* names were introduced for, preserved here now that the
+# returns live behind a module boundary. Each denotes EXACTLY ONE outcome;
+# that is the whole reason 3 exists rather than being folded into 0.
+AUDIT_EXIT_OK = 0                # audited; nothing dirty found
+AUDIT_EXIT_FINDINGS = 1          # at least one dirty result (is_dirty fired)
+AUDIT_EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
+AUDIT_EXIT_NOTHING_AUDITED = 3   # roots resolved but EVERY one failed to audit
+
+
+def sweep_project_roots(
+    roots: Sequence[str],
+    audit_fn: Callable[[str], Any],
+) -> tuple[list[Any], list[str]]:
+    """Run *audit_fn* over every root in *roots*, returning (audits, unreadable).
+
+    CONTRACT — :func:`run_audit_cli`'s exit-3 gate depends on it: *audit_fn*
+    returns EXACTLY ONE audit object per root, or raises ``sqlite3.Error``.
+    Under that contract ``len(audits) + len(unreadable) == len(roots)`` always
+    holds, so "no audits but some unreadable" is precisely "every root failed".
+    An *audit_fn* that instead returned None to "skip" a root would break that
+    equality and silently re-open the false green exit 3 exists to close
+    (docs/legibility/design-invariants.md, no-silent-fail-soft).
+
+    A single unreadable project (e.g. a corrupt/locked tasks.db, or a transient
+    "database is locked"/"file is not a database" condition) does not abort the
+    sweep: it is logged to stderr and skipped so every other resolvable project
+    is still audited and reported. Only ``sqlite3.Error`` is caught — any other
+    exception propagates, so a real bug in *audit_fn* surfaces instead of being
+    silently downgraded to "unreadable project".
+
+    Writes the per-project warnings during the loop and the aggregate "results
+    below are incomplete" warning after it, so a caller printing its report
+    afterwards keeps the warnings above the results.
+
+    Structurally parallel to :func:`sweep_databases` on purpose: keeping the
+    two shapes aligned is what makes "pure extraction, no behaviour change"
+    checkable by diff.
+    """
+    audits: list[Any] = []
+    unreadable: list[str] = []
+    for root in roots:
+        try:
+            audits.append(audit_fn(root))
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
+            unreadable.append(root)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} project(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
+
+    return audits, unreadable
+
+
+def run_audit_cli(
+    argv: list[str] | None,
+    *,
+    parser: argparse.ArgumentParser,
+    audit_fn: Callable[[str, argparse.Namespace], Any],
+    render: Callable[[list[Any], argparse.Namespace], str],
+    is_dirty: Callable[[list[Any]], bool],
+    on_roots: Callable[[list[str], argparse.Namespace], None] | None = None,
+) -> int:
+    """Shared audit-script ``main()`` body.
+
+    Exit codes: :data:`AUDIT_EXIT_OK` (0) = audited, nothing dirty;
+    :data:`AUDIT_EXIT_FINDINGS` (1) = *is_dirty* fired;
+    :data:`AUDIT_EXIT_NO_ROOT` (2) = no project root resolved to a readable
+    tasks.db; :data:`AUDIT_EXIT_NOTHING_AUDITED` (3) = roots resolved but EVERY
+    one failed to audit, so NOTHING was audited (never treat 3 as a clean run).
+
+    A SINGLE unreadable project among several is not exit 3: it stays a
+    warn-and-continue skip, and the readable remainder decides 0 vs 1.
+
+    STDOUT ON EXIT 3 STILL LOOKS CLEAN — read this before writing a consumer.
+    The report is rendered before the exit-3 branch (preserving both audit
+    scripts' pre-extraction ordering), so a total-failure sweep still emits a
+    well-formed EMPTY payload: an empty projects list under ``--json``, or the
+    script's ordinary "nothing found" report otherwise. A pipeline that reads
+    only stdout — ``... --json | jq -e '.projects | length == 0'`` and friends
+    — therefore CANNOT distinguish "audited everything, found nothing" from
+    "audited NOTHING at all". Every consumer MUST branch on the exit code
+    (and/or read the stderr error line); treating a parseable empty payload as
+    a clean result is exactly the false green this exit code exists to kill.
+
+    WHY THE EXIT-3 GATE IS SPELLED ``unreadable and not audits`` here, unlike
+    :func:`run_scan_cli`'s ``len(unreadable) == len(db_paths)``: that tier's
+    first return element is MATCHES, so one unreadable db beside a readable
+    CLEAN one would wrongly trip a "nothing found" gate. THIS tier's first
+    element IS the successfully-audited list, so the condition is exactly
+    "every root failed" — but only while :func:`sweep_project_roots`'
+    one-audit-per-root contract holds. An *audit_fn* that returned None to skip
+    a root would silently break it.
+
+    PARSER CONTRACT — *parser* MUST define the roots under
+    ``dest="project_roots"`` (an ``action="append"`` ``--project-root``, as
+    both adopters spell it); that attribute is read off the parsed Namespace
+    below. Unlike Tier 2, where :func:`add_db_discovery_args` owns the flag
+    definitions outright, this tier leaves each adopter to hand-roll its own
+    ``--project-root``/``--json`` because their help text names different
+    resolved paths — so the dest name is a convention the two sides must agree
+    on rather than something the shared code guarantees. A third adopter that
+    spells ``dest="roots"`` gets an ``AttributeError`` from inside this
+    function; the fix is the dest, not this function.
+
+    *audit_fn* takes ``(root, args)`` because both adopters need a parsed flag
+    inside the per-root call that the calling script cannot close over (argv is
+    parsed here): ``--min-fidelity`` for one, ``--project-id`` for the other.
+    It is bound to a one-argument closure at the :func:`sweep_project_roots`
+    call below so that function keeps a signature parallel to
+    :func:`sweep_databases`. *is_dirty* deliberately does NOT take *args* —
+    neither adopter's predicate reads a flag.
+
+    *on_roots*, when supplied, is called with the RESOLVED root list BEFORE the
+    empty-roots return, so a hook can observe the empty case. That is where
+    ``audit_combine_gate_marker_loss.py``'s multi-root ``--project-id`` warning
+    has always sat: a once-per-run warning computed from the resolved roots,
+    which fits neither *audit_fn* (per-root) nor *render* (post-sweep).
+    """
+    args = parser.parse_args(argv)
+
+    # dest="project_roots" is the PARSER CONTRACT above, not an accident.
+    roots = discover_project_roots(project_roots=args.project_roots)
+
+    if on_roots is not None:
+        on_roots(roots, args)
+
+    if not roots:
+        print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
+        return AUDIT_EXIT_NO_ROOT
+
+    audits, unreadable = sweep_project_roots(roots, lambda root: audit_fn(root, args))
+
+    print(render(audits, args))
+
+    if unreadable and not audits:
+        # Nothing was audited at all — never report that as a clean sweep.
+        print(
+            "error: every resolved project was unreadable; NOTHING was "
+            "audited (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return AUDIT_EXIT_NOTHING_AUDITED
+
+    return AUDIT_EXIT_FINDINGS if is_dirty(audits) else AUDIT_EXIT_OK
+
+
+# --- Tier 3 reporting primitives (LAYOUT only, never the prose) -------------
+
+# Width of the coverage block's label column. Every label in both audit scripts
+# is <= 31 characters, so all of their values land at column 40 — this constant
+# is the MEASURED, byte-exact reproduction of both existing blocks, not a new
+# choice. A label at or past the gutter falls back to a single separating
+# space rather than colliding with its value.
+_COVERAGE_LABEL_WIDTH = 36
+
+
+def format_kv_line(pairs: Sequence[tuple[str, Any]], *, indent: str = "  ") -> str:
+    """Render *pairs* as one indented ``key=value key=value`` line.
+
+    THIS HELPER OWNS THE INDENT AND THE SEPARATOR, AND NOTHING ELSE. It
+    deduplicates no field names: the two adopters share none, so the field set,
+    the key spellings (``source`` for ``expected_source``, and so on) and the
+    column ORDER all stay per-script at the call sites. What it buys is that
+    the two scripts' finding lines cannot drift apart in shape — the same
+    narrow guarantee :func:`format_coverage_block` gives the coverage gutter.
+
+    Values go through ``str()``, exactly as the f-strings this replaced did, so
+    an int, a str and a ``len()`` result all render identically to before.
+    """
+    return indent + " ".join(f"{key}={value}" for key, value in pairs)
+
+
+def format_coverage_block(
+    caveat: str | Sequence[str],
+    rows: Sequence[tuple[str, Any]],
+    details: Sequence[str] = (),
+) -> list[str]:
+    """Render an always-printed COVERAGE block: caveat, aligned rows, details.
+
+    *caveat* is emitted verbatim above the rows and accepts either a single
+    pre-joined string (``audit_combine_gate_marker_loss.py``'s
+    ``_COVERAGE_CAVEAT`` constant) or a sequence of lines
+    (``audit_wiped_metadata_files.py``'s three-line literal). Each row renders
+    as ``f"    {label:<36}{value}"``; each detail as ``f"      - {detail}"``,
+    with the detail section omitted entirely when *details* is empty.
+
+    ONLY THE ALIGNMENT IS SHARED, deliberately. The 36-character gutter is the
+    measured, byte-exact reproduction of BOTH scripts' existing coverage blocks
+    (every label in both files is <= 31 chars, so every value already lands at
+    column 40), and a drifting gutter is the failure mode this helper exists to
+    prevent. The caveat PROSE and the label/field sets stay per-script: wiped's
+    caveat is about unrecoverable plan scope, combine's about combine targets
+    with no comparison source, and folding them into one string here would
+    delete exactly the semantics each block carries.
+    """
+    lines = [caveat] if isinstance(caveat, str) else list(caveat)
+
+    for label, value in rows:
+        if len(label) < _COVERAGE_LABEL_WIDTH:
+            lines.append(f"    {label:<{_COVERAGE_LABEL_WIDTH}}{value}")
+        else:
+            # Past the gutter: keep a separator rather than rendering an
+            # unreadable "label:value" collision.
+            lines.append(f"    {label} {value}")
+
+    # NAME what is missing, never just count it — a count alone tells an
+    # operator that coverage is incomplete but not where to look.
+    for detail in details:
+        lines.append(f"      - {detail}")
+
+    return lines

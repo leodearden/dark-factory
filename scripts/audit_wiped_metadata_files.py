@@ -31,13 +31,29 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 (tasks.db discovery) ONLY. This module deliberately keeps its own
-# format_report/format_json/_build_parser/main: its fourth exit code (3 = roots
-# resolved but every one failed to audit, kept distinct from 0 per
-# docs/legibility/design-invariants.md's no-silent-fail-soft rule), its
-# --min-fidelity filter and its object-shaped JSON are genuinely different
-# behaviour, not duplication.
-from _task_db_scan import discover_project_roots, tasks_db_path
+# Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
+# loop, the warn-and-continue skip, the exit-code ladder and the two reporting
+# layout primitives), shared with audit_combine_gate_marker_loss.py as of task
+# 3616. Tier 2 is the LEAK-SCANNER skeleton and does not apply here — it sweeps
+# db paths and accumulates matches, not one audit per project root.
+#
+# This module deliberately keeps its own format_report/format_json/_build_parser:
+# its --min-fidelity filter, its object-shaped JSON, its epilog wording and its
+# COVERAGE caveat/labels are genuinely different behaviour, not duplication.
+# Exit 3 is NOT among those differences any more — it is Tier 3's, shared.
+#
+# The noqa below sits on the ONE name that needs it rather than on the
+# statement header: a header noqa blankets every name in the block, so a name
+# that later went dead here would be invisible to lint. Only
+# discover_project_roots is unused BY THIS MODULE — it is re-exported because
+# scripts/tests/test_audit_wiped_metadata_files.py imports it from here.
+from _task_db_scan import (
+    discover_project_roots,  # noqa: F401  (re-exported for this script's tests)
+    format_coverage_block,
+    format_kv_line,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # The canonical meta-root directory name, per config.py:1343 TASK_META_DIRNAME
 # and artifacts.py:287 meta_root_for. It is a SIBLING of the worktrees inside
@@ -660,14 +676,26 @@ _LOCK_LEVEL_CAVEAT = (
 )
 
 
+_COVERAGE_CAVEAT = (
+    "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+    "  full damaged population — tasks with no recoverable plan scope are",
+    "  UNKNOWN, neither clean nor damaged):",
+)
+
+
 def _format_candidate_line(candidate: WipeCandidate) -> str:
-    return (
-        f"  task_id={candidate.task_id} tag={candidate.tag} "
-        f"status={candidate.status} signature={candidate.wipe_signature} "
-        f"source={candidate.plan_files_source} "
-        f"fidelity={candidate.plan_files_fidelity} "
-        f"plan_files={len(candidate.plan_files)}"
-    )
+    # signature/source/fidelity are deliberately shorter than the
+    # wipe_signature/plan_files_source/plan_files_fidelity attributes they
+    # carry, so the keys are spelled here, not derived from the field names.
+    return format_kv_line([
+        ("task_id", candidate.task_id),
+        ("tag", candidate.tag),
+        ("status", candidate.status),
+        ("signature", candidate.wipe_signature),
+        ("source", candidate.plan_files_source),
+        ("fidelity", candidate.plan_files_fidelity),
+        ("plan_files", len(candidate.plan_files)),
+    ])
 
 
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
@@ -676,17 +704,21 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
     Never omitted, never abbreviated when there are no candidates: the whole
     point is that the candidate list is an observable subset, and a reader
     must be told the size of the unobservable remainder.
+
+    Only the ALIGNMENT is shared with audit_combine_gate_marker_loss.py (via
+    format_coverage_block); the caveat prose above and the labels below are
+    this script's, and say what this script could not see.
     """
-    return [
-        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
-        "  full damaged population — tasks with no recoverable plan scope are",
-        "  UNKNOWN, neither clean nor damaged):",
-        f"    total tasks scanned:                {coverage.total_tasks}",
-        f"    with a file-level plan signal:      {coverage.tasks_with_file_level_signal}",
-        f"    with only a lock-level signal:      {coverage.tasks_with_lock_level_signal_only}",
-        f"    with NO plan signal at all:         {coverage.tasks_without_plan_signal}",
-        f"    plan records with no such task:     {coverage.plan_records_without_task}",
-    ]
+    return format_coverage_block(
+        _COVERAGE_CAVEAT,
+        [
+            ("total tasks scanned:", coverage.total_tasks),
+            ("with a file-level plan signal:", coverage.tasks_with_file_level_signal),
+            ("with only a lock-level signal:", coverage.tasks_with_lock_level_signal_only),
+            ("with NO plan signal at all:", coverage.tasks_without_plan_signal),
+            ("plan records with no such task:", coverage.plan_records_without_task),
+        ],
+    )
 
 
 def format_report(audits: list[ProjectAudit]) -> str:
@@ -836,6 +868,30 @@ def _passes_min_fidelity(candidate: WipeCandidate, min_fidelity: str) -> bool:
     return candidate.plan_files_fidelity == FIDELITY_FILE_LEVEL
 
 
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root, applying the per-root ``--min-fidelity`` filter.
+
+    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
+    other exception propagates. Returns exactly one audit, per that function's
+    one-audit-per-root contract.
+    """
+    audit = audit_project(root)
+    filtered = [
+        c for c in audit.candidates
+        if _passes_min_fidelity(c, args.min_fidelity)
+    ]
+    return audit._replace(candidates=filtered)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    return any(a.candidates for a in audits)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -852,55 +908,20 @@ def main(argv: list[str] | None = None) -> int:
     A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
     sweep: it is logged to stderr and skipped so every other project is still
     audited, and a trailing warning states that the results are incomplete.
+
+    The roots loop, the warn-and-continue skip and the exit-code ladder are
+    :func:`_task_db_scan.run_audit_cli` (Tier 3, task 3616), shared with
+    audit_combine_gate_marker_loss.py. What stays here is what genuinely
+    differs: this script's parser and epilog, its ``--min-fidelity`` per-root
+    filter (:func:`_audit_root`), its object-shaped JSON and its report.
     """
-    args = _build_parser().parse_args(argv)
-
-    roots = discover_project_roots(project_roots=args.project_roots)
-    if not roots:
-        print(
-            "no project root resolvable with a readable tasks.db (checked "
-            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-            "dark-factory default)",
-            file=sys.stderr,
-        )
-        return 2
-
-    audits: list[ProjectAudit] = []
-    unreadable: list[str] = []
-    for root in roots:
-        try:
-            audit = audit_project(root)
-        except sqlite3.Error as exc:
-            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
-            unreadable.append(root)
-            continue
-        filtered = [
-            c for c in audit.candidates
-            if _passes_min_fidelity(c, args.min_fidelity)
-        ]
-        audits.append(audit._replace(candidates=filtered))
-
-    if unreadable:
-        print(
-            f"warning: {len(unreadable)} project(s) skipped due to read errors "
-            "(see warnings above); results below are incomplete",
-            file=sys.stderr,
-        )
-
-    if args.json:
-        print(format_json(audits))
-    else:
-        print(format_report(audits))
-
-    if unreadable and not audits:
-        # Nothing was scanned at all — never report that as a clean sweep.
-        print(
-            "error: every resolved project was unreadable; NOTHING was "
-            "audited (this is not a clean result)",
-            file=sys.stderr,
-        )
-        return 3
-    return 1 if any(a.candidates for a in audits) else 0
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+    )
 
 
 if __name__ == "__main__":

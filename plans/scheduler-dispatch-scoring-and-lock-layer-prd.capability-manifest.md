@@ -93,7 +93,18 @@ claim survives.
 | Bounded subprocess occupancy | asserted as a count of git invocations per TTL window — measurable in-test; `for-each-ref` covers every branch in one process (verified above) | PASS |
 | Probe-failure storm escape | `producer:γ` — **added at decompose**, see the G7 note | PASS |
 
-## δ — Starvation watchdog repair: durable clock, auto-pin, emitted event
+## δ — Starvation watchdog repair: durable clock, park-blocked discriminator, auto-pin, emitted event
+
+**AMENDMENT 2026-08-07 (post-csv-outage).** The last two rows were added after the
+2026-08-06/07 csv main-red incident, in which the task that would have healed main sat
+PARKED 16h behind a single held module and the auto-pin remedy this section certifies was
+applied **twice, by two independent actors, to no effect** — priority ordering selects among
+*dispatchable* candidates and does not evict a lock holder. C4 as originally written
+classifies that task identically to a never-top-scored one and prescribes the inert remedy,
+which converts an unhandled condition into an apparently-handled one. Both new capabilities
+were confirmed `producer-absent` at amendment time (`grep park_blocked` and
+`grep blocking_holder` across `orchestrator/src/` and `fused-memory/src/` each return 0),
+so both bind to real gates rather than to already-satisfied greps.
 
 | Capability | Binding | Verdict |
 |---|---|---|
@@ -105,6 +116,8 @@ claim survives.
 | `pending_since` for the durable idle clock | `producer:α` — **upstream** (δ depends α) | PASS |
 | Auto-pin cap / TTL bounds | `floor:` `auto_pin_max_concurrent` default 3 against a live pin queue already holding 12 entries, 4 operator-owned — the cap cannot silently consume operator pins because `source` distinguishes them | PASS |
 | Watchdog is genuinely dead today (the premise being fixed) | `grep:orchestrator/src/orchestrator/scheduler.py:3433` `_apply_starvation_watchdog`, anchor wipe at `:3480-3485`; `_bump_skip_and_maybe_park` at `:4506` called **only** at `:6425`/`:6436` for `top_id` — so a never-rank-1 task provably accrues zero skips | PASS |
+| `gate='park_blocked'` discriminator | `producer:δ` — **added by amendment**; confirmed absent (`grep park_blocked` = 0). Inputs already exist: `ModuleLockTable.snapshot_parks()` + the `_held` map, joined by `shared.locking.modules_conflict` (the canonical prefix rule — INV-5, do not re-implement) | PASS |
+| `starvation_detected` names its blocker | `producer:δ` — **added by amendment**; confirmed absent (`grep blocking_holder` = 0). INV-2: without `blocking_holder`/`blocking_module`/`park_age_secs` a reader must hand-join `parks[tid].modules` against `current_holders`, which is precisely the manual derivation performed during the 17h outage to establish that nine of ten modules were free and exactly one was held | PASS |
 
 ## ε — Truthful lock release
 

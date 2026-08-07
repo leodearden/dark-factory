@@ -139,8 +139,39 @@ tasks:
     verdict: PASS
 - label: δ
   task_id: 3821
-  title: 'Starvation watchdog repair: durable clock, auto-pin, emitted event'
+  title: 'Starvation watchdog repair: durable clock, park-blocked discriminator, auto-pin,
+    emitted event'
   capabilities:
+  - name: park-blocked-gate-exists
+    binding: 'capability→producer (self) — ADDED BY AMENDMENT 2026-08-07 (post-csv-outage).
+      Confirmed absent today: grep park_blocked across orchestrator/src and fused-memory/src
+      returns 0. C4 as written cannot distinguish "starved because never top-scored"
+      (auto-pin fixes it) from "starved because PARKED behind a live lock holder"
+      (auto-pin is PROVABLY inert — measured twice during the incident, two independent
+      actors, both null). Both inputs already exist: ModuleLockTable.snapshot_parks()
+      and the _held map; modules_conflict is the canonical prefix rule (INV-5)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: park_blocked
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: starvation-facts-name-the-blocker
+    binding: 'capability→producer (self) — ADDED BY AMENDMENT 2026-08-07. Confirmed
+      absent today: grep blocking_holder returns 0. INV-2: the payload {task_id, eligible_age_secs,
+      skip_count, gate, auto_pinned, pin_order, source} names no blocker, so a reader
+      must hand-cross-reference parks[tid].modules against current_holders — exactly
+      the derivation a human performed during the 17h outage to find the ONE held
+      module of ten. Emit blocking_holder/blocking_module/park_age_secs at the failure
+      point instead'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: blocking_holder
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
   - name: starvation-event-type-exists
     binding: 'capability→producer (self) — confirmed absent today: no starvation member
       in EventType; _file_starvation_info emits nothing'

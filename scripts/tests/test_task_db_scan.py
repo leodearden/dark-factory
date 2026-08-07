@@ -1,18 +1,26 @@
 """Tests for scripts/_task_db_scan.py — the shared plumbing extracted out of
-the three READ-ONLY tasks.db sweep scripts (task 3336, following task 3286's
-"~134 identical lines" finding).
+the four READ-ONLY tasks.db sweep scripts (tasks 3336 and 3616, following task
+3286's "~134 identical lines" finding).
 
 Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
-by ALL THREE sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by
-the two leak scanners only — audit_wiped_metadata_files.py keeps its own
-CLI layer, whose --min-fidelity filter, object-shaped rather than
-array-shaped JSON and different no-roots message are genuinely different
-behaviour rather than duplication. Its exit 3 is NOT one of those
-differences any more: task 3474 gave run_scan_cli the same "nothing was
-scanned, so this is not a clean run" semantics (see
-test_run_scan_cli_exits_3_when_every_db_is_unreadable below), so that
-exit code is now shared by both tiers rather than a differentiator.
+by ALL FOUR sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by the
+two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing: run_audit_cli /
+sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
+format_coverage_block) by the two AUDIT scripts only. The split is
+load-bearing rather than cosmetic: Tier 2 sweeps db PATHS and accumulates
+MATCHES, Tier 3 sweeps project ROOTS and collects exactly one audit per root,
+which is why their exit-3 gates are spelled differently (see
+test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean and its
+Tier-2 sibling).
+
+Both audit scripts keep their own format_report/format_json/_build_parser,
+whose --min-fidelity filter, --project-id handling, object-shaped JSON, epilog
+wording and COVERAGE caveat/labels are genuinely different behaviour rather
+than duplication. Exit 3 is NOT one of those differences: task 3474 gave
+run_scan_cli the same "nothing was scanned, so this is not a clean run"
+semantics (see test_run_scan_cli_exits_3_when_every_db_is_unreadable below), so
+that exit code is shared by every tier rather than a differentiator.
 
 The precedence cases below are the consolidated single home for assertions
 that previously lived duplicated across test_scan_task_toolcall_leaks.py,
@@ -20,46 +28,57 @@ test_scan_provenance_note_log_leaks.py and test_audit_wiped_metadata_files.py.
 Those files keep their own copies as the untouched regression gate for the
 extraction; this file pins the shared implementation directly.
 
-COVERAGE CAVEAT — this file is NOT executed by any verify chain.
-Every chain runs ``tests/scripts/`` (scripts/orchestrator.yaml:13,
-tests/scripts/orchestrator.yaml:47, and the root
-dark-factory-orchestrator.yaml:41 fleet command), which is a DIFFERENT
-directory from the ``scripts/tests/`` this file lives in — the near-identical
-names are the trap. So run it explicitly:
+COVERAGE — this file IS executed by the verify chains that matter for it
+(task 3384 closed the gap a former caveat here recorded; re-verified
+2026-08-06). Both of these run the directory this file lives in:
+
+    scripts/orchestrator.yaml (test_command)
+        uv run --project shared pytest tests/scripts/ scripts/tests/ \\
+            --tb=short -q --timeout=300
+    dark-factory-orchestrator.yaml (test_command, tail segment)
+        uv run --project shared pytest tests/scripts/ scripts/tests/ \\
+            --timeout=300
+
+STILL THE TRAP, so it is kept: ``scripts/tests/`` (this directory) and
+``tests/scripts/`` (a suite at the repo root) are near-homographs but DIFFERENT
+directories. A command naming only one of them covers only one of them — which
+is exactly how the original gap arose. ``tests/scripts/orchestrator.yaml`` is
+correctly scoped to ``tests/scripts/`` alone and does not collect this file;
+the two chains above are what gate it.
+
+To run just this suite:
 
     uv run --project shared pytest scripts/tests/test_task_db_scan.py -q
-
-The gap is pre-existing (44 files already sat here before task 3336) and was
-out of that task's scope to fix — it holds no lock on any orchestrator.yaml.
-It is recorded rather than assumed away: ticket tkt_0RRZ2N8MTQ8GCC4VVGTJ1PMDKB
-proposes either adding ``scripts/tests/`` to the chains or relocating these
-suites to ``tests/scripts/`` (whose conftest.py already puts ``scripts/`` on
-sys.path, so ``import _task_db_scan`` would resolve there unchanged — but see
-this module's IMPORT-RESOLUTION CONTRACT: the tests may move, the module
-may not). Until then the only gated signal touching _task_db_scan.py is
-indirect: tests/scripts/test_repair_wiped_metadata_files.py imports
-audit_wiped_metadata_files, which imports this module, so a hard ImportError
-surfaces there but a behavioural regression does not.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
     _DEFAULT_PROJECT_ROOTS,
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
     NO_DB_RESOLVED_MESSAGE,
+    NO_PROJECT_ROOT_RESOLVED_MESSAGE,
     add_db_discovery_args,
     discover_db_paths,
     discover_project_roots,
+    format_coverage_block,
     format_json,
+    format_kv_line,
     group_matches_by_db,
     resolve_project_roots,
+    run_audit_cli,
     run_scan_cli,
     sweep_databases,
+    sweep_project_roots,
     tasks_db_path,
     truncate,
 )
@@ -505,6 +524,535 @@ def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):
 
     assert _cli(["--db", str(db), "--json"], lambda db_path: [], render=render) == 0
     assert capsys.readouterr().out == "custom body\nsecond line\n"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — audit-script CLI plumbing (the two audit scripts).
+#
+# Adopted by audit_wiped_metadata_files.py and audit_combine_gate_marker_loss.py
+# (task 3616). Unlike Tier 2, this tier sweeps PROJECT ROOTS rather than db
+# paths, and its per-root callback returns exactly ONE audit object per root —
+# that difference is what lets the exit-3 gate be spelled `unreadable and not
+# audits` here while Tier 2 must count (see run_scan_cli's comment).
+# ---------------------------------------------------------------------------
+
+# --- AUDIT_EXIT_* constants ------------------------------------------------
+
+def test_audit_exit_constants_carry_the_documented_values():
+    assert AUDIT_EXIT_OK == 0
+    assert AUDIT_EXIT_FINDINGS == 1
+    assert AUDIT_EXIT_NO_ROOT == 2
+    assert AUDIT_EXIT_NOTHING_AUDITED == 3
+
+
+def test_audit_exit_constants_are_pairwise_distinct():
+    """3 must never collapse into 0.
+
+    Each constant denotes EXACTLY ONE outcome. Folding "audited nothing at all"
+    into "audited everything, found nothing" is the silent fail-soft that
+    docs/legibility/design-invariants.md's no-silent-fail-soft rule forbids, and
+    a careless renumbering is exactly how it would come back.
+    """
+    codes = [
+        AUDIT_EXIT_OK,
+        AUDIT_EXIT_FINDINGS,
+        AUDIT_EXIT_NO_ROOT,
+        AUDIT_EXIT_NOTHING_AUDITED,
+    ]
+
+    assert len(set(codes)) == len(codes)
+
+
+# --- sweep_project_roots(roots, audit_fn) -> (audits, unreadable) ----------
+
+def test_sweep_project_roots_returns_one_audit_per_root_in_root_order():
+    audits, unreadable = sweep_project_roots(
+        ["/proj/b", "/proj/a"], lambda root: f"audit:{root}"
+    )
+
+    assert audits == ["audit:/proj/b", "audit:/proj/a"]
+    assert unreadable == []
+
+
+def test_sweep_project_roots_skips_unreadable_root_and_warns_on_stderr(capsys):
+    def audit(root):
+        if root == "/proj/bad":
+            raise sqlite3.Error("file is not a database")
+        return f"audit:{root}"
+
+    audits, unreadable = sweep_project_roots(
+        ["/proj/bad", "/proj/good"], audit
+    )
+
+    # The BAD root is first on purpose: the sweep must CONTINUE past a failure
+    # so every later root is still audited.
+    assert audits == ["audit:/proj/good"]
+    assert unreadable == ["/proj/bad"]
+
+    err = capsys.readouterr().err
+    assert (
+        "warning: skipping unreadable project /proj/bad: file is not a database" in err
+    )
+
+
+def test_sweep_project_roots_warns_once_in_aggregate_that_results_are_incomplete(capsys):
+    def audit(root):
+        raise sqlite3.Error("file is not a database")
+
+    sweep_project_roots(["/proj/a", "/proj/b"], audit)
+
+    err = capsys.readouterr().err
+    aggregate = (
+        "warning: 2 project(s) skipped due to read errors (see warnings above); "
+        "results below are incomplete"
+    )
+    assert aggregate in err
+    assert err.count("results below are incomplete") == 1
+
+
+def test_sweep_project_roots_omits_the_aggregate_warning_when_all_readable(capsys):
+    audits, unreadable = sweep_project_roots(["/proj/a"], lambda root: "audit")
+
+    assert (audits, unreadable) == (["audit"], [])
+    assert "incomplete" not in capsys.readouterr().err
+
+
+def test_sweep_project_roots_does_not_swallow_non_sqlite_errors():
+    """Mirrors test_sweep_databases_does_not_swallow_non_sqlite_errors.
+
+    A real bug in *audit_fn* must surface, never be silently downgraded to
+    "unreadable project" — that would turn a crash into a quietly incomplete
+    report.
+    """
+    def audit(root):
+        raise ValueError("a real bug, not an unreadable project")
+
+    try:
+        sweep_project_roots(["/proj/a"], audit)
+    except ValueError:
+        return
+    raise AssertionError("a non-sqlite3 error must propagate, not be skipped")
+
+
+# --- run_audit_cli(argv, parser=, audit_fn=, render=, is_dirty=, on_roots=) -
+
+def _audit_cli(
+    argv,
+    audit_fn,
+    render=lambda audits, args: f"rendered:{len(audits)}",
+    is_dirty=lambda audits: False,
+    on_roots=None,
+):
+    """In-process harness modelled on ``_cli`` above.
+
+    Subprocess execution is left to the two audit scripts' own suites, where it
+    is load-bearing (it is what proves the flat-sibling ``import _task_db_scan``
+    resolves for a DIRECTLY-EXECUTED script).
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-root", dest="project_roots", action="append")
+    parser.add_argument("--json", action="store_true")
+    return run_audit_cli(
+        argv,
+        parser=parser,
+        audit_fn=audit_fn,
+        render=render,
+        is_dirty=is_dirty,
+        on_roots=on_roots,
+    )
+
+
+def _unreadable(root, args):
+    raise sqlite3.Error("file is not a database")
+
+
+def test_run_audit_cli_exits_2_when_no_root_resolves(tmp_path, capsys):
+    """The report must NOT be rendered on the exit-2 path.
+
+    Nothing was audited and no audit list exists, so emitting a well-formed
+    empty payload here would hand a stdout-only consumer a clean-looking result
+    for a run that never started.
+    """
+    missing = tmp_path / "nope"
+
+    assert _audit_cli(["--project-root", str(missing)], lambda root, args: "a") == 2
+
+    captured = capsys.readouterr()
+    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE in captured.err
+    assert captured.out == ""
+
+
+def test_run_audit_cli_exits_0_when_nothing_is_dirty(project_root_with_tasks_db, tmp_path, capsys):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root)],
+        lambda root_, args: "audit",
+        is_dirty=lambda audits: False,
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.strip() == "rendered:1"
+
+
+def test_run_audit_cli_exits_1_when_is_dirty_fires(project_root_with_tasks_db, tmp_path):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root)],
+        lambda root_, args: "audit",
+        is_dirty=lambda audits: True,
+    )
+
+    assert exit_code == 1
+
+
+def test_run_audit_cli_exits_3_when_every_root_is_unreadable(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """Every resolved project failing to audit is NOT a clean sweep.
+
+    The report is still rendered before the exit-3 branch, so stdout STILL
+    reads clean — that is precisely why the exit code is the only honest
+    signal, and why 3 is kept distinct from 0 per
+    docs/legibility/design-invariants.md's no-silent-fail-soft rule.
+    """
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    assert _audit_cli(["--project-root", str(root)], _unreadable) == 3
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "rendered:0"
+    assert "results below are incomplete" in captured.err
+    assert "NOTHING was audited (this is not a clean result)" in captured.err
+
+
+def test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """THE PARTIAL-FAILURE GUARD — the standing regression check on the gate.
+
+    One root raising beside one clean root is exit 0, not 3: a project was
+    genuinely audited and found clean. Mirrors
+    test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean; gating
+    exit 3 on "some root failed and nothing was found" would wrongly fire here.
+    """
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "audit"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(good), "--project-root", str(bad)], audit
+    )
+
+    assert exit_code == 0
+    assert "results below are incomplete" in capsys.readouterr().err
+
+
+def test_run_audit_cli_still_exits_1_when_a_readable_root_is_dirty_despite_failures(
+    project_root_with_tasks_db, tmp_path
+):
+    """A finding in a readable project is not masked by a sibling failure."""
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "dirty"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(good), "--project-root", str(bad)],
+        audit,
+        is_dirty=lambda audits: "dirty" in audits,
+    )
+
+    assert exit_code == 1
+
+
+def test_run_audit_cli_passes_the_parsed_namespace_to_audit_fn_and_render(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """Both callbacks see the parsed flags.
+
+    argv is parsed INSIDE the helper, so a per-root flag (wiped's
+    --min-fidelity, combine's --project-id) can only reach the callbacks this
+    way — the calling script has nothing to close over.
+    """
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    seen_roots = []
+
+    def audit(root_, args):
+        assert args.json is True
+        seen_roots.append(root_)
+        return "audit"
+
+    def render(audits, args):
+        assert args.json is True
+        return f"json={args.json} audits={audits}"
+
+    assert _audit_cli(["--project-root", str(root), "--json"], audit, render=render) == 0
+    assert seen_roots == [str(root)]
+    assert capsys.readouterr().out.strip() == "json=True audits=['audit']"
+
+
+def test_run_audit_cli_gives_is_dirty_only_the_successfully_audited_objects(
+    project_root_with_tasks_db, tmp_path
+):
+    """An unreadable root contributes NO placeholder to the is_dirty input.
+
+    This is the caller-visible half of sweep_project_roots' one-audit-per-root
+    contract: a predicate iterating the list must never meet a None standing in
+    for a project that failed.
+    """
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+    seen = []
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "audit:good"
+
+    def is_dirty(audits):
+        seen.append(list(audits))
+        return False
+
+    _audit_cli(["--project-root", str(good), "--project-root", str(bad)], audit, is_dirty=is_dirty)
+
+    assert seen == [["audit:good"]]
+
+
+def test_run_audit_cli_calls_on_roots_before_the_empty_roots_return(tmp_path, capsys):
+    """The hook fires even when NO root resolved, and its output comes first.
+
+    This is the verbatim position audit_combine_gate_marker_loss.py's multi-root
+    --project-id warning has always occupied: after root resolution, BEFORE the
+    empty-roots early return. Preserving it keeps the extraction a pure diff and
+    lets a future hook observe the empty case.
+    """
+    missing = tmp_path / "nope"
+    seen = []
+
+    def on_roots(roots, args):
+        seen.append((list(roots), args.json))
+        print("hook ran", file=sys.stderr)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(missing)], lambda root, args: "a", on_roots=on_roots
+    )
+
+    assert exit_code == 2
+    assert seen == [([], False)]
+
+    err = capsys.readouterr().err
+    assert err.index("hook ran") < err.index(NO_PROJECT_ROOT_RESOLVED_MESSAGE)
+
+
+def test_run_audit_cli_calls_on_roots_once_with_the_resolved_roots(
+    project_root_with_tasks_db, tmp_path
+):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    calls = []
+
+    def on_roots(roots, args):
+        calls.append(list(roots))
+
+    _audit_cli(["--project-root", str(root)], lambda root_, args: "a", on_roots=on_roots)
+
+    assert calls == [[str(root)]]
+
+
+def test_run_audit_cli_works_without_an_on_roots_hook(project_root_with_tasks_db, tmp_path):
+    """on_roots defaults to None — only one of the two adopters supplies it."""
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-root", dest="project_roots", action="append")
+    parser.add_argument("--json", action="store_true")
+
+    exit_code = run_audit_cli(
+        ["--project-root", str(root)],
+        parser=parser,
+        audit_fn=lambda root_, args: "a",
+        render=lambda audits, args: "body",
+        is_dirty=lambda audits: False,
+    )
+
+    assert exit_code == 0
+
+
+# --- format_kv_line(pairs) -> str ------------------------------------------
+
+def test_format_kv_line_uses_a_two_space_indent_and_single_space_separator():
+    assert format_kv_line([("task_id", 7), ("tag", "master")]) == "  task_id=7 tag=master"
+
+
+def test_format_kv_line_leaves_no_trailing_space():
+    line = format_kv_line([("task_id", 7)])
+
+    assert line == "  task_id=7"
+    assert line == line.rstrip()
+
+
+def test_format_kv_line_reproduces_the_wiped_audit_candidate_line_byte_for_byte():
+    """audit_wiped_metadata_files.py's _format_candidate_line, exactly.
+
+    Asserted against the literal string rather than a regex: the acceptance bar
+    for the extraction is byte-for-byte identical output, and a regex would
+    happily accept a changed separator or indent.
+    """
+    line = format_kv_line([
+        ("task_id", 3264),
+        ("tag", "master"),
+        ("status", "done"),
+        ("signature", "null-merge-sha"),
+        ("source", "plan.files"),
+        ("fidelity", "file-level"),
+        ("plan_files", 3),
+    ])
+
+    assert line == (
+        "  task_id=3264 tag=master status=done signature=null-merge-sha "
+        "source=plan.files fidelity=file-level plan_files=3"
+    )
+
+
+def test_format_kv_line_reproduces_the_combine_audit_finding_line_byte_for_byte():
+    """audit_combine_gate_marker_loss.py's _format_finding_line, exactly."""
+    line = format_kv_line([
+        ("task_id", 3088),
+        ("tag", "master"),
+        ("status", "pending"),
+        ("key", "delivered_checks"),
+        ("severity", "gate_removing"),
+        ("source", "ticket"),
+    ])
+
+    assert line == (
+        "  task_id=3088 tag=master status=pending key=delivered_checks "
+        "severity=gate_removing source=ticket"
+    )
+
+
+def test_format_kv_line_renders_an_empty_pair_list_as_the_bare_indent():
+    assert format_kv_line([]) == "  "
+
+
+def test_format_kv_line_renders_every_value_with_str():
+    """An int, a str and a len() result must format identically to today's
+    f-strings, which interpolate all three through str()."""
+    assert format_kv_line([
+        ("count", 3),
+        ("name", "master"),
+        ("plan_files", len(["a.py", "b.py"])),
+    ]) == "  count=3 name=master plan_files=2"
+
+
+# --- format_coverage_block(caveat, rows, details) -> list[str] --------------
+
+def test_format_coverage_block_places_every_value_at_column_40():
+    """THE GUTTER CONTRACT, pinned from three different label widths.
+
+    These are the real padded literals from both audit scripts: labels of 30,
+    26 and 31 characters, all of which put their value at column 40 today. A
+    drifting gutter is the exact failure mode this helper exists to prevent, so
+    the rendered lines are asserted whole.
+    """
+    lines = format_coverage_block(
+        "  CAVEAT:",
+        [
+            ("with a file-level plan signal:", 3),
+            ("with NO comparison source:", 25),
+            ("manifests that failed to parse:", 2),
+        ],
+    )
+
+    assert lines[1:] == [
+        "    with a file-level plan signal:      3",
+        "    with NO comparison source:          25",
+        "    manifests that failed to parse:     2",
+    ]
+    for line in lines[1:]:
+        # Every value starts at column 40, i.e. after 4 spaces of indent plus a
+        # 36-character label gutter.
+        assert len(line) - len(line.split()[-1]) == 40
+
+
+def test_format_coverage_block_emits_a_multi_line_caveat_verbatim_above_the_rows():
+    """wiped's caveat is a 3-line list literal, including an em dash."""
+    caveat = [
+        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+        "  full damaged population — tasks with no recoverable plan scope are",
+        "  UNKNOWN, neither clean nor damaged):",
+    ]
+
+    lines = format_coverage_block(caveat, [("total tasks scanned:", 41)])
+
+    assert lines == caveat + ["    total tasks scanned:                41"]
+
+
+def test_format_coverage_block_accepts_a_single_pre_joined_caveat_string():
+    """combine's _COVERAGE_CAVEAT is one module-level string constant."""
+    caveat = (
+        "  COVERAGE (the findings above are an OBSERVABLE SUBSET, not the full "
+        "damaged population - a combine target with no comparison source is "
+        "UNKNOWN, neither clean nor damaged):"
+    )
+
+    lines = format_coverage_block(caveat, [("combine targets scanned:", 67)])
+
+    assert lines == [caveat, "    combine targets scanned:            67"]
+
+
+def test_format_coverage_block_renders_trailing_detail_lines():
+    """combine NAMES its unreadable sidecars rather than only counting them."""
+    lines = format_coverage_block(
+        "  CAVEAT:",
+        [("manifests that failed to parse:", 2)],
+        details=["plans/a.yaml: bad yaml", "plans/b.yaml: missing key"],
+    )
+
+    assert lines[-2:] == [
+        "      - plans/a.yaml: bad yaml",
+        "      - plans/b.yaml: missing key",
+    ]
+
+
+def test_format_coverage_block_omits_the_detail_section_entirely_when_none_given():
+    lines = format_coverage_block("  CAVEAT:", [("total tasks scanned:", 0)])
+
+    assert lines == ["  CAVEAT:", "    total tasks scanned:                0"]
+    assert not any(line.lstrip().startswith("- ") for line in lines)
+
+
+def test_format_coverage_block_keeps_a_separating_space_for_an_overlong_label():
+    """A label past the 36-char gutter must not collide with its value.
+
+    Every label in both scripts is <= 31 chars today, so this guards a FUTURE
+    long label against silently producing an unreadable ``label:12`` line.
+    """
+    label = "a label that is quite a lot longer than the gutter:"
+    assert len(label) > 36
+
+    lines = format_coverage_block("  CAVEAT:", [(label, 12)])
+
+    assert lines[1] == f"    {label} 12"
 
 
 # ---------------------------------------------------------------------------

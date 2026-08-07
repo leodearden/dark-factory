@@ -31,9 +31,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+)
 from audit_combine_gate_marker_loss import (
     _COVERAGE_CAVEAT,
     _FIDELITY_CAVEAT,
+    EXIT_LIVE_FINDINGS,
+    EXIT_NO_ROOT,
+    EXIT_NOTHING_SCANNED,
+    EXIT_OK,
     NO_COMPARISON_SOURCE_KEY,
     SEVERITY_BENIGN,
     SEVERITY_DISPATCH,
@@ -1627,8 +1637,33 @@ def test_main_exit_0_when_a_gate_removing_loss_is_terminal(tmp_path, make_tasks_
     assert f"severity={SEVERITY_GATE_REMOVING}" in result.stdout
 
 
+def test_exit_constants_alias_the_shared_tier_3_codes():
+    """The per-script EXIT_* names must stay the SHARED values, not copies.
+
+    audit_combine_gate_marker_loss.py:1068 states the constants are named "so
+    the epilog, main()'s docstring and the returns can never drift into
+    disagreeing about what a number means". Since task 3616 the returns live in
+    _task_db_scan.run_audit_cli, so that no-drift property now spans a module
+    boundary and nothing else enforces it: this script could redefine EXIT_OK =
+    9 and its epilog would keep promising 0 while run_audit_cli kept returning
+    it. This assertion is what keeps the alias honest.
+    """
+    assert EXIT_OK == AUDIT_EXIT_OK
+    assert EXIT_LIVE_FINDINGS == AUDIT_EXIT_FINDINGS
+    assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+    assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
+
+
 def test_main_exit_2_when_no_project_root_resolves(tmp_path):
-    """Nothing resolvable -> exit 2, empty stdout, reason on stderr."""
+    """Nothing resolvable -> exit 2, empty stdout, reason on stderr.
+
+    The 2 is HARDCODED on purpose, unlike the in-process Tier-3 tests. This
+    observes a real process exit code, i.e. the boundary _build_parser's epilog
+    promises to an operator ("2 = no project root resolved..."). Asserting
+    ``== EXIT_NO_ROOT`` would import the expected value from the module under
+    test, so renumbering the shared code to 7 would leave this green while the
+    epilog kept promising 2 -- the one place a literal is stronger than a name.
+    """
     result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
 
     assert result.returncode == 2
@@ -1638,7 +1673,11 @@ def test_main_exit_2_when_no_project_root_resolves(tmp_path):
 
 def test_main_exit_3_when_roots_resolve_but_nothing_is_scanned(tmp_path):
     """A resolvable-but-unreadable tasks.db is NOT a clean run. Exit 3 keeps it
-    distinct from 0, per docs/legibility/design-invariants.md."""
+    distinct from 0, per docs/legibility/design-invariants.md.
+
+    3 hardcoded for the reason the exit-2 sibling above spells out: this is the
+    externally-observed code the epilog promises, not an in-process constant.
+    """
     root = tmp_path / "corrupt"
     (root / ".taskmaster" / "tasks").mkdir(parents=True)
     (root / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
