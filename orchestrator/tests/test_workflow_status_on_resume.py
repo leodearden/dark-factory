@@ -1192,6 +1192,90 @@ class TestCheckScopeInvariant:
             're-word would silently break its divergence-class handling'
         )
 
+    async def test_empty_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Robustness (review amendment, task 3429): an EMPTY plan.files is
+        not evidence of a safe metadata.files superset — containment
+        (``uncovered = plan_modules - metadata_modules``) is vacuously empty
+        for an empty LHS regardless of what metadata_modules holds, so it
+        looks identical to a lost/never-populated plan.files. Must escalate
+        (loud-over-silent-degradation), not fall into the benign-superset
+        INFO path.
+        """
+        plan_files = []
+        metadata_files = ['a.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: plan_modules must be empty and metadata_modules '
+            f'non-empty; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an empty plan.files next to non-empty metadata.files must '
+            f'escalate, not be treated as a benign superset; pending={pending!r}'
+        )
+        assert infra_issues[0].severity == 'blocking', 'PRD D11 keeps the gate'
+
+    async def test_all_directory_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Same robustness gap, reached via the other route: every
+        plan.files entry is directory-shaped (no recognised file
+        extension), so ``sanitize_files_for_persist`` alpha-strips the list
+        to empty before ``_check_scope_invariant`` ever computes
+        ``plan_modules`` — structurally identical to a genuinely empty
+        plan.files from this method's point of view, and must escalate for
+        the same reason.
+        """
+        from shared.locking import is_file_path
+
+        from orchestrator.module_charter import sanitize_files_for_persist
+
+        plan_files = ['pkg']  # directory-shaped: no '.', stripped on sanitize
+        metadata_files = ['a.py']
+        assert not is_file_path(plan_files[0]), (
+            'precondition: the fixture file must be directory-shaped (no '
+            f'recognised extension); is_file_path({plan_files[0]!r}) says '
+            'otherwise'
+        )
+        sanitized_plan_files = sanitize_files_for_persist(plan_files)
+        plan_modules = set(
+            files_to_modules(sanitized_plan_files, config.lock_depth)
+        )
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: an all-directory plan_files must derive NO lock '
+            f'modules once sanitized (mirroring _check_scope_invariant\'s '
+            f'own sanitize_files_for_persist call); '
+            f'sanitized={sanitized_plan_files!r} plan_modules={plan_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an all-directory plan.files (alpha-stripped to empty) next to '
+            f'non-empty metadata.files must escalate; pending={pending!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Regression: workflow passes real prompt (not 'continue') to invoke_with_cap_retry

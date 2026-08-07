@@ -13474,6 +13474,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
         )
+        if not plan_modules and metadata_modules:
+            # An empty plan_modules is NOT evidence of a safe wider lock: the
+            # containment test below (`uncovered = plan_modules -
+            # metadata_modules`) is vacuously empty for an empty LHS
+            # regardless of what metadata_modules holds, so it cannot tell
+            # "the plan genuinely needs nothing" apart from "plan.files was
+            # lost, never populated, or every entry was directory-shaped and
+            # alpha-stripped by sanitize_files_for_persist" (review
+            # amendment, task 3429). Escalate rather than silently logging
+            # this as the benign-superset case below —
+            # loud-over-silent-degradation.
+            logger.warning(
+                'Task %s: plan.files resolves to NO lock modules at MERGE '
+                'entry (self.plan files=%s) while metadata.files is '
+                'non-empty (files=%s, modules=%s) — an empty plan cannot be '
+                'verified as a safe superset, escalating rather than '
+                'treating it as benign',
+                self.task_id, self.plan.get('files'), sorted(metadata_files),
+                sorted(metadata_modules),
+            )
+            self._escalate_scope_invariant_violation(
+                sorted(plan_files), sorted(metadata_files), sorted(plan_modules),
+            )
+            return
         uncovered = plan_modules - metadata_modules
         if not uncovered:
             if metadata_modules != plan_modules:
@@ -13505,9 +13529,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Submit an ``infra_issue`` escalation for the UNSAFE-direction
         plan.files/metadata.files divergence caught by
         :meth:`_check_scope_invariant` (task 2505; narrowed to this one
-        direction by task 3429) — the plan needs a lock module that
-        metadata.files does not cover. Mirrors :meth:`_escalate_plan_overwrite`'s
-        submission shape.
+        direction by task 3429) — either the plan needs a lock module that
+        metadata.files does not cover, or plan.files itself is empty/fully
+        alpha-stripped and thus unverifiable as a safe metadata.files
+        superset (review amendment, task 3429). Mirrors
+        :meth:`_escalate_plan_overwrite`'s submission shape.
 
         The ``summary`` string is load-bearing: ``harness._is_scope_divergence_orphan``
         discriminates this entire escalation class on the substring
@@ -13517,18 +13543,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         summary = (
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
         )
-        detail = (
-            f'plan.files={plan_files} but metadata.files={metadata_files}. At '
-            f'lock_depth={self.config.lock_depth} the plan needs lock '
-            f'module(s) {uncovered_modules} that metadata.files does NOT '
-            f'cover. metadata.files is the only input the scheduler derives '
-            f"this task's file locks from, so this task is about to merge "
-            f'edits to module(s) it holds no lock on. Only this direction '
-            f'escalates (task 3429): a metadata.files module SUPERSET is '
-            f'benign — a wider lock cannot let two tasks collide, only '
-            f'over-serialise — and is logged at INFO with no escalation. A '
-            f'same-module file-level delta does not reach here at all.'
-        )
+        if plan_files:
+            detail = (
+                f'plan.files={plan_files} but metadata.files={metadata_files}. At '
+                f'lock_depth={self.config.lock_depth} the plan needs lock '
+                f'module(s) {uncovered_modules} that metadata.files does NOT '
+                f'cover. metadata.files is the only input the scheduler derives '
+                f"this task's file locks from, so this task is about to merge "
+                f'edits to module(s) it holds no lock on. Only this direction '
+                f'escalates (task 3429): a metadata.files module SUPERSET is '
+                f'benign — a wider lock cannot let two tasks collide, only '
+                f'over-serialise — and is logged at INFO with no escalation. A '
+                f'same-module file-level delta does not reach here at all.'
+            )
+        else:
+            detail = (
+                f'plan.files is EMPTY at MERGE entry (metadata.files='
+                f'{metadata_files}). A plan with no lock modules cannot be '
+                f'verified as a safe metadata.files superset — containment is '
+                f'vacuously true for an empty plan regardless of what '
+                f'metadata.files holds, so this looks identical to a '
+                f'lost/never-populated plan.files (or one whose entries were '
+                f'all directory-shaped and stripped by '
+                f'sanitize_files_for_persist). Escalating rather than '
+                f'silently treating this as benign (task 3429 amendment).'
+            )
         logger.error(f'Task {self.task_id}: {summary}')
 
         if not self.escalation_queue:
