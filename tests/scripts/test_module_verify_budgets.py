@@ -151,11 +151,32 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 the error bar is wider here and is stated rather than implied.
 #                 These six also show the widest spread of any module in the
 #                 sweep, 2.3x (283.47s -> 653.54s).
+#
+#   sampler       6 runs, all rc=0, 52 passed. Plus a planning-time trial of the
+#                 same verbatim command: 14.54s wall / 7.25s pytest @ loadavg
+#                 157.45.
+#                  8.78s @ loadavg 148.02 (convenient)
+#                  9.64s @ loadavg 191.12 (concurrent wave)
+#                 10.51s @ loadavg 195.51 (warm-up)
+#                 15.98s @ loadavg 252.01
+#                 18.94s @ loadavg 148.31
+#                 22.49s @ loadavg 139.53 (INCONVENIENT)
+#
+#                 THIS IS THE MODULE THAT MAKES ASSERTION (b)'s DEGENERACY
+#                 CONCRETE, so it is spelled out here as well as in the test
+#                 docstring. `_min_budget(22.49)` == `(int(44.98) // 100) * 100`
+#                 == 0, so (b) asserts `budget >= 0` for sampler — literally
+#                 unfalsifiable. What actually carries this module is (a)
+#                 declared-at-all, (c) strictly-below-root, (d) honoured by the
+#                 real resolver, (e) survives the plan->execution bridge and (f)
+#                 the cold fall-through. A reader must not infer a measurement
+#                 floor here that does not exist.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
     'escalation': 354.56,
     'fused-memory': 439.80,
     'dashboard': 653.54,
+    'sampler': 22.49,
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -168,6 +189,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'escalation': 'escalation/src/escalation/__init__.py',
     'fused-memory': 'fused-memory/src/fused_memory/__init__.py',
     'dashboard': 'dashboard/src/dashboard/__init__.py',
+    'sampler': 'sampler/src/sampler/__init__.py',
 }
 
 
