@@ -1044,13 +1044,18 @@ def test_foreign_holder_bounds_clear_measured_spawn_latency():
     Not a guess: task 3451 measured worst-case happy-path subprocess spawn
     latency on this host at 4.71s (n=3: 2.13/3.10/4.71) at load-per-core 6.6.
     Any bound near 5s is within noise of that measured worst case — which is
-    exactly how ``_FOREIGN_HOLDER_STARTUP_SECS = 5.0`` produced the flake
-    this task fixes. Both bounds here only gate how long a genuinely BROKEN
-    staging takes to fail; they can never make a broken staging pass, so
-    widening them buys safety margin at zero cost to a healthy run, while
-    tightening either back below the measured worst case buys nothing but
-    another full-suite flake — hence pinning the floor as an invariant,
-    following task 3451's own headroom-invariant precedent
+    exactly how ``_FOREIGN_HOLDER_STARTUP_SECS = 5.0`` produced the flake this
+    task fixes. This is the FLOOR half of a two-sided contract (task 3836):
+    these bounds are also bounded from above by the global pytest-timeout,
+    pinned by the sibling invariant
+    ``test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout``
+    immediately below. Widening buys safety margin for free only up to that
+    ceiling — past it, a genuinely broken staging no longer merely takes longer
+    to fail: pytest-timeout fires first and, under timeout_method="thread",
+    os._exit()s the xdist worker, discarding this helper's own ``pytest.fail``
+    diagnostics. Tightening either bound back below the measured worst case
+    still buys nothing but another full-suite flake — hence pinning the floor
+    as an invariant here, following task 3451's headroom-invariant precedent
     (``test_set_started_grace_floor_clears_measured_happy_path_latency``).
     """
     bounds = {
