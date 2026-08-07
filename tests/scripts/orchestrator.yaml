@@ -238,5 +238,15 @@ type_check_command: "npx pyright tests/scripts/"
 # than merely amends, the value previously named here (3600): that is
 # verify_command_timeout_secs, the WARM key one line above
 # verify_cold_command_timeout_secs in the root yaml — a near-identical adjacent
-# key the cold cascade never consults.
+# key the cold cascade never consults. Under a merge-role cold verify — the
+# merge_verify_breadth: "full" case this file's commands already run VERBATIM
+# under (noted above) — the cascade consults
+# config.merge_verify_cold_command_timeout_secs FIRST, ahead of the 5400, and
+# returns 7200. That value ships from the package-bundled
+# orchestrator/src/orchestrator/defaults.yaml, not from
+# dark-factory-orchestrator.yaml, so it stays invisible to a reader checking
+# only the root config — the same defaults.yaml-shadows-root blind spot
+# test_tests_scripts_module_config.py::
+# test_tests_scripts_is_a_registered_module_config already records for
+# lock_depth.
 verify_command_timeout_secs: 600
