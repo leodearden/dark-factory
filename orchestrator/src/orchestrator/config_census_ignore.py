@@ -53,7 +53,10 @@ from typing import Any, NamedTuple
 
 __all__ = [
     'CENSUS_IGNORE_ENTRY_KEYS',
+    'HARD_KINDS',
+    'CensusIgnoreFinding',
     'CensusIgnoreSpec',
+    'audit_census_ignore_specs',
     'parse_census_ignore_entries',
 ]
 
@@ -145,3 +148,141 @@ def parse_census_ignore_entries(tree: dict[Any, Any]) -> list[CensusIgnoreSpec]:
             CensusIgnoreSpec(path, reason, _citations(reason) if reason else ())
         )
     return specs
+
+
+# ---------------------------------------------------------------------------
+# The violation taxonomy (PTODO §8.3) and its severity grading (§8.4)
+# ---------------------------------------------------------------------------
+
+
+class CensusIgnoreFinding(NamedTuple):
+    """One graded defect found in an ignore entry.
+
+    ``pattern`` is the offending entry's glob, so an operator can locate the
+    entry in the YAML; ``kind`` is a taxonomy member; ``severity`` is
+    ``'hard'`` or ``'advisory'``; ``detail`` states the defect AND the concrete
+    remediation — a finding that only says "wrong" is not actionable.
+    """
+
+    pattern: str
+    kind: str
+    severity: str
+    detail: str
+
+
+KIND_UNREASONED = 'unreasoned'
+KIND_SELF_REFUTING = 'self-refuting'
+KIND_MISSING_CITE = 'missing-cite'
+KIND_MALFORMED_CITE = 'malformed-cite'
+KIND_UNKNOWN_ID = 'unknown-id'
+KIND_ORPHANED = 'orphaned'
+KIND_PARKED_ON_ANCHOR = 'parked-on-anchor'
+
+SEVERITY_HARD = 'hard'
+SEVERITY_ADVISORY = 'advisory'
+
+# Grading per PTODO §8.4.  A kind is HARD only when a positive answer is
+# certain from information the linter actually holds:
+#   * self-refuting — certain with NO external state at all (the entry
+#     contradicts itself: dark-factory owns the schema, so a key it consumed
+#     would be a model field and would never need excusing);
+#   * missing-cite  — certain from the reason text alone (a not-yet-landed
+#     claim with no citation has no expiry, so nothing will ever re-check it);
+#   * orphaned      — the cited task is POSITIVELY terminal in the task DB, so
+#     the justification is provably spent.
+# Everything else stays ADVISORY: `unknown-id` can be a task-DB sync artifact
+# and must never hard-fail a gate, `malformed-cite` still leaves a usable
+# pointer, `parked-on-anchor` is a deliberate operator state, and `unreasoned`
+# is pre-existing debt that must not turn every green config red on upgrade.
+HARD_KINDS = frozenset({KIND_SELF_REFUTING, KIND_MISSING_CITE, KIND_ORPHANED})
+
+# The framework itself named as the consumer.  \bDF\b catches the
+# DF_-prefixed env-var convention (e.g. DF_AGENT_CPU_GOVERN) that names
+# dark-factory directly.
+_SELF_CONSUMER_RE = re.compile(
+    r'\b(dark[-\s]?factory|orchestrator|orchestratorconfig|DF)\b', re.IGNORECASE
+)
+
+# Prose asserting the consumer has NOT landed yet.  Such a claim is only
+# auditable if it says WHICH task will land it.
+_PENDING_PROSE_RE = re.compile(
+    r'\b(pending|not yet|until|once|lands?|landing|will be|planned|upcoming|in flight)\b',
+    re.IGNORECASE,
+)
+
+# Legacy / non-canonical reference forms.  Matching one of these while the
+# canonical #NNNN extractor found nothing means the operator DID leave a
+# pointer, just not one this linter (or any other tool) can resolve.
+_LOOSE_REF_RE = re.compile(
+    r'\b(task|tkt|ticket|df)\s*[-#]?\s*([0-9]{1,5}|[Ͱ-Ͽ])\b', re.IGNORECASE
+)
+
+
+def audit_census_ignore_specs(
+    specs: list[CensusIgnoreSpec],
+    status_probe: dict[int, Any] | None = None,
+) -> list[CensusIgnoreFinding]:
+    """Grade every spec against the taxonomy; pure and sync.
+
+    *status_probe* is the injected task-liveness view (``None`` = "cannot
+    know"), mirroring the shape of
+    ``fused_memory.reconciliation.task_filter.nonterminal_completion_claim_task_ids``.
+    All task-store access flows through it, so every kind is unit-testable with
+    a dict-backed fake and no sqlite at all.
+
+    Kinds are INDEPENDENT defects, not a single classification: one entry can
+    be both self-refuting and uncited, and suppressing either would hide a real
+    problem.
+    """
+    findings: list[CensusIgnoreFinding] = []
+    for spec in specs:
+        reason = (spec.reason or '').strip()
+
+        if not reason:
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_UNREASONED,
+                SEVERITY_ADVISORY,
+                f'{spec.pattern}: no reason given — an ignore entry is an '
+                'assertion that some non-orchestrator consumer reads this key, '
+                'and with no reason that assertion cannot be checked by anyone. '
+                'Add a `reason:` naming the actual consumer.',
+            ))
+            # Every remaining structural kind reads the reason text, so there is
+            # nothing further to say about an entry that has none.
+            continue
+
+        if _SELF_CONSUMER_RE.search(reason):
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_SELF_REFUTING,
+                SEVERITY_HARD,
+                f'{spec.pattern}: the reason names dark-factory/the orchestrator '
+                'as the consumer, which is self-refuting — dark-factory owns the '
+                'schema, so a key it consumed would be a FIELD on the model, '
+                'hence classified known, hence never in need of an ignore entry. '
+                'Add the key as a field on the model instead of excusing it.',
+            ))
+
+        if _PENDING_PROSE_RE.search(reason) and not spec.citations:
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_MISSING_CITE,
+                SEVERITY_HARD,
+                f'{spec.pattern}: the reason says the consumer has not landed '
+                'yet but cites no tracking task, so nothing will ever prompt a '
+                're-check and the entry has no expiry. Cite the tracking task '
+                'as #NNNN.',
+            ))
+
+        if not spec.citations and _LOOSE_REF_RE.search(reason):
+            findings.append(CensusIgnoreFinding(
+                spec.pattern,
+                KIND_MALFORMED_CITE,
+                SEVERITY_ADVISORY,
+                f'{spec.pattern}: the reason references a task in a '
+                'non-canonical form that no tool can resolve. Rewrite it as '
+                '#NNNN so the citation can be checked for liveness.',
+            ))
+
+    return findings
