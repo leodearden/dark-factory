@@ -2023,8 +2023,19 @@ class TestIndeterminateLocalLegDoesNotVeto:
 
     @staticmethod
     async def _drive(tmp_path, *, local_category: str, merge_sha: str,
-                     local_summary: str | None = None):
-        """Remote PASS + local FAIL(*local_category*) through the real callee."""
+                     local_summary: str | None = None,
+                     local_failing_legs: list[str] | None = None):
+        """Remote PASS + local FAIL(*local_category*) through the real callee.
+
+        *local_failing_legs* (task 3173 review amendment) is what
+        ``_summarize_checks`` published for EACH failing leg, which is what the
+        veto gate actually reads.  It is a SEPARATE knob from *local_category*
+        precisely because the two can disagree: severity dominance makes a
+        rank-1 ``infra_kill`` the aggregate category even when a rank-11
+        ``test_failure`` leg completed alongside it.  Defaulting to ``None``
+        (rather than deriving ``[local_category]``) keeps the fail-CLOSED
+        "not recorded" case drivable.
+        """
         from unittest.mock import patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
@@ -2036,6 +2047,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         remote = _remote_stub(_make_result(True), name='laptop')
         # Host B's leg: signal-killed at 0.31s, zero diagnostics on any leg.
         local_fail = _make_result(False, category=local_category)
+        local_fail.failing_leg_categories = local_failing_legs
         local_fail.test_output = ''
         local_fail.lint_output = ''
         local_fail.type_output = ''
@@ -2071,6 +2083,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         completed PASS, and must not blame the branch for it."""
         outcome, git_ops, eq, es, quarantine, lr_calls = await self._drive(
             tmp_path, local_category='infra_kill', merge_sha='b1ac2c7f',
+            local_failing_legs=['infra_kill'],
         )
 
         # (1) the land PROCEEDS — the killed leg produced no verdict to veto with.
@@ -2099,19 +2112,12 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert 'infra_kill' in repr(data), (
             f'the event must name the indeterminate category; got {data}'
         )
-        assert es.events_of(EventType.verify_cross_check_mismatch) == []
-
-    async def test_arm_keys_off_the_registry_not_a_hardcoded_infra_kill(self, tmp_path):
-        """disk_full is equally verdict-less: the arm must read
-        INDETERMINATE_VERDICT_CATEGORIES, not a literal."""
-        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
-            tmp_path, local_category='disk_full', merge_sha='deadbeef',
+        # The event names EVERY per-leg category, not just the aggregate, so a
+        # future triager can see WHY the run was judged verdict-less rather
+        # than having to trust one collapsed severity-ranked string.
+        assert data['local_failing_leg_categories'] == ['infra_kill'], (
+            f'the event must name every per-leg category; got {data}'
         )
-        assert outcome is None
-        git_ops.cleanup_merge_worktree.assert_not_awaited()
-        assert quarantine == set()
-        assert eq.submitted == []
-        assert len(es.events_of(EventType.verify_cross_check_inconclusive)) == 1
         assert es.events_of(EventType.verify_cross_check_mismatch) == []
 
     async def test_every_indeterminate_category_is_covered(self, tmp_path):
@@ -2123,13 +2129,123 @@ class TestIndeterminateLocalLegDoesNotVeto:
         for i, category in enumerate(sorted(INDETERMINATE_VERDICT_CATEGORIES)):
             outcome, _, eq, es, quarantine, _ = await self._drive(
                 tmp_path, local_category=str(category), merge_sha=f'sha{i:04d}',
+                local_failing_legs=[str(category)],
             )
             assert outcome is None, f'{category} must not veto a completed PASS'
             assert quarantine == set(), f'{category} must not quarantine the remote'
             assert eq.submitted == [], f'{category} must not escalate'
             assert es.events_of(EventType.verify_cross_check_mismatch) == [], category
 
+    # -- THE GAP THE REVIEW NAMED: MIXED per-leg results -------------------
+
+    async def test_real_test_failure_plus_killed_lint_still_vetoes_and_quarantines(
+        self, tmp_path
+    ):
+        """A local trust-anchor whose TEST leg COMPLETED and reported real
+        branch failures, while an UNRELATED lint leg was SIGKILLed.
+
+        `_summarize_checks` genuinely produces `category='infra_kill'` here —
+        severity_rank=1 dominates rank-11 test_failure — so an arm keyed on
+        the aggregate category alone silently LANDS this, discarding the
+        completed, branch-blaming evidence the cross-check exists to collect
+        (task 2822).  The task-2822 fail-CLOSED contract must hold in full.
+        """
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='infra_kill', merge_sha='mixed001',
+            local_failing_legs=['test_failure', 'infra_kill'],
+            local_summary=(
+                'Failures: tests failed, lint leg killed by signal 9 after 0.31s; '
+                'no diagnostics produced; verdict indeterminate'
+            ),
+        )
+        assert outcome is not None, (
+            'a COMPLETED test-leg failure must still withhold the land, even '
+            'when a co-occurring kill dominates the aggregate category'
+        )
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert 'laptop' in quarantine
+        mismatch = [
+            e for e in eq.submitted
+            if getattr(e, 'category', None) == 'verify_cross_check_mismatch'
+        ]
+        assert len(mismatch) == 1, f'expected 1 mismatch escalation, got {eq.submitted}'
+        assert mismatch[0].severity == 'blocking'
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
+
+    async def test_missing_failing_leg_categories_fails_closed(self, tmp_path):
+        """None is NOT RECORDED, never a licence: an old wire payload, or any
+        result not produced by `run_verification`, must veto."""
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='infra_kill', merge_sha='none0001',
+            local_failing_legs=None,
+        )
+        assert outcome is not None, 'an unrecorded per-leg list must fail CLOSED'
+        assert outcome.status == 'blocked'
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
+
+    async def test_empty_failing_leg_categories_fails_closed(self, tmp_path):
+        """[] is "no legs recorded", not "all legs indeterminate"."""
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='infra_kill', merge_sha='empty001',
+            local_failing_legs=[],
+        )
+        assert outcome is not None, 'an empty per-leg list must fail CLOSED'
+        assert outcome.status == 'blocked'
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
+
     # -- CONTROLS: the task-2822 fail-CLOSED contract is fully intact -------
+
+    @pytest.mark.parametrize(
+        ('category', 'why'),
+        [
+            # Each cites the step-13 adjudication that removed it from the
+            # registry, so the three narrowed rows are pinned AT THE GATE and
+            # not only in the registry's own unit test.
+            ('disk_full', 'fails predicate (2): a diff generating very large '
+                          'build artifacts or a runaway test log can genuinely '
+                          'cause the ENOSPC itself'),
+            ('env_transient', 'fails predicate (3): verify_classify.py:498-508 '
+                              'documents that a guard script tripping over a '
+                              'file the DIFF deleted is textually '
+                              'indistinguishable from worktree-removal collateral'),
+            ('semaphore_timeout', 'fails predicate (3): verify_classify.py:438-453 '
+                                  'documents that a deterministic shell gate '
+                                  'assertion quoting a lock + timeout token '
+                                  'still classifies SEMAPHORE_TIMEOUT'),
+        ],
+    )
+    async def test_narrowed_infra_rows_still_veto(self, tmp_path, category, why):
+        """These three are is_infra_transient=True — retrying them is still
+        right — but they are NOT verdict-indeterminate, so they keep their
+        veto over another host's completed PASS."""
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+
+        # The premise each control exists for: infra-transient, yet vetoing.
+        assert category in INFRA_TRANSIENT_CATEGORIES, why
+        assert category not in INDETERMINATE_VERDICT_CATEGORIES, why
+
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category=category, merge_sha='narrow01',
+            local_failing_legs=[category],
+        )
+        assert outcome is not None, f'{category} must still withhold the land: {why}'
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
 
     @pytest.mark.parametrize('category', ['test_failure', 'infra_timeout'])
     async def test_completed_fail_and_local_timeout_still_veto(self, tmp_path, category):
@@ -2138,6 +2254,10 @@ class TestIndeterminateLocalLegDoesNotVeto:
         of the few non-completions a branch can genuinely cause."""
         outcome, git_ops, eq, es, quarantine, _ = await self._drive(
             tmp_path, local_category=category, merge_sha='ctrl0001',
+            # Backfilled (review amendment): drive the per-leg list too, so
+            # these veto because their CATEGORY is not indeterminate — not
+            # vacuously, because the list happened to be unrecorded.
+            local_failing_legs=[category],
         )
         assert outcome is not None, f'{category} must still withhold the land'
         assert outcome.status == 'blocked'
@@ -2172,6 +2292,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         outcome, git_ops, eq, es, quarantine, _ = await self._drive(
             tmp_path, local_category='pytest_internalerror', merge_sha='ctrl0003',
             local_summary='Failures: tests failed',
+            local_failing_legs=['pytest_internalerror'],
         )
         assert outcome is not None, 'a branch-causable collection error must veto'
         assert outcome.status == 'blocked'
@@ -2185,6 +2306,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         """An empty category is not a licence to land: fail CLOSED."""
         outcome, _, eq, es, quarantine, _ = await self._drive(
             tmp_path, local_category='', merge_sha='ctrl0002',
+            local_failing_legs=[''],
         )
         assert outcome is not None
         assert outcome.status == 'blocked'
