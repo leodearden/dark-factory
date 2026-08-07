@@ -17,7 +17,7 @@ _PROJECT_ID_GUIDELINE = (
 _STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
         'search, get_entity, get_episodes, get_status, add_memory, delete_memory, '
-        'update_edge'
+        'update_edge, update_memory, redact_episode_content, delete_episode'
     )
 )
 
@@ -27,6 +27,7 @@ _STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
 _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
         'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
+        'update_memory, redact_episode_content, delete_episode, '
         'get_tasks, get_task, set_task_status, submit_task, resolve_ticket, '
         'update_task, remove_task, add_dependency, remove_dependency'
     )
@@ -36,6 +37,33 @@ _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
 _STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
 )
+
+# ---------------------------------------------------------------------------
+# Shared memory-amend / episode-mutation tool listing (esc-3391-1)
+# ---------------------------------------------------------------------------
+# Stage 1 and Stage 2 can already call all three of these tools today — neither
+# STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds DISALLOW_MEMORY_WRITES
+# (cli_stage_runner.py) — but until now neither stage's "## Available Tools"
+# block named them, so the agent never learned they exist. `--disallowed-tools`
+# OMITS a denied tool rather than rejecting a call (cli_stage_runner.py:96-104),
+# so an unadvertised-but-held tool is just as invisible to the agent by the
+# mirror-image failure: nothing in its prompt ever mentions it.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Not an f-string: it is interpolated INTO f-strings, and
+# braces inside an interpolated value are not re-parsed by the enclosing
+# f-string, so its own text needs no {{/}} escaping.
+AMEND_AND_EPISODE_TOOLS_BLOCK = """\
+- `mcp__fused-memory__update_memory` — in-place Mem0 content amend / metadata patch. \
+The Qdrant point id and created_at are PRESERVED, so nothing citing the record dangles. \
+PREFER THIS over delete + re-add when consolidating a cluster: delete + re-add mints a \
+new UUID and strands any task metadata citing the old one.
+- `mcp__fused-memory__redact_episode_content` — in-place replacement of ONE episode's raw \
+content. NON-destructive: the episode's extracted edges are deliberately left untouched.
+- `mcp__fused-memory__delete_episode` — IRREVERSIBLE. `cascade=True` (the default) also \
+destroys entities and edges exclusively sourced from that episode.\
+"""
 
 # ---------------------------------------------------------------------------
 # Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)

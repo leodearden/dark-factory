@@ -3,6 +3,7 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -37,6 +38,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
