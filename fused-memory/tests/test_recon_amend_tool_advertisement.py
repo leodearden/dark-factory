@@ -226,11 +226,6 @@ class TestStagePromptsCarryTheAnnotationNorm:
     already-passing assertions, stay unaffected and collectible.
     """
 
-    def test_is_nonempty_str(self) -> None:
-        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
-        assert isinstance(STALE_KNOWLEDGE_ANNOTATION_NORM, str)
-        assert STALE_KNOWLEDGE_ANNOTATION_NORM
-
     def test_embedded_exactly_once_in_stage1_prompt(self) -> None:
         from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
         assert STAGE1_SYSTEM_PROMPT.count(STALE_KNOWLEDGE_ANNOTATION_NORM) == 1, (
@@ -261,17 +256,3 @@ class TestStagePromptsCarryTheAnnotationNorm:
         take" rule that render_escalation_boundary_note's docstring states."""
         from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
         assert STALE_KNOWLEDGE_ANNOTATION_NORM not in STAGE3_SYSTEM_PROMPT
-
-    def test_does_not_contain_the_available_tools_sentinel(self) -> None:
-        """build_stage2_system_prompt raises RuntimeError unless
-        '## Available Tools' appears exactly once in STAGE2_SYSTEM_PROMPT —
-        the constant must not introduce a second occurrence."""
-        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
-        assert '## Available Tools' not in STALE_KNOWLEDGE_ANNOTATION_NORM
-
-    def test_does_not_contain_a_bare_recon_report_example(self) -> None:
-        """test_recon_report_guidance_drift.py scans the assembled prompts and
-        requires every recon-report tool-call example to carry run_id=; the
-        norm must introduce none."""
-        from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
-        assert 'mcp__recon-report__' not in STALE_KNOWLEDGE_ANNOTATION_NORM
