@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -63,7 +64,17 @@ _GUARD_NAME = '_df_deploy_clocks_unwritten'
 _MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
 
 
-def _fixture_marker(fixture: object) -> object:
+def _fixture_marker(fixture: object) -> Any:
+    """Return pytest's fixture marker, whatever this pytest version calls it.
+
+    `Any`, not `object`, is the honest annotation and is load-bearing for the
+    type gate: the two `_MARKER_ATTRS` spellings above hang DIFFERENT private
+    classes off the fixture, neither of which pytest exports, so there is no
+    real static type that covers both — and `object` makes every `.scope` /
+    `.autouse` read below a `reportAttributeAccessIssue`. Do not "tighten" this
+    back to `object`; pin the attributes with assertions instead, as the caller
+    does.
+    """
     for attr in _MARKER_ATTRS:
         marker = getattr(fixture, attr, None)
         if marker is not None:
@@ -205,7 +216,13 @@ class TestDeployClockViolationReason:
         os.utime(clock, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
         after = deploy_clock_snapshot(tmp_path)
-        assert after[_FLEET_RELPATH][0] == before[_FLEET_RELPATH][0], 'bytes must be identical'
+        before_entry, after_entry = before[_FLEET_RELPATH], after[_FLEET_RELPATH]
+        # Bound before subscripting: the snapshot value is `tuple | None`, and
+        # a None on either side would mean the clock vanished rather than being
+        # restamped — a different violation, and one that would make the
+        # bytes-identical premise below vacuous rather than false.
+        assert before_entry is not None and after_entry is not None
+        assert after_entry[0] == before_entry[0], 'bytes must be identical'
 
         reason = deploy_clock_violation_reason(before, after)
 
