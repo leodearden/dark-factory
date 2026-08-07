@@ -505,6 +505,24 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 # timeouts surface hangs ... on the PER-MODULE budgets". Nine of ten configs
 # now declare their own; this is the tenth. Recorded here so the guard REPORTS
 # that gap on every run rather than hiding it.
+# Modules whose budget IS measurement-backed, but whose figures are recorded in
+# the sibling guard that owns them rather than in this file's table. Copying
+# those numbers here would create a second copy of a measurement that must be
+# raised in lockstep — exactly the drift that has already occurred once between
+# these two configs and was caught only by a reviewer.
+MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
+    'scripts': (
+        'MEASURED_SUITE_WORST_SECS = 930.59 in '
+        'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
+        "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block."
+    ),
+    'tests/scripts': (
+        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml '
+        'and gated by tests/scripts/test_tests_scripts_module_config.py '
+        '(task 3350).'
+    ),
+}
+
 MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
     'orchestrator': (
         'Owned by task 3353, which is still pending. Deliberately not fixed by '
@@ -603,6 +621,15 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
         # A budget with no recorded measurement behind it is a guess wearing a
         # number's clothes. This is what stops a newly-registered config from
         # landing with a plausible-looking value and no provenance.
+        #
+        # MEASURED_BY_SIBLING_GUARD is not a loophole: those modules' figures
+        # ARE recorded, just in the guard that owns them rather than in this
+        # file's table. Requiring them here would demand a DUPLICATE copy of a
+        # measurement, which is precisely the drift the RAISE-TOGETHER rule in
+        # every provenance block exists to prevent — and the drift that has
+        # already happened once between the two sibling configs.
+        if prefix in MEASURED_BY_SIBLING_GUARD:
+            continue
         assert prefix in MEASURED_MODULE_SUITE_WORST_SECS, (
             f'{prefix}/orchestrator.yaml declares '
             f'verify_command_timeout_secs={mc.verify_command_timeout_secs} but '
