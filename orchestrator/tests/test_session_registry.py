@@ -4318,3 +4318,113 @@ def test_migrate_decision_project_tokens_survives_a_raising_record(
 
     assert {m.id for m in migrated} == {'d-ok'}
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI migrate-decision-projects verb (task 3807: one-shot project backfill)
+# ---------------------------------------------------------------------------
+
+
+def test_main_migrate_decision_projects_prints_one_line_per_migrated_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One ``<id> <old> -> <new>`` line per migrated record, mirroring
+    reap-decisions' one-line-per-closed-decision convention -- so the verb is
+    grep-able and diffable the same way and an operator's ``| wc -l`` habits
+    transfer unchanged. Asserted as a SET: ordering is list_decisions' sorted
+    glob, not a promise this verb makes.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_dry_run_prints_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--dry-run prints the same preview lines and leaves every record's
+    project unchanged, so an operator can read the plan before running it
+    against the live fleet root.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects', '--dry-run'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'df',
+        'd-hyphen': 'dark-factory',
+        'd-mixed': 'Dark_Factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_is_a_no_op_when_already_clean(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Re-running after the fleet is clean prints NOTHING.
+
+    That silence is what makes the verb safe to keep permanently: it doubles
+    as the repair tool for a hand-edited record without an operator having to
+    reason about whether it already ran.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+    assert sr.main(['migrate-decision-projects']) == 0
+    capsys.readouterr()
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_write_decision_fail_soft_when_fleet_root_under_a_file:
+    an unusable fleet root must return 0 and raise nothing, preserving the
+    module's documented boundary that a registry fault can never change a
+    bash caller's exit code.
+    """
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert not (blocker / 'fleet').exists()
