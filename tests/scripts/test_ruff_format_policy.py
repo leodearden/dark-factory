@@ -34,12 +34,23 @@ Three invariants, and they are not the same kind of thing:
       exists to rewrap exactly those lines. If a future task drops that ignore,
       a premise behind the DECLINE has changed and the policy needs re-reading.
 
+MEASUREMENTS, stated once here so they are not duplicated per package. All
+taken with ruff 0.15.9 at task 3441, AFTER the canonicalisation in (a) — the
+``docstring-code-format`` flag shifts the counts, so a figure measured before it
+does not match one measured after.
+
+  - ``ruff format --check`` over the seven packages: 1125 of 1357 first-party
+    ``.py`` files would be reformatted. CONTRIBUTING.md section 3 states the
+    same pair; they are meant to agree, and disagreeing is a defect.
+  - ``ruff format --diff escalation/src``: 317 changed lines with the canonical
+    block, 1431 with no block at all (ruff's own defaults). That ~4.5x is the
+    whole reason the blocks are retained rather than deleted as unused config.
+
 WHAT THIS FILE DELIBERATELY DOES NOT DO. It asserts nothing about prose in
 CONTRIBUTING.md or CLAUDE.md, and must not be extended to: pinning wording
 would go red on any future rewording, which is not a defect. It also asserts
-nothing about whether source files ARE format-clean — most are not (as of task
-3441, 1124 of 1357 first-party package ``.py`` files would be reformatted), and
-that is the expected steady state, not debt.
+nothing about whether source files ARE format-clean — most are not, per the
+1125-of-1357 figure above — and that is the expected steady state, not debt.
 
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard actually runs under FULL_SUITE and merge-role
@@ -62,9 +73,24 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # nothing.
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
-# The pre-commit gate's own check script — the one place outside the yaml
-# configs where a formatter leg could plausibly be bolted on.
-HOOK_PATH = REPO_ROOT / "hooks" / "project-checks"
+# Every git hook that gates a commit — the places outside the yaml configs where
+# a formatter leg could plausibly be bolted on.
+#
+# ALL THREE, not just `project-checks`. `pre-commit` runs a universal-guard body
+# on every branch and only then `exec`s `project-checks`, and `pre-merge-commit`
+# is a third, independent gate — so a `ruff format --check` leg added above that
+# `exec` would be a real, enforced gate that a `project-checks`-only scan never
+# sees. CONTRIBUTING.md section 3 claims the formatter is enforced in none of
+# them; the claim and the scanned surface have to be the same set, or the guard
+# certifies less than the docs promise.
+#
+# Read by exact path, like DF_CONFIG_PATH above: renaming a hook raises here
+# rather than quietly shrinking what is guarded.
+HOOK_PATHS = (
+    REPO_ROOT / "hooks" / "pre-commit",
+    REPO_ROOT / "hooks" / "pre-merge-commit",
+    REPO_ROOT / "hooks" / "project-checks",
+)
 
 # The three command keys that can invoke a tool during verify / pre-commit.
 _COMMAND_KEYS = ("lint_command", "test_command", "type_check_command")
@@ -76,8 +102,21 @@ _COMMAND_KEYS = ("lint_command", "test_command", "type_check_command")
 # would flag those.
 _FORMAT_INVOCATION = "ruff format"
 
-# The 4-of-7 majority shape, adopted as canonical by task 3441. Compared as a
-# PARSED DICT, never as TOML text: task 3441 step 3 adds a multi-line comment
+# The 4-of-7 majority shape, adopted as canonical by task 3441.
+#
+# WHY CANONICALISE UP, NOT DOWN. Majority is the tie-break, not the argument —
+# resolving the drift by ADDING `docstring-code-format` to cockpit/escalation/
+# shared does slightly enlarge what an ad-hoc `ruff format` rewrites, which is
+# worth justifying in a commit that declares the formatter unadopted. It was
+# measured, not assumed: on escalation/src the flag is worth 4 changed lines
+# (317 with it, 313 without) against 1431 for the no-block fallback — 0.3% of
+# the divergence this block exists to prevent. Canonicalising DOWN instead would
+# have stripped a key four packages set deliberately, to buy those 4 lines. The
+# cost of the flag is real but bounded, and it is visible: it moved exactly one
+# `shared/` file from format-clean to not (53 -> 54), which is why the 1125
+# figure above must be read as post-canonicalisation.
+#
+# Compared as a PARSED DICT, never as TOML text: task 3441 step 3 adds a comment
 # directly above each of these blocks, and a text-matching guard would go red on
 # its own follow-up step.
 CANONICAL_FORMAT_BLOCK: dict[str, object] = {
@@ -132,8 +171,38 @@ def _first_party_ruff_tables() -> dict[str, dict]:
     return tables
 
 
-def _hook_invocation_lines() -> list[tuple[int, str]]:
-    """``(1-based line number, text)`` for every non-comment line of the hook.
+def _globally_ignored_codes(ruff_table: dict) -> set[str]:
+    """Lint codes a package tolerates REPO-WIDE, across ruff's equivalent spellings.
+
+    Ruff accepts several ways to say the same thing, and which one a package uses
+    is a config-style choice with no policy content: ``[tool.ruff.lint].ignore``,
+    its ``extend-ignore`` sibling, and the legacy pre-``[tool.ruff.lint]``
+    spellings directly under ``[tool.ruff]``. Reading only the first would let a
+    pure re-spelling trip a red assertion whose message claims a POLICY premise
+    changed — a false alarm that is expensive precisely because this guard's
+    whole job is to be believed when it fires.
+
+    ``per-file-ignores`` is deliberately NOT unioned in. It is not an equivalent
+    spelling: it exempts named files, whereas the decision this pins is that the
+    repo tolerates long lines EVERYWHERE. A package that narrowed ``E501`` down
+    to a handful of files really has moved a premise of the DECLINE, and should
+    go red and be re-read.
+    """
+    lint_table = ruff_table.get("lint", {})
+    codes: set[str] = set()
+    for spelling in (
+        lint_table.get("ignore"),
+        lint_table.get("extend-ignore"),
+        ruff_table.get("ignore"),
+        ruff_table.get("extend-ignore"),
+    ):
+        if spelling:
+            codes.update(spelling)
+    return codes
+
+
+def _hook_invocation_lines() -> list[tuple[pathlib.Path, int, str]]:
+    """``(path, 1-based line number, text)`` per non-comment line of every gate hook.
 
     Only whole-line comments — first non-whitespace character ``#`` — are
     dropped. A trailing ``# ...`` comment is deliberately NOT stripped: doing
@@ -143,12 +212,15 @@ def _hook_invocation_lines() -> list[tuple[int, str]]:
     loud, self-explaining, and fixed by moving that prose onto its own comment
     line. This errs toward flagging.
     """
-    text = HOOK_PATH.read_text(encoding="utf-8")
-    return [
-        (number, line)
-        for number, line in enumerate(text.splitlines(), start=1)
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    lines: list[tuple[pathlib.Path, int, str]] = []
+    for hook in HOOK_PATHS:
+        text = hook.read_text(encoding="utf-8")
+        lines += [
+            (hook, number, line)
+            for number, line in enumerate(text.splitlines(), start=1)
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    return lines
 
 
 def test_ruff_format_blocks_are_canonical_across_packages() -> None:
@@ -182,7 +254,10 @@ def test_ruff_format_blocks_are_canonical_across_packages() -> None:
         if block == CANONICAL_FORMAT_BLOCK:
             continue
         if block is None:
-            drift[package] = "has no [tool.ruff.format] block at all"
+            drift[package] = (
+                "has no [tool.ruff.format] block at all — see the NEW PACKAGE "
+                "note below; absence is the worst case, not an exemption"
+            )
             continue
         missing = {k: v for k, v in CANONICAL_FORMAT_BLOCK.items() if k not in block}
         extra = {k: v for k, v in block.items() if k not in CANONICAL_FORMAT_BLOCK}
@@ -205,17 +280,27 @@ def test_ruff_format_blocks_are_canonical_across_packages() -> None:
         "hand-run format produces a single-quoted, repo-consistent diff. That is "
         "only coherent if they are IDENTICAL: divergence means the same ad-hoc "
         "run reformats one package differently from another. Bring the outlier "
-        "into line with the canonical block above; see CONTRIBUTING.md section 3."
+        "into line with the canonical block above; see CONTRIBUTING.md section 3.\n"
+        "NEW PACKAGE? Yes, you must copy the canonical block verbatim even "
+        "though no gate ever runs the formatter, and that is not busywork: with "
+        "NO block, ruff falls back to its own defaults — double quotes, against "
+        "a repo that writes single — so the first editor-on-save or hand-run "
+        "`ruff format` in your package produces the maximal diff (measured "
+        "~4.5x the canonical one; see this module's docstring) instead of a "
+        "minimal, repo-consistent one. The block is what makes an unadopted "
+        "tool harmless when someone runs it anyway."
     )
 
 
 def test_no_lint_gate_invokes_ruff_format() -> None:
-    """No verify command and no pre-commit hook line may invoke ``ruff format``.
+    """No verify command and no git-hook line may invoke ``ruff format``.
 
     Covers the root ``dark-factory-orchestrator.yaml`` plus every per-module
-    ``orchestrator.yaml`` the orchestrator itself registers, plus
-    ``hooks/project-checks``. Together those are the places a formatter leg
-    could actually be bolted onto the gate.
+    ``orchestrator.yaml`` the orchestrator itself registers, plus all three gate
+    hooks (see ``HOOK_PATHS``). Together those are the places a formatter leg
+    could actually be bolted onto the gate — and they are exactly the set
+    CONTRIBUTING.md section 3 names when it says the formatter is enforced in
+    none of them.
 
     Module configs come from the PRODUCTION walk
     ``config._discover_module_configs`` rather than a hand-rolled glob — the
@@ -246,9 +331,12 @@ def test_no_lint_gate_invokes_ruff_format() -> None:
         f"{DF_CONFIG_PATH.name}'s own commands."
     )
     hook_lines = _hook_invocation_lines()
-    assert hook_lines, (
-        f"{HOOK_PATH} has no non-comment lines (task 3441) — this guard would "
-        f"pass vacuously; the pre-commit check script should be executable shell."
+    scanned_hooks = {hook for hook, _, _ in hook_lines}
+    assert scanned_hooks == set(HOOK_PATHS), (
+        f"scanned no non-comment lines in "
+        f"{sorted(str(h.relative_to(REPO_ROOT)) for h in set(HOOK_PATHS) - scanned_hooks)} "
+        f"(task 3441) — this guard would pass vacuously over them; every gate "
+        f"hook should be executable shell."
     )
 
     offenders = [
@@ -257,8 +345,8 @@ def test_no_lint_gate_invokes_ruff_format() -> None:
         if _FORMAT_INVOCATION in command
     ]
     offenders += [
-        f"{HOOK_PATH.relative_to(REPO_ROOT)}:{number}: {line.strip()!r}"
-        for number, line in hook_lines
+        f"{hook.relative_to(REPO_ROOT)}:{number}: {line.strip()!r}"
+        for hook, number, line in hook_lines
         if _FORMAT_INVOCATION in line
     ]
 
@@ -297,12 +385,17 @@ def test_ruff_lint_still_ignores_e501() -> None:
     missing = sorted(
         package
         for package, ruff_table in ruff_tables.items()
-        if "E501" not in ruff_table.get("lint", {}).get("ignore", [])
+        if "E501" not in _globally_ignored_codes(ruff_table)
     )
     assert not missing, (
-        f"these packages no longer ignore E501: {missing} (task 3441). "
+        f"these packages no longer ignore E501 repo-wide: {missing} (task 3441). "
         f"`ignore = [\"E501\"]` with `line-length = 100` is the deliberate choice "
         f"to tolerate long lines, and it is the first reason `ruff format` — "
         f"which exists to rewrap them — was declined. Dropping it changes a "
-        f"premise of that decision.\n" + _ADOPTION_REMEDY
+        f"premise of that decision.\n"
+        f"Before treating this as a re-spelling: every global spelling ruff "
+        f"accepts is already unioned in (see _globally_ignored_codes), so this "
+        f"is a real narrowing, not a config-style change. Narrowing E501 to "
+        f"`per-file-ignores` counts as narrowing — the premise is that long "
+        f"lines are tolerated everywhere.\n" + _ADOPTION_REMEDY
     )
