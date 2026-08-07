@@ -11,6 +11,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -4162,5 +4163,5 @@ def test_migrated_decision_is_a_frozen_result_record() -> None:
         'df',
         'dark_factory',
     )
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         migrated.new_project = 'other'  # type: ignore[misc]

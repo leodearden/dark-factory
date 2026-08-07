@@ -1132,6 +1132,95 @@ def reap_answered_decisions(
     return reaped
 
 
+@dataclass(frozen=True)
+class MigratedDecision:
+    """One DecisionRecord whose project token was canonicalized (task 3807).
+
+    id: the migrated decision's id -- NEVER rewritten by the migration, so
+        this is also its filename stem before and after.
+    old_project: the non-canonical token it was filed under.
+    new_project: the canonical token it now carries (see
+        normalize_project_token).
+    """
+
+    id: str
+    old_project: str
+    new_project: str
+
+
+def migrate_decision_project_tokens(
+    root: Path | str | None = None,
+) -> list[MigratedDecision]:
+    """One-shot, idempotent backfill of DecisionRecord.project onto the canonical token.
+
+    Repairs the population filed BEFORE ``write-decision`` canonicalized
+    ``--project`` (task 3807). For each ``list_decisions(root)`` entry whose
+    stored token differs from ``normalize_project_token`` of itself, rewrites
+    ONLY that field. Returns one MigratedDecision per record actually
+    changed; an already-canonical record and an unrelated project's record
+    are skipped and absent from the result.
+
+    Load-bearing invariants, in the order they matter:
+
+    (a) SAME LOCK AS EVERY OTHER MUTATOR. The read-modify-write runs under
+        ``decision_id_lock``, exactly as ``update_decision_state`` and
+        ``set_manual_boost`` do, so a concurrent cockpit ``set_manual_boost``
+        or watcher state-update on the SAME id is serialized rather than
+        having one side's mutation dropped.
+
+    (b) RE-READ INSIDE THE LOCK. ``list_decisions`` returns a point-in-time
+        snapshot; a state transition landing between the scan and the write
+        would be ROLLED BACK by writing that stale snapshot. Re-reading from
+        disk under the lock is what prevents the sweep from resurrecting a
+        decision the human just answered.
+
+    (c) ONLY ``.project`` IS TOUCHED. ``state`` and ``filed_at`` (and every
+        other field) are carried through from the re-read record untouched,
+        so an already-ANSWERED/DROPPED row can never be reopened and the
+        cockpit's age/ordering signal is not restamped. (a)+(b)+(c) make this
+        structurally identical to ``update_decision_state``, so the guarantee
+        is inherited from a shape already pinned by TestDecisionIdLock rather
+        than re-argued here.
+
+    (d) IDEMPOTENT. Because ``normalize_project_token`` is idempotent, a
+        second run finds nothing to change and returns ``[]`` without
+        rewriting a single file. That is what makes this safe to keep
+        permanently as the repair tool for a hand-edited record, rather than
+        a one-shot script that must be deleted after use.
+
+    (e) THE ID IS NEVER REWRITTEN. Only the ``project`` FIELD moves; the
+        record keeps its id and therefore its ``<id>.json`` filename, so the
+        ``df-`` prefix on ids like ``df-esc-3524-1`` and every cockpit
+        cross-link survive intact.
+
+    Iterates ``list_decisions`` rather than doing its own scan, inheriting
+    its skip-a-corrupt-file tolerance for free. A record whose write fails is
+    simply absent from the returned list, mirroring
+    ``reap_answered_decisions``' "only record it when the update actually
+    succeeded" contract.
+    """
+    migrated: list[MigratedDecision] = []
+    for decision in list_decisions(root):
+        new_project = normalize_project_token(decision.project)
+        if new_project == decision.project:
+            continue
+        path = decision_path_for_id(decision.id, root=root)
+        with decision_id_lock(decision.id, root=root):
+            # Re-read under the lock -- see invariant (b).
+            record = DecisionRecord.from_json(path.read_text())
+            record.project = new_project
+            if not write_decision(record, root=root):
+                continue
+        migrated.append(
+            MigratedDecision(
+                id=decision.id,
+                old_project=decision.project,
+                new_project=new_project,
+            )
+        )
+    return migrated
+
+
 # ---------------------------------------------------------------------------
 # TTL / pid stale-record reaper (PRD §4.8)
 # ---------------------------------------------------------------------------
