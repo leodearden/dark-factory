@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -136,7 +137,7 @@ def _make_req(
     config: OrchestratorConfig,
     git_repo: Path,
     *,
-    lane: str = 'normal',
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future.
 
@@ -164,7 +165,7 @@ def _make_group_req(
     git_repo: Path,
     *,
     member_task_ids: list[str] | None = None,
-    lane: str = 'normal',
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> GroupMergeRequest:
     """Build a minimal GroupMergeRequest (train) for the truncation test."""
     qb = QueuedBranch.parse(branch, config.git.branch_prefix)
