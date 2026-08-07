@@ -1540,10 +1540,18 @@ def _summarize(*args, **kwargs):
     pre-existing 12-positional-arg call site in this module passes no kwargs
     and is byte-identical, which is the point: the duration params are
     purely additive (see the design decision on keeping the 12 positionals).
+
+    ``[:4]`` (task 3173 review amendment): ``_summarize_checks`` now returns a
+    FIVE-tuple, whose fifth element is the per-failing-leg category list.  The
+    slice keeps all fourteen pre-existing 4-tuple unpack call sites in this
+    module BYTE-IDENTICAL — none of them care about the new element — while
+    the tests that DO care call ``_summarize_checks`` directly rather than
+    going through this harness.  Widening every old call site instead would
+    have been fourteen edits that assert nothing.
     """
     from orchestrator.verify import _summarize_checks  # noqa: PLC0415
 
-    return _summarize_checks(*args, **kwargs)
+    return _summarize_checks(*args, **kwargs)[:4]
 
 
 class TestSummarizeChecksThreadsToolIdentity:
@@ -2039,6 +2047,116 @@ class TestSummarizeChecksNamesTheKill:
         assert 'indeterminate' in summary
         assert 'after' not in summary
         assert '0.00' not in summary
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-14 (REVIEW AMENDMENT, blocking finding 1): the aggregate
+# `category` and the per-leg verdicts answer DIFFERENT questions, and
+# collapsing them is a false-GREEN.
+#
+# `_worst_category` is severity-ranked, and INFRA_KILL sits at rank 1 while
+# TEST_FAILURE sits at rank 11.  So a run whose TEST leg COMPLETED and blamed
+# the branch, alongside an UNRELATED lint leg that was SIGKILLed, aggregates to
+# category == 'infra_kill'.  That is the RIGHT answer for "how bad was this
+# run" (it drives the retry budget, archival, and the transient-infra hold) and
+# a catastrophic answer for "did this run produce a verdict at all" — which is
+# what merge_queue's veto gate needs.  Keying the gate off the single aggregate
+# would discard a completed, branch-blaming verdict and land the remote PASS.
+#
+# So `_summarize_checks` publishes what EACH failing leg decided, and the gate
+# reads that instead of inferring it.  RED today: the fifth tuple element does
+# not exist (`per_check_categories` is computed and then thrown away).
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeChecksReportsEveryFailingLegCategory:
+    """`_summarize_checks` returns a FIVE-tuple whose last element is one
+    category per FAILING leg, in test/lint/type order."""
+
+    def test_mixed_real_test_failure_plus_killed_lint_lists_both(self):
+        """THE REVIEWER'S CASE. The aggregate category and the per-leg list
+        must DECOUPLE: severity dominance still governs `category`, while the
+        list preserves the completed test verdict the gate must not discard."""
+        from orchestrator.verify import _summarize_checks
+
+        passed, category, _, _, failing_leg_categories = _summarize_checks(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            test_duration=901.0, lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        # Unchanged: severity_rank=1 still dominates rank-11 test_failure.
+        assert category == FailureCategory.INFRA_KILL
+        # New: the completed test verdict is still visible, in leg order.
+        assert failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_single_killed_leg_lists_only_that_leg(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, category, _, _, failing_leg_categories = _summarize_checks(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert category == FailureCategory.INFRA_KILL
+        assert failing_leg_categories == ['infra_kill']
+
+    def test_passing_short_circuit_still_returns_five_elements(self):
+        """The `passed` early return is a separate `return` statement, so it
+        needs its own fifth element — an EMPTY list (no failing legs), which
+        the gate must never read as "every leg was indeterminate"."""
+        from orchestrator.verify import _summarize_checks
+
+        result = _summarize_checks(
+            0, '', False, None,
+            0, '', False, None,
+            0, '', False, None,
+        )
+        assert len(result) == 5
+        assert result[0] is True
+        assert result[4] == []
+
+    def test_crash_signal_leg_is_not_listed_as_a_kill(self):
+        """CONTROL: SIGSEGV is a genuine fault OF THE CODE UNDER TEST, not an
+        external kill — it must stay RED and must never reach the per-leg list
+        as 'infra_kill', or the veto gate would wave a segfaulting branch
+        through."""
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, _, failing_leg_categories = _summarize_checks(
+            0, '', False, None,
+            -11, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert failing_leg_categories == ['unknown_test_failure']
+        assert 'infra_kill' not in failing_leg_categories
+
+    def test_every_failing_leg_appears_in_test_lint_type_order(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, _, failing_leg_categories = _summarize_checks(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            1, 'flock: failed to acquire lock on /var/lock/mylock\n', False, 'ruff check . && x',
+            -9, '', False, './scripts/verify.sh type',
+        )
+        assert failing_leg_categories == ['test_failure', 'flock_error', 'infra_kill']
+
+    def test_first_four_elements_are_unchanged_for_every_prior_caller(self):
+        """REGRESSION GUARD for the `_summarize(...)[: 4]` harness slice: the
+        four legacy elements keep their exact positions and values."""
+        from orchestrator.verify import _summarize_checks
+
+        args = (
+            0, '', False, None,
+            1, 'src/x.py:1:1: F401 unused\nFound 1 error.\n', False, 'ruff check .',
+            0, '', False, None,
+        )
+        full = _summarize_checks(*args)
+        assert full[:4] == _summarize(*args)
+        assert full[3] == 'Failures: lint issues'
 
     # -- (e) crash-signal control -----------------------------------------
 

@@ -1467,7 +1467,10 @@ def _fake_run_verification_killed_lint(passed_prefixes: dict[str, bool]) -> Asyn
     """
     from orchestrator.verify import _summarize_checks
 
-    passed_flag, category, cause_hint, summary = _summarize_checks(
+    # Five-tuple since the task-3173 review amendment: the fifth element is
+    # one category per FAILING leg, which merge_queue's veto gate reads instead
+    # of inferring verdict-lessness from the severity-ranked aggregate.
+    passed_flag, category, cause_hint, summary, failing_legs = _summarize_checks(
         0, '', False, None,
         -9, ROW6B_LINT_OUT, False, ROW6B_LINT_CMD,
         0, '', False, None,
@@ -1475,6 +1478,9 @@ def _fake_run_verification_killed_lint(passed_prefixes: dict[str, bool]) -> Asyn
     )
     assert not passed_flag and category == 'infra_kill', (
         f'sanity: the producer must classify this as infra_kill; got {category!r}'
+    )
+    assert failing_legs == ['infra_kill'], (
+        f'sanity: the only failing leg here is the killed lint leg; got {failing_legs!r}'
     )
 
     async def _fake(worktree, config, module_config=None, **kwargs):

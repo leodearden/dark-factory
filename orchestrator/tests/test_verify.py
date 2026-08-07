@@ -9129,6 +9129,9 @@ def _kill_note_child(*, module: str = 'orchestrator') -> VerifyResult:
         summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654)}',
         category='infra_kill',
         cause_hint=f'{module}: killed',
+        # Task 3173 review amendment: this child's ONE failing leg is the
+        # killed lint leg, so it is what `_summarize_checks` would publish.
+        failing_leg_categories=['infra_kill'],
     )
 
 
@@ -9246,6 +9249,141 @@ class TestSummaryPayloadNamesTheKilledRun:
         payload = _build_summary_payload(runs, 'infra_timeout', '')
         assert payload['cmd'] == 'pytest'
         assert payload['timed_out'] is True
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-14 (REVIEW AMENDMENT, blocking finding 1): VerifyResult must
+# CARRY what each failing leg decided, so merge_queue's veto gate never has to
+# infer it from the single severity-ranked aggregate `category`.
+#
+# `_worst_category` lets a rank-1 INFRA_KILL dominate a rank-11 TEST_FAILURE.
+# That is correct for "how bad was this run" and catastrophic if read as "this
+# run produced no verdict": a trust anchor whose test leg COMPLETED and blamed
+# the branch, next to an unrelated SIGKILLed lint leg, aggregates to
+# category='infra_kill'.  Only a run in which EVERY failing leg is verdict-less
+# may decline to veto, and that question is unanswerable from one string.
+#
+# RED today: the field does not exist.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultCarriesFailingLegCategories:
+    """`VerifyResult.failing_leg_categories`: None = NOT RECORDED (fail
+    CLOSED), a list = one category per FAILING leg in test/lint/type order."""
+
+    @staticmethod
+    def _child(category: str, *, legs: list[str] | None, passed: bool = False) -> VerifyResult:
+        return VerifyResult(
+            passed=passed, test_output='', lint_output='', type_output='',
+            summary='All checks passed' if passed else f'Failures: {category}',
+            category=category, failing_leg_categories=legs,
+        )
+
+    # -- the None contract -------------------------------------------------
+
+    def test_default_is_none_not_empty_list(self):
+        """None means "not recorded" and must NEVER be read as indeterminate.
+        Every result NOT produced by `run_verification` lands here: an old wire
+        payload, a `_trivial_pass`, a verify_runner UNSCOPED_TYPECHECK_*
+        sentinel, or any hand-constructed result in a test."""
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+        )
+        assert vr.failing_leg_categories is None
+
+    def test_trivial_pass_leaves_it_none(self):
+        assert verify._trivial_pass('reason').failing_leg_categories is None
+
+    # -- codec round-trip (mirrors the `trivial` round-trip tests above) ----
+
+    def test_round_trips_losslessly_through_the_remote_codec(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        original = self._child('infra_kill', legs=['test_failure', 'infra_kill'])
+        restored = result_from_dict(result_to_dict(original))
+        assert restored.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_empty_list_round_trips_as_empty_not_none(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        restored = result_from_dict(result_to_dict(self._child('passed', legs=[], passed=True)))
+        assert restored.failing_leg_categories == []
+        assert restored.failing_leg_categories is not None
+
+    def test_payload_missing_the_key_reconstructs_as_none(self):
+        """DEPLOY ORDERING: an older remote's payload simply omits the key, so
+        the default must be the fail-CLOSED None rather than an empty list."""
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        d = result_to_dict(self._child('test_failure', legs=['test_failure']))
+        d.pop('failing_leg_categories')
+        assert result_from_dict(d).failing_leg_categories is None
+
+    # -- aggregation over FAILING children only ----------------------------
+
+    def test_aggregate_unions_two_failing_children_in_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('flock_error', legs=['flock_error']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'flock_error']
+
+    def test_passing_child_contributes_nothing(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=[],
+        )
+        agg = _aggregate_results([passing, self._child('test_failure', legs=['test_failure'])])
+        assert agg.failing_leg_categories == ['test_failure']
+
+    def test_aggregate_de_duplicates_and_preserves_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure', 'infra_kill']),
+            self._child('infra_kill', legs=['infra_kill']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_a_failing_child_with_none_poisons_the_aggregate(self):
+        """FAIL CLOSED: one unrecorded failing child means the aggregate
+        cannot claim to know what every leg decided."""
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('infra_kill', legs=None),
+        ])
+        assert agg.failing_leg_categories is None
+
+    def test_a_PASSING_child_with_none_does_not_poison(self):
+        """Only FAILING children are consulted — a passing child has no legs to
+        report, so its None is not evidence of anything missing."""
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=None,
+        )
+        agg = _aggregate_results([passing, self._child('infra_kill', legs=['infra_kill'])])
+        assert agg.failing_leg_categories == ['infra_kill']
+
+    # -- THE REVIEWER'S COMPOSITION ----------------------------------------
+
+    def test_completed_test_failure_plus_kill_note_child_keeps_both(self):
+        """The aggregate `category` still collapses to the worst
+        (severity_rank=1 infra_kill dominates rank-11 test_failure — i.e.
+        `test_aggregate_category_is_infra_kill` is NOT weakened), while the
+        per-leg list preserves the completed, branch-blaming verdict that the
+        veto gate must not discard."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure', failing_leg_categories=['test_failure'],
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_single_child_fast_path_passes_the_field_straight_through(self):
+        """len==1 returns the child object itself — pin it so the field cannot
+        be silently dropped by a future rewrite of that fast path."""
+        child = self._child('infra_kill', legs=['infra_kill'])
+        assert _aggregate_results([child]).failing_leg_categories == ['infra_kill']
 
 
 # ---------------------------------------------------------------------------
