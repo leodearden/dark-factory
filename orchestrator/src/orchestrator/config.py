@@ -36,7 +36,9 @@ from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 # depends only on stdlib plus shared/, so there is no cycle.
 from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for the drift test)
     CENSUS_IGNORE_ENTRY_KEYS,
+    HARD_KINDS,
     CensusIgnoreSpec,
+    audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
 
@@ -5334,6 +5336,44 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 uk.path + (f' (did you mean {uk.shadow_hint}?)' if uk.shadow_hint else '')
                 for uk in census
             ),
+        )
+
+    # An ignore entry is an ASSERTION about a non-orchestrator consumer that is
+    # otherwise never re-checked (task 3395).  Warn on HARD findings only —
+    # advisory ones (un-reasoned grandfathered entries in particular) would fire
+    # on every startup of an already-green unit, and a warning that always fires
+    # is one operators learn to ignore.
+    #
+    # This ONE call site covers startup AND hot-reload: Harness.reload_config
+    # obtains its `fresh` config from load_config, so no harness.py edit is
+    # needed for the loud path (nor for the reload report — ConfigIgnoredKey's
+    # new `note` rides along via the existing ik._asdict()).  The born-at-L2
+    # deliberately stays keyed on unknown keys ALONE, per the L2-decoupling
+    # decision: an unrelated task-status change must never be able to shift the
+    # census signature or hard-fail startup.
+    try:
+        hard_findings = [
+            f for f in audit_census_ignore_entries(config_path) if f.kind in HARD_KINDS
+        ]
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately broad but ALWAYS logged at WARNING, never a silent
+        # swallow (which is what shared/tests/test_silent_fallthrough_gate.py
+        # ratchets against).  Breadth is the point here: load_config runs on
+        # every startup and every hot-reload, and no defect in an advisory lint
+        # may be allowed to take either down — while the degradation still
+        # announces itself.
+        logger.warning(
+            'Config %s: census-ignore audit failed (%s) — entry findings SKIPPED',
+            config_path, exc,
+        )
+        hard_findings = []
+    if hard_findings:
+        logger.warning(
+            'Config %s has %d config_key_census.ignore entry finding(s) that '
+            'need action: %s',
+            config_path,
+            len(hard_findings),
+            '; '.join(f'{f.kind}: {f.detail}' for f in hard_findings),
         )
     return config
 
