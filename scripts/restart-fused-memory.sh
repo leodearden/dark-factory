@@ -57,7 +57,11 @@ if [[ "$mode" == "default" ]]; then
     while true; do
         body="$(curl -s --max-time "$CURL_MAX_TIME" "$HEALTH_URL" || true)"
         gate_output="$(printf '%s' "$body" | python3 "$SCRIPT_DIR/recon_busy_check.py" || true)"
-        verdict="$(printf '%s\n' "$gate_output" | head -n1)"
+        # Pure-bash first-line extraction (no pipeline): `head -n1` can lose
+        # the SIGPIPE race against a still-writing producer once gate_output
+        # is large (many recon_busy_cycle lines), which under `pipefail` +
+        # `set -e` aborted this script with exit 141 mid-gate (task 3838).
+        verdict="${gate_output%%$'\n'*}"
         elapsed=$((SECONDS - gate_start))
 
         if [[ "$verdict" != "busy" ]]; then

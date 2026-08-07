@@ -69,7 +69,11 @@ _FAKE_CURL_SRC = '''#!/usr/bin/env python3
 
 BEFORE restart -> recon-gate body fetch (`curl -s --max-time N URL`):
   - curl_unreachable True  -> emit nothing, exit 1 (endpoint unreachable)
-  - recon_busy_remaining>0 -> emit a BUSY /health body (decrement)
+  - recon_busy_remaining>0 -> emit a BUSY /health body with
+    `recon_busy_entry_count` in-flight cycles (decrement remaining). Entry 0
+    always has run_id "run-xyz" so existing assertions keep working; a large
+    entry_count drives recon_busy_check.py's output past 64KiB, the pipe
+    buffer size that made `... | head -n1` race against SIGPIPE (task 3838).
   - else                   -> emit an IDLE /health body
 
 AFTER restart  -> post-start health verify (`curl -sf URL`):
@@ -82,12 +86,6 @@ import sys
 
 STATE_PATH = os.environ["FAKE_STATE_PATH"]
 
-BUSY_BODY = (
-    '{"status":"ok","graphiti":true,"mem0":true,"recon_busy":'
-    '[{"project_id":"dark_factory","run_id":"run-xyz",'
-    '"stage":"stage1_memory_consolidation",'
-    '"started_at":"2026-07-18T06:00:00+00:00"}]}'
-)
 IDLE_BODY = '{"status":"ok","graphiti":true,"mem0":true,"recon_busy":[]}'
 
 
@@ -99,6 +97,21 @@ def _load():
 def _save(state):
     with open(STATE_PATH, "w") as f:
         json.dump(state, f)
+
+
+def _busy_body(entry_count):
+    entries = [
+        {
+            "project_id": "dark_factory",
+            "run_id": "run-xyz" if i == 0 else f"run-{i}",
+            "stage": "stage1_memory_consolidation",
+            "started_at": "2026-07-18T06:00:00+00:00",
+        }
+        for i in range(entry_count)
+    ]
+    return json.dumps(
+        {"status": "ok", "graphiti": True, "mem0": True, "recon_busy": entries}
+    )
 
 
 def main(argv):
@@ -114,8 +127,9 @@ def main(argv):
         remaining = state.get("recon_busy_remaining", 0)
         if remaining > 0:
             state["recon_busy_remaining"] = remaining - 1
+            entry_count = state.get("recon_busy_entry_count", 1)
             _save(state)
-            sys.stdout.write(BUSY_BODY)
+            sys.stdout.write(_busy_body(entry_count))
             return 0
         _save(state)
         sys.stdout.write(IDLE_BODY)
@@ -181,6 +195,7 @@ def _write_fakes(
     tmp_path,
     *,
     recon_busy_remaining=0,
+    recon_busy_entry_count=1,
     curl_unreachable=False,
     health_fail_remaining=0,
     journalctl_marker="",
@@ -203,6 +218,7 @@ def _write_fakes(
         "curl_calls": [],
         "journalctl_calls": [],
         "recon_busy_remaining": recon_busy_remaining,
+        "recon_busy_entry_count": recon_busy_entry_count,
         "curl_unreachable": curl_unreachable,
         "health_fail_remaining": health_fail_remaining,
         "journalctl_marker": journalctl_marker,
@@ -220,6 +236,7 @@ def _run_script(
     *args,
     env=None,
     recon_busy_remaining=0,
+    recon_busy_entry_count=1,
     curl_unreachable=False,
     health_fail_remaining=0,
     journalctl_marker="",
@@ -228,6 +245,7 @@ def _run_script(
     bin_dir, state_path = _write_fakes(
         tmp_path,
         recon_busy_remaining=recon_busy_remaining,
+        recon_busy_entry_count=recon_busy_entry_count,
         curl_unreachable=curl_unreachable,
         health_fail_remaining=health_fail_remaining,
         journalctl_marker=journalctl_marker,
@@ -316,6 +334,35 @@ def test_default_proceeds_after_cap(tmp_path):
     )
     state = _state(tmp_path)
     assert ["restart", UNIT] in state["systemctl_calls"], f"state={state!r}"
+
+
+# ---------------------------------------------------------------------------
+# (c2) DEFAULT survives a large multi-line busy verdict without SIGPIPE
+# (regression, task 3838)
+# ---------------------------------------------------------------------------
+
+def test_default_survives_large_busy_output_without_sigpipe(tmp_path):
+    """With the old `verdict="$(printf '%s\\n' "$gate_output" | head -n1)"`
+    pipeline, `head -n1` can close the pipe before `printf` finishes writing
+    a large gate_output, taking SIGPIPE; under `set -euo pipefail` that
+    became exit 141 and aborted the whole script mid-gate, before the
+    restart, with no diagnostic. A single busy poll with 2000
+    `recon_busy_cycle` lines (~260KB, well past the 64KiB pipe buffer) makes
+    the race deterministic instead of load-sensitive. The fix
+    (`verdict="${gate_output%%$'\\n'*}"`) is pure bash and cannot SIGPIPE."""
+    result = _run_script(
+        tmp_path,
+        recon_busy_remaining=1,  # one large-busy poll, then idle
+        recon_busy_entry_count=2000,
+        env={"RECON_GATE_TIMEOUT": "100", "RECON_GATE_POLL_INTERVAL": "0"},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert ["restart", UNIT] in state["systemctl_calls"], f"state={state!r}"
+    assert "recon_busy_cycle" in result.stdout, f"stdout={result.stdout!r}"
+    assert "run_id=run-xyz" in result.stdout, f"stdout={result.stdout!r}"
 
 
 # ---------------------------------------------------------------------------
