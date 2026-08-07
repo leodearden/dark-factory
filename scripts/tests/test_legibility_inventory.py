@@ -77,12 +77,11 @@ REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Corruption scaffolding — a gz payload plus the two damage shapes a
-# fire-and-forget archive writer really produces (a write interrupted by a
-# killed unit, or a file read while it is still being compressed). Kept local
-# to this file rather than hoisted into conftest: scripts/tests/conftest.py is
-# sys.path bootstrap only, and each test module here already carries its own
-# write helpers.
+# Corruption scaffolding — the damage a fire-and-forget archive writer really
+# produces on a plain ``.jsonl`` corpus (a write interrupted by a killed unit,
+# or a flipped stored byte). Kept local to this file rather than hoisted into
+# conftest: scripts/tests/conftest.py is sys.path bootstrap only, and each test
+# module here already carries its own write helpers.
 # ---------------------------------------------------------------------------
 
 _UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
@@ -94,31 +93,15 @@ would yield record 0 and skip record 1) instead of silently passing.
 """
 
 
-def _write_undecodable_gz(path: Path) -> Path:
-    """Write a STRUCTURALLY VALID gz whose payload is not valid UTF-8.
-
-    The FOURTH shape, and the one the three helpers above structurally CANNOT
-    reach: each damages the gzip container, so a probe that decompresses in
-    BINARY mode (``gzip.GzipFile(...).read()``, as ``_write_corrupt_body_gz``
-    does) can see them. This file decompresses perfectly. The failure happens
-    one layer up — when the reader's ``encoding='utf-8'`` text wrapper meets
-    byte 0xFF and raises ``UnicodeDecodeError``, which is a ``ValueError``
-    subclass and therefore escapes an ``except OSError`` degrade path no
-    matter how the gzip shapes are normalized. A single flipped byte in
-    stored archive data produces exactly this.
-    """
-    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
-    return path
-
-
 def _write_undecodable_plain(path: Path) -> Path:
-    """The same bad byte in a PLAIN ``.jsonl`` — no gzip layer involved.
+    """Write a plain ``.jsonl`` whose payload is not valid UTF-8.
 
-    Pins the half of the decode shape that has no gzip analogue at all: both
-    reader branches open under strict ``encoding='utf-8'``, so an
-    uncompressed transcript is equally able to abort a walk. This is why the
-    normalized message says "undecodable transcript bytes" rather than
-    labelling it a gzip-stream failure.
+    The reader opens under strict ``encoding='utf-8'``, so a single flipped
+    stored byte makes byte 0xFF meet the text wrapper and raise
+    ``UnicodeDecodeError`` — a ``ValueError`` subclass, which therefore
+    escapes an ``except OSError`` degrade path unless the reader normalizes
+    it. This is why the normalized message says "undecodable transcript
+    bytes" rather than labelling it a compression failure.
     """
     path.write_bytes(_UNDECODABLE_BODY)
     return path
@@ -492,32 +475,21 @@ class TestPublicIterJsonLines:
 
 
 class TestIterJsonLinesCorruptionShapes:
-    """ALL FOUR corruption shapes must raise ``OSError`` at the FILE level.
+    """The file-level corruption shape must raise ``OSError``.
 
-    ``test_corrupt_gz_raises_oserror`` above covers only bad MAGIC, which
-    happens to be an ``OSError`` already (``gzip.BadGzipFile``). Measured, the
-    other three shapes are not::
+    With the gzip container gone, the container-damage shapes (bad magic,
+    truncated stream, corrupt body) are gone with it, and one shape survives::
 
-        truncated stream  -> EOFError            ("ended before the end-of-stream marker")
-        corrupt body      -> zlib.error          ("Error -3 while decompressing data")
         undecodable byte  -> UnicodeDecodeError  ("codec can't decode byte 0xff")
 
-    None derives from ``OSError``, so all escape every consumer's documented
-    ``except OSError`` degrade path — ``sampling.py``,
+    It does not derive from ``OSError``, so unnormalized it escapes every
+    consumer's documented ``except OSError`` degrade path — ``sampling.py``,
     ``check_transcript_persistence.py``, and the cross-package corpus
-    extractor alike — and abort the whole walk with a traceback. All are
-    exactly what a fire-and-forget archive writer produces on a killed unit or
-    a flipped stored byte, and the archive is live fleet runtime state, so
-    none is a theoretical shape.
+    extractor alike — and aborts the whole walk with a traceback. A flipped
+    stored byte in live fleet runtime state produces exactly it, so it is not
+    a theoretical shape.
 
-    The fourth is worth calling out separately, because a fix aimed at the
-    gzip LAYER misses it: the container decompresses cleanly and the fault is
-    at the strict ``encoding='utf-8'`` text wrapper one level up, so it is
-    reachable on a plain ``.jsonl`` too, and being a ``ValueError`` rather
-    than anything gzip raises it survives an
-    ``except (EOFError, zlib.error)`` widening.
-
-    These tests pin the contract the docstring already advertises: one
+    These tests pin the contract the reader's docstring advertises: one
     documented degrade path covers every way a FILE can be unreadable.
     """
 

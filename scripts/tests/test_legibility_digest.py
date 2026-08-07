@@ -127,12 +127,12 @@ def _write_archived_jsonl(tmp_path, records, name='archived.jsonl'):
 
 # ---------------------------------------------------------------------------
 # Corruption scaffolding for the file-level contract tests below. A near-copy
-# of the pair in test_legibility_inventory.py, deliberately: pytest runs here
+# of the helper in test_legibility_inventory.py, deliberately: pytest runs here
 # under --import-mode=importlib (pyproject.toml), which does not make sibling
 # test modules importable by bare name, and scripts/tests/conftest.py is a
 # sys.path bootstrap with no fixtures. The coupling that matters — that both
 # readers answer the same way — is asserted directly by
-# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_a_truncated_file
+# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_an_undecodable_file
 # rather than implied by a shared helper.
 # ---------------------------------------------------------------------------
 
@@ -141,23 +141,12 @@ _UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xf
 
 
 def _write_undecodable_plain(path):
-    """A structurally VALID gz whose payload is not valid UTF-8.
+    """The one file-level corruption shape a plain ``.jsonl`` archive still has.
 
-    The fourth shape, unreachable by the two helpers above: they damage the
-    gzip container, and the ``_write_corrupt_body_gz`` probe decompresses in
-    BINARY mode, so neither can surface a decode fault. This file
-    decompresses cleanly and fails one layer up, at the reader's
-    ``encoding='utf-8'`` text wrapper, as ``UnicodeDecodeError`` — a
-    ``ValueError``, so it escapes ``except OSError`` however the gzip shapes
-    are handled.
-    """
-    path.write_bytes(_UNDECODABLE_BODY)
-    return path
-
-
-def _write_undecodable_plain(path):
-    """The same bad byte with no gzip layer — the plain branch opens with the
-    same strict encoding, so the shape is reachable on ``.jsonl`` too."""
+    The reader opens under strict ``encoding='utf-8'``, so a single bad byte
+    raises ``UnicodeDecodeError`` — a ``ValueError``, not an ``OSError`` —
+    and would escape every consumer's documented ``except OSError`` degrade
+    path unless the reader normalizes it."""
     path.write_bytes(_UNDECODABLE_BODY)
     return path
 
