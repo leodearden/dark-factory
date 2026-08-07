@@ -243,7 +243,17 @@ persist. The script is dry-run by default (`--apply` required), requires an
 explicit `--task-id`, refuses on a collision rather than clobbering, and runs a
 mandatory read-back proving the `x_` keys landed, the old spellings are gone,
 sibling keys are byte-identical, and `description`/`details` sha256 and `status`
-are unchanged.
+are unchanged. Two guards cover what the read-back structurally cannot, since
+it verifies *intent* (did the rename land) and not *safety* (should it have):
+`--keys` is validated up front and refuses an already-`x_`-prefixed, typed
+`TaskMetadata` or Tier-A blessed key (`--force` overrides), and `--apply`
+writes the full pre-write row — metadata *and* `description`/`details` — to
+`--backup-path` first, refusing to write at all if that snapshot cannot be
+saved. The read-back also discounts the backend's own reserved control keys
+(`append`, `metadata_mode`, stripped from every incoming payload in all modes),
+so migrating a task that carries a leaked control key reports the drop as
+information rather than raising a false corruption alarm after the write has
+already committed.
 
 **This task's stated signal — zero `unknown_key` lines on task 3083 — is
 PARTIALLY MET, and is recorded as such rather than claimed.** Blessing

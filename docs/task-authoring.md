@@ -984,7 +984,12 @@ reserved task. `x_`-prefixed precedents for these same spellings already
 exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
 `x_related_df_tasks` 5), so the target spelling is not in doubt and the
 sweep is a mechanical per-task re-run of
-`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`.
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
+script's "no reader anywhere" grep argument covers only its six built-in
+default keys, so when you re-run it with your own `--keys` it validates
+them first and refuses an already-`x_`-prefixed key, a typed
+`TaskMetadata` field or a Tier-A blessed key — its read-back proves the
+rename *landed*, never that the rename was *safe*.
 
 **The write-path blocker** is why the third row is still open, and it
 bounds both of the others: `update_task` rejects any metadata payload

@@ -1779,7 +1779,7 @@ class TestParseMetadataFailurePolicy:
         Promoted to Tier-A rather than renamed under `x_`, which is the
         non-obvious part. `last_blocked_at` is MACHINE-written by the
         orchestrator on every block (orchestrator/src/orchestrator/workflow.py,
-        _record_block) and READ back by
+        `_mark_blocked`) and READ back by
         orchestrator/src/orchestrator/agents/briefing.py to decide whether a
         briefing is stale — so it is load-bearing, not decorative. A census
         over .taskmaster/tasks/tasks.db counts 78 tasks carrying it (measured

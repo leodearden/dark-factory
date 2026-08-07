@@ -5,9 +5,12 @@ without sys.path pollution — mirrors the pattern in
 test_strip_leaked_control_keys.py, the precedent this migration follows.
 
 This suite covers the script's PURE transform (``plan_x_namespace_migration``),
-its write-payload builder (``build_update_payload``) and its CLI contract.
-No network, no live DB: the live httpx/JSON-RPC plumbing is reused wholesale
-from strip_leaked_control_keys.py and is exercised operationally.
+its write-payload builder (``build_update_payload``), its read-back proof
+(``_verify_read_back``), its ``--keys`` safety guard
+(``validate_migration_keys``), its pre-write snapshot (``write_backup``) and
+its CLI contract. No network, no live DB: the live httpx/JSON-RPC plumbing is
+reused wholesale from strip_leaked_control_keys.py and is exercised
+operationally.
 
 The payload-builder tests are load-bearing safety, not ceremony. Task 3083
 carries a one-of-a-kind ~6 KB hand-curated evidence log in its `description`
@@ -53,9 +56,15 @@ plan_x_namespace_migration = _mod.plan_x_namespace_migration
 build_update_payload = _mod.build_update_payload
 build_parser = _mod.build_parser
 DEFAULT_KEYS = _mod.DEFAULT_KEYS
+BACKEND_STRIPPED_KEYS = _mod.BACKEND_STRIPPED_KEYS
 MigrationCollisionError = _mod.MigrationCollisionError
 assert_write_accepted = _mod.assert_write_accepted
 WriteRejectedError = _mod.WriteRejectedError
+validate_migration_keys = _mod.validate_migration_keys
+UnsafeMigrationKeyError = _mod.UnsafeMigrationKeyError
+write_backup = _mod.write_backup
+default_backup_path = _mod.default_backup_path
+_verify_read_back = _mod._verify_read_back
 
 
 # The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that are
@@ -335,6 +344,228 @@ def test_non_dict_reply_is_not_treated_as_a_rejection():
     rather than being misreported as a rejection."""
     assert_write_accepted('unexpected')
     assert_write_accepted(None)
+
+
+# --- case 9: the READ-BACK PROOF, one case per failure branch ---------------
+#
+# `_verify_read_back` is the script's central safety claim — the CHANGELOG, the
+# module docstring and docs/task-authoring.md §8 all advertise it as the thing
+# that proves the write did exactly what was intended. If one of its checks
+# were wrong (comparing against the wrong snapshot, an unreachable branch), a
+# corrupted or partial write to task 3083's one-of-a-kind evidence blob would
+# print "read-back verified" and this suite would stay green. It is a pure
+# function over plain dicts, so every branch is cheap to pin.
+
+_BEFORE_TASK = {
+    'id': '3083',
+    'status': 'done',
+    'description': 'EVIDENCE LOG — 6269 bytes of hand-curated record',
+    'details': 'THE ~14 KB EVIDENCE LOG — irreplaceable',
+    'metadata': _TASK_3083_SHAPED_METADATA,
+}
+
+
+def _run_verify(mutate=None, extra_before=None, **after_task_overrides):
+    """Drive `_verify_read_back` over a simulated write + read-back.
+
+    `mutate` corrupts the read-back metadata (the write went wrong);
+    `after_task_overrides` corrupts the read-back's other columns.
+    Everything is deep-copied so cases cannot leak into one another.
+    """
+    before_task = json.loads(json.dumps(_BEFORE_TASK))
+    if extra_before:
+        before_task['metadata'].update(extra_before)
+    before_meta = before_task['metadata']
+    migrated, applied = plan_x_namespace_migration(before_meta, DEFAULT_KEYS)
+
+    after_meta = json.loads(json.dumps(migrated))
+    if mutate is not None:
+        mutate(after_meta)
+    after_task = json.loads(json.dumps(before_task))
+    after_task['metadata'] = after_meta
+    after_task.update(after_task_overrides)
+
+    return _verify_read_back(
+        before_meta=before_meta,
+        expected_meta=migrated,
+        applied=applied,
+        before_task=before_task,
+        after_task=after_task,
+    )
+
+
+def test_verify_read_back_passes_on_a_faithful_write():
+    """The clean case: nothing to report. Without this the failure cases below
+    could all be passing for the wrong reason (e.g. a check that always fires)."""
+    problems, notes = _run_verify()
+    assert problems == []
+    assert notes == []
+
+
+@pytest.mark.parametrize(
+    'label, mutate, after_overrides, fragment',
+    [
+        # (a) the rename did not land
+        ('a-missing', lambda m: m.pop('x_origin_escalation'), {},
+         '(a) x_origin_escalation missing'),
+        # (a) it landed but carrying the wrong value — the check must compare
+        # against the PRE-WRITE snapshot, not against itself
+        ('a-value-changed', lambda m: m.__setitem__('x_origin_escalation', 'esc-WRONG'), {},
+         '(a) x_origin_escalation value changed'),
+        # (b) both spellings coexist — precisely the outcome metadata_mode
+        # 'merge' would have produced, and the reason replace-mode is used
+        ('b-old-spelling', lambda m: m.__setitem__('origin_escalation', 'esc-markup-tripwire-3'), {},
+         '(b) old spelling origin_escalation still present'),
+        # (c) an untouched sibling was dropped by the write
+        ('c-missing-sibling', lambda m: m.pop('branch_base_sha'), {},
+         '(c) key-set drift'),
+        # (c) the write invented a key
+        ('c-extra-key', lambda m: m.__setitem__('surprise', 1), {},
+         '(c) key-set drift'),
+        # (c) an untouched sibling's VALUE changed — key sets still match, so
+        # only the per-key value pass can catch this
+        ('c-value-drift', lambda m: m.__setitem__('files', ['SOMETHING ELSE.py']), {},
+         '(c) value drift on files'),
+        # (d) the DO-NOT-LOSE columns
+        ('d-details', None, {'details': 'clobbered'}, '(d) details CHANGED'),
+        ('d-description', None, {'description': 'clobbered'}, '(d) description CHANGED'),
+        # (e) a metadata-only write must never move status
+        ('e-status', None, {'status': 'pending'}, '(e) status changed'),
+    ],
+)
+def test_verify_read_back_catches_each_corruption(label, mutate, after_overrides, fragment):
+    """Every branch fires on its own corruption, with a specific message."""
+    problems, _ = _run_verify(mutate=mutate, **after_overrides)
+    assert any(fragment in p for p in problems), (
+        f'{label}: expected a problem containing {fragment!r}; got {problems}'
+    )
+
+
+def test_verify_read_back_reports_backend_stripped_control_keys_as_info():
+    """A stored blob carrying a leaked `append` must not read as corruption.
+
+    `SqliteTaskBackend.update_task` runs `_strip_reserved_control_keys` over the
+    incoming payload for EVERY mode, replace included — so a target task that
+    already carried a leaked control key (the task-2682/2735 defect class, in
+    this same corpus) comes back one key lighter than what we sent. That is the
+    backend doing the right thing. Reporting it as `(c) key-set drift` would
+    tell the operator the write corrupted the blob, after the write already
+    committed, on an irreplaceable evidence-log task.
+    """
+    problems, notes = _run_verify(
+        extra_before={'append': True},
+        mutate=lambda m: m.pop('append'),  # the backend's strip
+    )
+
+    assert problems == [], problems
+    assert len(notes) == 1
+    assert 'append' in notes[0]
+    assert notes[0].startswith('(i)')
+
+
+def test_backend_stripped_keys_match_the_backend_source_of_truth():
+    """The literal in the script must not drift from the backend's frozenset.
+
+    The script hard-codes the set to keep the heavy backend package off its
+    import path; this is the anti-drift guard that buys that back.
+    """
+    from fused_memory.backends.sqlite_task_backend import (
+        _RESERVED_METADATA_CONTROL_KEYS,
+    )
+    assert BACKEND_STRIPPED_KEYS == _RESERVED_METADATA_CONTROL_KEYS
+
+
+# --- case 10: --keys safety validation --------------------------------------
+#
+# The module docstring's "verified by grep, no reader anywhere" argument covers
+# DEFAULT_KEYS ONLY, but docs/task-authoring.md §8 points the future
+# corpus-wide sweep at a per-task re-run with other --keys. `_verify_read_back`
+# cannot cover this gap: it verifies INTENT (did the rename land), not SAFETY
+# (should it have), so a mangle would be reported as "verified".
+
+def test_default_keys_pass_validation():
+    """The shipped defaults must not trip their own guard."""
+    validate_migration_keys(DEFAULT_KEYS)
+
+
+@pytest.mark.parametrize(
+    'key, why',
+    [
+        # An easy slip when re-running against a partially-migrated task:
+        # plan_x_namespace_migration prefixes unconditionally, so this would
+        # mint x_x_origin_escalation AND drop the correct spelling.
+        ('x_origin_escalation', 'already x_-namespaced'),
+        # Typed TaskMetadata fields: renaming one blinds every live reader.
+        ('files', 'a typed TaskMetadata field'),
+        ('task_kind', 'a typed TaskMetadata field'),
+        # Tier-A blessed — including the one this very task promoted.
+        ('last_blocked_at', 'a Tier-A blessed key'),
+    ],
+)
+def test_unsafe_keys_are_refused_before_any_write(key, why):
+    with pytest.raises(UnsafeMigrationKeyError) as excinfo:
+        validate_migration_keys([key])
+
+    message = str(excinfo.value)
+    assert key in message, f'the refusal must name the offending key: {message}'
+    assert why in message
+
+
+def test_validation_names_every_offender_not_just_the_first():
+    """One run, one full list — so the operator fixes the invocation once."""
+    with pytest.raises(UnsafeMigrationKeyError) as excinfo:
+        validate_migration_keys(['files', 'origin_escalation', 'x_related_reify_tasks'])
+
+    message = str(excinfo.value)
+    assert 'files' in message
+    assert 'x_related_reify_tasks' in message
+    # ...and a legitimate ad-hoc target is NOT flagged.
+    assert "'origin_escalation'" not in message
+
+
+def test_cli_exposes_force_to_override_key_validation():
+    """The escape hatch exists but must be opted into."""
+    assert build_parser().parse_args(['--task-id', '3083']).force is False
+    assert build_parser().parse_args(['--task-id', '3083', '--force']).force is True
+
+
+# --- case 11: the durable pre-write snapshot --------------------------------
+
+def test_write_backup_captures_the_whole_row_including_content_columns():
+    """Metadata alone is not enough to recover from.
+
+    If the write lands and the read-back then reports drift, this file is the
+    only surviving copy of the original row — and what is actually irreplaceable
+    on task 3083 is the evidence log in `description`/`details`, not the
+    metadata blob. Both must be in the artifact.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / 'nested' / 'before.json'
+        returned = write_backup(path, _BEFORE_TASK)
+
+        assert returned == path
+        assert path.exists(), 'the backup must be on disk BEFORE the write is attempted'
+        restored = json.loads(path.read_text())
+        assert restored['description'] == _BEFORE_TASK['description']
+        assert restored['details'] == _BEFORE_TASK['details']
+        assert restored['metadata'] == _BEFORE_TASK['metadata']
+        assert restored['status'] == 'done'
+
+
+def test_default_backup_path_is_task_scoped():
+    """Two tasks must not overwrite each other's only recovery artifact."""
+    assert default_backup_path('3083') != default_backup_path('3141')
+    assert '3083' in str(default_backup_path('3083'))
+
+
+def test_cli_backup_path_defaults_to_none_and_is_overridable():
+    """Resolution to the task-scoped default happens in main_async, so the
+    parser default stays None and an explicit path wins."""
+    assert build_parser().parse_args(['--task-id', '3083']).backup_path is None
+    args = build_parser().parse_args(['--task-id', '3083', '--backup-path', '/tmp/x.json'])
+    assert args.backup_path == '/tmp/x.json'
 
 
 def test_cli_requires_an_explicit_task_id():

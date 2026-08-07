@@ -46,6 +46,20 @@ payload is constructed, and
 column absent by name. The post-write read-back additionally verifies the
 sha256 of both columns is unchanged.
 
+Two further guards, because the grep-verified no-reader argument above covers
+:data:`DEFAULT_KEYS` ONLY and ``docs/task-authoring.md`` §8 points the future
+corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
+
+* :func:`validate_migration_keys` refuses an ``x_``-prefixed, typed or
+  Tier-A-blessed key before any read or write. The read-back cannot catch
+  these — it verifies INTENT (did the rename land), not SAFETY (should it
+  have) — so a ``--keys files`` mangle would otherwise report "verified".
+  ``--force`` overrides.
+* ``--apply`` writes the FULL pre-write task row (metadata *and*
+  description/details) to ``--backup-path`` and refuses to write if it
+  cannot. Without it, a read-back failure leaves the only copy of a
+  one-of-a-kind row in a process that is about to exit.
+
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
 
@@ -83,6 +97,22 @@ DEFAULT_KEYS: tuple[str, ...] = (
     'origin_reify_task',
 )
 
+# `SqliteTaskBackend.update_task` runs `_strip_reserved_control_keys` over the
+# INCOMING metadata payload for EVERY mode, replace included, before the write
+# lands. So a stored blob that already carried a leaked `append` (exactly the
+# task-2682/2735 defect class that `strip_leaked_control_keys.py` exists to
+# repair, and which lives in this same corpus) comes back one key lighter than
+# the blob we sent. That is the backend doing the right thing, NOT a corrupted
+# write, so the read-back must report it as information rather than raising a
+# false corruption alarm after an already-committed write.
+#
+# Source of truth: `_RESERVED_METADATA_CONTROL_KEYS` in
+# fused_memory/backends/sqlite_task_backend.py. Duplicated as a literal here
+# (rather than imported) to keep the heavy backend package off this module's
+# import path — the same reason `_load_sibling_client` is lazy. The test suite
+# imports the backend constant and asserts these two stay in lockstep.
+BACKEND_STRIPPED_KEYS: frozenset[str] = frozenset({'append', 'metadata_mode'})
+
 
 class WriteRejectedError(RuntimeError):
     """The server returned a tool-level rejection inside a success-shaped reply.
@@ -95,6 +125,18 @@ class WriteRejectedError(RuntimeError):
     """
 
 
+class UnsafeMigrationKeyError(ValueError):
+    """A ``--keys`` entry whose ``x_`` rename would do damage.
+
+    The module docstring's safety argument — "verified by grep, the six
+    default targets have no reader anywhere" — covers :data:`DEFAULT_KEYS`
+    ONLY. ``docs/task-authoring.md`` §8 points the future corpus-wide sweep at
+    a per-task re-run of this script, so a non-default ``--keys`` is expected
+    usage, and the read-back cannot catch a bad one: it verifies INTENT (did
+    the rename land) not SAFETY (should it have).
+    """
+
+
 class MigrationCollisionError(RuntimeError):
     """Both ``k`` and ``x_k`` exist with DIFFERENT values.
 
@@ -102,6 +144,55 @@ class MigrationCollisionError(RuntimeError):
     record that never existed, and discarding either side would destroy
     evidence. A human decides.
     """
+
+
+def validate_migration_keys(keys: Sequence[str]) -> None:
+    """Refuse ``--keys`` entries that must never be blindly renamed.
+
+    Raises :class:`UnsafeMigrationKeyError` naming EVERY offending key (not
+    just the first) when a key is:
+
+    * already ``x_``-prefixed — :func:`plan_x_namespace_migration` prefixes
+      unconditionally, so ``--keys x_origin_escalation`` (an easy slip when
+      re-running against a partially-migrated task) would mint
+      ``x_x_origin_escalation`` and drop the correct spelling;
+    * a typed ``TaskMetadata`` field (``files``, ``task_kind``, ...) —
+      renaming one to ``x_files`` blinds every live reader while the read-back
+      cheerfully reports "verified";
+    * a Tier-A blessed key — same blinding risk, and the Tier-C rule applies
+      to ad-hoc keys, which these by definition are not.
+
+    ``--force`` is the deliberate override, for the case where a genuine need
+    turns up. Imported lazily so this module keeps its light import path.
+    """
+    from shared.task_metadata import _BLESSED_METADATA_KEYS, TaskMetadata
+
+    typed_fields = set(TaskMetadata.model_fields)
+    offenders: list[str] = []
+    for key in keys:
+        if key.startswith('x_'):
+            offenders.append(
+                f'{key!r}: already x_-namespaced — migrating it would produce '
+                f'x_{key} and drop the correct spelling'
+            )
+        elif key in typed_fields:
+            offenders.append(
+                f'{key!r}: a typed TaskMetadata field — renaming it to x_{key} '
+                f'would blind every reader of that field'
+            )
+        elif key in _BLESSED_METADATA_KEYS:
+            offenders.append(
+                f'{key!r}: a Tier-A blessed key — the x_ rule is for ad-hoc keys '
+                f'with no reader; a blessed key is neither'
+            )
+
+    if offenders:
+        raise UnsafeMigrationKeyError(
+            'refusing to migrate:\n  - '
+            + '\n  - '.join(offenders)
+            + '\nThe read-back verifies intent, not safety, so it would report '
+              'such a rename as "verified". Pass --force to override.'
+        )
 
 
 def plan_x_namespace_migration(
@@ -196,6 +287,30 @@ def _sha256(text: str | None) -> str:
     return hashlib.sha256((text or '').encode()).hexdigest()
 
 
+def default_backup_path(task_id: str) -> Path:
+    """Where the pre-write snapshot lands when ``--backup-path`` is omitted."""
+    return Path(f'/tmp/task-{task_id}-metadata-before.json')
+
+
+def write_backup(path: Path, before_task: dict) -> Path:
+    """Persist the ENTIRE pre-write task row before any write is attempted.
+
+    Not just the metadata blob: ``description`` and ``details`` hold task
+    3083's one-of-a-kind hand-curated evidence log, so the artifact that would
+    actually be needed for a hand recovery has to include them.
+
+    Why an artifact at all: if the write lands and the read-back then reports
+    drift, the operator's process exits carrying the only copy of the original
+    row in memory. That is the exact failure this script's whole SAFETY section
+    is built around, and it was the one step with no durable output. The caller
+    treats a failure here as fatal and skips the write — no write without a
+    recoverable snapshot.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(before_task, indent=2, sort_keys=True, default=str))
+    return path
+
+
 def _load_sibling_client() -> type:
     """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
 
@@ -248,15 +363,20 @@ def _verify_read_back(
     applied: list[str],
     before_task: dict,
     after_task: dict,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Prove the write did exactly what was intended and nothing else.
 
-    Returns a list of human-readable mismatches — empty means verified.
+    Returns ``(problems, notes)``. ``problems`` is a list of human-readable
+    mismatches — empty means verified. ``notes`` carries expected, benign
+    differences that must NOT read as corruption (see
+    :data:`BACKEND_STRIPPED_KEYS`).
+
     Checks, in order: (a) every ``x_<key>`` present with the pre-write value,
     (b) every old spelling gone, (c) every untouched key byte-identical,
     (d) description/details sha256 unchanged, (e) status unchanged.
     """
     problems: list[str] = []
+    notes: list[str] = []
     after_meta = _coerce_metadata(after_task)
 
     for key in applied:
@@ -270,11 +390,25 @@ def _verify_read_back(
         if key in after_meta:
             problems.append(f'(b) old spelling {key} still present')
 
-    if set(after_meta) != set(expected_meta):
-        missing = sorted(set(expected_meta) - set(after_meta))
-        extra = sorted(set(after_meta) - set(expected_meta))
+    # The backend drops its own call-flag key names from any incoming payload,
+    # so those are expected to be absent from the read-back even though we sent
+    # them. Discount them before the key-set comparison instead of reporting a
+    # write that did the right thing as corruption.
+    stripped = sorted(set(expected_meta) & BACKEND_STRIPPED_KEYS)
+    if stripped:
+        notes.append(
+            f'(i) backend stripped its reserved control key(s) {stripped} from the '
+            f'written blob — expected: update_task removes these from every incoming '
+            f'payload (sqlite_task_backend._RESERVED_METADATA_CONTROL_KEYS). The '
+            f'stored blob was carrying a leaked control key and is now clean.'
+        )
+    expected_keys = set(expected_meta) - BACKEND_STRIPPED_KEYS
+
+    if set(after_meta) != expected_keys:
+        missing = sorted(expected_keys - set(after_meta))
+        extra = sorted(set(after_meta) - expected_keys)
         problems.append(f'(c) key-set drift: missing={missing} unexpected={extra}')
-    for key in sorted(set(after_meta) & set(expected_meta)):
+    for key in sorted(set(after_meta) & expected_keys):
         if after_meta[key] != expected_meta[key]:
             problems.append(f'(c) value drift on {key}')
 
@@ -293,7 +427,7 @@ def _verify_read_back(
             f'(e) status changed: {before_task.get("status")!r} -> {after_task.get("status")!r}'
         )
 
-    return problems
+    return problems, notes
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -307,7 +441,22 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f'Task ID:      {args.task_id}')
     print(f'Keys:         {keys}')
     print(f'Mode:         {"APPLY" if args.apply else "dry-run"}')
+    backup_path = Path(args.backup_path) if args.backup_path else default_backup_path(
+        args.task_id
+    )
+    print(f'Backup:       {backup_path}')
     print()
+
+    # Before ANY read or write: a bad --keys entry is a mangle the read-back
+    # cannot detect, so it has to be refused up front.
+    if not args.force:
+        try:
+            validate_migration_keys(keys)
+        except UnsafeMigrationKeyError as exc:
+            print(f'  [error] {exc}', file=sys.stderr)
+            return 1
+    else:
+        print('  [warn] --force: key-safety validation SKIPPED')
 
     client_cls = _load_sibling_client()
     async with client_cls(args.server_url) as client:
@@ -341,6 +490,19 @@ async def main_async(args: argparse.Namespace) -> int:
             print('  DRY RUN — nothing written. Re-run with --apply to write.')
             return 0
 
+        # No write without a durable snapshot: once update_task lands, this
+        # process's memory is otherwise the only copy of the original row.
+        try:
+            write_backup(backup_path, before_task)
+        except OSError as exc:
+            print(
+                f'  [error] could not write the pre-write backup to {backup_path}: {exc}. '
+                f'Refusing to write without a recoverable snapshot.',
+                file=sys.stderr,
+            )
+            return 1
+        print(f'  pre-write snapshot saved: {backup_path}')
+
         write_result = await client.call_tool(
             'update_task', build_update_payload(args.task_id, project_root, migrated),
         )
@@ -352,17 +514,24 @@ async def main_async(args: argparse.Namespace) -> int:
         print('  write accepted; verifying read-back...')
 
         after_task = await _fetch_task(client, args.task_id, project_root)
-        problems = _verify_read_back(
+        problems, notes = _verify_read_back(
             before_meta=before_meta,
             expected_meta=migrated,
             applied=applied,
             before_task=before_task,
             after_task=after_task,
         )
+        for note in notes:
+            print(f'    {note}')
         if problems:
             print('  [error] READ-BACK VERIFICATION FAILED:', file=sys.stderr)
             for problem in problems:
                 print(f'    - {problem}', file=sys.stderr)
+            print(
+                f'  The pre-write row (metadata AND description/details) is saved at '
+                f'{backup_path} — recover from there, do not re-derive by hand.',
+                file=sys.stderr,
+            )
             return 1
 
         print('  read-back verified: x_ keys present, old spellings gone, '
@@ -390,6 +559,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--server-url', default=DEFAULT_SERVER,
         help=f'Fused-memory MCP server URL (default: {DEFAULT_SERVER})',
+    )
+    parser.add_argument(
+        '--backup-path', dest='backup_path', default=None,
+        help=(
+            'Where to save the FULL pre-write task row before applying '
+            '(default: /tmp/task-<task-id>-metadata-before.json). The write is '
+            'refused if this cannot be written.'
+        ),
+    )
+    parser.add_argument(
+        '--force', action='store_true',
+        help=(
+            'Skip --keys safety validation (x_-prefixed / typed TaskMetadata '
+            'field / Tier-A blessed). Only for a genuine, considered need.'
+        ),
     )
     parser.add_argument(
         '--apply', action='store_true',
