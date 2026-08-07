@@ -550,6 +550,13 @@ async def judge_plan_quality(
     infra cause stays distinguishable from an unparseable answer; the caller
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
+
+    COST ACCOUNTING (eval-revival υ): the returned verdict's ``cost_usd``
+    reports THIS invocation's own USD spend — every path that reached
+    ``invoke_agent`` (success, transport refusal, NaN, parse failure) carries
+    that call's real cost, whatever the verdict turned out to be; only the
+    PRE-invoke unjudgeable-artifact refusal above, which returns before
+    ``invoke_agent`` is ever called, reports ``0.0``.
     """
     # Name WHICH cell to go look at, whichever key the caller populated:
     # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
@@ -593,6 +600,10 @@ async def judge_plan_quality(
                 'plan carries no steps — not a judgeable artifact; scored on '
                 f'the deterministic structural floor ({floor})'
             ),
+            # cost_usd stays the dataclass default (0.0): no invoke_agent call
+            # happened on this path, so recording any spend would fabricate
+            # it — the same anti-fabrication discipline that governs
+            # plan_quality and invocation_error on this exact return.
         )
 
     task_name = task.get('name', task.get('id', 'unknown'))
@@ -666,6 +677,8 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             per_criterion={},
             reasoning=f'plan judge invocation refused: {invocation_error}',
             invocation_error=invocation_error,
+            # A refused invocation still burned tokens — real spend, not $0.
+            cost_usd=result.cost_usd,
         )
 
     # Parse verdict — structured_output first, else json.loads(output); a
@@ -698,6 +711,9 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
                         f'Plan judge answered a non-finite plan_quality '
                         f'(NaN) for {cell}'
                     ),
+                    # The judge DID run and produced an answer (a nonsense
+                    # one) — real spend, not $0.
+                    cost_usd=result.cost_usd,
                 )
             plan_quality = clamp_unit_score(raw_quality)
             # See clamp_unit_score's docstring for why the schema bound alone
@@ -720,6 +736,9 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality=None,
             per_criterion={},
             reasoning='Plan judge output parse failure',
+            # The judge DID run and produced output (just unparseable) —
+            # real spend, not $0.
+            cost_usd=result.cost_usd,
         )
 
     return PlanQualityVerdict(
