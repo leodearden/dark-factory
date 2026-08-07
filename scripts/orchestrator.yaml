@@ -1,33 +1,163 @@
 # Scripts orchestrator configuration
 #
-# Two different trees are in play here, and the distinction is load-bearing:
-# test_command runs the tests/scripts/ suite (see the note below), while
-# lint_command lints this directory, scripts/. Bash scripts
+# TWO NEAR-HOMOGRAPH TREES are in play here, and telling them apart is
+# load-bearing throughout this file: `tests/scripts/` (at the repo root) and
+# `scripts/tests/` (this directory's own suite). test_command runs BOTH — see
+# the closure record below for why neither can be dropped — while lint_command
+# and type_check_command cover this directory, scripts/. Bash scripts
 # (verify-migration.sh, migrate.sh, etc.) are not linted by either — ruff only
 # reads .py.
 #
-# Pin --project shared: tests/scripts/ lives at the repo root and is not itself a
-# workspace member, so a bare `uv run pytest` resolves against the workspace-ROOT
+# Pin --project shared: NEITHER target directory is a workspace member
+# (tests/scripts/ lives at the repo root; scripts/tests/ is under a non-member
+# directory), so a bare `uv run pytest` resolves against the workspace-ROOT
 # project (dark-factory), which declares no deps and no pytest -> verify dies with
 # "Failed to spawn: pytest" on a freshly-synced venv (e.g. a fresh _merge-* verify
 # worktree). shared is a member that declares pytest, and the scripts tests import
-# no first-party package, so its env suffices. No --directory, so cwd stays at the
-# worktree root and the tests/scripts/ path still resolves. Mirrors the other
-# subprojects' --project <member> convention.
-test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+# no first-party package, so its env suffices — pre-1 confirmed the
+# `uv run --project shared` environment does collect and run every module under
+# scripts/tests/. No --directory, so cwd stays at the worktree root and BOTH
+# relative target paths still resolve. Mirrors the other subprojects'
+# --project <member> convention.
+test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"
 
-# COVERAGE GAP in the command above, recorded rather than left invisible
-# (task 3445, follow-up 3460). This command targets tests/scripts/, but this
-# directory has 40 test modules of its own under scripts/tests/, and NO
-# full-suite command anywhere targets them: the repo-root fleet chain also ends
-# in `pytest tests/scripts/`. FILE_SCOPED pytest does narrow correctly when a
-# scripts/tests/ file is touched (verified: it renders `pytest
-# scripts/tests/<file>.py`), so those tests are not wholly ungated — but under
-# FULL_SUITE and merge-role merge_verify_breadth=full, scripts/tests/ never
-# runs. Note this also corrects tests/scripts/orchestrator.yaml's comment,
-# which asserts "scripts/ has no tests of its own". Distinct from the
-# duplicate-run COST that file already records for the byte-identical
-# test_command; fixing 3460 would resolve both.
+# COVERAGE GAP CLOSED (task 3460, opened and recorded by task 3445). Kept as a
+# closure record rather than deleted, because the reason this is a UNION and
+# not a swap is not recoverable from the command alone.
+#
+# WHAT WAS CLOSED. This command used to target only tests/scripts/, while this
+# directory has a whole test suite of its own under scripts/tests/. (Stated
+# without a module COUNT deliberately: the claim is "a whole tree was ungated",
+# true at any size, and every hard-coded count of this directory rots on the
+# next test file added — the "40" this block first shipped with was already
+# stale at HEAD, inherited from task 3445.) All three production paths that
+# reach the FULL_SUITE form ran the wrong tree —
+# measured live through the derive_verify_plan ->
+# verify._executed_module_configs_from_plan bridge before the fix:
+#
+#   * verify_plan._derive_module_runs arm 3, the task-3294 source-only floor,
+#     runs the owning module's test_command VERBATIM for ANY scripts/
+#     production diff. Touching scripts/legibility/census_trigger.py rendered
+#     `pytest tests/scripts/` at scope full_suite, so its own counterpart tests
+#     in scripts/tests/test_census_trigger.py never ran.
+#   * The same function's CONFTEST trigger (arm 1). Touching
+#     scripts/tests/conftest.py — the conftest of the very directory — also
+#     rendered `pytest tests/scripts/`, so the widening bought nothing for the
+#     suite it was widened for.
+#   * verify_plan._derive_full_suite_runs, the merge-role
+#     merge_verify_breadth=full deriver the repo root enables, which never
+#     consults the diff at all.
+#
+# Only the arm-4b FILE_SCOPED path (a touched scripts/tests/test_*.py, which
+# renders `pytest scripts/tests/<file>.py`) narrowed correctly, which is why
+# the gap survived: nothing reported skipped and nothing exited non-zero. The
+# command was present and green; it simply collected the sibling tree. Symbol
+# citations, not file:line, for the reason the LINT block below records.
+#
+# WHY A UNION AND NOT A SWAP to scripts/tests/ alone — which would additionally
+# have resolved the duplicate-run cost, and was rejected for that reason.
+# tests/scripts/ genuinely tests scripts/ PRODUCTION code, not merely config:
+# test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py, plus
+# test_spawn_claude.py, test_check_dashboard_unit_parity.py,
+# test_check_fused_memory_unit_parity.py, test_restart_all_orchestrators.py,
+# test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py
+# and test_dashboard_watchdog.py. Because arm 3 runs this command verbatim for
+# every scripts/ production diff, a swap would STOP running those tests for
+# exactly the diffs they cover — trading one coverage gap for another. Coverage
+# must be MONOTONE in the diff, the same principle task 3294 encoded when it
+# moved the floor above the collectable-test branch. The target ORDER and
+# spelling copy the repo-root fleet chain's trailing segment
+# (`pytest tests/scripts/ scripts/tests/`, task 3384 / commit 1eaaf26ab9)
+# verbatim, so the fallback path and this module config cannot drift into two
+# different notions of "the scripts suites".
+#
+# BOTH of those claims are GATED, not merely asserted here — a
+# documented-but-ungated invariant is the same defect class this task closed.
+# In tests/scripts/test_scripts_module_config.py:
+#   * test_scripts_full_suite_pytest_covers_scripts_tests — assertion (5) is
+#     what rejects a future narrowing back to one directory.
+#   * test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites —
+#     the anti-drift half, added by this task's amendment pass: the fleet
+#     chain's scripts-suites pytest segment and this command must name the
+#     SAME set of directories, so widening either one alone fails. Order is
+#     deliberately NOT pinned there (pytest collects directories
+#     order-insensitively); "same order" above is a readability convention for
+#     the reader diffing the two files, not a correctness property.
+#
+# MEASURED GREEN BEFORE SWITCHING, on this exact string, two runs at base main
+# b3155c13c7 — non-optional, because verify.run_full_verification
+# asyncio-gathers over ALL module_configs.values() and the repo root sets
+# merge_verify_breadth: "full", so a red command here blocks every merge, review
+# checkpoint and main-tip sweep repo-wide on branches with no defect:
+#
+#   run 1   exit 0   1926 passed, 1 skipped   430.96s pytest / 444.17s wall
+#   run 2   exit 0   1926 passed, 1 skipped   518.61s pytest / 565.37s wall
+#
+# Both figures are recorded rather than only the convenient one: the ~20%
+# run-to-run spread is this oversubscribed host, the same effect
+# tests/scripts/orchestrator.yaml's budget block sizes against.
+#
+# THE COST DELTA, measured against the command this REPLACES rather than only
+# in absolutes, so follow-up 3458 sizes verify_command_timeout_secs from a
+# baseline instead of re-deriving one. The old `pytest tests/scripts/` form,
+# same flags, two runs on this same host:
+#
+#   run 1   exit 0    677 passed, 1 skipped   331.56s pytest / 339.09s wall
+#   run 2   exit 0    677 passed, 1 skipped   428.18s pytest / 436.92s wall
+#
+# So the union buys +1249 collected tests for roughly +100s of wall-clock
+# (~+25%) — scripts/tests/ is the larger tree by module count but far cheaper
+# per test. Read that delta with its error bars: ~25% is the SAME ORDER as the
+# ~29% / ~20% spread WITHIN each pair on this host, and the two pairs were
+# taken at different times under different load, so the honest claim is
+# "roughly +1.5 to +2 minutes", not a multiple, and not a figure to plan a
+# tight timeout around. Two further runs of the union make that error bar
+# concrete rather than rhetorical — both exit 0, 1931 passed, 1 skipped:
+#
+#   run 3   310.33s pytest   (amendment-pass tip)
+#   run 4   914.61s pytest / 930.59s wall   (amendment-pass verification)
+#
+# Run 3 came in FASTER than the slower run of the command the union REPLACED;
+# run 4 is ~2.9x run 3 for a byte-identical command on a byte-identical tree.
+# Neither revises the delta — on this host the LOAD at measurement time moves
+# the number far more than the extra directory does, which is the whole reason
+# both are recorded instead of only the convenient one. For follow-up 3458 the
+# operative figure is run 4, not the mean: a budget sized off the 310-519s
+# range these comments recorded before it would have red-walled this very
+# verification pass. WHO PAYS IT is the sharper half: this is not a
+# merge-only cost, because verify_plan._derive_module_runs arm 3 runs this
+# command VERBATIM for any scripts/ production diff — so a one-line edit to an
+# operator script under scripts/ now pays the union where it used to pay
+# tests/scripts/ alone. That is the trade this task deliberately makes: before
+# it, that same one-line edit ran NONE of the touched module's own tests.
+#
+# CLOSURE RECORD (task 3458). verify_command_timeout_secs no longer stays
+# UNSET here — see the PER-MODULE VERIFY BUDGET block at the bottom of this
+# file, which sizes it at 2400s from exactly the six measured runs above
+# (four of the union, two of the command it replaced), using the SLOWEST
+# (930.59s wall, run 4) rather than the mean. The margin this paragraph used
+# to worry about — "only ~3.9x under that ceiling, not the ~6.4x the first
+# three runs implied" — is why 2400s (~2.6x the worst run) is the tightest
+# honestly declarable value: anything tighter risks red-walling this very
+# verification pass under load.
+#
+# THE DUPLICATE-RUN COST IS NOT RESOLVED BY THIS CHANGE. tests/scripts/ still
+# executes twice per full verify — once from this config and once from the
+# tests/scripts config — for the two structural reasons recorded in
+# tests/scripts/orchestrator.yaml's KNOWN COST block: run_full_verification
+# does not dedupe by command, and workflow._resolve_module_configs dedupes by
+# mc.prefix. That remains task 3383's, whose real fix is a dedupe-by-command
+# guard in run_full_verification — production code of a different class from a
+# yaml command edit. Note 3383's own "BYTE-IDENTICAL test_commands" framing is
+# now stale (these two commands differ); its substance survives unchanged.
+#
+# "Not resolved" UNDERSTATES it if read alone, so read it with the COST DELTA
+# block above: a full verify now collects tests/scripts/ twice AND
+# scripts/tests/ once, so this change did not merely leave the duplication in
+# place — it raised the absolute per-verify wall-clock (~+25%, measured) on top
+# of it. The duplicated leg is the smaller of the two trees by test count, but
+# it is duplicated on every review checkpoint, main-tip sweep and merge
+# full-verify, which is what makes 3383 worth doing rather than merely tidy.
 
 # LINT IS DECLARED DELIBERATELY (task 3445).
 #
@@ -84,40 +214,148 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # copy is guarded.
 lint_command: "uv run --project shared ruff check scripts/"
 
-# TYPE IS DELIBERATELY NOT DECLARED YET — the gap is measured, not overlooked
-# (task 3445; follow-up 3456 carries the burn-down).
+# TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #
-# The same vacuous-pass mechanism described above applies to
-# type_check_command — verify_plan._derive_module_runs emits the identical
-# reasoned SKIPPED for a falsy type_check_command a few lines below the lint
-# one — so TYPE currently passes at rc=0 for every scripts/-confined diff
-# without pyright running. That is a real, open gap. It is stated here rather
-# than left as a silent absence.
+# The same vacuous-pass mechanism the LINT block above describes applies
+# verbatim to type_check_command: verify_plan._derive_module_runs emits the
+# identical reasoned SKIPPED for a falsy type_check_command a few lines below
+# the lint one. Until this line existed, TYPE passed at rc=0 for every
+# scripts/-confined diff without pyright running. Symbol citations, not
+# file:line, for the reason the LINT block gives.
 #
-# It was not closed in the same task because the debt is roughly 50x task
-# 3350's 4-fix precedent: `npx pyright scripts/` returns 206 errors across 14
-# files (162 in scripts/tests/test_legibility_census.py alone; 20 in non-test
-# production scripts, genuine str|None / Optional-narrowing defects).
+# THE 206 -> 395 RISE THIS TASK CAUSED IS EXPECTED, NOT A REGRESSION, and the
+# previous version of this block read as a warning against it — so it is
+# corrected rather than deleted. 3445 measured `npx pyright scripts/` at 206
+# errors / 14 files, then measured 395 after adding "scripts" +
+# "scripts/legibility" to the root pyproject.toml [tool.pyright] extraPaths,
+# and reverted. 3456 added those two entries BACK and kept them: 9 of the
+# original 206 were reportMissingImports for the flat modules
+# census/codebook/coder/digest/inventory, and resolving them is what lets
+# pyright check against real signatures instead of Unknown. The extra 189 were
+# always latent; they were merely invisible. Two of the 206 were the reverse
+# symptom — `import config` in scripts/legibility/census.py resolving to the
+# WRONG module — and the extraPaths entries fixed those for free.
 #
-# The obvious "it is only unresolved imports" hypothesis was TESTED AND
-# DISPROVED — do not repeat the experiment blind. 9 of the errors are
-# reportMissingImports for census/codebook/coder/digest/inventory, flat
-# modules that scripts/tests/conftest.py puts on sys.path at runtime and
-# pyright cannot see. Adding "scripts" + "scripts/legibility" to the root
-# pyproject.toml [tool.pyright] extraPaths made it WORSE, not better:
-# 206 -> 395 errors (test_legibility_census.py alone 162 -> 350), because
-# resolving the imports lets pyright check against the real signatures and
-# surfaces a much larger latent mismatch surface. The experiment was reverted.
-# Plan against 395, not 206.
+# WHY `npx pyright scripts/` AND NOT A NARROWER FORM. It matches the sibling
+# tests/scripts/ invocation style exactly, and it runs FROM THE REPO ROOT, so
+# it resolves against the ROOT [tool.pyright] table — which is why those two
+# extraPaths entries are load-bearing for this command rather than a general
+# config preference, and why they are pinned by
+# tests/scripts/test_scripts_module_config.py::
+# test_root_pyright_extrapaths_resolves_scripts_imports. Remove either entry
+# and this gate goes red for reasons unrelated to any diff, which is how a
+# gate gets suppressed and dies. This command is guarded by
+# test_scripts_diff_is_type_gated in that same file.
 #
-# Declaring `type_check_command: "npx pyright scripts/"` before that tree is
-# clean is not a transiently-red gate, it is a fleet-wide outage — see the
-# run_full_verification / merge_verify_breadth reasoning above. The burn-down
-# and the declaration must land in one atomic commit.
+# THE BURN-DOWN, measured. 395 errors was 98 distinct (file, line) sites, not
+# 395 edit sites — pyright re-reports a union-typed expression once per union
+# member per use, so the raw count over-reports the edit surface by 4-5x. 350
+# of the 395 sat on 63 lines of scripts/tests/test_legibility_census.py, and a
+# single missing return annotation on its _run_census_kwargs helper generated
+# most of them. Cleared with 121 inserted / 23 deleted lines across 12 files,
+# ZERO `# type: ignore`, ZERO `# pyright: ignore` and ZERO --exclude flags —
+# the same fix-don't-exclude precedent tasks 3350 and 3445 set for lint, and
+# a property test_scripts_diff_is_type_gated asserts on the command directly.
+# The production-module fixes were annotation and narrowing ONLY (bind a
+# comprehension guard's value to a local, narrow a field, narrow a signature);
+# no runtime assert or raise-on-None was added, because every one of those
+# sites was a pyright narrowing limitation rather than a reachable None-path,
+# and a runtime guard would have changed behaviour on an unreachable path.
+#
+# NEW SIDE EFFECT, recorded so it is not rediscovered as a surprise: this
+# declaration is what makes scripts/ diffs read file CONTENT at all.
+# verify_plan._derive_module_runs computes need_structural from
+# bool(mc.type_check_command), so a diff touching a module that defines a
+# TypedDict or Protocol — scripts/repair_wiped_metadata_files.py is the one
+# such module here — widens pyright from FILE_SCOPED to the unscoped
+# FULL_SUITE form. MEASURED at declaration time on this host, two runs of the
+# unscoped `npx pyright scripts/`: 46.3s and 42.1s, both at 0 errors / 0
+# warnings / 0 informations (3445 measured 57s on the same command against the
+# pre-burn-down tree).
+type_check_command: "npx pyright scripts/"
 
-# verify_command_timeout_secs is deliberately left UNSET here, which means this
-# module inherits the repo-root whole-fleet ceiling (3600s) for each of its
-# checks — the same class of gap tests/scripts/ closed with its measured 600s
-# budget. Sizing it honestly needs multi-run measurement of the verbatim
-# FULL_SUITE command forms on this oversubscribed host, which task 3445 did not
-# perform; recorded here rather than guessed. Follow-up 3458.
+# PER-MODULE VERIFY BUDGET (task 3458, closing the gap this file recorded as
+# knowingly-open above — see the CLOSURE RECORD in the COST DELTA block).
+#
+# (1) MEASUREMENT PROVENANCE — every run this budget is sized against, so a
+# later reader sees the whole measured set, not the convenient half. Two
+# fresh, independent, sequential runs of the verbatim command above, at this
+# branch's base commit 37f761f5a4:
+#
+#   run 5   exit 0   2099 passed, 1 skipped   355.79s pytest / 360.47s wall
+#   run 6   exit 0   2099 passed, 1 skipped   275.44s pytest / 293.32s wall
+#
+# PLUS the four runs of this same union command already recorded above in the
+# MEASURED GREEN / COST DELTA blocks (task 3460):
+#
+#   run 1   exit 0   1926 passed, 1 skipped   430.96s pytest / 444.17s wall
+#   run 2   exit 0   1926 passed, 1 skipped   518.61s pytest / 565.37s wall
+#   run 3   exit 0   1931 passed, 1 skipped   310.33s pytest
+#   run 4   exit 0   1931 passed, 1 skipped   914.61s pytest / 930.59s wall
+#
+# The passed-count rose 1926/1931 -> 2099 between task 3460 and runs 5-6 from
+# unrelated commits landing on main in the interim, not from any change to
+# this command; runs 5-6 are otherwise the same command against the same two
+# target trees as runs 3-4.
+#
+# (2) THE SIZING ARITHMETIC. W = 930.59s (run 4), the largest wall-clock of
+# the five runs that recorded one; run 3 recorded only a pytest-internal
+# duration (310.33s pytest, no wall-clock captured), well under W either way,
+# so it cannot change which run is worst — never the mean. A mean would land
+# near 530s, which run 4 alone disproves: it is a recorded HONEST GREEN run
+# of this exact command on a byte-identical tree, so a budget under it would
+# manufacture infra_timeout on the green path — the exact defect this task
+# exists to prevent. The recorded wall-clocks span ~293s to ~931s for the
+# same command on this oversubscribed host; that spread is LOAD at
+# measurement time, not suite variance, which is exactly why the max and not
+# the mean is the sizing input (the same reasoning
+# tests/scripts/orchestrator.yaml applies to its own budget).
+# verify_command_timeout_secs: 2400 is ~2.6x W — the same multiple
+# tests/scripts/orchestrator.yaml uses for its own 600s budget (~2.6x its
+# 233.50s worst of two runs) — kept identical across the two sibling configs
+# deliberately, not coincidentally.
+#
+# (3) SCOPE: this is a PER-COMMAND budget. It bounds the TEST leg on its own,
+# not test+lint+type summed — each leg is timed independently by
+# verify._resolve_verify_timeout / run_verification. The type leg is
+# separately measured above at 46.3s / 42.1s (TYPE block); lint was not
+# separately timed but is orders of magnitude cheaper than either.
+#
+# (4) HOW MUCH THIS ACTUALLY BUYS, stated plainly rather than oversold: a
+# narrowing from the repo-root 3600s ceiling to 2400s — a hang surfaces in
+# ~40 minutes instead of ~60. That is modest, and deliberately NOT the
+# tests/scripts sibling's "surfaces a hang in minutes" framing: that suite
+# measures ~105-233s, so its 600s budget buys a far sharper narrowing than
+# this one can. Nothing tighter is honestly declarable here without risking
+# the green path itself, because an observed HONEST GREEN run has measured
+# 930.59s. THE DUPLICATE-RUN COST IS STILL NOT RESOLVED BY THIS CHANGE —
+# tests/scripts/ still executes twice per full verify (see "THE DUPLICATE-RUN
+# COST IS NOT RESOLVED BY THIS CHANGE" above); that remains task 3383's
+# dedupe-by-command guard in verify.run_full_verification, a fix of a
+# different class from a yaml budget.
+#
+# (5) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET — no build
+# step on this module to budget for. Per verify._resolve_verify_timeout's
+# cascade, an unset module cold knob does NOT inherit this warm value: a cold
+# verify falls through to the repo-root verify_cold_command_timeout_secs
+# (5400s), and a merge-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200s, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml, not overridden
+# by the root yaml). This asymmetry is deliberate, not an oversight, and is
+# GATED — not merely asserted here — by
+# tests/scripts/test_scripts_module_config.py::
+# test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling.
+#
+# (6) RAISE-TOGETHER RULE. If this suite's measured cost grows toward 2400s,
+# re-measure and raise BOTH this value and MIN_MODULE_BUDGET_SECS in
+# tests/scripts/test_scripts_module_config.py — never quietly widen one
+# without the other; that guard exists specifically to make a silent widening
+# impossible.
+#
+# GATED by tests/scripts/test_scripts_module_config.py::
+# test_scripts_module_carries_its_own_measured_verify_budget (this value:
+# declared / measurement-derived floor / strictly below the root ceiling /
+# honoured by the real verify._resolve_verify_timeout resolver) and by
+# test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling
+# (point (5) above).
+verify_command_timeout_secs: 2400

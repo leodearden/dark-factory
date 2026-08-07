@@ -63,21 +63,38 @@ def _materialize(worktree: Path, *relpaths: str) -> None:
         p.write_text('def test_x():\n    pass\n')
 
 
-# A merge-role subproject whose pytest command mirrors dark_factory's real
-# per-subproject test_command shape (uv run --project X --directory X pytest ...).
-_ORCH_TEST_CMD = (
-    'uv run --project orchestrator --directory orchestrator '
-    'pytest tests/ --tb=short -q'
-)
+def _module_config(prefix: str) -> ModuleConfig:
+    """A merge-role subproject whose commands mirror dark_factory's real
+    per-subproject shape (``uv run --project X --directory X pytest ...``).
+
+    THE single definition of the fixture's command shape — `_orch_module_config`
+    is just this at ``prefix='orchestrator'``, so a change to the shape lands in
+    exactly one place and the single- and multi-subproject fixtures cannot
+    silently diverge.
+    """
+    return ModuleConfig(
+        prefix=prefix,
+        test_command=(
+            f'uv run --project {prefix} --directory {prefix} '
+            'pytest tests/ --tb=short -q'
+        ),
+        lint_command=f'uv run --project {prefix} ruff check src/',
+        type_check_command=f'uv run --project {prefix} pyright src/',
+    )
 
 
 def _orch_module_config() -> ModuleConfig:
-    return ModuleConfig(
-        prefix='orchestrator',
-        test_command=_ORCH_TEST_CMD,
-        lint_command='uv run --project orchestrator ruff check src/',
-        type_check_command='uv run --project orchestrator pyright src/',
-    )
+    """The default single-subproject fixture used by most cases here."""
+    return _module_config('orchestrator')
+
+
+def _fmt_log(call) -> str:
+    """Render a mocked ``logger.<level>(fmt, *args)`` call to its final text,
+    so a substring assertion sees what an operator would actually read."""
+    args = call.args
+    if not args:
+        return ''
+    return (args[0] % args[1:]) if len(args) > 1 else str(args[0])
 
 
 def _result(passed: bool, *, category: str = '') -> VerifyResult:
@@ -431,6 +448,225 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
         assert result is None
+
+    # -- task-3290: node-id -> subproject mapping DELEGATES to the shared
+    # -- helper (_group_node_ids_by_subproject), plus the characterization
+    # -- guards the unification must not lose.
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _b1_failing() -> VerifyResult:
+        return VerifyResult(
+            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
+            type_output='', summary='fail', category='test_failure',
+        )
+
+    def test_delegates_node_id_mapping_to_shared_helper(self, tmp_path: Path) -> None:
+        """The gate maps node-ids via the SHARED
+        `_group_node_ids_by_subproject` helper — not a private inline copy.
+
+        The helper takes DICT-shaped module_configs, so the gate must hand it
+        the `{mc.prefix: mc}` dict it already builds (dict construction from a
+        prefix-deduped list preserves order, keeping candidate iteration — and
+        therefore first-wins ambiguity resolution — byte-identical). The
+        `log_label` must name THIS call site so an operator can attribute the
+        helper's log lines to the merge gate rather than the sweep.
+
+        RED today: the inline copy never calls the helper, so the spy records
+        zero calls. The file IS materialized so the inline path would
+        otherwise succeed — the failure is the missing delegation, not a
+        mapping miss.
+
+        SCOPE: this is a deliberately STRUCTURAL pin — it asserts on a private
+        helper's call signature, so a rename/re-ordering of
+        `_group_node_ids_by_subproject`'s parameters breaks it by design. It
+        exists to keep the third inline copy from creeping back (task 3290 is
+        the de-duplication); the *behavioral* contract lives in the end-to-end
+        cases below (ambiguity first-wins, unmapped -> not suppressing) and in
+        the B1/B2/B3 suppress/still-fails cases above.
+        """
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        mc = _orch_module_config()
+
+        spy = MagicMock(return_value={'orchestrator': [_B1_FAILED_ID, _B1_CRASH_ID]})
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, '_group_node_ids_by_subproject', spy),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = self._run(config, self._b1_failing(), tmp_path, [mc])
+
+        assert spy.call_count == 1, (
+            f'Expected exactly one delegation to _group_node_ids_by_subproject, '
+            f'got {spy.call_count} (call_args_list={spy.call_args_list!r})'
+        )
+        call = spy.call_args
+        assert call.args[0] == tmp_path, call.args[0]
+        assert call.args[1] == {'orchestrator': mc}, call.args[1]
+        assert call.args[2] == [_B1_FAILED_ID, _B1_CRASH_ID], call.args[2]
+        assert call.kwargs['log_label'] == 'confirm_merge_verify_flake_suppressible', (
+            call.kwargs
+        )
+        # The helper's groups drive the re-run, which confirms green -> suppress.
+        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+
+    def test_helper_returning_none_fails_closed_without_rerunning(
+        self, tmp_path: Path
+    ) -> None:
+        """`None` from the helper (an unmappable node-id) fails CLOSED to red
+        end-to-end THROUGH the delegation boundary: no isolated re-run is
+        attempted and the gate returns None.
+
+        RED today: the inline copy ignores the spy and maps the materialized
+        file successfully, so the gate re-runs and suppresses.
+        """
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        spy = MagicMock(return_value=None)
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, '_group_node_ids_by_subproject', spy),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
+
+        assert result is None, f'Expected None (fail-closed to red), got {result!r}'
+        rv.assert_not_awaited()
+
+    def test_helper_returning_empty_dict_fails_closed(self, tmp_path: Path) -> None:
+        """`{}` from the helper ALSO fails closed — the `not groups` (not
+        `is None`) guard.
+
+        An empty dict must never fall through the `for prefix, group_node_ids
+        in groups.items()` loop: that would exit having run ZERO isolated
+        re-runs and then `return node_ids` — a full suppression verdict on
+        zero evidence, letting a genuinely red merge land. That is precisely
+        the merge-masks-a-real-red failure this gate exists to prevent, so the
+        guard is pinned rather than left to a future simplification.
+
+        DEFENSIVE-ONLY — do NOT read this as reachable behavior. In production
+        the gate returns early on empty *node_ids*, and the helper documents
+        `{}` as its empty-input-only return, so `{}` cannot arrive here today;
+        the case is only reachable by patching the helper out, exactly as done
+        below. It pins the guard's PRESENCE so a future "simplify to `is None`"
+        edit — or a helper change that starts returning `{}` for a
+        non-empty input — cannot quietly turn zero evidence into a suppression.
+
+        RED today: no such guard exists (the inline loop cannot produce {}).
+        """
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        spy = MagicMock(return_value={})
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, '_group_node_ids_by_subproject', spy),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
+
+        assert result is None, (
+            f'Expected None: an empty group dict is zero evidence, not '
+            f'"all groups clean" — got {result!r}'
+        )
+        rv.assert_not_awaited()
+
+    def test_ambiguous_node_id_uses_first_by_list_order_and_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """CHARACTERIZATION (green before AND after the unification).
+
+        A bare subproject-relative node-id present under TWO given
+        subprojects resolves deterministically to the FIRST by
+        *module_configs* list order, and logs a WARNING naming the
+        ambiguity. This is the sole guard on the list->dict conversion's
+        order-preservation claim: `{mc.prefix: mc for mc in module_configs}`
+        preserves insertion order, so first-wins must stay byte-identical
+        after the gate starts iterating the dict inside the shared helper.
+        """
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'alpha/tests/test_dup.py', 'beta/tests/test_dup.py')
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output='FAILED tests/test_dup.py::test_dup\n',
+            lint_output='', type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = self._run(
+                config, failing, tmp_path, [_module_config('alpha'), _module_config('beta')],
+            )
+
+        assert result == ['tests/test_dup.py::test_dup'], result
+        rv.assert_awaited()
+        cmd = rv.call_args.args[2].test_command
+        assert 'alpha/tests/test_dup.py::test_dup' in cmd, (
+            f'Expected FIRST-by-list-order (alpha) attribution, got {cmd!r}'
+        )
+        assert 'beta/tests/test_dup.py::test_dup' not in cmd, cmd
+
+        warned = any(
+            'tests/test_dup.py::test_dup' in _fmt_log(call)
+            for call in mock_logger.warning.call_args_list
+        )
+        assert warned, (
+            f'Expected a WARNING naming the ambiguous node-id; got '
+            f'calls={mock_logger.warning.call_args_list!r}'
+        )
+
+    def test_unmapped_node_id_logs_not_suppressing(self, tmp_path: Path) -> None:
+        """CHARACTERIZATION (green before AND after the unification).
+
+        The unmapped path emits an INFO carrying the operator-facing verdict
+        vocabulary "not suppressing". The SHARED helper only knows the neutral
+        "unconfirmable" — only the CALLER knows whether that means "file an
+        alarm" (the sweep) or "stay red" (this gate) — so the unification must
+        add a caller-side INFO rather than silently changing what an operator
+        greps merge-lane logs for.
+
+        That ONE line must also name the offending node-id: after the
+        unification the helper names the node-id on a line of its own, so a
+        caller line carrying only the verdict would force an operator to
+        correlate two lines to answer "which test failed to map?".
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output='FAILED some/other/tests/test_q.py::test_z\n',
+            lint_output='', type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
+        rendered = [_fmt_log(call) for call in mock_logger.info.call_args_list]
+        logged = any(
+            'not suppressing' in msg and 'some/other/tests/test_q.py::test_z' in msg
+            for msg in rendered
+        )
+        assert logged, (
+            f'Expected ONE self-contained INFO log naming both the unmapped '
+            f'node-id and the "not suppressing" verdict; got {rendered!r}'
+        )
 
 
 class TestApplyMergeFlakeSuppression:

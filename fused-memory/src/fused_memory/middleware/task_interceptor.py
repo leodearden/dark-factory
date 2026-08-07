@@ -112,6 +112,15 @@ logger = logging.getLogger(__name__)
 # for zero lines against schema-clean metadata.
 _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
+# The escalation-gate stamp, named once so the readers and the writers stay
+# greppably coupled. WRITERS:
+# ``operational_routing_guard.inject_operational_routing`` (the declared
+# execution_class='operational'|'decision' boundary coercion) and
+# ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
+# route_deterministic fallback), which between them set every key below.
+# READER: ``TaskInterceptor._is_gate_metadata`` — see task 3446.
+_GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
+
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
     """Best-effort parse of *metadata* into a raw dict.
@@ -2025,19 +2034,37 @@ class TaskInterceptor:
         self,
         project_root: str,
         decision: CuratorDecision,
+        *,
+        candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
 
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
-        ``update_task`` with a ``prompt`` that instructs a verbatim replacement
-        plus metadata carrying the combine marker.
+        ``update_task``, writing the curator's rewrite as structured fields
+        and MERGING a three-key combine marker into the target's existing
+        metadata blob (``metadata_mode='merge'``) — it does not replace that
+        blob. See the comment at the write for why (task 3446).
 
         Before writing, verifies the target's fingerprint and status. A
         mismatched fingerprint (curator targeted the wrong task) or terminal
         status (done/cancelled) aborts the write and returns None so the
         caller degrades to ``create`` instead of silently clobbering an
         unrelated task.
+
+        A third abort condition joins those two: *candidate_metadata*
+        declaring an escalation gate while the live target does not. The
+        candidate's own metadata is never written anywhere by this path, so
+        such a combine would silently strip a human decision gate — the
+        target-side ``'merge'`` above cannot help. Refusing degrades to
+        ``create``, which files the gate as its own task (task 3446).
+
+        A corrupt *existing* metadata blob on the target now also aborts the
+        combine: ``_merge_metadata`` refuses to merge into unparseable bytes
+        and raises, which the ``except`` below turns into a WARNING plus
+        ``None``. Under the old ``'replace'`` that same row was silently
+        overwritten — combine is not a corrupt-row repair, so refusing is the
+        wanted behaviour (loud over silent).
         """
         if decision.rewritten_task is None or decision.target_id is None:
             return None
@@ -2087,6 +2114,37 @@ class TaskInterceptor:
             )
             return None
 
+        # ── Guard: never absorb a gated CANDIDATE into an ungated target ──
+        # metadata_mode='merge' fixes the target-side loss only; the
+        # candidate's metadata is never written anywhere by this path, so a
+        # human decision gate folded into ordinary agent work would still
+        # lose its gate status and be dispatched to an architect.
+        #
+        # Refuse rather than propagate the candidate's markers onto the
+        # target: the pure-gate stamp is task_kind='deterministic' +
+        # always_escalates=True with before_done DELETED, but under shallow
+        # merge a before_done already on the target SURVIVES (the incoming
+        # blob carries no such key), so propagation could construct exactly
+        # the combination deterministic_task_guard invariant 6 rejects.
+        # Degrading to create files the gate as its own task, which is the
+        # right conservative outcome for a duplicate human gate.
+        #
+        # Placed before _append_combine_audit so a refusal writes no audit
+        # record, matching the fingerprint and terminal-status guards above.
+        if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
+            target.get('metadata')
+        ):
+            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+            declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
+            logger.warning(
+                'combine-guard: candidate declares an escalation gate (%s) but target '
+                '%s does not — aborting combine; a human decision gate must not be '
+                'absorbed into an ungated task. Degrading to create.',
+                declared,
+                decision.target_id,
+            )
+            return None
+
         # The curator already produced the coherent rewrite — push it to the
         # backend as structured fields. No prompt, no LLM rewrite at the
         # write boundary; sqlite writes the columns directly. The
@@ -2122,12 +2180,32 @@ class TaskInterceptor:
                     task_id=decision.target_id,
                     project_root=project_root,
                     metadata=combine_metadata,
-                    # Whole-blob overwrite via the explicit replace co-signal —
-                    # NOT a bare append=False (rejected by the task-2180
-                    # metadata-wipe guard in _resolve_metadata_mode). Behaviour-
-                    # preserving: metadata still resolves to 'replace', and the
-                    # details path stays replace since append is now None (falsy).
-                    metadata_mode='replace',
+                    # Combine MERGES its marker keys into the target's blob; it
+                    # does NOT overwrite the blob. Shallow last-write-wins
+                    # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
+                    # the three keys above authoritative while everything else
+                    # already on the target survives: the escalation-gate stamp
+                    # (execution_class / operational_mode / task_kind /
+                    # always_escalates / gate_escalated_at) plus source,
+                    # spawned_from, candidate_key, milestone, model_overrides, …
+                    #
+                    # Task 3446: under the previous 'replace' this write deleted
+                    # every pre-existing key. Task 3426 ("Human gate: …") was
+                    # combined into, silently lost always_escalates=True, and was
+                    # then dispatched to an architect — a human decision gate
+                    # handed to an agent.
+                    #
+                    # Do NOT "restore" 'replace'. It was never a design choice:
+                    # bc4344db10 (task 2751 step-6) mechanically migrated a legacy
+                    # bare append=False onto the explicit co-signal the task-2180
+                    # metadata-wipe guard demands, annotated "Behaviour-
+                    # preserving" — i.e. it inherited the pre-2180 destructive
+                    # default rather than selecting it.
+                    #
+                    # append stays None, so the task-2180 bare-append=False
+                    # rejection in _resolve_metadata_mode is still satisfied and
+                    # the details path is unaffected (append falsy → replace).
+                    metadata_mode='merge',
                     title=rt.title,
                     description=rt.description,
                     details=details_with_files,
@@ -2196,6 +2274,34 @@ class TaskInterceptor:
         if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
+
+    @staticmethod
+    def _is_gate_metadata(metadata: Any) -> bool:
+        """True when *metadata* declares an escalation gate (task 3446).
+
+        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        blob, a dict, and ``None`` are all handled by the one shared shape
+        policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
+        metadata answers False (ungated): the shape WARNING is already emitted
+        by the helper, and the permissive answer keeps a malformed blob from
+        turning into a hard failure of the combine path.
+
+        The test is VALUE-sensitive, mirroring
+        :mod:`deterministic_task_guard`'s own strictness — it uses
+        ``always_escalates is True`` precisely so non-bool truthy values
+        (``'false'``, ``1``) do NOT satisfy the gate, since ``bool('false')``
+        is True and would silently accept the opposite of the caller's
+        intent. Reading the same keys loosely here would let a task the guard
+        considers ungated be treated as gated (and vice versa).
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if not meta:
+            return False
+        return (
+            meta.get('always_escalates') is True
+            or meta.get('operational_mode') == 'gate'
+            or meta.get('execution_class') == 'operational'
+        )
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
@@ -3192,12 +3298,51 @@ class TaskInterceptor:
         curator: Any,  # TaskCurator | None
         curator_degrade_reason: str | None = None,
     ) -> tuple[str, str | None, str | None, dict | None, str | None]:
-        """Execute the drop/combine/create dispatch for one curator decision.
+        """Execute the refuse/drop/combine/create dispatch for one curator decision.
 
         Returns (status, task_id, reason, result_dict, curator_degrade_reason).
         Does NOT call mark_resolved, _signal_ticket_event, journal, or commit —
         those are the caller's responsibility.
+
+        This is the single dispatch chokepoint shared by both worker paths
+        (``_process_add_ticket`` and ``_process_add_tickets_batch_prepared``), so
+        a branch added here is inherited by both.
         """
+        if decision is not None and decision.action == 'refuse':
+            # Deterministic refusal (cancelled-premise blocklist / recon premise
+            # guard): the candidate's premise is dead. Unlike 'drop' — which means
+            # "fold into existing target task N" and needs a target — this creates
+            # NOTHING and must never reach tm.add_task.
+            #
+            # Checked FIRST, ahead of the drop branch, so a refusal carrying a
+            # stray target_id cannot be shadowed into the dedupe path and silently
+            # reported as 'combined'.
+            #
+            # task_id is None so _format_ticket_result omits the key entirely — a
+            # caller therefore cannot mistake a refusal for a creation. That makes
+            # `reason` the only legibility channel reaching the caller (result_json
+            # is deliberately not exposed), so it states outright that no task was
+            # created.
+            logger.info(
+                'ticket %s: curator REFUSED the candidate (no task created): %s',
+                ticket_id, decision.justification,
+            )
+            result_dict = {
+                'id': None,
+                'title': candidate.title if candidate else '',
+                'created': False,
+                'refused': True,
+                'action': 'refuse',
+                'justification': decision.justification,
+            }
+            return (
+                'refused',
+                None,
+                f'refused (no task created): {decision.justification}',
+                result_dict,
+                None,
+            )
+
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
             # Preserves legacy result shape for the add_task facade.
@@ -3219,7 +3364,14 @@ class TaskInterceptor:
         if decision is not None and decision.action == 'combine' and decision.target_id:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
-                combine_result = await self._execute_combine(project_root, decision)
+                # candidate_metadata is this ticket's post-inject_operational_routing
+                # submission metadata — the same object stamped by
+                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # below. _execute_combine reads it to refuse absorbing a gated
+                # candidate into an ungated target (task 3446).
+                combine_result = await self._execute_combine(
+                    project_root, decision, candidate_metadata=metadata,
+                )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
                     rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
@@ -4724,6 +4876,19 @@ _DONE_PROVENANCE_KINDS_TEXT = (
 )
 
 
+def _provenance_stamp_now() -> str:
+    """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
+
+    Same convention as the module's other timestamp sites (``reopen_at``,
+    ``combined_at``): ``datetime.now(UTC).isoformat()``. Broken out as a
+    named module-level function purely so tests can monkeypatch it and
+    assert an exact string — here the timestamp IS the artifact under test,
+    so a loose "is parseable / within a range" assertion would let a
+    wrong-timezone or wrong-format regression through.
+    """
+    return datetime.now(UTC).isoformat()
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -4974,6 +5139,46 @@ async def _validate_done_provenance(
                 resolved['transient_unit'] = transient_unit_stripped
         if isinstance(fire_delay_secs, int):
             resolved['fire_delay_secs'] = fire_delay_secs
+
+    if kind == 'found_on_main':
+        # THE SINGLE WRITE SITE for done_provenance.stamped_at (task 3576).
+        #
+        # Every found_on_main producer funnels through this function: the
+        # fresh-done path (_apply_status_transition), the same-status repair
+        # seam (_repair_done_provenance_same_status), agent-authored
+        # set_task_status calls, and the orchestrator's
+        # Scheduler.mark_done(kind='found_on_main', ...) which reaches here
+        # via set_task_status. So no producer-side change is needed, and no
+        # future producer can forget to stamp. That matters: this defect
+        # class's history (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 ->
+        # 2787 -> 2794 -> 3057) is a chain of point fixes each reopened by an
+        # unguarded seam the previous fix missed.
+        #
+        # Scoped to found_on_main deliberately — it is the
+        # attribution-by-inference kind the soak gate watches. `merged`
+        # already carries independent landing evidence (merge-queue journal +
+        # is_ancestor + commit citation), and stamping it would perturb the
+        # exact-equality merged-kind assertions across the existing suites
+        # for no benefit.
+        #
+        # A caller-supplied value is DISCARDED with a warning rather than
+        # rejected. Rejection would break the same-status repair seam:
+        # _repair_done_provenance_same_status re-submits a previously-stored
+        # blob, which post-3576 carries its own stamped_at, so a hard reject
+        # would fail every repair of an already-stamped blob. Refreshing on
+        # repair is also the correct semantics — a repair is a fresh
+        # assertion of the attribution, and a repair that leaves the task
+        # still misattributed SHOULD re-enter the gate window. The warning
+        # keeps the override visible rather than silent.
+        supplied_stamp = raw.get('stamped_at')
+        if supplied_stamp is not None:
+            logger.warning(
+                'done_provenance.stamped_at is server-generated; discarding '
+                'caller-supplied value %r for task %s',
+                supplied_stamp,
+                task_id,
+            )
+        resolved['stamped_at'] = _provenance_stamp_now()
 
     return None, resolved
 

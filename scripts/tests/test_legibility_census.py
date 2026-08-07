@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import census as mod
 import codebook
@@ -954,6 +955,10 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     # A null baseline is UNKNOWN, not malformed -- the state file still loads.
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
+    # load_census_state returns tuple[str, dict | None] — the None is real for
+    # the "missing"/"malformed" statuses, so narrow it explicitly rather than
+    # subscripting an Optional.
+    assert data is not None
     assert data["last_census_done_count"] is None
 
     with caplog.at_level(logging.WARNING):
@@ -996,6 +1001,7 @@ def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
+    assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
     assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
     assert data["last_census_done_count"] == 7
@@ -1080,7 +1086,7 @@ def test_render_report_force_marker_present_when_forced():
 
 
 def test_render_report_is_deterministic_no_clock():
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1147,7 +1153,10 @@ def _capped_mining_result(*, stop_reason, max_batches, batches=2):
 
 
 def _render(**overrides):
-    kwargs = dict(
+    # Annotated for the same reason as _run_census_kwargs: a heterogeneous
+    # dict whose inferred value union would otherwise be re-reported once per
+    # union member per render_report parameter.
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1352,8 +1361,15 @@ def test_render_report_flagless_output_is_byte_identical_golden():
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
 
-def _run_census_kwargs(tmp_path, **overrides):
-    kwargs = dict(
+def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
+    # The return annotation is load-bearing for the type gate, not decoration.
+    # This dict is deliberately heterogeneous — injected callables, a
+    # LegibilityConfig, Paths, strs, bools, None — so without it pyright infers
+    # the value type as a wide union and then re-reports that union once per
+    # member per use: at each `mod.run_census(**kwargs)` call site (one error
+    # per parameter) and at each `kwargs[...]` attribute access. Measured: this
+    # single annotation cleared 337 of the 350 errors this file carried.
+    kwargs: dict[str, Any] = dict(
         batch_source=None,
         invoke=_make_fake_invoke(default="pong"),
         verify_fn=_poison("verify_fn"),
@@ -2059,6 +2075,99 @@ def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
     assert "verify=3" in report_text.split("## Cost", 1)[1]
 
 
+def test_run_census_warns_and_escalates_when_every_cluster_is_rejected(tmp_path, caplog):
+    """Clusters offered, none verified, is the observable signature of a
+    SYSTEMIC verifier failure — say it out loud rather than reporting an
+    empty census in the same voice as an unremarkable one.
+
+    Scoping the subprocess cwd (2026-08-03) removed one CAUSE of that
+    silence, not the class: _build_default_verify_fn fails CLOSED per
+    cluster, so a model that goes unreachable mid-run, a different
+    permission denial, or persistently unparseable verdicts all still land
+    as ordinary rejections with nothing surfacing the pattern.
+    """
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),  # every cluster rejects
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=fake_escalate_fn,
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    warnings = " ".join(r.message.lower() for r in caplog.records)
+    assert "systemic" in warnings, "the pattern must be NAMED, not left to be inferred"
+    assert "3" in warnings, "how many clusters were offered"
+
+    assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
+    escalation = fake_escalate_fn.calls[0]
+    assert escalation["severity"] == "info"
+    assert "reject" in escalation["summary"].lower()
+
+    # A suspicious run is still a COMPLETED run: mining is already paid for,
+    # and an all-rejected census is legitimately possible. Detect, never fail.
+    assert outcome.status == "done"
+    assert kwargs["census_state_path"].exists()
+
+
+def test_run_census_does_not_warn_when_some_cluster_verifies(tmp_path, caplog):
+    """The detector must not fire on an ordinary run — a partial rejection
+    is the normal case and must stay quiet, or the warning is noise that
+    gets filtered out before the real incident."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),  # 2 of 3 rejected -> nothing to escalate
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mod.run_census(**kwargs)
+
+    assert not any("systemic" in r.message.lower() for r in caplog.records)
+
+
+def test_run_census_mass_rejection_escalation_failure_is_not_fatal(tmp_path, caplog):
+    """A raising escalate_fn must not discard a run whose mining is already
+    paid for. Unlike the defer-path escalation (which returns immediately
+    afterwards), this one sits between the mining spend and the output
+    writes."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),  # raises on the detector's call
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["report_path"].exists()
+    assert kwargs["census_state_path"].exists()
+    # Swallowed, but never silently: both the finding and the failed post log.
+    warnings = " ".join(r.message.lower() for r in caplog.records)
+    assert "systemic" in warnings
+    assert "escalation failed" in warnings
+
+
 @pytest.mark.parametrize(
     "bad_kwargs",
     [
@@ -2325,6 +2434,7 @@ def test_run_census_dry_run_uses_the_given_path_when_free(tmp_path, caplog):
 
     # no gratuitous renaming: the free path is used verbatim (step-13 contract)
     assert payloads_path.exists()
+    assert outcome.dry_run is not None  # DryRunFiling | None on the outcome
     assert outcome.dry_run.path == str(payloads_path)
     assert list(tmp_path.glob("*-payloads-*.json")) == []
     assert not any("already exists" in r.message for r in caplog.records)
@@ -2829,15 +2939,16 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
     shared by census.py's submit_task and escalate_info posters via this one
-    function). httpx is imported lazily and is not importable in this test
-    env, so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
+    function). httpx is imported lazily, but it IS importable here -- a
+    direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable without a live listener on :8002."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -2845,14 +2956,11 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
         "result": {"structuredContent": {"ok": True}},
     }
 
-    fake_httpx = type(sys)("httpx")
-
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse(rpc_response)
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
 
@@ -2898,14 +3006,14 @@ def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
     # Record the timeout every stage invoke threads to coder._invoke_cli.
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append(timeout)
         return "dummy"
 
     monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
 
     cfg = _config_with_timeouts(111, 222, 333)
-    mining, verify, synth = mod._build_stage_invokes(cfg)
+    mining, verify, synth = mod._build_stage_invokes(cfg, project_root="/home/leo/src/dark-factory")
 
     # Drive each partial exactly as its census seam does: two positional
     # args, no kwargs (invoke(prompt, model)).
@@ -2932,7 +3040,7 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
 
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append({"model": model, "timeout": timeout})
         return '{"verified": true}'
 

@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import builtins
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 from dashboard.config import DashboardConfig
 
@@ -971,6 +973,14 @@ _FP_ALARMED_UNLINKED = 'ffeeddccbbaa99887766554433221100'
 _FP_CLEAR = '00112233445566778899aabbccddeeff'
 _FP_WRONG_CATEGORY = 'deadbeefdeadbeefdeadbeefdeadbeef'
 _FP_UNMATCHED = 'cafebabecafebabecafebabecafebabe'
+_FP_UNJUDGED_OPEN = '13579bdf02468ace13579bdf02468ace'
+# The non-alarm, non-no_alarm half of the M2 vocabulary.  Each one gets both a
+# linked and an unlinked case: the two answer different questions, and the
+# collapsed mapping used to give them the same badge.
+_FP_INSUFFICIENT_OPEN = '2468ace02468ace02468ace02468ace0'
+_FP_INSUFFICIENT = 'bdf13579bdf13579bdf13579bdf13579'
+_FP_GRANDFATHERED_OPEN = 'aabbccdd00112233aabbccdd00112233'
+_FP_GRANDFATHERED = '33221100ddccbbaa33221100ddccbbaa'
 
 # The escalation projection carried onto a metric row (and into
 # `unmatched_escalations`).  `created_at` is sourced from the queue record's
@@ -986,7 +996,13 @@ _JOIN_ESC_TIMESTAMP = '2026-07-30T03:15:00+00:00'
 
 
 def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
-    """One eval whose five metrics span every parity state alpha owns."""
+    """One eval whose metrics span every parity state alpha owns.
+
+    Covers the full ``(verdict class) x (linked?)`` matrix the payload can
+    reach from a single artifact tree: each of the four M2 verdict values with
+    and without a linked open escalation, plus the no-entry-at-all row.  The
+    storm states are ``_storm_tree``'s.
+    """
     root = tmp_path / 'memory-evals'
     esc_dir = tmp_path / 'escalations'
     esc_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,6 +1016,10 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
             'clear-metric',
             'wrong-category',
             'unjudged-metric',
+            'insufficient-open',
+            'insufficient-metric',
+            'grandfathered-open',
+            'grandfathered-metric',
         )
     ])
     _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
@@ -1009,6 +1029,22 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
         _verdict('eval-a', 'alarmed-unlinked', 'alarm', fingerprint=_FP_ALARMED_UNLINKED, run_stamp=_JOIN_RUN),
         _verdict('eval-a', 'clear-metric', 'no_alarm', fingerprint=_FP_CLEAR, run_stamp=_JOIN_RUN),
         _verdict('eval-a', 'wrong-category', 'alarm', fingerprint=_FP_WRONG_CATEGORY, run_stamp=_JOIN_RUN),
+        _verdict(
+            'eval-a', 'insufficient-open', 'insufficient_data',
+            fingerprint=_FP_INSUFFICIENT_OPEN, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'insufficient-metric', 'insufficient_data',
+            fingerprint=_FP_INSUFFICIENT, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'grandfathered-open', 'grandfathered',
+            fingerprint=_FP_GRANDFATHERED_OPEN, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'grandfathered-metric', 'grandfathered',
+            fingerprint=_FP_GRANDFATHERED, run_stamp=_JOIN_RUN,
+        ),
     ], run_stamp=_JOIN_RUN)
 
     _write_escalation(
@@ -1036,6 +1072,49 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
         dedupe_fingerprint=_FP_UNMATCHED,
         summary='an eval_regression nothing on disk explains',
         timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    # A still-open escalation on a metric the evaluator could NOT judge, and
+    # one on a metric it deliberately exempted.  Neither is a recovery.
+    _write_escalation(
+        esc_dir, 'esc-insufficient-open',
+        dedupe_fingerprint=_FP_INSUFFICIENT_OPEN,
+        summary='search-latency regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    _write_escalation(
+        esc_dir, 'esc-grandfathered-open',
+        dedupe_fingerprint=_FP_GRANDFATHERED_OPEN,
+        summary='topic-canonical-present regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    return root, esc_dir
+
+
+def _unjudged_open_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """One metric whose verdict entry keys and fingerprints but judges nothing.
+
+    The ONE reachable way a row can be both unjudged and linked: the join only
+    runs when the verdict ENTRY carries a fingerprint, so a metric with no
+    entry at all can never link.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(root, 'eval-a', _JOIN_RUN, [
+        _metric('unjudged-open', 'count', 3.0, direction='higher_is_worse'),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+    # Written out literally: ``_verdict()`` always sets a ``verdict``, and the
+    # artifact is unvalidated JSON, so an entry missing that one field is a
+    # shape the reader has to answer for.
+    _write_verdicts(root, [{
+        'eval_id': 'eval-a',
+        'metric_id': 'unjudged-open',
+        'fingerprint': _FP_UNJUDGED_OPEN,
+        'run_stamp': _JOIN_RUN,
+    }], run_stamp=_JOIN_RUN)
+    _write_escalation(
+        esc_dir, 'esc-unjudged-open',
+        dedupe_fingerprint=_FP_UNJUDGED_OPEN,
+        summary='unjudged-open regressed', timestamp=_JOIN_ESC_TIMESTAMP,
     )
     return root, esc_dir
 
@@ -1072,6 +1151,13 @@ class TestEscalationJoin:
         real, transient state — the watcher has not closed it yet.  Dropping
         the link would make the escalation look orphaned in exactly the window
         an operator is most likely to be looking at it.
+
+        ``recovered_open`` is reserved for THIS case and no other: the
+        escalation was filed on a prior alarm and the metric now reads
+        ``no_alarm``, so a recovery genuinely happened.  Every other verdict
+        class linked to an open escalation gets its own state — see the
+        ``insufficient_data``/``grandfathered``/``unjudged`` cases below —
+        because calling those a recovery asserts something that never occurred.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -1083,6 +1169,70 @@ class TestEscalationJoin:
         assert row['parity'] == 'recovered_open'
         assert row['escalation']['id'] == 'esc-recovered-open'
 
+    def test_insufficient_data_with_an_open_escalation_is_not_a_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        """"We could not judge this" is not "this recovered".
+
+        ``insufficient_data`` means the evaluator lacked the samples to reach a
+        verdict at all.  Rendering a still-open escalation on such a metric as
+        ``recovered_open`` asserts a recovery that never happened — the alarm
+        is live and nothing has been shown to have improved.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-open')
+
+        assert row['verdict'] == 'insufficient_data'
+        assert row['parity'] == 'insufficient_data_open'
+        assert row['escalation']['id'] == 'esc-insufficient-open'
+
+    def test_insufficient_data_without_a_link_is_not_clear(self, tmp_path: Path) -> None:
+        """An unjudgeable metric must not wear the healthy badge either."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-metric')
+
+        assert row['verdict'] == 'insufficient_data'
+        assert row['parity'] == 'insufficient_data'
+        assert row['escalation'] is None
+
+    def test_grandfathered_with_an_open_escalation_is_not_a_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        """A standing exception with a live alarm is neither clear nor recovered."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-open')
+
+        assert row['verdict'] == 'grandfathered'
+        assert row['parity'] == 'grandfathered_open'
+        assert row['escalation']['id'] == 'esc-grandfathered-open'
+
+    def test_grandfathered_without_a_link_is_not_clear(self, tmp_path: Path) -> None:
+        """A known-bad measurement, deliberately exempted, is not a healthy one.
+
+        ``grandfathered`` is the ratchet's standing exception: the metric IS
+        failing and the program has chosen not to alarm on it yet.  Labelling
+        it ``clear`` calls that exception healthy, which erases the one signal
+        telling an operator the exception is still outstanding.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-metric')
+
+        assert row['verdict'] == 'grandfathered'
+        assert row['parity'] == 'grandfathered'
+        assert row['escalation'] is None
+
     def test_alarm_with_no_escalation_is_flagged_unlinked(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -1093,16 +1243,50 @@ class TestEscalationJoin:
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
 
-    def test_quiet_metrics_are_clear(self, tmp_path: Path) -> None:
+    def test_quiet_and_unjudged_metrics_are_distinguishable(self, tmp_path: Path) -> None:
+        """``clear`` means "judged, and not alarming" — nothing weaker.
+
+        A metric NOTHING has judged is materially different from one the
+        evaluator looked at and passed: the first says the evaluator never
+        reached this metric, the second says it did and found no regression.
+        Folding the two into one label makes an un-run judgement render with
+        the healthy badge, which is the module's own stated failure mode
+        (fail toward "visibly unrenderable", never toward the healthy label).
+        """
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _join_tree(tmp_path)
         rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
 
+        assert _only(rows, 'clear-metric')['verdict'] == 'no_alarm'
         assert _only(rows, 'clear-metric')['parity'] == 'clear'
         assert _only(rows, 'clear-metric')['escalation'] is None
-        # No verdict at all is also not an alarm.
-        assert _only(rows, 'unjudged-metric')['parity'] == 'clear'
+        # No verdict entry at all: not an alarm, but not "clear" either.
+        assert _only(rows, 'unjudged-metric')['verdict'] is None
+        assert _only(rows, 'unjudged-metric')['parity'] == 'unjudged'
+        assert _only(rows, 'unjudged-metric')['escalation'] is None
+
+    def test_fingerprinted_entry_with_no_verdict_is_unjudged_open(self, tmp_path: Path) -> None:
+        """A link with no judgement behind it must not claim a recovery.
+
+        An entry that keys and fingerprints fine but carries no ``verdict``
+        field is the ONE reachable way a row can be both unjudged and linked:
+        the join only runs when the verdict ENTRY carries a fingerprint, so a
+        metric with no entry at all can never link.  Reporting this as
+        ``recovered_open`` asserts a recovery that never happened — the
+        evaluator did not judge this metric, so nothing recovered.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unjudged_open_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-open')
+
+        assert row['verdict'] is None
+        assert row['parity'] == 'unjudged_open'
+        # The link is still surfaced — the escalation is real and open, and
+        # hiding it would make it look orphaned.
+        assert row['escalation']['id'] == 'esc-unjudged-open'
 
     def test_matching_fingerprint_in_another_category_is_not_joined(self, tmp_path: Path) -> None:
         """Only ``eval_regression`` escalations participate in this join."""
@@ -1323,6 +1507,210 @@ class TestEscalationJoin:
         # The joinable records are untouched by the new path.
         assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
         assert unmatched['esc-unmatched']['reason'] == 'no_matching_verdict'
+
+
+# ---------------------------------------------------------------------------
+# a verdict value outside the closed M2 vocabulary
+# ---------------------------------------------------------------------------
+
+_FP_UNKNOWN_VERDICT = '9876543210fedcba9876543210fedcba'
+
+# The parity vocabulary in full — the closed set the UI switches on, mirroring
+# the `_VERDICT_VALUES` contract test one level down.  Deriving parity
+# server-side only buys the frontend anything if the output set is CLOSED and
+# knowable; an open-ended one would force every consumer to re-derive from
+# `verdict`, which is the exact drift this field exists to prevent.
+_PARITY_VALUES = (
+    'alarmed_open',
+    'alarmed_unlinked',
+    'recovered_open',
+    'clear',
+    'insufficient_data',
+    'insufficient_data_open',
+    'grandfathered',
+    'grandfathered_open',
+    'unjudged',
+    'unjudged_open',
+    'unknown_verdict',
+    'unknown_verdict_open',
+    'storm_collapsed',
+)
+
+
+def _unknown_verdict_tree(tmp_path: Path, verdict: Any, *, linked: bool) -> tuple[Path, Path]:
+    """One metric whose verdict value is outside the M2 vocabulary.
+
+    Built standalone rather than folded into ``_join_tree``: that tree is
+    asserted to be issue-free by several tests, and this one exists precisely
+    to raise an issue.  The entry is written as a literal dict because
+    ``_verdict()`` takes a ``str`` and one of these cases is not a string at
+    all — the artifact is unvalidated JSON, so that shape is reachable.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(root, 'eval-a', _JOIN_RUN, [
+        _metric('drifted-metric', 'count', 3.0, direction='higher_is_worse'),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+    _write_verdicts(root, [{
+        'eval_id': 'eval-a',
+        'metric_id': 'drifted-metric',
+        'verdict': verdict,
+        'fingerprint': _FP_UNKNOWN_VERDICT,
+        'run_stamp': _JOIN_RUN,
+    }], run_stamp=_JOIN_RUN)
+    if linked:
+        _write_escalation(
+            esc_dir, 'esc-drifted',
+            dedupe_fingerprint=_FP_UNKNOWN_VERDICT,
+            summary='drifted-metric regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+    return root, esc_dir
+
+
+class TestUnknownVerdict:
+    """A verdict this reader cannot render is NAMED, never rendered healthy.
+
+    The same shape the module already applies twice: ``unknown_kind`` for a
+    metric kind with no chart primitive, and ``unknown_escalation_status`` for
+    a status it cannot classify.  Both are justified by one rule — an
+    unrecognised value must fail toward "visibly unrenderable", never toward
+    the healthy label.  A verdict outside the closed M2 set is the third
+    instance, and it used to fail the other way: straight to ``clear``.
+
+    The drift is realistic rather than hypothetical.  The LIMITS artifact
+    carries its OWN verdict vocabulary (``baseline_snapshot|ok|alarm|improved|
+    insufficient_data``), so a producer-side mix-up lands ``improved`` in this
+    field — and ``improved`` reading as ``clear`` is very nearly plausible,
+    which is what makes the silent version of this dangerous.
+    """
+
+    def test_unknown_verdict_is_named_not_rendered_clear(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=False)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict'
+        # The reader NAMES the value it cannot render; it never rewrites it.
+        assert row['verdict'] == 'improved'
+
+        named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
+        assert len(named) == 1
+        assert named[0]['eval_id'] == 'eval-a'
+        assert 'drifted-metric' in named[0]['detail']
+        assert "'improved'" in named[0]['detail']
+        # The ROOT verdicts artifact is where the offending value lives.
+        assert named[0]['path'] == str(root / 'verdicts-current.json')
+
+    def test_unknown_verdict_with_an_open_escalation_keeps_the_link(
+        self, tmp_path: Path,
+    ) -> None:
+        """Unrenderable is not unlinked: the escalation is real and still open."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=True)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict_open'
+        assert row['verdict'] == 'improved'
+        assert row['escalation']['id'] == 'esc-drifted'
+        assert len([i for i in payload['issues'] if i['kind'] == 'unknown_verdict']) == 1
+
+    def test_non_string_verdict_is_named_not_raised(self, tmp_path: Path) -> None:
+        """An unhashable verdict must not raise on the vocabulary lookup.
+
+        Mirrors ``test_unhashable_status_is_named_not_raised``: the artifact is
+        unvalidated JSON, so ``verdict`` can be any type, and a bare
+        ``in _KNOWN_VERDICTS`` on a dict would raise ``TypeError``.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, {}, linked=False)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict'
+        # Passed through verbatim, exactly as a recognised value would be.
+        assert row['verdict'] == {}
+        named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
+        assert len(named) == 1
+        assert '{}' in named[0]['detail']
+
+    def test_absent_verdict_earns_no_unknown_issue(self, tmp_path: Path) -> None:
+        """"Nothing judged this" is a legitimate state, not a discard.
+
+        The payload already models it — ``unjudged`` parity, plus
+        ``missing_verdicts``/``orphan_verdict`` at the artifact level — so
+        naming it again here would put a standing issue on a healthy tree and
+        train operators past the list.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
+        assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
+
+
+class TestParityVocabularyIsClosedAndExported:
+    """``PARITY_STATES`` is the single source of truth for the badge vocabulary.
+
+    Deriving parity server-side only buys the frontend anything if the output
+    set is CLOSED and knowable — otherwise every consumer has to re-derive
+    badge state from ``verdict``, which is the drift this field exists to
+    prevent.  Exporting the set gives the two known consumers (the dashboard
+    tab, task 3216; the parity gate, task 3217) something to assert against the
+    PRODUCER instead of hardcoding a subset in their own test files, where it
+    rots silently the moment a state is added.
+    """
+
+    def test_the_module_exports_the_vocabulary(self) -> None:
+        from dashboard.data import memory_evals
+
+        assert set(_PARITY_VALUES) == memory_evals.PARITY_STATES
+
+    def test_the_literal_and_the_builder_agree(self, tmp_path: Path) -> None:
+        """Every state the builder emits is a member, and every member is reachable.
+
+        Both directions matter and neither implies the other.  A state escaping
+        the set means a consumer switching on ``PARITY_STATES`` silently drops
+        a row; a member no fixture can produce is either dead vocabulary or an
+        untested state, and the literal set cannot tell those apart on its own.
+        This is what keeps the hand-written literal honest.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        trees = [
+            _join_tree(tmp_path / 'join'),
+            _storm_tree(
+                tmp_path / 'storm',
+                storm={'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE},
+            ),
+            _unjudged_open_tree(tmp_path / 'unjudged-open'),
+            _unknown_verdict_tree(tmp_path / 'unknown', 'improved', linked=False),
+            _unknown_verdict_tree(tmp_path / 'unknown-open', 'improved', linked=True),
+        ]
+
+        observed = {
+            metric['parity']
+            for root, esc_dir in trees
+            for row in build_memory_evals(root, esc_dir)['evals']
+            for metric in row['metrics']
+        }
+
+        from dashboard.data import memory_evals
+
+        assert observed - memory_evals.PARITY_STATES == set(), 'a parity escaped the exported set'
+        assert memory_evals.PARITY_STATES - observed == set(), 'an exported parity is unreachable'
 
 
 # ---------------------------------------------------------------------------
@@ -1558,6 +1946,147 @@ def _corrupt(path: Path) -> Path:
     """Make *path* syntactically unparseable (it is still a file that exists)."""
     path.write_text('{"metrics": [ this is not json')
     return path
+
+
+def _raiser(exc: Exception) -> Any:
+    """A stand-in for a module-level reader that raises *exc* however it is called."""
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise exc
+    return _boom
+
+
+class TestCodeBugsAreNotArtifactDegradation:
+    """A bug in this module must not be reported to the operator as a bad file.
+
+    The narrow tuple and the outermost guard are two halves of one contract.
+    ``_ARTIFACT_ERRORS`` says what READING AND PARSING one artifact off disk
+    can raise — nothing more — so a ``TypeError`` or ``AttributeError`` out of
+    a typo in ``_read_limits`` can no longer masquerade as ``unreadable_limits``
+    and send the operator to inspect a file that is perfectly fine.
+
+    The module's never-raises contract is unchanged and still load-bearing: a
+    degraded tree yields a degraded payload, never a 500.  It is now delivered
+    by ONE named boundary rather than by four broad per-artifact catches, and
+    a bug that reaches it is reported AS a bug (``internal_error``) with a real
+    traceback in the dashboard log, instead of being silently relabelled.
+    """
+
+    def test_a_bug_in_read_limits_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_limits', _raiser(AttributeError("no attribute 'alpah'")),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The never-500 contract still holds.
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        # Named as what it is — NOT as an unreadable limits artifact.
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        # The exception type is in the detail so an operator can tell a
+        # dashboard bug from a broken artifact without reading the log.
+        assert 'AttributeError' in payload['issues'][0]['detail']
+
+    def test_a_bug_in_read_verdicts_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        assert 'TypeError' in payload['issues'][0]['detail']
+
+    def test_a_bug_in_index_escalations_is_an_internal_error(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_index_escalations',
+            _raiser(AttributeError("'list' object has no attribute 'get'")),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        assert 'AttributeError' in payload['issues'][0]['detail']
+
+    def test_the_traceback_reaches_the_log(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        """A swallowed code bug must not be invisible.
+
+        The payload names the bug for the operator; the log carries the
+        traceback for whoever has to fix it.  Without the second half, keeping
+        the never-500 contract would mean a bug that silently degrades the
+        dashboard forever with nothing to debug from.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
+        )
+
+        with caplog.at_level(logging.ERROR, logger='dashboard.data.memory_evals'):
+            build_memory_evals(root, esc_dir)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+
+    def test_io_failures_keep_their_granular_kinds(self, tmp_path: Path, monkeypatch) -> None:
+        """The outer guard must not swallow what the narrow catches still handle.
+
+        A parse failure is a ``ValueError`` and a permission failure is an
+        ``OSError``, so both stay inside ``_ARTIFACT_ERRORS`` and keep degrading
+        one artifact at a time.  If any of these started reading
+        ``internal_error``, the narrowing would have gone too far and the
+        operator would lose the pointer to the actual broken file.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        # Every tree is built BEFORE any monkeypatch, so the patched Path
+        # method can never affect the fixture that exercises it.
+        root, esc_dir = _healthy_tree(tmp_path)
+        root2, esc_dir2 = _healthy_tree(tmp_path / 'second')
+        root3, esc_dir3 = _healthy_tree(tmp_path / 'third')
+        _corrupt(root / 'eval-a' / 'limits-current.json')
+        _corrupt(root / 'verdicts-current.json')
+
+        # Two ValueError-induced boundaries (a corrupt file is a parse error).
+        assert {i['kind'] for i in build_memory_evals(root, esc_dir)['issues']} == {
+            'unreadable_limits', 'unreadable_verdicts',
+        }
+
+        # And the two OSError-induced boundaries, one at a time.
+        monkeypatch.setattr(
+            memory_evals_mod, 'load_queue_escalations',
+            _raiser(PermissionError(13, 'Permission denied')),
+        )
+        assert [i['kind'] for i in build_memory_evals(root2, esc_dir2)['issues']] == [
+            'unreadable_escalations',
+        ]
+
+        monkeypatch.setattr(Path, 'iterdir', _raiser(PermissionError(13, 'Permission denied')))
+        assert [i['kind'] for i in build_memory_evals(root3, esc_dir3)['issues']] == [
+            'unreadable_root',
+        ]
 
 
 class TestStalenessAndDegradedStates:
@@ -2600,6 +3129,107 @@ def _route_tree(tmp_path: Path) -> DashboardConfig:
     return config
 
 
+def _payload(**overrides: Any) -> dict[str, Any]:
+    """A healthy builder-shaped payload, overridable one key at a time.
+
+    Shaped as ``build_memory_evals`` returns it (``_PAYLOAD_KEYS`` exactly), so
+    a stub standing in for the builder cannot pass the route something the
+    route's own ``shape_memory_evals(**result)`` call would reject.
+    """
+    payload: dict[str, Any] = {
+        'generated_at': '2026-07-06T03:15:00+00:00',
+        'root_present': True,
+        'storm_escape': None,
+        'evals': [],
+        'issues': [],
+        'issue_count': 0,
+        'unmatched_escalations': [],
+    }
+    payload.update(overrides)
+    payload['issue_count'] = len(payload['issues'])
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# a scan that never reached the tree must not be pinned for the TTL window
+# ---------------------------------------------------------------------------
+
+
+class TestRootScanCacheability:
+    """``root_scan_succeeded`` — "did this scan actually reach the tree?"
+
+    The TTL cache in front of this route exists because the artifact walk is
+    expensive.  That reasoning does not extend to the two payloads produced
+    WITHOUT walking anything: an absent root returns immediately from
+    ``is_dir()``, and an unwalkable one raises immediately from ``iterdir()``.
+    Both are O(1) to recompute, so retrying them on every poll costs nothing
+    and there is no thundering herd to protect — while caching them pins a
+    "there is no data" view of a tree that may exist by the next poll (a mount
+    landing, a mode being fixed) for the full TTL window.
+
+    The predicate is deliberately narrow.  A degraded ROW — an unreadable
+    metrics run, an unknown kind, an orphan verdict — stays cacheable: the scan
+    DID reach the tree, re-running it would return the same degradation, and
+    that re-run is the expensive walk this cache is here to prevent.
+    """
+
+    def test_healthy_payload_is_cacheable(self) -> None:
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded(_payload()) is True
+
+    def test_absent_root_is_not_cacheable(self) -> None:
+        """``root_present: False`` — ``is_dir()`` said no, so nothing was walked."""
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded(_payload(root_present=False)) is False
+
+    def test_unreadable_root_is_not_cacheable(self) -> None:
+        """The root IS present but the enumeration raised — also nothing walked."""
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        payload = _payload(issues=[{
+            'kind': 'unreadable_root',
+            'path': '/tmp/memory-evals',
+            'detail': '[Errno 13] Permission denied',
+        }])
+
+        assert payload['root_present'] is True
+        assert root_scan_succeeded(payload) is False
+
+    def test_a_degraded_row_stays_cacheable(self) -> None:
+        """Row-level degradation is not a failed scan — the walk happened.
+
+        This is the load-bearing half.  Keying the cache on "any issue at all"
+        would make a single permanently-corrupt metrics file defeat the cache
+        forever, re-running the full walk on every poll to rediscover a
+        degradation that re-scanning cannot fix.
+        """
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        payload = _payload(issues=[
+            {'kind': 'unreadable_metrics', 'path': '/tmp/m.json', 'detail': 'x'},
+            {'kind': 'unknown_kind', 'path': '/tmp/m.json', 'detail': 'y'},
+            {'kind': 'orphan_verdict', 'path': '/tmp/v.json', 'detail': 'z'},
+        ])
+
+        assert payload['issue_count'] == 3
+        assert root_scan_succeeded(payload) is True
+
+    def test_a_partial_payload_cannot_raise_inside_the_predicate(self) -> None:
+        """It runs inside the cache write path, where raising would 500 the poll.
+
+        ``build_memory_evals`` returns every key on every path, so this is
+        defence rather than a live case — but a predicate that trusts that
+        invariant turns any future violation of it into a crash at the least
+        debuggable point in the request.
+        """
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded({}) is False
+        assert root_scan_succeeded({'root_present': True}) is True
+
+
 class TestMemoryEvalsEndpoint:
     """``GET /api/v2/dashboard/memory-evals`` end-to-end through the real route.
 
@@ -2761,6 +3391,109 @@ class TestMemoryEvalsEndpoint:
         after = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
 
         assert after['evals'][0]['run_stamps'][-1] == '20260706T031500Z'
+
+    def test_a_healthy_scan_is_still_served_from_cache(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Gating the cache must not disable it — the ordinary payload still caches.
+
+        ``test_ttl_cache_single_flights_the_scan`` above proves this over the
+        real disk; this proves it at the builder boundary, so a ``cache_ok``
+        predicate that accidentally rejected everything would fail HERE with a
+        call count rather than silently turning every dashboard poll into a
+        full artifact walk.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        # SYNC, not AsyncMock: the route calls the builder through
+        # asyncio.to_thread, which hands it a plain callable.
+        build = MagicMock(return_value=_payload())
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        assert client.get(_ROUTE_URL).status_code == 200
+        assert client.get(_ROUTE_URL).status_code == 200
+
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_an_absent_root_is_not_pinned_for_the_ttl(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """``root_present: False`` is re-checked every poll.
+
+        A root that does not exist yet is the pre-deployment state AND the
+        transient one (an unmounted volume, a tree being created).  Caching it
+        means the dashboard keeps reporting "no evals have ever run" for a full
+        TTL window after the tree lands.  Re-checking costs one ``is_dir()``.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(root_present=False))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        r1 = client.get(_ROUTE_URL)
+        r2 = client.get(_ROUTE_URL)
+
+        assert r1.status_code == r2.status_code == 200
+        assert r2.json()['MEMORY_EVALS']['root_present'] is False
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_an_unreadable_root_is_not_pinned_for_the_ttl(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """The other never-walked payload: present, but the enumeration raised.
+
+        Distinct from the absent case because ``root_present`` stays True — the
+        signal is the ``unreadable_root`` issue, which is why the predicate
+        reads both and not just the flag.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(issues=[{
+            'kind': 'unreadable_root',
+            'path': str(tmp_path),
+            'detail': '[Errno 13] Permission denied',
+        }]))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        r1 = client.get(_ROUTE_URL)
+        r2 = client.get(_ROUTE_URL)
+
+        assert r1.status_code == r2.status_code == 200
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_a_degraded_row_is_still_cached(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """A corrupt metrics file must not defeat the cache in front of the walk.
+
+        The failure this pins is a perf cliff, not a wrong answer: gate the
+        cache on ``issue_count`` instead of on the root and one permanently
+        broken artifact re-runs the full scan on every poll, forever.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(issues=[
+            {'kind': 'unreadable_metrics', 'path': str(tmp_path), 'detail': 'boom'},
+        ]))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        assert client.get(_ROUTE_URL).status_code == 200
+        r2 = client.get(_ROUTE_URL)
+
+        assert r2.json()['MEMORY_EVALS']['issue_count'] == 1
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
     def test_cache_clear_hook_is_exported(self) -> None:
         """The test hook is part of the module's published surface, like the analytics one."""
@@ -2984,12 +3717,13 @@ class TestCommittedExemplarBoundary:
 
         assert len([i for i in payload['issues'] if i['kind'] == 'missing_verdicts']) == 1
 
-        # No verdicts artifact means no verdict — never a defaulted "no_alarm".
+        # No verdicts artifact means no verdict — never a defaulted "no_alarm",
+        # and never the healthy ``clear`` badge either: nothing judged these.
         for row in payload['evals']:
             for metric in row['metrics']:
                 assert metric['verdict'] is None, (row['eval_id'], metric['metric_id'])
                 assert metric['escalation'] is None
-                assert metric['parity'] == 'clear'
+                assert metric['parity'] == 'unjudged'
             assert row['storm_escape'] is None
 
     def test_negative_exemplars_split_rendering_from_producer_validation(self, tmp_path: Path) -> None:

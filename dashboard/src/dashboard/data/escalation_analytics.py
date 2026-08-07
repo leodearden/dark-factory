@@ -731,6 +731,43 @@ def build_escalation_analytics(
 
     ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
     see :func:`_lifespan_block` and :func:`_downsample_stratified`.
+
+    Two archive-reach signals, both computed from ONE ``is_dir`` stat per
+    project.  They exist because nothing else in the payload can answer either
+    question — :func:`iter_all_escalation_paths` returns silently on a missing
+    dir and :meth:`Path.glob` swallows ``PermissionError``, so an absent
+    archive, an unreadable one and a genuinely empty one otherwise produce
+    byte-identical entries.
+
+    * ``archives_present`` (``all``) — the completeness DIAGNOSTIC: did this
+      scan reach EVERY configured archive?  An operator reads it to find a
+      root that is unmounted or misconfigured.
+    * ``archives_reached`` (``any``) — the CACHE predicate (see
+      :func:`archive_scan_succeeded`): did this scan reach ANY archive at all?
+      A build that walked nothing is free to re-derive and must not pin an
+      empty view for a TTL window past the moment the volume mounts; a build
+      that walked something paid for that walk, and the cache is what stops it
+      being paid again on the next poll.
+
+    They are separate fields because ``all`` is UNSOUND as a cache predicate,
+    which is not hypothetical: measured 2026-08-01 against the installed
+    unit's own ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (9 roots), 2 roots have no
+    ``data/escalations`` dir at all while the other 7 hold ~9.1k records
+    between them.  Keying on ``all`` there means the TTL never stores
+    anything and every 3s poll re-runs the whole multi-second walk — ``all``
+    reports "this scan was free to redo" at precisely the moment it was most
+    expensive.  A root that has simply never escalated must not delete the
+    cache in front of the other seven.
+
+    Their shared LIMIT, stated because a signal is only useful if its blind
+    spot is known: one ``is_dir`` stat distinguishes the ABSENT/unmounted
+    case, not every permission flap — a directory that exists but whose own
+    mode is stripped still passes ``is_dir`` and then globs empty.  Both are
+    deliberately not ``parse_failures``, which counts unparseable RECORDS:
+    that count is a permanent property of a corrupt file, so a cache keyed on
+    it would be defeated forever in front of the ~10k-record walk the cache
+    exists to prevent.  All three fields answer different questions and none
+    is derived from another.
     """
     resolved_now = resolve_now(now)
 
@@ -747,9 +784,52 @@ def build_escalation_analytics(
     markers, markers_parse_failures = load_regime_markers(regime_markers_path)
     parse_failures += markers_parse_failures
 
+    # ONE pass, one stat per project, feeding both signals — so the two can
+    # never drift apart by disagreeing about what was on disk when.
+    reached = [
+        Path(escalations_dir).is_dir() for _label, escalations_dir, _runs_db in project_dirs
+    ]
+
     return {
         'generated_at': resolved_now.isoformat(),
         'parse_failures': parse_failures,
         'regime_markers': markers,
         'per_project': per_project,
+        # ``all`` — the completeness diagnostic an operator reads.
+        'archives_present': all(reached),
+        # ``any`` — the cache predicate; see archive_scan_succeeded.
+        'archives_reached': any(reached),
     }
+
+
+def archive_scan_succeeded(payload: dict) -> bool:
+    """Did this scan reach any escalation archive at all?
+
+    The cacheability predicate for the analytics route's TTL cache
+    (``cache_ok=archive_scan_succeeded``).  False for exactly one payload: the
+    one built without reaching a single archive, where every configured
+    ``escalations_dir`` failed its :meth:`Path.is_dir` check and nothing was
+    walked.  That is O(1) to recompute — one negative stat per project — so
+    re-deriving it on every poll costs nothing, while caching it keeps the tab
+    reporting an empty archive for a full TTL window after the volume mounts.
+
+    A PARTIAL scan is cacheable, and that is the whole point of keying on
+    ``archives_reached`` (``any``) rather than ``archives_present`` (``all``):
+    the ordinary multi-project config has roots that have simply never
+    escalated, and one of those must not delete the cache sitting in front of
+    every other root's ~10k-record walk.  ``archives_present: False`` rides
+    along in the payload as the diagnostic and has no say here.  The accepted
+    trade-off is the narrow one: an archive that disappears mid-life leaves
+    that project's panel up to one TTL window stale.
+
+    Deliberately not keyed on ``parse_failures`` — that counts unparseable
+    RECORDS and is permanent for a corrupt file, so gating on it would defeat
+    the cache forever in front of the very walk it protects.
+
+    Reads through ``.get`` for the same reason
+    :func:`dashboard.data.memory_evals.root_scan_succeeded` does: it runs
+    inside the cache write path, where a partially-built or older-shaped
+    payload must degrade to "don't cache" rather than raise where a raise
+    would surface as a 500 on a 3s dashboard poll.
+    """
+    return bool(payload.get('archives_reached'))

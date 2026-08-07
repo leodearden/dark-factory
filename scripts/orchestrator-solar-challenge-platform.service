@@ -18,7 +18,11 @@ Type=simple
 WorkingDirectory=/home/leo/src/dark-factory
 # Gate startup on fused-memory's MCP port (8002) being live.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/solar-challenge-platform/orchestrator.yaml
+# --config MUST name the canonical `dark-factory-orchestrator.yaml` -- CLAUDE.md
+# calls it "the canonical, required filename" that the dashboard's escalation-URL
+# discovery keys on. The legacy `orchestrator.yaml` / `orchestrator-config.yaml`
+# spellings are a discovery fallback only; do NOT restore them here (task 3512).
+ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/solar-challenge-platform/dark-factory-orchestrator.yaml
 
 # Replicate PATH so verify subprocesses find their toolchain (a user service gets a minimal PATH).
 Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
@@ -30,6 +34,7 @@ Environment=ORCH_UNIT=orchestrator-solar-challenge-platform.service
 
 Restart=on-failure
 RestartSec=10
+RestartSteps=4
 RestartMaxDelaySec=60
 TimeoutStopSec=90
 TimeoutStartSec=300

@@ -60,6 +60,7 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+- `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_execution_class_section()}
 
@@ -401,11 +402,12 @@ reconstruction writes.
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
-`tasks_created` directly. If `task_id` is missing from the `resolve_ticket` response, \
+`tasks_created` directly. If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
+Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
-If the status is anything other than `created`/`combined`/`failed` but a `task_id` \
+If the status is anything other than `created`/`combined`/`failed`/`refused` but a `task_id` \
 is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.

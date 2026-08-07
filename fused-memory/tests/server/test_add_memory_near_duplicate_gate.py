@@ -12,7 +12,26 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fused_memory.config.schema import ProceduralTopicCluster
+# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
+# copied so the two suites cannot drift: an edit to the straddling note (e.g.
+# adding or removing a phrase hit) must move BOTH the matcher assertions there
+# and the whole-tool assertions here, instead of leaving one silently
+# exercising a different scenario (task 3054, reviewer: duplication).
+#
+# The bare import resolves because fused-memory/tests/conftest.py inserts the
+# tests dir onto sys.path (the same mechanism that makes `from _fm_helpers
+# import X` work), and pytest loads a conftest by PATH regardless of import
+# mode. Do NOT reason about this from pytest's rootdir/prepend behaviour: the
+# repo-root pyproject.toml sets `--import-mode=importlib`, under which a test
+# file's own directory is NOT put on sys.path, so a root-bound run would fail
+# at collection without that insert. Verified green under -n0, under xdist,
+# standalone, and root-bound via `pytest -c pyproject.toml` from the repo root.
+from test_config_schema import (
+    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
+    STRADDLING_WRITE_FIXTURE,
+)
+
+from fused_memory.config.schema import ProceduralTopicCluster, ReconciliationConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.tools import create_mcp_server
@@ -745,4 +764,144 @@ class TestAddMemoryTopicClusterGate:
             f'Master kill-switch must disable the topic gate; got: {result!r}'
         )
         mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+
+class TestAddMemorySufficientPhraseGate:
+    """End-to-end: a sufficient-phrase block reaches a real add_memory call (task 3054).
+
+    Unlike every class above, this wires the REAL shipped cluster seed
+    (``ReconciliationConfig().procedural_knowledge_topic_guard_clusters``)
+    rather than the synthetic ``_topic_cluster()``, so the clusters agents
+    actually hit in production are exercised through the whole tool path.
+
+    The content is the reconstructed straddling-write fixture IMPORTED from
+    ``tests/test_config_schema.py`` -- one distinct phrase in each of three
+    clusters, which under count-only matching was blocked by none. Importing
+    rather than copying keeps this end-to-end assertion and the pure-matcher
+    assertions pinned to the same scenario.
+    """
+
+    STRADDLING_CONTENT = STRADDLING_WRITE_FIXTURE
+
+    @staticmethod
+    def _configure_real_clusters(mock_service: AsyncMock) -> None:
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=(
+                ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_straddling_write_is_blocked_before_the_cosine_search(self):
+        """The headline fix, end to end: blocked, routed, and no embedding round-trip."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Expected the straddling write to be blocked, got: {result!r}'
+        )
+        assert (
+            result.get('topic_id') == 'architect-report-task-already-done-main-reachability'
+        ), f'Expected routing to the report_task_already_done gate, got: {result!r}'
+        # A SINGLE-element list, deliberately shorter than the cluster's
+        # min_phrase_hits=2: a sufficient-phrase block reports exactly what
+        # fired, which is what makes the routing unambiguous.
+        assert result.get('matched_phrases') == ['report_task_already_done'], (
+            f'Expected only the sufficient phrase reported, got: {result!r}'
+        )
+        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        # The topic guard is deterministic and must short-circuit BEFORE the
+        # cosine round-trip, exactly as the count-only path already does.
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_near_duplicate_override_still_bypasses_a_sufficient_block(self):
+        """The new match arm must not bypass the existing escape hatch."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+                'metadata': {'allow_near_duplicate': True},
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Override must bypass a sufficient-phrase block; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_agent_still_exempt_from_a_sufficient_block(self):
+        """Stage-1 consolidation writes the canonical entry, which contains the phrase."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'recon-stage agents must stay exempt; got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_note_still_falls_through_to_the_cosine_path(self):
+        """Negative control against the REAL seed: sufficiency must not over-fire."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': MERGE_BASE_NEGATIVE_CONTROL_NOTE,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'A plain git-ancestry note must not be blocked; got: {result!r}'
+        )
+        mock_service.search.assert_called_once()
         mock_service.add_memory.assert_called_once()

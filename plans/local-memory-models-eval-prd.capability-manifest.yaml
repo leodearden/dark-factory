@@ -1,0 +1,212 @@
+prd: plans/local-memory-models-eval-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3713
+  title: 'LME-α: serving substrate — candidate endpoints as systemd --user units,
+    VRAM budget, health check'
+  capabilities:
+  - name: serving-stacks-research-verified
+    binding: vLLM ≥0.26 structured outputs (json_schema/xgrammar) + llama.cpp json_object-only
+      MoE arm (#21228) + TEI/vLLM-pooling embeddings — research-verified 2026-08-05,
+      PRD appendix
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: external serving-stack capability; proven live by the health-check signal,
+        not a repo grep
+  - name: serving-units-and-health-script-committed
+    binding: capability→producer — α commits units + health script under scripts/local-model-serving/
+      carrying the resolved marker literal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval serving
+      paths:
+      - scripts/
+      expect: present
+- label: β
+  task_id: 3715
+  title: 'LME-β: llm.client_class knob + LLM/Mem0/reindex base_url + Mem0 dims plumbing
+    (default byte-identical)'
+  capabilities:
+  - name: openai-generic-client-in-wheel
+    binding: graphiti_core 0.28.2 llm_client/openai_generic_client.py:37; json_schema/json_object
+      response_format :111-128; forced-json_object selection is NOT a stock knob —
+      delivered by β itself (upstream of every arm)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: client_class
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: base-url-gaps-are-real-seams
+    binding: graphiti_client.py LLM construction omits base_url (embedder path passes
+      it — asymmetry confirms); mem0_client.py:138-170 and reindex.py:155-166 lack
+      base_url/dims
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'gap evidence is authoring-time; the anti-silent-fallback property (graphiti
+        #912 class) is bound by β''s mock-server integration test'
+- label: γ
+  task_id: 3716
+  title: 'LME-γ: duration_ms on backend_ops + per-write token usage in journal result_summary'
+  capabilities:
+  - name: journal-choke-point-and-token-tracker
+    binding: _journaled_backend_call services/memory_service.py:1302; wheel TokenUsageTracker
+      llm_client/token_tracker.py:55, client.py:84 self.token_tracker, graphiti.py:272
+      getter
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: duration_ms
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: present
+- label: δ
+  task_id: 3717
+  title: 'LME-δ: committed replay corpus — stratified real-episode sample, never conditioned
+    on incumbent outcome'
+  capabilities:
+  - name: episode-store-readable-and-corpus-committed
+    binding: ~2,635 dark_factory episodes measured read-only 2026-08-05; committed
+      manifest (ids + hashes + stratification + no-outcome-filter statement)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval corpus[-]manifest
+      paths:
+      - fused-memory/scripts/
+      expect: present
+- label: ε
+  task_id: 3718
+  title: 'LME-ε: arm-runner harness — ArmSpec + scratch-guard, replay engine, MetricsRecord,
+    instrument checks, INV-4 abort; boundary tests'
+  capabilities:
+  - name: reused-substrate-imported-not-forked
+    binding: shared/src/shared/memory_eval_metrics.py + fused-memory/scripts/memory_eval_retrieval_probe.py
+      + memory_eval_transcript_corpus.py all exist; GraphitiBackend construction path
+      reused (INV-5); probe-file split belongs to the eval-program lane (G4)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: import-not-fork is a review property; the harness's own boundary-test
+        matrix is the signal
+  - name: scratch-guard-rejection-built-and-bound
+    binding: rejection-mechanism — ^evalmem_[a-z0-9_]+$ constructor guard built by
+      ε; boundary test observes the typed rejection fire on group_id=dark_factory
+      (G6 branch 4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: evalmem_
+      paths:
+      - fused-memory/
+      expect: present
+- label: ζ
+  task_id: 3719
+  title: 'LME-ζ: incumbent control runs + committed pre-registration (margins derived
+    from measured variance)'
+  capabilities:
+  - name: margins-finite-by-construction
+    binding: margin_m = max(2·σ_control(m), floor_m) over two completed control replays;
+      latency envelope anchored to the 120s write timeouts (config.yaml queue block);
+      ordering enforced by DAG position + ε's preregistration_sha schema rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval preregistration
+      paths:
+      - plans/
+      expect: present
+- label: η
+  task_id: 3720
+  title: 'LME-η: LLM screening — all 4 candidates × small subset; survivors ≤3 per
+    pre-registered rule'
+  capabilities:
+  - name: screening-report-committed
+    binding: endpoints (α), harness (ε), survivor rule (ζ) all upstream; Phi-4 16K
+      prompt-fit measured in-task (Open Q2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval screening[-]report
+      paths:
+      - plans/
+      expect: present
+- label: θ
+  task_id: 3721
+  title: 'LME-θ: LLM full corpus replays (survivors, realistic concurrency) + comparison
+    report vs pre-registered margins'
+  capabilities:
+  - name: llm-axis-report-committed
+    binding: SEMAPHORE_LIMIT collision confirmed (config.yaml queue reads ${SEMAPHORE_LIMIT:3})
+      — harness sets graphiti concurrency without poisoning the product knob; one
+      code SHA per comparison (ArmSpec code_sha instrument check); preregistration_sha
+      schema-enforced by ε
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval llm[-]report
+      paths:
+      - plans/
+      expect: present
+- label: ι
+  task_id: 3722
+  title: 'LME-ι: embedding arms — re-embed frozen reference graph + Mem0 replica;
+    two index configurations; report'
+  capabilities:
+  - name: embedding-axis-report-committed
+    binding: reindex.py machinery (β adds base_url); frozen reference graph from ζ;
+      index recipe = upstream build_indices_and_constraints on evalmem_* ONLY (hazard);
+      with-indices proven different-in-fact by the fulltext-leg boundary row; probes
+      via E1 math + transcript corpus
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval embedding[-]report
+      paths:
+      - plans/
+      expect: present
+- label: λ
+  task_id: 3723
+  title: 'LME-λ: synthesis — apply pre-registered rules, commit two decision records
+    + memory writes, name warranted follow-up PRDs'
+  capabilities:
+  - name: llm-axis-decision-record-committed
+    binding: applies ζ's pre-registered rule to θ's report; commits the LLM-axis decision
+      record + decisions_and_rationale memory write; names (never files) the warranted
+      follow-up PRD
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval decision[-]llm
+      paths:
+      - plans/
+      expect: present
+  - name: embedding-axis-decision-record-committed
+    binding: applies ζ's pre-registered rule to ι's report; commits the embedding-axis
+      decision record + decisions_and_rationale memory write; names (never files)
+      the warranted follow-up PRD
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-memory-models-eval decision[-]embedding
+      paths:
+      - plans/
+      expect: present
+- label: μ
+  task_id: 3725
+  title: 'LME-μ: operator gate — Leo''s per-axis ruling (deterministic pure gate,
+    the 3634/2864 shape)'
+  capabilities:
+  - name: operator-ruling-recorded
+    binding: born-at-L2 escalation presents λ's two decision records; resolution text
+      records Leo's per-axis ruling verbatim; the ruling gates authoring of the follow-up
+      PRDs
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an escalation resolution is not greppable on the committed tree

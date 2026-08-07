@@ -128,7 +128,19 @@ class DashboardConfig:
 
     host: str = '127.0.0.1'
     port: int = 8080
-    project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
+    # Derived from cwd, never a hardcoded absolute path (task 3503): a literal
+    # silently pointed every un-configured consumer on every other host at one
+    # developer's checkout.
+    #
+    # Production behaviour is UNCHANGED because of a two-sided contract, and the
+    # units are the load-bearing half: both dashboard/dark-factory-dashboard.service
+    # and scripts/dashboard.service.template pin WorkingDirectory to the repo root
+    # and neither sets DASHBOARD_PROJECT_ROOT, so cwd resolves to exactly what the
+    # literal returned.  A future edit that drops or changes WorkingDirectory
+    # therefore silently relocates every derived DB path (burndown, metrics, runs,
+    # escalations, memory-evals) — from_env() logs the cwd-derived root at INFO so
+    # that relocation is at least visible in the journal.
+    project_root: Path = field(default_factory=Path.cwd)
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
@@ -238,7 +250,24 @@ class DashboardConfig:
 
     @classmethod
     def from_env(cls) -> DashboardConfig:
-        """Create config with DASHBOARD_-prefixed env var overrides."""
+        """Create config with DASHBOARD_-prefixed env var overrides.
+
+        When ``DASHBOARD_PROJECT_ROOT`` is unset, the cwd-derived fallback root
+        (see the ``project_root`` field) is logged at INFO — read off the
+        CONSTRUCTED config, so the journal always names the root the databases
+        actually hang off — instead of being an invisible default.
+
+        INFO and not WARNING, deliberately: the canonical deployment relies on
+        the cwd path BY DESIGN — the systemd units pin ``WorkingDirectory`` on
+        purpose — so a WARNING would be crying wolf on the supported
+        configuration, unlike the ``_discover_escalation_urls`` WARNINGs in this
+        same module, which flag genuinely degraded states.  INFO still surfaces
+        the root in ``journalctl`` at uvicorn's default log level.
+
+        ``from_env()`` is called once per process (app.py's ``lifespan``,
+        ``__main__.py``), so this is one line per process lifetime — never per
+        request.
+        """
         kwargs: dict = {}
         if (host := os.environ.get('DASHBOARD_HOST')) is not None:
             kwargs['host'] = host
@@ -250,4 +279,20 @@ class DashboardConfig:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
             kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
-        return cls(**kwargs)
+
+        config = cls(**kwargs)
+        if root is None:
+            # Log the CONSTRUCTED project_root, never a re-derivation of it.
+            # The fallback is `default_factory=Path.cwd` plus __post_init__'s
+            # .resolve(); re-computing `Path.cwd().resolve()` here would be a
+            # second copy of that derivation, and any future change to how the
+            # fallback root is computed (walking up to the repo root, honouring
+            # a different var) would silently make this line name a path the
+            # process is not actually using — in a message whose entire job is
+            # to be the one observable record of a silently-relocated data root.
+            logger.info(
+                'DASHBOARD_PROJECT_ROOT unset — using cwd-derived project_root %s '
+                '(all database paths are derived from it)',
+                config.project_root,
+            )
+        return config

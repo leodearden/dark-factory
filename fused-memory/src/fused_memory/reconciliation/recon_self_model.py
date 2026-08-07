@@ -257,7 +257,11 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed', 'task_id'?: ..., 'reason'?: ...}"
+        "{'status': 'created'|'combined'|'failed'|'refused', 'task_id'?: ..., "
+        "'reason'?: ...}  "
+        '# refused = a deterministic guard rejected the candidate: NO task was '
+        'created and NO task_id key is present. Terminal and intended; never '
+        'retry it and never record a task id for it.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '

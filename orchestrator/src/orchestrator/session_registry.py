@@ -342,6 +342,18 @@ class DecisionRecord:
         filer doesn't supply one or the record predates this field; ''
         falls back to the scoring defaults.severity weight rather than
         raising or coercing to a recognized value.
+    escalations_dir: the source escalation QUEUE this record's
+        ``escalation_id`` belongs to, stored as a normalized absolute path
+        (see normalize_escalations_dir). Needed because DecisionRecords are
+        FLEET-GLOBAL while an escalation id (``esc-<taskid>-<n>``) is unique
+        only WITHIN one queue, and a single project can run more than one --
+        dark_factory runs ``data/escalations`` and
+        ``data/reconciliation/escalations`` over the same id namespace, so
+        without this second axis the reap-decisions reaper can close one
+        watcher's decision against an unrelated same-named escalation in the
+        other queue (task 3528). Defaults to '' (unknown/legacy -- a record
+        filed before this field existed, or by a caller that didn't supply
+        it), which makes the reaper fall back to project-only scoping.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -367,6 +379,7 @@ class DecisionRecord:
     manual_boost: int = field(default=0, kw_only=True)
     state: str = field(default=DecisionState.OPEN, kw_only=True)
     severity: str = field(default='', kw_only=True)
+    escalations_dir: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -381,6 +394,7 @@ class DecisionRecord:
             'manual_boost': self.manual_boost,
             'state': str(self.state),
             'severity': self.severity,
+            'escalations_dir': self.escalations_dir,
         }
 
     @classmethod
@@ -397,6 +411,11 @@ class DecisionRecord:
             manual_boost=data.get('manual_boost', 0),
             state=data.get('state', DecisionState.OPEN),
             severity=data.get('severity', ''),
+            # `or ''` (not a plain .get default): a missing key AND an
+            # explicit null both collapse to the one falsy sentinel, so the
+            # `str` annotation stays honest against a hand-edited record and
+            # the reaper's queue guard needs no None-vs-''-vs-missing branch.
+            escalations_dir=data.get('escalations_dir') or '',
         )
 
     def to_json(self) -> str:
@@ -489,15 +508,45 @@ def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
     return sessions_dir(root) / slug / 'record.json'
 
 
-def transcript_path_for_cwd(cwd: str) -> str:
-    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` encoding.
+def encode_cwd(cwd: str) -> str:
+    """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
-    Both ``/`` and ``.`` map to ``-`` (confirmed against a real
-    ``~/.claude/projects/`` directory; PRD §3). This is read-only enrichment
-    metadata — never used as a lookup key by this module.
+    THE authoritative statement of the rule; every other copy in this repo
+    is a mirror of this one and is pinned to it by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``.
+
+    ``/``, ``.`` and ``_`` all map to ``-``. ``-`` passes through unchanged.
+    CASE IS PRESERVED — there is no case-folding step (a live dir named
+    ``-opt-Auto-Claude-resources-backend`` proves it).
+
+    Validated against 738 real (encoded-dir, decoded-cwd) pairs sampled from
+    a live ``~/.claude/projects`` tree, which the rule reproduces exactly.
+    Over that sample the only non-alphanumeric characters appearing in ANY
+    cwd were ``- . / _``, so the rule is complete over the observed domain
+    and UNVERIFIED outside it — a cwd containing some other punctuation
+    character has never been measured, and this function's output for one is
+    a guess. Extend the sample before extending the rule (task 3272).
+
+    Returns the BARE dir name, no ``~/.claude/projects/`` prefix — see
+    :func:`transcript_path_for_cwd` for the display-path form.
     """
-    encoded = cwd.replace('/', '-').replace('.', '-')
-    return f'~/.claude/projects/{encoded}'
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
+
+
+def transcript_path_for_cwd(cwd: str) -> str:
+    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` path.
+
+    Delegates the encoding to :func:`encode_cwd` (``/``, ``.`` and ``_`` all
+    map to ``-``; case preserved), which carries the authoritative statement
+    of the rule and the record of what it was measured against — 738 real
+    (encoded-dir, decoded-cwd) pairs from a live ``~/.claude/projects`` tree.
+
+    This is read-only enrichment metadata — never used as a lookup key by
+    this module. Note that OTHER modules do use the encoding as a lookup key
+    (``scripts/legibility/check_transcript_persistence.py``), so its exactness
+    is load-bearing beyond this file.
+    """
+    return f'~/.claude/projects/{encode_cwd(cwd)}'
 
 
 _DECISION_ID_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
@@ -830,6 +879,42 @@ _ESCALATION_ARCHIVE_SUBDIR = 'archive'
 this module is deliberately stdlib-only with no intra-orchestrator imports
 (see module docstring), so it cannot import escalation.archive directly.
 Kept in sync by hand with that constant."""
+
+
+def normalize_escalations_dir(value: str | Path) -> str:
+    """The ONE canonical spelling of an escalation-queue path (task 3528).
+
+    Both sides of the (fleet-global decisions <-> per-queue escalations) join
+    run their queue path through this helper: the ``write-decision`` verb
+    stamps the normalized form onto ``DecisionRecord.escalations_dir``, and
+    the ``reap-decisions`` verb normalizes both its own ``--escalations-dir``
+    and the decision's stored value before comparing them. Routing both
+    through one function is what makes ``data/../data/escalations/``, a
+    ``~``-relative spelling and a plain absolute path all compare EQUAL --
+    a raw string compare would silently fail open and reintroduce the
+    cross-queue false-closure bug this scoping exists to prevent.
+
+    Returns ``''`` -- the "unset/legacy queue" sentinel, never a path -- for
+    an empty or whitespace-only *value*, mirroring the sibling
+    ``DecisionRecord.severity`` convention; the reaper reads that sentinel as
+    "fall back to project-only scoping". Otherwise returns
+    ``str(Path(raw).expanduser().resolve())``. ``Path.resolve()`` is
+    non-strict on Python 3.11+, so a well-formed queue path that does not
+    exist yet still normalizes rather than faulting.
+
+    Stdlib-only and fail-soft: never raises. A value the OS cannot resolve
+    (an embedded NUL, an unreadable cwd) degrades to the stripped raw string,
+    which simply matches no real queue -- the fail-OPEN direction, leaving a
+    decision visible to the human rather than risking a false close. Keeps
+    this module's no-intra-orchestrator-imports rule (see module docstring).
+    """
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return raw
 
 
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
@@ -2221,6 +2306,7 @@ def _run_write_decision(
     escalation_id: str | None,
     session_id: str | None,
     severity: str = '',
+    escalations_dir: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -2236,6 +2322,14 @@ def _run_write_decision(
     critical|urgent) onto the record so the cockpit decision queue can
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
+
+    ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
+    to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
+    passes the SAME queue dir it later reaps with, so this fleet-global
+    decision can be joined back to the right per-queue escalation-id
+    namespace: ids are unique only within one queue, and a project may run
+    several (task 3528). Omitting it stores '' and keeps today's
+    project-only-scoped reaper behaviour, so no existing caller breaks.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -2259,6 +2353,7 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
         severity=severity,
+        escalations_dir=normalize_escalations_dir(escalations_dir),
     )
     if write_decision(record):
         print(record.id)
@@ -2268,14 +2363,43 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
-    reap_answered_decisions: a decision belonging to a DIFFERENT project is
-    left alone (returns None -- unresolved), since DecisionRecords are
-    fleet-global (``~/.claude/fleet/decisions/``) but escalations are
-    per-project (``<project_root>/data/escalations``); otherwise defers to
-    read_escalation_status against *escalations_dir*. Project-scoping this
-    way makes the (global decisions <-> per-project escalations) join
-    correct without fragile project_id -> path auto-discovery. Root
+    reap_answered_decisions. The (fleet-global decisions <-> per-queue
+    escalations) join is scoped on TWO axes, and a decision failing either
+    one is left alone (returns None -- unresolved):
+
+    1. PROJECT. DecisionRecords are fleet-global
+       (``~/.claude/fleet/decisions/``) but escalations are per-project
+       (``<project_root>/data/escalations``), so a decision belonging to a
+       DIFFERENT project is skipped. Scoping this way keeps the join correct
+       without fragile project_id -> path auto-discovery.
+    2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
+       only WITHIN one queue, and a project can run several: dark_factory
+       runs ``data/escalations`` (orchestrator) and
+       ``data/reconciliation/escalations`` (recon watcher) over the SAME id
+       namespace. Project scoping alone therefore let either watcher's
+       reaper resolve the OTHER watcher's decisions against its own queue --
+       observed with ``esc-3036-1``, where an unrelated resolved
+       orchestrator escalation silently closed a still-pending recon
+       blocking gate, which then sat invisible in the cockpit for ~7 days
+       (15 ids were resolved in both queues at time of measurement). So a
+       decision stamped with a queue OTHER than *escalations_dir* is
+       skipped. Both sides go through normalize_escalations_dir, including
+       the decision's own stored value, so equivalent spellings match and a
+       hand-written record is compared honestly rather than fail-open.
+
+    A decision carrying NO queue (``escalations_dir == ''`` -- every record
+    filed before that field existed) falls back to axis 1 alone, keeping
+    today's exact behaviour for the existing population rather than changing
+    it under the human; the two watchers stamp the queue on newly-filed
+    decisions, so the unprotected set only shrinks. Otherwise the closure
+    defers to read_escalation_status against *escalations_dir*. Root
     resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    Both guards are fail-OPEN: on any doubt the decision stays OPEN and
+    visible in the cockpit queue, matching reap_answered_decisions' contract
+    that any status not in DECISION_CLOSE_MAP leaves a decision OPEN. The
+    asymmetry of harm is the reason -- an over-held decision is a
+    human-triageable row, while a falsely closed one is invisible.
 
     A watcher runs this once per Main Loop cycle (SKILL.md "Closing parked
     decisions on resolve") so a decision it (or anyone -- /unblock, an L2
@@ -2283,6 +2407,7 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     resolved/dismissed. Prints one ``f'{id} {new_state}'`` line per closed
     decision, mirroring `write-decision` printing the filed id.
     """
+    reaper_dir = normalize_escalations_dir(escalations_dir)
 
     def _status(decision: DecisionRecord) -> str | None:
         if decision.project != project:
@@ -2295,6 +2420,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
             # call below (typed to take a `str`) and stays correct if this
             # closure is ever invoked from elsewhere.
             return None
+        # Axis 2: normalize the decision's OWN stored value at compare time
+        # too, not just at write time -- a raw compare would fail open for
+        # any record write-decision did not produce (hand-repaired, migrated
+        # between checkouts, or written by a future caller), and a false
+        # NON-match is how silent divergence creeps back in.
+        decision_dir = normalize_escalations_dir(decision.escalations_dir)
+        if decision_dir and decision_dir != reaper_dir:
+            return None
+        # RAW escalations_dir here, deliberately: only the comparison needs a
+        # canonical spelling; the read keeps using exactly what the caller
+        # passed.
         return read_escalation_status(escalations_dir, decision.escalation_id)
 
     for reaped in reap_answered_decisions(escalation_status=_status):
@@ -2362,6 +2498,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default='',
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
+    write_decision_p.add_argument(
+        '--escalations-dir',
+        default='',
+        help=(
+            "the escalation queue dir this decision's --escalation-id belongs to; "
+            'scopes the reaper (see reap-decisions)'
+        ),
+    )
 
     reap_decisions_p = sub.add_parser(
         'reap-decisions',
@@ -2412,6 +2556,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.escalation_id,
                 args.session_id,
                 args.severity,
+                args.escalations_dir,
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)

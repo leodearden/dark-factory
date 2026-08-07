@@ -377,12 +377,22 @@ print(render_protect_glob(default_protected_prefixes(band), owned=sys.argv[1:]))
 #
 #     glob="$(lane_protect_glob _lane- _spec-)" || glob="$LANE_PROTECT_GLOB_FALLBACK"
 #
-# NOTE: as of leaf β there is NO in-tree consumer — this function and
-# LANE_PROTECT_GLOB_FALLBACK ship ahead of the caller that uses them. The
-# intended callers (warm-lane-gc.sh / warm-lane-gc-sweep.sh, wired by leaf γ,
-# which owns those files) run `set -euo pipefail`, so a caller that FORGETS the
-# `||` will abort on the non-zero return rather than sweep with an empty glob.
-# That is a property of γ's wiring, not something validated in situ here.
+# THE CONSUMER: warm-lane-gc.sh's PROTECT_GLOB default (task 3292), which calls
+# exactly the line above. It is the only one, and one is enough —
+# warm-lane-gc-sweep.sh carries no protect glob of its own and never has (its
+# terminal `exec "$GC_SCRIPT" "${args[@]}"` passes `reclaim --mount …` plus an
+# optional `--disk-pressure`), so it INHERITS gc.sh's resolution transitively.
+# Wiring it too would double the render cost on the one path that runs from a
+# systemd timer, for no behaviour change; it is deliberately not a caller.
+#
+# The `||` contract above is therefore an OBSERVED behaviour now, not a claim:
+# Block X-degrade in orchestrator/tests/warm-lane/test_warm_lane_gc.sh drives a
+# RELOCATED copy of gc.sh whose resolved repo root carries no dark-factory
+# checkout, so this function really does return non-zero there, and the block
+# asserts that gc.sh — which runs `set -euo pipefail` — degrades to
+# LANE_PROTECT_GLOB_FALLBACK with exactly one [warn] instead of aborting its
+# sweep. A future caller that FORGETS the `||` still aborts; that hazard is
+# unchanged, it is just no longer unexercised in-tree.
 lane_protect_glob() {
     # One guard for both root failures — an unresolvable root and a resolved root
     # that is not a dark-factory checkout are the same thing to a caller

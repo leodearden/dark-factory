@@ -3324,10 +3324,15 @@ class ReconciliationHarness:
     ) -> None:
         """Escalate a sustained task_count_snapshot write-cadence gap.
 
-        Reads *run*'s Stage-2 freshness stat (``task_count_snapshot_written``,
-        already computed by ``TaskKnowledgeSync.run()``'s post-flight check);
-        only a CONFIRMED current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  The prior
+        Reads *run*'s Stage-2 freshness stat
+        (``task_count_snapshot_mem0_written``, already computed by
+        ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
+        current miss (``False`` — not a fresh write and not an
+        inconclusive/unknown check) is eligible to escalate.  Journal rows
+        persisted before the task-3045 rename carry the old
+        ``task_count_snapshot_written`` spelling and are still honored, via
+        ``extract_snapshot_written``'s legacy-key fallback — without it the
+        streak below would stop dead at the first pre-rename row.  The prior
         consecutive-miss streak is recomputed each call from
         ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
         journal-recompute pattern — rather than a stored counter, so it

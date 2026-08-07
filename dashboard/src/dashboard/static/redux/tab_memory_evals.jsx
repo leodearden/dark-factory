@@ -1,11 +1,23 @@
 /* tab_memory_evals.jsx — memory-eval monitoring section, rendered INSIDE the
    Memory tab (PRD DD3: not a thirteenth top-level tab, no Rail entry).
 
-   No JS test runner in this project (see scheduler_drawer.jsx comment).
-   Wiring contracts are verified via Python source-assertion tests in
-   dashboard/tests/test_tab_memory_evals.py.
+   The JSX/React wiring here is verified via Python source-assertion tests in
+   dashboard/tests/test_tab_memory_evals.py — no JSX runner exists (this file
+   is transformed by CDN Babel at runtime and the repo has no node_modules).
+   The pure, JSX-free logic that used to live here was moved to
+   /static/redux/memory_evals_fmt.js (task 3481) so it could escape that
+   limitation; WHY, in full, is in that file's header, which is the one place
+   that account is kept.
 
-   LOAD ORDER IS THE CONTRACT — this file must load BEFORE tabs.jsx.
+   LOAD ORDER IS THE CONTRACT, in both directions.
+
+   UPSTREAM — memory_evals_fmt.js must load BEFORE this file, because the
+   destructure of window.DF_MEMORY_EVALS_FMT below runs at module top level.
+   A later tag leaves that global undefined here, which throws, which leaves
+   window.DF_MEMORY_EVALS undefined for tabs.jsx, which blanks every tab
+   defined there — the downstream contract below, one link back.
+
+   DOWNSTREAM — this file must load BEFORE tabs.jsx.
    tabs.jsx destructures window.DF_MEMORY_EVALS at module top level (the
    tab_scheduler.jsx:15 / window.DF_SCHED_HEATMAP precedent), so a later tag
    would leave the global undefined at tabs.jsx evaluation time, throw, and
@@ -18,141 +30,46 @@
    contract.  This file CONSUMES the server's judgments; it never re-derives
    them.  In particular nothing here compares a metric value against a limit.
 
-   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge }
+   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection }
+   (chartForKind and verdictBadge were exported here only so the Python suite
+   could see them; they are owned by window.DF_MEMORY_EVALS_FMT now, and
+   re-exporting them would create two paths to one function.  tabs.jsx, the
+   only real consumer, destructures MemoryEvalsSection alone.)
 */
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
+// ME-prefixed like the two lines above.  The prefix is a readability
+// convention here, NOT a collision workaround: this file is a
+// `type="text/babel"` .jsx, and Babel-standalone downlevels .jsx top-level
+// bindings so they never join the classic-script shared global lexical scope.
+// That is an observed fact, not an assumption — tabs.jsx, tab_escalations.jsx
+// and tab_escalation_analytics.jsx each already declare their own top-level
+// `const DF` / `useOpenSet` / `usePersistedState` and all render fine.  See the
+// SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs before
+// "fixing" this.
+const { useState: MEuS } = React;
 
-// ── Chart primitive per metric kind (PRD open question 1) ──
+// The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481); their
+// behavioural suite is dashboard/tests/js/memory_evals_fmt.test.mjs.
+// index.html loads that classic script before this file, exactly as this file
+// loads before tabs.jsx.
 //
-// The payload's kind vocabulary is exactly {tripwire, proportion, count,
-// scalar}.  A kind outside that set is a RENDERING gap, not a data error: the
-// builder passes the value through verbatim and files an `unknown_kind` issue
-// for it.  So the fallback is `null` — value only, NO chart.  Guessing a
-// primitive would render an unvalidated shape as though it were understood.
-function chartForKind(kind) {
-  if (kind === 'tripwire') return MEStep;   // step-shaped item counts
-  if (kind === 'proportion') return MESpark;
-  if (kind === 'count') return MESpark;
-  if (kind === 'scalar') return MESpark;
-  return null;
-}
+// NOTE `chartForKind` returns a TAG ('step' | 'spark' | null), NOT a component
+// — see its comment in memory_evals_fmt.js.  ME_CHART_BY_TAG below is the
+// two-entry lookup that turns the tag back into a primitive.
+const {
+  chartForKind,
+  trendGaps,
+  dash,
+  ageText,
+  verdictBadge,
+  unmatchedReasonText,
+} = window.DF_MEMORY_EVALS_FMT;
 
-// Count the deliberate holes in a trend series.  A `null` in `trend.values`
-// means that run produced no sample.
-//
-// The array is handed on UNMODIFIED — dropping a hole would shift this
-// metric's points against every other metric's, since all series share the
-// run_stamps x-axis.  But charts.jsx's primitives cannot REPRESENT a hole:
-// `Sparkline` (:42-53) and `StepSpark` (:66-90) have no null handling at all —
-// `Math.max(...values, 1)`, `Math.min(...values, 0)` and
-// `y = height - ((v - min) / range) * height` all coerce `null` to 0 — so a
-// hole would be drawn as a real data point at value 0, connected by a line
-// segment to its neighbours.  For a `proportion` metric sitting at 0.95 that
-// is a plunge to the chart floor and back, visually identical to a genuine
-// regression to zero.  Nor is "the baseline" even a safe place for it: 0 is
-// the floor only when `min` happens to be 0; with any negative value in the
-// series the fabricated point lands mid-chart.
-//
-// So a holed series is NOT DRAWN (see `plottable` below) and the gap count is
-// disclosed in text instead.  This is the same invariant `dash()` states for
-// scalars — a synthetic zero reads as a measured zero — applied to the trend
-// column.  Teaching the shared primitives to skip nulls is the systemically
-// better fix, but it is untestable in this toolchain (JSX, CDN Babel, no
-// node_modules) and they are on five other tabs' render paths; that repair is
-// filed as a separate follow-up.
-function trendGaps(values) {
-  if (!values) return 0;
-  let gaps = 0;
-  for (let i = 0; i < values.length; i++) {
-    if (values[i] === null || values[i] === undefined) gaps += 1;
-  }
-  return gaps;
-}
-
-// Missing scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
-// measured zero.  Same placeholder the Memory tab already uses (tabs.jsx:589).
-function dash(v) {
-  if (v === null || v === undefined) return '\u2014';
-  return v;
-}
-
-// Compact age from `latest_run_age_seconds`.  Display only — the staleness
-// THRESHOLD lives server-side and is deliberately absent from the payload, so
-// nothing here can re-derive `stale`.
-function ageText(seconds) {
-  if (seconds === null || seconds === undefined) return '\u2014';
-  const h = seconds / 3600;
-  if (h < 1) return `${Math.round(seconds / 60)}m ago`;
-  if (h < 48) return `${Math.round(h)}h ago`;
-  return `${Math.round(h / 24)}d ago`;
-}
-
-// ── Verdict badge ──
-//
-// `verdict` and `parity` are the ONLY badge inputs.  Re-deriving alarm state
-// from value-vs-limit in the browser is forbidden by PRD section 8 (G6/INV-5):
-// memory_evals.py:660-661 says `parity` exists precisely so the UI does not
-// re-derive badge state "out of three separate fields, which is where the two
-// sides would drift apart".  This function therefore performs string equality
-// only — no arithmetic, no ordering comparison, no limits.
-//
-// The parity dimension REFINES the verdict; it never replaces it.  Where the
-// two agree there is nothing extra to say, so `alarmed_open` and `clear` fall
-// through to the plain verdict badge.
-function verdictBadge(metric) {
-  const verdict = metric.verdict;
-  const parity = metric.parity;
-
-  // The plain verdict label is computed FIRST, so that no parity branch below
-  // can discard it.
-  //
-  // This ordering is load-bearing.  memory_evals.py:706-715 `_parity()` is a
-  // two-case lookup — `if verdict == 'alarm': ...; return 'recovered_open' if
-  // escalation else 'clear'` — so `recovered_open` is derived for EVERY
-  // non-alarm verdict that carries a linked escalation, not just `no_alarm`.
-  // `insufficient_data`, `grandfathered` and a null verdict all reach it.  A
-  // parity branch returning a bare 'recovered' label would therefore tell the
-  // operator that a metric which was never measured had recovered — the same
-  // "we did not measure" -> "we measured and it is fine" substitution the
-  // absent-verdict fall-through exists to prevent, and worse, because it
-  // asserts a recovery rather than merely a clean bill of health.
-  //
-  // Absent is absent: a null/unrecognised verdict labels itself, and is NEVER
-  // defaulted to no_alarm (mirrors memory_evals.py:847-849).
-  let base = 'no verdict';
-  let cls = 'badge muted';
-  if (verdict === 'alarm') {
-    base = 'alarm';
-    cls = 'badge bad';
-  } else if (verdict === 'no_alarm') {
-    base = 'no_alarm';
-    cls = 'badge ok';
-  } else if (verdict === 'grandfathered') {
-    base = 'grandfathered';
-    cls = 'badge info';
-  } else if (verdict === 'insufficient_data') {
-    base = 'insufficient_data';
-    cls = 'badge muted';
-  }
-
-  // Parity states that carry information the verdict alone does not.  Each
-  // REFINES the base label by suffixing it; none replaces it.  `alarmed_unlinked`
-  // and `storm_collapsed` are only reachable when verdict === 'alarm', so those
-  // read as "alarm · ..." as before — composing rather than hard-coding just
-  // keeps them honest if the producer's derivation ever widens.
-  if (parity === 'recovered_open') {
-    return { cls: 'badge warn', label: base + ' · escalation open' };
-  }
-  if (parity === 'alarmed_unlinked') {
-    return { cls: 'badge bad', label: base + ' · no escalation' };
-  }
-  if (parity === 'storm_collapsed') {
-    return { cls: 'badge bad', label: base + ' · storm-collapsed' };
-  }
-  // parity 'alarmed_open' / 'clear' agree with the verdict — plain badge.
-  return { cls: cls, label: base };
-}
+// Tag -> chart primitive.  An unknown kind yields the `null` tag, which misses
+// this table and leaves `Chart` null, preserving the `plottable` truthiness
+// gate below: value only, NO chart.
+const ME_CHART_BY_TAG = { step: MEStep, spark: MESpark };
 
 // ── Escalation link ──
 //
@@ -191,13 +108,32 @@ function EscalationLink({ escalation, onNavigate }) {
 function MemoryEvalMetricRow({ metric, onNavigate }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
-  const Chart = chartForKind(m.kind);
+  const Chart = ME_CHART_BY_TAG[chartForKind(m.kind)] || null;
   const gaps = trendGaps(trend.values);
+  // An EMPTY series is not a drawable series: both Sparkline and StepSpark
+  // return null for a zero-length array, so without this count a metric with
+  // no runs renders a blank 26px box.  `trendGaps([])` is 0, so the gap check
+  // alone cannot tell the two apart.
+  //
+  // `points` is the ONE series count in this row — the chart gate, the gap
+  // disclosure and the footer all read it.  Measuring the state from
+  // trend.values and the footer from trend.labels would let a payload where
+  // they disagree render the contradictory pair "no runs yet" next to "N pts",
+  // which is exactly the reads-as-a-bug outcome the no-runs state was added to
+  // prevent, one line further down.
+  const labels = trend.labels || [];
+  const points = (trend.values || []).length;
+  // labels and values are PARALLEL arrays — one entry per run, both built from
+  // the same `runs` list server-side (memory_evals.py:955,993).  A payload
+  // where they disagree cannot be reconciled here: neither length is more
+  // authoritative, the chart would be drawn against a `span` title derived from
+  // the other array, and the gap message would print "1 of 0 runs".  It gets
+  // its own named state rather than a silently-picked winner.
+  const seriesMismatch = labels.length !== points;
   // A series with a hole cannot be drawn honestly by charts.jsx (see
   // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
   // anything from a threshold.
-  const plottable = Chart && gaps === 0;
-  const labels = trend.labels || [];
+  const plottable = Chart && gaps === 0 && points > 0 && !seriesMismatch;
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
@@ -234,7 +170,8 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
             </div>
           )}
         {/* Fingerprints are rendered whole — never parsed. They are the
-            producer's private construction (memory_evals.py:576-579). */}
+            producer's private construction
+            (memory_evals._escalation_projection()). */}
         {m.fingerprint && (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
             fp {m.fingerprint}
@@ -250,33 +187,78 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {/* Two DISTINCTLY worded suppression states, both reusing the
-            "no chart, value only" shape chartForKind already establishes:
-            an unknown kind is a rendering gap the payload files an
-            `unknown_kind` issue for, whereas a hole is normal, fully-explained
-            missing data.  Either way the row still shows value, current_value,
-            n, denominator, direction and the verdict badge — the operator
-            loses a 160px sparkline, never the signal. */}
+        {/* FOUR DISTINCTLY worded suppression states, all reusing the
+            "no chart, value only" shape chartForKind already establishes.
+            They assert different things and must not be collapsed:
+
+              * unknown kind — a RENDERING gap; the payload passes the value
+                through verbatim and files an `unknown_kind` issue for it.
+              * length disagreement — a MALFORMED payload: labels and values are
+                parallel arrays, so nothing else this cell could say about the
+                series would be trustworthy. Named, never silently reconciled
+                by picking one length over the other.
+              * holed series — normal, fully-explained MISSING DATA: some runs
+                produced no sample, and the count says how many.
+              * no runs — the metric simply has NOT BEEN MEASURED yet. Folding
+                this into the gap message would print "0 of 0 runs produced no
+                sample", a nonsense sentence that reads as a bug.
+
+            `!Chart` stays first: an unrenderable kind is the more actionable
+            fact than an empty or malformed series.  In every case the row still
+            shows value, current_value, n, denominator, direction and the
+            verdict badge — the operator loses a 160px sparkline, never the
+            signal. */}
         {plottable
           ? (
-            <div style={{ height: 26 }} title={span}>
+            <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
           )
           : !Chart
             ? (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+              <span
+                className="mono"
+                style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                data-testid="memory-eval-trend-no-kind"
+              >
                 no chart for kind {String(m.kind)}
               </span>
             )
-            : (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-                no chart — {gaps} of {labels.length} runs produced no sample
-              </span>
-            )}
+            : seriesMismatch
+              ? (
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                  data-testid="memory-eval-trend-mismatch"
+                >
+                  no chart — {labels.length} run labels but {points} samples
+                </span>
+              )
+              : points === 0
+                ? (
+                  <span
+                    className="mono"
+                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                    data-testid="memory-eval-trend-no-runs"
+                  >
+                    no runs yet — nothing to chart
+                  </span>
+                )
+                : (
+                  <span
+                    className="mono"
+                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                    data-testid="memory-eval-trend-gaps"
+                  >
+                    no chart — {gaps} of {labels.length} runs produced no sample
+                  </span>
+                )}
+        {/* Footer count reads `points`, the SAME local the states above are
+            derived from — never the labels array's own length, which would
+            contradict the no-runs state whenever the two arrays disagree. */}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-          {trend.labels ? trend.labels.length : 0} pts
+          {points} pts
           {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
         </div>
       </td>
@@ -286,32 +268,60 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
 
 // ── Limits provenance ──
 //
-// Collapsed by default (a <details>, open state persisted under
-// 'df.memevals.prov' in the useOpenSet/usePersistedState idiom of
-// tab_escalations.jsx:286) so provenance does not dominate the card.
+// Collapsed by default (a <details>, open state persisted in the
+// useOpenSet/usePersistedState idiom of tab_escalations.jsx:286) so provenance
+// does not dominate the card.
+//
+// The persisted key is PER EVAL — `df.memevals.prov.<eval_id>` — and the open
+// state is held in component state seeded from storage exactly once at mount.
+// Both halves matter, and both were once wrong:
+//
+//   * One shared key meant expanding ONE card's provenance wrote '1' for
+//     every card, so the next poll-driven re-render expanded all of them.
+//     A <details> open state is per-disclosure UI state; keying it on the
+//     section makes one operator's click read as a rendering bug everywhere
+//     else.
+//   * Calling the reader inside the JSX attribute (`open={readProvOpen()}`)
+//     re-ran a synchronous localStorage read on EVERY render — once per eval
+//     card per 3s poll tick — and made the toggle unrecoverable, since each
+//     poll overwrote whatever the operator had just opened.
+//
+// No migration off the old flat 'df.memevals.prov' key: a lost <details> open
+// state is a cosmetic default, not data.
 //
 // Everything here is DISPLAYED verbatim.  Nothing is compared, rounded into a
 // verdict, or re-derived — see the verdictBadge comment (PRD section 8,
 // G6/INV-5).  The label/value pairs are built as data rather than as JSX text
 // so the field names live in quoted strings, which also keeps the
 // no-comparison guard's member-access regex unambiguous.
-const ME_PROV_OPEN_KEY = 'df.memevals.prov';
+const ME_PROV_OPEN_PREFIX = 'df.memevals.prov';
 
-function readProvOpen() {
+function provOpenKey(evalId) {
+  return `${ME_PROV_OPEN_PREFIX}.${evalId}`;
+}
+
+// The key is a PARAMETER, not a closed-over module constant: that is what
+// makes one global key shared by every card structurally unrepresentable.
+function readProvOpen(key) {
   try {
-    return localStorage.getItem(ME_PROV_OPEN_KEY) === '1';
+    return localStorage.getItem(key) === '1';
   } catch (e) {
     return false;
   }
 }
 
-function writeProvOpen(open) {
+function writeProvOpen(key, open) {
   try {
-    localStorage.setItem(ME_PROV_OPEN_KEY, open ? '1' : '0');
+    localStorage.setItem(key, open ? '1' : '0');
   } catch (e) { /* private mode — the toggle simply does not persist */ }
 }
 
 function LimitsProvenance({ ev }) {
+  // ABOVE the `if (!lim)` early return below — that guard is a conditional
+  // return, so a hook placed after it would change the hook count on the first
+  // eval with no limits artifact (Rules of Hooks) and blank the card.
+  const provKey = provOpenKey(ev.eval_id);
+  const [provOpen, setProvOpen] = MEuS(() => readProvOpen(provKey));
   const lim = ev.limits;
   if (!lim) {
     return (
@@ -336,14 +346,17 @@ function LimitsProvenance({ ev }) {
     ['generator', lim.generator],
   ];
   return (
-    <details open={readProvOpen()} onToggle={e => writeProvOpen(e.target.open)}>
+    <details
+      open={provOpen}
+      onToggle={e => { setProvOpen(e.target.open); writeProvOpen(provKey, e.target.open); }}
+    >
       <summary className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', cursor: 'pointer' }}>
         limits provenance
       </summary>
       {/* The provenance may have been stamped at an earlier run than the one
           on screen.  Saying so is not optional: listed flatly, an older alpha
           reads as governing the newer displayed run
-          (memory_evals.py:237-241). */}
+          (memory_evals._read_limits() stamps `stale_for_latest_run`). */}
       {lim.stale_for_latest_run && (
         <div className="badge warn" style={{ margin: '4px 0' }}>
           provenance stamped at {lim.run_stamp} — does not govern{' '}
@@ -372,10 +385,11 @@ function LimitsProvenance({ ev }) {
 
 // ── Storm aggregate banner ──
 //
-// Reads the TOP-LEVEL storm_escape block (memory_evals.py:958-964), never the
-// copy repeated on an eval row: the top-level block is the single banner
-// source, so the UI never has to elect a row to read it from and the banner
-// survives a root with zero eval dirs.
+// Reads the TOP-LEVEL storm_escape block — declared on every return path by
+// memory_evals._empty_payload() and filled by memory_evals._build_payload() —
+// never the copy repeated on an eval row: the top-level block is the single
+// banner source, so the UI never has to elect a row to read it from and the
+// banner survives a root with zero eval dirs.
 function StormBanner({ storm, onNavigate }) {
   if (!storm) return null;
   return (
@@ -402,19 +416,6 @@ function StormBanner({ storm, onNavigate }) {
         )}
     </div>
   );
-}
-
-// ── Unmatched escalations ──
-//
-// Branched on `reason`, with distinct wording per value.  Collapsing the three
-// into one undifferentiated "unexplained" list would fire on escalations that
-// are in fact fully explained and train operators to ignore the one signal
-// that catches a real parity orphan (memory_evals.py:530-534).
-function unmatchedReasonText(reason) {
-  if (reason === 'no_matching_verdict') return 'no metric row explains this';
-  if (reason === 'storm_suppressed') return "explained, but this run's links are collapsed into the aggregate";
-  if (reason === 'no_fingerprint') return 'producer emitted no dedupe_fingerprint';
-  return `unrecognised reason: ${String(reason)}`;
 }
 
 function UnmatchedEscalations({ rows, onNavigate }) {
@@ -559,7 +560,7 @@ function MemoryEvalsSection({ onNavigate }) {
       )}
       {/* Two DISTINCT empty states. root_present false means the artifact tree
           does not exist yet; root_present true with zero evals is an
-          empty-but-healthy system (memory_evals.py:972-974). Sharing one
+          empty-but-healthy system (memory_evals._build_payload()). Sharing one
           message would report a working system as a broken one. */}
       {!payload.root_present && (
         <div className="col-span-12 empty" data-testid="memory-eval-empty">
@@ -588,4 +589,4 @@ function MemoryEvalsSection({ onNavigate }) {
   );
 }
 
-window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge };
+window.DF_MEMORY_EVALS = { MemoryEvalsSection };

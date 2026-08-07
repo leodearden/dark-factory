@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,8 +45,8 @@ from orchestrator.config import (
     load_config,
 )
 from orchestrator.delivered_checks import (
-    DeliveredChecksVerdict,
-    verify_delivered_checks_on_main,
+    DeliveredChecksBlock,
+    gate_mark_done_on_delivered_checks,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
 from orchestrator.deterministic_runner import (
@@ -956,7 +956,9 @@ class HarnessReport:
         return '\n'.join(lines)
 
 
-def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCallbackFactory:
+def build_train_callback_factory(
+    scheduler: Any, git_ops: Any = None, config: Any = None,
+) -> TrainCallbackFactory:
     """Build a per-train callback factory that captures the live scheduler.
 
     Returns a factory function ``factory(train_id) -> TrainCallbacks`` whose
@@ -973,8 +975,186 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
     ``_mark_member_done`` closures in ``workflow._maybe_enqueue_group_merge``
     should be retired so there is a single source of truth for train-callback
     semantics (synthesis logic, no-op guard, merged-provenance shape).
+
+    *config* (task 3057) arms the delivered-capability guard on the two
+    closures that STAMP: ``mark_member_done`` (``kind='merged'``) and
+    ``redrive_member``'s ``found_on_main`` arm. Both credit THIS member with a
+    landing that a SIBLING's merge produced — attribution by inference, which
+    is exactly what can be wrong. Two inert contracts keep the change
+    additive:
+
+    * ``config is None`` — the bare-worker construction used by every
+      pre-3057 caller and by this module's unit tests: guard fully inert,
+      zero added I/O, behavior byte-identical.
+    * ``git_ops is None`` — no way to resolve a main SHA to audit against.
+      Degrades INERT (proceed with the flip) rather than withholding every
+      train flip in a configuration that has always worked, mirroring this
+      factory's existing ``git_ops is None`` lane-release degradation. A
+      DEBUG line records it so the degradation is not silent.
+
+    A withheld flip RETURNS rather than RAISES. ``mark_member_done`` is
+    called from ``SpeculativeMergeWorker._do_train_merge``'s post-advance flip
+    loop, which collects raises into ``TRAIN_PARTIAL_FLIP``; a capability
+    withholding is NOT a partial-flip failure — the merge genuinely advanced
+    main, only this member's declared deliverable is unverifiable — and
+    raising would misclassify it and could bounce an otherwise-healthy train.
+    Returning matches the shape the existing "member has no scheduler task"
+    guard already uses, so the loop's contract is unchanged.
+
+    The withheld member is then REVERTED TO PENDING by
+    ``_revert_withheld_member`` and recovered by the scheduler's normal
+    dispatch. It is explicitly NOT left parked for the stranded sweep: a
+    member sits at ``'merge-deferred'`` here, which
+    :data:`_RECONCILE_SWEEP_STATUSES` excludes and
+    :meth:`Harness._reconcile_one_stranded` early-returns on, so the sweep
+    can never reach it — and :data:`_WARM_LANE_RECLAIM_PROTECTED_STATUSES`
+    contains that status too, so leaving it there would strand its warm lane
+    as well. The revert is safe precisely BECAUSE this seam fires after the
+    merge advanced main, so PRD § 9.8's "the worktree must survive for the
+    train-merge worker" rationale for the park has expired by this point.
+    Termination is guaranteed rather than assumed: a re-dispatched member
+    that re-implements and merges completes through
+    ``TaskWorkflow._finalise_merged_done``, which task 3057 design decision 2
+    deliberately leaves unguarded, so even a permanently-ERRORing check
+    descriptor cannot produce an infinite withhold/revert cycle.
     """
     from orchestrator.merge_queue import TrainCallbacks
+
+    async def _delivered_checks_withhold(
+        mid: str, *, site: str,
+    ) -> DeliveredChecksBlock | None:
+        """Non-``None`` => do NOT stamp *mid* done at this seam.
+
+        Returns the :class:`DeliveredChecksBlock` rather than a bool so the
+        caller's recovery log can name the REASON — an operator seeing a
+        member bounced back to pending needs to know whether a check FAILED
+        (the capability is genuinely absent) or the guard ERRORED (it could
+        not tell), because those call for very different responses.
+
+        Fail-safe in ALL directions: unknown metadata or an errored guard
+        withholds rather than stamps, and this never propagates an exception
+        to the train-flip loop (see the factory docstring on
+        ``TRAIN_PARTIAL_FLIP``). Those fail-safe arms synthesise
+        ``reason='errored'`` — accurate for all three (they ARE errors), and
+        each already emits its own distinct WARNING naming the specific cause
+        just above, so no diagnostic detail is lost by the collapse.
+        """
+        if config is None:
+            return None
+        if not config.delivered_checks.enabled:
+            # Kill switch, checked BEFORE the metadata pre-read (task 3057
+            # review). This seam is one of the three that must read ANOTHER
+            # task's row to reach the shared decision, so — unlike the
+            # self-task seams, whose metadata is already in scope — delegating
+            # the kill switch to `gate_mark_done_on_delivered_checks` alone is
+            # not sufficient here: the read happens FIRST, and its fail-safe
+            # arms synthesise a block without ever reaching the gate. A
+            # transient `scheduler.get_task` failure would then withhold the
+            # flip and revert the member to pending even with the fleet-wide
+            # switch off. Disarmed means disarmed: return before the read so a
+            # kill-switched fleet reproduces exactly the pre-3057 behaviour.
+            logger.debug(
+                'Train callbacks: delivered_checks.enabled=False — guard '
+                'inert for member %s (%s)', mid, site,
+            )
+            return None
+        if git_ops is None:
+            logger.debug(
+                'Train callbacks: git_ops unbound — delivered-checks guard '
+                'inert for member %s (%s)', mid, site,
+            )
+            return None
+        try:
+            member = await scheduler.get_task(mid)
+        except Exception:
+            logger.warning(
+                'Train callbacks: member %s metadata unreadable — withholding '
+                'the done flip (fail-safe)', mid, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        if member is None:
+            logger.warning(
+                'Train callbacks: member %s has no scheduler task — '
+                'withholding the done flip (fail-safe)', mid,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        try:
+            return await gate_mark_done_on_delivered_checks(
+                mid,
+                (member.get('metadata') or {}),
+                git_ops=git_ops,
+                project_root=str(config.project_root),
+                check_timeout_secs=config.delivered_checks.check_timeout_secs,
+                enabled=config.delivered_checks.enabled,
+                site=site,
+                log=logger,
+            )
+        except Exception:
+            logger.warning(
+                'Train callbacks: delivered-checks guard errored for member '
+                '%s — withholding the done flip (fail-safe)', mid, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+
+    async def _revert_withheld_member(
+        mid: str, *, train_id: str, site: str, reason: str,
+        current_statuses: Mapping[str, str] | None = None,
+    ) -> None:
+        """Hand a withheld train member back to the scheduler (task 3057).
+
+        The member's ONLY recovery edge. Shared by both stamping closures so
+        the two seams cannot drift apart, and mirroring
+        ``TaskWorkflow._revert_withheld_member`` so the four train seams
+        across both modules stay one behaviour.
+
+        *current_statuses* (task 3057 review): a caller that has ALREADY probed
+        live statuses passes them so the pending flip inherits the same
+        race guard ``redrive_member``'s not-on-main arm applies to the
+        identical write. If the member has moved past ``'merge-deferred'``
+        since the caller's snapshot, a live ``TaskWorkflow`` already owns the
+        transition and holds the worktree — clobbering it back to
+        ``'pending'`` would let the scheduler dispatch it a SECOND time
+        concurrently. Unlike ``mark_done``, which is terminal, this write
+        opens that window, so the guard belongs here rather than at one call
+        site. ``None`` (the default, used where no probe was taken) reverts
+        unconditionally, preserving the existing behaviour of the
+        post-advance flip loop, whose members the worker already gated on
+        ``'merge-deferred'`` before advancing.
+
+        NEVER raises: a failed recovery edge must not reach
+        ``_do_train_merge``'s post-advance flip loop as a false
+        ``TRAIN_PARTIAL_FLIP``. When the revert itself fails the member stays
+        merge-deferred — no worse than before this edge existed — and that is
+        logged rather than escalated.
+        """
+        if current_statuses is not None:
+            current = current_statuses.get(mid)
+            if current is not None and current != 'merge-deferred':
+                logger.warning(
+                    'train %s: member %s (%s) — delivered_checks not verifiably '
+                    'on main (%s) and NOT stamped done, but the member is now '
+                    '%r (moved past merge-deferred since the re-drive '
+                    'snapshot); live workflow owns the transition — skipping '
+                    'the revert to pending',
+                    train_id, mid, site, reason, current,
+                )
+                return
+        try:
+            await scheduler.set_task_status(mid, 'pending')
+        except Exception:
+            logger.warning(
+                'train %s: member %s (%s) — delivered-checks withheld but the '
+                'revert to pending FAILED; member remains merge-deferred and '
+                'will need operator attention',
+                train_id, mid, site, exc_info=True,
+            )
+            return
+        logger.warning(
+            'train %s: member %s (%s) — delivered_checks not verifiably on '
+            'main (%s); NOT stamping done, reverted to pending for '
+            're-dispatch (LandedRow retained for the reconciler)',
+            train_id, mid, site, reason,
+        )
 
     def factory(train_id: str) -> TrainCallbacks:
         async def status_check(ids: list[str]) -> dict[str, str]:
@@ -1037,6 +1217,23 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
                     train_id, mid,
                 )
                 return
+            # task 3057 — delivered-capability guard. The train's merge
+            # advanced main, but that credits this member only by inference:
+            # it never proves THIS member's declared capability rode along.
+            # Placed AFTER the existence probe (a non-task member still no-ops
+            # without check work) and structurally IMMEDIATELY before the
+            # stamp, so the mark_done / consume / lane-release trio below stays
+            # on the fall-through and cannot drift behind an upstream boolean.
+            # RETURNS rather than raises — see the factory docstring — and
+            # reverts the member to pending, which is its ONLY recovery edge
+            # (the stranded sweep provably cannot reach a merge-deferred task).
+            block = await _delivered_checks_withhold(mid, site='train-member-merged')
+            if block is not None:
+                await _revert_withheld_member(
+                    mid, train_id=train_id, site='train-member-merged',
+                    reason=block.reason,
+                )
+                return
             await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
             # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow inline
             # so a train-landed member no longer leaves a stale row surviving to the
@@ -1070,6 +1267,31 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
                 )
                 return
             if found_on_main:
+                # task 3057 — delivered-capability guard, same contract as
+                # mark_member_done above (see the factory docstring): the
+                # partner's landing brought SOMETHING of this branch to main,
+                # never a proof that this member's declared capability is in
+                # it. Withhold by RETURNING and revert the member to pending —
+                # the same recovery edge the else (not-on-main) arm below
+                # already takes, and the member's only one. NOT applied to
+                # that else branch, which stamps nothing.
+                block = await _delivered_checks_withhold(
+                    mid, site='coalesce-derail-found-on-main',
+                )
+                if block is not None:
+                    # Forward the statuses probed above so the revert inherits
+                    # the SAME race guard the else (not-on-main) arm applies to
+                    # this identical write — see `_revert_withheld_member`.
+                    # `err is not None` means the probe is untrustworthy, so we
+                    # pass None and fall through to the unconditional revert,
+                    # mirroring that arm's fail-open policy.
+                    await _revert_withheld_member(
+                        mid, train_id=train_id,
+                        site='coalesce-derail-found-on-main',
+                        reason=block.reason,
+                        current_statuses=statuses if err is None else None,
+                    )
+                    return
                 # Double-landing guard: a partner's merge already brought this
                 # branch into main, so we mark it done directly.
                 await scheduler.mark_done(
@@ -1397,12 +1619,23 @@ class Harness:
         # dir path as a string. Kept separate from the adopted sidecar dict
         # (which flows into build_workflow) to keep the resume payload clean.
         self._recovered_session_config_dirs: dict[str, str] = {}
-        # Consecutive-per-boot session_resume_fallback streak (task γ storm
-        # escape, INV-4). Incremented on each reason-carrying fallback in
-        # _run_slot; reset to 0 on any eligible resume. When it reaches
+        # session_resume_fallback streak (task γ storm escape, INV-4).
+        # Incremented in _run_slot on each UNEXPLAINED fallback ('stale' /
+        # 'no_transcript'); reset to 0 on any eligible resume. When it reaches
         # session_resume.fallback_storm_threshold, one deduped L1 is filed.
-        # Capped/disabled degradations do NOT feed it (by design).
+        # By-design degradations do NOT feed it: disabled, capped, and (task
+        # 3256) reseeded.
+        #
+        # The run is a ROLLING WINDOW, not a cumulative per-boot count: each
+        # increment must chain within session_resume.storm_window_secs of the
+        # previous fallback, else the streak decays to 0 first (task 3256 — a
+        # slow drip of isolated failures must never accumulate into a false
+        # storm). The stamp below is the chain's comparison point, on the
+        # MONOTONIC clock — 'stale' is itself produced by clock skew, so a
+        # wall-clock decay would be corrupted by the very failure it detects.
+        # None means "no run in progress" (boot, or after an eligible resume).
         self._session_resume_fallback_streak: int = 0
+        self._last_session_resume_fallback_at: float | None = None
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -2845,13 +3078,28 @@ class Harness:
         input degrades to an ineligible ``(False, <reason>)`` so the caller
         falls back to a fresh dispatch — this method NEVER raises.
 
-        Reasons (checked in this order):
+        Reasons, in branch order:
           - 'disabled'      — the session_resume kill switch is off (B6).
           - 'stale'         — (now - started_at) >= freshness_window_secs, OR
                               started_at is missing/unparseable (fail-safe).
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-          - 'no_transcript' — no stashed config_dir, no session_id, or the
-                              transcript is absent on disk (B4 reseed/wipe).
+        Then transcript corroboration, which resolves three ways. Note
+        'no_transcript' is listed first because it is reached BOTH before the
+        transcript glob (nothing to corroborate with) and after it (the store
+        survived but this session's file is missing):
+          - 'no_transcript' — no stashed config_dir, no session_id, the config
+                              dir survives but this session's transcript is
+                              absent, or the dir is present-but-unreadable
+                              (a filesystem fault is NOT a wipe) — a genuine
+                              corroboration failure.
+          - 'reseeded'      — the stashed config dir is PROVABLY gone on disk
+                              (ENOENT/ENOTDIR): warm-lane acquire ALWAYS
+                              re-seeds from base
+                              (docs/prds/warm-lane-pool-cow-seeding.md §9.3/
+                              §9.5), which wipes <lane>/.task/ and the whole
+                              transcript store with it. An EXPECTED fallback,
+                              not a corroboration failure (task 3256) — it
+                              does not feed the fallback-storm streak.
           - 'eligible'      — all corroboration passed; inject the session.
         """
         cfg = self.config.session_resume
@@ -2878,12 +3126,42 @@ class Harness:
         # reseed/wipe of .task between boot and re-dispatch is detected.
         # transcript_exists is itself total (any glob error → False), so no
         # outer try/except is needed here to uphold this method's I3 totality:
-        # a non-empty config_dir str makes Path() safe, and a missing/absent
-        # transcript degrades to the 'no_transcript' fallback below.
+        # a non-empty config_dir str makes Path() safe, and any absent
+        # transcript degrades to one of the two ineligible reasons below.
+        #
+        # A failed corroboration is then split (task 3256) on whether the
+        # config dir that HELD the transcript is PROVABLY gone: its absence is
+        # positive evidence that the whole store was wiped by an acquire
+        # reseed ('reseeded', expected), while a surviving dir missing only
+        # this session's transcript is a genuine failure ('no_transcript').
+        # A never-stashed config_dir / session_id stays 'no_transcript': a
+        # reseed clears the out-of-lane meta root together with the lane
+        # (PRD I2), so it destroys the sidecar WITH the transcript and yields
+        # no adoption at all — an adopted session with no config dir is
+        # pathological and must stay loud.
         session_id = session.get('session_id')
         if not config_dir or not session_id:
             return (False, 'no_transcript')
         if not transcript_exists(Path(config_dir), session_id):
+            # Discriminate "PROVABLY gone" from "there but unreadable", and do
+            # it with an explicit stat rather than Path.exists(), which is
+            # wrong for this seam in both directions: it swallows exactly
+            # {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a symlink loop
+            # or bad fd would read as a wipe and land in the SILENT,
+            # storm-exempt 'reseeded' arm — and it RE-RAISES every other
+            # OSError (EACCES on a parent, ESTALE, EIO), which would escape
+            # this method and break the never-raises I3 contract above.
+            # Either way a genuine filesystem fault stops surfacing as the
+            # systematic breakage INV-4 exists to catch. So: only ENOENT/
+            # ENOTDIR earns 'reseeded'; everything else falls through to the
+            # LOUD arm, caught here so the method stays total (ValueError
+            # covers the NUL-bearing path that os.stat rejects outright).
+            try:
+                Path(config_dir).stat()
+            except (FileNotFoundError, NotADirectoryError):
+                return (False, 'reseeded')
+            except (OSError, ValueError):
+                pass  # unreadable/faulted != wiped — stay loud
             return (False, 'no_transcript')
         return (True, 'eligible')
 
@@ -5088,85 +5366,49 @@ class Harness:
                     )
                 return None
 
-            # Delivered-capability ground-truth guard (task 2794). Sibling to
-            # the effect-present refinement above (same downgrade shape): git
-            # attribution and the effect-present check prove a merge advanced
-            # main and that the cited commit's paths survive at HEAD — but NOT
-            # that THIS task's OWN declared capability
-            # (metadata.delivered_checks) is actually complete on main. A
-            # journal row / citation / merge marker attributes a landing; it
-            # does not certify the deliverable. So — AFTER all
+            # Delivered-capability ground-truth guard (task 2794, generalized
+            # by task 3057). Sibling to the effect-present refinement above
+            # (same downgrade shape): git attribution and the effect-present
+            # check prove a merge advanced main and that the cited commit's
+            # paths survive at HEAD — but NOT that THIS task's OWN declared
+            # capability (metadata.delivered_checks) is actually complete on
+            # main. A journal row / citation / merge marker attributes a
+            # landing; it does not certify the deliverable. So — AFTER all
             # attribution/effect guards, applied UNIFORMLY to every evidence
             # source (ON_MAIN, GONE_WITH_MERGE_MARKER, MergeProvenance journal)
             # funneling through this one arm — verify the declared capability
-            # is present on main before stamping found_on_main. Kept as an
-            # early return on failed/errored (in-progress -> revert-to-pending
-            # for re-dispatch; blocked -> leave alone, blocked discipline) so
-            # _mark_in_progress_done below is structurally reachable ONLY on
-            # the all_delivered fall-through — never behind a mutable boolean a
-            # later refactor could drift out of sync. Gated on the enabled kill
-            # switch AND truthy delivered_checks so check-less tasks keep their
-            # exact pre-2794 attribution+effect-present bar (kill-switch parity
-            # with the dependent-side dispatch gate's documented inertness).
-            delivered_checks = metadata.get('delivered_checks')
-            if delivered_checks and self.config.delivered_checks.enabled:
-                try:
-                    main_sha = await self.git_ops.get_main_sha()
-                except Exception:
-                    # get_main_sha() raises on git error — the caller owns the
-                    # fail-safe: no mark, no revert, retry when main is
-                    # readable again (sibling of the ERRORED outcome below).
-                    logger.warning(
-                        'Reconcile: task %s carries delivered_checks but the '
-                        'main SHA could not be resolved — deferring mark-done '
-                        '(fail-safe), will retry next sweep',
-                        tid, exc_info=True,
+            # is present on main before stamping found_on_main.
+            #
+            # The DECISION now lives in exactly ONE place —
+            # gate_mark_done_on_delivered_checks — shared by all eleven
+            # attribution-shaped stamp seams (task 3057). This arm used to
+            # carry its own ~58-line copy; ten more hand-copies would have been
+            # ten independent drift surfaces, and this defect class's history
+            # (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 -> 2787 -> 2794) is
+            # a point fix followed by another unguarded seam re-opening it.
+            # main-SHA resolution (both fail-safe arms), the verdict collapse,
+            # the kill switch, the check-less inertness and the WARNING all
+            # moved INTO the helper; `log=logger` (via _delivered_checks_block)
+            # keeps every WARNING addressable as 'orchestrator.harness'.
+            #
+            # Still an early return, deliberately: _mark_in_progress_done below
+            # stays structurally reachable ONLY on the all-delivered
+            # fall-through, never behind a mutable boolean a later refactor
+            # could drift out of sync.
+            block = await self._delivered_checks_block(
+                tid, metadata, site='reconcile-stranded-found-on-main',
+            )
+            if block is not None:
+                # 'failed' is a DEFINITIVE absence -> re-dispatch an
+                # in-progress task; 'blocked' is left alone (blocked
+                # discipline forbids a silent blocked->pending flip).
+                # 'errored' / 'main_sha_unresolved' make no claim either way:
+                # no mark, no revert, retried next sweep.
+                if block.reason == 'failed' and status == 'in-progress':
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
-                    return None
-                if not main_sha:
-                    logger.warning(
-                        'Reconcile: task %s carries delivered_checks but '
-                        'get_main_sha() returned empty — deferring mark-done '
-                        '(fail-safe), will retry next sweep',
-                        tid,
-                    )
-                    return None
-                dc_verdict: DeliveredChecksVerdict = await verify_delivered_checks_on_main(
-                    delivered_checks,
-                    project_root=str(self.config.project_root),
-                    main_sha=main_sha,
-                    check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
-                )
-                if dc_verdict.outcome == 'failed':
-                    failed_check = dc_verdict.failed_check or {}
-                    is_grep = failed_check.get('kind') == 'grep'
-                    logger.warning(
-                        'Reconcile: task %s delivered-check %r (%s=%r) is '
-                        'absent from main@%s — declared capability not present, '
-                        'not marking done',
-                        tid, failed_check.get('name'),
-                        'pattern' if is_grep else 'script',
-                        failed_check.get('pattern') if is_grep else failed_check.get('script'),
-                        main_sha,
-                    )
-                    if status == 'in-progress':
-                        return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata, status=status,
-                        )
-                    return None
-                if dc_verdict.outcome == 'errored':
-                    # Some check could not be evaluated and none FAILED — make
-                    # no claim either way; fail-safe wait (no mark, no revert).
-                    logger.warning(
-                        'Reconcile: task %s delivered-checks could not be '
-                        'evaluated at main@%s (errored) — deferring mark-done '
-                        '(fail-safe), will retry next sweep',
-                        tid, main_sha,
-                    )
-                    return None
-                # dc_verdict.outcome == 'all_delivered' -> the declared
-                # capability is present; fall through to note-building /
-                # _mark_in_progress_done below, unchanged.
+                return None
 
             if status == 'blocked':
                 note = (
@@ -5567,6 +5809,52 @@ class Harness:
         )
         return 'reverted'
 
+    async def _delivered_checks_block(
+        self,
+        task_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        site: str,
+        main_sha: str | None = None,
+    ) -> DeliveredChecksBlock | None:
+        """Harness-side binding of the ONE shared mark-done decision (task 3057).
+
+        The single rule for every harness stamp seam: a non-``None`` result
+        means **do NOT stamp done at this site** — take the site's EXISTING
+        "no landing evidence" path instead. Never invent a new recovery: each
+        site's no-evidence path is already proven safe and self-healing, so
+        reusing it adds no new state machine.
+
+        ``None`` means the caller MAY proceed, either because the guard is
+        inert (kill switch off, or the task declares no ``delivered_checks``)
+        or because the declared capability is verifiably present on ``main``.
+        The inertness and the kill switch live in
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        ALONE — harness sites delegate unconditionally rather than
+        re-implementing either locally, so one hot reload disarms all eleven
+        attribution-shaped seams at once.
+
+        ``log=logger`` keeps every WARNING addressable as
+        ``orchestrator.harness`` (task 2794's caplog assertions depend on it),
+        and ``main_sha`` lets a seam that has ALREADY resolved a main SHA
+        forward it so the guard audits the SAME main that seam's other
+        evidence test used, with no second git call.
+
+        Never raises — the helper it delegates to is documented "never raises",
+        so a guard can never crash a mark-done path.
+        """
+        return await gate_mark_done_on_delivered_checks(
+            task_id,
+            metadata,
+            git_ops=self.git_ops,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            enabled=self.config.delivered_checks.enabled,
+            main_sha=main_sha,
+            site=site,
+            log=logger,
+        )
+
     async def _mark_in_progress_done(
         self,
         tid: str,
@@ -5621,6 +5909,10 @@ class Harness:
         worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
+        # The config dir must be dropped in lockstep with its session (task
+        # 3256): a stale stash paired with a later adoption would classify as
+        # 'reseeded' and be silently suppressed instead of surfacing.
+        self._recovered_session_config_dirs.pop(tid, None)
         if worktree_path.exists():
             try:
                 await self.git_ops.cleanup_worktree(worktree_path, tid)
@@ -5827,13 +6119,17 @@ class Harness:
     def _file_session_resume_storm_escalation(self) -> None:
         """File an L1 when session-resume fallbacks storm (task γ, INV-4).
 
-        Called from the _run_slot guard once the consecutive-per-boot
+        Called from the _run_slot guard once the
         ``_session_resume_fallback_streak`` reaches
         ``session_resume.fallback_storm_threshold``. A single isolated
-        fallback (a lone foreign-acquire) never trips this — only a RUN does,
-        which is the signature of SYSTEMATIC corroboration breakage (clock
-        skew, wiped transcripts, mass reseed). Deduped by ``has_open_l1`` so
-        the operator sees exactly one open storm L1 at a time.
+        fallback never trips this — only a RUN does, which is the signature of
+        SYSTEMATIC corroboration breakage. Only UNEXPLAINED failures feed the
+        streak: since task 3256 a lane reseed is classified ``reseeded`` and
+        excluded by construction (as ``capped`` already was), so the causes
+        that can still trip this are clock skew making every sidecar look
+        stale, or transcripts vanishing while their config dir survives.
+        Deduped by ``has_open_l1`` so the operator sees exactly one open storm
+        L1 at a time.
 
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
         failure is swallowed so filing never breaks the guard path (I3).
@@ -5853,29 +6149,39 @@ class Harness:
                 category='infra_issue',
                 summary=(
                     'Session-resume fallback storm — '
-                    f'{threshold}+ consecutive resume corroboration failures '
-                    'this boot; resume degraded to fresh dispatch for all'
+                    f'{threshold}+ UNEXPLAINED resume corroboration failures '
+                    'in a row; resume degraded to fresh dispatch for all'
                 )[:200],
                 detail=(
-                    f'{threshold} or more consecutive session-resume '
-                    'eligibility failures occurred this boot without an '
+                    f'{threshold} or more session-resume eligibility failures '
+                    'occurred in a chained run — each within '
+                    'session_resume.storm_window_secs of the previous, with no '
                     'intervening successful resume. Every recovered agent '
-                    'session was rejected (stale sidecar or absent transcript) '
-                    'and degraded to a fresh dispatch — safe, but a RUN this '
-                    'long suggests a systematic cause rather than isolated '
-                    'foreign-acquires: clock skew making every sidecar look '
-                    'stale, a reseed/`git clean` wiping transcripts out from '
-                    'under adopted sessions, or a mass lane reseed.\n\n'
+                    'session was rejected and degraded to a fresh dispatch — '
+                    'safe, but a RUN this tight suggests a systematic cause.\n\n'
+                    'By-design degradations are EXCLUDED BY CONSTRUCTION and '
+                    'cannot have contributed: a lane reseed (which always wipes '
+                    '.task/ and its transcript store) is classified '
+                    "reason='reseeded', and the per-task cap is "
+                    'session_resume_capped. So the remaining causes are:\n'
+                    "  - reason='stale' — host clock skew (NTP) making every "
+                    'sidecar look older than freshness_window_secs;\n'
+                    "  - reason='no_transcript' — transcripts vanishing while "
+                    'their claude-config dir SURVIVES, or an adopted sidecar '
+                    'with no config dir at all.\n\n'
                     'Fresh dispatch loses the in-flight agent context that '
                     'resume would have preserved, so throughput/cost is '
-                    'degraded until the cause is fixed. Check host clock skew '
-                    '(NTP) and whether warm-lane reseeds are wiping '
-                    '.task/claude-config transcripts.'
+                    'degraded until the cause is fixed. Query the reasons: '
+                    "select json_extract(data,'$.reason'), count(*) from events "
+                    "where event_type='session_resume_fallback' group by 1."
                 ),
                 suggested_action=(
-                    'Investigate clock skew (NTP) and transcript-wiping '
-                    'reseeds; the streak resets on the next successful resume, '
-                    'so resolve this L1 once the underlying cause is fixed.'
+                    'Check host clock skew (NTP) first, then whether '
+                    'transcripts are disappearing from a surviving '
+                    '.task/claude-config dir. The streak resets on the next '
+                    'successful resume, or decays after a storm_window_secs '
+                    'gap, so resolve this L1 once the underlying cause is '
+                    'fixed.'
                 ),
                 level=1,
             )
@@ -7394,9 +7700,16 @@ class Harness:
             # fresh, under its per-task resume cap, and its transcript is
             # corroborated on disk. Any ineligible session degrades to a fresh
             # dispatch WITH the recovered plan (I3 — never a stall, never a
-            # scheduler-visible error), emitting a reason-carrying event. The
-            # kill switch (enabled=False) degrades silently (B6). Streak
-            # bookkeeping / storm-escape is layered in by task 2774 step-6.
+            # scheduler-visible error), emitting a reason-carrying event.
+            #
+            # The outcome is a FOUR-way split (task 3256):
+            #   eligible                     → inject; resets the storm streak.
+            #   disabled                     → silent: no event, no streak (B6).
+            #   BY DESIGN {capped, reseeded} → own event, streak untouched
+            #                                  (neither fed nor reset).
+            #   GENUINE {stale, no_transcript} → session_resume_fallback, feeds
+            #                                  the streak, storm-escape at
+            #                                  fallback_storm_threshold (INV-4).
             if recovered_session is not None:
                 eligible, reason = self._session_resume_eligible(
                     recovered_session, recovered_config_dir
@@ -7408,6 +7721,10 @@ class Harness:
                 }
                 if eligible:
                     self._session_resume_fallback_streak = 0  # break any storm run
+                    # Drop the chain's comparison point too, so the next
+                    # fallback starts a fresh run instead of chaining off a
+                    # pre-reset stamp (task 3256).
+                    self._last_session_resume_fallback_at = None
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,
@@ -7427,6 +7744,21 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data=resume_event_data,
                             )
+                    elif reason == 'reseeded':
+                        # By-design lane reseed (task 3256) — the acquire that
+                        # re-seeds from base wiped the transcript store, so this
+                        # fallback is EXPECTED, not a corroboration failure.
+                        # Keeps the session_resume_fallback event (the fallback
+                        # rate stays measurable — PRD open question 3) but, like
+                        # 'capped', neither feeds nor resets the storm streak:
+                        # a drip of reseeds must not mask a genuine systematic
+                        # failure interleaved between them.
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.session_resume_fallback,
+                                task_id=assignment.task_id,
+                                data={**resume_event_data, 'reason': reason},
+                            )
                     else:  # 'stale' / 'no_transcript' — genuine corroboration fail
                         if self.event_store:
                             self.event_store.emit(
@@ -7434,6 +7766,21 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data={**resume_event_data, 'reason': reason},
                             )
+                        # Rolling-window decay (task 3256): "consecutive" means
+                        # CHAINED within storm_window_secs, not merely
+                        # cumulative-per-boot — which is what makes this a
+                        # storm DETECTOR rather than a running total. A gap at
+                        # least as long as the window means the previous run
+                        # ended, so start counting over. Monotonic, not
+                        # wall-clock: 'stale' is itself produced by clock skew.
+                        now = time.monotonic()
+                        window = self.config.session_resume.storm_window_secs
+                        if (
+                            self._last_session_resume_fallback_at is not None
+                            and (now - self._last_session_resume_fallback_at) >= window
+                        ):
+                            self._session_resume_fallback_streak = 0
+                        self._last_session_resume_fallback_at = now
                         self._session_resume_fallback_streak += 1
                         if (
                             self._session_resume_fallback_streak
@@ -8801,7 +9148,9 @@ class Harness:
         # inject it opaquely into the worker so task γ can construct
         # GroupMergeRequests without the worker importing the scheduler
         # (pure-git-engine layering preserved; the worker never calls the factory).
-        train_callback_factory = build_train_callback_factory(self.scheduler, self.git_ops)
+        train_callback_factory = build_train_callback_factory(
+            self.scheduler, self.git_ops, self.config,
+        )
 
         self._merge_worker = SpeculativeMergeWorker(
             self.git_ops,
@@ -9712,21 +10061,40 @@ class Harness:
         merge worker is absent (disabled / not yet constructed) or has no
         bound ``LandedOutbox``, mirroring
         :meth:`_reap_orphaned_merge_worktrees`'s None-guard.
+
+        ARMS the RC-2 delivered-capability guard (task 3057) by forwarding
+        this harness's live ``delivered_checks`` config. Git ancestry alone
+        proves only that a branch tip reached ``main``; it never proves the
+        task's declared capability rode along with it, so a crash-recovered
+        landing whose ``metadata.delivered_checks`` are absent from main is
+        now WITHHELD rather than stamped ``kind='merged'``. A withheld row
+        stays UNCONSUMED and its task stays DISPATCHABLE, so the capability
+        gets actually delivered instead of a hollow done being written from
+        the crash-recovery path. The count is surfaced in the INFO summary
+        below — a withholding is an operator-visible disposition, never
+        silently absorbed into ``skipped``.
         """
         if self._merge_worker is None or self._merge_worker._landed_outbox is None:
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
             provenance_conflict_sink=self._provenance_conflict_sink,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
-            'already_done_pruned=%d skipped=%d stale_conflict=%d errors=%d',
+            'already_done_pruned=%d skipped=%d stale_conflict=%d '
+            'delivered_checks_withheld=%d errors=%d',
             report.get('pruned_not_landed', 0),
             report.get('marked_done', 0),
             report.get('already_done_pruned', 0),
             report.get('skipped', 0),
             report.get('stale_conflict', 0),
+            # .get(..., 0) like its siblings: a report dict from an older or
+            # foreign reconciler must not abort startup over a telemetry field.
+            report.get('delivered_checks_withheld', 0),
             report.get('errors', 0),
         )
 
@@ -9757,6 +10125,16 @@ class Harness:
         rather than propagating, and ``reconcile_landed_task`` maps that
         disposition to ``True`` too — a contested task must not dispatch
         while under arbitration, same as an already-landed one.
+
+        ARMS the RC-2 delivered-capability guard (task 3057) from live
+        config, exactly as :meth:`_reconcile_landed_outbox` does — the two
+        callers must stay in lockstep or the guard would apply on the startup
+        sweep but not the hot dispatch consult. Note the asymmetry with
+        ``'stale_conflict'`` above: a ``'delivered_checks_withheld'``
+        disposition maps to ``False`` (DO dispatch). The done-write was
+        refused precisely because the declared capability is not on main, so
+        dispatching is the recovery — gating would wedge the task forever and
+        turn a would-be misattribution into a permanent strand.
         """
         if self._merge_worker is None or self._merge_worker._landed_outbox is None:
             return False
@@ -9766,6 +10144,9 @@ class Harness:
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
             provenance_conflict_sink=self._provenance_conflict_sink,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
 
     async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
@@ -9840,6 +10221,34 @@ class Harness:
         tick at the same ``reopen_at``: it short-circuits before the
         git-ancestry subprocess work and before re-attempting the
         already-rejected write.
+
+        **Delivered-capability guard** (task 3057, seam 2 of eleven): all
+        three evidence arms above — git ancestry, merge marker, content
+        equivalence — prove only that SOMETHING of this branch reached main.
+        None of them proves that THIS task's declared capability
+        (``metadata.delivered_checks``) survived to it, which is exactly the
+        hollow-done shape ``check_found_on_main_spurious_rate.py`` audits. So
+        each arm re-checks the capability via
+        :meth:`_delivered_checks_block` IMMEDIATELY before its
+        ``_mark_in_progress_done`` call, as an early return, so the stamp
+        stays structurally on the fall-through and a later refactor cannot
+        drift it out from behind the guard.
+
+        On ANY block — ``failed``, ``errored`` or ``main_sha_unresolved``
+        alike — the arm returns ``False``: deliberately this gate's own
+        pre-2313 behavior (dispatch normally) rather than gating dispatch.
+        The invariant being defended is "never stamp a hollow done", and a
+        ``False`` return can never wedge a task the way a permanent gate
+        could — the task dispatches and an agent actually delivers it. The
+        fail-safe reasons are handled UNIFORMLY with ``failed`` for the same
+        reason: a malformed check descriptor ERRORs forever, so any
+        wait-and-retry degradation would wedge the task permanently, whereas
+        an extra dispatch of an already-landed task always terminates.
+
+        The guard sits DOWNSTREAM of every existing veto (open L1, the
+        task-2677 ``should_skip`` memo, the degenerate-branch check, and each
+        arm's ``validate_landing_evidence`` verdict), so a landing that is
+        being refused anyway never pays for check work.
         """
         if (
             self._escalation_queue is not None
@@ -9894,6 +10303,10 @@ class Harness:
                 # (it returned False here before the helper extraction too),
                 # so this is not a newly-introduced silent failure.
                 return False
+            if await self._delivered_checks_block(
+                task_id, metadata, site='dispatch-gate-already-on-main',
+            ) is not None:
+                return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found branch already on main',
@@ -9923,6 +10336,10 @@ class Harness:
                 if not verdict.accepted:
                     self._file_unattributed_landing_escalation(task_id, branch, verdict)
                     return False
+                if await self._delivered_checks_block(
+                    task_id, metadata, site='dispatch-gate-marker-found',
+                ) is not None:
+                    return False
                 await self._mark_in_progress_done(
                     task_id, marker,
                     'reconcile: pre-dispatch check found merge marker on main',
@@ -9946,6 +10363,10 @@ class Harness:
             )
             if not verdict.accepted:
                 self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                return False
+            if await self._delivered_checks_block(
+                task_id, metadata, site='dispatch-gate-content-equivalent',
+            ) is not None:
                 return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,

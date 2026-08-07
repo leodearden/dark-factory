@@ -829,14 +829,17 @@ class SessionResumeConfig(BaseModel):
     (INV-3). Any ineligible session degrades to today's fresh dispatch
     (I3 — never a stall, never a scheduler-visible error), emitting a
     reason-carrying ``session_resume_fallback``/``session_resume_capped``
-    event; a per-boot run of consecutive fallbacks above
-    ``fallback_storm_threshold`` files one L1 escalation (INV-4).
+    event; a run of UNEXPLAINED fallbacks above
+    ``fallback_storm_threshold``, each chained within ``storm_window_secs``
+    of the previous, files one L1 escalation (INV-4). By-design
+    degradations (``capped``, and ``reseeded`` since task 3256) emit their
+    event but never feed that run.
 
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
     Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
-    int knobs); all four leaves are green-tier hot-reloadable via the
+    int knobs); all five leaves are green-tier hot-reloadable via the
     ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
     """
 
@@ -875,12 +878,35 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive per-boot session_resume_fallback degradations '
-            '(reset to 0 on any eligible resume) before one L1 escalation is '
-            'filed (INV-4 storm escape — suspected systematic clock skew / '
-            'wiped transcripts / mass reseed). Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic corroboration breakage trips it.'
+            'Consecutive UNEXPLAINED session_resume_fallback degradations '
+            'before one L1 escalation is filed (INV-4 storm escape — '
+            'suspected systematic clock skew, or transcripts vanishing while '
+            'their config dir survives). Only reason in {stale, no_transcript} '
+            'counts: reason=reseeded is a by-design lane reseed and is '
+            'excluded, exactly as session_resume_capped is. The run is chained '
+            'within storm_window_secs (and reset to 0 on any eligible resume) '
+            'rather than accumulating unbounded per boot. Must be >= 1. '
+            'Default 5 is above both the resume cap and ordinary collision '
+            'noise, so only systematic corroboration breakage trips it.'
+        ),
+    )
+    storm_window_secs: int = Field(
+        default=3600,
+        ge=1,
+        description=(
+            'Maximum gap, in seconds, between two consecutive unexplained '
+            'session-resume fallbacks for them to count as the same storm '
+            'run; a larger gap decays the streak to 0 before the next '
+            'fallback is counted. Without this the streak is cumulative '
+            'rather than consecutive, so a slow drip of isolated failures '
+            'accumulates into a false storm. Must be >= 1. Default 3600 is '
+            'read off the measured signature: real bursts land ~17 fallbacks '
+            'inside one hour, while quiet gaps between isolated failures run '
+            '~7h and ~39h — so a 1h chain window separates burst from drip '
+            'with a wide margin on both sides. Measured on the monotonic '
+            'clock, deliberately: the stale reason is itself PRODUCED by '
+            'clock skew, so a wall-clock decay would be corrupted by the very '
+            'failure mode it must detect.'
         ),
     )
 

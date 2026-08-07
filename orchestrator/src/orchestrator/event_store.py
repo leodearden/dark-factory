@@ -228,10 +228,29 @@ class EventType(StrEnum):
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript}.
+    #                             dispatch; data.reason ∈ {stale, no_transcript,
+    #                             reseeded}.
     #   session_resume_capped   — resume_count reached max_resumes_per_task;
     #                             by-design throttling, degrades to fresh dispatch.
     # (enabled=False degrades silently — no event.)
+    #
+    # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
+    # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
+    # <lane>/.task/ and the whole claude-config transcript store with it, so a
+    # session adopted at boot routinely finds its store gone by re-dispatch. It
+    # therefore does NOT feed the fallback-storm streak (like
+    # session_resume_capped); only {stale, no_transcript} do. The event is still
+    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
+    # rate is read off these reasons post-deploy).
+    #
+    # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
+    # the three outcome events (session_resume + session_resume_fallback +
+    # session_resume_capped) for a window, since the guard emits exactly one per
+    # dispatch that carried a recovered session. Read the fallback RATE as a
+    # ratio against that denominator rather than as an absolute count, and split
+    # the numerator by json_extract(data, '$.reason') to separate expected
+    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
+    # so a zero total means either no recovered sessions or the kill switch.)
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'

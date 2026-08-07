@@ -586,37 +586,135 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: spark_path.js must load BEFORE charts.jsx (task 3436)
+# ---------------------------------------------------------------------------
+
+_SPARK_PATH_PREFIX = '/static/redux/spark_path.js'
+
+
+def test_spark_path_js_is_served(client) -> None:
+    """GET /static/redux/spark_path.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while
+    charts.jsx dies in the browser. That failure is NOT quiet: charts.jsx
+    destructures window.DF_SPARK_PATH with no fallback, so the module throws at
+    load and nearly every tab blanks. Worth its own assertion precisely because
+    the blast radius is so wide.
+    """
+    resp = client.get(_SPARK_PATH_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_SPARK_PATH_PREFIX}, got {resp.status_code} — the '
+        'module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_spark_path_js_loads_before_charts(index_html_body: str) -> None:
+    """spark_path.js must load as a classic synchronous script BEFORE charts.jsx.
+
+    charts.jsx destructures {sparkPaths, stepPaths} from window.DF_SPARK_PATH
+    at top-level execution time, with no `|| {}` fallback — a later (or
+    missing) tag therefore makes charts.jsx throw at load, taking down every
+    tab that imports a chart primitive. The destructure is deliberate
+    (loud-over-silent degradation); this ordering guard is what keeps that
+    loudness from ever reaching a browser.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _SPARK_PATH_PREFIX,
+        _CHARTS_PREFIX,
+        before_label='spark_path.js',
+        after_label='charts.jsx',
+        consumer_note=(
+            'charts.jsx (Sparkline/StepSpark) destructures window.DF_SPARK_PATH '
+            'at top level; spark_path.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: task_status_counts.js must load BEFORE tab_tasks.jsx
+# (task 3516)
+# ---------------------------------------------------------------------------
+
+_TASK_STATUS_COUNTS_PREFIX = '/static/redux/task_status_counts.js'
+
+
+def test_task_status_counts_js_is_served(client) -> None:
+    """GET /static/redux/task_status_counts.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while
+    tab_tasks.jsx dies in the browser. tab_tasks.jsx destructures
+    window.DF_TASK_STATUS_COUNTS with no fallback, so a 404 here throws at
+    load and blanks the whole Tasks tab.
+    """
+    resp = client.get(_TASK_STATUS_COUNTS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_TASK_STATUS_COUNTS_PREFIX}, got {resp.status_code} '
+        '— the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """task_status_counts.js must load as a classic synchronous script BEFORE
+    tab_tasks.jsx.
+
+    tab_tasks.jsx destructures {projectStatusCounts, activityPips} from
+    window.DF_TASK_STATUS_COUNTS at top-level execution time, with no `|| {}`
+    fallback — a later (or missing) tag therefore makes tab_tasks.jsx throw at
+    load, so the per-project header (and the whole Tasks tab) never renders.
+    The destructure is deliberate (loud-over-silent degradation); this
+    ordering guard is what keeps that loudness from ever reaching a browser.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _TASK_STATUS_COUNTS_PREFIX,
+        _TAB_TASKS_PREFIX,
+        before_label='task_status_counts.js',
+        after_label='tab_tasks.jsx',
+        consumer_note=(
+            'tab_tasks.jsx (TasksTab per-project header) destructures '
+            'window.DF_TASK_STATUS_COUNTS at top level; task_status_counts.js '
+            'must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 37,
-    and graph_layout.js / prd_grouping.js / runtime_format.js / orch_filter.js /
-    esc_flow_layout.js must all be among the versioned assets.
+    """All /static/redux/*?v= cache-busters must share a single version >= 42,
+    and graph_layout.js / prd_grouping.js / task_status_counts.js /
+    runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
+    must all be among the versioned assets.
 
-    Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py. Floor provenance: 30
-    proved the uniform bump from 29 alongside task 2637's runtime_format.js
-    addition; 37 proves the bump for task 3332's `const API` collision fix
-    (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
-    GRAPH_LAYOUT_API). That bump matters more than a usual one: before the fix,
-    an already-open browser had cached an esc_flow_layout.js that dies on load,
-    leaving window.DF_ESC_FLOW_LAYOUT undefined, so without a new ?v= the fix
-    would not reach it.
+    This is the sole home of the UNIFORMITY check ("all versions are the
+    same"); every other module asserts only its own `min(versions) >= N`
+    floor, which needs no uniformity precondition to be sound (the OLDEST
+    asset is the one that would still serve stale code).
+
+    The floor tracks the newest bump — currently 42, for task 3470's
+    tab_memory_evals.jsx and tab_escalations.jsx fixes. Raising it matters
+    more than a routine bump for the usual reason: an already-open browser
+    holds a cached copy of the BROKEN file, so without a new ?v= the fix
+    never reaches it.
     """
-    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
         f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
         'bump all of them uniformly to the same value.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 37, (
-        f'index.html cache-buster version is {v}, expected >= 37 (proves the '
-        "uniform bump for task 3332's `const API` collision fix actually "
-        'reaches already-open browsers holding the broken esc_flow_layout.js; '
-        'the previous floor, 30, proved the bump from 29 alongside task 2637\'s '
-        'runtime_format.js addition).'
+    v = next(iter(versions))
+    assert v >= 42, (
+        f'index.html cache-buster version is {v}, expected >= 42 — the bump '
+        "that carries task 3470's tab_memory_evals.jsx and tab_escalations.jsx "
+        'fixes to already-open browsers.'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -626,21 +724,40 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'prd_grouping.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
+    assert re.search(r'/static/redux/task_status_counts\.js\?v=\d+', index_html_body), (
+        'task_status_counts.js is not present among the versioned '
+        '/static/redux/* assets in index.html — tab_tasks.jsx destructures '
+        'window.DF_TASK_STATUS_COUNTS at top level with no fallback, so a '
+        'missing tag blanks the Tasks tab; a tag added without a cache-buster '
+        'misses already-open browsers. Bump all /static/redux/* ?v= uniformly.'
+    )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
         'runtime_format.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
     assert re.search(r'/static/redux/orch_filter\.js\?v=\d+', index_html_body), (
         'orch_filter.js is not present among the versioned /static/redux/* '
-        'assets in index.html — a tag added without a cache-buster would both '
-        'miss an already-open browser and break the single-shared-version '
-        'invariant this test and four other modules assert.'
+        'assets in index.html — a tag added without a cache-buster misses '
+        'already-open browsers; bump all /static/redux/* ?v= uniformly.'
     )
     assert re.search(r'/static/redux/esc_flow_layout\.js\?v=\d+', index_html_body), (
         'esc_flow_layout.js is not present among the versioned /static/redux/* '
-        'assets in index.html — this test enumerated four of the six classic '
-        'scripts and omitted this one, the very file task 3332 fixes, so an '
-        'unversioned tag here would both miss an already-open browser (still '
-        'holding the copy that dies on load) and break the single-shared-version '
-        'invariant unnoticed.'
+        'assets in index.html — a tag added without a cache-buster misses '
+        'already-open browsers; bump all /static/redux/* ?v= uniformly.'
+    )
+    assert re.search(r'/static/redux/memory_evals_fmt\.js\?v=\d+', index_html_body), (
+        'memory_evals_fmt.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tab_memory_evals.jsx destructures '
+        'window.DF_MEMORY_EVALS_FMT at top level with no fallback, so a missing '
+        'tag throws at its evaluation, which in turn leaves window.DF_MEMORY_EVALS '
+        'undefined for the tabs.jsx top-level destructure and blanks EVERY tab '
+        'defined in that file. An unversioned tag would both miss an already-open '
+        'browser and break the single-shared-version invariant this test asserts.'
+    )
+    assert re.search(r'/static/redux/spark_path\.js\?v=\d+', index_html_body), (
+        'spark_path.js is not present among the versioned /static/redux/* '
+        'assets in index.html — charts.jsx destructures window.DF_SPARK_PATH at '
+        'top level with no fallback, so a missing tag blanks nearly every tab; '
+        'a tag added without a cache-buster misses already-open browsers. Bump '
+        'all /static/redux/* ?v= uniformly.'
     )

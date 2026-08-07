@@ -26,11 +26,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
 from typing import NamedTuple
+
+# Tier 1 (tasks.db discovery) ONLY. This module deliberately keeps its own
+# format_report/format_json/_build_parser/main: its fourth exit code (3 = roots
+# resolved but every one failed to audit, kept distinct from 0 per
+# docs/legibility/design-invariants.md's no-silent-fail-soft rule), its
+# --min-fidelity filter and its object-shaped JSON are genuinely different
+# behaviour, not duplication.
+from _task_db_scan import discover_project_roots, tasks_db_path
 
 # The canonical meta-root directory name, per config.py:1343 TASK_META_DIRNAME
 # and artifacts.py:287 meta_root_for. It is a SIBLING of the worktrees inside
@@ -534,11 +541,6 @@ class ProjectAudit(NamedTuple):
     coverage: AuditCoverage
 
 
-def tasks_db_path(project_root: str) -> Path:
-    """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
-    return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
-
-
 def runs_db_path(project_root: str) -> Path:
     """``<root>/data/orchestrator/runs.db`` (harness.py:1877; no config key).
 
@@ -781,41 +783,11 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # CLI.
 # ---------------------------------------------------------------------------
 
-# Multi-project discovery fallback, mirroring scan_task_toolcall_leaks.py's
-# _DEFAULT_PROJECT_ROOTS.
-_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
-
 # --min-fidelity values, loosest last.
 _MIN_FIDELITY_CHOICES = {
     "file-level": FIDELITY_FILE_LEVEL,
     "lock-level": FIDELITY_LOCK_LEVEL,
 }
-
-
-def discover_project_roots(
-    project_roots: list[str] | None = None,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    """Resolve the list of project roots to audit.
-
-    Precedence (first supplied wins): *project_roots* >
-    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (comma-separated, read from *env*,
-    defaulting to the real ``os.environ``) > the dark-factory default root.
-
-    A root whose ``tasks.db`` does not exist is silently dropped — this never
-    raises on a missing or not-yet-set-up project.
-    """
-    if project_roots is not None:
-        roots = list(project_roots)
-    else:
-        environ = env if env is not None else os.environ
-        roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
-        if roots_env:
-            roots = [r.strip() for r in roots_env.split(",") if r.strip()]
-        else:
-            roots = list(_DEFAULT_PROJECT_ROOTS)
-
-    return [root for root in roots if tasks_db_path(root).exists()]
 
 
 def _build_parser() -> argparse.ArgumentParser:

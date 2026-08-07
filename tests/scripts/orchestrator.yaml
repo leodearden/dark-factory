@@ -46,35 +46,97 @@
 # classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
 
-# KNOWN COST, recorded rather than left invisible (task 3350 amendment).
+# THIS COMMAND ALSO CARRIES THE skills/ LINT GATE (task 3554), which is not
+# recoverable from the string itself and is why the note exists.
 #
-# This command is BYTE-IDENTICAL to scripts/orchestrator.yaml's test_command
-# (verified). That is not an accident — scripts/ has no tests of its own and has
-# always pointed at this suite — but it means the suite now runs TWICE, and the
-# two dedupe layers each miss it for a different reason:
+# test_root_lint_covers_nonmember_py.py::
+# test_root_level_and_skills_py_are_clean_under_the_members_rule_set
+# SUBPROCESSES ruff over REPO_ROOT.glob('*.py') + (REPO_ROOT/'skills').rglob(
+# '*.py') and asserts an empty finding set. That test lives in tests/scripts/,
+# so this DIRECTORY target is what carries skills/**/*.py lint into
+# verify.run_full_verification's asyncio.gather over module_configs.values() —
+# i.e. onto every review checkpoint, run_main_tip_sweep and merge full-verify.
+# The repo-root lint_command's ruff head DECLARES `skills` as a target but
+# cannot deliver that: its verbatim form is reached only via
+# verify.run_verification with module_config is None (see the root config's
+# SCOPE HONESTY block).
 #
-#   * run_full_verification (verify.py:4735) asyncio.gathers over
-#     module_configs.values() with NO dedupe by command, so on every review
-#     checkpoint, run_main_tip_sweep and merge full-verify, `scripts` and
-#     `tests/scripts` both fire this identical command CONCURRENTLY in one
-#     worktree — two pytest processes sharing the worktree-root .pytest_cache
-#     and tests/scripts/__pycache__.
+# So narrowing this command away from the tests/scripts/ directory — to a file
+# list, or to a subset — would SILENTLY kill the skills/ lint gate: nothing
+# would report skipped and nothing would exit non-zero. Task 3554 declined to
+# register skills/orchestrator.yaml partly BECAUSE this gate already holds, so
+# removing it would invalidate that decision, not merely lose coverage.
+# test_skills_module_config_decision.py::
+# test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_command
+# fails if that happens. It deliberately does NOT assert that THIS config is
+# the carrier — scripts/orchestrator.yaml's test_command collects tests/scripts/
+# too, and task 3383's pending dedupe-by-command fix will legitimately change
+# that arrangement — only that SOME registered module config still carries it.
+#
+# That is only HALF the gate, and the other half is not this config's to keep:
+# collecting the probe's PATH is worthless if the probe stops globbing skills/.
+# test_skills_py_ruff_probe_still_globs_skills_at_runtime pins that half by
+# CALLING _guarded_py_files and inspecting its result. MEASURED at base main
+# 7c6039327d: narrowing that function to REPO_ROOT.glob('*.py') deletes the
+# skills/ lint gate outright while the path-level assertion above stays green
+# (`1 failed, 5 passed`). So an edit here can only break the half named above —
+# do not read a green run of that one test as the gate being intact.
+
+# KNOWN COST, recorded rather than left invisible (task 3350 amendment;
+# restated by task 3460, which falsified this block's original premise).
+#
+# The two commands are NO LONGER byte-identical. scripts/orchestrator.yaml's
+# test_command now reads `pytest tests/scripts/ scripts/tests/`: it runs BOTH
+# directories, because tests/scripts/ tests scripts/ PRODUCTION code
+# (test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py,
+# test_spawn_claude.py, test_check_dashboard_unit_parity.py,
+# test_restart_all_orchestrators.py, ...) while scripts/tests/ holds that
+# directory's own suite covering the same tree — so neither can be dropped from
+# the owning module's suite. (Deliberately stated without a module COUNT: the
+# "40" this sentence first shipped with was already stale at HEAD, and a
+# hard-coded count of a directory's contents rots on the next test file added.
+# The claim needs no number — it is "both trees cover scripts/", true at any
+# size.) This corrects, rather than merely amends, the claim this
+# block used to make: "scripts/ has no tests of its own and has always pointed
+# at this suite" was FALSE in its first clause, which is precisely the coverage
+# gap task 3460 closed.
+#
+# THE COST SURVIVES, in narrowed form. `scripts` and `tests/scripts` both still
+# run tests/scripts/ under a full verify, so THIS suite still executes twice
+# (~110-230s of duplicated work per full verify) — only the second command is
+# now a superset rather than a copy. The two dedupe layers still each miss it
+# for a different reason, cited by SYMBOL rather than by file:line: the pins
+# this block previously carried (verify.py:4735, workflow.py:3558) were BOTH
+# stale at the time of writing — run_full_verification had drifted ~510 lines
+# and `seen[mc.prefix]` ~100, and each pin landed on unrelated code, so the
+# rot was compounding exactly as scripts/orchestrator.yaml's LINT block records
+# for its own inherited pins.
+#
+#   * verify.run_full_verification asyncio.gathers over module_configs.values()
+#     with NO dedupe by command, so on every review checkpoint,
+#     run_main_tip_sweep and merge full-verify, `scripts` and `tests/scripts`
+#     both collect tests/scripts/ CONCURRENTLY in one worktree — two pytest
+#     processes sharing the worktree-root .pytest_cache and
+#     tests/scripts/__pycache__.
 #   * workflow._resolve_module_configs dedupes by `mc.prefix` (`seen[mc.prefix]
-#     = mc`, workflow.py:3558), not by command, so a SCOPED verify whose touched
-#     files span both scripts/ and tests/scripts/ also runs it twice.
+#     = mc`), not by command, so a SCOPED verify whose touched files span both
+#     scripts/ and tests/scripts/ also runs it twice.
 #
-# Cost: ~110-230s of duplicated work per full verify. That cuts against this
-# file's own premise — the 600s budget below is sized for a ~39% run-to-run
-# spread attributed to host oversubscription, and duplicate execution is itself
-# a contributor to that oversubscription.
+# That cuts against this file's own premise — the 600s budget below is sized
+# for a ~39% run-to-run spread attributed to host oversubscription, and
+# duplicate execution is itself a contributor to that oversubscription.
 #
-# It is documented here rather than fixed because both fixes are out of this
-# task's lock scope: narrowing/removing scripts/orchestrator.yaml's test_command
-# would edit a file this task does not hold, and a dedupe-identical-commands
-# guard in run_full_verification is a production-code change of a different
-# class. Filed as follow-up. Recording it keeps the cost measured and visible —
-# the same standard this file applies to its timeout budgets — instead of
-# leaving a silent 2x for someone to rediscover under load.
+# OWNED BY TASK 3383, not by this file and not by task 3460. It is documented
+# rather than fixed because the real fix is a dedupe-by-command guard in
+# run_full_verification — production code of a different class from a yaml
+# command edit, and outside the locks of every task that has touched these two
+# configs. Note 3383's own framing ("BYTE-IDENTICAL test_commands") is now
+# STALE while its substance is unchanged: the duplication is a property of two
+# module configs collecting the same directory, not of the two command strings
+# matching, so a dedupe keyed on string equality would no longer catch it.
+# Recording this keeps the cost measured and visible — the same standard this
+# file applies to its timeout budgets — instead of leaving a silent 2x for
+# someone to rediscover under load.
 
 # ALL THREE commands are declared DELIBERATELY, not incidentally.
 #

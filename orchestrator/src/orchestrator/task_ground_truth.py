@@ -16,6 +16,15 @@ instead of re-deriving recovery policy themselves is a separate task (θ2).
 TG-1 (journal-first branch state) / TG-2 (one classification table) / TG-3
 (liveness via the public accessor, not scheduler privates) are implemented
 in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
+
+Task 3533 widened :class:`EscalationRef` with ``severity`` and
+``filing_claimant_run_id`` so refs can feed the shared
+``escalation.pins.classify_pins`` predicate (spec
+``docs/task-escalation-state-spec.md`` S6/E7) without a downstream re-read.
+That task deliberately rewires NO veto site: ``_shape``'s
+``has_open_escalation = bool(report.open_escalations)``, ``classify_recovery``
+and the ``_RECOVERY`` table are unchanged, and making that boolean
+pin-class-aware is task eta (3541).
 """
 
 from __future__ import annotations
@@ -112,11 +121,27 @@ class Claimant:
 
 @dataclass(frozen=True)
 class EscalationRef:
-    """A lightweight reference to an open escalation."""
+    """A lightweight reference to an open escalation.
+
+    Severity and level must BOTH travel with every escalation reference — a
+    predicate that cannot see severity cannot discriminate a pinning record
+    from a non-pinning one (spec ``docs/task-escalation-state-spec.md`` S6/E7),
+    which is why ``severity`` is carried here rather than re-read downstream.
+
+    ``severity=''`` and ``filing_claimant_run_id=None`` both mean "unknown".
+    Their semantics and the fail-safe rule are documented once, on
+    ``escalation.pins.classify_pins`` (normative source: spec S6) — this
+    docstring deliberately does not restate them.
+
+    Both new fields are DEFAULTED so every existing construction site keeps
+    working untouched.
+    """
 
     id: str
     level: int
     category: str = ''
+    severity: str = ''
+    filing_claimant_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,12 +150,23 @@ class TruthReport:
 
     Frozen — a point-in-time snapshot, not a live view; callers re-derive
     via :meth:`TaskGroundTruth.derive_truth` for a fresh report.
+
+    KNOWN GAP on ``open_escalations`` (task 3533 -> beta/3535): its ``[]`` is
+    currently AMBIGUOUS — "the store was read and holds no open escalations"
+    and "no escalation store was bound, so no read was possible" are
+    indistinguishable (see :meth:`TaskGroundTruth._resolve_open_escalations`).
+    That is exactly the collapse ``escalation.pins.classify_pins(records=None)
+    -> store_unavailable`` exists to make impossible, so this field has no way
+    to reach that third state yet.  Task beta (3535) widens it; until then a
+    consumer must NOT read ``open_escalations == []`` as proof that the task
+    carries no open escalation.
     """
 
     db_status: str
     live_claimant: Claimant | None
     branch_state: BranchState
     worktree_present: bool
+    # ``[]`` is ambiguous — see the KNOWN GAP note in the class docstring.
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
 
@@ -468,15 +504,37 @@ class TaskGroundTruth:
     def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
         """Map *tid*'s pending escalations to lightweight refs.
 
+        ``severity`` and ``filing_claimant_run_id`` travel with each ref so
+        consumers can feed ``escalation.pins.classify_pins`` directly instead
+        of re-reading the store (spec ``docs/task-escalation-state-spec.md``
+        S6/E7).  ``row.severity or ''`` normalises a null/absent severity to
+        the unknown-severity sentinel, so the classifier reaches its
+        documented fail-safe-to-pinning branch rather than raising.
+
+        STORE-CORRECTNESS (spec S6; esc-3163 was a wrong-store read): this
+        resolver reads the escalation store INJECTED by the task's owning
+        orchestrator — never the reconciliation store.
+
         ``[]`` when no ``escalation_queue`` was injected — a caller that
         doesn't wire one up gets an empty-but-valid TruthReport field rather
-        than an error.
+        than an error.  That degradation is a KNOWN gap: it is indistinguishable
+        from a genuine "no open escalations", which is exactly the collapse
+        ``classify_pins(records=None)`` -> ``store_unavailable`` exists to
+        prevent.  Task beta (3535) replaces it with that distinguishable third
+        state; it is deliberately left unchanged here so this task ships no
+        disposition change.
         """
         if self.escalation_queue is None:
             return []
         rows = self.escalation_queue.get_by_task(tid, status='pending')
         return [
-            EscalationRef(id=row.id, level=row.level, category=row.category)
+            EscalationRef(
+                id=row.id,
+                level=row.level,
+                category=row.category,
+                severity=row.severity or '',
+                filing_claimant_run_id=row.filing_claimant_run_id,
+            )
             for row in rows
         ]
 

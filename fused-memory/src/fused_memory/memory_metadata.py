@@ -7,27 +7,17 @@ the vocabulary.  A second copy of any constant in this module is a bug.
 
 Contents
 --------
-* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` — the shared ``topic`` slug
-  shape (PRD D4: ``ProceduralTopicCluster.topic_id`` and
-  ``metadata.topic`` are one namespace with one regex).
+* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` / ``is_valid_topic_slug`` —
+  the shared ``topic`` slug shape (PRD D4:
+  ``ProceduralTopicCluster.topic_id`` and ``metadata.topic`` are one
+  namespace with one regex).  **Defined in**
+  :mod:`fused_memory.topic_slug` (task 3198, leaf ε) and re-exported here
+  bound to the *same objects*, so this registry remains the advertised
+  import site while ``config/schema.py`` — which cannot import this
+  module without a cycle — validates through the identical rule.  See
+  that module's docstring for the measured ``ImportError`` behind the
+  split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
-
-Measured basis for the slug shape
----------------------------------
-Derived from leaf α's census
-(``plans/memory-metadata-census-report.json`` @ ``b5af3e4b03``,
-``coverage.complete = true``) rather than guessed:
-
-* accepts all **5** seeded ``ProceduralTopicCluster.topic_id`` values
-  (PRD §10's one hard requirement); longest is 52 chars;
-* accepts **254 of 352** distinct live ``topic`` values (355 of 491
-  records); the longest conforming live value is 69 chars, so the
-  100-char cap bounds the key while rejecting nothing observed;
-* the 98 non-conforming live values are all snake_case.  Under the
-  warn-mode default (``memory_metadata.enforce = False``) these emit a
-  census line and the write proceeds — leaf θ's bounded retro-stamping
-  sweep is the intended normalizer.  This is why the warn default is
-  load-bearing rather than merely cautious.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -65,17 +55,31 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
+# Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
+# *same objects* the leaf module defines, so this registry remains the
+# advertised import site for the vocabulary while ``config/schema.py`` —
+# which cannot import this module without the measured
+# ``ImportError: cannot import name 'FusedMemoryConfig'`` cycle — validates
+# through the identical rule.  Per INV-5 there is one copy of the pattern
+# and the cap in the tree; ``tests/test_topic_slug_namespace.py`` asserts
+# that by ``is``, so retyping either here fails by design.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
 __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
+    'CanonicalUniquenessViolation',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'RESERVED_VOCABULARY_KEYS',
@@ -83,6 +87,7 @@ __all__ = [
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'classify_unknown_keys',
+    'is_valid_topic_slug',
     'normalize_supersedes',
     'validate_memory_metadata',
 ]
@@ -93,20 +98,6 @@ __all__ = [
 #: it is experimenting should be able to say so without manufacturing census
 #: noise.
 EXPERIMENTAL_KEY_PREFIX = 'x_'
-
-
-#: Shared ``topic`` slug shape (PRD D4 — one namespace for
-#: ``ProceduralTopicCluster.topic_id`` and ``metadata.topic``).
-#:
-#: Lowercase alphanumeric segments joined by single hyphens.  Anchored at
-#: both ends with ``\Z`` rather than ``$`` so a trailing newline cannot
-#: sneak past (``$`` matches before a final ``\n``).
-TOPIC_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*\Z')
-
-#: Maximum ``topic`` slug length.  See the module docstring for the
-#: measured basis (longest conforming live topic 69, longest seeded
-#: cluster id 52 — 100 has headroom and rejects nothing observed).
-TOPIC_SLUG_MAX_LEN = 100
 
 
 def normalize_supersedes(value: Any) -> list[Any]:
@@ -698,6 +689,49 @@ class MemoryMetadataValidationError(Exception):
         )
 
 
+class CanonicalUniquenessViolation(Exception):
+    """A second ``canonical`` write for a ``(project, topic)`` already taken.
+
+    V1 contract-fixes this type alongside
+    :class:`MemoryMetadataValidationError`, and requires the message to
+    NAME the incumbent's id -- counting is not enough, because an operator
+    who trips this needs to go look at the record that already holds the
+    topic. That obligation is why the seam counts first and only then
+    scrolls: ``count_memories_by_metadata`` is the contracted INV-3 gate
+    but returns an ``int``, which structurally cannot carry an id.
+
+    Deliberately **NOT** a subclass of
+    :class:`MemoryMetadataValidationError`. The two are separate rejection
+    contracts -- one is "your metadata is malformed", the other is "your
+    metadata is well-formed but collides with live state" -- and a caller
+    must be able to tell them apart at the ``except``. Subclassing would
+    also let the pre-existing
+    ``pytest.raises(MemoryMetadataValidationError)`` sites silently
+    swallow a uniqueness violation, i.e. pass for the wrong reason. The
+    structured fields below satisfy INV-2's structured-rejection
+    obligation without needing inheritance.
+
+    Raised ONLY from
+    :func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`,
+    never from :func:`validate_memory_metadata`: the check needs live
+    store state, and the pure validator structurally cannot perform a
+    store lookup. Look for it at the seam, not in the shape validator.
+    """
+
+    def __init__(self, *, project_id: str, topic: str, incumbent_id: str) -> None:
+        self.project_id = project_id
+        self.topic = topic
+        self.incumbent_id = incumbent_id
+        super().__init__(
+            f'canonical uniqueness violated: memory {incumbent_id} is already '
+            f'canonical for topic {topic!r} in project {project_id!r}; at most '
+            f'one canonical memory is allowed per (project, topic). Update or '
+            f'supersede that memory instead of adding a second canonical -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # The shape validator
 # ---------------------------------------------------------------------------
@@ -760,7 +794,17 @@ def validate_memory_metadata(
     deliberate, not an oversight:
 
     * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
-    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's.
+    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's, and
+      lives at the async seam
+      (:func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`)
+      because it needs live store state.
+
+    Leaf ε (task 3198) split ``canonical`` along exactly that line.  Its
+    SHAPE half — a canonical assertion requires a ``topic`` (§2b's
+    ``canonical_without_topic``) — is checked HERE, because it needs
+    nothing but the dict.  Its UNIQUENESS half stays at the seam.  The
+    boundary moved no work into this function that a store lookup could
+    have been needed for.
 
     Making the boundary structural rather than a comment means a later leaf
     must add liveness at the seam and cannot accidentally grow a second
@@ -820,7 +864,16 @@ def validate_memory_metadata(
                 f'topic must be a str, got {type(topic).__name__}',
                 fatal=True,
             ))
-        elif not TOPIC_SLUG_RE.match(topic) or len(topic) > TOPIC_SLUG_MAX_LEN:
+        # `is_valid_topic_slug`, NOT an inlined `TOPIC_SLUG_RE.match(...) or
+        # len(...) >` — the predicate is THE shared verdict (D4: one
+        # namespace, one answer), and the config-side validator and the
+        # seam's uniqueness guard both call it.  Re-expressing the rule here
+        # would split the closure the moment the predicate gains a step
+        # (a normalization pass, a reserved-prefix rule): the other two call
+        # sites would get it and the shape validator would not.  The
+        # `isinstance(topic, str)` branch above already separated the type
+        # defect from the shape defect, so both violation codes survive.
+        elif not is_valid_topic_slug(topic):
             violations.append(_violation(
                 'topic',
                 'invalid_topic_slug',
@@ -844,6 +897,24 @@ def validate_memory_metadata(
                 f'canonical must be a bool, got {type(canonical).__name__} '
                 f'({canonical!r}); the check is isinstance(x, bool), not '
                 f'truthiness, so 1/0 do not pass as True/False',
+                fatal=True,
+            ))
+        # `is True`, not truthiness — for the reason 2b already documents
+        # above (`1 == True`), and so a non-bool value reports only the TYPE
+        # defect rather than being double-counted here.
+        #
+        # Only the `topic` KEY's presence is tested: when it is present but
+        # malformed, 2a's invalid_topic_slug already describes that defect,
+        # and emitting both would report one defect twice while implying the
+        # writer forgot a key they did supply.
+        elif canonical is True and 'topic' not in meta:
+            violations.append(_violation(
+                'canonical',
+                'canonical_without_topic',
+                'canonical=True requires a topic: the marker asserts "this is '
+                'THE entry for its topic", so outside a topic there is no set '
+                'for it to be canonical of and the <=1-per-(project, topic) '
+                'uniqueness rule has no key to check',
                 fatal=True,
             ))
 

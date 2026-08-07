@@ -477,6 +477,13 @@ class TestHarnessWiring:
         # Inject a FakeScheduler with one seeded member.
         sched = FakeScheduler()
         await sched.set_task_status('4442', 'merge-deferred')
+        # task 3057: the harness now arms the factory with self.config, so the
+        # delivered-checks guard makes a get_task round-trip per member. Seed
+        # the record a real scheduler would have — an ABSENT one is the
+        # fail-safe "unknown metadata -> withhold" case, not the happy path
+        # this test is about (that case has its own coverage in
+        # TestTrainCallbacksDeliveredChecksGuard).
+        sched.task_data['4442'] = {'id': '4442', 'metadata': {}}
         harness.scheduler = sched  # type: ignore[assignment]
 
         # Stub git_ops so the worker constructor doesn't fail on project_root.
@@ -541,3 +548,647 @@ class TestHarnessWiring:
 
         # Teardown.
         await harness._stop_merge_worker()
+
+
+# ---------------------------------------------------------------------------
+# Task 3057 step-17 (RED) — seams 3 + 9: the two harness train callbacks.
+#
+# `mark_member_done` stamps kind='merged' and `redrive_member(found_on_main=True)`
+# stamps kind='found_on_main' — both on the strength of a SIBLING's merge having
+# advanced main. That is attribution by inference: it proves something of this
+# branch reached main, never that THIS member's declared capability rode along.
+#
+# The overriding constraint at these two seams is that a withholding must RETURN,
+# never RAISE: `mark_member_done` is called from `_do_train_merge`'s post-advance
+# flip loop, which collects raises into TRAIN_PARTIAL_FLIP. A capability
+# withholding is not a partial-flip failure — the merge genuinely advanced main —
+# and raising would bounce an otherwise-healthy train.
+# ---------------------------------------------------------------------------
+
+_TC_GATE_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
+_TC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+_TC_TRAIN = 'train-dc'
+
+
+def _tc_block(reason: str = 'failed'):
+    from orchestrator.delivered_checks import DeliveredChecksBlock
+
+    return DeliveredChecksBlock(
+        reason=reason,  # type: ignore[arg-type]
+        main_sha='MAIN',
+        failed_check=_TC_CHECK if reason == 'failed' else None,
+    )
+
+
+def _tc_config(*, enabled: bool = True, tmp_path: Path | None = None) -> MagicMock:
+    from orchestrator.config import DeliveredChecksConfig
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.project_root = tmp_path or Path('/tmp/proj')
+    config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    return config
+
+
+def _tc_scheduler(
+    mid: str = '7001',
+    *,
+    get_task: AsyncMock | None = None,
+    member_metadata: dict | None = None,
+) -> MagicMock:
+    """Scheduler stub whose get_statuses passes the closures' existence probe."""
+    sched = MagicMock()
+    sched.get_statuses = AsyncMock(return_value=({mid: 'merge-deferred'}, None))
+    sched.mark_done = AsyncMock()
+    sched.set_task_status = AsyncMock()
+    sched.get_task = get_task or AsyncMock(return_value={
+        'id': mid,
+        'metadata': (
+            {'delivered_checks': [_TC_CHECK]}
+            if member_metadata is None else member_metadata
+        ),
+    })
+    return sched
+
+
+async def _tc_drive(cbs, closure: str, mid: str = '7001') -> None:
+    """Invoke the closure under test with args that reach its stamp."""
+    if closure == 'mark_member_done':
+        await cbs.mark_member_done(mid, 'deadbeefcafe')
+    else:
+        assert cbs.redrive_member is not None
+        await cbs.redrive_member(mid, True, 'deadbeefcafe')
+
+
+_TC_CLOSURES = ['mark_member_done', 'redrive_member']
+_TC_SITES = {
+    'mark_member_done': 'train-member-merged',
+    'redrive_member': 'coalesce-derail-found-on-main',
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('closure', _TC_CLOSURES)
+class TestTrainCallbacksDeliveredChecksGuard:
+    """Task 2794's six-row matrix, applied to both harness train callbacks.
+
+    On every block the seam withholds the stamp and REVERTS the member to
+    'pending' (task 3057 step-23/24 — review remediation). It still does NOT
+    consume the write-ahead LandedRow (the reconciler needs the crash-window
+    record) and does NOT release the lane through
+    ``release_lane_for_terminal_task`` (the member is not terminal; the revert
+    itself makes the lane a legitimate reclaim victim).
+
+    The revert is the member's ONLY recovery edge: a member left at
+    'merge-deferred' is unreachable by every recovery path — see
+    ``TestWithheldTrainMemberHasRecoveryEdge`` in test_reconcile_stranded.py,
+    which pins the three status filters that make it a permanent wedge.
+    """
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    async def test_failed_block_withholds_flip_without_raising(
+        self, closure: str, tmp_path: Path, caplog,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.mark_done.assert_not_called()
+        prov.consume.assert_not_called()
+        git_ops.release_lane_for_terminal_task.assert_not_awaited()
+        assert _TC_TRAIN in caplog.text
+        assert '7001' in caplog.text
+
+    # --- step-23 (RED): the withhold path's ACTUAL recovery edge ----------
+
+    @pytest.mark.parametrize('reason', ['failed', 'errored', 'main_sha_unresolved'])
+    async def test_withheld_member_is_reverted_to_pending(
+        self, closure: str, reason: str, tmp_path: Path, caplog,
+    ) -> None:
+        """A withheld member must be handed back to the scheduler.
+
+        Before step-24 all four train seams withheld by RETURNING with the
+        member's status untouched at 'merge-deferred' — a status no recovery
+        path can reach (the stranded sweep does not iterate it,
+        ``_reconcile_one_stranded`` early-returns on it, the train already
+        advanced main so the merge worker will not re-drive it, and warm-lane
+        reclaim is barred from taking its lane). The revert to 'pending' IS
+        the recovery edge; without it a permanently-ERRORing check descriptor
+        wedges the member forever.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block(reason))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+        # UNCHANGED from step-17 — this remediation must not silently relax
+        # either contract:
+        sched.mark_done.assert_not_called()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _TC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '7001' in blob, f'WARNING must name the member: {blob!r}'
+        assert reason in blob, f'WARNING must name the block reason: {blob!r}'
+
+    async def test_revert_failure_is_swallowed_not_raised(
+        self, closure: str, tmp_path: Path, caplog,
+    ) -> None:
+        """A FAILED recovery edge must never become a TRAIN_PARTIAL_FLIP.
+
+        ``mark_member_done`` is called from ``_do_train_merge``'s post-advance
+        flip loop, which collects raises into TRAIN_PARTIAL_FLIP. If the revert
+        itself fails the member simply stays merge-deferred — no worse than
+        before this remediation — and that is logged rather than raised.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.set_task_status = AsyncMock(side_effect=RuntimeError('scheduler down'))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+        sched.mark_done.assert_not_called()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert '7001' in blob
+        assert 'merge-deferred' in blob, (
+            'a failed revert must say the member is left parked: ' f'{blob!r}'
+        )
+
+    # --- row 2: all_delivered -> byte-identical flip ----------------------
+
+    async def test_all_delivered_flips_with_todays_exact_args_and_ordering(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        calls: list[str] = []
+        sched.mark_done = AsyncMock(side_effect=lambda *a, **k: calls.append('mark'))
+        git_ops.release_lane_for_terminal_task = AsyncMock(
+            side_effect=lambda *a, **k: calls.append('lane'),
+        )
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=None)), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            prov.consume.side_effect = lambda *a, **k: calls.append('consume')
+            await _tc_drive(cbs, closure)
+
+        assert calls == ['mark', 'consume', 'lane'], (
+            'mark_done -> MergeProvenance.consume -> lane release ordering '
+            'must be byte-identical to today'
+        )
+        kwargs = sched.mark_done.await_args.kwargs
+        if closure == 'mark_member_done':
+            assert kwargs['kind'] == 'merged'
+            assert kwargs['note'] == f'train {_TC_TRAIN}'
+        else:
+            assert kwargs['kind'] == 'found_on_main'
+            assert 'on main' in kwargs['note']
+            assert _TC_TRAIN in kwargs['note']
+        assert kwargs['sha'] == 'deadbeefcafe'
+
+    # --- row 3: no delivered_checks -> unchanged flip ---------------------
+
+    async def test_member_without_delivered_checks_flips_unchanged(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler(member_metadata={})
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        sched.mark_done.assert_awaited_once()
+
+    # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
+
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_withhold_and_revert_to_pending(
+        self, closure: str, reason: str, tmp_path: Path,
+    ) -> None:
+        """A permanently-ERRORing descriptor must not wedge the member.
+
+        A malformed check descriptor ERRORs forever, so the fail-safe arms are
+        exactly where a silent park becomes a permanent wedge. They take the
+        SAME recovery edge as ``failed``: revert to pending and let the
+        scheduler re-dispatch.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block(reason))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+        prov.consume.assert_not_called()
+
+    # --- row 6: config=None -> FULLY inert (every existing caller) --------
+
+    async def test_config_none_keeps_the_guard_fully_inert(
+        self, closure: str,
+    ) -> None:
+        """The bare-worker construction `build_train_callback_factory(sched)`
+        must keep working with zero added I/O.
+
+        `git_ops` is deliberately a REAL (mock) handle here so that
+        `config is None` is the ONLY thing that can produce inertness.
+        Passing `git_ops=None` as well would make this test pass off the
+        `git_ops is None` arm instead, and deleting the `config is None`
+        check outright would not fail it — the contract this test is named
+        after would go untested. The `git_ops is None` degradation has its
+        own test below.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        guard = AsyncMock(return_value=_tc_block('failed'))
+        cbs = build_train_callback_factory(sched, git_ops)(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        guard.assert_not_awaited()
+        sched.get_task.assert_not_called()
+        sched.mark_done.assert_awaited_once()
+        sched.set_task_status.assert_not_called()
+
+    async def test_kill_switch_short_circuits_before_the_metadata_read(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        """Retargeted by the task 3057 review.
+
+        This test previously pinned the OPPOSITE contract — that the seam
+        forwards `enabled` to the shared gate and short-circuits nowhere
+        locally. That is right for the eight seams whose metadata is already
+        in scope, but WRONG here: this seam must read another task's row
+        FIRST, and that read's fail-safe arms withhold without ever reaching
+        the gate. Forwarding alone therefore left the kill switch unable to
+        disarm the seam (see
+        `test_kill_switch_disarms_the_metadata_pre_read` for the failure it
+        allowed). The correct contract at the three pre-read seams is a local
+        short-circuit on the SAME config leaf, so one hot reload still
+        disarms everything at once.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        guard = AsyncMock(return_value=None)
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(enabled=False, tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        guard.assert_not_awaited()
+        sched.get_task.assert_not_called()
+        sched.mark_done.assert_awaited_once()
+        sched.set_task_status.assert_not_called()
+
+    # --- plumbing: ONE metadata read, live config forwarded ---------------
+
+    async def test_metadata_read_once_and_config_forwarded(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        meta = {'delivered_checks': [_TC_CHECK]}
+        sched = _tc_scheduler(member_metadata=meta)
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        guard = AsyncMock(return_value=None)
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        sched.get_task.assert_awaited_once_with('7001')
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.args[0] == '7001'
+        assert guard.await_args.args[1] == meta
+        assert guard.await_args.kwargs['project_root'] == str(tmp_path)
+        assert guard.await_args.kwargs['check_timeout_secs'] == 7.5
+        assert guard.await_args.kwargs['enabled'] is True
+        assert guard.await_args.kwargs['site'] == _TC_SITES[closure]
+        # The factory's git_ops HANDLE, not merely a truthy sentinel:
+        # without it the guard cannot resolve a main SHA and every
+        # check-carrying member collapses to `main_sha_unresolved`, i.e.
+        # every train flip withheld forever.
+        assert guard.await_args.kwargs['git_ops'] is git_ops
+
+    # --- fail-safe: unknown metadata / an errored guard never stamp -------
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_unreadable_member_metadata_withholds(
+        self, closure: str, mode: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        sched = _tc_scheduler(get_task=get_task)
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.mark_done.assert_not_called()
+        # The fail-safe withholds need the recovery edge too — they are the
+        # arms most likely to fire repeatedly on a degraded backend, so a
+        # silent park here is the same permanent wedge.
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+
+    async def test_guard_exception_withholds_rather_than_propagating(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        """A raise here would reach `_do_train_merge`'s post-advance flip loop
+        and be misreported as TRAIN_PARTIAL_FLIP."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(side_effect=RuntimeError('boom'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+
+    # --- git_ops unbound: degrade to TODAY's behavior, but not silently ---
+
+    async def test_git_ops_none_degrades_inert_with_a_debug_line(
+        self, closure: str, tmp_path: Path, caplog,
+    ) -> None:
+        """Mirrors this factory's existing `git_ops is None` lane-release
+        degradation: withholding EVERY train flip in a configuration that has
+        always worked would be worse than the status quo."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        guard = AsyncMock(return_value=_tc_block('failed'))
+        cbs = build_train_callback_factory(
+            sched, None, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        guard.assert_not_awaited()
+        sched.mark_done.assert_awaited_once()
+        # Assert the SPECIFIC line this arm emits, not the bare token
+        # 'git_ops': the pre-3057 B3 lane-release DEBUG line
+        # ('factory built without git_ops (missing wiring?)') also fires on
+        # this same logger, so a bare-token assertion passes even with the
+        # guard's own degradation line deleted.
+        assert 'delivered-checks guard inert' in caplog.text, \
+            'the degradation must not be silent'
+
+    # --- ordering: the existence probe still wins -------------------------
+
+    async def test_non_task_member_noops_before_any_check_work(
+        self, closure: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.get_statuses = AsyncMock(return_value=({}, None))
+        guard = AsyncMock(return_value=None)
+        cbs = build_train_callback_factory(
+            sched, MagicMock(), _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance'):
+            await _tc_drive(cbs, closure)
+
+        guard.assert_not_awaited()
+        sched.get_task.assert_not_called()
+        sched.mark_done.assert_not_called()
+
+    # --- kill switch disarms the PRE-READ, not just the decision ----------
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_kill_switch_disarms_the_metadata_pre_read(
+        self, closure: str, mode: str, tmp_path: Path,
+    ) -> None:
+        """`enabled=False` must reproduce pre-3057 behaviour EXACTLY.
+
+        This seam reads ANOTHER task's row before reaching the shared
+        decision, and that read's fail-safe arms synthesise a block without
+        ever calling the gate. Forwarding `enabled` therefore cannot disarm
+        them: with the fleet-wide switch off, a transient scheduler failure
+        would still withhold the flip AND revert the member to pending — a
+        guard that is supposedly off changing behaviour. The kill switch must
+        short-circuit BEFORE the read.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        sched = _tc_scheduler(get_task=get_task)
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        guard = AsyncMock(return_value=None)
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(enabled=False, tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)
+
+        # Not read at all — the short-circuit precedes the round-trip.
+        sched.get_task.assert_not_called()
+        guard.assert_not_awaited()
+        # Pre-3057 behaviour: stamped, row consumed, NOT reverted.
+        sched.mark_done.assert_awaited_once()
+        prov.consume.assert_called_once_with('7001')
+        sched.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestWithheldRedriveRespectsTheLiveStatusRace:
+    """The withhold revert must not clobber a member a live workflow owns.
+
+    `redrive_member`'s not-on-main arm already re-checks the probed status
+    before flipping to 'pending', because a member that raced to 'in-progress'
+    has a live TaskWorkflow holding its worktree. The found_on_main withhold
+    path performs the IDENTICAL write and must inherit that guard — unlike
+    `mark_done`, which is terminal, a pending flip opens a concurrent-dispatch
+    window.
+    """
+
+    @pytest.mark.parametrize('live_status', ['in-progress', 'done'])
+    async def test_withhold_skips_the_revert_when_member_moved_on(
+        self, live_status: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.get_statuses = AsyncMock(return_value=({'7001': live_status}, None))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        # Withheld (no stamp) AND not clobbered (no pending flip).
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_not_called()
+
+    async def test_withhold_still_reverts_a_member_still_merge_deferred(
+        self, tmp_path: Path,
+    ) -> None:
+        """The guard must not swallow the recovery edge in the normal case."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+
+    async def test_untrustworthy_probe_falls_open_to_the_revert(
+        self, tmp_path: Path,
+    ) -> None:
+        """A get_statuses error must not cost the member its only recovery edge.
+
+        Mirrors the fail-open policy the not-on-main arm already applies: an
+        unreadable probe means we cannot prove a live workflow owns the member,
+        and a member left at 'merge-deferred' is a permanent wedge.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.get_statuses = AsyncMock(return_value=({'7001': 'in-progress'}, 'backend down'))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+
+
+@pytest.mark.asyncio
+class TestRedrivePendingArmUnaffectedByTheGuard:
+    """`redrive_member(mid, False, None)` stamps nothing — it must stay untouched."""
+
+    async def test_pending_redrive_never_consults_the_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = FakeScheduler()
+        await sched.set_task_status('5001', 'merge-deferred')
+        guard = AsyncMock(return_value=_tc_block('failed'))
+        cbs = build_train_callback_factory(
+            sched, MagicMock(), _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('5001', False, None)
+
+        guard.assert_not_awaited()
+        assert sched.statuses['5001'][-1] == 'pending'

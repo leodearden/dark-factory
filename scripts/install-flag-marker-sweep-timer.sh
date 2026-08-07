@@ -36,7 +36,14 @@ echo "install-flag-marker-sweep-timer.sh: kicking immediate one-time drain via $
 systemctl --user start "$SERVICE_NAME"
 
 echo "install-flag-marker-sweep-timer.sh: verifying ${TIMER_NAME} is listed..."
-if ! systemctl --user list-timers --all | grep -qF "$TIMER_NAME"; then
+# Capture the full listing first, THEN grep the captured text. Piping
+# `systemctl ... | grep -qF` is fragile under `set -o pipefail`: `grep -q`
+# exits on the first match and closes the pipe, so `systemctl` -- still
+# writing its trailing summary line -- dies with SIGPIPE, and pipefail turns
+# that producer failure into a false "timer not listed" error. Running
+# systemctl to completion into a variable removes the pipe entirely.
+list_timers_out="$(systemctl --user list-timers --all)"
+if ! grep -qF "$TIMER_NAME" <<<"$list_timers_out"; then
     echo "ERROR: ${TIMER_NAME} not found in 'systemctl --user list-timers --all' after enable" >&2
     exit 1
 fi

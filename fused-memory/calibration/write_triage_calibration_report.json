@@ -1,41 +1,41 @@
 {
-  "chosen_t_high": 0.8868293243724489,
-  "chosen_t_low": 0.522971590497168,
+  "chosen_t_high": 0.8868282526657318,
+  "chosen_t_low": 0.5229672433064231,
   "reason": null,
   "deterministic_band_false_positives": 0,
   "distributions": {
     "true_dup": {
       "n": 301,
       "min": 0.3044689234163344,
-      "max": 0.9657105894445585,
-      "mean": 0.7009793614503841,
-      "median": 0.7097019587340561,
-      "p05": 0.522971590497168,
-      "p25": 0.6165531913206045,
-      "p75": 0.7848736212886502,
-      "p95": 0.864638988578648
+      "max": 0.96570744126053,
+      "mean": 0.7009787622581548,
+      "median": 0.709713152372983,
+      "p05": 0.5229672433064231,
+      "p25": 0.6164660007110104,
+      "p75": 0.7847931720229323,
+      "p95": 0.8646358352421091
     },
     "unrelated": {
       "n": 5037,
       "min": 0.1491529252563599,
-      "max": 0.8349098187756331,
-      "mean": 0.4341046542858694,
-      "median": 0.42545052030721703,
-      "p05": 0.27870581017515533,
-      "p25": 0.3639867511771781,
-      "p75": 0.49767549585999604,
-      "p95": 0.6135410083022856
+      "max": 0.8349988478146576,
+      "mean": 0.4341117479202444,
+      "median": 0.4254931064390011,
+      "p05": 0.2786760529807258,
+      "p25": 0.3639902745784614,
+      "p75": 0.49766807005413743,
+      "p95": 0.6136026802068789
     },
     "hard_negative": {
       "n": 18,
       "min": 0.722523229400382,
-      "max": 0.8843326154083471,
-      "mean": 0.7883160062450589,
-      "median": 0.7846622725948826,
+      "max": 0.8843433935965617,
+      "mean": 0.7883216672937455,
+      "median": 0.7846337403069573,
       "p05": 0.722523229400382,
-      "p25": 0.7481461574125756,
-      "p75": 0.8216043288606502,
-      "p95": 0.8843326154083471
+      "p25": 0.7481496080601845,
+      "p75": 0.8215389446744906,
+      "p95": 0.8843433935965617
     }
   },
   "per_band": {
@@ -55,19 +55,159 @@
       "store": 0
     }
   },
+  "per_category": {
+    "procedural_knowledge": {
+      "distributions": {
+        "true_dup": {
+          "n": 242,
+          "min": 0.5076461513969943,
+          "max": 0.96570744126053,
+          "mean": 0.7178710565283163,
+          "median": 0.7203316687045846,
+          "p05": 0.5750178537519799,
+          "p25": 0.6458155072965306,
+          "p75": 0.7914273741185776,
+          "p95": 0.8618487614353623
+        },
+        "unrelated": {
+          "n": 3316,
+          "min": 0.1491529252563599,
+          "max": 0.8349988478146576,
+          "mean": 0.4400026151672054,
+          "median": 0.43193891823894615,
+          "p05": 0.27786910079730626,
+          "p25": 0.3647672582371951,
+          "p75": 0.5085338588661676,
+          "p95": 0.6272986832234049
+        },
+        "hard_negative": {
+          "n": 12,
+          "min": 0.7245013614771467,
+          "max": 0.8388495151705722,
+          "mean": 0.7857889153308962,
+          "median": 0.7846337403069573,
+          "p05": 0.7245013614771467,
+          "p25": 0.7481496080601845,
+          "p75": 0.8153625631981813,
+          "p95": 0.8388495151705722
+        }
+      },
+      "t_high": 0.839045608910388,
+      "t_low": 0.5750178537519799,
+      "reason": null,
+      "pair_counts": {
+        "true_dup": 242,
+        "unrelated": 3316,
+        "hard_negative": 12
+      },
+      "pooled_t_high_negatives_admitted": 0
+    },
+    "observations_and_summaries": {
+      "distributions": {
+        "true_dup": {
+          "n": 4,
+          "min": 0.6030506494744563,
+          "max": 0.8868282526657318,
+          "mean": 0.7836518628483499,
+          "median": 0.8189230982197944,
+          "p05": 0.6030506494744563,
+          "p25": 0.6030506494744563,
+          "p75": 0.8258054510334168,
+          "p95": 0.8868282526657318
+        },
+        "unrelated": {
+          "n": 45,
+          "min": 0.2974050660532761,
+          "max": 0.6600816503204221,
+          "mean": 0.4580490855615139,
+          "median": 0.47277485019395593,
+          "p05": 0.33674659981701993,
+          "p25": 0.3843751495779087,
+          "p75": 0.523341314602434,
+          "p95": 0.5667145829571415
+        },
+        "hard_negative": {
+          "n": 6,
+          "min": 0.722523229400382,
+          "max": 0.8843433935965617,
+          "mean": 0.7933871712194439,
+          "median": 0.7600880313453288,
+          "p05": 0.722523229400382,
+          "p25": 0.7478583084443828,
+          "p75": 0.830515869150983,
+          "p95": 0.8843433935965617
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "insufficient_pairs: 4 duplicate and 51 negative pair(s) measured, below the 20/20 minimum. A fresh pair falls outside a sample this small's observed extreme with expected probability 1/(n+1), and both band edges are fitted to exactly that extreme. Refusing a cutoff the sample size cannot support \u2014 this category runs on the disclosed pooled fallback instead.",
+      "pair_counts": {
+        "true_dup": 4,
+        "unrelated": 45,
+        "hard_negative": 6
+      },
+      "pooled_t_high_negatives_admitted": 0
+    },
+    "preferences_and_norms": {
+      "distributions": {
+        "true_dup": {
+          "n": 28,
+          "min": 0.48436164811765825,
+          "max": 0.7935816256565051,
+          "mean": 0.655500708039061,
+          "median": 0.649687808904173,
+          "p05": 0.49163325143081005,
+          "p25": 0.591201365635598,
+          "p75": 0.729501420003076,
+          "p95": 0.777318897858907
+        },
+        "unrelated": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "hard_negative": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=28, n_negative=0)",
+      "pair_counts": {
+        "true_dup": 28,
+        "unrelated": 0,
+        "hard_negative": 0
+      },
+      "pooled_t_high_negatives_admitted": 0
+    }
+  },
   "recall_at_k": {
     "per_k": [
       {
         "k": 1,
-        "hits": 18,
+        "hits": 17,
         "total": 63,
-        "recall": 0.2857142857142857
+        "recall": 0.2698412698412698
       },
       {
         "k": 3,
-        "hits": 26,
+        "hits": 25,
         "total": 63,
-        "recall": 0.4126984126984127
+        "recall": 0.3968253968253968
       },
       {
         "k": 5,
@@ -77,9 +217,9 @@
       },
       {
         "k": 10,
-        "hits": 46,
+        "hits": 45,
         "total": 63,
-        "recall": 0.7301587301587301
+        "recall": 0.7142857142857143
       }
     ],
     "canonical_absent": [
@@ -178,10 +318,33 @@
     "search_categories": "all",
     "record_count": 104,
     "cluster_count": 20,
+    "per_category_record_counts": {
+      "procedural_knowledge": 85,
+      "observations_and_summaries": 11,
+      "preferences_and_norms": 8
+    },
+    "cross_category_dropped": 1703,
     "pair_counts": {
       "true_dup": 301,
       "unrelated": 5037,
       "hard_negative": 18
+    },
+    "per_category_pair_counts": {
+      "procedural_knowledge": {
+        "true_dup": 242,
+        "unrelated": 3316,
+        "hard_negative": 12
+      },
+      "observations_and_summaries": {
+        "true_dup": 4,
+        "unrelated": 45,
+        "hard_negative": 6
+      },
+      "preferences_and_norms": {
+        "true_dup": 28,
+        "unrelated": 0,
+        "hard_negative": 0
+      }
     }
   }
 }

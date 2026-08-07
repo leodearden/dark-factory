@@ -171,7 +171,7 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 | Project | Family |
 |---|---|
-| dark-factory | INV-1..5 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication` |
+| dark-factory | INV-1..7 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication`, `status-matches-liveness`, `holds-owned-and-bounded` (the doc is normative — walk whatever it contains, this row is illustrative) |
 | reify | INV-SF-1..6 (silent-failure) — `undef-has-provenance`, `error-severity-exits-nonzero`, `declared-intent-consumed-or-diagnosed`, `indeterminate-attributable-transient`, `placeholders-owned-and-loud`, `diagnostics-carry-codes` |
 
 **If the project has no such file** — most targets don't — G7 is **advisory, not blocking**: screen the batch against the dark-factory trigger shapes below, record any hit in the decomposition record, and do not block on a list the project never adopted. Note the fallback explicitly rather than skipping G7 silently.
@@ -180,7 +180,7 @@ Trigger shapes (dark-factory's family — illustrative of the *method*; re-deriv
 
 **Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
 
-**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table, for calibrating this walk against dark-factory's INV-1..5. A project with its own invariant family has its own fixtures or none.
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table (10 rows for INV-1..5; a 2026-08-02 addendum walk covers INV-6..7), for calibrating this walk against dark-factory's family. A project with its own invariant family has its own fixtures or none.
 
 ---
 

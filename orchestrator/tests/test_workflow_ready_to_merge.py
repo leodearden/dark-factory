@@ -19,17 +19,19 @@ unworkable spec), carrying the failed predicate + its measured values.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -1075,3 +1077,242 @@ class TestReadyToMergeDispatch:
         assert outcome == WorkflowOutcome.BLOCKED
         f.wf._execute_iterations.assert_not_called()
         assert f.merge_queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# TestOnArchitectMergeDoneDeliveredChecksGuard (task 3057 — step-9 RED /
+# step-10 GREEN)
+#
+# Seam 6 of eleven — and the decisive evidence for guarding ALL of them rather
+# than point-fixing. This found_on_main stamp was added on 2026-07-30 by task
+# 3031, i.e. a BRAND-NEW unguarded seam that appeared while task 3057 sat
+# queued. This defect class's "fixed-then-recurred" signature, reproducing in
+# real time.
+# ---------------------------------------------------------------------------
+
+_MD_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+_MD_DC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+
+
+async def _fire_merge_done_armed(
+    tmp_path: Path, outcome: Any, *, metadata: dict | None = None,
+    enabled: bool = True, escalation_queue: object = None,
+) -> _Fixture:
+    """``_fire_merge_done`` plus a live ``delivered_checks`` config.
+
+    Reuses this module's existing driver shape verbatim rather than building a
+    parallel fixture; only the metadata and the config knobs the guard must
+    forward are added.
+    """
+    from orchestrator.config import DeliveredChecksConfig
+
+    f = _make(
+        tmp_path=tmp_path,
+        metadata=(
+            {'delivered_checks': [_MD_DC_CHECK]} if metadata is None else metadata
+        ),
+    )
+    if escalation_queue is not None:
+        f.wf.escalation_queue = escalation_queue  # type: ignore[assignment]
+    f.wf.config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    await f.wf._on_architect_merge_done(outcome, tip=_TIP, evidence='ev')
+    return f
+
+
+def _failure_events(f: _Fixture) -> list[dict]:
+    rows = f.event_store.fetch_events_by_type_all_runs(
+        EventType.architect_desync_merge, task_id=_TASK_ID,
+    )
+    return [r for r in rows if (r.get('data') or {}).get('decision') == 'merge_failed']
+
+
+@pytest.mark.asyncio
+class TestOnArchitectMergeDoneDeliveredChecksGuard:
+    """The delivered-capability guard on the architect-desync done flip.
+
+    A landed merge sha proves main advanced — never that THIS task's declared
+    capability rode along. On a block the method degrades to the reconciler
+    exactly like its existing success-without-a-sha arm: this method ALREADY
+    has a precedent for "we could land but cannot write honest provenance, so
+    degrade rather than stamp a bogus one".
+    """
+
+    _fire = staticmethod(_fire_merge_done_armed)
+
+    def _done(self) -> Any:
+        from orchestrator.merge_types import MergeOutcome
+
+        return MergeOutcome(status='done', merge_sha=_LANDED)
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    async def test_failed_block_withholds_the_flip_without_raising(
+        self, tmp_path: Path, caplog,
+    ):
+        """No stamp; returns NORMALLY (this is a fire-and-forget callback
+        whose caller only logs on exception, so a raise would be
+        indistinguishable from an infrastructure fault); task left blocked for
+        the reconciler backstop, which this method's own docstring already
+        designates as the degradation path."""
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_MD_DC_CHECK,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done())
+
+        f.scheduler.mark_done.assert_not_awaited()
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _TASK_ID in blob
+        assert 'failed' in blob
+
+    # --- row 2: all_delivered -> byte-identical flip -----------------------
+
+    async def test_all_delivered_flips_exactly_as_today(self, tmp_path: Path):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done())
+
+        f.scheduler.mark_done.assert_awaited_once()
+        call = f.scheduler.mark_done.await_args
+        assert call.args[0] == _TASK_ID
+        assert call.kwargs['kind'] == 'found_on_main'
+        assert call.kwargs['sha'] == _LANDED
+        assert call.kwargs['note'].startswith('architect-desync merge landed')
+
+    # --- row 3: no delivered_checks -> unchanged, but still DELEGATED -----
+
+    async def test_check_less_task_delegates_and_flips(self, tmp_path: Path):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done(), metadata={})
+
+        f.scheduler.mark_done.assert_awaited_once()
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.args[1] == f.wf.task['metadata']
+
+    # --- rows 4 & 5: fail-safe blocks must NOT be misrouted into the L2 ----
+
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_withhold_without_filing_the_l2(
+        self, tmp_path: Path, reason: str,
+    ):
+        """A capability withholding is NOT a durable merge failure — the merge
+        genuinely landed. Misrouting it into ``_file_architect_merge_failed``
+        would both misclassify the condition and erode a load-bearing L2 that
+        operators must keep trusting."""
+        escalations = _FakeEscalationQueue()
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason=reason,  # type: ignore[arg-type]
+        ))
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(
+                tmp_path, self._done(), escalation_queue=escalations,
+            )
+
+        f.scheduler.mark_done.assert_not_awaited()
+        assert _failure_events(f) == []
+        assert escalations.submitted == []
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented -------------
+
+    async def test_kill_switch_is_forwarded_not_short_circuited(
+        self, tmp_path: Path,
+    ):
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, self._done(), enabled=False)
+
+        f.scheduler.mark_done.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.kwargs['enabled'] is False
+
+    async def test_kill_switch_with_real_helper_flips_as_today(
+        self, tmp_path: Path,
+    ):
+        f = await self._fire(tmp_path, self._done(), enabled=False)
+
+        f.scheduler.mark_done.assert_awaited_once()
+
+    # --- ordering: only the landed-success arm pays for check work ---------
+
+    async def test_success_without_a_sha_never_reaches_the_guard(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status='done'))
+
+        guard.assert_not_awaited()
+        f.scheduler.mark_done.assert_not_awaited()
+
+    @pytest.mark.parametrize('status', ['already_merged', 'superseded'])
+    async def test_transient_statuses_never_reach_the_guard(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.merge_types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
+
+        guard.assert_not_awaited()
+        assert _failure_events(f) == []
+
+    @pytest.mark.parametrize('status', ['conflict', 'brand_new_status'])
+    async def test_failure_arms_are_untouched_by_the_guard(
+        self, tmp_path: Path, status: str,
+    ):
+        """The durable-failure and UNCLASSIFIED arms must keep their existing
+        structured failure event and born-at-L2 path exactly as today — this
+        pins that the guard did not perturb the load-bearing L2."""
+        from orchestrator.merge_types import MergeOutcome
+
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
+
+        guard.assert_not_awaited()
+        f.scheduler.mark_done.assert_not_awaited()
+        assert len(_failure_events(f)) == 1
+
+    # --- the existing mark_done except-guard must survive ------------------
+
+    async def test_mark_done_raising_still_degrades_not_crashes(
+        self, tmp_path: Path,
+    ):
+        """With the guard passing and ``mark_done`` raising, the existing
+        WARNING-and-degrade behaviour is unchanged."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = _make(tmp_path=tmp_path, metadata={'delivered_checks': [_MD_DC_CHECK]})
+        from orchestrator.config import DeliveredChecksConfig
+
+        f.wf.config.delivered_checks = DeliveredChecksConfig(
+            enabled=True, check_timeout_secs=7.5,
+        )
+        f.scheduler.mark_done = AsyncMock(side_effect=RuntimeError('boom'))
+        guard = AsyncMock(return_value=None)
+
+        with patch(_MD_GATE_TARGET, guard):
+            await f.wf._on_architect_merge_done(
+                MergeOutcome(status='done', merge_sha=_LANDED),
+                tip=_TIP, evidence='ev',
+            )
+
+        f.scheduler.mark_done.assert_awaited_once()

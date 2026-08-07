@@ -21,6 +21,7 @@ import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from legibility import trickle_state
 
@@ -87,7 +88,10 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             "barren-budget": dict(budget_skipped=4, total_records=4),
             "barren-cut": dict(below_sampling_cut=3, total_records=3),
         }[outcome]
-        full = dict(
+        # Annotated: without it the counter values infer as a narrow union
+        # that pyright then checks positionally against record_run's later
+        # keyword parameters when splatted as **full.
+        full: dict[str, Any] = dict(
             zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
             budget_skipped=0, selected_count=0,
         )

@@ -1399,15 +1399,124 @@ async def invoke_with_cap_retry(
                         except Exception:
                             logger.warning('Failed to save cap_hit event', exc_info=True)
 
-                    # Resume the capped session on the next account if possible
-                    if result.session_id:
-                        invoke_kwargs['resume_session_id'] = result.session_id
-                        invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                        resume_or_fresh = 'resuming'
-                    else:
+                    # ------------------------------------------------------------------
+                    # MEASURED 2026-08-01, claude CLI 2.1.220 (task 3454).
+                    #
+                    # MECHANISM (confirmed empirically, and it reframes the
+                    # question).  Claude CLI sessions are LOCAL JSONL transcripts
+                    # at <config_dir>/projects/<cwd-slug>/<session_id>.jsonl — not
+                    # server-side, account-scoped objects.  `--resume` replays that
+                    # local file.  So what governs a cross-account resume is
+                    # TRANSCRIPT REACHABILITY, not OAuth identity.  Observed: a
+                    # session started on one account wrote
+                    # .../projects/-tmp/<sid>.jsonl (slug from cwd=/tmp) under the
+                    # EFFECTIVE config dir — the ambient CLAUDE_CONFIG_DIR, since
+                    # invoke_claude_agent inherits os.environ when config_dir is
+                    # None — and NOT under ~/.claude.  A resume issued on a
+                    # DIFFERENT account appended its turn to that same file
+                    # (12 -> 20 records), i.e. the resume attached locally across
+                    # the account switch.
+                    #
+                    # The retry loop below keeps that reachable on purpose: it
+                    # reuses ONE TaskConfigDir across rotations and rewrites
+                    # .credentials.json in place (see the write_credentials call
+                    # further down), passing the same config_dir.path every
+                    # attempt.  The guard below ENFORCES that invariant instead of
+                    # assuming it.
+                    #
+                    # RUNS.  Same-account control (CLAUDE_OAUTH_TOKEN_B, 1 run):
+                    #   r1 sid=8e4d1819-db90-4b69-8f42-f8ef09facd52,
+                    #   transcript present after r1 (12 records), r2 recalled the
+                    #   codeword.  PASS — the harness itself is sound.
+                    # Cross-account (A=CLAUDE_OAUTH_TOKEN_B, B=CLAUDE_OAUTH_TOKEN_C,
+                    # 1 attempt): r1 sid=eeec059e-be5d-413d-bae7-15274dd758c3,
+                    #   transcript PRESENT after r1 (12 records); r2 did NOT recall
+                    #   the codeword — but r2's transcript turn is literally
+                    #   "You've hit your weekly limit · resets Aug 5, 11am", i.e.
+                    #   account B was CAPPED and no model turn ever ran.  That
+                    #   attempt is VOID for the context question.
+                    #
+                    # VERDICT: INCONCLUSIVE between (a) preserved and (b)
+                    # account-scoped rejection — but the transcript-ABSENT
+                    # explanation is definitively RULED OUT (it was present both
+                    # times), and the single cross-account observation is fully
+                    # explained by a capped account, so it is NOT evidence for (b).
+                    # 0 valid cross-account runs: at measurement time 4 of the 5
+                    # accounts in env were capped (weekly limits resetting Aug 5 /
+                    # Aug 6, one session limit) and a cross-account resume needs
+                    # two healthy accounts.
+                    #
+                    # WHAT WOULD SETTLE IT: re-run
+                    # tests/test_cli_invoke_integration.py::TestCrossAccountResume
+                    # (with `-m integration`, which pyproject deselects by default)
+                    # when two accounts are simultaneously uncapped, and record
+                    # whether r2 recalls the codeword given a transcript that is
+                    # present after r1.
+                    #
+                    # That re-run is now trustworthy: when this measurement was
+                    # taken, the cap message above was NOT matched by the test
+                    # module's skip guard (its marker was "you've hit your usage",
+                    # the real text is "you've hit your weekly limit"), so a
+                    # capped second account failed the ZEPPELIN assertion loudly
+                    # and looked exactly like lost context. Task 3483 closed that
+                    # gap — the guard now lives in tests/_capacity_skip.py, is
+                    # pinned against this exact string, and is cross-checked
+                    # against invocation_outcome.classify_invocation so the two
+                    # cannot drift apart again. A capped account SKIPS.
+                    # ------------------------------------------------------------------
+                    # Resume the capped session on the next account if possible.
+                    #
+                    # A session is resumable only if its transcript is actually
+                    # REACHABLE: Claude CLI sessions are local JSONL files at
+                    # <config_dir>/projects/*/<session_id>.jsonl (see
+                    # _resolve_transcript_path), and --resume replays that file.
+                    # Resuming a session whose transcript is gone (cleaned-up
+                    # TaskConfigDir, a different config dir, a swept temp dir)
+                    # starts an effectively EMPTY session, and the agent then
+                    # restarts on CAP_HIT_RESUME_PROMPT with no context to
+                    # continue from — silent context loss.  Mirrors the
+                    # orchestrator's own resume-eligibility guard
+                    # (harness.py, 'no_transcript').
+                    #
+                    # config_dir is None -> resume as today: without a concrete
+                    # directory there is no correct place to glob (the process
+                    # default ~/.claude would be wrong for any caller under an
+                    # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
+                    # have a directory and the transcript is provably not in it".
+                    #
+                    # resume_or_fresh carries the REASON, not just the verdict:
+                    # it is interpolated into both cap-hit warnings below, so a
+                    # fresh retry that dropped context is distinguishable in the
+                    # logs from one that never had a session to keep.  The
+                    # 'resuming'/'fresh' prefix stays first so existing log
+                    # greps keep matching.
+                    if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
-                        resume_or_fresh = 'fresh'
+                        resume_or_fresh = 'fresh (no session_id)'
+                    elif config_dir is not None and not transcript_exists(
+                        config_dir.path, result.session_id
+                    ):
+                        logger.warning(
+                            f'{label}: capped session {result.session_id} has no transcript '
+                            f'under {config_dir.path} — retrying FRESH instead of resuming '
+                            f'into an empty session (context from this attempt is lost)',
+                        )
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
+                        resume_or_fresh = 'fresh (transcript unreachable)'
+                    else:
+                        invoke_kwargs['resume_session_id'] = result.session_id
+                        invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                        # Distinguish a VERIFIED resume from an unverified one:
+                        # with no config_dir the transcript was never checked,
+                        # so claiming 'transcript present' would be a false
+                        # statement in the log.
+                        resume_or_fresh = (
+                            'resuming (transcript unchecked — no config dir)'
+                            if config_dir is None
+                            else 'resuming (transcript present)'
+                        )
 
                     if acct_name:
                         logger.warning(

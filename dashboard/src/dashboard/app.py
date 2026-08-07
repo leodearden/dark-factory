@@ -58,12 +58,15 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
-from dashboard.data.db import DbPool
-from dashboard.data.escalation_analytics import build_escalation_analytics
+from dashboard.data.db import DbPool, track_task
+from dashboard.data.escalation_analytics import (
+    archive_scan_succeeded,
+    build_escalation_analytics,
+)
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import TTLCache, first_success
-from dashboard.data.memory_evals import build_memory_evals
+from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -329,10 +332,30 @@ async def _metrics_loop(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage shared resources: HTTP client, DB connection pool."""
-    app.state.http_client = httpx.AsyncClient(follow_redirects=True)
+    """Manage shared resources: HTTP client, DB connection pool.
+
+    **Shutdown closes the objects THIS lifespan opened, held in locals — never
+    whatever ``app.state`` happens to point at by then** (task 3466).
+    ``app.state`` is a single mutable namespace on the ``FastAPI`` instance, so
+    two overlapping lifespans over one ``app`` (which the dashboard test suite
+    does routinely: ~15 module-scoped ``TestClient(app)`` fixtures coexist with
+    the function-scoped ``client`` fixture in ``tests/conftest.py``, and
+    starlette runs a full lifespan per ``TestClient`` context) leave the inner
+    one's handles installed.  Reading them back at shutdown made the OUTER
+    lifespan close the INNER's already-closed stores — a silent no-op — and
+    strand its own two writable WAL connections plus its ``DbPool``.  Each
+    stranded ``aiosqlite.Connection`` is later finalised by ``__del__``, whose
+    ``stop()`` queues work onto a loop that has since closed, so
+    ``RuntimeError: Event loop is closed`` escapes ``_connection_worker_thread``
+    and pytest blames whichever unrelated test is running at that instant.
+    ``app.state`` stays assigned for request handlers and for tests that swap
+    ``app.state.config``; it is simply not the shutdown path's source of truth.
+    """
+    http_client = httpx.AsyncClient(follow_redirects=True)
+    app.state.http_client = http_client
     app.state.config = DashboardConfig.from_env()
-    app.state.db = DbPool()
+    pool = DbPool()
+    app.state.db = pool
     app.state.start_time = time.monotonic()
 
     # Burndown snapshot collector (writable WAL connection with full durability triad).
@@ -344,7 +367,7 @@ async def lifespan(app: FastAPI):
         _burndown_loop(
             burndown_store,
             app.state.config,
-            app.state.http_client,
+            http_client,
         )
     )
 
@@ -363,10 +386,10 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await app.state.burndown_store.close()
-    await app.state.metrics_store.close()
-    await app.state.db.close_all()
-    await app.state.http_client.aclose()
+    await burndown_store.close()
+    await metrics_store.close()
+    await pool.close_all()
+    await http_client.aclose()
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
@@ -422,15 +445,9 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
 
 # Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
 # reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight; this set holds the strong reference until each task's own
+# mid-flight; this set holds the strong reference until track_task's
 # done-callback removes it.
 _ABANDONED_PROBES: set[asyncio.Task] = set()
-
-
-def _discard_abandoned_probe(task: asyncio.Task) -> None:
-    _ABANDONED_PROBES.discard(task)
-    if not task.cancelled():
-        task.exception()  # consume so "exception was never retrieved" isn't logged
 
 
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
@@ -457,11 +474,19 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     `asyncio.wait(..., timeout=budget)` returns at the deadline WITHOUT
     awaiting the task, so a hung cleanup can never block this handler.
 
-    Cancelling the abandoned task does NOT stop aiosqlite's underlying
-    worker thread — a wedged connection stays wedged and will simply time
-    out again on the next /healthz call. That's intended: /healthz reports,
-    it does not repair, and per-DB caps mean a poisoned connection costs one
-    _DB_PROBE_TIMEOUT, never the whole handler.
+    Abandoning the task does not repair a wedged connection — it stays
+    wedged and will simply time out again on the next /healthz call. That's
+    intended: /healthz reports, it does not repair, and per-DB caps mean a
+    poisoned connection costs one _DB_PROBE_TIMEOUT, never the whole handler.
+
+    It does not LEAK one either, though it once did (task 3466). When the
+    abandoned task is cancelled inside `pool.get()`, DbPool keeps the
+    in-flight `aiosqlite.connect()` alive under `asyncio.shield` and adopts
+    the connection when it lands, so a slow open becomes a warm cached
+    connection for the next probe rather than a stranded (non-daemon)
+    aiosqlite worker thread. That matters here specifically: the
+    `_THREAD_LIMIT` check above exists to detect exactly such leaks, so
+    /healthz must not manufacture them itself.
     """
 
     async def _inner() -> str:
@@ -479,8 +504,7 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     done, _pending = await asyncio.wait({task}, timeout=budget)
     if task not in done:
         task.cancel()  # fire-and-forget — do NOT await the unwinding
-        _ABANDONED_PROBES.add(task)
-        task.add_done_callback(_discard_abandoned_probe)
+        track_task(task, _ABANDONED_PROBES)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
@@ -1518,6 +1542,32 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     within the TTL window are free. No clock read here — the aggregator
     resolves `now` once internally via resolve_now (clock-discipline guard
     scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
+
+    A scan that reached NO archive at all is served but NOT cached
+    (cache_ok=archive_scan_succeeded), matching api_memory_evals'
+    root_scan_succeeded gate — the two routes are one idiom and are kept so
+    deliberately. Both decline to cache a build that walked nothing: it is
+    O(1) to re-derive (one negative is_dir stat per project), while caching it
+    keeps the tab reporting an empty archive for a full TTL window after the
+    volume mounts, and the archive is the thing most likely to appear on the
+    next poll. The only asymmetry is that memory-evals has ONE root, so
+    "reached nothing" and "reached not everything" coincide there.
+
+    A PARTIAL scan IS cached, and archives_present: false rides along in the
+    payload as the diagnostic. That is not a concession — keyed on
+    archives_present (all) instead, this cache is dead in the installed
+    config: measured 2026-08-01 against the unit's own
+    DASHBOARD_KNOWN_PROJECT_ROOTS (9 roots), 2 roots have no data/escalations
+    dir while the other 7 hold ~9.1k records, so the predicate never passes,
+    the 60s TTL never stores anything, and every 3s poll re-runs the whole
+    multi-second walk. Trade-off actually being accepted: an archive that
+    disappears mid-life leaves that project's panel up to one TTL window
+    stale — the right side of it, since the alternative costs the full
+    re-walk on every poll, forever, for every ordinary multi-project config.
+
+    Deliberately NOT keyed on parse_failures: that counts unparseable records
+    and is permanent for a corrupt file, so gating on it would defeat the
+    cache forever in front of the very walk it protects.
     """
     config: DashboardConfig = request.app.state.config
     project_dirs = _analytics_project_dirs(config)
@@ -1526,7 +1576,9 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     async def _refresh() -> dict:
         return await asyncio.to_thread(build_escalation_analytics, project_dirs)
 
-    result = await _analytics_cache.get_or_refresh(key, _refresh)
+    result = await _analytics_cache.get_or_refresh(
+        key, _refresh, cache_ok=archive_scan_succeeded,
+    )
     return JSONResponse({'ESCALATION_ANALYTICS': result})
 
 
@@ -1555,6 +1607,20 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
     resolve_now is the sanctioned site).
 
+    A scan that never REACHED the tree is served but NOT cached (cache_ok=
+    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
+    offline marker: an absent root and an unwalkable one are both O(1) to
+    re-derive, so re-checking each poll costs nothing, while caching them
+    would keep reporting "no evals have ever run" for a full TTL window after
+    the tree lands. A degraded ROW (a corrupt metrics file, an unknown kind)
+    IS still cached — the walk happened, re-running it would not fix it, and
+    that walk is the expensive thing this cache exists to prevent.
+
+    Same idiom as api_escalation_analytics' archive_scan_succeeded: both
+    routes decline to cache only a scan that reached NOTHING. The asymmetry
+    is that memory-evals has ONE root, so "reached nothing" and "reached not
+    everything" coincide here; analytics has N and must distinguish them.
+
     The escalation source is config.reconciliation_escalations_dir: memory-eval
     regressions are filed onto the 8103 recon queue (memory-eval-program.md
     M3), which is the same queue the Escalations tab renders — so a linked
@@ -1568,7 +1634,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     async def _refresh() -> dict:
         return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
 
-    result = await _memory_evals_cache.get_or_refresh(key, _refresh)
+    result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
     return JSONResponse(redux_api.shape_memory_evals(**result))
 
 

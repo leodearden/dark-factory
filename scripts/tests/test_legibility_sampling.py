@@ -178,7 +178,7 @@ class TestClassifyAgentClass:
 
     def test_reify_warm_lane_worktree_is_orchestrated_task(self):
         # Faithful encoding of /home/leo/src/reify/.warm-lanes/worktrees/5187
-        # (encode_cwd maps both '/' and '.' to '-'), embedding the
+        # (encode_cwd maps '/', '.' and '_' all to '-'), embedding the
         # '-warm-lanes-worktrees-' substring (task 2612).
         path = Path('/root/-home-leo-src-reify--warm-lanes-worktrees-5187/sess.jsonl')
         assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'

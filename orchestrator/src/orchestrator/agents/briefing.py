@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from orchestrator.agents.roles import BACKGROUND_TASK_WARNING
+from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import mcp_call
 
@@ -761,7 +761,7 @@ This task holds locks for the following modules:
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
 4. Run verification for the touched files before finishing.
-{BACKGROUND_TASK_WARNING}
+{WAIT_PATTERN_REMINDER}
 """
 
     async def build_debugger_prompt(

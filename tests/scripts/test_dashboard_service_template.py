@@ -18,6 +18,11 @@ import subprocess
 
 import pytest
 
+from systemd_unit_invariants import (
+    assert_restart_backoff_effective as _assert_restart_backoff_effective,
+    restart_directive as _restart_directive,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
 HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
@@ -30,6 +35,28 @@ TEMPLATE_EXPECTED_ENV_LINE = (
 HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
     "/home/leo/src/dark-factory"
+)
+
+# WorkingDirectory= is load-bearing on its own terms: ExecStart runs
+# `uv run --project dashboard python -m uvicorn dashboard.app:app`, and
+# `--project dashboard` is a RELATIVE path resolved against the unit's
+# process cwd. systemd sets that cwd only from WorkingDirectory= (it does not
+# inherit an interactive shell's), so dropping or repointing this directive
+# makes uv resolve the wrong project directory, or fail outright. Both files
+# also pin an ABSOLUTE path, which systemd requires: an unsubstituted
+# __REPO_ROOT__ sentinel trips a fatal "WorkingDirectory= path is not
+# absolute" error, corroborated in this file's
+# test_systemd_analyze_verify_reports_no_ignored_directives.
+# check_dashboard_unit_parity.py treats WorkingDirectory as presence-only by
+# design (it compares committed-vs-installed, where the directive's value can
+# legitimately diverge across hosts), so it does not guard the
+# template/hardcoded pair asserted below — that guard is
+# _assert_working_directory_line, an anchored check (not a substring check),
+# so a repointed or commented-out directive still fails.
+TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
+
+HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
+    "WorkingDirectory=/home/leo/src/dark-factory"
 )
 
 # These are the literal paths baked into the committed hardcoded service file;
@@ -79,6 +106,31 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     )
 
 
+def _assert_working_directory_line(path: pathlib.Path, expected_line: str) -> None:
+    """Assert *expected_line* appears in *path* as a whole, anchored line.
+
+    A plain substring check (``expected_line in content``) is satisfied by a
+    repointed value that merely starts with the expected text — e.g.
+    ``WorkingDirectory=__REPO_ROOT__/dashboard`` still contains
+    ``WorkingDirectory=__REPO_ROOT__`` — and by the same text sitting inside a
+    ``#`` comment, which systemd never parses as a directive.  Both leave the
+    unit's real cwd wrong or unset while a substring check stays green.
+    Anchoring the full line with ``^...$`` under ``re.MULTILINE`` rejects
+    both: a suffix breaks the ``$`` boundary, and a leading ``#`` breaks the
+    ``^`` boundary.  See the module comment on
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above for why the directive
+    itself is load-bearing.
+    """
+    content = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{re.escape(expected_line)}\s*$", re.MULTILINE)
+    assert pattern.search(content) is not None, (
+        f"No line matching {expected_line!r} found in {path}. See the "
+        "WorkingDirectory= rationale comment above "
+        "TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE for why this directive is "
+        "load-bearing."
+    )
+
+
 def test_template_sets_known_project_roots() -> None:
     """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
 
@@ -106,6 +158,25 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
+
+
+def test_working_directory_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must pin WorkingDirectory= to the repo root, exactly.
+
+    See the module comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above
+    for why the directive is load-bearing, and
+    _assert_working_directory_line's docstring for why the check is anchored
+    rather than a substring match.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    file's WorkingDirectory= line broke without inspecting a full-file diff.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE),
+    ):
+        _assert_working_directory_line(path, expected_line)
 
 
 def test_comma_separator_helper_rejects_empty_value(
@@ -170,6 +241,47 @@ def test_comma_separator_helper_detects_colon_in_any_position(
         encoding="utf-8",
     )
     _assert_known_project_roots_comma_separated(good_file)
+
+
+def test_working_directory_helper_rejects_suffix_or_comment(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_working_directory_line must not be satisfied by a substring match.
+
+    A plain ``expected in content`` check stays green if WorkingDirectory= is
+    repointed to a subdirectory (``.../dashboard``) or survives only inside a
+    ``#`` comment — both leave the unit's real cwd wrong while every
+    substring-based assertion keeps passing.  This pins the anchored check
+    against exactly those two regressions.
+    """
+    expected_line = "WorkingDirectory=/home/leo/src/dark-factory"
+
+    # Bad: repointed to a subdirectory — `expected_line in content` is still
+    # True, but the unit's cwd is now wrong.
+    suffixed = tmp_path / "suffixed.service"
+    suffixed.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory/dashboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_working_directory_line(suffixed, expected_line)
+
+    # Bad: directive only present inside a comment — systemd never parses it.
+    commented = tmp_path / "commented.service"
+    commented.write_text(
+        "[Service]\n# WorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_working_directory_line(commented, expected_line)
+
+    # Good: exact, uncommented line — helper must not raise.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_working_directory_line(good, expected_line)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
@@ -768,95 +880,22 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
 # ---------------------------------------------------------------------------
 # Restart backoff
 #
-# RestartMaxDelaySec= is silently INERT unless RestartSteps= accompanies it.
-# systemd parses the cap, logs "Service has RestartMaxDelaySec= but no
-# RestartSteps= setting. Ignoring." at load time, and then discards it — so the
-# interpolated 5s -> 60s backoff the unit's own comment advertises never
-# happens and every restart waits exactly RestartSec, forever.  Nothing in the
-# unit's text reveals this; the only signal is a load-time warning nobody reads.
+# The invariant and its directive reader now live in systemd_unit_invariants,
+# imported at the top of this module under the private aliases this file has
+# always used.  They were lifted out of here by task 3408 so that the
+# fleet-wide sweep in test_systemd_restart_backoff.py applies the SAME
+# assertion rather than a second copy of it — see that module's docstring.
 #
-# The invariant below is RELATIONAL and CONDITIONAL, mirroring
-# _assert_drain_bounded above: the defect is the missing PAIRING, not the
-# absence of either directive on its own.  RestartSteps= alone is meaningless
-# and RestartMaxDelaySec= alone is thrown away, while a unit that deliberately
-# declares no cap is not in violation of anything.
+# Nothing asserts that the sharing holds, deliberately: the `from
+# systemd_unit_invariants import (...)` at the top of this module IS the
+# sharing, structurally, and a drifted private copy would be caught by that
+# fleet sweep failing on whichever unit the copy stopped checking.  An earlier
+# meta-test pinning it by object identity was dropped as testing the shape of
+# the refactor rather than any behaviour of a systemd unit.
+#
+# The negative-case guard for the helper stays here, below, next to the
+# drain-bound guard it is modelled on.
 # ---------------------------------------------------------------------------
-
-
-def _restart_directive(path: pathlib.Path, name: str) -> str | None:
-    r"""Return the effective value of ``<name>=`` in *path*, or None if absent.
-
-    Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
-    captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
-    spelling (``RestartMaxDelaySec=60s``, ``RestartSec=1min``) is reported as the
-    present directive it is rather than misdiagnosed as a missing line.  Matching
-    ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
-    skip the pairing invariant silently — the worst possible failure for a guard
-    whose entire job is to notice a directive that is being ignored.
-
-    LAST occurrence wins, not the first, which is why this uses ``findall`` and
-    not ``search`` (the same reasoning _success_exit_statuses below applies to
-    repeated directives, reaching the opposite conclusion only because
-    SuccessExitStatus= is one of the few systemd directives that ACCUMULATES).
-    These restart directives are scalars, and systemd overwrites on each repeat.
-    Measured on this host (systemd 255.4): a unit carrying ``RestartSteps=4``
-    followed by ``RestartSteps=0`` draws the pairing warning "Service has
-    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." — i.e. systemd
-    applied the trailing 0 — while the reverse order (0 then 4) is silent.  A
-    first-match read would report 4, and this guard would bless a unit whose
-    backoff systemd has in fact discarded.  Repeats are not hypothetical: a
-    drop-in under <unit>.d/ is merged by appending, so an override that pins one
-    of these values lands as exactly this shape.
-    """
-    matches = re.findall(
-        rf"^{re.escape(name)}=(.*)$",
-        path.read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    return matches[-1].strip() if matches else None
-
-
-def _assert_restart_backoff_effective(path: pathlib.Path) -> None:
-    """Assert *path*'s restart backoff actually engages, given that it declares a cap.
-
-    Conditional on RestartMaxDelaySec= being present: a unit that asks for no
-    backoff cap violates nothing.  But once the cap is written down, systemd
-    needs RestartSteps= to interpolate between RestartSec and that cap; without
-    it the cap is parsed, warned about, and dropped.
-    """
-    cap = _restart_directive(path, "RestartMaxDelaySec")
-    if cap is None:
-        return
-
-    steps = _restart_directive(path, "RestartSteps")
-    assert steps is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} but no RestartSteps=. "
-        "systemd logs 'Service has RestartMaxDelaySec= but no RestartSteps= "
-        "setting. Ignoring.' at unit load and then drops the cap entirely, so "
-        "the backoff this unit advertises never engages — every restart waits "
-        "exactly RestartSec and the delay never grows. Add RestartSteps= to "
-        "make the cap effective; scripts/jcodemunch-watcher.service.template "
-        "already carries this fix for the identical restart shape."
-    )
-    assert steps.isdigit(), (
-        f"could not parse RestartSteps={steps!r} in {path} as an integer; "
-        "systemd accepts only a plain unsigned integer here."
-    )
-    assert int(steps) >= 1, (
-        f"RestartSteps={steps} in {path} produces no backoff curve at all: with "
-        "zero steps there is nothing to interpolate between RestartSec and "
-        f"RestartMaxDelaySec={cap}, leaving the cap as inert as if it had been "
-        "omitted. Use at least 1 step."
-    )
-
-    floor = _restart_directive(path, "RestartSec")
-    assert floor is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} and RestartSteps={steps} but "
-        "no RestartSec=. The curve is interpolated FROM RestartSec TO "
-        "RestartMaxDelaySec, so without an explicit floor the unit silently "
-        "starts from systemd's 100ms default and the backoff that runs is not "
-        "the one the file describes."
-    )
 
 
 def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
@@ -959,6 +998,30 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     )
     with pytest.raises(AssertionError, match="but no RestartSteps="):
         _assert_restart_backoff_effective(suffixed_no_steps)
+
+    # Bad: the same inert cap, spelled with the leading and around-separator
+    # whitespace systemd.syntax permits.  This is a VALID unit whose cap systemd
+    # parses and discards, so it must be caught — a column-0-only anchor reads
+    # it as declaring no cap at all and returns early, skipping the invariant
+    # without a word.  That is the one failure direction this guard cannot
+    # afford: it masks the very defect the helper exists to surface, unlike the
+    # opaque-value capture above, which errs toward checking MORE.
+    spaced_no_steps = _write_restart_unit(
+        tmp_path / "spaced_no_steps.service",
+        "Restart=on-failure\n  RestartSec = 5\n\tRestartMaxDelaySec\t=\t60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(spaced_no_steps)
+    assert _restart_directive(spaced_no_steps, "RestartMaxDelaySec") == "60"
+
+    # Good: the whitespace-tolerant read is complete, not just detection-only —
+    # a properly paired unit in that same spelling must not raise.
+    spaced_good = _write_restart_unit(
+        tmp_path / "spaced_good.service",
+        "Restart=on-failure\n  RestartSec = 5\n  RestartSteps = 4\n"
+        "  RestartMaxDelaySec = 60",
+    )
+    _assert_restart_backoff_effective(spaced_good)
 
 
 def test_restart_backoff_is_effective_in_both_unit_files() -> None:

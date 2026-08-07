@@ -1,17 +1,40 @@
-"""File-content tests for the orchestrator systemd service files.
+"""File-content tests for the orchestrator systemd units and how they reach a host.
 
-These tests read the source-controlled service definition files directly —
-no systemd runtime is required.  They guard the shape of:
-  - scripts/orchestrator-dark-factory.service
-  - scripts/orchestrator-reify.service
-  - scripts/orchestrator-watchdog.service
-  - scripts/orchestrator-watchdog.timer
+These tests read source-controlled files directly — no systemd runtime is
+required.  Three suites live here, in this order:
+
+1. Per-unit shape (named units, then fleet-wide parametrized invariants):
+     - scripts/orchestrator-dark-factory.service
+     - scripts/orchestrator-reify.service
+     - scripts/orchestrator-watchdog.service
+     - scripts/orchestrator-watchdog.timer
+     - every scripts/orchestrator-*.service, via ALL_ORCHESTRATOR_SERVICE_FILES
+       (ORCH_UNIT self-identification; canonical --config filename)
+
+2. scripts/setup-host.sh installer coverage (task 3641) — every committed
+   template must be `cp`'d to $UNIT_DIR, and every template with an [Install]
+   section must be `systemctl --user enable`d.
+
+3. SETUP.md operator-remediation coverage (task 3641) — the copy-paste
+   `systemctl --user disable --now` block must name exactly the foreign
+   orchestrator units setup-host.sh enables.
+
+Suites 2 and 3 do not read .service files as their subject, but they are
+here rather than in their own module because they are checked AGAINST
+ALL_ORCHESTRATOR_SERVICE_FILES and reuse this module's ``_parse_sections``:
+a unit template only "exists" for an operator once the installer copies it
+and the docs account for it, so template / installer / doc form one
+invariant.  Splitting them out would mean extracting those helpers into a
+shared module (cf. tests/scripts/systemd_unit_invariants.py) first.
 
 See also:
   - tests/scripts/test_dashboard_service_template.py — pattern reference
+  - tests/scripts/test_systemd_restart_backoff.py — content-discovered
+    restart-backoff sweep over every unit in the tree
 """
 
 import pathlib
+import re
 
 import pytest
 
@@ -80,6 +103,11 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
+    # The cap above is INERT without this pairing: systemd warns and discards
+    # RestartMaxDelaySec= when no RestartSteps= accompanies it. This pins the
+    # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
+    # in tests/scripts/test_systemd_restart_backoff.py.
+    assert "RestartSteps=4" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
@@ -146,7 +174,7 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the reify config, frozen"
     # --frozen: see the df structure test — unit start must never re-sync the
@@ -157,6 +185,11 @@ def test_reify_orchestrator_service_structure() -> None:
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
+    # The cap above is INERT without this pairing: systemd warns and discards
+    # RestartMaxDelaySec= when no RestartSteps= accompanies it. This pins the
+    # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
+    # in tests/scripts/test_systemd_restart_backoff.py.
+    assert "RestartSteps=4" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
@@ -213,7 +246,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     }
     allowed_reify_fragments = {
         "Reify Orchestrator",
-        "/home/leo/src/reify/orchestrator.yaml",
+        "/home/leo/src/reify/dark-factory-orchestrator.yaml",
     }
     # The ORCH_UNIT line must match EXACTLY, not merely contain the unit's
     # basename — a fragment-only "in" check would also wave through an
@@ -286,7 +319,7 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/orchestrator-config.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
     assert "uv run --frozen" in content
@@ -456,12 +489,14 @@ _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
     "orchestrator-solar-challenge-platform.service",
     "orchestrator-my-solar-challenge.service",
     "orchestrator-autopilot-video.service",
+    "orchestrator-know-live.service",
+    "orchestrator-pump-web-ui.service",
     "orchestrator-watchdog.service",
 }
 
 
 def test_orchestrator_service_glob_covers_all_known_units() -> None:
-    """Coverage guard: the glob must be non-empty and include all six known units.
+    """Coverage guard: the glob must be non-empty and include all eight known units.
 
     A wrong CWD or other glob mishap would silently shrink the parametrized
     ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
@@ -498,4 +533,522 @@ def test_orchestrator_service_sets_own_orch_unit(
     assert expected_line in service_text.splitlines(), (
         f"{service_path.name} must set `{expected_line}` in its [Service] section "
         "(systemd only honours Environment= under [Service])"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
+# ---------------------------------------------------------------------------
+
+CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
+
+
+
+class MalformedExecStart(ValueError):
+    """A unit's ExecStart= is broken — never a legitimate "no --config" answer.
+
+    Kept distinct from the ``None`` return below because the two outcomes want
+    opposite handling.  ``None`` means "this unit takes no ``--config``", which
+    is true of orchestrator-watchdog.service and must SKIP.  A missing
+    ``ExecStart=`` line, or a ``--config`` flag with no value after it, is a
+    malformed unit (or a regressed parser) and must FAIL: collapsing those into
+    the same ``None`` is how a guard silently waves through the very drift it
+    was written to catch.
+    """
+
+
+def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
+    """The unit's ExecStart= line, stripped.  Raises if it has none.
+
+    ``lstrip()`` before matching because systemd permits leading whitespace on
+    a directive; the trailing ``=`` in the prefix is what keeps ExecStartPre=
+    out of the match.
+    """
+    exec_line = next(
+        (
+            stripped
+            for ln in content.splitlines()
+            if (stripped := ln.strip()).startswith("ExecStart=")
+        ),
+        None,
+    )
+    if exec_line is None:
+        raise MalformedExecStart(
+            f"{unit_name} declares no ExecStart= line. Every orchestrator unit "
+            "must have one — systemd refuses to start a Type=simple service "
+            "without it. Treating this as 'takes no --config' would silently "
+            "skip the unit out of the canonical-config-filename guard below."
+        )
+    return exec_line
+
+
+def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | None:
+    """Return the `--config` argument of the unit's ExecStart=, or None if absent.
+
+    None now means exactly ONE thing: the ExecStart= carries no ``--config``
+    flag at all.  That is a real answer, not a parse failure —
+    orchestrator-watchdog.service runs a probe script that takes no
+    ``--config`` — and callers skip on it, so the watchdog is not dragged into
+    an invariant that does not apply to it.
+
+    Every other way this could previously have produced None now raises
+    MalformedExecStart (see that class): no ExecStart= line at all, and a
+    dangling ``--config`` as the final token with nothing after it.  The
+    dangling case in particular is a unit that would start the orchestrator
+    with no config path — a hard defect, not something to skip past.
+    """
+    tokens = _exec_start_line(content, unit_name).split()
+    for i, token in enumerate(tokens):
+        if token == "--config":
+            if i + 1 >= len(tokens):
+                raise MalformedExecStart(
+                    f"{unit_name} ends its ExecStart= with a dangling `--config` "
+                    "and no value after it. The orchestrator would start with no "
+                    f"config path at all. ExecStart line: {' '.join(tokens)!r}"
+                )
+            return tokens[i + 1]
+        if token.startswith("--config="):
+            return token.split("=", 1)[1]
+    return None
+
+
+# Marker identifying a unit that launches the orchestrator CLI proper (as
+# opposed to orchestrator-watchdog.service, which runs a bare probe script).
+# `orchestrator run` REQUIRES a --config, so this is the mechanical predicate
+# for "must be asserted, must not skip" in the coverage guard below.
+_ORCHESTRATOR_RUN_MARKER = "orchestrator run"
+
+
+def test_exec_start_config_parser_answers_for_every_orchestrator_run_unit() -> None:
+    """Coverage guard: the --config parser must ANSWER, not skip, for real units.
+
+    Mirrors test_orchestrator_service_glob_covers_all_known_units and
+    test_setup_host_install_predicate_discriminates.  The parametrized guard
+    below is CONDITIONAL — it skips whenever _exec_start_config_arg returns
+    None — so a parser regression (a change in ExecStart= line shape, a
+    continuation-line variant, a renamed flag) would return None for all eight
+    templates, skip every case, and report green while checking nothing.
+
+    The expectation is DERIVED, not a hard-coded count that rots the day an
+    eighth project lands: a unit whose ExecStart= invokes ``orchestrator run``
+    needs a --config by construction, and one that does not (the watchdog probe
+    script) legitimately has none.  Both directions are asserted so the skip
+    branch stays genuinely exercised rather than becoming the only branch.
+    """
+    assert ALL_ORCHESTRATOR_SERVICE_FILES, (
+        "glob discovered no orchestrator-*.service templates"
+    )
+
+    parsed: dict[str, str | None] = {}
+    runs_orchestrator: set[str] = set()
+    for path in ALL_ORCHESTRATOR_SERVICE_FILES:
+        content = path.read_text(encoding="utf-8")
+        # A malformed ExecStart= raises out of here — deliberately, so it is a
+        # hard failure of this guard rather than a skipped parametrized case.
+        parsed[path.name] = _exec_start_config_arg(content, path.name)
+        if _ORCHESTRATOR_RUN_MARKER in _exec_start_line(content, path.name):
+            runs_orchestrator.add(path.name)
+
+    assert runs_orchestrator, (
+        "no orchestrator template has an ExecStart= invoking "
+        f"{_ORCHESTRATOR_RUN_MARKER!r}, so this guard has nothing to check and "
+        f"the parametrized test below would skip everything. Parsed: {parsed}"
+    )
+
+    silent = sorted(name for name in runs_orchestrator if parsed[name] is None)
+    assert not silent, (
+        f"{', '.join(silent)} run `{_ORCHESTRATOR_RUN_MARKER}` but no --config "
+        "argument could be parsed from their ExecStart=. Either the unit really "
+        "lost its --config (the orchestrator cannot start without one), or "
+        "_exec_start_config_arg has regressed — in which case "
+        "test_orchestrator_service_points_at_canonical_config_filename is "
+        f"silently skipping instead of asserting. Parsed: {parsed}"
+    )
+
+    assert any(value is None for value in parsed.values()), (
+        "every orchestrator template yielded a --config argument, so the skip "
+        "branch of test_orchestrator_service_points_at_canonical_config_filename "
+        "is never exercised. orchestrator-watchdog.service is expected to have "
+        f"none (it runs a probe script, not the orchestrator). Parsed: {parsed}"
+    )
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_orchestrator_service_points_at_canonical_config_filename(
+    service_path: pathlib.Path,
+) -> None:
+    """Every orchestrator unit's --config must name the CANONICAL config filename.
+
+    CLAUDE.md makes ``<project_root>/dark-factory-orchestrator.yaml`` the
+    canonical, required filename — the dashboard's escalation-URL discovery
+    (``_discover_escalation_urls``) keys on it, and legacy spellings
+    (``orchestrator.yaml``, ``orchestrator-config.yaml``,
+    ``orchestrator/config.yaml``) are honoured only as a discovery fallback for
+    not-yet-migrated projects, never as a supported choice.  Task 2698
+    canonicalized the filename; task 2719 then RETIRED dark-factory's own
+    transitional symlinks (guarded by test_legacy_config_symlinks_retired.py),
+    which is the precedent that makes the legacy spelling a defect here rather
+    than merely an inconsistency.
+
+    The failure this catches is latent, not active, and that is exactly why it
+    needs a guard: a target project that still keeps ``orchestrator.yaml`` as a
+    SYMLINK to the canonical file resolves the legacy path fine today, so a
+    stale unit template starts cleanly and nothing looks wrong.  It breaks on
+    the day that project retires its symlink the way this repo already did —
+    at which point the unit fails to start and the cause is a line nobody has
+    looked at in months.
+
+    The ``--config`` predicate is load-bearing: orchestrator-watchdog.service
+    runs a probe script with no ``--config``, so it is skipped rather than
+    failed.  Keying on the flag's presence (rather than naming the watchdog as
+    an exception) means a future unit is covered the day it lands.  That skip
+    is itself guarded — see
+    test_exec_start_config_parser_answers_for_every_orchestrator_run_unit,
+    which fails if a unit that runs the orchestrator ever lands in it — and a
+    MALFORMED ExecStart= raises MalformedExecStart out of here rather than
+    skipping, because "broken unit" is not "unit takes no --config".
+    """
+    content = service_path.read_text(encoding="utf-8")
+    config_arg = _exec_start_config_arg(content, service_path.name)
+    if config_arg is None:
+        pytest.skip(f"{service_path.name} has no ExecStart --config argument")
+
+    actual = pathlib.PurePosixPath(config_arg).name
+    assert actual == CANONICAL_CONFIG_BASENAME, (
+        f"{service_path.name} points --config at {config_arg!r}, whose basename "
+        f"is {actual!r}. It must be the canonical {CANONICAL_CONFIG_BASENAME!r} "
+        "(CLAUDE.md: the dashboard's _discover_escalation_urls keys on that "
+        "exact filename). If the target project still has a legacy "
+        "orchestrator.yaml symlink, the legacy path resolves today and breaks "
+        "the moment that project retires the symlink — as dark-factory already "
+        "did under task 2719."
+    )
+
+
+# ---------------------------------------------------------------------------
+# setup-host.sh installer coverage (task 3641)
+# ---------------------------------------------------------------------------
+#
+# A committed unit template that setup-host.sh never installs is invisible: it
+# looks like a supported unit, but a fresh host simply does not get it, and an
+# existing host keeps whatever hand-installed copy it happens to have.  That is
+# the exact defect this task exists to fix — orchestrator-know-live.service had
+# a committed template since e5273d8623 and was never wired in, and
+# orchestrator-pump-web-ui.service ran on the host for weeks with no committed
+# source at all.  Fixing the two instances without a guard leaves the CLASS
+# open, so this asserts the installer's coverage mechanically.
+
+SETUP_HOST_SH = REPO_ROOT / "scripts" / "setup-host.sh"
+
+
+def _unit_has_install_section(content: str) -> bool:
+    """True if the unit declares an [Install] section (i.e. it is enable-able).
+
+    ``systemctl enable`` on a unit with no [Install] section is an error, not a
+    no-op — such a unit is 'static'.  orchestrator-watchdog.service is exactly
+    that: it is pulled in by orchestrator-watchdog.timer, which carries the
+    install instead.
+    """
+    return "Install" in _parse_sections(content)
+
+
+def _shell_statements(script_text: str) -> list[str]:
+    """Non-comment, non-blank statements of a shell script, whitespace-stripped.
+
+    Comments are dropped so that a unit merely NAMED in the section header
+    prose above the cp block cannot satisfy an assertion that the installer
+    actually copies it.
+    """
+    return [
+        stripped
+        for line in script_text.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+
+
+# Parsed once at import and shared by every consumer below (the parametrized
+# installer guard, one case per template, plus the SETUP.md parity guard) —
+# setup-host.sh does not change under a test run, so re-reading and re-parsing
+# it per case bought nothing.
+SETUP_HOST_STATEMENTS = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
+
+# Destination the installer must copy units into: ~/.config/systemd/user, via
+# the $UNIT_DIR variable setup-host.sh defines.  Asserted explicitly because a
+# `cp` to anywhere else leaves the unit uninstalled just as surely as no `cp`
+# at all — which is the failure class this whole section exists to close.
+_UNIT_DIR_VAR = "$UNIT_DIR"
+
+
+def test_setup_host_install_predicate_discriminates() -> None:
+    """Coverage guard: the glob is non-empty AND the [Install] predicate splits it.
+
+    Mirrors test_orchestrator_service_glob_covers_all_known_units, plus the
+    silent-green risk specific to the parametrized guard below.  That test's
+    enable half is CONDITIONAL on _unit_has_install_section, so a predicate
+    that answered False for everything (a broken _parse_sections, a change in
+    unit shape) would vacuously satisfy every case while checking nothing.
+    Asserting the predicate discriminates in BOTH directions keeps it honest:
+    at least one enable-able unit, and at least one static unit — today the
+    seven project orchestrators and orchestrator-watchdog.service respectively.
+    """
+    assert ALL_ORCHESTRATOR_SERVICE_FILES, (
+        "glob discovered no orchestrator-*.service templates"
+    )
+    by_install = {
+        p.name: _unit_has_install_section(p.read_text(encoding="utf-8"))
+        for p in ALL_ORCHESTRATOR_SERVICE_FILES
+    }
+    assert any(by_install.values()), (
+        "no orchestrator template has an [Install] section — the enable half of "
+        "test_setup_host_installs_every_orchestrator_unit would pass vacuously "
+        f"for every unit. Parsed: {by_install}"
+    )
+    assert not all(by_install.values()), (
+        "every orchestrator template has an [Install] section, so the static-unit "
+        "branch is never exercised. orchestrator-watchdog.service is expected to "
+        f"have none (it is pulled in by its .timer). Parsed: {by_install}"
+    )
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_setup_host_installs_every_orchestrator_unit(
+    service_path: pathlib.Path,
+) -> None:
+    """setup-host.sh must copy every orchestrator template, and enable each one
+    that has an [Install] section.
+
+    setup-host.sh is how a unit reaches a host.  A template it does not copy is
+    a unit that does not exist on a fresh machine, however correct its contents
+    — so 'committed' and 'installed' silently diverge with nothing to detect it.
+
+    The enable obligation is DERIVED from the [Install] predicate rather than
+    hard-coded around a named watchdog exception, for the same reason
+    test_systemd_restart_backoff.py discovers by content instead of by list: a
+    hand-maintained exception list has to be edited for every future unit, and
+    a unit nobody remembers to add is precisely the bug being fixed here.  With
+    the predicate, a new orchestrator template turns this red on the day it
+    lands unless the installer learns about it.
+
+    This does NOT assert the converse (that the installer names no unknown
+    unit) — a `cp` of a template this glob cannot see would fail the installer
+    loudly at run time, so it needs no test.
+    """
+    basename = service_path.name
+
+    expected_cp = f'cp "$REPO_ROOT/scripts/{basename}" "{_UNIT_DIR_VAR}/"'
+    copied = any(
+        stmt.startswith("cp ")
+        and f"scripts/{basename}" in stmt
+        and _UNIT_DIR_VAR in stmt
+        for stmt in SETUP_HOST_STATEMENTS
+    )
+    assert copied, (
+        f"{SETUP_HOST_SH.name} never copies {basename} into {_UNIT_DIR_VAR}, so a "
+        "fresh host never gets that unit. The destination is asserted, not just "
+        "the source: a cp of the template to a staging path or any other "
+        "directory leaves the unit just as uninstalled as no cp at all. Add a "
+        f"line to the cp block:\n    {expected_cp}"
+    )
+
+    content = service_path.read_text(encoding="utf-8")
+    if not _unit_has_install_section(content):
+        return
+
+    expected_enable = f"systemctl --user enable {basename}"
+    enabled = any(stmt.startswith(expected_enable) for stmt in SETUP_HOST_STATEMENTS)
+    assert enabled, (
+        f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} never "
+        "enables it, so it is copied to the host and then never starts at boot. "
+        f"Add a line to the enable block:\n    {expected_enable}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SETUP.md operator remediation coverage (task 3641, review feedback)
+# ---------------------------------------------------------------------------
+#
+# setup-host.sh installs and ENABLES orchestrator units for several projects
+# that are not part of this repo.  SETUP.md's "Known gap" callout is the only
+# operator-facing remediation for that: it hands a non-maintainer a copy-paste
+# `systemctl --user disable --now ...` command naming the units to turn off.
+#
+# That block is EXECUTABLE, not prose — which makes it the same class of
+# artifact as setup-host.sh's own cp/enable lines guarded above, and it drifts
+# the same way.  Every unit the installer enables but the doc omits is left
+# running on a non-maintainer's host with a --config path that does not exist:
+# at the next login/default.target it crash-loops until StartLimitBurst is
+# exhausted, then sits failed.  And every unit the doc names but the installer
+# does NOT install as a foreign unit breaks the operator's copy-paste outright:
+# `systemctl --user disable --now` on a nonexistent unit file exits non-zero,
+# and on THIS repo's own orchestrator it turns off the one the operator wants.
+# So both drift directions are real defects and both are asserted, separately.
+
+SETUP_MD = REPO_ROOT / "SETUP.md"
+
+# The one enabled orchestrator unit that IS genuinely the reader's own, which
+# SETUP.md explicitly tells them to keep ("orchestrator-dark-factory.service
+# itself is genuinely yours and is fine to run").  Keying the exclusion on this
+# repo's OWN unit — rather than hand-listing the foreign ones — means a seventh
+# project is covered by this guard the day its unit lands, matching the
+# [Install]-predicate reasoning used by the installer-coverage guard above.
+_OWN_PROJECT_UNIT = "orchestrator-dark-factory.service"
+
+_DISABLE_COMMAND = "systemctl --user disable --now"
+
+_ORCHESTRATOR_UNIT_RE = re.compile(r"orchestrator-[\w.-]+?\.service")
+
+
+def _enabled_orchestrator_service_units() -> set[str]:
+    """Orchestrator .service units that setup-host.sh actually enables.
+
+    Derived from the same comment-stripped view of setup-host.sh that the
+    installer-coverage guard uses, so the doc is checked against what the
+    installer DOES, never against what its section header prose says.
+
+    The ``.service`` filter naturally drops ``orchestrator-watchdog.timer``,
+    which setup-host.sh also enables and which SETUP.md correctly tells the
+    reader to KEEP enabled (it skips disabled units, so it is harmless).
+    """
+    prefix = "systemctl --user enable "
+    units = set()
+    for stmt in SETUP_HOST_STATEMENTS:
+        if not stmt.startswith(prefix):
+            continue
+        unit = stmt.split()[-1]
+        if unit.startswith("orchestrator-") and unit.endswith(".service"):
+            units.add(unit)
+    return units
+
+
+def _fenced_code_blocks(md_text: str) -> list[str]:
+    """Bodies of every ``` -fenced code block, in document order.
+
+    Parsed by walking fences rather than by line number so the guard survives
+    any edit above the block it cares about.
+    """
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in md_text.splitlines():
+        if line.lstrip().startswith("```"):
+            if current is None:
+                current = []
+            else:
+                blocks.append("\n".join(current))
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+def _setup_md_disable_blocks() -> list[str]:
+    """Every fenced block in SETUP.md carrying the disable-the-foreign-units command."""
+    return [
+        block
+        for block in _fenced_code_blocks(SETUP_MD.read_text(encoding="utf-8"))
+        if _DISABLE_COMMAND in block
+    ]
+
+
+def test_setup_md_disable_block_is_discoverable() -> None:
+    """Coverage guard: exactly one disable block, and a non-empty derived set.
+
+    Mirrors the intent of test_setup_host_install_predicate_discriminates.  The
+    parity assertion below compares two derived sets, and BOTH can silently
+    collapse to empty: a fence-parse mishap returning no block, or an enable-
+    statement scan that matches nothing.  Empty-vs-empty is a passing set
+    comparison that checks nothing — the same silent-green failure mode the
+    other coverage guards in this file exist to prevent — so both inputs are
+    asserted non-degenerate here, before the parity test relies on them.
+    """
+    blocks = _setup_md_disable_blocks()
+    assert len(blocks) == 1, (
+        f"expected exactly one fenced block in {SETUP_MD.name} containing "
+        f"{_DISABLE_COMMAND!r}, found {len(blocks)}. The parity guard below "
+        "assumes a single copy-paste remediation block; if the doc genuinely "
+        "grew a second one, teach the helper which is which rather than "
+        "letting it pick arbitrarily."
+    )
+
+    enabled = _enabled_orchestrator_service_units()
+    assert enabled, (
+        f"derived no `{_DISABLE_COMMAND.replace('disable --now', 'enable')} "
+        f"orchestrator-*.service` statements from {SETUP_HOST_SH.name} — the "
+        "parity guard below would pass vacuously against an empty set."
+    )
+    assert enabled - {_OWN_PROJECT_UNIT}, (
+        f"{SETUP_HOST_SH.name} enables no orchestrator unit other than "
+        f"{_OWN_PROJECT_UNIT}, so the foreign-unit set is empty and the parity "
+        "guard below checks nothing."
+    )
+
+
+def test_setup_md_disable_block_covers_every_foreign_orchestrator_unit() -> None:
+    """SETUP.md's disable block must name exactly the foreign units setup-host.sh enables.
+
+    Scope, deliberate: this guards ONLY the executable
+    ``systemctl --user disable --now`` block — the artifact an operator actually
+    copy-pastes.  It does NOT pin the surrounding prose (the "four projects"
+    count, or the sentence-form list of unit names), because asserting on
+    documentation wording is a brittle meta-test that rots on the next rewrite
+    and buys nothing this block-level assertion does not already give.  That
+    prose is corrected by hand.  Do not "helpfully" extend this test into a
+    wording pin.
+
+    Note the asymmetry in how _OWN_PROJECT_UNIT is used: it is excluded when
+    DERIVING the foreign set (setup-host.sh enables it, but it is not foreign),
+    and deliberately NOT excluded from the ``extra`` check.  The block naming
+    this repo's own orchestrator would directly contradict the sentence right
+    above it — "orchestrator-dark-factory.service itself is genuinely yours and
+    is fine to run" — and hand the operator a copy-paste that shuts off the one
+    orchestrator they actually want.  That is drift this bidirectional guard
+    exists to catch, so it is reported like any other extra.
+    """
+    foreign = _enabled_orchestrator_service_units() - {_OWN_PROJECT_UNIT}
+    block = _setup_md_disable_blocks()[0]
+    named = set(_ORCHESTRATOR_UNIT_RE.findall(block))
+
+    missing = sorted(foreign - named)
+    assert not missing, (
+        f"{SETUP_HOST_SH.name} enables {', '.join(missing)} but {SETUP_MD.name}'s "
+        f"`{_DISABLE_COMMAND}` block does not name "
+        f"{'them' if len(missing) > 1 else 'it'}. A non-maintainer who follows "
+        "the documented remediation verbatim is left with "
+        f"{'those units' if len(missing) > 1 else 'that unit'} enabled, pointing "
+        "at a --config path that does not exist on their machine; at the next "
+        "login/default.target they crash-loop until StartLimitBurst is exhausted "
+        f"and then sit failed. Fix: add {', '.join(missing)} to the "
+        f"`{_DISABLE_COMMAND}` block in {SETUP_MD.name}."
+    )
+
+    extra = sorted(named - foreign)
+    own_unit_note = (
+        (
+            f" {_OWN_PROJECT_UNIT} in particular is THIS repo's own orchestrator: "
+            f"{SETUP_MD.name} tells the reader two sentences earlier that it "
+            "'is genuinely yours and is fine to run', so naming it here makes "
+            "the doc contradict itself and shuts off the one orchestrator the "
+            "operator actually wants."
+        )
+        if _OWN_PROJECT_UNIT in extra
+        else ""
+    )
+    assert not extra, (
+        f"{SETUP_MD.name}'s `{_DISABLE_COMMAND}` block names "
+        f"{', '.join(extra)}, which is not a foreign unit {SETUP_HOST_SH.name} "
+        "enables. `systemctl --user disable --now` on a unit file that does not "
+        "exist fails with 'Unit file does not exist' and returns NON-ZERO, so a "
+        "stale entry breaks the whole copy-paste command for the operator — this "
+        f"is a real defect, not cosmetic.{own_unit_note} Fix: remove "
+        f"{', '.join(extra)} from the block in {SETUP_MD.name} (or, if the unit "
+        f"should be installed after all, add it to {SETUP_HOST_SH.name}'s enable "
+        "block)."
     )
