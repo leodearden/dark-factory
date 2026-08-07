@@ -1115,3 +1115,76 @@ def test_check_config_survives_a_raising_audit(tmp_path, monkeypatch):
     result = _check_config(p)
     assert result.exit_code == 0, result.output
     assert 'OK' in result.output
+
+
+# --- (d) load_config warns on hard findings (startup AND hot-reload) ----------
+
+
+def _load_and_capture(tmp_path, monkeypatch, caplog, tree) -> list[str]:
+    p = _write_yaml(tmp_path, tree, name='config.yaml')
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+        load_config(p)
+    return [rec.getMessage() for rec in caplog.records]
+
+
+def test_load_config_warns_on_a_hard_ignore_finding(tmp_path, monkeypatch, caplog):
+    """Loud-over-silent. This ONE call site covers startup AND hot-reload,
+    because Harness.reload_config obtains its fresh config from load_config."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'the orchestrator reads this'}
+        ]},
+        'warm_lane_pool': 8,
+    })
+    assert any('warm_lane_pool' in m and 'self-refuting' in m for m in messages), messages
+
+
+def test_load_config_silent_for_a_clean_config(tmp_path, monkeypatch, caplog):
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'read by scripts/deploy.sh'}
+        ]},
+        'warm_lane_pool': 8,
+    })
+    assert not any('ignore entr' in m for m in messages), messages
+
+
+def test_load_config_silent_for_advisory_only_findings(tmp_path, monkeypatch, caplog):
+    """The five grandfathered bare entries must not make EVERY startup noisy —
+    a warning that always fires is one operators learn to ignore."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path), **_reify_shape(),
+    })
+    assert not any('ignore entr' in m for m in messages), messages
+
+
+def test_unknown_key_warning_still_fires_independently(tmp_path, monkeypatch, caplog):
+    """The two warnings are independent signals: a config can have a hard
+    finding, an unknown key, or both, and each must still be named."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'the orchestrator reads this'}
+        ]},
+        'warm_lane_pool': 8,
+        'spare_warm_lanes': 8,
+    })
+    assert any('unknown key' in m and 'spare_warm_lanes' in m for m in messages), messages
+    assert any('self-refuting' in m for m in messages), messages
+
+
+def test_load_config_survives_a_raising_audit(tmp_path, monkeypatch):
+    """A broken audit must never take down startup OR a hot-reload."""
+    def _boom(_path):
+        raise RuntimeError('audit exploded')
+
+    monkeypatch.setattr('orchestrator.config.audit_census_ignore_entries', _boom)
+    p = _write_yaml(
+        tmp_path, {'project_root': str(tmp_path), 'max_concurrent_tasks': 3},
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    assert load_config(p).max_concurrent_tasks == 3
