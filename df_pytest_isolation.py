@@ -47,12 +47,20 @@ a genuine one: ``scripts/orchestrator-watchdog.py`` reads the file and SKIPS
 its staleness pass for ``ORCH_RESTART_MIN_INTERVAL_SECS`` (8h default), so the
 fleet-staleness backstop was silently disarmed for the rest of the day.
 
-Same structure as the ceiling above — two pure helpers
-(``deploy_clock_snapshot`` / ``deploy_clock_violation_reason``) plus a thin
+Same structure as the ceiling above — pure helpers (``deploy_clock_guard_roots``
+/ ``deploy_clock_snapshot`` / ``deploy_clock_violation_reason``) plus a thin
 session-scoped autouse fixture wiring them — and the same reason for living
 here: the defence must be suite-wide and impossible to opt out of, because the
 defect class is "a spawner that forgets the env var" and the next one has not
 been written yet.
+
+Unlike the ceiling, this one guards TWO roots when it runs inside a task
+worktree: that worktree AND the main checkout enclosing it.  The bash script
+derives its clock path from its own location (so a worktree run hits the
+worktree), but ``scripts/orchestrator-watchdog.py`` HARDCODES ``REPO_DIR``, so
+its fused-memory clock and the fleet script it spawns land in the main checkout
+whichever worktree invoked them.  One root would have left the second protected
+path watched-but-unwritable-to, i.e. green and useless.
 
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
@@ -222,6 +230,50 @@ PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
     'data/fused-memory/last_redeploy_fused_memory.json',
 )
 
+# A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
+# truncates nothing legitimate; it exists only so a failure message stays
+# readable if the guard ever fires on a file that is not a clock at all.
+_MAX_CLOCK_BODY_CHARS = 200
+
+
+def deploy_clock_guard_roots(
+    module_root: str | os.PathLike[str],
+) -> tuple[Path, ...]:
+    """Every checkout whose deploy clocks a run in *module_root* must leave alone.
+
+    Always *module_root* itself — the checkout this module sits in, which is the
+    ``REPO_DIR`` ``scripts/restart-all-orchestrators.sh`` derives from its own
+    path, hence the file a forgetful spawner hits in an ordinary worktree run.
+
+    PLUS, when that checkout is a task worktree (``…/.worktrees/<id>``), the MAIN
+    checkout enclosing it.  That second root is not belt-and-braces: the OTHER
+    protected clock is written against a HARDCODED path.
+    ``scripts/orchestrator-watchdog.py`` fixes ``REPO_DIR =
+    "/home/leo/src/dark-factory"``, so its ``FM_DEPLOY_CLOCK_PATH`` default — and
+    the fleet restart script it spawns — resolve into the main checkout no matter
+    which worktree the suite runs from.  A guard rooted only at the worktree would
+    watch a path nothing writes and report all-clear while the REAL production
+    clock was being falsified, which is the same "green and useless" failure the
+    relpath drift pin exists to prevent.
+
+    The cost is accepted deliberately: a GENUINE concurrent redeploy in the
+    machine-operated main checkout now fails a worktree suite too, not just a
+    main-checkout one.  That is the loud-over-silent trade this whole defence is
+    built on, and it is why the failure message prints the absolute path plus
+    both observed bodies — so "real redeploy" is one glance away from "test bug".
+
+    Own checkout FIRST and deduped, so the message names the run's own checkout
+    when both were touched, and so a suite running in the main checkout (where
+    ``module_root`` has no ``.worktrees`` parent) snapshots it exactly once.
+    """
+    root = Path(module_root).resolve()
+    roots = [root]
+    if root.parent.name in _WORKTREE_ROOT_COMPONENTS and len(root.parents) >= 2:
+        enclosing = root.parents[1]
+        if enclosing != root:
+            roots.append(enclosing)
+    return tuple(roots)
+
 
 def deploy_clock_snapshot(
     root: str | os.PathLike[str],
@@ -273,28 +325,57 @@ def _clock_change_kind(
     )
 
 
+def _describe_clock_entry(entry: tuple[bytes, int] | None) -> str:
+    """Render one snapshot reading for the failure message.
+
+    The body is printed, not just the fact that it changed, because
+    distinguishing a test stamp from a GENUINE concurrent redeploy means
+    comparing the ``{ts, iso}`` against the deploy you expect — and by the time
+    anyone reads the failure the file may have moved again, so re-reading it is
+    not a substitute.  Both readings are already in hand in the snapshot tuples;
+    withholding them just makes triage a second investigation.
+    """
+    if entry is None:
+        return 'absent'
+    body, mtime_ns = entry
+    text = body.decode('utf-8', errors='replace').strip()
+    if len(text) > _MAX_CLOCK_BODY_CHARS:
+        text = f'{text[:_MAX_CLOCK_BODY_CHARS]}…(truncated)'
+    return f'{text!r} st_mtime_ns={mtime_ns}'
+
+
 def deploy_clock_violation_reason(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
+    root: str | os.PathLike[str] | None = None,
 ) -> str | None:
     """Explain which protected deploy clock the run falsified, or ``None``.
 
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
-    order, what happened to it, and both readings of that observation — a test
-    that forgot to redirect its clock (the common case, with the concrete
-    remedy) and a genuine concurrent redeploy in a machine-operated checkout
-    (not a bug at all).  Naming only the first would invite the reader to assume
-    whichever one they thought of first.
+    order, what happened to it, the before/after readings actually observed, and
+    both readings of that observation — a test that forgot to redirect its clock
+    (the common case, with the concrete remedy) and a genuine concurrent redeploy
+    in a machine-operated checkout (not a bug at all).  Naming only the first
+    would invite the reader to assume whichever one they thought of first.
+
+    *root* is optional and cosmetic-but-load-bearing: pass the checkout the
+    snapshots were taken against and the message names the ABSOLUTE file.  A run
+    guards more than one checkout (see :func:`deploy_clock_guard_roots`), so a
+    bare relpath leaves the reader unable to tell which one was falsified.
     """
     for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
-        kind = _clock_change_kind(before.get(relpath), after.get(relpath))
+        before_entry, after_entry = before.get(relpath), after.get(relpath)
+        kind = _clock_change_kind(before_entry, after_entry)
         if kind is None:
             continue
         env_var = (
             'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
         )
+        where = relpath if root is None else str(Path(root) / relpath)
         return (
-            f'this test run falsified a REAL deploy clock: {relpath} was {kind}.\n'
+            f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+            f'observed before: {_describe_clock_entry(before_entry)}\n'
+            f'observed after:  {_describe_clock_entry(after_entry)}\n'
             'scripts/orchestrator-watchdog.py reads that file as "this component '
             'was redeployed at <ts>" and SKIPS its staleness pass while the '
             'min-interval window is open (8h by default), so the stamp silently '
@@ -310,21 +391,25 @@ def deploy_clock_violation_reason(
             'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
             'operator running restart-all-orchestrators.sh --drain) fired while '
             'this suite was running. That is a genuine stamp and not a test bug — '
-            'compare the {ts, iso} body against the deploy you expect.'
+            'the two bodies printed above ARE that comparison: check the {ts, iso} '
+            'against the deploy you expect.'
         )
     return None
 
 
 @pytest.fixture(scope='session', autouse=True)
 def _df_deploy_clocks_unwritten():
-    """Fail the run if it falsified a REAL deploy clock in this checkout.
+    """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
 
-    The repo root is ``Path(__file__).resolve().parent`` — this module SITS at
-    the repo root, and in a task worktree that correctly yields the WORKTREE
-    root, which is precisely the ``REPO_DIR`` that
-    ``scripts/restart-all-orchestrators.sh`` computes for its ``CLOCK_FILE``
-    default.  So the guard watches exactly the file a forgetful spawner would
-    hit, in whichever checkout the suite is running from.
+    The roots come from :func:`deploy_clock_guard_roots`, seeded with
+    ``Path(__file__).resolve().parent`` — this module SITS at the repo root, and
+    in a task worktree that correctly yields the WORKTREE root, which is
+    precisely the ``REPO_DIR`` that ``scripts/restart-all-orchestrators.sh``
+    computes for its ``CLOCK_FILE`` default.  Under a worktree the enclosing MAIN
+    checkout is guarded too, because ``scripts/orchestrator-watchdog.py``
+    hardcodes its ``REPO_DIR`` and so writes there regardless of which worktree
+    spawned it.  So the guard watches exactly the files a forgetful spawner would
+    hit, in every checkout it could hit them in.
 
     SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
     documents — cost (a function-scoped autouse fixture runs once per test,
@@ -345,11 +430,14 @@ def _df_deploy_clocks_unwritten():
     exit code even when every test passed.  That is the intended loudness: the
     damage is to production state, not to any one test's result.
     """
-    root = Path(__file__).resolve().parent
-    before = deploy_clock_snapshot(root)
+    roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
+    before = [(root, deploy_clock_snapshot(root)) for root in roots]
     try:
         yield
     finally:
-        reason = deploy_clock_violation_reason(before, deploy_clock_snapshot(root))
-        if reason is not None:
-            pytest.fail(reason, pytrace=False)
+        for root, snapshot in before:
+            reason = deploy_clock_violation_reason(
+                snapshot, deploy_clock_snapshot(root), root=root,
+            )
+            if reason is not None:
+                pytest.fail(reason, pytrace=False)

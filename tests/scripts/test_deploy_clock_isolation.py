@@ -27,6 +27,8 @@ other suite-wide isolation defence, so the two read as one family.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
+    deploy_clock_guard_roots,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
 )
@@ -126,6 +129,90 @@ class TestProtectedRelpaths:
         """
         for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
             assert not Path(relpath).is_absolute(), relpath
+
+
+# The gitignored worktree-root vocabulary, .gitignore:15-17.  Spelled out here
+# rather than imported so the test pins the values independently of the module.
+_WORKTREE_ROOTS = ('.worktrees', '.worktrees-orphaned', '.eval-worktrees')
+
+
+class TestDeployClockGuardRoots:
+    """WHICH checkouts the guard watches — one root is not enough."""
+
+    def test_a_plain_checkout_yields_only_itself(self, tmp_path: Path) -> None:
+        """No ``.worktrees`` parent (the main checkout's own shape) — exactly one
+        root, so a main-checkout run does not snapshot the same file twice.
+        """
+        root = tmp_path / 'dark-factory'
+        root.mkdir()
+
+        assert deploy_clock_guard_roots(root) == (root.resolve(),)
+
+    @pytest.mark.parametrize('worktree_dir', _WORKTREE_ROOTS)
+    def test_a_worktree_also_yields_the_enclosing_main_checkout(
+        self, tmp_path: Path, worktree_dir: str,
+    ) -> None:
+        """The whole point of this helper.
+
+        ``scripts/orchestrator-watchdog.py`` HARDCODES ``REPO_DIR =
+        "/home/leo/src/dark-factory"`` (line 96), so its ``FM_DEPLOY_CLOCK_PATH``
+        default and the fleet restart script it spawns resolve into the MAIN
+        checkout no matter which worktree the suite runs from.  A guard rooted
+        only at the worktree would report all-clear while the REAL production
+        clock was falsified — the fused-memory entry in the protected set would
+        be watching a path nothing under a worktree can even write.
+        """
+        main = tmp_path / 'dark-factory'
+        worktree = main / worktree_dir / '3797'
+        worktree.mkdir(parents=True)
+
+        assert deploy_clock_guard_roots(worktree) == (worktree.resolve(), main.resolve())
+
+    def test_the_run_s_own_checkout_comes_first(self, tmp_path: Path) -> None:
+        """Ordering is load-bearing for the failure MESSAGE: when a test falsifies
+        both, the reader should be pointed at the checkout they are working in.
+        """
+        main = tmp_path / 'dark-factory'
+        worktree = main / '.worktrees' / '3797'
+        worktree.mkdir(parents=True)
+
+        assert deploy_clock_guard_roots(worktree)[0] == worktree.resolve()
+
+    def test_the_roots_are_deduped(self, tmp_path: Path) -> None:
+        """Snapshotting a root twice would compare it against itself twice and
+        double every failure message; it must be impossible by construction.
+        """
+        worktree = tmp_path / 'dark-factory' / '.worktrees' / '3797'
+        worktree.mkdir(parents=True)
+
+        for root in (worktree, tmp_path / 'plain'):
+            roots = deploy_clock_guard_roots(root)
+            assert len(roots) == len(set(roots)), roots
+
+    def test_a_lookalike_directory_name_is_not_a_worktree(self, tmp_path: Path) -> None:
+        """Matching is on the exact parent NAME, never a substring: a directory
+        merely containing the word is an ordinary, unrelated checkout, and
+        promoting its parent to a guarded root would watch some stranger's tree.
+        """
+        root = tmp_path / 'my.worktrees-backup' / 'dark-factory'
+        root.mkdir(parents=True)
+
+        assert deploy_clock_guard_roots(root) == (root.resolve(),)
+
+    def test_the_roots_are_absolute(self, tmp_path: Path) -> None:
+        """The snapshot joins relpaths onto these; a relative root would resolve
+        against whatever cwd the session happened to leave behind.
+        """
+        (tmp_path / 'dark-factory').mkdir()
+
+        for root in deploy_clock_guard_roots(Path('dark-factory')):
+            assert root.is_absolute(), root
+
+    def test_this_checkout_is_guarded_in_this_run(self) -> None:
+        """Liveness, not just shape: whatever checkout this file lives in — main
+        or worktree — must be among the roots the guard would snapshot.
+        """
+        assert REPO_ROOT.resolve() in deploy_clock_guard_roots(REPO_ROOT)
 
 
 class TestDeployClockSnapshot:
@@ -271,6 +358,59 @@ class TestDeployClockViolationReason:
         assert 'ORCH_FLEET_DEPLOY_CLOCK' in reason
         assert 'redeploy' in reason.lower()
 
+    def test_the_reason_prints_the_observed_bodies(self, tmp_path: Path) -> None:
+        """Triage must be possible from the failure OUTPUT alone.
+
+        Telling the reader to "compare the {ts, iso} body against the deploy you
+        expect" — the step that separates a genuine concurrent redeploy from a
+        test bug — is useless if the bodies are not printed: by the time anyone
+        reads the ERROR the file may have moved again, so re-reading it is not the
+        same observation.  Both readings are already in hand in the snapshots.
+        """
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 111, "iso": "2026-08-06T00:00:00+00:00"}')
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 222, "iso": "2026-08-07T00:00:00+00:00"}')
+        after = deploy_clock_snapshot(tmp_path)
+
+        reason = deploy_clock_violation_reason(before, after)
+
+        assert reason is not None
+        assert '"ts": 111' in reason, reason
+        assert '"ts": 222' in reason, reason
+        before_entry, after_entry = before[_FLEET_RELPATH], after[_FLEET_RELPATH]
+        # Bound before subscripting: a snapshot value is `tuple | None` by design.
+        assert before_entry is not None and after_entry is not None
+        assert str(before_entry[1]) in reason, 'the before mtime_ns must be printed'
+        assert str(after_entry[1]) in reason, 'the after mtime_ns must be printed'
+
+    def test_the_reason_reports_absence_rather_than_a_bare_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """The created case (the 3797 shape) has no before body to print, and
+        ``None`` would read as "the guard failed to look" rather than "the file
+        did not exist".
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}')
+
+        reason = deploy_clock_violation_reason(before, deploy_clock_snapshot(tmp_path))
+
+        assert reason is not None
+        assert 'absent' in reason, reason
+
+    def test_a_root_names_the_absolute_file(self, tmp_path: Path) -> None:
+        """A run guards MORE THAN ONE checkout (see deploy_clock_guard_roots), so
+        a bare relpath leaves the reader unable to tell which one was falsified.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}')
+        after = deploy_clock_snapshot(tmp_path)
+
+        reason = deploy_clock_violation_reason(before, after, root=tmp_path)
+
+        assert reason is not None
+        assert str(tmp_path / _FLEET_RELPATH) in reason, reason
+
     def test_the_detector_is_not_vacuous_end_to_end(self, tmp_path: Path) -> None:
         """Self-test: snapshot and detector agree on a dict shape that WORKS.
 
@@ -336,3 +476,116 @@ class TestGuardIsLiveInThisRun:
                 'this whole suite runs with no deploy-clock guard.',
                 pytrace=False,
             )
+
+
+# ---------------------------------------------------------------------------
+# The guard's FAILURE contract, exercised through a real nested pytest run.
+#
+# Everything above pins the helpers, the marker and the registration; none of it
+# pins what a violation actually DOES to the run. A refactor that warned instead
+# of failing, or moved the check into a fixture nobody requests, would leave
+# every test in this file green while the defence emitted nothing an exit code
+# could carry. Only a nested run can observe "the process exits non-zero even
+# though every test passed", because a fixture cannot fail its own session.
+# ---------------------------------------------------------------------------
+
+# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
+# without it pytest walks up looking for an inifile and would inherit this
+# repo's addopts (`--import-mode=importlib -m 'not smoke ...'`).
+_NESTED_INI = '[pytest]\n'
+
+_NESTED_CONFTEST = '''\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from df_pytest_isolation import _df_deploy_clocks_unwritten  # noqa: F401
+'''
+
+_NESTED_STAMP_BODY = '{"ts": 1786033966, "iso": "2026-08-06T16:32:46+00:00"}'
+
+
+def _nested_test_source(*, writes_clock: bool) -> str:
+    """Source for the nested test module — which PASSES either way.
+
+    Built by concatenation rather than ``str.format``: the stamp body is JSON, so
+    a template would have to escape its braces, and a mis-escaped one would
+    silently write a different file than the guard watches.
+    """
+    body = (
+        (
+            '    clock = Path(__file__).resolve().parent / RELPATH\n'
+            '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
+            f'    clock.write_text({_NESTED_STAMP_BODY!r})\n'
+        )
+        if writes_clock
+        else '    pass\n'
+    )
+    return (
+        'from pathlib import Path\n'
+        '\n'
+        f'RELPATH = {_FLEET_RELPATH!r}\n'
+        '\n'
+        '\n'
+        'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is to the checkout, not to this result."""\n'
+        + body
+    )
+
+
+def _nested_run(tmp_path: Path, *, writes_clock: bool) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp checkout.
+
+    The copied ``df_pytest_isolation.py`` sits at the tmp tree's root, so the
+    guard's ``Path(__file__).resolve().parent`` resolves THERE and the protected
+    clocks it watches are the tmp ones — the real checkout is never involved.
+    """
+    root = tmp_path / ('violating' if writes_clock else 'clean')
+    root.mkdir()
+    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
+    (root / 'pytest.ini').write_text(_NESTED_INI)
+    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
+    (root / 'test_forgetful.py').write_text(_nested_test_source(writes_clock=writes_clock))
+    return subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+
+
+class TestTheGuardFailsTheRunEndToEnd:
+    """A violation must cost the RUN, not merely log something."""
+
+    def test_a_stamped_clock_fails_a_session_whose_tests_all_passed(
+        self, tmp_path: Path,
+    ) -> None:
+        result = _nested_run(tmp_path, writes_clock=True)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a run that falsified a deploy clock exited 0 — the guard is inert. '
+            f'stdout={result.stdout!r}'
+        )
+        assert '1 passed' in combined, (
+            'the nested TEST must still pass, or this proves nothing about a '
+            f'green suite being caught. output={combined!r}'
+        )
+        assert 'falsified a REAL deploy clock' in combined, combined
+        # The BASENAME, not the relpath: the message names the absolute file, and
+        # asserting on a 48-char segment of a long tmp path would be hostage to
+        # terminal-width wrapping rather than to the guard's behaviour.
+        assert Path(_FLEET_RELPATH).name in combined, combined
+
+    def test_the_same_harness_without_the_write_exits_zero(self, tmp_path: Path) -> None:
+        """Non-vacuity control: the identical nested tree, minus the clock write.
+
+        Without it the failure above could be any nested-harness breakage — a
+        bad ini, an unimportable module, a missing pytest.
+        """
+        result = _nested_run(tmp_path, writes_clock=False)
+
+        assert result.returncode == 0, (
+            f'the control run failed for an unrelated reason: '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert 'falsified a REAL deploy clock' not in result.stdout
