@@ -2602,13 +2602,18 @@ _ARCHIVE_ENC = '-home-leo-src-dark-factory--worktrees-9999'
 def _make_archive(project_root: Path, task_id: str, session_id: str) -> Path:
     """Lay down one archived transcript at the real producer layout.
 
-    ``<project_root>/data/orchestrator/agent-transcripts/<task_id>/<enc>/
+    ``<project_root>/<TranscriptArchiveConfig.root>/<task_id>/<enc>/
     <session_id>.jsonl.gz`` — the path shared.transcript_archive._archive_one
     writes and durable_archive_path globs.
+
+    The root is READ OFF the config default rather than hardcoded: a change to
+    ``TranscriptArchiveConfig.root`` would otherwise silently desynchronise
+    this helper from the lookup under test, and every row here would fail as a
+    baffling ``archive_available is False`` instead of at the seam that moved.
     """
     dest = (
         project_root
-        / 'data/orchestrator/agent-transcripts'
+        / TranscriptArchiveConfig().root
         / task_id
         / _ARCHIVE_ENC
         / f'{session_id}.jsonl.gz'
@@ -2788,10 +2793,21 @@ class TestSessionResumeArchiveAvailable:
         """FAIL-SAFE: a config regression must not become a dispatch fault.
 
         ``transcript_archive`` is left as the bare spec_set MagicMock the
-        conftest fixture yields (it never assigns the field), so
-        ``project_root / <MagicMock>.root`` raises TypeError. _run_slot must
+        conftest fixture yields (it never assigns the field). _run_slot must
         still complete, the fallback must still be emitted with its correct
         reason, and the instrument must read False — never propagate.
+
+        MECHANISM, measured rather than assumed (and NOT the one the original
+        plan rationale asserted): ``project_root / <MagicMock>.root`` does not
+        raise. ``MagicMock`` implements ``__fspath__``, so the composition
+        succeeds into a nonsense-but-well-formed path
+        (``<project_root>/MagicMock/mock.root/<id>``) that simply matches
+        nothing, and the lookup returns None. The genuinely-raising composition
+        is pinned separately by the ``project_root = None`` rows in
+        :meth:`test_archive_available_is_total_against_broken_config` and
+        :meth:`test_instrument_fault_is_reported_loudly_exactly_once`. Both
+        routes have to land on False, which is what this row and those rows
+        together establish.
         """
         session = {
             'session_id': 'uuid-arch-mock',
@@ -2820,13 +2836,105 @@ class TestSessionResumeArchiveAvailable:
         self, harness: Harness
     ):
         """The helper itself is total, called directly, on a broken config."""
-        # Bare conftest MagicMock for transcript_archive → Path / MagicMock.
+        # Bare conftest MagicMock for transcript_archive: composes (MagicMock is
+        # os.PathLike) into a path that matches nothing — no raise, still False.
         assert harness._archive_available('42', 'sid') is False
 
-        # A nonsense project_root composes just as badly.
+        # project_root = None: the composition itself raises TypeError. THIS is
+        # the row that exercises the guard, not the MagicMock one above.
         harness.config.transcript_archive = TranscriptArchiveConfig()
         harness.config.project_root = None  # type: ignore[assignment]
         assert harness._archive_available('42', 'sid') is False
+
+    async def test_instrument_fault_is_reported_loudly_exactly_once(
+        self, harness: Harness, caplog
+    ):
+        """A faulted instrument must not be indistinguishable from an empty archive.
+
+        False-on-fault is the right DISPATCH behaviour, but reporting it
+        silently is the silent degradation INV-2/INV-4 forbid: "no archive" and
+        "the lookup is broken" would both read ``archive_available: false``, so
+        a config regression would render the measurement this task exists to
+        produce as a confident "0% recoverable" with nothing above DEBUG
+        dissenting — on the very signal task 3619 is judged by.
+
+        The faults reaching this handler are the ones durable_archive_path
+        CANNOT log (it logs its own at WARNING): they fail before the lookup, in
+        the archive-root composition, and are persistent rather than transient.
+        Hence loud, and hence rate-limited to once per process — a persistent
+        fault fires on every dispatch, and a fallback storm must not become a
+        log flood.
+        """
+        # A project_root the composition genuinely cannot divide. MEASURED, not
+        # assumed: the bare conftest MagicMock does NOT fault here (see
+        # test_unconfigured_transcript_archive_degrades_to_false), so using it
+        # would make this test vacuous.
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness.config.project_root = None  # type: ignore[assignment]
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            assert harness._archive_available('42', 'sid-1') is False
+            assert harness._archive_available('42', 'sid-2') is False
+            assert harness._archive_available('42', 'sid-3') is False
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'archive_available' in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING across 3 faults, got {len(warnings)}'
+        )
+        # It has to be actionable on its own: name the field so an operator
+        # greps it, and say the reported rate is not to be trusted.
+        msg = warnings[0].getMessage()
+        assert 'archive_available' in msg
+        assert 'sid-1' in msg  # the FIRST fault is the one that speaks
+        assert warnings[0].exc_info is not None  # the traceback is retained
+
+        # The suppressed repeats are still recoverable at DEBUG, not dropped.
+        debugs = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'archive_available' in r.getMessage()
+        ]
+        assert len(debugs) == 2
+
+    async def test_disabled_archival_still_reports_an_existing_archive(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The FILESYSTEM is the source of truth, not ``transcript_archive.enabled``.
+
+        Pins the docstring's explicit design decision, which nothing else
+        covered: adding an ``if not ...enabled: return False`` short-circuit
+        looks like a free optimisation and would still leave the whole suite
+        green, while silently inverting the contract. Turning archival OFF
+        today does not un-archive what was written while it was ON, and those
+        sessions are exactly the recoverable population this instrument exists
+        to count — a config-derived answer would bias the measurement toward
+        "nothing is recoverable" and mislead an operator triaging the storm L1.
+        """
+        session = {
+            'session_id': 'uuid-arch-disabled',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-disabled'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig(enabled=False)
+        _make_archive(harness.config.project_root, 'ar11', 'uuid-arch-disabled')
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar11', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['archive_available'] is True
 
     async def test_null_session_id_reports_false_without_raising(
         self, harness: Harness, tmp_path: Path
