@@ -687,9 +687,9 @@ _COVERAGE_CAVEAT = (
 
 
 def _format_candidate_line(candidate: WipeCandidate) -> str:
-    # The KEYS are spelled explicitly rather than derived from the NamedTuple
-    # field names: signature/source/fidelity are deliberately shorter than
-    # wipe_signature/plan_files_source/plan_files_fidelity.
+    # signature/source/fidelity are deliberately shorter than the
+    # wipe_signature/plan_files_source/plan_files_fidelity attributes they
+    # carry, so the keys are spelled here, not derived from the field names.
     return format_kv_line([
         ("task_id", candidate.task_id),
         ("tag", candidate.tag),

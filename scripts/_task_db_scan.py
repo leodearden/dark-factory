@@ -524,15 +524,15 @@ _COVERAGE_LABEL_WIDTH = 36
 def format_kv_line(pairs: Sequence[tuple[str, Any]], *, indent: str = "  ") -> str:
     """Render *pairs* as one indented ``key=value key=value`` line.
 
-    The enforced form of the "precedent's ``key=value`` style" that
-    ``audit_combine_gate_marker_loss.py``'s ``_format_finding_line`` docstring
-    previously only asserted in prose. Values go through ``str()``, exactly as
-    the f-strings this replaces did, so an int, a str and a ``len()`` result
-    all render identically to before.
+    THIS HELPER OWNS THE INDENT AND THE SEPARATOR, AND NOTHING ELSE. It
+    deduplicates no field names: the two adopters share none, so the field set,
+    the key spellings (``source`` for ``expected_source``, and so on) and the
+    column ORDER all stay per-script at the call sites. What it buys is that
+    the two scripts' finding lines cannot drift apart in shape — the same
+    narrow guarantee :func:`format_coverage_block` gives the coverage gutter.
 
-    The FIELD SET stays per-script: the two adopters name different columns,
-    and several of their keys deliberately differ from the underlying attribute
-    names (``source`` for ``expected_source``, and so on).
+    Values go through ``str()``, exactly as the f-strings this replaced did, so
+    an int, a str and a ``len()`` result all render identically to before.
     """
     return indent + " ".join(f"{key}={value}" for key, value in pairs)
 

@@ -960,10 +960,9 @@ _COVERAGE_CAVEAT = (
 def _format_finding_line(finding: Finding) -> str:
     """One finding, in the precedent's ``key=value`` style.
 
-    That style is now ENFORCED rather than merely asserted in prose:
-    format_kv_line is the shared spelling both audit scripts render through.
-    The KEY names are spelled explicitly here because ``source`` is
-    deliberately shorter than the ``expected_source`` attribute it carries.
+    The field set and order are this script's; format_kv_line supplies only
+    the indent and separator. ``source`` is deliberately shorter than the
+    ``expected_source`` attribute it carries.
     """
     return format_kv_line([
         ("task_id", finding.task_id),
