@@ -511,3 +511,165 @@ class TestMergeBranchIntoWorktree:
         assert res.details
         assert res.merge_worktree == wt
         assert await _rev_parse(wt) == tip
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-07: RED — acquire_chain_build_lane / release_chain_build_lane
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestChainBuildLane:
+    """The chain-build worktree-routing seam in merge_liveness.py."""
+
+    async def test_seam_is_reexported_through_merge_queue(self):
+        """Both names are reachable via merge_queue's merge_liveness shim.
+
+        merge_queue.py re-exports every merge_liveness name; a missing entry
+        is a real regression for `from orchestrator.merge_queue import X`
+        importers, which is the house convention.
+        """
+        from orchestrator.merge_liveness import (
+            acquire_chain_build_lane,
+            release_chain_build_lane,
+        )
+        from orchestrator.merge_queue import (
+            acquire_chain_build_lane as mq_acquire,
+        )
+        from orchestrator.merge_queue import (
+            release_chain_build_lane as mq_release,
+        )
+
+        assert mq_acquire is acquire_chain_build_lane
+        assert mq_release is release_chain_build_lane
+
+    async def test_warm_path_assigns_a_spec_lane(self, git_repo: Path):
+        """Pool ON → a warm _spec-0 lane checked out at the base commit."""
+        from orchestrator.merge_liveness import (
+            acquire_chain_build_lane,
+            release_chain_build_lane,
+        )
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops = _make_git_ops(git_repo, pool=True, size=1)
+        config = _make_config(git_repo)
+        head_sha = await _rev_parse(git_repo)
+
+        lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
+
+        assert warm is True
+        assert lane == git_ops.worktree_base / '_spec-0'
+        assert await git_ops._is_registered_worktree(lane)
+        assert await _rev_parse(lane) == head_sha
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.ASSIGNED
+
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+
+        # Warm release: pool FREE, worktree retained (target/ stays warm).
+        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.FREE
+        assert await git_ops._is_registered_worktree(lane)
+
+    async def test_cold_path_when_pool_knob_off(self, git_repo: Path):
+        """Pool OFF → an ephemeral _merge- worktree, warm=False, removed on release."""
+        from orchestrator.merge_liveness import (
+            acquire_chain_build_lane,
+            release_chain_build_lane,
+        )
+
+        git_ops = _make_git_ops(git_repo, pool=False)
+        config = _make_config(git_repo)
+        assert git_ops.spec_warm_lane_pool is None
+        head_sha = await _rev_parse(git_repo)
+
+        lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
+
+        assert warm is False
+        assert lane is not None
+        assert lane.name.startswith('_merge-')
+        assert await _rev_parse(lane) == head_sha
+
+        await release_chain_build_lane(git_ops, lane, warm=False)
+        assert lane.name not in await _worktree_names(git_ops)
+
+    async def test_refuses_the_serial_merge_verify_lane(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        """Fail-closed: never borrow the serial _merge-verify lane.
+
+        Chain dispatch is spec-lane-side and structurally exempt from DF-3071's
+        serial-head admission gate.  Silently borrowing _merge-verify would make
+        the chain build contend with the serial head verify, and 3071's guard
+        would then read the lane BUSY and defer the fleet.
+        """
+        import logging
+
+        from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME
+        from orchestrator.merge_liveness import acquire_chain_build_lane
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head_sha = await _rev_parse(git_repo)
+        serial = git_ops.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+        async def _fake_acquire(_merge_commit: str) -> tuple[Path, bool]:
+            return serial, True
+
+        monkeypatch.setattr(git_ops, 'acquire_spec_lane', _fake_acquire)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
+
+        assert lane is None
+        assert warm is False
+        # Loud refusal, not a silent None.
+        assert any(
+            PERSISTENT_MERGE_WORKTREE_NAME in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    async def test_normal_spec_lane_does_not_trip_the_guard(self, git_repo: Path):
+        """Negative control: a normal _spec-0 resolution is accepted."""
+        from orchestrator.merge_liveness import (
+            acquire_chain_build_lane,
+            release_chain_build_lane,
+        )
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head_sha = await _rev_parse(git_repo)
+
+        lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
+
+        assert lane is not None
+        assert lane.name == '_spec-0'
+        assert warm is True
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+
+    async def test_acquire_never_raises(self, git_repo: Path, monkeypatch):
+        """A lane hiccup degrades to (None, False), never into the dispatch loop."""
+        from orchestrator.merge_liveness import acquire_chain_build_lane
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head_sha = await _rev_parse(git_repo)
+
+        async def _boom(_merge_commit: str) -> tuple[Path, bool]:
+            raise RuntimeError('lane provisioning exploded')
+
+        monkeypatch.setattr(git_ops, 'acquire_spec_lane', _boom)
+
+        lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
+
+        assert lane is None
+        assert warm is False
+
+    async def test_release_of_none_is_a_noop(self, git_repo: Path):
+        """release_chain_build_lane(None) lets callers release unconditionally."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+
+        git_ops = _make_git_ops(git_repo)
+        await release_chain_build_lane(git_ops, None, warm=False)
+        await release_chain_build_lane(git_ops, None, warm=True)
