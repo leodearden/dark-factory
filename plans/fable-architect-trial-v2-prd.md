@@ -380,4 +380,24 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
 3. **Thin-brief exclusions.** The curation criterion is "brief fails to state
    an implementable goal", judged during β1 with every decision recorded in
    the committed table — auditable rather than threshold-pinned.
-4. **Driver filename/placement under `scripts/`.** Decide during β2.
+4. ~~**Driver filename/placement under `scripts/`.** Decide during β2.~~
+   **RESOLVED in β2 (task 3632).** The driver landed at
+   `scripts/run_fable_trial_v2_campaign.py`, with its tests at
+   `scripts/tests/test_run_fable_trial_v2_campaign.py` (merged as
+   `a98e91997a`, "Merge task/3632 into main"). All logic lives in that
+   one script: no new module was added inside
+   `orchestrator/src/orchestrator/evals/` — the β2 merge touched exactly
+   two files, both under `scripts/`. The instrument (`run_ofat_stage`,
+   `build_plan_quality_report`, `produced_a_plan`, `get_config_by_name`)
+   is consumed unmodified.
+
+   Why that constraint bound: decision **D1** above ("Instrument
+   single-ownership honored") states this PRD's own tasks "edit nothing
+   in the instrument", and task 3632 declared `Modules touched: scripts/`
+   accordingly. A module under `orchestrator/evals/` would have crossed
+   the eval-framework-revival lane's single-ownership boundary. The
+   `run_<campaign>.py` filename spelling follows the committed
+   eval-driver siblings `run_judge_ofat_pilot.py` and `run_vllm_eval.py`
+   (cross-referencing **D10** by label, which already names the driver as
+   committed under `scripts/`; this entry supplies the filename D10 left
+   generic).
