@@ -267,8 +267,19 @@ async def _run_lane(
     host under load; a caller can easily need several spawns inside this
     window. Same load-sensitive full-suite-flake class as
     1335/1836/2819/3451/3491 (task 3832); 30s is the ceiling task 3491
-    settled on for it. Widening this can never make a broken staging pass —
-    it only lengthens how long a genuinely broken one takes to fail.
+    settled on for it. Widening THIS bound alone can never make a broken
+    staging pass — it only lengthens how long a genuinely broken SINGLE pass
+    takes to fail. That safety property does not compose for free: callers
+    chaining N passes (:func:`_drive_reds`) sum this bound N times, so a
+    worst case can now approach or exceed this module's pyproject-configured
+    60s per-test timeout before this function's own ``wait_for`` ever fires —
+    trading a clean, well-located ``TimeoutError`` here for pytest-timeout's
+    blunter thread-mode worker kill instead (task 3832 review; see
+    ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
+    comment). Multi-pass callers whose worst-case sum is at or above that
+    ceiling carry their own ``@pytest.mark.timeout`` override — see
+    ``test_b5_same_set_recurrence_updates_not_duplicates`` and
+    ``test_b7_stall_promotes_to_blocker`` below.
     """
     inner_run_once = worker._run_once
     done = asyncio.Event()
@@ -359,8 +370,11 @@ async def _assert_never_a_gate(
     ``_note_merge_all`` (the exact ``on_merge_landed`` callback
     ``SpeculativeMergeWorker`` invokes, ``harness.py:4979``) awaits AHEAD of
     its diff fetch — must return promptly. ``_note_merge_all`` itself is
-    then exercised immediately after, unbounded, and must still set
-    ``worker._dirty`` (arming a coalesced re-run).
+    then exercised immediately after, at a loose 15.0s bound (well outside
+    the flake band, but still catching a genuine block), with ``_dirty``
+    explicitly reset just before so the ``worker._dirty`` assertion below
+    re-proves ITS OWN fan-out sets it, not merely the ``_note_offline_lane``
+    call above (task 3832 review).
     (3) A raising notifiee is fail-open: ``_note_offline_lane``'s own
     try/except (``harness.py:5072-5079``) swallows it — the SAME shape
     ``SpeculativeMergeWorker`` independently wraps this exact call in
@@ -384,20 +398,32 @@ async def _assert_never_a_gate(
     # the synchronous on_merge_landed fan-out never blocks on the in-flight
     # run); widening it would weaken what it's testing.
     #
-    # ``_note_merge_all`` is called separately, UNBOUNDED, right after:
-    # unlike ``_note_offline_lane`` alone, it unconditionally runs
+    # ``_note_merge_all`` is called separately, right after, at a much
+    # looser 15.0s bound rather than left fully unbounded (task 3832
+    # review): unlike ``_note_offline_lane`` alone, it unconditionally runs
     # ``git_ops.get_merge_diff_files`` (a real ``git diff`` subprocess spawn)
     # once ``_note_offline_lane`` returns, so bounding IT at 0.5s would sit
     # in the same load-sensitive flake class this task (3832) exists to
     # remove (task 3451 measured 4.71s worst-case single-spawn latency under
-    # load). The resulting double-invoke of ``on_post_merge`` is safe — it
-    # is idempotent (sets ``_dirty = True`` and an already-set
-    # ``asyncio.Event``) — so the assertions below still exercise the full
-    # fan-out unchanged.
+    # load). 15.0s sits comfortably outside that flake band (>3x the
+    # measured worst-case single spawn) while still catching a genuine block
+    # in the production ``on_merge_landed`` callback this call IS
+    # (harness.py:4979) — restoring promptness coverage of the real
+    # callback that narrowing the FIRST bound to ``_note_offline_lane``
+    # alone would otherwise drop entirely. The resulting double-invoke of
+    # ``on_post_merge`` is safe — it is idempotent (sets ``_dirty = True``
+    # and an already-set ``asyncio.Event``) — so the assertions below still
+    # exercise the full fan-out unchanged. ``_dirty`` is explicitly reset
+    # just before this call so the assertion below re-proves
+    # ``_note_merge_all``'s OWN fan-out sets it, rather than passing
+    # vacuously on the strength of the ``_note_offline_lane`` call above.
     await asyncio.wait_for(
         harness._note_offline_lane('task-2', base_sha, head_sha), timeout=0.5,
     )
-    await harness._note_merge_all('task-2', base_sha, head_sha)
+    worker._dirty = False
+    await asyncio.wait_for(
+        harness._note_merge_all('task-2', base_sha, head_sha), timeout=15.0,
+    )
     assert worker._dirty is True, (
         'a landed advance during an in-flight run must arm a coalesced re-run'
     )
@@ -493,6 +519,11 @@ async def _drive_reds(
     (:func:`_drive_advance`, mirroring B1-B4) followed by one full pass
     (:func:`_run_one_lane_pass`) — the same-fingerprint repeat-red sequence
     B5's dedup and B7's stall-promotion scenarios both need.
+
+    Each pass sums its own 30s :func:`_run_lane` bound (see that function's
+    docstring); a caller whose ``n`` (or count of calls) pushes the total at
+    or above the 60s pyproject per-test timeout MUST carry its own
+    ``@pytest.mark.timeout`` override (task 3832 review) — see B5/B7 below.
     """
     _inject_red(worker, failing_ids)
     for _ in range(n):
@@ -668,6 +699,10 @@ async def test_b4_confirmed_red_files_fix_task_and_info_escalation(harness, git_
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(150)  # task 3832 review: _drive_reds(n=2) chains 2 30s-bounded
+# _run_one_lane_pass calls (60s alone) plus real-git _drive_advance overhead --
+# clear the 60s pyproject default with margin so a genuinely wedged pass fails
+# via _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
 @pytest.mark.asyncio
 async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, repo, tmp_path):
     """B5 (PRD §8) — a SECOND red advance with the SAME failing-test set
@@ -722,6 +757,9 @@ async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, t
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(300)  # task 3832 review: 4 _drive_reds calls (2+1+2+1 = 6 total
+# 30s-bounded _run_one_lane_pass calls -- 180s worst case) across both arms, plus
+# real-git overhead -- clear the 60s pyproject default with margin.
 @pytest.mark.asyncio
 async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
     """B7 (PRD §8, C4) — a fix task that stalls promotes the L0 info signal
