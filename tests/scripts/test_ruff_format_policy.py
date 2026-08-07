@@ -104,17 +104,23 @@ _FORMAT_INVOCATION = "ruff format"
 
 # The 4-of-7 majority shape, adopted as canonical by task 3441.
 #
-# WHY CANONICALISE UP, NOT DOWN. Majority is the tie-break, not the argument —
-# resolving the drift by ADDING `docstring-code-format` to cockpit/escalation/
-# shared does slightly enlarge what an ad-hoc `ruff format` rewrites, which is
-# worth justifying in a commit that declares the formatter unadopted. It was
-# measured, not assumed: on escalation/src the flag is worth 4 changed lines
-# (317 with it, 313 without) against 1431 for the no-block fallback — 0.3% of
-# the divergence this block exists to prevent. Canonicalising DOWN instead would
-# have stripped a key four packages set deliberately, to buy those 4 lines. The
-# cost of the flag is real but bounded, and it is visible: it moved exactly one
-# `shared/` file from format-clean to not (53 -> 54), which is why the 1125
-# figure above must be read as post-canonicalisation.
+# WHY CANONICALISE UP, NOT DOWN. Majority is the tie-break, not the argument.
+# ADDING `docstring-code-format` to cockpit/escalation/shared genuinely enlarges
+# what an ad-hoc `ruff format` rewrites there — it starts reformatting code
+# blocks inside docstrings, which can include deliberately-unformatted or
+# pseudo-code snippets — and that needs justifying in a commit which declares
+# the formatter unadopted.
+#
+# So it was measured on all three, not assumed. The flag costs 16 changed lines
+# and one newly-unclean file in total: escalation +4 lines/+0 files, shared
+# +12/+1, cockpit +0/+0. Set against the fallback it prevents — 1431 changed
+# lines on escalation/src alone with no block at all — that is the rounding
+# error, and canonicalising DOWN would have bought those 16 lines back by
+# stripping a key four packages set deliberately.
+#
+# The cost is real, bounded, and visible rather than hidden: the one `shared/`
+# file it moved from format-clean to not (53 -> 54 dirty) is exactly why the
+# 1125 figure above is the post-canonicalisation one.
 #
 # Compared as a PARSED DICT, never as TOML text: task 3441 step 3 adds a comment
 # directly above each of these blocks, and a text-matching guard would go red on
