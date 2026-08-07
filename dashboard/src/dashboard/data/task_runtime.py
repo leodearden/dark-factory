@@ -24,15 +24,27 @@ prescribes — and names the FAULT DOMAIN of the failure (task 3517):
   nothing about the orchestrator's health: under a starved dashboard event
   loop the probe never got enough CPU to complete, so the fault is the
   DASHBOARD's. See the aggregate warning in ``fetch_task_runtime``.
-- ``'unreachable'`` — connect refused, an HTTP error status, or a malformed
-  payload. The orchestrator IS the fault domain here and the operator's next
-  action is to go look at it. Malformed-payload deliberately shares this
-  member: same fault domain, same next action; the finer detail survives in
-  that path's own WARNING.
+- ``'unreachable'`` — ANY ``httpx.TransportError`` (connect refused, a
+  connection reset or protocol error mid-response, a proxy failure), an HTTP
+  error status, or a malformed payload. The orchestrator IS the fault domain
+  here and the operator's next action is to go look at it. Malformed-payload
+  deliberately shares this member: same fault domain, same next action; the
+  finer detail survives in that path's own WARNING.
 
 ``offline=True`` alone cannot separate those, which is why the 2026-07-30
 event — a starved dashboard loop — was misdiagnosed as an orchestrator
 outage.
+
+Those two clauses between them catch EVERYTHING ``mcp_tool_call`` can raise
+on the wire, which is load-bearing rather than merely tidy: ``asyncio.gather``
+runs with ``return_exceptions=False``, so anything escaping them propagates
+all the way out and 500s the whole tasks endpoint — turning one orchestrator's
+hiccup into a total loss of every project's rows. See the tuple comments.
+
+Per-project failures are logged at WARNING on a STATE TRANSITION only (see
+``_log_probe_failure``): this endpoint is polled every few seconds per open
+browser tab, so unconditional WARNINGs would bury the diagnosis under
+thousands of identical lines an hour.
 
 ``DEFAULT_PER_CALL_TIMEOUT`` deliberately STAYS 2.0. A healthy call measures
 0.2-0.4s, so 2.0s is already ~5-10x headroom; the 2026-07-30 failure was
@@ -68,8 +80,69 @@ DEFAULT_PER_CALL_TIMEOUT = 2.0
 # ``httpx.ConnectError``), so a connect-timeout lands in the deadline bucket
 # by design: a timeout is a timeout, and under a starved loop even the connect
 # leg can time out through no fault of the orchestrator.
+#
+# The unreachable tuple names the ``httpx.TransportError`` BASE, not a hand-
+# picked list of leaves. Enumerating leaves silently missed the rest of the
+# family: ``httpx.ReadError`` and ``httpx.RemoteProtocolError`` are neither
+# ``OSError`` nor ``TimeoutException`` subclasses, so nothing caught them and
+# — with ``asyncio.gather(return_exceptions=False)`` — one connection reset
+# mid-response (exactly what an orchestrator restart on the fleet-redeploy
+# path produces) propagated out of ``fetch_task_runtime`` and 500'd the whole
+# tasks endpoint, losing EVERY project's rows rather than degrading the one
+# that failed. ``httpx.TimeoutException`` is itself a ``TransportError``
+# subclass, so widening to the base makes the clause ORDER above even more
+# load-bearing, not less: deadlines are only kept out of this bucket by being
+# caught first.
 _DEADLINE_EXC = (TimeoutError, httpx.TimeoutException)
-_UNREACHABLE_EXC = (httpx.ConnectError, httpx.HTTPStatusError, ValueError, OSError)
+_UNREACHABLE_EXC = (httpx.TransportError, httpx.HTTPStatusError, ValueError, OSError)
+
+# ── Bounded WARNING logging ──
+# ``/api/v2/dashboard/tasks`` is uncached and the React app re-polls it every
+# few seconds, once per open browser tab. Logging every probe failure at
+# WARNING would emit an identical line per project per poll — on the order of
+# a thousand an hour for ONE down orchestrator — burying the very signal this
+# taxonomy exists to surface. So WARNING fires on a STATE TRANSITION only (a
+# URL started failing, or its fault domain changed); a steady-state repeat
+# drops to DEBUG, and a recovery logs one INFO and re-arms the WARNING. Same
+# trade-off ``dashboard.config._discover_escalation_urls`` already reasons
+# about: a bounded reminder, not log spam.
+#
+# Keyed by base_url and holding a LOG key, not the wire ``offline_reason``:
+# connect-refused and malformed-payload share the ``'unreachable'`` member but
+# have different operator detail, so a flip between them is a real transition
+# worth one more line.
+_LAST_PROBE_LOG_KEY: dict[str, str] = {}
+# Labels that were ALL deadline-exceeded on the previous pass; the aggregate
+# WARNING re-fires only when that set changes.
+_LAST_AGGREGATE_LABELS: set[str] = set()
+
+
+def reset_probe_log_state() -> None:
+    """Forget the WARNING-dedupe memory (process-global).
+
+    Exists so tests can assert on transition logging without depending on
+    which test ran first. Production never needs to call it — the state is
+    self-maintaining across polls.
+    """
+    _LAST_PROBE_LOG_KEY.clear()
+    _LAST_AGGREGATE_LABELS.clear()
+
+
+def _log_probe_failure(base_url: str, log_key: str, msg: str, *args: object) -> None:
+    """WARNING on a transition for ``base_url``, DEBUG while it stays put."""
+    changed = _LAST_PROBE_LOG_KEY.get(base_url) != log_key
+    _LAST_PROBE_LOG_KEY[base_url] = log_key
+    (logger.warning if changed else logger.debug)(msg, *args)
+
+
+def _note_probe_success(base_url: str) -> None:
+    """Clear the dedupe memory for a recovered URL so the next failure warns."""
+    previous = _LAST_PROBE_LOG_KEY.pop(base_url, None)
+    if previous is not None:
+        logger.info(
+            'get_task_runtime_state: %s recovered (was failing: %s)',
+            base_url, previous,
+        )
 
 
 async def _probe_one(
@@ -84,7 +157,8 @@ async def _probe_one(
         )
     except _DEADLINE_EXC as exc:
         # OUR budget expired, not necessarily their outage — see module docstring.
-        logger.warning(
+        _log_probe_failure(
+            base_url, 'deadline_exceeded',
             'get_task_runtime_state: deadline_exceeded for %s after %.2fs budget '
             '(the orchestrator may be healthy; a starved dashboard event loop '
             'produces this too): %s',
@@ -92,23 +166,27 @@ async def _probe_one(
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='deadline_exceeded')
     except _UNREACHABLE_EXC as exc:
-        logger.warning(
-            'get_task_runtime_state: unreachable for %s (connect/HTTP failure): %s',
+        _log_probe_failure(
+            base_url, 'unreachable',
+            'get_task_runtime_state: unreachable for %s (transport/HTTP failure): %s',
             base_url, exc,
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')
     try:
-        return TaskRuntimeSnapshot.model_validate(result)
+        snapshot = TaskRuntimeSnapshot.model_validate(result)
     except ValueError as exc:
         # pydantic v2 ValidationError subclasses ValueError. Same fault domain
         # as a connect failure — the orchestrator is the problem — so it shares
         # the 'unreachable' member; the finer detail stays in this WARNING.
-        logger.warning(
+        _log_probe_failure(
+            base_url, 'unreachable:malformed',
             'get_task_runtime_state: malformed payload from %s, degrading to '
             'offline (unreachable): %s',
             base_url, exc,
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')
+    _note_probe_success(base_url)
+    return snapshot
 
 
 async def fetch_task_runtime(
@@ -125,8 +203,9 @@ async def fetch_task_runtime(
     offline_reason=...)`` so the caller can render an honest ``—`` rather
     than a fabricated zero, AND say which fault domain produced it —
     ``'deadline_exceeded'`` (our probe budget fired) vs ``'unreachable'``
-    (connect refused / HTTP error / malformed payload). See the module
-    docstring for the full taxonomy.
+    (any transport error / HTTP error / malformed payload). No wire failure
+    escapes that split, so one sick orchestrator can never take the whole
+    endpoint down with it. See the module docstring for the full taxonomy.
 
     Beyond the per-project reasons, this emits ONE aggregate WARNING when
     EVERY probed project (>= 2 of them) exceeded the deadline at once. That
@@ -134,6 +213,12 @@ async def fetch_task_runtime(
     so all-at-once points at the dashboard's own event loop rather than at
     the orchestrators. The returned mapping is unaffected — the signal is
     purely additive.
+
+    Both the per-project and the aggregate lines are TRANSITION-logged: the
+    first pass of a new failure mode is a WARNING, steady-state repeats drop
+    to DEBUG, and a recovery re-arms the WARNING. This endpoint is polled
+    every few seconds per open browser tab, so unconditional WARNINGs would
+    bury the diagnosis they exist to deliver.
     """
     if not escalation_urls:
         return {}
@@ -159,8 +244,18 @@ async def fetch_task_runtime(
         lbl for lbl, snap in zip(labels, results, strict=True)
         if snap.offline_reason == 'deadline_exceeded'
     ]
-    if len(labels) >= 2 and len(deadline) == len(labels):
-        logger.warning(
+    #
+    # Like the per-project lines, this is TRANSITION-logged: a starvation event
+    # spanning many polls would otherwise repeat this paragraph every few
+    # seconds per open browser tab. It re-fires when the affected label set
+    # changes (a project joining or leaving the pattern is new information).
+    firing = len(labels) >= 2 and len(deadline) == len(labels)
+    previous = set(_LAST_AGGREGATE_LABELS)
+    _LAST_AGGREGATE_LABELS.clear()
+    if firing:
+        _LAST_AGGREGATE_LABELS.update(deadline)
+        emit = logger.warning if previous != _LAST_AGGREGATE_LABELS else logger.debug
+        emit(
             'get_task_runtime_state: all %d probed projects (%s) exceeded the '
             '%.2fs probe deadline in the same pass. A real orchestrator outage '
             'is per-project, so this pattern points at the DASHBOARD\'s own '

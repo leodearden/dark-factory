@@ -51,6 +51,9 @@ class _PerPortHandler:
     tools/call leg, which ``mcp_tool_call``'s ``raise_for_status()`` turns
     into an ``httpx.HTTPStatusError`` (the "orchestrator answered, but
     badly" arm of the unreachable bucket).
+    ``raise_ports`` maps port -> an arbitrary exception INSTANCE to raise,
+    for transport failures ``fail_ports``' fixed ``ConnectError`` cannot
+    express (e.g. ``httpx.ReadError``, a connection reset mid-response).
     """
 
     def __init__(
@@ -60,15 +63,19 @@ class _PerPortHandler:
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
         error_status_ports: dict[int, int] | None = None,
+        raise_ports: dict[int, BaseException] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
         self.error_status_ports = error_status_ports or {}
+        self.raise_ports = raise_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        if port in self.raise_ports:
+            raise self.raise_ports[port]
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
@@ -97,6 +104,21 @@ def _clean_sessions():
     reset_sessions()
     yield
     reset_sessions()
+
+
+@pytest.fixture(autouse=True)
+def _clean_probe_log_state():
+    """Reset the transition-logging dedupe memory between tests.
+
+    ``task_runtime`` only WARNs when a URL's failure mode CHANGES, and that
+    memory is module-global. Without this reset a test asserting on a WARNING
+    would silently depend on whether an earlier test had already failed the
+    same port — the classic order-dependent green.
+    """
+    from dashboard.data.task_runtime import reset_probe_log_state
+    reset_probe_log_state()
+    yield
+    reset_probe_log_state()
 
 
 def _urls(*ports: int) -> dict[str, str]:
@@ -433,3 +455,149 @@ class TestAllProjectsDeadlineWarning:
 
         assert self._aggregate_records(caplog) == []
         assert all(s.offline is False for s in result.values())
+
+
+class TestTransportErrorFamilyIsContained:
+    """No wire failure may escape _probe_one's two except-clauses.
+
+    ``asyncio.gather`` runs with ``return_exceptions=False``, so an uncaught
+    transport error does not degrade one project — it propagates out of
+    ``fetch_task_runtime``, through ``collect_tasks_with_counts``, and 500s
+    the whole tasks endpoint, losing EVERY project's rows. Enumerating leaf
+    httpx types missed most of the ``TransportError`` family: neither
+    ``ReadError`` nor ``RemoteProtocolError`` is an ``OSError`` or a
+    ``TimeoutException``, and a connection reset mid-response is exactly what
+    an orchestrator restart on the fleet-redeploy path produces.
+    """
+
+    @pytest.mark.parametrize(
+        'exc',
+        [
+            httpx.ReadError('connection reset by peer'),
+            httpx.RemoteProtocolError('server disconnected without response'),
+            httpx.WriteError('broken pipe'),
+        ],
+        ids=['read_error', 'remote_protocol_error', 'write_error'],
+    )
+    async def test_transport_error_degrades_only_that_project(self, exc):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        good = TaskRuntimeSnapshot(tasks=[TaskRuntimeEntry(**_entry_kwargs())])
+        handler = _PerPortHandler(
+            {8100: good.model_dump(mode='json')},
+            raise_ports={8108: exc},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(client, _urls(8100, 8108))
+
+        # The healthy project's rows survive — that is the whole point.
+        assert result['proj8100'].offline is False
+        assert len(result['proj8100'].tasks) == 1
+        assert result['proj8108'] == TaskRuntimeSnapshot(
+            offline=True, offline_reason='unreachable',
+        )
+
+    async def test_deadline_still_wins_over_the_widened_transport_bucket(self):
+        """``httpx.TimeoutException`` IS a ``TransportError``, so widening the
+        unreachable tuple to the base class makes the clause ORDER even more
+        load-bearing: a connect-timeout must still land in the deadline
+        bucket, not be swallowed as 'unreachable'."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(
+            raise_ports={8109: httpx.ConnectTimeout('handshake took too long')},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(client, _urls(8109))
+
+        assert result['proj8109'].offline_reason == 'deadline_exceeded'
+
+
+class TestProbeWarningsAreTransitionLogged:
+    """WARNING on a change of state, DEBUG while it stays put.
+
+    ``/api/v2/dashboard/tasks`` is uncached and re-polled every few seconds
+    per open browser tab, so an unconditional WARNING per failed project
+    emits on the order of a thousand identical lines an hour for ONE down
+    orchestrator — burying the diagnosis this taxonomy exists to deliver.
+    """
+
+    @staticmethod
+    def _for(caplog, level: str, needle: str) -> list[str]:
+        return [
+            rec.getMessage() for rec in caplog.records
+            if rec.levelname == level and needle in rec.getMessage()
+        ]
+
+    async def test_steady_state_failure_warns_once_then_drops_to_debug(self, caplog):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('DEBUG'):
+                for _ in range(4):
+                    result = await fetch_task_runtime(client, _urls(8102))
+
+        assert len(self._for(caplog, 'WARNING', '8102')) == 1, (
+            'a persistently-down orchestrator must warn once, not once per poll'
+        )
+        # Still reported on every poll — just at a level that does not spam.
+        assert len(self._for(caplog, 'DEBUG', '8102')) == 3
+        # The returned snapshot never changes: only the LOG level is deduped.
+        assert result['proj8102'].offline_reason == 'unreachable'
+
+    async def test_changed_fault_domain_warns_again(self, caplog):
+        """unreachable -> deadline_exceeded is new information for the
+        operator: the next action flips from 'go look at the orchestrator' to
+        'go look at the dashboard'."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        transport = httpx.MockTransport(_PerPortHandler(fail_ports={8102}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('DEBUG'):
+                await fetch_task_runtime(client, _urls(8102))
+        slow = httpx.MockTransport(_PerPortHandler(slow_ports={8102: 0.5}))
+        async with httpx.AsyncClient(transport=slow) as client:
+            with caplog.at_level('DEBUG'):
+                await fetch_task_runtime(client, _urls(8102), per_call_timeout=0.05)
+
+        warnings = self._for(caplog, 'WARNING', '8102')
+        assert len(warnings) == 2, warnings
+        assert 'unreachable' in warnings[0]
+        assert 'deadline_exceeded' in warnings[1]
+
+    async def test_recovery_re_arms_the_warning(self, caplog):
+        """A flap must not be silently swallowed — after a project comes back,
+        the next failure is a fresh transition and warns again."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        down = httpx.MockTransport(_PerPortHandler(fail_ports={8102}))
+        up = httpx.MockTransport(
+            _PerPortHandler({8102: TaskRuntimeSnapshot().model_dump(mode='json')}),
+        )
+        async with httpx.AsyncClient(transport=down) as client:
+            with caplog.at_level('DEBUG'):
+                await fetch_task_runtime(client, _urls(8102))
+        async with httpx.AsyncClient(transport=up) as client:
+            with caplog.at_level('DEBUG'):
+                assert (await fetch_task_runtime(client, _urls(8102)))['proj8102'].offline is False
+        async with httpx.AsyncClient(transport=down) as client:
+            with caplog.at_level('DEBUG'):
+                await fetch_task_runtime(client, _urls(8102))
+
+        assert len(self._for(caplog, 'WARNING', '8102')) == 2
+        assert len(self._for(caplog, 'INFO', 'recovered')) == 1
+
+    async def test_aggregate_warning_also_transitions(self, caplog):
+        """A starvation event spanning many polls must not repeat the whole
+        diagnostic paragraph every few seconds."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5, 8106: 0.5})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('DEBUG'):
+                for _ in range(3):
+                    await fetch_task_runtime(
+                        client, _urls(8105, 8106), per_call_timeout=0.05,
+                    )
+
+        assert len(self._for(caplog, 'WARNING', 'probed projects')) == 1
+        assert len(self._for(caplog, 'DEBUG', 'probed projects')) == 2
