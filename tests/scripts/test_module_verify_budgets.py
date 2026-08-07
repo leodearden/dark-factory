@@ -105,9 +105,40 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                   reasoning that concurrency is the worst case, would have
 #                   UNDER-sized this module. The worst case is whichever run is
 #                   worst, not whichever sweep is theoretically harshest.)
+#
+#   fused-memory  6 runs, EVERY ONE rc=1, 1 failed / 11350 passed / 2 skipped
+#                 181.12s @ loadavg 72.37  (convenient — serial1)
+#                 236.23s @ loadavg 229.40
+#                 273.52s @ loadavg 119.77
+#                 408.45s @ loadavg 191.12 (concurrent wave)
+#                 435.56s @ loadavg 123.76 (concurrent wave)
+#                 439.80s @ loadavg 120.09 (INCONVENIENT — warm-up)
+#
+#                 TWO CAVEATS, both load-bearing and neither hidden:
+#
+#                 (i) THIS MODULE HAS NO GREEN RUN. All six are rc=1 on the
+#                 PRE-EXISTING failure escalation esc-3473-1 records —
+#                 test_lock_charter_guard.py::
+#                 test_every_tracked_extension_is_allowlisted, a content-derived
+#                 allowlist check over tracked file extensions, red at base main
+#                 5a7770d239 before this task touched anything. The sizing rule
+#                 says "worst across recorded GREEN runs"; here it is applied to
+#                 RED runs, because the failure is one fast assertion in a suite
+#                 that ran to COMPLETION (no -x, no early exit) and adds no
+#                 measurable wall-clock. That is an assumption with an error bar,
+#                 not a clean measurement, and the 2.6x multiple absorbs it.
+#
+#                 (ii) fused-memory is the ONLY in-scope module running under
+#                 pytest-xdist (addopts = "-n auto --dist loadgroup -m 'not
+#                 integration'"). 11353 collected test functions in ~400s is an
+#                 XDIST figure, not a serial one, which makes it the module most
+#                 sensitive to host load and to the concurrent wave. A future
+#                 change to -n or to the dist mode INVALIDATES this measurement
+#                 rather than merely shifting it — re-measure, do not scale.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 219.08,
     'escalation': 354.56,
+    'fused-memory': 439.80,
 }
 
 # One real tracked file under each module prefix, used to drive the production
@@ -118,6 +149,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
 SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'shared': 'shared/src/shared/__init__.py',
     'escalation': 'escalation/src/escalation/__init__.py',
+    'fused-memory': 'fused-memory/src/fused_memory/__init__.py',
 }
 
 
