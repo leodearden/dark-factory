@@ -285,6 +285,100 @@ test('rtProbeSummary: never-probed projects do not count toward "all probed"', (
   assert.ok(summary.text.includes('1 project(s)'), summary.text);
 });
 
+// ── The denominator must include the HEALTHY probed projects ──
+// `selfInflicted` claims the DASHBOARD is at fault because it could not
+// finish ANY of its probes. That is only true if every project it actually
+// reached also timed out — so the denominator has to count the projects that
+// answered fine. Counting only the degraded ones makes "all probed projects"
+// vacuously true for any pure-timeout subset, and sends an operator to the
+// dashboard during a textbook per-project outage.
+//
+// Why the existing suite missed this: the closest test above ('a healthy
+// project alongside a timeout is NOT self-inflicted', :253) uses exactly ONE
+// timeout, so it is caught by the `>= 2` degenerate guard and never reaches
+// the denominator at all. The 3-timeouts-plus-1-healthy case below is the one
+// that actually exercises it.
+
+test('rtProbeSummary: healthy probed projects count toward the denominator', () => {
+  // THE REGRESSION CASE: 3 orchestrators answered fine, 2 are slow. That is
+  // the per-project signature this module's own prose points AT the
+  // orchestrators — the banner must not blame the dashboard.
+  const summary = rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'deadline_exceeded'),
+    row('c', 'ok'),
+    row('d', 'ok'),
+    row('e', 'ok'),
+  ]);
+  assert.equal(summary.selfInflicted, false);
+  // Denominator and numerator are separately observable: every project that
+  // was probed at all (healthy included) vs. the degraded subset.
+  assert.equal(summary.probedCount, 5);
+  assert.equal(summary.degradedCount, 2);
+  // The non-self-inflicted text reports the DEGRADED count, so its count and
+  // its listing describe the same set. Reporting the denominator here would
+  // claim 5 projects while naming 2.
+  assert.ok(summary.text.includes('2 project(s)'), summary.text);
+  assert.ok(!summary.text.includes('5 project(s)'), summary.text);
+});
+
+test('rtProbeSummary: selfInflicted still fires when NO project answered', () => {
+  // The denominator change must not defang the real signal: 2 probed, 2 timed
+  // out, none healthy — the dashboard genuinely finished nothing.
+  const summary = rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'deadline_exceeded'),
+  ]);
+  assert.equal(summary.selfInflicted, true);
+  assert.equal(summary.probedCount, 2);
+  assert.equal(summary.degradedCount, 2);
+  assert.ok(summary.text.includes('all 2 probed projects'), summary.text);
+});
+
+test('rtProbeSummary: 3 timeouts alongside 1 healthy project is NOT self-inflicted', () => {
+  // Past the `>= 2` degenerate guard, so this can only pass if the healthy
+  // project is genuinely in the denominator.
+  const summary = rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'deadline_exceeded'),
+    row('c', 'deadline_exceeded'),
+    row('d', 'ok'),
+  ]);
+  assert.equal(summary.selfInflicted, false);
+  assert.equal(summary.probedCount, 4);
+  assert.equal(summary.degradedCount, 3);
+});
+
+test('rtProbeSummary: an absent runtime_status counts as a probed HEALTHY project', () => {
+  // Matches normStatus's read-as-'ok' policy and the producer default
+  // (active_tasks._build_task_row does `rt.get('runtime_status', 'ok')`), so
+  // an older cached payload cannot silently shrink the denominator into a
+  // false all-at-once verdict.
+  const summary = rtProbeSummary([
+    row('a', 'deadline_exceeded'),
+    row('b', 'deadline_exceeded'),
+    { project: 'c' },
+  ]);
+  assert.equal(summary.probedCount, 3);
+  assert.equal(summary.degradedCount, 2);
+  assert.equal(summary.selfInflicted, false);
+});
+
+test('rtProbeSummary: not_configured stays OUT of the denominator', () => {
+  // Python's `labels` is escalation_urls.keys(), which never contains an
+  // unconfigured root — so an unprobed project must not inflate the
+  // denominator here either. Same scenario as the ':270' test above, asserted
+  // against the corrected meaning of probedCount.
+  const summary = rtProbeSummary([
+    row('alpha', 'deadline_exceeded'),
+    row('beta', 'not_configured'),
+    row('gamma', 'not_configured'),
+  ]);
+  assert.equal(summary.probedCount, 1);
+  assert.equal(summary.degradedCount, 1);
+  assert.equal(summary.selfInflicted, false);
+});
+
 test('rtProbeSummary: not_configured alone raises NO banner', () => {
   // Expected AND permanent: dashboard/config.py's _discover_escalation_urls
   // explicitly anticipates "a legitimately non-orchestrator root". Banner-ing
