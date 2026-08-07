@@ -61,6 +61,36 @@ queue:
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
+  # Error-aware retry budget (task 1936, membership revised by task 3585).
+  # Errors whose class name matches any entry below — walked over the raised
+  # exception's __mro__, so subclasses match too — get transient_max_attempts
+  # instead of the plain max_attempts ceiling.
+  #
+  # The not-found family (NodeNotFoundError, EdgeNotFoundError,
+  # EdgesNotFoundError) is DELIBERATELY ABSENT: esc-3561-3 refuted the
+  # visibility-race premise it was added on. See
+  # DEFAULT_TRANSIENT_ERROR_NAMES in
+  # src/fused_memory/services/durable_queue.py for the evidence and for the
+  # clustered/read-routed-backend condition that would justify putting it back.
+  # That list is the authority; this one must match it (enforced by
+  # test_config_schema.py::TestQueueConfigTransientErrorFields::
+  # test_config_yaml_pins_transient_retry_policy).
+  #
+  # queue.* is NOT in reload.py's hot-reload allowlist, so mcp__fused-memory__
+  # reload_config reports a change here under restart_required rather than
+  # silently no-op'ing — the queue reads this config once, at construction.
+  # A change takes effect on restart.
+  #
+  # transient_error_names is spelled literally: _expand_env_vars substitutes
+  # per string and recurses INTO lists, so a whole-list ${VAR:default} would
+  # reach pydantic as one string and fail validation.
+  transient_max_attempts: ${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}
+  transient_error_names:
+    - TimeoutError
+    - ConnectionError
+    - ConnectionResetError
+    - ServerDisconnectedError
+    - OperationalError
 
 # ── Project isolation (task 1143) ────────────────────────────────────────────
 # The reconciliation harness hard-binds project_root per project_id via a
