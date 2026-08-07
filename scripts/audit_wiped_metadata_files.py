@@ -41,8 +41,14 @@ from typing import NamedTuple
 # its --min-fidelity filter, its object-shaped JSON, its epilog wording and its
 # COVERAGE caveat/labels are genuinely different behaviour, not duplication.
 # Exit 3 is NOT among those differences any more — it is Tier 3's, shared.
-from _task_db_scan import (  # noqa: F401  (discover_project_roots re-exported for the tests)
-    discover_project_roots,
+#
+# The noqa below sits on the ONE name that needs it rather than on the
+# statement header: a header noqa blankets every name in the block, so a name
+# that later went dead here would be invisible to lint. Only
+# discover_project_roots is unused BY THIS MODULE — it is re-exported because
+# scripts/tests/test_audit_wiped_metadata_files.py imports it from here.
+from _task_db_scan import (
+    discover_project_roots,  # noqa: F401  (re-exported for this script's tests)
     format_coverage_block,
     format_kv_line,
     run_audit_cli,

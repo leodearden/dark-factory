@@ -75,12 +75,11 @@ from typing import NamedTuple
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import (  # noqa: F401  (tasks_db_path/discover_project_roots re-exported)
+from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    discover_project_roots,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
