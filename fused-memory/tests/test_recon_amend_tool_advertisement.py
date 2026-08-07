@@ -18,6 +18,8 @@ named anywhere in either stage's system prompt.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -87,3 +89,123 @@ class TestStagePromptsAdvertiseAmendAndEpisodeTools:
         build_stage2_system_prompt raises RuntimeError otherwise."""
         built = build_stage2_system_prompt('autopilot_video')
         assert isinstance(built, str) and built
+
+
+class TestDisallowListForAmendAndEpisodeTools:
+    """Pins the grant the prompt now advertises, so a future disallow-list edit
+    cannot silently make the prompt lie.
+
+    Two parts. PART A is the cheap structural guard (set membership, mirroring
+    the established shape at test_merge_entities.py:948-959 and
+    test_redact_episode_content.py:491-506). PART B is the by-MEASUREMENT pin
+    the 2026-08-06 operator amendment (esc-3623-3) requires: "assert on the
+    RENDERED Stage 3 tool surface, not merely on set membership. A test that
+    only checks 'update_memory' in STAGE3_DISALLOWED can pass while the tool
+    remains live if the constant is composed differently than expected." Part B
+    exists because `--disallowed-tools` OMITS a denied tool from the agent's
+    tool listing rather than rejecting an attempted call
+    (cli_stage_runner.py:96-104) — so a denial is only real once it reaches the
+    rendered CLI argv, not merely a Python list.
+
+    Measured fact this guard exists for: `redact_episode_content` and
+    `delete_episode` already satisfy every assertion below, but `update_memory`
+    shipped with task 3088 in NO disallow list at all — Stage 3 (the read-only
+    integrity check) held a live Mem0 silent-rewrite primitive. Its agent_id
+    `recon-stage-integrity_check` matches `Mem0UpdateConfig`'s default
+    `content_amend_allowed_agent_prefixes=['recon-stage-']`, and the
+    `mem0_update` block in `config/config.yaml` is fully commented out, so that
+    default applies — Stage 3 both passed the authz gate and held the tool.
+    """
+
+    # -- PART A: set membership (cheap structural guard) --------------------
+
+    @pytest.mark.parametrize('tool_name', _ADVERTISED_TOOLS)
+    def test_not_in_stage1_disallowed(self, tool_name: str) -> None:
+        """Stage 1 may call it — what esc-3391-1's gate premise got wrong."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert tool_name not in STAGE1_DISALLOWED
+
+    @pytest.mark.parametrize('tool_name', _ADVERTISED_TOOLS)
+    def test_not_in_stage2_disallowed(self, tool_name: str) -> None:
+        """Stage 2 holds the full memory write surface."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE2_DISALLOWED
+        assert tool_name not in STAGE2_DISALLOWED
+
+    @pytest.mark.parametrize('tool_name', _ADVERTISED_TOOLS)
+    def test_in_stage3_disallowed(self, tool_name: str) -> None:
+        """Stage 3 is read-only."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert tool_name in STAGE3_DISALLOWED
+
+    @pytest.mark.parametrize('tool_name', _ADVERTISED_TOOLS)
+    def test_in_disallow_memory_writes(self, tool_name: str) -> None:
+        """The single list through which the Stage 3 denial above is achieved
+        (folded into STAGE3_DISALLOWED only) — pinned separately so a future
+        edit satisfying the assertion above by some other route is still
+        visible."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert tool_name in DISALLOW_MEMORY_WRITES
+
+    # -- PART B: the RENDERED Stage 3 tool surface (by-measurement pin) -----
+
+    def test_stage3_rendered_argv_denies_the_amend_and_episode_tools(self) -> None:
+        """Measure the denial at the end of the real pipeline instead of
+        asserting on a constant.
+
+        Path: IntegrityCheck.get_disallowed_tools() -> run_stage_via_cli
+        (disallowed_tools=..., cli_stage_runner.py:463) -> invoke_with_cap_retry
+        (disallowed_tools=...) -> shared.cli_invoke.build_claude_argv, which
+        renders the actual `--disallowed-tools` CLI flag (cli_invoke.py:1849).
+        This runs through both the genuine stage hook (so a stage overriding
+        get_disallowed_tools() would be caught) and the argv renderer (so a
+        differently-composed disallow constant would be caught) — the failure
+        mode a pure set-membership assertion (Part A) cannot see.
+
+        output_schema={'type': 'object'} is passed to match the realistic
+        recon call site and exercise (not dodge) cli_invoke.py:1845-1848's
+        wildcard-expansion branch. That branch only rewrites disallowed_tools
+        when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
+        'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
+        straight passthrough here — confirmed against today's code.
+        """
+        from shared.cli_invoke import build_claude_argv
+        from test_stages import _mock_stage_deps
+
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
+
+        stage = IntegrityCheck(StageId.integrity_check, **_mock_stage_deps())
+        disallowed_tools = stage.get_disallowed_tools()
+
+        cmd, temp_files = build_claude_argv(
+            model='opus',
+            max_budget_usd=5.0,
+            system_prompt='irrelevant to this test — only --disallowed-tools is inspected',
+            max_turns=50,
+            permission_mode='bypassPermissions',
+            allowed_tools=None,
+            disallowed_tools=disallowed_tools,
+            mcp_config=None,
+            output_schema={'type': 'object'},
+            effort=None,
+            resume_session_id=None,
+            session_id=None,
+        )
+        try:
+            flag_idx = cmd.index('--disallowed-tools')
+            rendered = []
+            for token in cmd[flag_idx + 1:]:
+                if token.startswith('--'):
+                    break
+                rendered.append(token)
+
+            assert 'mcp__fused-memory__update_memory' in rendered, (
+                'Stage 3 must not be able to invoke update_memory — it must appear in '
+                'the RENDERED --disallowed-tools argv, not merely in STAGE3_DISALLOWED.'
+            )
+            # Passing controls — prove the harness itself is measuring correctly.
+            assert 'mcp__fused-memory__redact_episode_content' in rendered
+            assert 'mcp__fused-memory__delete_episode' in rendered
+        finally:
+            for path in temp_files:
+                Path(path).unlink(missing_ok=True)
