@@ -64,7 +64,12 @@ import shutil
 import subprocess
 
 import pytest
-from systemd_unit_invariants import assert_restart_backoff_effective, restart_directive
+
+from systemd_unit_invariants import (
+    assert_restart_backoff_effective,
+    restart_directive,
+    systemctl_user_show,
+)
 
 # Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`)
 # exactly. Deliberately NOT XDG_CONFIG_HOME-aware: the installer itself does
@@ -478,7 +483,7 @@ def test_systemctl_user_show_returns_none_when_subprocess_raises(
         raise raised
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert _systemctl_user_show(UNIT_BASENAME, "RestartSteps") is None, (
+    assert systemctl_user_show(UNIT_BASENAME, "RestartSteps") is None, (
         "_systemctl_user_show's docstring promises None, never raises — a "
         f"{type(raised).__name__} from subprocess.run must degrade to a "
         "skip via None, not propagate uncaught"
