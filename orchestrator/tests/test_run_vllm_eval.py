@@ -1444,12 +1444,14 @@ class TestConcurrentLoop:
                 task_id = Path(task_arg).stem
                 attempted.append(task_id)
                 if task_id == "df_task_11":
-                    # Simulate failure: write a "blocked" outcome. Skip the
-                    # shared 0.1s sleep so this future is deterministically
-                    # the first FIRST_COMPLETED completion the executor loop
-                    # observes, instead of racing df_task_10's equal-duration
-                    # sleep to decide how many extra tasks get refilled
-                    # before --stop-on-first-failure is noticed.
+                    # Simulate failure: write a "blocked" outcome immediately.
+                    # (This comment previously argued that skipping a shared
+                    # sleep made this future "deterministically" win the
+                    # FIRST_COMPLETED race against df_task_10 — that duration
+                    # comparison was falsified in the field twice; see the
+                    # ordering-guarantee comment above `released =
+                    # _release_on_summary(...)` and the falsification note
+                    # near the final assertion below for the full story.)
                     results.mkdir(parents=True, exist_ok=True)
                     _write_result(
                         results,
@@ -1495,12 +1497,23 @@ class TestConcurrentLoop:
 
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # df_task_11 (the failure) skips the shared 0.1s sleep in fake_run,
-        # so it always wins the FIRST_COMPLETED race against df_task_10 by a
-        # wide margin. The executor loop therefore notices
-        # --stop-on-first-failure and drains `remaining` before a third task
-        # is ever refilled, so the attempted set is exactly the initial wave
-        # — deterministic, with no race window left to tolerate.
+        # Still holds: the loop drains `remaining` on the first observed
+        # failure while in-flight work finishes naturally, so the attempted
+        # set is exactly the initial wave.
+        # Falsified: the old wording here claimed df_task_11 "always wins
+        # the FIRST_COMPLETED race against df_task_10 by a wide margin ...
+        # deterministic, with no race window left to tolerate" (ca05d20ffa).
+        # That duration-margin claim was disproven in the field on
+        # 2026-08-06 and again on 2026-08-07 under ~24-way xdist load:
+        # completion order is governed by thread START latency, not body
+        # duration, so a duration margin is compared against unbounded
+        # scheduling latency and can always be inverted.
+        # Replaced by: the threading.Event happens-before from task 3805
+        # (`released = _release_on_summary(...)` above), which makes zero
+        # refills the only reachable outcome regardless of scheduling. See
+        # test_concurrent_stop_on_first_failure_drains_after_sibling_completion
+        # for the deterministic reproduction of the inverted order this test
+        # used to be vulnerable to.
         assert set(attempted) == {"df_task_10", "df_task_11"}
         # Summaries cover whatever was attempted.
         summary_ids = {s.task_id for s in captured["summaries"]}
