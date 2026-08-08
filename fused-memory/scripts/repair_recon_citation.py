@@ -77,6 +77,11 @@ The row was verified byte-identical afterwards (the failed write left nothing
 behind), so the two ``--apply`` runs above remain to be executed by a process
 with write access to that checkout. Run 1 before 2: after 1 the successor is
 already cited, which is why 2 is drop-only rather than a second re-point.
+That handoff is tracked as escalation ``esc-3065-5`` (scope_violation), which
+carries the measured pre-repair blob digest to verify against:
+``sha256 ea653dc8cccf8a51a61f555adb6126056d0544f38165afac13eb0fbbe882f61c``
+(11063 bytes). Both dry-runs and the read-only re-read were re-measured at
+commit ``a08e759b`` and the row was still unrepaired at that point.
 """
 
 from __future__ import annotations
