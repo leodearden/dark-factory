@@ -240,3 +240,92 @@ def malformed_pointer_refs(refs: list[PointerRef]) -> list[PointerRef]:
     return [ref for ref in refs if not (
         isinstance(ref.target, str) and _UUID_RE.match(ref.target)
     )]
+
+
+def unique_pointer_targets(refs: list[PointerRef]) -> list[str]:
+    """The distinct memory-id-shaped targets in *refs*, in first-seen order.
+
+    The read plan for :func:`resolve_pointer_targets`: a target cited by
+    several sources costs ONE live read, not one per citation. Order is
+    first-seen rather than sorted so a run's store-access sequence is
+    reproducible from the scan alone.
+
+    Non-string targets are excluded — they cannot be handed to a point-id
+    read at all. They are not thereby forgiven: :func:`dangling_census` still
+    counts them unresolved, and :func:`malformed_pointer_refs` names them.
+    """
+    seen: dict[str, None] = {}
+    for ref in refs:
+        if isinstance(ref.target, str) and ref.target:
+            seen.setdefault(ref.target, None)
+    return list(seen)
+
+
+# ---------------------------------------------------------------------------
+# Family (2b) — the dangling census
+#
+# PURE. The live `get_memory_by_id` reads happen in the async band and arrive
+# here as an already-fetched resolution map, which is what keeps every
+# assertion about this family in the merge lane.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DanglingCensus:
+    """What the pointer sweep found, with the unresolved edges named.
+
+    ``by_key`` carries a row ONLY for a key with live pointers. A key with no
+    population (``parent_id`` measures zero live records today) gets no row
+    rather than a zero one, for the same reason ``build_series`` omits a
+    zero-exposure metric: a fabricated "nothing wrong here" is worse than a
+    gap, and the report names every family so the absence cannot read as
+    health.
+    """
+
+    examined: int
+    resolved: int
+    unresolved: int
+    by_key: dict[str, dict[str, int]]
+    unresolved_refs: list[PointerRef]
+
+
+def dangling_census(
+    refs: list[PointerRef], resolution: dict[str, bool],
+) -> DanglingCensus:
+    """Count *refs* against *resolution* (``target id -> does it exist``).
+
+    *resolution* is supplied by the caller because corroboration has to happen
+    against the LIVE store (INV-3), not against the scrolled snapshot already
+    in hand: the scroll is capped and category-scoped, so a target outside it
+    would read as dangling when it exists, and a census that confirmed itself
+    from its own scan would be measuring its own scan depth.
+
+    A target the map does not carry counts as UNRESOLVED. That is the loud
+    direction: a pointer the resolver never reached is exactly the case a
+    permissive default would paper over.
+
+    ``examined`` counts POINTERS, not distinct targets — the same target cited
+    by three sources is three edges that could each be broken, and each keeps
+    its own attribution in ``unresolved_refs``. The de-duplication that saves
+    the redundant store READ lives in :func:`unique_pointer_targets`, where it
+    costs no accounting.
+    """
+    by_key: dict[str, dict[str, int]] = {}
+    unresolved_refs: list[PointerRef] = []
+    resolved = 0
+    for ref in refs:
+        row = by_key.setdefault(ref.key, {'examined': 0, 'resolved': 0, 'unresolved': 0})
+        row['examined'] += 1
+        target = ref.target if isinstance(ref.target, str) else None
+        if target is not None and resolution.get(target, False):
+            row['resolved'] += 1
+            resolved += 1
+        else:
+            row['unresolved'] += 1
+            unresolved_refs.append(ref)
+    return DanglingCensus(
+        examined=len(refs),
+        resolved=resolved,
+        unresolved=len(unresolved_refs),
+        by_key=by_key,
+        unresolved_refs=unresolved_refs,
+    )
