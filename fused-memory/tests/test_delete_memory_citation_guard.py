@@ -502,6 +502,132 @@ class TestGateAppliesToEveryCaller:
         mock_service.delete_memory.assert_not_awaited()
 
 
+class TestAllowDanglingCitationsEscape:
+    """``metadata={'allow_dangling_citations': True}`` is the deliberate escape.
+
+    Broadening the gate (task 3624) leaves one caller with no reachable next
+    action: an operator dropping a record outright, with no survivor at all to
+    repoint to. ``replacement_memory_id`` cannot help them, so the refusal would
+    be a dead end. The escape closes that — knowingly, loudly, and only on a
+    LITERAL ``True``.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1301', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1302', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_override_permits_the_delete(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(a) The flag lets the delete through with no replacement supplied —
+        and rewrites nothing. It dangles the citation knowingly; it does not
+        silently invent a forwarding pointer."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true', None])
+    async def test_only_a_literal_true_counts(
+        self, mcp_server, mock_service, value,
+    ):
+        """(b) The ``is True`` half of the house override idiom
+        (tools.py:2103-2104). A truthy ``'yes'`` or ``1`` must NOT unlock an
+        irreversible delete — the same literal-boolean convention CHANGELOG.md
+        records for ``allow_mcp_markup``."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationRepointRequired', value
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_does_not_defeat_the_fail_closed_scan_error(
+        self, mock_service,
+    ):
+        """(c) PLACEMENT, pinned. The escape sits AFTER the scan, so an
+        unreadable task DB still fails closed. The flag means "I accept
+        dangling the citers you just showed me" — with nothing enumerated there
+        is nothing to knowingly accept, so this is the right semantics rather
+        than an accident of ordering."""
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['error_type'] == 'CitationScanFailed'
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_is_never_forwarded_to_the_store(
+        self, mcp_server, mock_service,
+    ):
+        """(d) The write-time flag must not reach persistence. It cannot today
+        (delete_memory discards _extract_causation's cleaned dict and the
+        service call takes no metadata parameter), so this guards the actual
+        hazard: a future signature change that starts forwarding the
+        envelope."""
+        await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        kwargs = mock_service.delete_memory.await_args.kwargs
+        assert 'metadata' not in kwargs
+        assert 'allow_dangling_citations' not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_override_applies_to_a_recon_caller_too(
+        self, mcp_server, mock_service,
+    ):
+        """(e) The escape is a property of stated INTENT, not of identity —
+        adding a second caller-identity check would reintroduce exactly the
+        scoping this task just removed."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id=RECON_AGENT,
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+
 TOMBSTONE_KEY = 'x_memory_citation_tombstones'
 
 
