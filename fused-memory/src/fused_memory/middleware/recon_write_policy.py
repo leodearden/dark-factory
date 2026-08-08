@@ -26,7 +26,11 @@ Three independent early-return gates in :func:`check`:
    :func:`is_terminal_annotation_exempt` — the single-parse combined form of
    the two predicates. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
-   -> ``ReconLiveWorkflowWriteRejected``.
+   -> ``ReconLiveWorkflowWriteRejected``. The caller's ``live_status`` and
+   (optionally) the task's ``task_metadata`` are forwarded to the detector
+   as ``status``/``task_kind``/``pure_gate``, so the project-wide
+   orchestrator-lock signal is dropped for tasks it is not evidence for
+   (task 3751 — see :func:`check`'s Gate 2 paragraph).
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
    (op-agnostic) -> ``ReconStaleSnapshotRejected``.
 
@@ -50,7 +54,10 @@ from typing import Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    is_pure_gate_metadata,
+    is_workflow_live_for_task,
+)
 
 # Metadata keys carrying the snapshot status a recon-stage caller observed
 # before writing. Promoted (Open Q3) from
@@ -267,6 +274,7 @@ def check(
     live_status: str,
     snapshot_token: str | None,
     is_annotation_clear: bool = False,
+    task_metadata: object = None,
 ) -> Verdict:
     """Decide whether a recon-stage caller may perform *op* on *task_id*.
 
