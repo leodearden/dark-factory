@@ -6106,6 +6106,42 @@ class TestSearchGraphitiIncludePlanned:
             "Planned edges must have metadata['planned'] = True when include_planned=True"
         )
 
+    # task 3658: the RRF stamping must not clobber the planned marker, and a
+    # planned edge that survives include_planned=True DOES consume a rank.
+    @pytest.mark.asyncio
+    async def test_planned_marker_survives_alongside_rrf_fields(
+        self, service_with_registry
+    ):
+        """metadata['planned'] coexists with store_rank/store_score stamping."""
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        ep1 = 'plan-ep-1'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Real fact', uuid='edge-real', episodes=['real-ep']),
+            MockEdge(fact='PRD: planned fact', uuid='edge-planned', episodes=[ep1]),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti(
+            'planned', scope, 10, include_planned=True
+        )
+
+        assert [r.id for r in results] == ['edge-real', 'edge-planned']
+        assert 'planned' not in results[0].metadata
+        assert results[1].metadata['planned'] is True, (
+            'RRF stamping must not clobber the planned marker'
+        )
+        # Both edges survive, so both consume a rank.
+        assert [r.metadata['store_rank'] for r in results] == [1, 2]
+        assert [r.metadata['store_score'] for r in results] == [None, None]
+        assert results[1].relevance_score == pytest.approx(1.0 / (RRF_K + 2))
+
 
 class TestSearchMem0Filtering:
     """step-15: _search_mem0 filtering — exclude planned=True by default, include with flag."""
@@ -6504,29 +6540,35 @@ class TestSearchGraphitiInvalidatedFiltering:
             'Results must be truncated to limit=10 when Graphiti returns more valid edges'
         )
 
-    # step-11: scores reflect original rank position from Graphiti, not re-ranked positions
+    # step-11 (task 3658): scores are ORDINAL RRF values over the SURVIVING rank.
+    # Supersedes the pre-RRF contract this test used to pin (synthesized
+    # score = max(0, 1 - i*0.05), keyed on the raw pre-filter index i), which
+    # task 3658 deleted: Graphiti exposes no scores at all, so a synthesized
+    # similarity was never an honest number to merge against Mem0 cosines.
     @pytest.mark.asyncio
-    async def test_scores_reflect_original_rank_position(self, service):
-        """Surviving edges keep scores from their original Graphiti rank positions.
+    async def test_scores_are_rrf_over_surviving_rank(self, service):
+        """Surviving edges are scored 1/(RRF_K + rank), rank contiguous over survivors.
 
-        Graphiti returns 5 edges at positions 0-4. Edges at positions 1 and 3
-        are invalidated (invalid_at set). The surviving edges at positions 0, 2,
-        and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
-        NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
+        Graphiti returns 5 edges at positions 0-4; the edges at positions 1 and
+        3 are invalidated (invalid_at set).  The three survivors must take
+        ranks 1, 2, 3 — NOT 1, 3, 5 — because a filtered edge must not consume
+        a rank: RRF maps rank directly to score, so a gap would silently
+        penalize the store for facts the caller never sees.
         """
         from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
 
         service.graphiti.search = AsyncMock(return_value=[
-            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # i=0, score=1.00
+            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 1
             MockEdge(fact='Superseded at pos 1', uuid='pos-1', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # i=2, score=0.90
+            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 2
             MockEdge(fact='Superseded at pos 3', uuid='pos-3', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # i=4, score=0.80
+            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 3
         ])
 
         scope = Scope(project_id='test')
@@ -6534,15 +6576,36 @@ class TestSearchGraphitiInvalidatedFiltering:
 
         assert len(results) == 3, 'Three edges should survive filtering'
 
-        scores_by_id = {r.id: r.relevance_score for r in results}
-        assert scores_by_id['pos-0'] == pytest.approx(1.00), (
-            'Edge at original rank 0 must score 1.0 (1.0 - 0*0.05)'
+        # Ranks are 1-based and contiguous over SURVIVORS, in Graphiti's order.
+        assert [r.id for r in results] == ['pos-0', 'pos-2', 'pos-4']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2, 3], (
+            'store_rank must be contiguous 1..N over surviving edges — a '
+            'filtered edge must not consume a rank'
         )
-        assert scores_by_id['pos-2'] == pytest.approx(0.90), (
-            'Edge at original rank 2 must score 0.9 (1.0 - 2*0.05)'
-        )
-        assert scores_by_id['pos-4'] == pytest.approx(0.80), (
-            'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
+
+        # Graphiti has no scores of its own: store_score is honestly absent.
+        for r in results:
+            assert r.metadata['store_score'] is None, (
+                "Graphiti's public search() exposes no scores, so store_score "
+                'must be None rather than a synthesized stand-in'
+            )
+
+        # relevance_score is the ordinal RRF value derived from that rank.
+        for r in results:
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            ), f'{r.id}: relevance_score must be 1/(RRF_K + store_rank)'
+
+        # The old synthesized sequence is gone entirely.
+        for r in results:
+            for stale in (1.0, 0.95, 0.90, 0.80):
+                assert r.relevance_score != pytest.approx(stale), (
+                    f'{r.id} still carries the pre-RRF synthesized score {stale}'
+                )
+
+        scores = [r.relevance_score for r in results]
+        assert scores == sorted(scores, reverse=True) and len(set(scores)) == 3, (
+            'RRF scores must be strictly decreasing in rank order'
         )
 
 
