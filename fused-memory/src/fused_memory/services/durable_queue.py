@@ -613,7 +613,7 @@ class DurableWriteQueue:
         assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
-        limit = self._transient_max_attempts if self._is_transient(exc) else item.max_attempts
+        classification, limit = self._classify_failure(item, exc)
         died = new_attempts >= limit
         if died:
             await self._db.execute(
