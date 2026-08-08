@@ -854,3 +854,156 @@ class TestChainSnapshotIsSync:
         worker = _make_worker(_make_git_ops(git_repo))
 
         assert worker.chain_snapshot() == ()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-11: RED — build_chain degenerate inputs
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _count_spec_lane_acquires(git_ops: GitOps, monkeypatch) -> list[str]:
+    """Wrap acquire_spec_lane with a call recorder; return the record list."""
+    calls: list[str] = []
+    original = git_ops.acquire_spec_lane
+
+    async def _recording(merge_commit: str):
+        calls.append(merge_commit)
+        return await original(merge_commit)
+
+    monkeypatch.setattr(git_ops, 'acquire_spec_lane', _recording)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestBuildChainDegenerate:
+    """Degenerate inputs return an empty ChainResult and touch ZERO worktrees.
+
+    The cap=0 case is the structural expression of α's kill switch at the
+    builder level: no worktree is provisioned and no git command runs.
+    """
+
+    async def _assert_empty_and_untouched(
+        self, git_ops: GitOps, res, head: str, before: set[str], calls: list[str],
+    ) -> None:
+        from orchestrator.warm_lane_pool import LaneState
+
+        assert res.links == []
+        assert res.tip == head
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        assert res.depth == 0
+        # An empty result NEVER holds a lane, so a caller that skips the
+        # release on the empty path cannot leak one.
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert await _worktree_names(git_ops) == before
+        assert calls == []
+        assert git_ops.spec_warm_lane_pool is not None
+        assert all(
+            s == LaneState.FREE
+            for s in git_ops.spec_warm_lane_pool._lanes.values()
+        )
+
+    async def test_cap_zero_is_the_kill_switch(self, git_repo: Path, monkeypatch):
+        """cap=0 (α's shipped default) provisions nothing and runs no git."""
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        calls = _count_spec_lane_acquires(git_ops, monkeypatch)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=0, target_depth=3)
+
+        await self._assert_empty_and_untouched(git_ops, res, head, before, calls)
+
+    async def test_target_depth_zero(self, git_repo: Path, monkeypatch):
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        calls = _count_spec_lane_acquires(git_ops, monkeypatch)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=0)
+
+        await self._assert_empty_and_untouched(git_ops, res, head, before, calls)
+
+    async def test_empty_queue_snapshot(self, git_repo: Path, monkeypatch):
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        calls = _count_spec_lane_acquires(git_ops, monkeypatch)
+
+        res = await build_chain(git_ops, (), head, cap=6, target_depth=3)
+
+        await self._assert_empty_and_untouched(git_ops, res, head, before, calls)
+
+    async def test_negative_cap_is_treated_as_zero(self, git_repo: Path, monkeypatch):
+        """Defensive: α's validator is ge=0, but a direct call must not misbehave."""
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        calls = _count_spec_lane_acquires(git_ops, monkeypatch)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=-1, target_depth=3)
+
+        await self._assert_empty_and_untouched(git_ops, res, head, before, calls)
+
+    async def test_lane_acquisition_failure_returns_empty(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """acquire_chain_build_lane -> (None, False) yields the empty result."""
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        head = await _rev_parse(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        before = await _worktree_names(git_ops)
+
+        async def _boom(_merge_commit: str):
+            raise RuntimeError('lane provisioning exploded')
+
+        monkeypatch.setattr(git_ops, 'acquire_spec_lane', _boom)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=1)
+
+        assert res.links == []
+        assert res.tip == head
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert await _worktree_names(git_ops) == before
+
+    async def test_depth_is_clamped_to_snapshot_length(self, git_repo: Path):
+        """depth == min(len(snapshot), cap, target_depth) — a 1-item chain builds."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        head = await _rev_parse(git_repo)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=99)
+
+        assert [tid for tid, _ in res.links] == ['101']
+        assert res.depth == 1
+        assert res.tip == res.links[0][1]
+        # A depth stop is not a truncation.
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
