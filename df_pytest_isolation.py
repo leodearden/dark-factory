@@ -98,6 +98,7 @@ together by
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -477,6 +478,65 @@ def _df_deploy_clocks_unwritten():
 # because it is a CEILING, not a latency: once the group is SIGKILLed every
 # write end of the pipe is closed and the drain returns in milliseconds.
 _POST_KILL_DRAIN_SECS = 10
+
+
+# ---------------------------------------------------------------------------
+# The wait-proving grace (task 3798, fix (c))
+# ---------------------------------------------------------------------------
+
+# How far the grace must exceed the spawn timeout that will kill it. 4x absorbs
+# scheduling jitter under 32-way xdist load with room to spare, which is the
+# load the existing 20s timeout was itself chosen against.
+WAIT_PROOF_GRACE_MULTIPLIER = 4
+
+# A purely multiplicative grace off a 1-3s timeout lands near the script's own
+# startup cost, so the defer line the test is waiting for might never print.
+WAIT_PROOF_GRACE_FLOOR_SECS = 30
+
+# The other side of the invariant: how long a poller that ESCAPES its kill may
+# live before its own grace expires and it exits.
+LEAK_SELF_TERMINATION_CEILING_SECS = 90
+
+
+def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
+    """The grace a wait-proving test should hand the script it spawns.
+
+    Several tests prove ``restart-all-orchestrators.sh`` is genuinely POLLING
+    rather than fail-opening, by setting a grace large enough that the script
+    is still waiting when the test's own short ``subprocess`` timeout kills it,
+    then asserting no restart was recorded. That shape needs a number, and all
+    three sites independently picked ``99999`` — 27.8 HOURS.
+
+    Each choice was locally reasonable: bigger is safer against the ONE
+    constraint the code stated. The unstated second constraint is what this
+    function exists to make explicit, because the number is two things at once:
+
+    * LARGE enough that the wait is provably still a real wait at the moment
+      the caller's own ``subprocess`` timeout kills it — at least
+      :data:`WAIT_PROOF_GRACE_MULTIPLIER` times that timeout, never below
+      :data:`WAIT_PROOF_GRACE_FLOOR_SECS`. Too small and the script force-fires
+      mid-test, records the restart, and the assertion fails.
+    * SMALL enough that a poller which nevertheless escapes the kill
+      self-terminates within :data:`LEAK_SELF_TERMINATION_CEILING_SECS`. Too
+      large and it does not: 86 concurrent orphans on 2026-08-06 and 82 more on
+      2026-08-07, each with 27.8h left to run.
+
+    THE COUNTER-INTUITIVE PART, because it is the objection a reviewer will
+    raise: shrinking the grace makes an escaped orphan reach expiry and issue a
+    REAL ``systemctl --user restart`` SOONER. That is strictly SAFER, not
+    riskier. At 30-80s the fake ``systemctl`` in the test's tmpdir under
+    ``/tmp/pytest-of-<user>/pytest-NNN/`` still exists, so the orphan's PATH
+    still resolves to the FAKE and its restart goes nowhere. It was only the
+    27.8h survivor that outlived pytest's tmpdir GC, fell through to
+    ``/usr/bin/systemctl``, and restarted real units while stamping a real
+    fleet-deploy clock. A short grace is what keeps an escape contained inside
+    the lifetime of its own containment.
+
+    Returns an ``int``: the value is stringified into an env var and compared
+    by bash's integer operators, which reject ``30.0``.
+    """
+    derived = math.ceil(spawn_timeout_secs * WAIT_PROOF_GRACE_MULTIPLIER)
+    return max(WAIT_PROOF_GRACE_FLOOR_SECS, derived)
 
 
 def _unsafe_pgid_reason(pgid: int) -> str | None:
