@@ -10387,13 +10387,22 @@ class Harness:
             # fleet-redeploy/watchdog restart, or when a merge-queue writer
             # site filed it.  Ordering alone cannot deliver the invariant;
             # durability is what delivers it.
-            if self._provenance_conflict_sink.arbitration_pending(rows):
+            #
+            # `reopen_at` is the SAME `metadata.get('reopen_at')` the
+            # `should_skip` pre-check above already passes, so the durable
+            # hold and the in-memory memo invalidate on exactly one shared
+            # signal — a restart changes performance, not behaviour.
+            if self._provenance_conflict_sink.arbitration_pending(
+                rows, reopen_at=metadata.get('reopen_at'),
+            ):
                 logger.info(
                     'already-landed dispatch gate: task %s is under provenance '
-                    'arbitration (pending provenance_conflict escalation) — '
-                    'withholding it from dispatch rather than re-attempting '
-                    'the already-rejected done-write',
+                    'arbitration (pending provenance_conflict escalation at '
+                    'reopen_at=%s) — withholding it from dispatch rather than '
+                    're-attempting the already-rejected done-write; reopening '
+                    'the task again releases this hold',
                     task_id,
+                    metadata.get('reopen_at'),
                 )
                 return True
 
