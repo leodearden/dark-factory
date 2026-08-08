@@ -1373,17 +1373,14 @@ class TestStartupGraceSecsReachesWatchdog:
 class TestSameModuleSiblings:
     """Pin `same_module_siblings`'s contract across every plausible lock_depth.
 
-    The premise "two DISTINCT files that share one lock module" is asserted as
-    a precondition by several tests in this repo.  Encoded as a fixed literal
-    (`a/b/c/d/{e,f}.py`) it silently dies once `lock_depth` exceeds the
-    literal's own depth — which is exactly how these tests went red when
-    `dark-factory-orchestrator.yaml` moved `lock_depth` 4 -> 12.  The
-    constructor derives the shared package prefix FROM the depth, so the
-    premise holds BY CONSTRUCTION; this test is what keeps that true.
+    See `same_module_siblings`' own docstring in `_workflow_helpers` for WHY
+    the pair is derived from the depth rather than written as a literal; that
+    rationale is kept in exactly one place so the copies cannot drift.
 
     Depths cover the operational value (12), the package-bundled default
-    (`defaults.yaml:7` = 4), the pydantic Field default (2), the degenerate
-    minimum (1), and a deeper future setting (20).
+    (`defaults.yaml:7` = 4), the pydantic Field default (2), the smallest
+    depth that can honour the contract (1), and a deeper future setting (20);
+    `test_rejects_depths_below_one` pins the boundary just under it.
     """
 
     @pytest.mark.parametrize('lock_depth', [1, 2, 3, 4, 12, 20])
@@ -1406,4 +1403,35 @@ class TestSameModuleSiblings:
             f'Adding sibling {f2!r} must not widen the module set of {f1!r} at '
             f'lock_depth={lock_depth} — that equality is the exact precondition '
             'the same-module-widen tests assert.'
+        )
+
+    @pytest.mark.parametrize('lock_depth', [0, -1])
+    def test_rejects_depths_below_one(self, lock_depth: int):
+        """Below depth 1 the guarantee is UNSATISFIABLE, so it must raise.
+
+        `OrchestratorConfig.lock_depth` carries no `ge=1` constraint, so a
+        caller forwarding `config.lock_depth` can genuinely reach this input.
+        """
+        with pytest.raises(ValueError, match='lock_depth >= 1'):
+            same_module_siblings(lock_depth)
+
+        # The boundary is real, not arbitrary — and the reason it must RAISE
+        # rather than return is that the unguarded construction fails
+        # SILENTLY.  Both paths truncate to '' (parts[:0]), files_to_modules
+        # DROPS them, and the same-module precondition the callers assert
+        # degenerates to [] == [] — passing VACUOUSLY while the workflow under
+        # test holds no module lock at all.
+        package = '/'.join(f'p{i}' for i in range(max(lock_depth, 0)))
+        f1, f2 = f'{package}/e.py', f'{package}/f.py'
+        assert files_to_modules([f1, f2], lock_depth) == [], (
+            f'expected the unguarded pair at lock_depth={lock_depth} to yield NO '
+            f'modules; got {files_to_modules([f1, f2], lock_depth)!r}. If this '
+            'changed, re-derive the guard\'s rationale from the new behaviour.'
+        )
+        assert files_to_modules([f1], lock_depth) == files_to_modules(
+            [f1, f2], lock_depth,
+        ), (
+            'the same-module precondition is expected to pass VACUOUSLY here — '
+            'that vacuity is precisely why same_module_siblings refuses this '
+            'depth instead of returning a pair'
         )

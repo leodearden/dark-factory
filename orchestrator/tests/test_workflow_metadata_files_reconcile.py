@@ -34,15 +34,37 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # The depth these tests pin on their MagicMock config, in ONE place.
 #
-# Every `files_to_modules(..., _LOCK_DEPTH)` precondition below and every
-# `config.lock_depth` pin must read this same name.  Re-typing the literal in
-# both places looks harmless but is the failure mode task 3866 exists to
-# document: if a pin is ever swapped for a real config (which resolves the
-# LIVE operational lock_depth via the autouse `_isolate_orch_config` fixture),
-# a re-typed precondition keeps asserting the old depth and keeps PASSING
-# while the code under test runs at a depth where the premise is false — a
-# silently-wrong test instead of a loud precondition failure.
+# The constant alone only deduplicates a literal — it CANNOT by itself stop
+# the premise and the code under test from drifting apart, because it is
+# itself the re-typed value: swap a `config.lock_depth` pin for a real config
+# (which resolves the LIVE operational depth via the autouse
+# `_isolate_orch_config` fixture) and `_LOCK_DEPTH` still reads 2, so every
+# `files_to_modules(..., _LOCK_DEPTH)` precondition below would keep asserting
+# 2 and keep PASSING against a workflow running at 12.  That silently-wrong
+# outcome — rather than a loud precondition failure — is the failure mode task
+# 3866 exists to document, so it is `_assert_depth_pin_holds` below, not the
+# constant, that actually forecloses it.
 _LOCK_DEPTH = 2
+
+
+def _assert_depth_pin_holds(wf: TaskWorkflow) -> None:
+    """Fail LOUDLY if the workflow's real depth diverges from `_LOCK_DEPTH`.
+
+    Read through `wf.config` — the object the code under test actually
+    consults — not through the local pin, so this compares the premise the
+    preconditions were computed at against the depth the workflow will really
+    run at.  Both factories call it at construction time, which is what makes
+    the two impossible to diverge silently.
+    """
+    actual = wf.config.lock_depth
+    assert actual == _LOCK_DEPTH, (
+        f'this module computes its same-module/cross-module preconditions at '
+        f'lock_depth={_LOCK_DEPTH}, but the workflow under test resolves '
+        f'{actual}. Those preconditions are now false (or vacuous) for the code '
+        'being exercised. Re-point _LOCK_DEPTH at the depth the workflow really '
+        'uses — do NOT silence this by editing the preconditions alone (task '
+        '3866).'
+    )
 
 
 def _make_workflow(
@@ -84,6 +106,7 @@ def _make_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    _assert_depth_pin_holds(wf)
     return wf, update_task, get_merge_diff_files, get_merge_commit_diff_files
 
 
@@ -465,6 +488,7 @@ def _make_replan_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    _assert_depth_pin_holds(wf)
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     artifacts = TaskArtifacts(worktree)
@@ -621,10 +645,7 @@ class TestReplanScopeReconcile:
     async def test_same_module_widen_persists_via_update_task_before_next_execute(
         self, tmp_path: Path,
     ):
-        # Derived from _LOCK_DEPTH, not a fixed literal: a hardcoded
-        # `a/b/c/d/{e,f}.py` pair only shares a module while lock_depth <= 4,
-        # so at a deeper setting the SAME-module premise below becomes
-        # unsatisfiable (task 3866).
+        # Derived, not a literal — see same_module_siblings' docstring for why.
         f1, f2 = same_module_siblings(_LOCK_DEPTH)
         assert files_to_modules([f1], _LOCK_DEPTH) == files_to_modules(
             [f1, f2], _LOCK_DEPTH,

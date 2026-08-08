@@ -1195,7 +1195,28 @@ def same_module_siblings(lock_depth: int) -> tuple[str, str]:
     ``lock_depth: 12`` is one project's operational override — while even at 12
     any path deeper than ``lock_depth`` still collapses onto its truncated
     prefix.
+
+    Raises ``ValueError`` below ``lock_depth == 1``, the one input where the
+    by-construction guarantee breaks SILENTLY rather than loudly.  MEASURED,
+    not assumed: at depth 0 the package prefix is empty, so the pair is
+    ``/e.py`` / ``/f.py``; ``normalize_lock`` truncates to ``parts[:0]`` and
+    both normalize to ``''``, which ``files_to_modules`` then DROPS — the
+    module list is ``[]``, not two modules.  That is worse than an outright
+    wrong answer, because the usual precondition
+    ``files_to_modules([f1]) == files_to_modules([f1, f2])`` degenerates to
+    ``[] == []`` and PASSES VACUOUSLY while the workflow under test holds no
+    module lock at all.  ``OrchestratorConfig.lock_depth`` carries no ``ge=1``
+    constraint, so a caller forwarding ``config.lock_depth`` really can reach
+    this; failing loudly beats handing back a pair whose preconditions are
+    satisfied by emptiness.
     """
+    if lock_depth < 1:
+        raise ValueError(
+            f'same_module_siblings requires lock_depth >= 1; got {lock_depth}. '
+            'At depth < 1 the shared package prefix is empty and the returned '
+            'paths normalize to DIFFERENT modules, so the "same module, '
+            'different file" guarantee cannot be honoured.'
+        )
     package = '/'.join(f'p{i}' for i in range(lock_depth))
     return f'{package}/e.py', f'{package}/f.py'
 
