@@ -1591,9 +1591,41 @@ def _emit_verdict(report: VerifyReport) -> int:
     return report.exit_code
 
 
+def _store_error_types() -> tuple[type[BaseException], ...]:
+    """The exception types that mean "the store could not be read".
+
+    Two measured facts shape this, both re-confirmed on redis 7.4.0 rather than
+    assumed:
+
+    1. ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — the MRO
+       of ``redis.exceptions.ConnectionError`` is ``ConnectionError ->
+       RedisError -> Exception``. So catching ``OSError`` alone, the obvious
+       reading, would still let an unreachable FalkorDB escape as a traceback:
+       exactly the case exit ``1`` is documented to cover.
+    2. The import is function-local, matching :meth:`EpisodeReader._resolve_graph`,
+       so merely importing this module — which the tests do, with a double in
+       hand — never drags in the client. It tolerates ``ImportError`` because
+       ``redis`` is only a transitive dependency
+       (``graphiti-core[falkordb]`` -> ``falkordb`` -> ``redis``); without the
+       client installed there is no FalkorDB to be unreachable, and ``OSError``
+       alone is then the whole story.
+
+    ``RedisError`` rather than ``ConnectionError`` so a server-side
+    ``ResponseError`` also exits with a message instead of a traceback. The
+    caller names ``type(exc).__name__``, which keeps "unreachable" and "query
+    rejected" distinguishable in the text without needing two clauses.
+    """
+    try:
+        from redis.exceptions import RedisError  # noqa: PLC0415
+    except ImportError:
+        return (OSError,)
+    return (OSError, RedisError)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     args = _build_parser().parse_args(argv)
+    store_errors = _store_error_types()
     try:
         return _run_verify(args) if args.verify else _run_build(args)
     except CorpusBuildError as exc:
@@ -1601,6 +1633,17 @@ def main(argv: list[str] | None = None) -> int:
         # code rather than a traceback plus exit 1-by-accident. Distinct from
         # every EXIT_CODES verification status: nothing was verified.
         print(f'error: {exc}', file=sys.stderr)
+        return EXIT_RUN_FAILED
+    except store_errors as exc:
+        # Same contract, other culprit: the store never answered, so there is
+        # no verdict to report about the artifact. Deliberately NOT a bare
+        # `except Exception` — that would satisfy the documented exit-1
+        # promise while swallowing genuine builder bugs behind a tidy message,
+        # turning a loud crash into a silent fail-soft.
+        print(
+            f'error: the store could not be read ({type(exc).__name__}): {exc}',
+            file=sys.stderr,
+        )
         return EXIT_RUN_FAILED
 
 
