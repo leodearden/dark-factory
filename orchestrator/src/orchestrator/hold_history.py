@@ -31,7 +31,10 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard (rebase_cost_readout.py idiom)
+    from orchestrator.event_store import EventStore
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +287,64 @@ class HoldHistory:
         self._window = int(window)
         self._min_samples = int(min_samples)
         self._samples: dict[str, deque[float]] = {}
+        self._seeded = False
+
+    # --- seeding from durable history -------------------------------------
+
+    def seed_from_event_store(self, event_store: EventStore) -> int:
+        """Seed the windows from the durable event log.  Returns spans recorded.
+
+        Reads the three event types :func:`iter_hold_spans` cares about through
+        ``fetch_events_by_type_all_runs`` — the run-AGNOSTIC fetch, so a restart
+        does not amnesia away the history the predictor exists to use — and
+        merges them back into ONE stream sorted by row ``id``.
+
+        The merge is the load-bearing part.  Each type comes back as its own
+        list, so concatenating them would place every release after every
+        acquire: T4's double-acquire and the ``service_restart`` boundary would
+        then resolve against the wrong neighbours and yield durations that never
+        happened.  ``id`` is the store's own insertion order and is what
+        ``fetch_events_by_type_all_runs`` already sorts each list by, so a merge
+        on it restores the original stream exactly.
+
+        SEED-ONCE.  ``finish_startup`` is not guaranteed to run exactly once
+        across a reconfigure, and a second seed would replay the same spans into
+        bounded windows — halving each module's effective history while leaving
+        the medians looking plausible.  A silent corruption is worse than a
+        missed refresh, so the second call is a no-op returning 0.
+
+        FAIL-SOFT.  Any exception is logged and swallowed, returning 0, matching
+        event_store.py's own read-path convention.  This runs inside
+        ``finish_startup``: propagating would turn an unreadable history — a
+        degradation :meth:`predicted_hold`'s refusal already handles correctly —
+        into a failure to start the scheduler at all.
+
+        The seed-once flag is set BEFORE the read, deliberately: spans are
+        recorded as they stream, so a mid-stream failure leaves a PARTIAL seed
+        that a retry would double-count.  One partial history that refuses until
+        the live feed refills it beats a silently doubled one.
+        """
+        if self._seeded:
+            return 0
+        self._seeded = True
+        try:
+            rows: list[dict] = []
+            for event_type in (_ACQUIRED, _RELEASED, _SERVICE_RESTART):
+                rows.extend(event_store.fetch_events_by_type_all_runs(event_type))
+            rows.sort(key=lambda r: r.get('id') or 0)
+
+            recorded = 0
+            for span in iter_hold_spans(rows):
+                self.record_span(span)
+                recorded += 1
+        except Exception:
+            logger.warning('hold_history: seed from event store failed', exc_info=True)
+            return 0
+        logger.info(
+            'hold_history: seeded %d span(s) across %d module(s) from %d event row(s)',
+            recorded, len(self._samples), len(rows),
+        )
+        return recorded
 
     # --- feeding ----------------------------------------------------------
 
