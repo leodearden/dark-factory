@@ -1776,18 +1776,31 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A metric with NO runs is a third suppression state, not a chart.
+    """A series a primitive would render as NOTHING is a named state, not a
+    chart.
 
-    The defect: `trendGaps([])` counts zero holes in zero samples, so the
-    `Chart && gaps === 0` gate is TRUE for a metric that has never been
-    measured.  The empty series is then handed to a charts.jsx primitive —
+    The original defect: `trendGaps([])` counts zero holes in zero samples, so
+    the old `Chart && gaps === 0` gate was TRUE for a metric that had never
+    been measured.  The empty series was handed to a charts.jsx primitive —
     and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
-    on a zero-length array.  The cell therefore renders an empty 26px <div>
-    plus a "0 pts" footer: a blank box that is indistinguishable from a
-    rendering bug, which is precisely the failure mode the gap-suppression
-    path already exists to avoid.  The deliberate 'no runs' text the row
-    ALREADY computes reaches only a `title=` on that invisible div, so the
-    state is never stated in the open.
+    on a zero-length array.  The cell therefore rendered an empty 26px <div>
+    plus a "0 pts" footer: a blank box indistinguishable from a rendering bug.
+    The deliberate 'no runs' text the row ALREADY computes reached only a
+    `title=` on that invisible div, so the state was never stated in the open.
+
+    Task 3490 widened the blast radius of that defect and this test with it.
+    Now that a holed series is DRAWN (the primitive became hole-aware in 3436),
+    an ALL-HOLE series — one that ran but in which no run produced a sample —
+    reaches the same dead end: an empty path, `return null`, blank box.  So the
+    gate stopped meaning "no holes" and started meaning "at least one sample
+    the primitive will actually draw", and the empty series is now excluded
+    TRANSITIVELY through that count rather than by its own `points > 0` term.
+
+    This test therefore derives the gate in exactly the hops its sibling
+    test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed uses.  That
+    pairing is deliberate and load-bearing: the two tests must not drift apart
+    on what "the gate" means, because between them they are the only thing
+    standing between an unrenderable series and a blank box.
 
     Asserted on structure and on `data-testid` values, never on copy: a
     rewording keeps this green, deleting a state does not.
@@ -1810,60 +1823,112 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     )
     points_local = points_decl.group(1)
 
-    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
-    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
+    # (b) the chart gate must CONSUME that measurement — now TRANSITIVELY,
+    #     through the drawable-sample count, since the gate no longer names
+    #     `points` directly (gaps <= points always, so `plotted > 0` implies
+    #     `points > 0` and restating it would leave a dead conjunct).  Derived
+    #     in exactly the two hops
+    #     test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed uses, so
     #     the two tests cannot drift apart on what "the gate" means.
+    plotted_decl = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body):
+        if decl.group(1) == 'gaps' or re.search(r'\bChart\b', decl.group(0)):
+            continue
+        plotted_decl = decl
+        break
+    assert plotted_decl is not None, (
+        'no `const <name> = ...gaps...;` drawable-sample count (excluding the '
+        '`gaps` declaration itself and the gate) — see '
+        'test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed, which '
+        'derives it the same way.'
+    )
+    plotted_local = plotted_decl.group(1)
+    assert re.search(r'\b' + re.escape(points_local) + r'\b', plotted_decl.group(0)), (
+        f'the drawable-sample count {plotted_decl.group(0).strip()!r} does not '
+        f'consume the series-length local `{points_local}`, so the chain that '
+        'excludes an empty series from the chart is broken at its first hop.'
+    )
+
     gate_decl = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
-    ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
+        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
+            continue
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
             gate_decl = decl
             break
     assert gate_decl is not None, (
-        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
-        'reaches a `{<local>` JSX position — see '
-        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
-        'the gate the same way.'
-    )
-    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
-        f'series-length local `{points_local}`. An empty series must never '
-        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
-        'null for a zero-length array, leaving a blank 26px box.'
+        f'no single-line `const <name> = ...Chart...{plotted_local}...;` gate '
+        'whose local reaches a `{<local>` JSX position — see '
+        'test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed, which '
+        'derives the gate the same way. An empty series must never reach a '
+        'charts.jsx primitive: both Sparkline and StepSpark return null for a '
+        f'zero-length array, leaving a blank 26px box. It is excluded '
+        f'TRANSITIVELY — {points_local} -> {plotted_local} -> gate — not by a '
+        f'direct `{points_local} > 0` term.'
     )
 
     # (c) FIVE structurally distinct trend states. A separate no-runs arm is
-    #     required rather than folding it into the gap message because
-    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
-    #     that reads as a bug — the very failure this suppression path exists
-    #     to prevent.  A separate mismatch arm is required for the same reason,
-    #     one payload shape further out: labels and values are PARALLEL arrays
-    #     (memory_evals.py:955,993), so a disagreement makes every other
-    #     sentence this cell could produce untrustworthy.
+    #     required rather than folding it into the all-gaps message because
+    #     "none of the 0 runs produced a sample" is a nonsense sentence that
+    #     reads as a bug — the very failure this state inventory exists to
+    #     prevent.  The two must stay separate for a second reason as well:
+    #     "no runs yet — nothing to chart" and "none of the 90 runs produced a
+    #     sample" are DIFFERENT FACTS about the metric, and collapsing them
+    #     would tell an operator that a measured-but-empty metric had never
+    #     run.  A separate mismatch arm is required one payload shape further
+    #     out: labels and values are PARALLEL arrays (memory_evals.py:955,993),
+    #     so a disagreement makes every other sentence this cell could produce
+    #     untrustworthy.
+    #
+    #     `memory-eval-trend-gaps` was RENAMED to `memory-eval-trend-all-gaps`
+    #     (task 3490) because its meaning NARROWED, from "the series has at
+    #     least one hole" to "the series has nothing but holes" — a different
+    #     predicate over a different population. Keeping the old id would let a
+    #     test that means the old thing pass green against the new thing.
     testids = (
         'memory-eval-trend-chart',
         'memory-eval-trend-no-kind',
         'memory-eval-trend-mismatch',
         'memory-eval-trend-no-runs',
-        'memory-eval-trend-gaps',
+        'memory-eval-trend-all-gaps',
     )
     assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
     for testid in testids:
         assert f'data-testid="{testid}"' in code, (
             f'the trend cell must render a `data-testid="{testid}"` arm. The '
-            'five states — drawn chart, unrenderable kind, labels/values length '
-            'disagreement, no runs yet, and holed series — must be structurally '
-            'distinguishable, so a rewording cannot silently collapse two of '
-            'them into one.'
+            'five states — drawn chart (INCLUDING a holed series, drawn by the '
+            'hole-aware primitive with its gaps disclosed), unrenderable kind, '
+            'labels/values length disagreement, no runs yet, and not one run '
+            'produced a sample — must be structurally distinguishable, so a '
+            'rewording cannot silently collapse two of them into one.'
         )
+
+    # (c2) the all-gaps arm must be reachable ONLY when the drawable count is
+    #      zero. Without this the arm becomes dead code the moment the gate
+    #      changed: it sits last in the else-chain, so nothing else in the
+    #      source ties it to the predicate it claims to state.
+    assert re.search(
+        re.escape(plotted_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-all-gaps"',
+        row_body,
+    ), (
+        f'`{plotted_local}` does not gate the '
+        '`data-testid="memory-eval-trend-all-gaps"` arm. That arm now means '
+        'the series exists but NOT ONE run produced a sample — the one shape '
+        'the hole-aware primitive still cannot draw — so the drawable-sample '
+        'count is what must select it.'
+    )
 
     # (d) the existing guards must SURVIVE, re-asserted here so a later
     #     refactor to a `trendState()` discriminator cannot quietly drop them.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    #     The `gaps` lookahead is gone (mirroring the sibling test): holes no
+    #     longer veto the chart, so ANY inline `{Chart &&` / `{Chart ?` render
+    #     guard is a bypass of the named gate.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)', body)
     assert bare is None, (
         f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
-        'a holed OR empty series would reach the primitive through it.'
+        'an all-hole OR empty series would reach the primitive through it and '
+        'render a blank 26px box.'
     )
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count must still reach a render position — adding the '
