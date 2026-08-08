@@ -359,18 +359,23 @@ class DecisionRecord:
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
     file may be mutated by SEVERAL different subsystems: a C8 watcher (via
-    update_decision_state), the C5 cockpit (via set_manual_boost), and -- for
+    update_decision_state), the C5 cockpit (via set_manual_boost), -- for
     task 3640's back-fill, running against live records while the watchers
     are up -- scripts/backfill_decision_queue_stamp.py (via
-    set_decision_escalations_dir). All three helpers serialize their
+    set_decision_escalations_dir), and the ``write-decision`` verb itself
+    (task 3559), whose enrichment path folds a SECOND watcher's filing into
+    an existing open record. That fourth one is the only mutator that may
+    CREATE the record rather than merely mutate an existing one, so it races
+    on a path where nothing exists on disk yet. All four serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
-    1609's escalation_id_lock), so a concurrent state-update, boost-update
-    or queue-stamp racing on the same id no longer drops any of the
-    mutations -- each write remains individually atomic AND the
+    1609's escalation_id_lock), so a concurrent state-update, boost-update,
+    queue-stamp or cross-queue filing racing on the same id no longer drops
+    any of the mutations -- each write remains individually atomic AND the
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
-    set_decision_escalations_dir for the caller-facing note.
+    set_decision_escalations_dir/_run_write_decision for the caller-facing
+    note.
     """
 
     id: str
@@ -2619,6 +2624,14 @@ def _run_write_decision(
     is itself self-guarding fail-soft (never raises), so a fault there is
     silently skipped here rather than printed as a false confirmation.
 
+    Concurrency NOTE (see DecisionRecord's docstring): the read -> merge ->
+    write span above is serialized per-decision-id via decision_id_lock (a
+    stable ``<id>.json.lock`` sidecar), so two watchers filing the SAME id
+    from two queues at the same moment cannot drop either one's
+    contribution. That matters more here than for the field setters: this is
+    the only mutator that may CREATE the record, so an unserialized span
+    races on a path where nothing exists on disk yet.
+
     Intentionally omits DecisionRecord's ``options`` field: C8 watchers only
     ever file plain open/text decisions, and the peer `update_decision_state`
     / `set_manual_boost` helpers already own post-filing mutation (state,
@@ -2682,28 +2695,40 @@ def _run_write_decision(
     # ValueError) read/parse/write fault set, and (step-14) the lock sitting
     # INSIDE the try/except so an acquisition fault is absorbed rather than
     # raised at a watcher.
-    record = incoming
+    # The lock is taken HERE, after the stamp guards, so a refused
+    # invocation never creates an orphan `<id>.json.lock` sidecar for an id
+    # that will never be written (the ORPHAN SIDECARS caveat in
+    # decision_id_lock's own docstring), and INSIDE the try/except so a
+    # lock-acquisition fault is absorbed rather than raised at a watcher.
     try:
-        existing = DecisionRecord.from_json(decision_path_for_id(decision_id).read_text())
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        # Absent (the common first-filing case), unreadable, or corrupt: all
-        # fall through to writing fresh. A watcher's filing must never raise.
-        existing = None
-    if (
-        existing is not None
-        and existing.state == DecisionState.OPEN
-        and normalize_escalations_dir(existing.escalations_dir) != stamp
-    ):
-        # A DIFFERENT queue filing against a live record: this is the MODE-2
-        # cross-queue collapse, so enrich rather than overwrite. A matching
-        # stamp is the SAME watcher re-filing across a restart, which both
-        # SKILL.md files promise is a plain idempotent overwrite; a non-open
-        # record is a question the human already dealt with, so a new filing
-        # against it starts a new ask rather than editing a closed row.
-        record = merge_decision_enrichment(existing, incoming)
+        with decision_id_lock(decision_id):
+            record = incoming
+            try:
+                existing = DecisionRecord.from_json(
+                    decision_path_for_id(decision_id).read_text()
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # Absent (the common first-filing case), unreadable, or
+                # corrupt: all fall through to writing fresh.
+                existing = None
+            if (
+                existing is not None
+                and existing.state == DecisionState.OPEN
+                and normalize_escalations_dir(existing.escalations_dir) != stamp
+            ):
+                # A DIFFERENT queue filing against a live record: this is the
+                # MODE-2 cross-queue collapse, so enrich rather than
+                # overwrite. A matching stamp is the SAME watcher re-filing
+                # across a restart, which both SKILL.md files promise is a
+                # plain idempotent overwrite; a non-open record is a question
+                # the human already dealt with, so a new filing against it
+                # starts a new ask rather than editing a closed row.
+                record = merge_decision_enrichment(existing, incoming)
 
-    if write_decision(record):
-        print(record.id)
+            if write_decision(record):
+                print(record.id)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('write-decision: failed to file %s', decision_id, exc_info=True)
 
 
 def _run_reap_decisions(project: str, escalations_dir: str) -> None:
