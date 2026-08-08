@@ -1567,6 +1567,7 @@ async def _run_architect_eval_hermetic(
     invoke_side_effect=None,
     arch_result=None,
     orch_prices: dict | None = None,
+    orch_config_side_effect=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1591,6 +1592,12 @@ async def _run_architect_eval_hermetic(
     ``result.input_tokens`` must be an int, not a truthy Mock that ``or 0``
     cannot rescue. Both make the harness model reality so a RED here is caused
     by production behaviour, never by the double.
+
+    ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
+    RAISE — the harness-crash shape where the eval orch config (and therefore
+    the price table) is never bound at all. It has to live here rather than in
+    a caller-side ``patch``: this helper patches the same name from inside, so
+    an outer patch would be shadowed.
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -1629,9 +1636,12 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.agents.briefing.BriefingAssembler',
                 MagicMock(return_value=briefing_instance)))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
-                MagicMock(return_value=MagicMock(
-                    prices=orch_prices if orch_prices is not None else {},
-                ))))
+                MagicMock(
+                    return_value=MagicMock(
+                        prices=orch_prices if orch_prices is not None else {},
+                    ),
+                    side_effect=orch_config_side_effect,
+                )))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
@@ -2198,6 +2208,147 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
 
         assert result.metrics['is_local_model'] is False
         assert mocks['save'].call_args.args[0].metrics['is_local_model'] is False
+
+
+_PROXY_ENV = {'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}
+
+
+@pytest.mark.asyncio
+class TestArchitectCellResolvesCostProvenance:
+    """Task 3656 step-5: the architect cell's cost must be RESOLVED through
+    :func:`~orchestrator.evals.metrics.resolve_cost_usd`, not copied from the
+    raw CLI figure with an UNVERIFIED ``cost_source='cli'`` dataclass default.
+
+    Invariant P5: a PROXIED endpoint's CLI cost figure is untrustworthy, so a
+    proxied architect candidate must land on the price table (or the defined,
+    LOUD fallback) rather than keeping the proxy's number. ``collect_metrics``
+    (the implementer path) has resolved through this seam since task 2820;
+    ``run_architect_eval`` bypassed it entirely.
+
+    The plan judge is held to ZERO spend throughout (the harness's default
+    ``PlanQualityVerdict`` carries ``cost_usd=0.0``) so these cases isolate the
+    ARCHITECT component — composing the two-component label is step-7's.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    async def test_native_candidate_keeps_the_cli_figure_verbatim(self):
+        """REGRESSION PIN for every architect cell that has already landed.
+
+        ``architect-opus-max`` / ``architect-fable-max`` are native cloud
+        (``env_overrides={}``) and unlisted in the price table, so
+        ``resolve_cost_usd`` takes its ``not is_local_model`` branch and returns
+        ``(cli_cost_usd, 'cli')`` VERBATIM. Both the figure and the label must
+        be byte-identical to today's — the change bites only a PROXIED
+        candidate, and turns today's UNVERIFIED 'cli' into a DERIVED one.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23)
+        assert result.metrics['cost_source'] == 'cli'
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    async def test_priced_proxied_candidate_uses_the_price_table(self):
+        """A proxied candidate whose model IS listed must be priced from the
+        table, NOT from the proxy's own (wrong) CLI figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        expected = (1_000_000 * 0.30 + 500_000 * 1.20) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        # Emphatically NOT the raw proxied CLI figure.
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'price_table'
+
+    async def test_unpriced_proxied_candidate_warns_and_uses_defined_fallback(
+        self, caplog,
+    ):
+        """A proxied candidate with NO price entry degrades to the DEFINED
+        ``_FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
+        number (the loud-over-silent-degradation norm)."""
+        from orchestrator.evals.metrics import _FALLBACK_PRICE
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+                orch_prices={},
+            )
+
+        # Import the constant rather than hardcoding 2.0/8.0, so a future rate
+        # change updates this expectation instead of leaving a stale magic
+        # number (the single-home discipline of task 2459).
+        expected = (
+            1_000_000 * _FALLBACK_PRICE['input_per_1m']
+            + 500_000 * _FALLBACK_PRICE['output_per_1m']
+        ) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'unpriced_proxy'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'unpriced_proxy'
+
+        warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'No configured price for proxied-endpoint model' in r.message
+        ]
+        assert warnings, (
+            'Expected the LOUD unpriced-proxy WARNING from '
+            'orchestrator.evals.metrics; got '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_orch_config_never_built_still_lands_a_cell(self):
+        """The price table lives on the eval orch config, which is built INSIDE
+        the try — so a harness crash before it is bound must leave an explicit
+        ``None`` the resolver tolerates, never an ``UnboundLocalError`` /
+        ``AttributeError`` that loses the whole cell.
+
+        That path never invoked the architect (0 tokens, $0.00), so no price
+        table could have changed the number anyway.
+        """
+        from orchestrator.evals.metrics import EvalMetrics as _EM
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_config_side_effect=RuntimeError('config build exploded'),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        # The cell LANDED — marked and excluded, not lost.
+        assert persisted['cap_tainted'] is True
+        assert 'harness_error' in (persisted['invocation_error'] or '')
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        assert persisted['cost_source'] in {
+            'price_table', 'cli', 'unpriced_proxy', 'mixed',
+        }
+        # The documented default is still a member of the vocabulary.
+        assert _EM().cost_source in {
+            'price_table', 'cli', 'unpriced_proxy', 'mixed',
+        }
+        assert result.metrics['cap_tainted'] is True
 
 
 @pytest.mark.asyncio
