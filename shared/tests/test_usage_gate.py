@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _capacity_skip import looks_like_capacity_failure
+from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
@@ -1038,14 +1039,24 @@ class TestProbeConfigDirLeakSweep:
 # together, carrying the same blind spot into two live pytest.skip sites.
 # _capacity_skip is now the single source; see its contract tests in
 # test_capacity_skip.py.
+#
+# The account scan below is IMPORTED from _oauth_accounts for the same reason,
+# one task later (3700). It used to be an independent `BCDEF` copy — and unlike
+# the capacity markers, that copy had already DRIFTED: it could not reach
+# CLAUDE_OAUTH_TOKEN_G, a real fleet account present in .env and visible to the
+# three other hand-rolled scans. So under the capacity scarcity task 3484
+# measured on 2026-08-05 (5 of 6 accounts capped) this gate skipped a live test
+# that had a healthy account to run on — the exact failure mode a skip guard
+# exists to prevent, arrived at from the opposite direction.
+#
+# _oauth_accounts is now the single source; see its contract tests in
+# test_oauth_accounts.py. The default letter set it scans is the FLEET set
+# (B..G) — deliberately NOT the wider A..G the startup-probe sites use, because
+# this call site spends real capacity and account A is the interactive/primary
+# account, not a fleet worker.
 # ---------------------------------------------------------------------------
 
-_TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
-_AVAILABLE_TOKENS: list[tuple[str, str]] = [
-    (var, os.environ[var])
-    for var in _TOKEN_ENV_VARS
-    if os.environ.get(var)
-]
+_AVAILABLE_TOKENS: list[tuple[str, str]] = available_tokens(os.environ)
 
 _need_one_account = pytest.mark.skipif(
     len(_AVAILABLE_TOKENS) < 1,
