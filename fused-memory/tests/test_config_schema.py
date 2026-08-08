@@ -2259,6 +2259,262 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
         assert 'no-op' in cluster.hint.lower()
         assert '3162' in cluster.hint
 
+    def test_cluster_present_with_expected_phrases(self):
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'npx pyright',
+            'EACCES',
+            '_cacache',
+            '/home/leo/.npm',
+            '.venv/bin/pyright',
+            'npm_config_cache',
+            'sudo chown -R 1000:1000',
+        ]
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'GOTCHA — running the scripts/ type gate (`npx pyright scripts/`, '
+                "scripts/orchestrator.yaml's type_check_command) inside a task "
+                'worktree fails with "npm error Your cache folder contains '
+                'root-owned files, due to a bug in previous versions of npm", and '
+                'npx exits before pyright ever runs. It is NOT a pyright or config '
+                'problem. Fix without touching ~/.npm ownership: `export '
+                'npm_config_cache=/tmp/npm-cache-<taskid>` in the same shell, then '
+                '`npx pyright scripts/`.',
+                id='dfdad23e-at-threshold-2-hits',
+            ),
+            pytest.param(
+                "`npx pyright scripts/` — the repo's real quality gate "
+                '(scripts/orchestrator.yaml:278) — can abort before pyright ever '
+                'runs with `npm error Your cache folder contains root-owned files`, '
+                'because /home/leo/.npm holds root-owned entries. Work around it '
+                'per-invocation with `env npm_config_cache=/tmp/npm-cache-<task> npx '
+                '--yes pyright scripts/`; the permanent fix needs root (`sudo chown '
+                '-R 1000:1000 /home/leo/.npm`).',
+                id='a0c39676-harmful-chown-regression-4-hits',
+            ),
+            pytest.param(
+                'CORRECTION to the several existing entries about `npx pyright` '
+                'failing with npm EACCES on /home/leo/.npm/_cacache: the cause is '
+                'the AGENT SANDBOX, not root-owned cache files, and npm\'s "cache '
+                'folder contains root-owned files ... sudo chown -R 1000:1000 '
+                '/home/leo/.npm" text is npm\'s generic EACCES advice, NOT a '
+                'diagnosis.',
+                id='6a02360d-correct-diagnosis-correction-5-hits',
+            ),
+            pytest.param(
+                'In dark-factory worktrees, `npx pyright` fails with an EACCES npm '
+                'cache error (root-owned files in ~/.npm/_cacache). The supported '
+                'invocation is `uv run pyright` run FROM each package directory '
+                '(e.g. `cd orchestrator && uv run pyright`), which is exactly what '
+                'the pre-commit hook `hooks/project-checks` does.',
+                id='3df6017f-tilde-npm-path-3-hits',
+            ),
+            pytest.param(
+                'Also: `npx pyright` can fail with an npm cache permission error on '
+                '/home/leo/.npm — work around it with '
+                '`npm_config_cache=/tmp/npm-cache-<task> npx pyright`, and filter '
+                'out `^npm notice` lines before piping to `tail` or they swallow '
+                "pyright's own summary line.",
+                id='c9afcce3-secondary-mention-no-eacces-3-hits',
+            ),
+            pytest.param(
+                'Also: `npx pyright` can fail with EACCES on a root-owned ~/.npm '
+                'cache in a sandboxed agent shell; `.venv/bin/pyright` is the same '
+                'version and works.',
+                id='1db61279-venv-binary-no-path-phrase-3-hits',
+            ),
+        ],
+    )
+    def test_matches_the_entries_in_gate_3417s_cluster(self, excerpt):
+        """Representative members of gate 3417's freshly re-scoped corpus.
+
+        Each excerpt is a CONTIGUOUS VERBATIM span of a member's stored
+        content, so the literal-substring convention stays auditable against
+        the corpus the seed was derived from.
+
+        Reviewer (test-proportionality, the task-3435 precedent): one case per
+        distinct HIT-PROFILE, not one per corpus entry -- the 21 members
+        collapse to 14 profiles, all of which were verified matching
+        out-of-band at derivation time, as the schema.py comment records.
+
+        Why these six specifically, all measured:
+        - dfdad23e sits exactly AT min_phrase_hits on
+          {'npx pyright', 'npm_config_cache'} and nothing else. It is the
+          profile that makes BOTH those phrases load-bearing: dropping either
+          one sinks this entry below threshold, and dropping any of the other
+          five sinks nobody. a883f914 is its exact profile-duplicate.
+        - a0c39676 is the harmful chown-REGRESSION entry -- it prescribes the
+          no-op remedy as "the permanent fix". It is the sole member of its
+          profile, and the only chown-prescribing entry that names NEITHER
+          'EACCES' nor '_cacache', so it matches purely on the symptom+remedy
+          vocabulary. This is the case that proves a diagnosis-keyed phrase
+          set would have missed exactly the writes worth catching.
+        - 6a02360d is the correct-diagnosis CORRECTION entry. Together with
+          a0c39676 above it demonstrates the design claim: ONE symptom-keyed
+          phrase set catches both sides of a corpus that contradicts itself.
+          The full entry is the 7-hit maximum (shared with f9c9ea2a); this
+          contiguous opening span scores 5, which is the auditable part.
+        - 3df6017f writes the cache path as `~/.npm/_cacache`, so
+          '/home/leo/.npm' does NOT fire -- it is caught by '_cacache'. Pins
+          that the seed handles both spellings of the same path.
+        - c9afcce3 is a SECONDARY member: the EACCES material is an aside in a
+          note about per-subproject pyright scope, and neither 'EACCES' nor
+          '_cacache' appears literally.
+        - 1db61279 is the sole profile reaching threshold via
+          '.venv/bin/pyright' + 'EACCES' with no path or cache phrase at all.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'gate 3417 corpus excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_routes_here_rather_than_to_an_earlier_cluster(self):
+        # Seeded LAST, and find_matching_topic_cluster returns the FIRST
+        # qualifying cluster in a single pass over list order, so this cluster
+        # can only catch what the six earlier ones miss and can never shadow
+        # them. The converse -- that an npx/pyright note is not swallowed
+        # upstream -- is what this pins: the eval-worktree-venv-shadowing
+        # cluster is the plausible upstream catcher (it once carried a bare
+        # 'pyright' phrase, narrowed away precisely for over-matching), so
+        # assert the resolved topic_id, not merely that something matched.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'In a dark-factory task worktree, `npx pyright <dir>` can fail with '
+            '`npm error code EACCES` against /home/leo/.npm/_cacache. Workaround '
+            'needing no sudo: prefix with a writable cache dir, e.g. '
+            '`npm_config_cache=/tmp/npm-cache-<task> npx pyright <dir>`.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == self.TOPIC_ID
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'To parse-check offline, use the esbuild binary already in the npx '
+                'cache, feeding the file on stdin (the --loader flag only applies '
+                'to stdin input): ESB=$(ls -d '
+                '~/.npm/_npx/*/node_modules/esbuild/bin/esbuild | head -1)',
+                id='f0225474-esbuild-npx-cache-0-hits',
+            ),
+            pytest.param(
+                'Run type checks per package rather than repo-wide: `cd '
+                'fused-memory && uv run pyright`, then the same in orchestrator/ '
+                'and dashboard/. Each package carries its own [tool.pyright] '
+                'block. Plan steps that say `npx pyright` should be executed this '
+                'way instead.',
+                id='per-package-pyright-convention-1-hit',
+            ),
+            pytest.param(
+                'In the docker CI image the build step fails because the mounted '
+                'cache folder contains root-owned files written by an earlier '
+                'container run as root, so the unprivileged build user hits '
+                'EACCES. Fix it in the compose file by chowning the mount to the '
+                'build uid on entry.',
+                id='generic-docker-ci-root-owned-cache-1-hit',
+            ),
+            pytest.param(
+                'orchestrator.agents.write_set.compute_write_set is the single '
+                "source (PRD D11 / INV-5) for an agent's writable paths; its "
+                'contract grants the worktree, /tmp and ~/.cache/uv. Adding a path '
+                'widens the FINAL-WRITABLE-LIST and changes write_set.digest() for '
+                'every invocation.',
+                id='compute-write-set-uv-cache-0-hits',
+            ),
+        ],
+    )
+    def test_does_not_match_unrelated_npm_cache_or_pyright_notes(self, note):
+        """Each note reaches at most 1 distinct hit, so it must NOT be blocked.
+
+        The docker/CI note is the load-bearing one: it is WHY bare
+        'root-owned' and the verbatim npm string 'cache folder contains
+        root-owned files' were both rejected as phrases. Measured -- adding
+        either raises this note to 2 hits, soft-blocking a generic
+        toolchain-cache EACCES observation and mis-routing it to gate 3417.
+        Memory f9c9ea2a makes the hazard concrete by explicitly distinguishing
+        the pump-web-ui / know-live toolchain-cache EACCES entries as a
+        DIFFERENT failure class; this note stands in for them. Pinning it here
+        means a future tuner who re-adds those phrases gets a red test rather
+        than a silent widening.
+        """
+        assert find_matching_topic_cluster(note, [self._cluster()]) is None
+
+    def test_known_residual_excluded_offline_hang_entry_matches(self):
+        """Entry 37743789 matches even though gate 3417 EXCLUDES it. Accepted.
+
+        This is NOT a defect and NOT a regression. 3417 singles 37743789 out
+        as a DISTINCT root cause -- a sandboxed network-fetch hang, fixed with
+        `npx --offline`, not the write-set omission -- so it is deliberately
+        outside the consolidation. It matches anyway (4 hits, measured)
+        because its FIRST symptom is literally the same npm EACCES symptom
+        this cluster is keyed on, and the matcher has no negative-phrase arm
+        to say "except when the note is really about a hang".
+
+        Accepted rather than tuned away because every alternative is worse.
+        No phrase can separate them: the discriminating vocabulary ('--offline',
+        'network fetch') appears only in the EXCLUDED entry, so keying on it
+        would invert the guard. And the cost is small -- the block is SOFT,
+        overridable with metadata={'allow_near_duplicate': True}, and it routes
+        the writer to 3417, whose description documents this very exclusion.
+        So a writer lands on the right reading rather than a lost write.
+
+        Pinned so the boundary is executable: a future tuner narrowing the
+        phrase list can tell 'intended residual' from 'regression'.
+        """
+        excerpt = (
+            'Debugger gotcha (distinct from venv-provisioning races): running the '
+            'orchestrator TYPE gate `npx pyright` MANUALLY through the Claude Code '
+            'Bash sandbox fails/hangs where the merge-verify harness (unsandboxed) '
+            'passes. First symptom is an npm-cache write-permission error ("npm '
+            'error ... please run: sudo chown -R 1000:1000 /home/leo/.npm") because '
+            'the sandbox blocks writes to ~/.npm outside the worktree; retrying '
+            'with a worktree-local cache still HANGS (>7min timeout) because npx '
+            'attempts a network fetch of the pinned pyright build. Workaround that '
+            'resolves cleanly to "0 errors": warm the cache once (`env '
+            'npm_config_cache=<worktree>/.task/npm-cache npx --offline pyright '
+            '--version`).'
+        )
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, (
+            'residual documented in schema.py no longer holds for the 37743789 '
+            'offline-hang entry -- if this was deliberate, update the ACCEPTED '
+            'RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_known_residual_pyright_version_pin_note_matches(self):
+        """A pyright version-pin note matches (2 hits). Judged ON-TOPIC.
+
+        Unlike the 37743789 residual above, this one is not a reluctant
+        acceptance -- it is the desired routing. Gate 3417's steward addendum
+        explicitly wants the version-inequivalence detail folded into the
+        canonical entry, because it CORRECTS member 1db61279's claim that
+        `.venv/bin/pyright` "is the same version" as `npx pyright`. It is not.
+        The pre-commit hook pins pyright-python at 1.1.408 while the verify
+        lane's unpinned `npx pyright` resolved 1.1.411 (member 604ed99f).
+
+        So a writer recording that correction SHOULD be routed to 3417 rather
+        than opening a 22nd standalone entry -- which is exactly what the soft
+        block does. Pinned so it is not mistaken for a false positive and
+        tuned away.
+        """
+        note = (
+            'Version note: /home/leo/src/dark-factory/.venv/bin/pyright is pinned '
+            'at 1.1.408 (pyright-python) while `npx pyright` resolves the unpinned '
+            'latest, 1.1.411 as of 2026-08-06. They are NOT the same version, so a '
+            'claim that the venv binary is "the same version" is wrong.'
+        )
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            'residual documented in schema.py no longer holds for the pyright '
+            'version-pin note -- if this was deliberate, update the ACCEPTED '
+            'RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
 
 class TestWriteTriageConfig:
     """The write-triage band thresholds (task 3130, PRD leaf alpha).
