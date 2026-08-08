@@ -1604,6 +1604,8 @@ async def _run_architect_eval_hermetic(
     orch_config_side_effect=None,
     task_override=None,
     reference_diff: str = '--- a/x\n+++ b/x\n+ landed change\n',
+    usage_gate=None,
+    usage_gate_error=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1641,7 +1643,34 @@ async def _run_architect_eval_hermetic(
     ``get_diff_between_commits`` returns — both defaulting to today's hardcoded
     values so every existing caller keeps byte-identical behavior. Together
     they drive the ``judged_without_reference`` cases (task 3628).
+    Usage-gate control (eval-revival φ, task 3630). ``build_eval_orch_config``
+    is patched to return an anonymous MagicMock, so ``.usage_cap.enabled`` would
+    be a TRUTHY Mock attribute — which, once ``run_architect_eval`` builds a
+    gate, would have every one of this file's pre-existing call sites construct
+    a REAL ``UsageGate`` out of a mock config (``_init_accounts`` +
+    ``_sweep_stale_probe_dirs_once`` touch the filesystem, and whether the
+    constructor raises would be undefined). So ``.usage_cap`` is pinned to a
+    REAL ``UsageCapConfig(enabled=False)``: every existing test stays on the
+    gate-ABSENT path, which is byte-identical to pre-φ behaviour AND is itself a
+    real production configuration, so their assertions keep exactly the meaning
+    they had.
+
+    The new gate behaviours are then opt-in and explicit rather than an accident
+    of MagicMock truthiness:
+
+    - ``usage_gate=<gate>``: flips ``usage_cap.enabled`` on and patches
+      ``runner.UsageGate`` to a factory returning THIS gate. Exposed as
+      ``mocks['UsageGate']`` (the factory) and ``mocks['gate']`` (the gate).
+    - ``usage_gate_error=<exc>``: flips ``usage_cap.enabled`` on and patches
+      ``runner.UsageGate`` to RAISE it — the construction-failure /
+      warn-and-degrade path.
+
+    ``shared.cli_invoke.asyncio.sleep`` is patched unconditionally (the
+    ``_SLEEP_PATCH`` idiom from shared/tests/test_cap_retry.py:224) so cap-retry
+    cooldowns never really sleep; exposed as ``mocks['sleep']``.
     """
+    from shared.config_models import UsageCapConfig
+
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
 
@@ -1666,9 +1695,30 @@ async def _run_architect_eval_hermetic(
     mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
     mock_verify = AsyncMock()
     mock_save = MagicMock()
+    mock_sleep = AsyncMock()
+
+    # NOT named *_config/*_cfg on purpose: this is the anonymous stand-in for
+    # build_eval_orch_config's RETURN value, and a bare MagicMock() bound to a
+    # config-named local is rejected by check_bare_magicmock_config.py. Only
+    # ``.usage_cap`` is pinned to a real model — every other attribute stays a
+    # permissive Mock, exactly as before.
+    orch_stub = MagicMock()
+    orch_stub.usage_cap = UsageCapConfig(enabled=False)
+    orch_stub.prices = orch_prices if orch_prices is not None else {}
+
+    gate_factory = None
+    if usage_gate is not None or usage_gate_error is not None:
+        orch_stub.usage_cap = UsageCapConfig(enabled=True)
+        gate_factory = (
+            MagicMock(side_effect=usage_gate_error) if usage_gate_error is not None
+            else MagicMock(return_value=usage_gate)
+        )
 
     with contextlib.ExitStack() as es:
         p = es.enter_context
+        if gate_factory is not None:
+            p(patch('orchestrator.evals.runner.UsageGate', gate_factory))
+        p(patch('shared.cli_invoke.asyncio.sleep', mock_sleep))
         p(patch('orchestrator.evals.snapshots.create_eval_worktree',
                 AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
         p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock()))
@@ -1681,9 +1731,7 @@ async def _run_architect_eval_hermetic(
                 MagicMock(return_value=briefing_instance)))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
                 MagicMock(
-                    return_value=MagicMock(
-                        prices=orch_prices if orch_prices is not None else {},
-                    ),
+                    return_value=orch_stub,
                     side_effect=orch_config_side_effect,
                 )))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
@@ -1699,6 +1747,7 @@ async def _run_architect_eval_hermetic(
     return result, {
         'invoke': mock_invoke, 'verify': mock_verify,
         'save': mock_save, 'judge': mock_judge,
+        'sleep': mock_sleep, 'UsageGate': gate_factory, 'gate': usage_gate,
     }
 
 
