@@ -51,6 +51,7 @@ from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_arti
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
@@ -2760,12 +2761,11 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_dependencies(task: dict) -> list[str]:
-    deps = task.get('dependencies') or []
-    if isinstance(deps, str):
-        # CSV fallback
-        return [d.strip() for d in deps.split(',') if d.strip()]
-    return [str(d) for d in deps if d]
+# Task 3615: the CSV-tolerant dependency-id parse now lives in
+# fused_memory.utils.task_dependency_ids (shared with reconciliation/targeted.py).
+# Kept as a module-level alias so existing call sites and tests
+# (tests/test_task_curator.py::TestTaskDependencies) are untouched.
+_task_dependencies = task_dependency_ids
 
 
 def _task_metadata_spawned_from(task: dict) -> str | None:

@@ -33,6 +33,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
 # Defensive import — escalation is an optional workspace package (mirrors
@@ -715,8 +716,8 @@ class TargetedReconciler:
                 for t in all_tasks:
                     if not isinstance(t, dict):
                         continue
-                    deps = t.get('dependencies', [])
-                    if task_id in [str(d) for d in deps]:
+                    deps = task_dependency_ids(t)
+                    if task_id in deps:
                         all_deps_done = all(
                             any(
                                 str(dt.get('id')) == str(dep_id) and dt.get('status') == 'done'
@@ -1141,7 +1142,7 @@ class TargetedReconciler:
                 if isinstance(escalation_id_raw, str) and escalation_id_raw
                 else None
             )
-            deps = [str(d) for d in (t.get('dependencies') or [])]
+            deps = task_dependency_ids(t)
 
             is_spawn_from_parent = spawned_from_str == parent_id_str
             is_dependent = parent_id_str in deps
