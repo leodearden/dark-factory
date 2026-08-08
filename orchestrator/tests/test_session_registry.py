@@ -3185,6 +3185,108 @@ def test_main_write_decision_refuses_when_escalations_dir_omitted(
     assert sr.list_decisions(root=tmp_path) == []
 
 
+@pytest.mark.parametrize('blank', ['', '   '])
+def test_main_write_decision_refuses_an_explicitly_empty_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    blank: str,
+) -> None:
+    """argparse's required=True cannot see the loophole this closes.
+
+    ``--escalations-dir ''`` (or whitespace-only) SATISFIES a required flag
+    and would still produce the unstamped, cross-queue-ambiguous record the
+    verb now exists to refuse -- so the legacy population task 3640
+    back-filled would simply regrow through the loophole. The verb
+    therefore guards on the NORMALIZED stamp too, using the same
+    normalize_escalations_dir the reaper compares with (it already collapses
+    empty and whitespace-only to '').
+
+    Shape is this module's loud-but-fail-soft CLI idiom, matching
+    test_main_write_decision_fail_soft_when_fleet_root_under_a_file: rc 0
+    (filing a decision can never crash a watcher's watch loop), an ERROR
+    log, NOTHING written, and the id NOT echoed on stdout -- the absent id
+    is itself the agent-visible failure signal, since both SKILL.md files
+    tell the watcher to cross-link that printed id into its digest line.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-blankq',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                blank,
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path) == []
+    assert 'dec-blankq' not in capsys.readouterr().out
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    assert any('dec-blankq' in r.getMessage() for r in errors)
+
+
+def test_main_write_decision_refuses_the_unknown_queue_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``<unknown>`` is a BACK-FILL-only sentinel and is refused at this verb.
+
+    skills/escalation-watcher/SKILL.md states the contract outright of the
+    sentinel: "You never write it; task 3640's back-fill did". The reason it
+    must be ENFORCED here rather than merely documented is that an
+    UNKNOWN_QUEUE-stamped record is refused by EVERY reaper (the by-name
+    guard in _run_reap_decisions._status), so a watcher filing one creates a
+    record that only a human can ever close -- a regrowth strictly WORSE
+    than the unstamped '' population this task outlaws, which at least still
+    closes under project-only scoping.
+
+    There is no legitimate write-path caller: a watcher always knows its own
+    queue by construction, since it is the same dir it passes to
+    reap-decisions. The sentinel stays fully valid on the BACK-FILL path via
+    set_decision_escalations_dir, which is where task 3640 put it; this
+    refusal is scoped to the CLI verb alone.
+
+    Gets its OWN error message, distinct from the empty-stamp refusal, so
+    the log tells a watcher author which of the two mistakes they made.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-unkq',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                sr.UNKNOWN_QUEUE,
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path) == []
+    assert 'dec-unkq' not in capsys.readouterr().out
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    assert any(sr.UNKNOWN_QUEUE in r.getMessage() for r in errors)
+    assert any('dec-unkq' in r.getMessage() for r in errors)
+
+
 def test_main_write_decision_prints_filed_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
