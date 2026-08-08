@@ -1673,6 +1673,10 @@ class TestSeededStalenessSweep:
             source_id=successor_id, key='supersedes', target=predecessor_id,
             source_content=SEED_SUCCESSOR,
         ))
+        # items is Optional on the shared model (only a tripwire carries one),
+        # so assert it is populated before indexing rather than narrowing with
+        # a cast: an empty items list is itself a schema violation here.
+        assert tripwire.items
         matching = [item for item in tripwire.items if item.item_key == seeded_key]
         assert len(matching) == 1
         assert matching[0].passed is True
