@@ -68,6 +68,22 @@ _TOPIC_CLUSTER_DEFAULT_HINT = (
 )
 
 
+def _cosine_of(r: MemoryResult) -> float | None:
+    """Read the per-store cosine a search result carries, or ``None``.
+
+    Since task 3658 ``MemoryService.search`` puts the honest per-store
+    similarity in ``metadata['store_score']`` (the Mem0 cosine; ``None`` for
+    Graphiti, which exposes no scores).  Uses the same defensive coercion as
+    :func:`resolve_near_dup_threshold` — ``bool`` is excluded despite being an
+    ``int`` subclass, as is any attribute an unspecced test double might
+    auto-generate — so a non-measurement can never be read as a similarity.
+    """
+    value = (r.metadata or {}).get('store_score')
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def find_near_duplicate_memory(
     results: list[MemoryResult],
     threshold: float,
@@ -77,11 +93,21 @@ def find_near_duplicate_memory(
 ) -> MemoryResult | None:
     """Select the best near-duplicate candidate from already-fetched *results*.
 
-    Returns the highest ``relevance_score`` result that matches *category*
-    and *source_store* and whose ``relevance_score >= threshold``, or
+    Returns the result with the highest per-store COSINE that matches
+    *category* and *source_store* and whose cosine is ``>= threshold``, or
     ``None`` if no result qualifies. Defensively filters out results with a
     mismatched category or source_store even when their score is high —
     callers may pass unfiltered/mixed search results.
+
+    The cosine is read from ``metadata['store_score']`` (see :func:`_cosine_of`),
+    **not** from ``relevance_score`` — which since task 3658 is an ordinal RRF
+    fusion value (single-store rank-1 ~ 0.0164) and would never clear a 0.92
+    cosine threshold, silently disabling this guard for every input.
+
+    A result carrying no numeric ``store_score`` — a Graphiti result, where it
+    is ``None``, or any result predating the stamping — can never qualify, at
+    any threshold. A missing cosine means "not comparable", which is not the
+    same as a measured similarity of 0.0 that a low threshold might clear.
 
     Pure and synchronous: does no I/O and raises nothing on empty input.
     """
@@ -90,11 +116,13 @@ def find_near_duplicate_memory(
         for r in results
         if r.category == category
         and r.source_store == source_store
-        and r.relevance_score >= threshold
+        and (cosine := _cosine_of(r)) is not None
+        and cosine >= threshold
     ]
     if not qualifying:
         return None
-    return max(qualifying, key=lambda r: r.relevance_score)
+    # Every qualifying result has a non-None cosine by construction above.
+    return max(qualifying, key=lambda r: _cosine_of(r) or 0.0)
 
 
 def find_matching_topic_cluster(
