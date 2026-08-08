@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -193,6 +194,93 @@ def _iter_tool_result_blocks(
             if isinstance(block, dict) and block.get('type') == 'tool_result':
                 found.append((index, block))
     return found
+
+
+EXIT_CODE_PATTERN = re.compile(
+    r'exit\s*=\s*(\d+)|exit\s+code\s+(\d+)|exit\s+status\s+(\d+)',
+    re.IGNORECASE,
+)
+"""The three exit-code spellings observed in tool_result content: the
+machine-readable ``exit=<rc>`` form emitted by scripts/watcher-rearm.sh
+(:228-237) and the two prose forms ('exit code N', 'exit status N') shells
+and harness wrappers produce. Case-insensitive, like every other pattern in
+this module."""
+
+BOUNDED_WAIT_EXIT_CODE = 124
+"""``timeout(1)``'s ceiling exit -- the status it returns when the command
+was still running when the time limit expired (as opposed to the command's
+own status). In this repo a 124 is overwhelmingly produced by a deliberately
+bounded poll or wait, not by a broken command."""
+
+
+def _extract_exit_code(text: str) -> int | None:
+    """Return the FIRST exit code mentioned in *text*, or None.
+
+    First-match-wins is deliberate: a tool_result that reports several codes
+    leads with the outcome of the invocation being reported (the watcher's
+    own ``exit=<rc>`` marker precedes any retry chatter), so the leading code
+    is the one that classifies the result.
+    """
+    match = EXIT_CODE_PATTERN.search(text)
+    if match is None:
+        return None
+    return int(next(g for g in match.groups() if g is not None))
+
+
+DESIGNED_OUTCOME_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r'WATCHER_REARM_OUTCOME:\s*(CEILING|FIRED)\b', re.IGNORECASE),
+        'watcher-rearm-declared',
+    ),
+)
+"""Table of (compiled regex, label) pairs recognising a self-DECLARED
+designed outcome, so a future contract is a one-line addition.
+
+Seeded with scripts/watcher-rearm.sh's marker (:228-237), which emits four
+outcomes and means different things by them: FIRED (exit=0, :228) and
+CEILING (exit=124, :231) are designed loop-continuation outcomes, while
+KILLED (137|143|144, :234) and ERROR (the catch-all, :237) are REAL
+failures. Only the first two are matched here -- deliberately. Suppressing
+all four because they share a marker token would trade one over-count for
+an under-count and hide genuine watcher breakage, the opposite of the
+07-31 census cluster 1.3 finding's intent.
+
+Two traps documented in that script's header (:52-73) bound what this
+table can be relied on to mean:
+  * usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, unresolved
+    queue dir, bad flag) return BEFORE the watcher is ever invoked and emit
+    NO marker at all (:59-63), so absence of a marker is NOT absence of
+    failure -- which is why a bare exit code still classifies below.
+  * a SIGTERM delivered to the watcher is converted to a clean exit 0 by
+    its own handler, surfacing as ``FIRED exit=0`` with EMPTY stdout
+    (:66-73). It is still a designed outcome by the shell contract; a
+    caller needing to know whether an escalation actually fired must check
+    stdout, which is beyond what a digest signal tally can see.
+"""
+
+
+def classify_designed_outcome(content: str, exit_code: int | None) -> str | None:
+    """Return a label when a structured error is a DESIGNED outcome, else None.
+
+    Two tiers, most authoritative first:
+      1. a machine-readable self-declaration matching DESIGNED_OUTCOME_PATTERNS;
+      2. a bare BOUNDED_WAIT_EXIT_CODE with no declaration at all.
+    The label differs per tier so a digest reader can tell which rule fired.
+
+    Tier 2 is a deliberate precision/recall tradeoff, and a deliberately
+    cheap one to be wrong about: misclassifying a genuine un-designed
+    timeout as designed costs exactly one weight-1.0 noise signal
+    (tool_error is joint-lowest in SIGNAL_WEIGHTS) and never a gold user
+    turn. Tightening to declaration-only, should a future census show real
+    suppressions, is deleting the tier-2 branch -- the table above is what
+    keeps the decision reversible rather than diffuse.
+    """
+    for pattern, label in DESIGNED_OUTCOME_PATTERNS:
+        if pattern.search(content):
+            return label
+    if exit_code == BOUNDED_WAIT_EXIT_CODE:
+        return 'bounded-wait-ceiling'
+    return None
 
 
 def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
