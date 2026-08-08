@@ -292,6 +292,14 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
     assistant's attempt is via ``tool_use_id``; an unmatched id (e.g. the
     attempt was truncated off the front of the transcript window) degrades
     to None attempt fields rather than raising.
+
+    Returns EVERY structured error -- this is the single scan and the single
+    source of truth. Each neighborhood is enriched with ``exit_code`` and
+    ``designed_outcome`` (see :func:`classify_designed_outcome`) so callers
+    can partition without rescanning; :func:`iter_genuine_errors` and
+    :func:`iter_designed_outcomes` are those partitions. Classification
+    reads only the structured ``is_error`` flag plus the already-extracted
+    content, never a fresh substring hunt that could resurrect a decoy.
     """
     attempts_by_id = {
         block.get('id'): block
@@ -303,15 +311,48 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
         if not block.get('is_error'):
             continue
         attempt = attempts_by_id.get(block.get('tool_use_id'))
+        error_content = _content_to_text(block.get('content'))
+        exit_code = _extract_exit_code(error_content)
         neighborhoods.append({
             'index': index,
             'attempt_tool': attempt.get('name') if attempt else None,
             'attempt_input_summary': (
                 _summarize_input(attempt.get('input')) if attempt else None
             ),
-            'error_content': _content_to_text(block.get('content')),
+            'error_content': error_content,
+            'exit_code': exit_code,
+            'designed_outcome': classify_designed_outcome(error_content, exit_code),
         })
     return neighborhoods
+
+
+def iter_genuine_errors(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The neighborhoods that are REAL failures (``designed_outcome`` None).
+
+    One half of a total, lossless partition of
+    :func:`iter_error_neighborhoods`; the other half is
+    :func:`iter_designed_outcomes`. This is what ``signal_counts``
+    tallies as ``tool_error``.
+    """
+    return [
+        n for n in iter_error_neighborhoods(records)
+        if n['designed_outcome'] is None
+    ]
+
+
+def iter_designed_outcomes(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The neighborhoods that are DESIGNED outcomes, not failures.
+
+    The complement of :func:`iter_genuine_errors` over
+    :func:`iter_error_neighborhoods` -- together the two are total and
+    lossless. Reported under its own ``designed_outcome`` count and its own
+    digest section rather than discarded: the 07-31 census still needs to
+    see that 13 bounded-wait ceilings occurred, just not as errors.
+    """
+    return [
+        n for n in iter_error_neighborhoods(records)
+        if n['designed_outcome'] is not None
+    ]
 
 
 SELF_CORRECTION_PATTERNS: tuple[str, ...] = (
