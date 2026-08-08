@@ -477,6 +477,116 @@ def assert_verdict_table_covers(
     )
 
 
+# Every site this module pins, and WHAT is pinned there. Registration means "this
+# file's relationship to the family is mechanized", not "this file enumerates" —
+# CONTRIBUTING.md is registered precisely because it must enumerate NOTHING.
+# `test_every_enumeration_site_is_pinned` checks this registry against a scan, so
+# it cannot quietly fall behind the repo the way the prose sites did.
+PINNED_SITES = {
+    "docs/legibility/design-invariants.md": (
+        "SOURCE OF TRUTH — its `## INV-N `slug`` headings define the family; its "
+        "two live family-size claims are pinned inside `inv-family-claim-*` spans"
+    ),
+    "docs/legibility/design-invariants-fixtures.md": (
+        "one fixture section per invariant, plus the rehearsal verdict table "
+        "pinned for COVERAGE (never for its snapshot rationale prose)"
+    ),
+    "skills/prd/references/gates.md": (
+        "two independent enumerations — the family-inventory row (ordered) and "
+        "the `inv-trigger-shapes` G7 fallback span (set)"
+    ),
+    "CONTRIBUTING.md": (
+        "pinned as an ABSENCE: zero restated slugs, no cardinal family count in "
+        "§6, and a live pointer at the normative doc in its place"
+    ),
+}
+
+# Four distinct slugs is an enumeration, not a discussion. Below it sit the docs
+# that legitimately reference an invariant or two by name (skills/prd's
+# decompose-mode.md and skills/review's phase2-architecture.md each name exactly
+# one), which must stay unregistered — a threshold that flagged them would train
+# readers to register files to silence the guard.
+_ENUMERATION_THRESHOLD = 4
+
+_SCAN_ROOTS = ("*.md", "docs/legibility/**/*.md", "skills/**/*.md")
+
+# Point-in-time record trees. Their PRDs and capability manifests transcribe
+# slugs as G7 walk records of the family AS IT WAS, and must not be retro-edited
+# when it changes (a scan measured fourteen such files at 5-7 slugs each). The
+# filter is applied to the scan result rather than assumed from the roots above,
+# so widening a root later cannot silently pull the records back in.
+_EXCLUDED_TREES = ("plans", "docs/prds")
+
+_EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
+
+
+def _scan_label(path: Path) -> str:
+    """A registry-comparable label: repo-relative in the repo, absolute outside it.
+
+    The fallback is for this module's own unit tests, which scan hand-written
+    fixture files under ``tmp_path``. Those deliberately do not live in the repo —
+    a fixture that enumerated the family from inside the scan roots would turn the
+    live assertion red on this guard's own test data.
+    """
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _enumeration_scan_files() -> list[Path]:
+    """Every markdown file the registry-completeness scan is responsible for."""
+    found = {
+        path
+        for root in _SCAN_ROOTS
+        for path in REPO_ROOT.glob(root)
+        if path.is_file() and not _in_excluded_tree(path)
+    }
+    return sorted(found)
+
+
+def _in_excluded_tree(path: Path) -> bool:
+    parts = path.relative_to(REPO_ROOT).parts
+    return any(parts[: len(tree)] == tree for tree in _EXCLUDED_TREE_PARTS)
+
+
+def unregistered_enumeration_sites(
+    files: list[Path],
+    registry: dict[str, str],
+    family: list[tuple[int, str]],
+    *,
+    threshold: int,
+) -> list[str]:
+    """Files restating `threshold`+ DISTINCT slugs of `family` that `registry` omits.
+
+    Loud on an empty scan or an empty family rather than returning ``[]``: an
+    empty result is this guard's strongest possible verdict ("every enumeration
+    site is pinned"), and a broken glob or an unparsed family would report it
+    while having compared nothing at all.
+    """
+    assert files, (
+        "the enumeration scan received no files to check (task 3802) — an empty "
+        "scan returns an empty result, which is indistinguishable from `every "
+        "enumeration site is pinned`. Check the scan roots."
+    )
+    assert family, (
+        "the enumeration scan received an empty invariant family (task 3802) — "
+        "with no slugs to look for, no file can ever clear the threshold and the "
+        "scan passes vacuously."
+    )
+
+    slugs = [slug for _, slug in family]
+    unregistered = []
+    for path in sorted(files):
+        label = _scan_label(path)
+        if label in registry:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if len({slug for slug in slugs if slug in text}) >= threshold:
+            unregistered.append(label)
+    return unregistered
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------
