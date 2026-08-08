@@ -53,6 +53,7 @@ edit; the live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,96 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
+
+# A family this small would mean the normative doc stopped parsing, not that
+# dark-factory shrank its invariant list: eight are landed and none has ever been
+# retired. The floor is a NON-VACUITY guard on every comparison downstream, kept
+# well below the live count so a deliberate retirement does not go red spuriously.
+_MINIMUM_FAMILY_SIZE = 5
+
+# The one structural shape that defines family membership. `##` exactly (a `###`
+# sub-heading is a fixture shape in the fixtures doc, not an invariant), a bare
+# integer, and a backticked lowercase-kebab slug to end of line.
+_HEADING_RE = re.compile(r"^## INV-(\d+) `([a-z0-9][a-z0-9-]*)`$", re.MULTILINE)
+
+
+def parse_invariant_headings(md_text: str, *, source: str) -> list[tuple[int, str]]:
+    """The ordered ``(number, slug)`` family declared by *md_text*'s headings.
+
+    Every failure is a loud ``AssertionError`` naming *source* and the specific
+    defect, never an empty list. That is the whole contract: an extractor that
+    silently yields nothing turns every downstream drift assertion into an
+    empty-vs-empty comparison that PASSES while pinning nothing — strictly worse
+    than no guard, because the suite still reports success. *source* is named
+    because one extractor parses several docs, so "which doc broke" is not
+    recoverable from the traceback.
+
+    Duplicates are checked BEFORE contiguity: a doubled number (1, 2, 2) is a
+    duplicate, not a numbering gap, and the message a reader gets should say so.
+    """
+    pairs = [(int(number), slug) for number, slug in _HEADING_RE.findall(md_text)]
+    assert pairs, (
+        f"{source}: no `## INV-N `slug`` headings found at all (task 3802). This "
+        f"guard derives the whole invariant family from those headings, so an "
+        f"empty parse would silently turn every other site's drift check into a "
+        f"vacuous pass. Either the heading shape changed (it must be `## INV-<n> "
+        f"`<lower-kebab-slug>`` on its own line) or the wrong file was read."
+    )
+
+    numbers = [number for number, _ in pairs]
+    slugs = [slug for _, slug in pairs]
+
+    duplicate_numbers = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicate_numbers, (
+        f"{source}: duplicate number(s) {duplicate_numbers} among the invariant "
+        f"headings {pairs} (task 3802) — two sections claim the same INV-N alias, "
+        f"so any by-number reference is ambiguous. Renumber one of them."
+    )
+
+    duplicate_slugs = sorted({s for s in slugs if slugs.count(s) > 1})
+    assert not duplicate_slugs, (
+        f"{source}: duplicate slug(s) {duplicate_slugs} among the invariant "
+        f"headings {pairs} (task 3802). Slugs are the STABLE ids referenced by G7 "
+        f"waivers, `/review`'s invariant_findings and the confusion census's "
+        f"invariant_violated field, so two headings sharing one makes every "
+        f"by-slug lookup ambiguous. Give each invariant its own slug."
+    )
+
+    expected = list(range(1, len(numbers) + 1))
+    assert numbers == expected, (
+        f"{source}: invariant numbers {numbers} are not contiguous from 1 "
+        f"(expected {expected}) (task 3802). Numeric aliases are prose "
+        f"convenience over a contiguous 1..N range; a gap or an offset start "
+        f"means an invariant was removed or the doc was truncated mid-read, and "
+        f"either way the family this guard compares every other site against is "
+        f"not the one the doc means."
+    )
+    return pairs
+
+
+def _repo_relative(path: Path) -> str:
+    """A repo-relative label for assertion messages, so a red run names the file."""
+    return str(path.relative_to(REPO_ROOT))
+
+
+def canonical_family() -> list[tuple[int, str]]:
+    """The ordered family, parsed fresh from the normative doc on EVERY call.
+
+    Deliberately not a module constant or a cached snapshot: a stored slug list
+    in this file would be one more lock-step copy — the very INV-5 violation this
+    guard enforces — and would go stale on the next invariant exactly like the
+    prose sites did. Parsing at call time is what makes the source of truth
+    auto-extend: adding INV-9 to the doc immediately turns every unpinned site
+    red until it is updated.
+    """
+    return parse_invariant_headings(
+        NORMATIVE_DOC.read_text(encoding="utf-8"), source=_repo_relative(NORMATIVE_DOC)
+    )
+
+
+def canonical_slugs() -> list[str]:
+    """The family's slugs in canonical (INV-1..INV-N) order."""
+    return [slug for _, slug in canonical_family()]
 
 
 # ---------------------------------------------------------------------------
@@ -222,3 +313,69 @@ def test_parse_invariant_headings_fails_loudly(
     message = str(excinfo.value)
     assert _FIXTURE_SOURCE in message, f"{case}: message must name the source doc: {message!r}"
     assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
+
+
+# ---------------------------------------------------------------------------
+# LIVE: the normative doc parses, and the fixtures doc's sections match it
+# ---------------------------------------------------------------------------
+
+
+def test_normative_doc_parses_to_a_contiguous_unique_family() -> None:
+    """The real design-invariants.md yields a usable family — the vacuity floor.
+
+    Contiguity and uniqueness are already enforced inside the extractor; what
+    this adds is the SIZE floor. Every other assertion in this module compares
+    some site against ``canonical_family()``, so a doc that stopped parsing (a
+    heading-style edit, a move) would otherwise make them all pass while pinning
+    nothing. The floor sits well below the eight landed invariants so a
+    deliberate retirement does not go red spuriously.
+    """
+    family = canonical_family()
+
+    assert len(family) >= _MINIMUM_FAMILY_SIZE, (
+        f"{_repo_relative(NORMATIVE_DOC)} parsed to only {len(family)} invariant(s) "
+        f"{family} (task 3802), below the non-vacuity floor of "
+        f"{_MINIMUM_FAMILY_SIZE}. Every cross-site check in this module is "
+        f"relative to this family, so a truncated parse would silently pin "
+        f"nothing. Check the `## INV-N `slug`` heading shape in that doc."
+    )
+
+
+def test_fixtures_doc_sections_match_the_normative_family() -> None:
+    """Every invariant has a calibration-fixture section, and no orphans exist.
+
+    ``docs/legibility/design-invariants-fixtures.md`` carries one ``## INV-N
+    `slug``` section per invariant. That correspondence does NOT auto-extend —
+    it is hand-maintained — so a new invariant lands with no seeded violations to
+    calibrate the G7 / Step-5.5 walk against, and a retired one leaves a section
+    referencing a slug no gate will ever emit. Compared as an ordered list, since
+    both docs number their sections and disagreeing order means one of them
+    renumbered without the other.
+    """
+    normative = canonical_family()
+    fixtures = parse_invariant_headings(
+        FIXTURES_DOC.read_text(encoding="utf-8"), source=_repo_relative(FIXTURES_DOC)
+    )
+
+    missing = [pair for pair in normative if pair not in fixtures]
+    extra = [pair for pair in fixtures if pair not in normative]
+    assert not missing and not extra, (
+        f"{_repo_relative(FIXTURES_DOC)} has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  MISSING fixture section(s) (invariant exists, nothing calibrates the "
+        f"walk against it): {missing}\n"
+        f"  ORPHAN fixture section(s) (fixture exists for no current invariant): "
+        f"{extra}\n"
+        f"  normative: {normative}\n"
+        f"  fixtures:  {fixtures}\n"
+        f"Add a `## INV-N `slug`` section with a PRD-leaf-shaped and a "
+        f"code-snippet-shaped seeded violation for each missing invariant, or "
+        f"delete the orphan section."
+    )
+    assert fixtures == normative, (
+        f"{_repo_relative(FIXTURES_DOC)}'s sections carry the same invariants as "
+        f"{_repo_relative(NORMATIVE_DOC)} but in a different ORDER (task 3802):\n"
+        f"  normative: {normative}\n"
+        f"  fixtures:  {fixtures}\n"
+        f"One doc renumbered without the other."
+    )
