@@ -26,6 +26,7 @@ from shared.toolcall_markup import (
     MCP_MARKUP_PATTERNS,
     PARAMETER_CLOSER_NAMES,
     PREFILTER_NEEDLES,
+    Repair,
     closer_for,
     detect,
     repair,
@@ -180,6 +181,40 @@ _ADD_MEMORY_PARAMS = frozenset(
 _UPDATE_MEMORY_PARAMS = frozenset({'memory_id', 'content', 'project_id', 'agent_id'})
 
 
+def assert_repair_invariants(value: object, result: Repair | None) -> None:
+    """Assert PRD section 4 C1's D5 structural invariants for one repair.
+
+    NON-CIRCULAR BY CONSTRUCTION — which is why the committed-corpus replay
+    (``test_toolcall_markup_corpus.py``) imports this exact function rather
+    than re-deriving it. Both properties hold or fail independently of what any
+    expectation column says, so unlike the machine-generated ``expected_outcome``
+    they can actually falsify the repairer:
+
+    * ``clean_value`` is a PREFIX of the input — the repairer never invents or
+      reorders caller text;
+    * every recovered value is a VERBATIM SUBSTRING of the input — the repairer
+      never synthesises a value;
+    * ``misclose`` sits exactly at the prefix boundary, so the three fields
+      describe one consistent cut of the input rather than three guesses.
+
+    ``None`` (unrepairable) satisfies all three trivially and is accepted, so a
+    caller can pass any result through unconditionally.
+    """
+    if result is None:
+        return
+    assert isinstance(value, str), 'a Repair can only come from a str input'
+    assert value.startswith(result.clean_value), (
+        'D5 violated: clean_value is not a prefix of the input'
+    )
+    for name, recovered_value in result.recovered.items():
+        assert recovered_value in value, (
+            f'D5 violated: recovered {name!r} is not a verbatim substring of the input'
+        )
+    assert value[len(result.clean_value):].startswith(result.misclose), (
+        'D5 violated: misclose does not sit at the clean_value boundary'
+    )
+
+
 class TestRepairSpecimens:
     """The four PRD section 2.1 specimens, hand-authored (step 3/4).
 
@@ -215,6 +250,7 @@ class TestRepairSpecimens:
         )
 
         assert result is not None
+        assert_repair_invariants(value, result)
         assert result.clean_value == clean
         assert result.recovered == {
             'priority': 'medium',
@@ -242,6 +278,7 @@ class TestRepairSpecimens:
         )
 
         assert result is not None
+        assert_repair_invariants(value, result)
         assert result.clean_value == clean
         assert result.recovered == {'priority': 'low'}
         assert result.pattern == _closer('description')
@@ -265,6 +302,7 @@ class TestRepairSpecimens:
         )
 
         assert result is not None
+        assert_repair_invariants(value, result)
         assert result.clean_value == clean
         assert result.recovered == {}
         assert result.pattern == _closer('content')
@@ -293,6 +331,7 @@ class TestRepairSpecimens:
         )
 
         assert result is not None
+        assert_repair_invariants(value, result)
         assert result.clean_value == clean
         assert result.recovered == {'agent_id': 'escalation-watcher-l2'}
         assert result.pattern == _CANONICAL_CLOSER
@@ -323,6 +362,220 @@ class TestRepairSpecimens:
         )
 
         assert result is not None
+        assert_repair_invariants(value, result)
         assert result.misclose == _closer('rationale')
         assert result.pattern == INVOKE_CLOSER
         assert result.recovered == {'agent_id': 'claude-interactive'}
+
+
+class TestRepairRefuses:
+    """The refusal boundary (step 5/6). Never guess — PRD section 4 C2.
+
+    Every case here parses far enough to be tempting. The point of the contract
+    is that "far enough" is not the accept condition: a candidate that fails ANY
+    of the three conditions is discarded whole and the scan advances, so there
+    is no code path that emits a PARTIAL repair.
+    """
+
+    def test_b8_recovered_name_outside_the_schema_is_refused(self):
+        """Boundary row B8 — the tail parses, but the name is not a parameter.
+
+        A clean parse of a name the tool does not have means the drift was into
+        something that is not a dropped argument. Recovering it would inject an
+        argument the tool never declared.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('nonesuch') + 'whatever' + _closer('nonesuch')
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
+    def test_b9_collision_with_a_supplied_argument_is_refused(self):
+        """Boundary row B9 — the caller's own argument is never overwritten.
+
+        The recovered value may well be the better one, but the middleware has
+        no way to know that, and silently replacing an argument the caller
+        actually sent is a worse failure than refusing.
+        """
+        clean = 'Only the escalation-watcher path is scoped).'
+        value = (
+            clean
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('agent_id') + 'escalation-watcher-l2'
+        )
+
+        assert repair(
+            value,
+            param='content',
+            schema_params=_UPDATE_MEMORY_PARAMS,
+            supplied={'memory_id', 'content', 'agent_id'},
+        ) is None
+
+    def test_leftover_text_after_the_last_pseudo_parameter_is_refused(self):
+        """Zero leftover is the accept condition, not "mostly parsed".
+
+        Trailing prose the harness never emitted means the mis-close reading is
+        wrong, so the cut would take real caller text with it.
+        """
+        clean = 'The scheduler retries this automatically).'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'medium' + _closer('priority') + '\n'
+            + 'and then some trailing prose no parser ever emitted'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
+    def test_no_qualifying_candidate_closer_is_refused(self):
+        """A closing tag for a name the tool does not have is not a mis-close.
+
+        This is the ordinary-prose case that makes a naive substring scan
+        useless (toolcall_xml_leak's module docstring makes the same point).
+        """
+        value = (
+            'The audit quotes a closing tag '
+            + _closer('rationale')
+            + ' in prose and then just stops.'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'description'},
+        ) is None
+
+    def test_doubly_corrupted_tail_is_refused(self):
+        """Boundary row B5 — a SECOND mis-close inside the recovered tail.
+
+        ``agent_id`` opens but closes as ``/details``, so where its value ends
+        is a guess. The one class-3 counterexample in the task-3654 sweep
+        evidence (957 chars of real prose in a swallowed argument) is why this
+        must refuse rather than take the longest plausible reading.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'medium' + _closer('priority') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _closer('details') + '\n'
+            + INVOKE_CLOSER
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
+
+# A hostile table for the totality and determinism invariants. Values only —
+# the invariants are about what repair() does with a VALUE, so one fixed
+# (param, schema, supplied) triple keeps the table readable.
+_HOSTILE_VALUES = [
+    None,
+    '',
+    0,
+    17,
+    {'content': 'x'},
+    ['\x3c/invoke>'],
+    b'\x3c/invoke>',
+    'ordinary prose with no envelope markup at all',
+    # a bare closer with no tail at all
+    'a bare closer and then nothing ' + _closer('content'),
+    # the value IS the invoke closer
+    INVOKE_CLOSER,
+    # an unterminated opener with an EMPTY name, in both dialects
+    'lead ' + _closer('content') + '\x3c>orphan',
+    'lead ' + _closer('content') + '\x3cparameter name="">low',
+    # deeply nested pseudo-parameters that never close
+    'lead ' + _closer('content') + ('\x3ca>' * 200) + 'deep',
+    # the stray-quote blend appearing in the CLOSER position
+    'lead ' + _closer('content') + _blend_closer('description'),
+    # the blend as a well-formed pair, which SHOULD repair
+    'lead ' + _closer('content') + _blend_opener('agent_id') + 'x' + _blend_closer('agent_id'),
+    # 100 KB of plain text, and 100 KB followed by a real last-parameter drift
+    'x' * 100_000,
+    ('x' * 100_000) + _closer('content') + '\n' + INVOKE_CLOSER,
+]
+
+
+class TestRepairInvariants:
+    """The four C1 invariants: totality, determinism, purity, D5."""
+
+    @pytest.mark.parametrize('value', _HOSTILE_VALUES, ids=range(len(_HOSTILE_VALUES)))
+    def test_never_raises_and_returns_none_or_a_repair(self, value):
+        """C1: ``repair`` is pure, synchronous, and never raises for any input.
+
+        Totality has to come from structure, not from a blanket except that
+        returns None — that is signature (b) of the shared silent-fallthrough
+        ratchet. A raise here is the only way this test can fail.
+        """
+        result = repair(
+            value,
+            param='content',
+            schema_params=_ADD_MEMORY_PARAMS,
+            supplied={'content', 'project_id'},
+        )
+        assert result is None or isinstance(result, Repair)
+
+    @pytest.mark.parametrize('value', _HOSTILE_VALUES, ids=range(len(_HOSTILE_VALUES)))
+    def test_is_deterministic(self, value):
+        """C1: identical input ⇒ identical output. The corpus replay leans on this."""
+        kwargs = {
+            'param': 'content',
+            'schema_params': _ADD_MEMORY_PARAMS,
+            'supplied': {'content', 'project_id'},
+        }
+        assert repair(value, **kwargs) == repair(value, **kwargs)
+
+    @pytest.mark.parametrize('value', _HOSTILE_VALUES, ids=range(len(_HOSTILE_VALUES)))
+    def test_d5_holds_for_every_result(self, value):
+        """C1 D5 over the hostile table, via the shared assertion helper."""
+        result = repair(
+            value,
+            param='content',
+            schema_params=_ADD_MEMORY_PARAMS,
+            supplied={'content', 'project_id'},
+        )
+        assert_repair_invariants(value, result)
+
+    def test_does_not_mutate_its_arguments(self):
+        """C1 purity: the caller's schema and supplied collections are untouched."""
+        schema = {'content', 'project_id', 'agent_id'}
+        supplied = {'content', 'project_id'}
+        value = 'lead ' + _closer('content') + '\n' + _opener('agent_id') + 'x' + _closer('agent_id')
+
+        result = repair(value, param='content', schema_params=schema, supplied=supplied)
+
+        assert result is not None
+        assert schema == {'content', 'project_id', 'agent_id'}
+        assert supplied == {'content', 'project_id'}
+
+    def test_a_repaired_result_is_reachable_from_the_hostile_table(self):
+        """Guards the table itself: an all-None table would make D5 vacuous."""
+        results = [
+            repair(
+                value,
+                param='content',
+                schema_params=_ADD_MEMORY_PARAMS,
+                supplied={'content', 'project_id'},
+            )
+            for value in _HOSTILE_VALUES
+        ]
+        assert any(result is not None for result in results)
