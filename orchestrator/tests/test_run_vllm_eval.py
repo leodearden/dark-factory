@@ -1179,6 +1179,82 @@ class TestConcurrentLoop:
                 f"belonging to a different task"
             )
 
+    def test_concurrent_no_stop_flag_attempts_all_tasks_under_adverse_order(
+        self, monkeypatch, tmp_path
+    ):
+        """Discrimination baseline for the --stop-on-first-failure drain
+        tests below: the SAME adverse completion order (df_task_10's summary
+        is processed by the main loop before df_task_11 even starts its
+        body), but WITHOUT --stop-on-first-failure, must attempt all five
+        tasks. This is what proves the narrower attempted sets asserted by
+        the drain tests actually come from the drain, not from some
+        incidental effect of the ordering fixture itself.
+        """
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        # Force the adverse order: df_task_11 cannot even start its body
+        # until the main loop has processed df_task_10's summary. No sleeps
+        # anywhere below — ordering is pinned by the Event, not by duration.
+        released = _release_on_summary(monkeypatch, "df_task_10")
+
+        attempted: list[str] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                attempted.append(task_id)
+                if task_id == "df_task_11":
+                    assert released.wait(timeout=10.0), (
+                        "df_task_10 summary never observed by the main loop"
+                    )
+                    results.mkdir(parents=True, exist_ok=True)
+                    _write_result(
+                        results,
+                        task_id,
+                        config_name,
+                        "fail00001",
+                        outcome="blocked",
+                        metrics={"cost_usd": 5.0},
+                    )
+                    return SimpleNamespace(returncode=1)
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+            ]
+        )
+
+        assert rc == 1  # df_task_11 blocked → non-zero exit
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        assert set(attempted) == set(task_ids)
+
     def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
         """Failing task stops the queue but in-flight tasks finish."""
         results = tmp_path / "results"
