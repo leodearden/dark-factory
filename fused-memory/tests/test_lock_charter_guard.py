@@ -132,6 +132,101 @@ def test_extension_drift_guard_vs_reify_script():
 
 
 # ---------------------------------------------------------------------------
+# _resolve_reify_root — layout-independent reify-checkout discovery.
+#
+# Task 3843's title prescribes changing _REIFY_GUARD_SCRIPT's parents[5] to
+# parents[3]. That prescription is a REGRESSION, not a fix: '.worktrees/<id>'
+# contributes exactly two path segments, so parents[5] is correct in a
+# worktree checkout and parents[3] is correct in a bare checkout — no single
+# fixed index is correct in both layouts. _resolve_reify_root (step 2)
+# replaces both parents[N] call sites with an ancestor walk that works in
+# either layout without a fixed index. See its docstring for the measured
+# evidence table.
+# ---------------------------------------------------------------------------
+
+
+def _plant(root: Path, tests_dir_relpath: str) -> Path:
+    """Create a synthetic reify checkout under *root* plus a tests dir.
+
+    Creates ``root/reify/scripts/lock-charter-guard.sh`` as a real file
+    (content is irrelevant) and ``root/tests_dir_relpath`` as a directory,
+    then returns a fake test-file path inside that tests dir.
+    ``_resolve_reify_root`` only inspects ancestor directories, so the
+    returned test-file path itself need not exist on disk.
+    """
+    guard_script = root / 'reify' / 'scripts' / 'lock-charter-guard.sh'
+    guard_script.parent.mkdir(parents=True, exist_ok=True)
+    guard_script.write_text('#!/bin/sh\necho stub\n')
+    tests_dir = root / tests_dir_relpath
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    return tests_dir / 'test_x.py'
+
+
+class TestResolveReifyRoot:
+    """`_resolve_reify_root` discovery, independent of checkout layout.
+
+    Every case delenvs REIFY_ROOT so discovery — not an operator's ambient
+    override — is what's under test.  REIFY_ROOT precedence is pinned
+    separately (step 3/4).
+    """
+
+    def test_resolves_from_bare_checkout_layout(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        src = tmp_path
+        start = _plant(src, 'dark-factory/fused-memory/tests')
+        assert _resolve_reify_root(start) == (src / 'reify').resolve()
+
+    def test_resolves_from_worktree_layout(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        src = tmp_path
+        bare_start = _plant(src, 'dark-factory/fused-memory/tests')
+        worktree_start = _plant(src, 'dark-factory/.worktrees/3843/fused-memory/tests')
+        expected = (src / 'reify').resolve()
+
+        bare_result = _resolve_reify_root(bare_start)
+        worktree_result = _resolve_reify_root(worktree_start)
+
+        assert worktree_result == expected
+        assert worktree_result == bare_result, (
+            "worktree and bare-checkout layouts must resolve to the same reify "
+            "root: '.worktrees/<id>' adds exactly two path segments relative to "
+            "the bare checkout, so no single fixed parents[N] index can satisfy "
+            f"both (got worktree={worktree_result!r} vs bare={bare_result!r})"
+        )
+
+    def test_resolves_from_arbitrary_extra_nesting(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        src = tmp_path
+        start = _plant(src, 'dark-factory/.worktrees/3843/fused-memory/tests/sub')
+        assert _resolve_reify_root(start) == (src / 'reify').resolve()
+
+    def test_returns_none_when_no_ancestor_has_the_guard_script(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        start = tmp_path / 'a' / 'b' / 'c' / 'test_x.py'
+        assert _resolve_reify_root(start) is None
+
+    def test_picks_the_nearest_ancestor(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        outer = tmp_path
+        _plant(outer, 'unused-outer-tests-dir')
+        inner = outer / 'inner'
+        start = _plant(inner, 'fused-memory/tests')
+        assert _resolve_reify_root(start) == (inner / 'reify').resolve()
+
+    def test_ignores_an_ancestor_reify_dir_without_the_guard_script(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        higher = tmp_path
+        _plant(higher, 'unused-higher-tests-dir')
+        (higher / 'src' / 'reify').mkdir(parents=True)
+        start_dir = higher / 'src' / 'dark-factory' / 'fused-memory' / 'tests'
+        start_dir.mkdir(parents=True)
+        start = start_dir / 'test_x.py'
+        assert _resolve_reify_root(start) == (higher / 'reify').resolve()
+
+
+# ---------------------------------------------------------------------------
 # REJECT corpus (α/γ shared vector — all must return False)
 # ---------------------------------------------------------------------------
 
