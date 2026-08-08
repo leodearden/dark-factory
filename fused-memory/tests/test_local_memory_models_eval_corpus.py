@@ -544,6 +544,71 @@ class TestSelect:
             _mod.select([], 10, seed='s')
 
 
+class TestSelectGroupsThePopulationOnce:
+    """The stratification is derived once per ``select``, not once per cell.
+
+    ``_group_by_cell`` derives a ``stratum_key`` for every record, and each key
+    costs an ISO-8601 parse plus a regex substitution. Calling it once per cell
+    makes the work O(cells x population) instead of O(population) — at the
+    committed shape (~2,775 episodes, 20 cells) the reviewer measured roughly
+    half a second of pure redundancy inside ``select``.
+
+    That is already fixed: ``select`` groups once and calls
+    ``_permutation_from_cells``. But nothing stopped it from being un-fixed,
+    because the optimisation is invisible in the RESULT — a revert to
+    ``cell_permutation(population, cell, ...)`` inside the loop would leave
+    every other test in this file green. Hence a pin on the call count.
+    """
+
+    def _counting_group_by_cell(self, monkeypatch) -> list[int]:
+        """Wrap the real ``_group_by_cell`` in a counter, returning the tally."""
+        calls: list[int] = []
+        real = _mod._group_by_cell
+
+        def counted(population):
+            calls.append(len(population))
+            return real(population)
+
+        monkeypatch.setattr(_mod, '_group_by_cell', counted)
+        return calls
+
+    def test_select_derives_the_stratification_exactly_once(self, monkeypatch):
+        calls = self._counting_group_by_cell(monkeypatch)
+        _mod.select(_population(SYNTHETIC_CELLS), 20, seed='s')
+        assert len(calls) == 1, f'grouped {len(calls)} times for {len(SYNTHETIC_CELLS)} cells'
+
+    def test_the_public_wrapper_still_takes_a_raw_population(self):
+        """The reviewer-facing seam survives the optimisation.
+
+        ``cell_permutation`` takes the shape a reviewer has in hand — an
+        ungrouped population — which is what makes the prefix property directly
+        checkable (see test_selection_is_a_prefix_of_each_cells_permutation).
+        Collapsing it into the grouped-only helper would optimise the seam away
+        along with the redundant work.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        for cell in SYNTHETIC_CELLS:
+            assert _mod.cell_permutation(pop, cell, seed='s') == (
+                _mod._permutation_from_cells(_mod._group_by_cell(pop), cell, seed='s')
+            )
+
+    def test_grouping_once_does_not_change_the_draw(self):
+        """CONTROL: the optimisation is result-preserving, not merely faster.
+
+        Asserted against the raw-population wrapper rather than against a
+        recorded constant, so this stays true under a future re-tune of N.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        baseline = _uuids(_mod.select(pop, 20, seed='s').selected)
+        shuffled = list(pop)
+        random.Random(7).shuffle(shuffled)
+        assert _uuids(_mod.select(shuffled, 20, seed='s').selected) == baseline
+        result = _mod.select(pop, 20, seed='s')
+        for cell in SYNTHETIC_CELLS:
+            taken = [r.uuid for r in result.selected if _mod.stratum_key(r) == cell]
+            assert taken == _mod.cell_permutation(pop, cell, seed='s')[: len(taken)], cell
+
+
 class TestSelectionIsNotConditionedOnOutcome:
     """The binding hazard, at the sampler: an outcome-failed episode stays eligible."""
 
