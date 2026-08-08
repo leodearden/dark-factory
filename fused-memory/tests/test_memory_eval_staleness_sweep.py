@@ -188,5 +188,69 @@ class TestPointerTargets:
         assert source.count('import normalize_supersedes') == 1
 
 
+class TestDanglingCensus:
+    """Resolved vs unresolved, per key, with the unresolved targets NAMED."""
+
+    def test_resolved_and_unresolved_totals(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=[UUID_A, UUID_B]))
+        census = m.dangling_census(refs, {UUID_A: True, UUID_B: False})
+        assert census.examined == 2
+        assert census.resolved == 1
+        assert census.unresolved == 1
+
+    def test_the_breakdown_is_per_pointer_key(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=UUID_A, corrects=UUID_B))
+        census = m.dangling_census(refs, {UUID_A: True, UUID_B: False})
+        assert census.by_key['supersedes'] == {'examined': 1, 'resolved': 1, 'unresolved': 0}
+        assert census.by_key['corrects'] == {'examined': 1, 'resolved': 0, 'unresolved': 1}
+        # A key with no live population is absent, not a fabricated zero row.
+        assert 'parent_id' not in census.by_key
+
+    def test_the_unresolved_targets_are_reported_not_just_counted(self):
+        """A bare count says something dangles, not which pointer to go look at."""
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=[UUID_A, UUID_B]))
+        census = m.dangling_census(refs, {UUID_A: True, UUID_B: False})
+        assert [r.target for r in census.unresolved_refs] == [UUID_B]
+        assert census.unresolved_refs[0].source_id == 'rec-1'
+        assert census.unresolved_refs[0].key == 'supersedes'
+
+    def test_a_shared_target_is_examined_once_per_citing_source(self):
+        """`examined` counts POINTERS, and each source keeps its own attribution."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-2', supersedes=UUID_A)),
+        ]
+        census = m.dangling_census(refs, {UUID_A: False})
+        assert census.examined == 2
+        assert census.unresolved == 2
+        assert sorted(r.source_id for r in census.unresolved_refs) == ['rec-1', 'rec-2']
+        assert m.unique_pointer_targets(refs) == [UUID_A]
+
+    def test_a_target_missing_from_the_resolution_map_is_unresolved(self):
+        """The map is the caller's ground-truth read; an absent key is a miss.
+
+        Never a silent 'assume fine': a target the resolver never reached is
+        exactly the case a self-confirming census would paper over.
+        """
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=UUID_A))
+        census = m.dangling_census(refs, {})
+        assert census.unresolved == 1
+
+    def test_an_empty_ref_set_is_zero_exposure(self):
+        """Which build_series then declines to emit as a metric at all."""
+        m = _mod()
+        census = m.dangling_census([], {})
+        assert census.examined == 0
+        assert census.resolved == 0
+        assert census.unresolved == 0
+        assert census.by_key == {}
+        assert census.unresolved_refs == []
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
