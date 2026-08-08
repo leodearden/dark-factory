@@ -38,9 +38,11 @@ explicit ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import uuid as uuid_mod
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -59,6 +61,45 @@ def _uuid() -> str:
     """A fresh uuid4 string, as ``MemoryService`` mints for each episode
     (``memory_service.py:2516``)."""
     return str(uuid_mod.uuid4())
+
+
+# A FIXED uuid, used ONLY inside ``@pytest.mark.parametrize`` lists. A
+# parametrized string becomes part of the test id, and pytest-xdist aborts a run
+# whose workers collect different ids — so a fresh uuid4 there would be a
+# flake generator. Every assertion that pins upstream's FORMAT still uses a
+# fresh ``_uuid()`` built through the real exception; these entries only pin
+# shapes that must NOT match, where the uuid's value is irrelevant.
+_FIXED_UUID = '00000000-0000-4000-8000-000000000000'
+
+
+def _enqueued_operations() -> set[str]:
+    """Operation strings ``MemoryService`` actually enqueues, read from the
+    producer's SOURCE rather than restated here.
+
+    Parses ``memory_service.py`` (a sibling of the module under test) and
+    collects the literal ``operation=`` keyword of every
+    ``self.durable_queue.enqueue(...)`` call. Deliberately a partial view: a
+    producer expressed some other way — e.g. the dict-shaped batch enqueue at
+    ``memory_service.py:2463`` that supplies ``mem0_classify_and_add`` — is not
+    seen here, which is why the caller asserts a SUBSET and never equality.
+    """
+    source = Path(dq_module.__file__).with_name('memory_service.py').read_text()
+    operations: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == 'enqueue'):
+            continue
+        target = func.value
+        if not (isinstance(target, ast.Attribute) and target.attr == 'durable_queue'):
+            continue
+        for kw in node.keywords:
+            if kw.arg != 'operation':
+                continue
+            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                operations.add(kw.value.value)
+    return operations
 
 
 async def _poll_until_dead(
@@ -202,11 +243,12 @@ class TestParserFailsOpen:
             '',
             'node not found',           # no uuid at all
             'node a b not found',       # \S+ must not span the space
-            'Node {u} not found',       # wrong case
+            f'Node {_FIXED_UUID} not found',  # wrong case, well-formed uuid
             'NODE x not found',
             'node x not found.',        # trailing punctuation breaks the anchor
             'prefix node x not found',  # unanchored prefix
             'node x not found suffix',  # unanchored suffix
+            'node x not found\n',       # $ would match here; the pattern uses \Z
             'nodes x not found',
             'edgy x not found',
         ],
@@ -215,6 +257,23 @@ class TestParserFailsOpen:
         assert dq_module._parse_not_found_uuid(message) is None, (
             f'{message!r} must not parse as the pinned not-found format; '
             f'got {dq_module._parse_not_found_uuid(message)!r}.'
+        )
+
+    def test_trailing_newline_does_not_match(self):
+        """The anchoring claim, enforced against the REAL message text.
+
+        Python's ``$`` matches immediately before a single trailing newline, so
+        a pattern anchored with ``$`` would accept ``'node <uuid> not found\\n'``
+        and hand back the uuid — treating a message that is NOT the pinned shape
+        as proof of permanent failure. That is the fail-CLOSED direction, the one
+        that discards a write. ``\\Z`` is what makes "fully anchored" true.
+        """
+        u = _uuid()
+        message = str(NodeNotFoundError(u)) + '\n'
+        assert dq_module._parse_not_found_uuid(message) is None, (
+            f'{message!r} must not parse: it is not exactly the pinned shape, '
+            f'and the fail-open invariant forbids concluding "permanent" from '
+            f'anything else. Use \\Z, not $, to anchor _NOT_FOUND_MESSAGE_RE.'
         )
 
 
@@ -228,18 +287,30 @@ class TestIdentityUuidResolution:
     minted identity licenses the "retrying cannot possibly help" conclusion.
     """
 
-    def test_add_episode_maps_to_the_uuid_key(self, tmp_path):
-        assert dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS['add_episode'] == 'uuid'
+    def test_every_mapped_operation_is_one_the_producer_enqueues(self):
+        """Each key must name an operation ``MemoryService`` really enqueues.
 
-    def test_only_add_episode_is_mapped(self, tmp_path):
-        """The other live operations carry no caller-minted identity."""
-        assert set(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS) == {'add_episode'}, (
-            'Only add_episode supplies a caller-minted identity (memory_service.py'
-            ':2516 mints it, :2534 stamps it, :2248 forwards it). '
-            'add_memory_graphiti and mem0_classify_and_add carry no uuid key at '
-            'all, and mem0_add has no live producer — mapping any of them would '
-            'claim an identity that does not exist. Got '
-            f'{sorted(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS)}.'
+        Deliberately DERIVED from the producer's source rather than restated: an
+        assertion like ``set(map) == {'add_episode'}`` would only echo the
+        constant it is testing, and would be edited to match whatever the
+        constant became. This one goes RED if a key is misspelled or names an
+        operation the producer stopped enqueueing — the drift that would make
+        the rule silently dead.
+
+        A SUBSET, not equality: the map claiming fewer operations than exist is
+        the safe direction (those fall open to the ordinary policy), and
+        ``_enqueued_operations`` sees only the keyword-argument enqueue sites.
+        """
+        enqueued = _enqueued_operations()
+        mapped = set(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS)
+        assert mapped <= enqueued, (
+            f'DEFAULT_IDENTITY_PAYLOAD_KEYS names {sorted(mapped - enqueued)}, '
+            f'which no self.durable_queue.enqueue(operation=...) call site in '
+            f'memory_service.py produces (found: {sorted(enqueued)}). Either the '
+            f'key is stale/misspelled — in which case the permanent rule can '
+            f'never fire and the doomed-retry loop is back — or the producer now '
+            f'enqueues it some other way, in which case update '
+            f'_enqueued_operations().'
         )
 
     def test_resolves_the_add_episode_identity(self, tmp_path):
@@ -306,24 +377,57 @@ class TestIdentityUuidResolution:
             'map, not merge with it.'
         )
 
+    def test_empty_map_disables_the_rule_entirely(self, tmp_path):
+        """``identity_payload_keys={}`` is the documented OFF-SWITCH.
+
+        durable_queue.py's REINSTATEMENT CONDITION tells a future operator that
+        this is how the permanent rule is disabled if Graphiti ever moves to a
+        clustered, read-routed backend where a self-referential not-found could
+        be genuinely transient. An advertised escape hatch that nothing
+        exercises is an escape hatch that quietly stops working, so pin it.
+        """
+        q = _queue(tmp_path, AsyncMock(), identity_payload_keys={})
+        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        assert q._identity_uuid(item) is None, (
+            'identity_payload_keys={} must express "no operation has a '
+            'self-identity"; {} is falsy but is NOT None, so the constructor '
+            'must not silently fall back to the default map.'
+        )
+        assert q._classify_failure(item, NodeNotFoundError('x')) == (
+            'normal', item.max_attempts
+        ), 'with the map emptied, every failure returns to the ordinary policy.'
+
 
 class TestClassifyFailure:
     """``_classify_failure(item, exc) -> (classification, attempts_limit)``.
 
     Permanent maps to a limit of 1 rather than a separate boolean, so the call
     site keeps ``died = new_attempts >= limit`` as one uniform expression — and
-    correctly re-kills an item arriving with ``attempts > 0``, which is what
-    ``replay_dead`` produces: it resets status but re-executes the identical
-    poison payload.
+    correctly re-kills an item arriving with ``attempts > 0``, which
+    ``_recover_in_flight`` produces: crash recovery returns an ``in_flight`` row
+    to ``pending`` while PRESERVING its attempt count. (``replay_dead`` zeroes
+    ``attempts``; what it re-supplies is the identical poison payload.)
     """
 
-    def test_self_referential_not_found_is_permanent_at_attempt_one(self, tmp_path):
+    @pytest.mark.parametrize('exc_class', [NodeNotFoundError, EdgeNotFoundError])
+    def test_self_referential_not_found_is_permanent_at_attempt_one(
+        self, tmp_path, exc_class
+    ):
         """The proof: the node reported missing IS the node this write exists to
-        create, so no number of retries can make it appear."""
+        create, so no number of retries can make it appear.
+
+        Parametrized over BOTH upstream classes because ``_NOT_FOUND_MESSAGE_RE``
+        accepts ``node`` and ``edge`` alike; without the edge case a regression
+        narrowing the classifier to nodes only would stay green here, caught
+        solely at the parser level.
+        """
         u = _uuid()
         q = _queue(tmp_path, AsyncMock())
         item = _item('add_episode', {'uuid': u, 'content': 'c', 'group_id': 'proj1'})
-        assert q._classify_failure(item, NodeNotFoundError(u)) == ('permanent', 1)
+        assert q._classify_failure(item, exc_class(u)) == ('permanent', 1), (
+            f'{exc_class.__name__}({u!r}) names this item\'s own identity uuid '
+            f'and must classify permanent at attempt 1.'
+        )
 
     def test_referenced_uuid_not_found_keeps_the_full_budget(self, tmp_path):
         """CONTROL — the rule keys off the IDENTITY field, not off "a uuid

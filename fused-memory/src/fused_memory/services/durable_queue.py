@@ -63,6 +63,22 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
 #
+# REINSTATEMENT NOW TAKES TWO EDITS, NOT ONE (task 3586). Re-adding names here
+# is no longer sufficient, because _classify_failure checks its payload-derived
+# permanent rule BEFORE the transient one: a self-referential not-found dies at
+# attempt 1 whatever this set says. That rule could itself mis-fire under the
+# very topology that would justify reinstatement — attempt 1 creates the
+# episodic node and then fails downstream; attempt 2's by-uuid lookup
+# (routing_='r') lands on a lagging follower and raises NodeNotFoundError naming
+# the item's OWN uuid, which is genuinely transient but reads as the permanent
+# proof. Disabling it means passing identity_payload_keys={} to
+# DurableWriteQueue, and that is a CODE CHANGE today, not a config edit: the
+# kwarg is deliberately not a QueueConfig field (see
+# DEFAULT_IDENTITY_PAYLOAD_KEYS below) and MemoryService's construction site
+# (memory_service.py:1190) does not pass it. Whoever reinstates the budget must
+# wire that kwarg through in the same change, or the reinstatement is a no-op
+# for exactly the failures it was meant to cover.
+#
 # ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
 # above argues the stronger claim. Dropping these names only returns them to
 # the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
@@ -107,7 +123,14 @@ DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
 # a write. fused-memory's own unrelated NodeNotFoundError
 # (backends/graphiti_client.py:219) is a live instance of this: none of its
 # messages match, so all of them fail open.
-_NOT_FOUND_MESSAGE_RE = re.compile(r'^(?:node|edge) (\S+) not found$')
+#
+# ANCHORED WITH \Z, NOT $. Python's $ also matches immediately before a single
+# trailing newline, so 'node <uuid> not found\n' would match and be read as
+# PROOF of permanent failure — the fail-CLOSED direction the invariant above
+# forbids. \Z matches only at the true end of the string. graphiti_core's
+# f-strings emit no trailing newline today, so this costs nothing and closes the
+# one hole in the "fully anchored" claim rather than leaving it merely asserted.
+_NOT_FOUND_MESSAGE_RE = re.compile(r'^(?:node|edge) (\S+) not found\Z')
 
 
 def _parse_not_found_uuid(message: str) -> str | None:
@@ -579,10 +602,13 @@ class DurableWriteQueue:
           state, not guessed from an error type. A limit of 1 (rather than a
           separate boolean) keeps ``died = new_attempts >= limit`` a single
           uniform expression at the call site, and also correctly re-kills an
-          item arriving with ``attempts > 0`` — which is exactly what
-          ``replay_dead`` produces, since it resets status but re-executes the
-          identical poison payload. That is the mechanism behind the recorded
-          55-retry item in esc-3561-3.
+          item arriving with ``attempts > 0``. That case is produced by
+          ``_recover_in_flight``: crash recovery flips ``in_flight`` back to
+          ``pending`` while PRESERVING the attempt count. (``replay_dead`` is
+          not that path — it explicitly zeroes ``attempts``. What it does supply
+          is re-execution of the identical poison payload, which is how the
+          esc-3561-3 item accumulated 55 attempts across successive replays:
+          five per replay, from a counter reset each time.)
         * ``('transient', transient_max_attempts)`` — the existing name-based
           policy, unchanged.
         * ``('normal', item.max_attempts)`` — everything else, today's default.
