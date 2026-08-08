@@ -4284,6 +4284,159 @@ def test_merge_decision_enrichment_treats_equivalent_queue_spellings_as_one(
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+def test_merge_decision_enrichment_never_forges_a_queue_id_pair(tmp_path: Path) -> None:
+    """``escalations_dir`` and ``escalation_id`` must move as ONE PAIR.
+
+    Merging them by INDEPENDENT rules lets the survivor carry a (queue, id)
+    combination that existed on NEITHER filer's record: here the queue would
+    be adopted from *incoming* while the id stays *existing*'s, yielding
+    ``(orch, 'esc-3036-1')`` -- a pair `orch` never vouched for.
+
+    That is fail-CLOSED, the one direction the reaper must never take.
+    ``_run_reap_decisions._status`` JOINS on exactly this pair: axis 2
+    compares the stamp, then ``read_escalation_status(escalations_dir,
+    decision.escalation_id)`` resolves the id INSIDE that queue -- and
+    ``esc-<taskid>-<n>`` ids are unique only WITHIN a queue, so the forged
+    pair resolves against an unrelated escalation that merely shares the id.
+    That is verbatim the incident _run_reap_decisions' own docstring records:
+    an unrelated RESOLVED orchestrator escalation silently closing a still
+    PENDING recon blocking gate, invisible in the cockpit for ~7 days.
+
+    The correct outcome is to keep *existing*'s own pair: the record is left
+    exactly as (un)reapable as it already was -- a visible cockpit row, which
+    is the fail-OPEN direction _run_reap_decisions' asymmetry-of-harm
+    paragraph prescribes.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir='', escalation_id='esc-3036-1')
+    incoming = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id='esc-9999-1',
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert (merged.escalations_dir, merged.escalation_id) != (
+        sr.normalize_escalations_dir(orch),
+        'esc-3036-1',
+    )
+    assert merged.escalations_dir == ''
+    assert merged.escalation_id == 'esc-3036-1'
+
+
+def test_merge_decision_enrichment_warns_when_it_refuses_an_ambiguous_queue_upgrade(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refusing the upgrade is right, but it must never be SILENT.
+
+    Same shape as ..._never_forges_a_queue_id_pair: the record keeps its
+    undetermined queue and therefore stays unreapable. That is deliberate,
+    not an oversight, so it is logged for the same never-silent-information
+    -loss reason the conflicting-stamp WARNING already exists -- naming the
+    decision and the incoming queue it declined to adopt, so an operator can
+    see which record is being held and why.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(id='esc-3036-1', escalations_dir='', escalation_id='esc-3036-1')
+    incoming = _make_decision(
+        id='esc-3036-1',
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id='esc-9999-1',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == ''
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'esc-3036-1' in r.getMessage()
+        and str(sr.normalize_escalations_dir(orch)) in r.getMessage()
+        for r in warnings
+    )
+
+
+def test_merge_decision_enrichment_does_not_borrow_an_escalation_id_across_a_queue_conflict(
+    tmp_path: Path,
+) -> None:
+    """The OTHER direction of the same defect: the queue stays, the id must not move.
+
+    First-writer-wins keeps `orch`, but filling the empty ``escalation_id``
+    from the recon filer hands `orch`'s stamp an id from RECON's namespace.
+    The damage is worse than a mismatch: today ``reap_answered_decisions``
+    SKIPS a decision with no escalation_id outright (``if not
+    escalation_id: continue``), so this record is inert and safe. Borrowing
+    an id turns a record the reaper never touched into one it will resolve
+    against the wrong namespace -- manufacturing the fail-CLOSED join out of
+    nothing.
+    """
+    orch, recon = _two_queues(tmp_path)
+    existing = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id=None,
+    )
+    incoming = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(recon),
+        escalation_id='esc-9999-1',
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    assert merged.escalation_id is None
+
+
+@pytest.mark.parametrize('incoming_id', [None, 'esc-a', 'esc-b'])
+@pytest.mark.parametrize('incoming_queue_key', ['empty', 'unknown', 'orch', 'recon'])
+@pytest.mark.parametrize('existing_id', [None, 'esc-a', 'esc-b'])
+@pytest.mark.parametrize('existing_queue_key', ['empty', 'unknown', 'orch', 'recon'])
+def test_merge_decision_enrichment_pair_is_always_vouched_for(
+    tmp_path: Path,
+    existing_queue_key: str,
+    existing_id: str | None,
+    incoming_queue_key: str,
+    incoming_id: str | None,
+) -> None:
+    """THE INVARIANT, over the whole 12x12 input space.
+
+    The two focused cases above are instances; this is the general rule they
+    are instances of, asserted exhaustively so no future merge rule can
+    reintroduce a forged pair through a combination nobody thought to test.
+
+    Predicate: the merged ``(escalations_dir, escalation_id)`` is either
+    id-less (inert -- the reaper skips it) or is a pair some INPUT record
+    actually vouched for. Never a synthesis of one filer's queue with the
+    other filer's id, because ``read_escalation_status`` is a JOIN on that
+    pair and ids are unique only within a queue.
+
+    Cheap to run exhaustively: merge_decision_enrichment is pure, so this is
+    144 in-memory calls.
+    """
+    orch, recon = _two_queues(tmp_path)
+    queues = {
+        'empty': '',
+        'unknown': sr.UNKNOWN_QUEUE,
+        'orch': sr.normalize_escalations_dir(orch),
+        'recon': sr.normalize_escalations_dir(recon),
+    }
+    existing = _make_decision(
+        escalations_dir=queues[existing_queue_key], escalation_id=existing_id
+    )
+    incoming = _make_decision(
+        escalations_dir=queues[incoming_queue_key], escalation_id=incoming_id
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    merged_queue = sr.normalize_escalations_dir(merged.escalations_dir)
+    assert merged.escalation_id is None or any(
+        sr.normalize_escalations_dir(side.escalations_dir) == merged_queue
+        and side.escalation_id == merged.escalation_id
+        for side in (existing, incoming)
+    )
+
+
 def test_main_reap_decisions_does_not_close_across_queues(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4793,10 +4946,17 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
         root=tmp_path,
     )
 
+    # --escalation-id is passed because a real watcher passes it by
+    # construction: the stamp names the queue THAT id belongs to (see the
+    # verb's own --escalations-dir help). It matters here because the queue
+    # and the id move as a PAIR -- a filing that supplies the queue but not
+    # the id cannot vouch for the seed's own 'esc-1', so the upgrade would be
+    # (correctly) refused as ambiguous rather than forging a pair.
     _file_decision(
         id='esc-5914-1',
         project='df',
         text='reify?',
+        escalation_id='esc-1',
         escalations_dir=str(orch),
     )
 
