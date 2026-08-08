@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import Callable, Coroutine, Iterable
 from pathlib import Path
@@ -80,6 +81,38 @@ DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'ServerDisconnectedError',
     'OperationalError',
 })
+
+# graphiti_core's not-found message format, pinned to 0.28.2:
+#   errors.py:54-59  NodeNotFoundError(uuid) -> f'node {uuid} not found'
+#   errors.py:22-27  EdgeNotFoundError(uuid) -> f'edge {uuid} not found'
+#
+# The uuid is recovered by PARSING because those exceptions expose no .uuid
+# attribute, no group_id and no node label — the message is the only carrier.
+# This module deliberately does not import graphiti_core (the same independence
+# rationale as DEFAULT_TRANSIENT_ERROR_NAMES' name-based matching above), so the
+# format is encoded here as a regex and pinned against the real class in
+# tests/test_durable_queue_selfref_classifier.py, which builds its expectation
+# from str(NodeNotFoundError(u)) rather than a copied literal.
+#
+# FAIL-OPEN INVARIANT. The pattern is fully anchored, so any message that is not
+# EXACTLY this shape returns None, which routes the caller back to the ordinary
+# retry policy. An upstream reword therefore degrades to today's retry
+# behaviour and NEVER to permanent failure — the asymmetry that matters, since a
+# missed permanent failure costs a few extra retries while a false one discards
+# a write. fused-memory's own unrelated NodeNotFoundError
+# (backends/graphiti_client.py:219) is a live instance of this: none of its
+# messages match, so all of them fail open.
+_NOT_FOUND_MESSAGE_RE = re.compile(r'^(?:node|edge) (\S+) not found$')
+
+
+def _parse_not_found_uuid(message: str) -> str | None:
+    """Return the uuid named by a graphiti_core not-found message, else None.
+
+    None means "this is not a message I recognise" — the caller must fall back
+    to its ordinary policy rather than draw any conclusion from the absence.
+    """
+    match = _NOT_FOUND_MESSAGE_RE.match(message)
+    return match.group(1) if match else None
 
 # -- Schema ------------------------------------------------------------------
 
