@@ -18,6 +18,7 @@ from dashboard.data.burndown import (
     _INSERT_SNAPSHOT_SQL,
     BURNDOWN_SCHEMA,
     _count_statuses,
+    _count_zones,
     aggregate_burndown_projects,
     aggregate_burndown_series,
     collect_snapshot,
@@ -225,6 +226,176 @@ class TestCountStatuses:
         # In the new API, a missing/None status maps to 'pending'.
         result = _count_statuses({1: None})
         assert result['pending'] == 1
+
+
+# ---------------------------------------------------------------------------
+# _count_zones — the live/stranded split (task 3543 / PRD ι, spec S8)
+# ---------------------------------------------------------------------------
+
+_ZONE_NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+
+
+def _ztask(status='in-progress', **overrides):
+    """A dashboard-shaped task row as ``tasks._shape_task`` emits it."""
+    task = {
+        'id': overrides.pop('id', 1),
+        'status': status,
+        'metadata': {},
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+    }
+    task.update(overrides)
+    return task
+
+
+def _live(**overrides):
+    """An in-progress row with a claimant heartbeating right now."""
+    return _ztask(
+        claimant_run_id='run-1/sess-1/pid=42',
+        heartbeat_at=_ZONE_NOW.isoformat(),
+        **overrides,
+    )
+
+
+class TestCountZones:
+    """``_count_zones(tasks, now)`` — the six display zones plus the split.
+
+    Takes shaped TASK ROWS, not the ``{id: status}`` map: the claimant columns
+    the split needs exist only on ``get_tasks`` rows (see the collector's source
+    switch in ``collect_snapshot``).
+    """
+
+    def test_returns_all_six_zones_plus_the_split(self):
+        result = _count_zones([], _ZONE_NOW)
+
+        assert result == {
+            'pending': 0, 'in_progress': 0, 'blocked': 0,
+            'deferred': 0, 'cancelled': 0, 'done': 0,
+            'in_progress_live': 0, 'in_progress_stranded': 0,
+        }
+
+    def test_conservation_invariant_on_a_mixed_fixture(self):
+        """THE load-bearing assertion: the split always sums to the zone.
+
+        If it ever did not, neither the stacked chart nor the parity alarm
+        derived from it could be trusted.
+        """
+        tasks = [
+            _live(id=1),
+            _ztask(id=2),                                    # in-progress, no claimant
+            _ztask(id=3, status='review'),                   # folds into in_progress
+            _ztask(id=4, status='pending'),
+            _ztask(id=5, status='blocked'),
+            _ztask(id=6, status='done'),
+            _ztask(id=7, status='deferred'),
+            _ztask(id=8, status='cancelled'),
+            _ztask(
+                id=9,
+                claimant_run_id='run-2/sess-2/pid=7',
+                heartbeat_at=(_ZONE_NOW - timedelta(hours=3)).isoformat(),
+            ),                                               # stale heartbeat
+        ]
+
+        result = _count_zones(tasks, _ZONE_NOW)
+
+        assert result['in_progress'] == 4  # 3 in-progress + 1 review
+        assert result['in_progress_live'] + result['in_progress_stranded'] == result['in_progress']
+        assert result['in_progress_stranded'] == 2
+        assert result['in_progress_live'] == 2
+        assert result['pending'] == 1
+        assert result['blocked'] == 1
+        assert result['done'] == 1
+        assert result['deferred'] == 1
+        assert result['cancelled'] == 1
+
+    def test_review_row_is_always_counted_live_even_with_a_null_claimant(self):
+        """A deliberate, documented conservatism — not an accident.
+
+        ``_STATUS_MAP`` folds 'review' into the ``in_progress`` zone, but
+        ``shared.task_claimant.is_stranded`` hard-gates on
+        ``status == 'in-progress'`` and can never fire for 'review'. Since
+        ``live`` is derived by SUBTRACTION (to keep conservation exact), a
+        claimant-less review row lands in ``live``. That under-reports strands
+        and never over-reports them — the correct direction to err for a
+        surface that raises alarms.
+        """
+        result = _count_zones([_ztask(id=1, status='review')], _ZONE_NOW)
+
+        assert result['in_progress'] == 1
+        assert result['in_progress_stranded'] == 0
+        assert result['in_progress_live'] == 1
+
+    def test_missing_claimant_evidence_counts_as_stranded(self):
+        """A pre-migration row has neither column: absence is not liveness."""
+        task = {'id': 1, 'status': 'in-progress', 'metadata': {}}
+
+        result = _count_zones([task], _ZONE_NOW)
+
+        assert result['in_progress_stranded'] == 1
+        assert result['in_progress_live'] == 0
+
+    def test_infra_hold_counts_as_live(self):
+        """The shared predicate's carve-out: a task parked for infra reasons is
+        not a strand, even with no claimant."""
+        task = _ztask(id=1, metadata={'infra_hold': True})
+
+        result = _count_zones([task], _ZONE_NOW)
+
+        assert result['in_progress'] == 1
+        assert result['in_progress_stranded'] == 0
+        assert result['in_progress_live'] == 1
+
+    def test_only_in_progress_rows_can_be_stranded(self):
+        """A claimant-less blocked/pending/done row never inflates the split."""
+        tasks = [
+            _ztask(id=1, status='blocked'),
+            _ztask(id=2, status='pending'),
+            _ztask(id=3, status='done'),
+        ]
+
+        result = _count_zones(tasks, _ZONE_NOW)
+
+        assert result['in_progress'] == 0
+        assert result['in_progress_stranded'] == 0
+        assert result['in_progress_live'] == 0
+
+    def test_unknown_and_missing_status_default_to_pending(self):
+        result = _count_zones(
+            [{'id': 1, 'status': 'something-weird'}, {'id': 2, 'status': None}],
+            _ZONE_NOW,
+        )
+
+        assert result['pending'] == 2
+
+    def test_now_is_threaded_not_read(self):
+        """A heartbeat ancient by the live clock but fresh by the supplied
+        instant must read as live — the verdict derives from *now*."""
+        historical = datetime(2020, 1, 1, tzinfo=UTC)
+        task = _ztask(
+            id=1,
+            claimant_run_id='run-1/sess-1/pid=42',
+            heartbeat_at=historical.isoformat(),
+        )
+
+        result = _count_zones([task], historical + timedelta(seconds=5))
+
+        assert result['in_progress_stranded'] == 0
+        assert result['in_progress_live'] == 1
+
+    def test_agrees_with_count_statuses_on_the_six_zones(self):
+        """``_count_zones`` supersedes ``_count_statuses`` for the collector, so
+        the six shared zones must not drift between them."""
+        tasks = [
+            _ztask(id=1, status='pending'), _ztask(id=2, status='pending'),
+            _ztask(id=3, status='in-progress'), _ztask(id=4, status='review'),
+            _ztask(id=5, status='done'), _ztask(id=6, status='blocked'),
+            _ztask(id=7, status='cancelled'), _ztask(id=8, status='deferred'),
+        ]
+
+        zones = _count_zones(tasks, _ZONE_NOW)
+        legacy = _count_statuses({t['id']: t['status'] for t in tasks})
+
+        assert {k: zones[k] for k in legacy} == legacy
 
 
 # ---------------------------------------------------------------------------
