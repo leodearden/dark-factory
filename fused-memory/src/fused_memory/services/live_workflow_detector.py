@@ -495,6 +495,41 @@ def corroboration_for_task(
     )
 
 
+def is_pure_gate_metadata(metadata: Mapping | object | None) -> bool:
+    """Return True when *metadata* has the ``DeterministicRunner`` PURE-GATE shape.
+
+    The pure-gate shape is ``always_escalates`` truthy AND ``before_done``
+    absent/falsy — the same two metadata fields ``DeterministicRunner`` itself
+    branches on (orchestrator/src/orchestrator/deterministic_runner.py section
+    3), and the same pair ``shared.task_metadata.TaskMetadata.
+    _deterministic_invariants`` validates. Such a task's ENTIRE execution is
+    "file one born-at-L2 escalation (deduped), stamp ``metadata.
+    gate_escalated_at``, set status ``blocked``": no script, no systemd, no
+    ``git_ops`` (the runner is constructed without ``git_ops`` for this path,
+    precisely to prove it). It therefore can never be mid-side-effect, which is
+    what makes it safe to drop the project-wide orchestrator lock for it while
+    it is still ``pending`` (see rule 5 of
+    :func:`_orchestrator_signal_ineligible`, task 3751).
+
+    A truthy ``before_done`` deliberately DISQUALIFIES the shape: that path runs
+    a blocking deploy/predicate script plus systemd inspection and fresh-PID
+    verification — minutes of real, side-effecting work — while the task's
+    status is still ``'pending'``, because ``Harness._run_deterministic_slot``
+    never flips a deterministic task to ``'in-progress'`` before invoking the
+    runner. Such a task has no git evidence to reveal that it is running, so the
+    orchestrator lock is the only signal protecting it from a recon race.
+
+    Fail-safe toward live: only POSITIVE evidence of the shape returns True. Any
+    non-``Mapping`` input (``None``, a string, an int, a list) returns False, so
+    an absent, malformed, or unparseable metadata blob leaves the task live
+    rather than suppressing its signal. Uses truthiness rather than ``is True``
+    because task metadata round-trips through JSON.
+    """
+    if not isinstance(metadata, Mapping):
+        return False
+    return bool(metadata.get('always_escalates')) and not metadata.get('before_done')
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
