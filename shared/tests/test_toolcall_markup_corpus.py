@@ -23,8 +23,8 @@ import json
 from pathlib import Path
 
 import pytest
-
 import toolcall_markup_corpus_extract as extract
+
 from shared.toolcall_markup import INVOKE_CLOSER
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,13 @@ class TestExtractRecords:
                         'title': 'a title',
                         'description': _TOTAL_DRIFT,
                     },
-                )
+                ),
+                # A CLEAN call of the same tool. It is what testifies that
+                # `priority` exists: a dropped parameter is by definition absent
+                # from the corrupted call's own key set, so without a clean
+                # sibling somewhere in the archive the recovered name fails
+                # schema validation and the specimen reads as unrepairable.
+                _tool_use('toolu_clean', 'submit_task', {'title': 't', 'priority': 'low'}),
             ],
         )
 
@@ -354,7 +360,10 @@ class TestTruncationRule:
         )
         _write_transcript(
             _archive_leaf(root, '2474', 'aaaa'),
-            [_tool_use('toolu_01', 'submit_task', {'title': 't', 'description': value})],
+            [
+                _tool_use('toolu_01', 'submit_task', {'title': 't', 'description': value}),
+                _tool_use('toolu_clean', 'submit_task', {'title': 't', 'priority': 'low'}),
+            ],
         )
 
         record = extract.extract(root)[0]
@@ -513,7 +522,8 @@ class TestExtractorRobustness:
             _tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})
         )
         with gzip.open(leaf, 'wt', encoding='utf-8') as handle:
-            handle.write('not json at all ' + INVOKE_CLOSER + '\n')
+            handle.write('{"type": "assistant", "tool_use": truncated mid-writ')
+            handle.write('\n')
             handle.write('\n')
             handle.write('[1, 2, 3]\n')
             handle.write(json.dumps({'type': 'assistant', 'message': 'not a dict'}) + '\n')
