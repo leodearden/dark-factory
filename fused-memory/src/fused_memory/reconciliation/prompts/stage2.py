@@ -572,13 +572,12 @@ to re-discover the failed entity by scanning all entity summaries heuristically.
 
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section carry a `flag_id` UUID \
-field that maps to a live Mem0 `flag_for_stage2=true` entry written by Stage 1 \
-(this is the only convention checked — a `stage1_flag_marker` key was a \
-never-shipped alias and task 2406 retired the Mem0 marker write path entirely, \
-so no live entry uses it). A `flag_id` may arrive via either of two source paths: \
-the Mem0 active-query path (`_source: mem0_active_query` marker) or the Stage 1 \
-analytical findings path (a structured `flagged_items` entry that carries a \
-`flag_id` field). \
+field that maps to a live Mem0 `flag_for_stage2=true` entry written by Stage 1 — \
+this is the only convention the Python layer checks here (see \
+`_query_stage2_flags` for the exact matching rule). A `flag_id` may arrive via \
+either of two source paths: the Mem0 active-query path (`_source: \
+mem0_active_query` marker) or the Stage 1 analytical findings path (a structured \
+`flagged_items` entry that carries a `flag_id` field). \
 After you record your action for such a flag (memory_hint write, task update, or a \
 no-action note explaining why no action is needed), you MUST immediately delete that \
 flag from Mem0 to prevent it from being re-surfaced in future reconciliation cycles:
