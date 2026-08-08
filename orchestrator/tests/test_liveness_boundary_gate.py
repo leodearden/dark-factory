@@ -350,10 +350,12 @@ class TestB2PreTurn1Wedge:
         branch and that the WATCHDOG'S OWN clock puts it well under the ceiling.
 
         Deliberately NOT asserted on outer wall-clock: under a saturated parallel
-        run the coroutine can be descheduled for seconds either side of
-        ``_run_subprocess``, so wall time is not a sound proxy for which kill
-        path fired. Observed in CI: 6.98s wall for a kill the watchdog itself
-        measured at 0.1s — a green behaviour reported red.
+        (full-suite xdist) run the coroutine can be descheduled for seconds either
+        side of ``_run_subprocess``, so wall time is not a sound proxy for which
+        kill path fired — same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491. Observed under load: 6.98s wall for a kill the watchdog itself
+        measured at 0.1s — correct behaviour reported red by scheduling noise
+        outside the code under test.
         """
         caplog.set_level(logging.WARNING, logger='shared.cli_invoke')
         sid = str(uuid.uuid4())
@@ -395,16 +397,17 @@ class TestB2PreTurn1Wedge:
         # The kill came from the startup-grace branch, not the ceiling. This log
         # line is emitted at exactly one place in cli_invoke (the
         # `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`
-        # branch), so its presence discriminates the two paths deterministically
-        # — the ceiling path never emits it.
+        # branch), so its presence discriminates the two kill paths
+        # deterministically — the ceiling path never emits it.
         wedge_log = re.search(r'Startup wedge detected after ([\d.]+)s', caplog.text)
         assert wedge_log is not None, (
             'Expected the startup-grace kill path to fire and log the wedge; '
             f'caplog.text snippet: {caplog.text[-500:]!r}'
         )
-        # Quantitative half, on the WATCHDOG'S clock: detected at the 0.05s grace
-        # bound, nowhere near the 5.0s ceiling. Guards a regression that still
-        # takes the wedge branch but only after ignoring startup_grace_secs.
+        # Quantitative half, on the WATCHDOG'S OWN clock (immune to outer
+        # scheduling noise): detected at the 0.05s grace bound, nowhere near
+        # the 5.0s ceiling. Guards a regression that still takes the wedge
+        # branch but only after ignoring startup_grace_secs.
         detected_after = float(wedge_log.group(1))
         assert detected_after < 2.0, (
             f'Expected fast kill (<2s on the watchdog clock), got {detected_after}s '

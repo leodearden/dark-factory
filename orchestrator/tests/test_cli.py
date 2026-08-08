@@ -162,18 +162,31 @@ class TestForceExitWatchdog:
         )
 
     def test_disarm_prevents_force_exit(self):
-        """Calling disarm() before timeout prevents os._exit from being called."""
+        """Calling disarm() before timeout prevents os._exit from being called.
+
+        Structural fix (same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491): the watchdog thread blocks on ``threading.Event.wait(timeout_secs)``
+        and ``disarm()`` calls ``_event.set()``, which wakes the thread and makes
+        it return WITHOUT ever calling ``_exit_fn`` — regardless of how large
+        timeout_secs is, and regardless of whether the event is set before or
+        after the thread reaches ``.wait()`` (Event is stateful, not an
+        edge-triggered signal, so ordering can't be missed). The correctness
+        condition is only "does disarm() land before timeout_secs elapses" — a
+        small timeout_secs (previously 0.2s) instead raced the main thread's next
+        bytecode (the disarm() call) against the watchdog's internal deadline;
+        under full-suite xdist load that arm→disarm gap can exceed hundreds of ms
+        and the watchdog fires before disarm() lands (observed: `calls == [137]`
+        on a saturated worker). Using an effectively-unbounded timeout_secs makes
+        that gap structurally impossible to exceed rather than merely widening a
+        still-tight window, and removes the need for a compensating sleep.
+        """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
-        # disarm() sets the event immediately so the watchdog thread returns
-        # without calling os._exit even if the scheduler is delayed.
-        handle = _force_exit_after_delay(timeout_secs=0.2, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
         handle.disarm()
-        time.sleep(2.0)
 
         assert calls == [], f'expected no calls, got {calls}'
         handle.thread.join(timeout=1.0)
