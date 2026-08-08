@@ -339,6 +339,38 @@ def dark_factory_family_row(md_text: str) -> str:
     return rows[0]
 
 
+def section_span(md_text: str, heading_prefix: str, *, source: str) -> str:
+    """One markdown section: its ``## <heading_prefix>…`` line to the next ``## ``.
+
+    Line-anchored on the heading rather than sliced by index of a substring, so a
+    section name quoted inside a paragraph elsewhere cannot re-target the span.
+    Stops at the next ``## `` specifically — not at the next heading of any level
+    — so the section's own ``###`` sub-headings stay inside it.
+
+    Loud on an absent or duplicated heading, never a ``''`` return. This
+    extractor feeds ABSENCE assertions, where an empty span is the worst possible
+    silent failure: it satisfies "contains no restated slug" by containing
+    nothing at all.
+    """
+    lines = md_text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(f"## {heading_prefix}")]
+    assert len(starts) == 1, (
+        f"{source}: expected exactly one `## {heading_prefix}…` heading, found "
+        f"{len(starts)} (task 3802). Absent means the section was renamed or "
+        f"renumbered and this guard would pin nothing; duplicated means one of "
+        f"the two copies is unchecked. Update the heading prefix constant in "
+        f"scripts/tests/test_design_invariants_consistency.py, or de-duplicate "
+        f"the section."
+    )
+
+    start = starts[0]
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------
