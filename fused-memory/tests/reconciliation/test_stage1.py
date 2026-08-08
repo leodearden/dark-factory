@@ -2582,6 +2582,154 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
 
 # ---------------------------------------------------------------------------
+# Task 3839 (gate 3833): pin that _assemble_remediation_payload includes the
+# '### Live-Workflow Signals' section emitted by _build_live_workflow_section —
+# it was the third Stage-1 payload builder, missed when task 1977 wired the
+# section into the other two builders (assemble_payload / _format_assembled_
+# payload). Direct structural sibling of task 2552's
+# TestStage1RemediationPayloadIncludesProjectRootDirective above (same
+# missing-builder-call shape, different section) and of
+# TestStage1PayloadLiveWorkflowSignalsSection above (same section, different
+# builder).
+# ---------------------------------------------------------------------------
+
+
+class TestStage1RemediationPayloadLiveWorkflowSection:
+    """_assemble_remediation_payload includes the '### Live-Workflow Signals'
+    section emitted by ``_build_live_workflow_section`` when the harness has
+    set a ``filtered_task_tree`` with a live active task.
+
+    RED until step-2 wires ``_build_live_workflow_section()`` into
+    ``_assemble_remediation_payload`` (memory_consolidator.py:971).
+    """
+
+    def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
+        """Build a FilteredTaskTree with the given tasks as active_tasks."""
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(tasks),
+            max_task_id=max((t.get('id', 0) for t in tasks), default=0),
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_payload_includes_section_for_live_task(self, monkeypatch):
+        """Remediation payload lists the live task id under '### Live-Workflow Signals'."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+        not_live_task_id = '100'
+        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
+        other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'blocked'}
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            if str(task_id) == live_task_id:
+                return WorkflowLiveness(
+                    is_live=True,
+                    worktree_registered=True,
+                    recent_commit=False,
+                    orchestrator_live=False,
+                    branch=f'task/{live_task_id}',
+                    last_commit_at=None,
+                )
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.remediation_findings = []
+        stage.filtered_task_tree = self._make_tree([live_task, other_task])
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section in remediation payload; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+        assert live_task_id in payload, (
+            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
+            f"in remediation payload; got snippet:\n{payload[-800:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_payload_omits_section_when_no_task_live(self, monkeypatch):
+        """Section absent when no active task is live (keeps the remediation payload tight)."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.remediation_findings = []
+        stage.filtered_task_tree = self._make_tree(
+            [{'id': 100, 'title': 'Other', 'status': 'blocked'}]
+        )
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when no task is live in remediation "
+            f"payload; got snippet:\n{payload[-800:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_payload_omits_section_when_no_filtered_task_tree(
+        self, monkeypatch
+    ):
+        """Section absent when filtered_task_tree is None (the _make_consolidator default)."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.remediation_findings = []
+        assert stage.filtered_task_tree is None
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when filtered_task_tree is None in "
+            f"remediation payload; got snippet:\n{payload[-800:]!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 2107 step-7 (RED) / step-8 (GREEN): degenerate task-node sweep wiring
 # ---------------------------------------------------------------------------
 
