@@ -2294,6 +2294,98 @@ class GraphitiBackend:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
         return survivor['uuid']
 
+    @_canonicalize_group_args
+    async def ensure_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        The resolve-or-MINT sibling of :meth:`_resolve_or_create_entity`, whose
+        documented 0-match behaviour is a no-op ("node minting stays
+        graphiti_core's job"). That contract is deliberately left intact —
+        callers like ``_dedup_episode_nodes`` depend on a stray extracted name
+        never becoming a permanent node — so the mint lives here instead, and
+        only on that method's None branch. The resolve/collapse half is
+        delegated to it unchanged, so both primitives share one identity rule.
+
+        Exists for names graphiti_core will never mint on its own. The
+        motivating case (task 3335) is a cross-project task reference
+        ``<project_id>:<task_number>``: LLM extraction is exactly what discards
+        the qualifier and collapses the reference onto a bare ``Task N`` node,
+        so waiting for extraction to produce the qualified node is waiting for
+        the bug not to happen.
+
+        LOCK CONTRACT (inherited from ``_resolve_or_create_entity``): callers
+        MUST hold ``_identity_lock_for(group_id)``. This method performs no
+        locking of its own, and a concurrent same-group writer between the
+        resolve and the mint would produce exactly the duplicate-name pair the
+        identity gate exists to prevent.
+
+        Idempotent: once the node exists, every later call for the same
+        (name, group_id) takes the resolve path and mints nothing.
+
+        The minted property set mirrors graphiti_core's own FalkorDB
+        ``get_entity_node_save_query`` minus ``name_embedding``, which that
+        query wraps in ``vecf32()`` and which this repo writes separately via
+        ``update_node_embedding``. ``created_at`` is written as
+        ``datetime.now(UTC).isoformat()`` — byte-identical to what
+        graphiti_core produces, since FalkorDB has no datetime type and
+        ``FalkorDriver.convert_datetimes_to_strings`` stores ``isoformat()``.
+        That matters because ``find_duplicate_entity_nodes`` orders survivors
+        DB-side on the stored string (``ORDER BY ... n.created_at ASC``), a
+        lexicographic compare that is chronologically correct only for
+        same-format, same-offset ISO strings; ``helpers.parse_db_date`` reads
+        the value back with ``datetime.fromisoformat``.
+
+        Args:
+            name: Exact name of the Entity to resolve or mint.
+            group_id: Project graph to target.
+            summary: Summary property for a newly minted node. Ignored on the
+                resolve path — an existing node's summary is never overwritten.
+
+        Returns:
+            The UUID of the single canonical Entity node with this name in
+            *group_id*'s graph — resolved, collapsed-to, or newly minted.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        resolved = await self._resolve_or_create_entity(name, group_id=group_id)
+        if resolved is not None:
+            return resolved
+
+        node_uuid = str(uuid.uuid4())
+        graph = self._graph_for(group_id)
+        await graph.query(
+            'CREATE (n:Entity {uuid: $uuid, name: $name, group_id: $group_id, '
+            'summary: $summary, created_at: $created_at})',
+            {
+                'uuid': node_uuid,
+                'name': name,
+                'group_id': group_id,
+                'summary': summary,
+                'created_at': datetime.now(UTC).isoformat(),
+            },
+        )
+        logger.info(
+            'ensure_entity_node: minted node=%s name=%r group_id=%s',
+            node_uuid, name, group_id,
+        )
+        try:
+            embedding = await self._require_client().embedder.create(name)
+            await self.update_node_embedding(node_uuid, embedding, group_id=group_id)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Best-effort, mirroring rename_entity_node: the node itself (the
+            # primary result, which keeps exact-name Cypher lookups correct)
+            # already exists; a missing embedding only affects fuzzy hybrid
+            # node search.
+            logger.warning(
+                'ensure_entity_node: failed to generate name_embedding for '
+                'node=%s name=%r; the node was still minted',
+                node_uuid, name, exc_info=True,
+            )
+        return node_uuid
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.

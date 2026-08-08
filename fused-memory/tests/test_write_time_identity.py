@@ -7,10 +7,15 @@ Covers:
   chokepoint — 0 matches is a no-op (None), 1 match resolves, >=2 collapses via
   find_duplicate_entity_nodes + merge_entities. group_id-scoped per the
   2026-07-06 amendment guarding task-2115's active cross-graph leak.
+- GraphitiBackend.ensure_entity_node (task 3335): the resolve-or-MINT sibling of
+  _resolve_or_create_entity — delegates resolve/collapse to it and adds only the
+  mint on its documented 0-match None branch.
 """
 from __future__ import annotations
 
 import asyncio
+import uuid
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -316,3 +321,193 @@ class TestGroupIdScopingAmendment:
         dep_uuid, sur_uuid = backend.merge_entities.await_args_list[0][0][:2]
         assert {dep_uuid, sur_uuid} == {'home-1', 'home-2'}
         assert sur_uuid == result
+
+
+# ---------------------------------------------------------------------------
+# task 3335 step-3/4: GraphitiBackend.ensure_entity_node — resolve-or-MINT
+# ---------------------------------------------------------------------------
+
+def _create_calls(graph: MagicMock) -> list:
+    """Return the graph.query calls whose Cypher mints an Entity node.
+
+    The mint path also issues a separate SET n.name_embedding write (via
+    update_node_embedding) against the same graph mock, so tests that assert on
+    the mint itself must select it rather than assume a single call.
+    """
+    return [c for c in graph.query.call_args_list if 'CREATE' in extract_cypher(c)]
+
+
+class TestEnsureEntityNode:
+    """GraphitiBackend.ensure_entity_node(name, *, group_id, summary='') — the
+    resolve-or-MINT sibling of _resolve_or_create_entity (task 3335).
+
+    _resolve_or_create_entity documents 0 matches as a no-op ("node minting
+    stays graphiti_core's job"), and several callers depend on that. Splitting a
+    collapsed cross-project reference needs a node that graphiti-core will never
+    mint (extraction is exactly what discarded the qualifier), so this primitive
+    delegates the resolve/collapse half to _resolve_or_create_entity and adds
+    ONLY the mint on its None branch — leaving that contract intact.
+
+    Inherits _resolve_or_create_entity's lock contract: callers MUST hold
+    _identity_lock_for(group_id).
+    """
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend, make_graph_mock):
+        """Backend whose resolve inputs are mocked and whose graph is captured.
+
+        get_nodes_by_exact_name defaults to [] (the 0-match mint branch); the
+        REAL _resolve_or_create_entity runs, so resolve/collapse behaviour is
+        exercised rather than stubbed.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        backend.merge_entities = AsyncMock()
+        backend.update_node_embedding = AsyncMock()
+        backend.client.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        backend._test_graph = graph
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_single_match_resolves_without_minting(self, backend_with_mocks):
+        """(a) Exactly one existing node: return its uuid, write nothing."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []}
+        ]
+        result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert result == 'u-1'
+        backend._test_graph.query.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_multiple_matches_collapse_and_return_survivor(self, backend_with_mocks):
+        """(b) >=2 existing nodes: collapse via find_duplicate_entity_nodes +
+        merge_entities, return the survivor, mint nothing."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'surv', 'name': 'dark_factory:2500', 'summary': '', 'labels': []},
+            {'uuid': 'dup1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []},
+        ]
+        backend.find_duplicate_entity_nodes.return_value = [
+            {'uuid': 'surv', 'created_at': 1, 'edge_count': 5},
+            {'uuid': 'dup1', 'created_at': 2, 'edge_count': 0},
+        ]
+        result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert result == 'surv'
+        backend.merge_entities.assert_awaited_once_with('dup1', 'surv', group_id='reify')
+        assert _create_calls(backend._test_graph) == []
+
+    @pytest.mark.asyncio
+    async def test_zero_matches_mints_an_entity_node(self, backend_with_mocks):
+        """(c) Zero existing nodes: mint one :Entity node and return its uuid."""
+        backend = backend_with_mocks
+        result = await backend.ensure_entity_node(
+            'dark_factory:2500', group_id='reify', summary='cross-project ref'
+        )
+        creates = _create_calls(backend._test_graph)
+        assert len(creates) == 1
+        cypher = extract_cypher(creates[0])
+        params = extract_params(creates[0])
+        assert 'CREATE' in cypher
+        assert ':Entity' in cypher
+        assert params['name'] == 'dark_factory:2500'
+        assert params['group_id'] == 'reify'
+        assert params['summary'] == 'cross-project ref'
+        assert params['created_at']
+        # A fresh uuid4 string, returned to the caller.
+        assert uuid.UUID(params['uuid'])
+        assert result == params['uuid']
+
+    @pytest.mark.asyncio
+    async def test_summary_defaults_to_empty_string(self, backend_with_mocks):
+        backend = backend_with_mocks
+        await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert extract_params(_create_calls(backend._test_graph)[0])['summary'] == ''
+
+    @pytest.mark.asyncio
+    async def test_created_at_matches_graphiti_cores_wire_format(self, backend_with_mocks):
+        """The minted created_at must be byte-compatible with what graphiti-core
+        itself writes, or survivor selection would be poisoned when this node
+        later needs collapsing.
+
+        Confirmed round-trip (task 3335 step-4): graphiti-core hands a datetime
+        to $entity_data, FalkorDriver.convert_datetimes_to_strings turns it into
+        `datetime.isoformat()` (FalkorDB has no datetime type), helpers.
+        parse_db_date reads it back with `datetime.fromisoformat`, and
+        find_duplicate_entity_nodes orders DB-SIDE on the stored string
+        (`ORDER BY ... n.created_at ASC`) — a lexicographic compare that is
+        chronologically correct only for same-format, same-offset ISO strings.
+        So the mint must emit exactly `datetime.now(UTC).isoformat()`.
+        """
+        backend = backend_with_mocks
+        await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        created_at = extract_params(_create_calls(backend._test_graph)[0])['created_at']
+        assert isinstance(created_at, str)
+        parsed = datetime.fromisoformat(created_at)  # what parse_db_date does
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timedelta(0)
+        # Lexicographic ordering agrees with chronological ordering against a
+        # value written in graphiti-core's own format.
+        older = (parsed - timedelta(seconds=1)).isoformat()
+        newer = (parsed + timedelta(seconds=1)).isoformat()
+        assert sorted([newer, created_at, older]) == [older, created_at, newer]
+
+    @pytest.mark.asyncio
+    async def test_mint_regenerates_name_embedding(self, backend_with_mocks):
+        """(d) After a successful mint the name_embedding is regenerated with
+        the NEW uuid, mirroring rename_entity_node."""
+        backend = backend_with_mocks
+        result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        backend.client.embedder.create.assert_awaited_once_with('dark_factory:2500')
+        backend.update_node_embedding.assert_awaited_once_with(
+            result, [0.1, 0.2, 0.3], group_id='reify'
+        )
+
+    @pytest.mark.asyncio
+    async def test_embedder_failure_is_swallowed_and_mint_still_returns(
+        self, backend_with_mocks
+    ):
+        """(d) Best-effort: an embedder failure is logged, not raised — the
+        node itself (the primary result) already exists."""
+        backend = backend_with_mocks
+        backend.client.embedder.create = AsyncMock(side_effect=RuntimeError('embedder down'))
+        result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert result == extract_params(_create_calls(backend._test_graph)[0])['uuid']
+        backend.update_node_embedding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_embedding_write_failure_is_swallowed(self, backend_with_mocks):
+        backend = backend_with_mocks
+        backend.update_node_embedding = AsyncMock(side_effect=RuntimeError('write failed'))
+        result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert result == extract_params(_create_calls(backend._test_graph)[0])['uuid']
+
+    @pytest.mark.asyncio
+    async def test_idempotent_second_call_mints_nothing(self, backend_with_mocks):
+        """(e) Idempotence: once the node exists, a second call for the same
+        (name, group_id) takes the resolve path."""
+        backend = backend_with_mocks
+        first = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': first, 'name': 'dark_factory:2500', 'summary': '', 'labels': []}
+        ]
+        second = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
+        assert second == first
+        assert len(_create_calls(backend._test_graph)) == 1
+
+    @pytest.mark.asyncio
+    async def test_group_id_is_canonicalized(self, backend_with_mocks):
+        """(f) Decorated with @_canonicalize_group_args: a hyphenated/uppercase
+        group_id resolves AND mints under the canonical key, so the graph key,
+        the node's group_id property and any later $group_id filter agree."""
+        backend = backend_with_mocks
+        await backend.ensure_entity_node('dark_factory:2500', group_id='Dark-Factory')
+        backend.get_nodes_by_exact_name.assert_awaited_once_with(
+            'dark_factory:2500', group_id='dark_factory'
+        )
+        assert extract_params(_create_calls(backend._test_graph)[0])['group_id'] == 'dark_factory'
+        backend._driver._get_graph.assert_called_with('dark_factory')
