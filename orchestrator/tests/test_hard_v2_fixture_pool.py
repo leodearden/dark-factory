@@ -33,6 +33,20 @@ STANDING_TASKS_DIR = EVALS_DIR / 'tasks'
 EXPECTED_CENSUS_COUNTS = {'reify': 36, 'dark_factory': 4, 'know_live': 1}
 EXPECTED_TOTAL = 41
 
+# The baseline-ladder rungs a CENSUS candidate's pre_task_commit can come from.
+BASELINE_RUNGS = {'merge_first_parent', 'status_autocommit', 'timestamp_walk'}
+
+# A CONTINUITY fixture's baseline is not resolved by the ladder at all — it is
+# inherited verbatim from the canonical fixture under evals/tasks/, whose own
+# pre/post predate the ladder (df_task_18's pre is not its post's first parent,
+# so claiming `merge_first_parent` would be a false provenance).
+CONTINUITY_RUNG = 'standing_fixture_inherited'
+
+# The three PRD-named back-filled continuity fixtures. They are deliberately
+# re-banded into the v2 cohort under their EXISTING ids, so these three ids are
+# the one intended overlap with the standing corpus.
+CONTINUITY_IDS = ('reify_task_12', 'reify_task_27', 'df_task_18')
+
 
 @pytest.fixture(scope='module')
 def manifest() -> dict:
@@ -123,9 +137,7 @@ class TestCandidatesBlock:
         for c in manifest['candidates']:
             if c['decision'] == 'include' and c['mint_mode'] == 'planrate_only':
                 assert c['merge_sha'] is None, c['task_id']
-                assert c['baseline_source'] in {
-                    'merge_first_parent', 'status_autocommit', 'timestamp_walk',
-                }, c['task_id']
+                assert c['baseline_source'] in BASELINE_RUNGS, c['task_id']
 
     def test_the_two_cancelled_reify_tasks_are_adjudicated(
         self, manifest: dict,
@@ -286,13 +298,16 @@ class TestMintedPool:
     def test_id_set_equals_the_manifest_includes(
         self, pool: list[dict], manifest: dict,
     ) -> None:
-        # No orphan fixture, no unminted include.
+        # No orphan fixture, no unminted include. The pool is exactly the
+        # manifest's included census candidates PLUS its continuity block —
+        # the two are the only sources a fixture may come from.
         expected = set()
         for c in manifest['candidates']:
             if c['decision'] == 'include':
                 repo = {'reify': 'reify', 'dark_factory': 'df',
                         'know_live': 'kl'}[c['project']]
                 expected.add(f'{repo}_task_{c["task_id"]}')
+        expected |= {e['id'] for e in manifest['continuity']['fixtures']}
         assert {f['id'] for f in pool} == expected
 
     def test_every_fixture_carries_what_the_runner_reads(
@@ -316,10 +331,13 @@ class TestMintedPool:
             assert f['cohort'] == 'fable-trial-v2-hard', f['id']
 
     def test_every_fixture_names_its_baseline_rung(self, pool: list[dict]) -> None:
+        # Census fixtures name the ladder rung that produced their baseline;
+        # a continuity fixture names the distinct `inherited` provenance
+        # instead of falsely claiming a ladder rung it never ran.
         for f in pool:
-            assert f['provenance']['baseline_source'] in {
-                'merge_first_parent', 'status_autocommit', 'timestamp_walk',
-            }, f['id']
+            assert f['provenance']['baseline_source'] in (
+                BASELINE_RUNGS | {CONTINUITY_RUNG}
+            ), f['id']
 
     def test_ceilings_are_pinned_fixture_side(
         self, pool: list[dict], manifest: dict,
@@ -375,15 +393,136 @@ class TestStandingCorpusIsolation:
         assert len(standing) == 22
         assert len({f['id'] for f in standing}) == 22
 
-    def test_pool_and_standing_corpus_are_disjoint(self, pool: list[dict]) -> None:
+    def test_the_only_id_overlap_is_the_declared_continuity_set(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # The census half of the pool must not collide with the standing
+        # corpus at all. The continuity fixtures DO share their ids by
+        # design — they are the same three tasks re-banded into the v2
+        # cohort — so the overlap is pinned to exactly that declared set
+        # rather than left as an open-ended allowance.
         from orchestrator.cli import _load_fixture_dir
         standing_ids = {f['id'] for f in _load_fixture_dir(STANDING_TASKS_DIR)}
-        assert standing_ids.isdisjoint({f['id'] for f in pool})
+        declared = {e['id'] for e in manifest['continuity']['fixtures']}
+        overlap = standing_ids & {f['id'] for f in pool}
+        assert overlap == declared
 
     def test_standing_corpus_carries_no_v2_cohort_fixture(self) -> None:
         from orchestrator.cli import _load_fixture_dir
         for f in _load_fixture_dir(STANDING_TASKS_DIR):
             assert f.get('cohort') != 'fable-trial-v2-hard', f['id']
+
+
+# ---------------------------------------------------------------------------
+# The continuity fixtures — a re-banded copy, machine-checked against drift
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def continuity(manifest: dict) -> list[dict]:
+    return manifest['continuity']['fixtures']
+
+
+def _source_fixture(entry: dict) -> dict:
+    return json.loads((REPO_ROOT / entry['source_path']).read_text())
+
+
+def _minted(entry: dict) -> dict:
+    return json.loads((POOL_DIR / f'{entry["id"]}.json').read_text())
+
+
+class TestContinuityFixtures:
+    def test_block_lists_exactly_the_three_prd_named_ids(
+        self, continuity: list[dict],
+    ) -> None:
+        assert {e['id'] for e in continuity} == set(CONTINUITY_IDS)
+        assert len(continuity) == len(CONTINUITY_IDS), 'no duplicate entries'
+
+    def test_block_records_why_the_back_fill_exists(self, manifest: dict) -> None:
+        # The PRD justification (re-banding under a valid reference closes the
+        # v1 n=1 confound) is recorded, not implied.
+        assert manifest['continuity']['rationale'].strip()
+
+    def test_each_entry_names_a_source_under_the_standing_corpus(
+        self, continuity: list[dict],
+    ) -> None:
+        for entry in continuity:
+            src = entry['source_path']
+            assert src.startswith(
+                'orchestrator/src/orchestrator/evals/tasks/'
+            ), src
+            assert (REPO_ROOT / src).exists(), src
+            assert Path(src).name == f'{entry["id"]}.json', src
+
+    def test_each_is_minted_into_the_pool(self, continuity: list[dict]) -> None:
+        for entry in continuity:
+            assert (POOL_DIR / f'{entry["id"]}.json').exists(), entry['id']
+
+    def test_lineage_fields_equal_the_source_fixture(
+        self, continuity: list[dict],
+    ) -> None:
+        # The task's "do not duplicate content divergently" requirement, made
+        # a machine check rather than a convention: a re-authored brief or a
+        # re-derived baseline would make the v2 record a DIFFERENT task
+        # wearing the same id, silently breaking the v1↔v2 comparison the
+        # continuity set exists to enable.
+        for entry in continuity:
+            src, got = _source_fixture(entry), _minted(entry)
+            where = entry['id']
+            assert got['pre_task_commit'] == src['pre_task_commit'], where
+            assert got['post_task_commit'] == src['post_task_commit'], where
+            assert got['task_definition'] == src['task_definition'], where
+            assert got['project'] == src['project'], where
+            assert got['project_root'] == src['project_root'], where
+
+    def test_each_carries_a_reference_captured_from_its_own_shas(
+        self, continuity: list[dict],
+    ) -> None:
+        # Captured directly from the fixture's already-committed pre/post, so
+        # β1 is self-contained and does not wait on ι2's back-fill.
+        for entry in continuity:
+            got = _minted(entry)
+            post = got['reference']['post_task_commit']
+            assert isinstance(post, str) and len(post) == 40, entry['id']
+            assert post == got['post_task_commit'], entry['id']
+            assert got['reference']['diff_stat']['files'] > 0, entry['id']
+
+    def test_each_carries_the_v2_cohort_and_ceilings(
+        self, continuity: list[dict], manifest: dict,
+    ) -> None:
+        for entry in continuity:
+            got = _minted(entry)
+            assert got['cohort'] == 'fable-trial-v2-hard', entry['id']
+            assert got['max_architect_turns'] == 120, entry['id']
+            assert got['timeout_minutes'] == manifest['ceilings']['timeout_minutes'], \
+                entry['id']
+
+    def test_provenance_names_the_source_path(
+        self, continuity: list[dict],
+    ) -> None:
+        for entry in continuity:
+            got = _minted(entry)
+            assert got['provenance']['derived_from'] == entry['source_path'], \
+                entry['id']
+            assert got['provenance']['baseline_source'] == CONTINUITY_RUNG, \
+                entry['id']
+
+    def test_source_fixtures_are_byte_unchanged_versus_git_head(
+        self, continuity: list[dict],
+    ) -> None:
+        # β1 must not edit the standing corpus. Byte-level, against git — a
+        # weaker "the file still parses" check would not catch a re-authored
+        # brief being written back into tasks/.
+        import subprocess
+        for entry in continuity:
+            src = entry['source_path']
+            head = subprocess.run(
+                ['git', 'show', f'HEAD:{src}'],
+                cwd=str(REPO_ROOT), capture_output=True, check=True,
+            ).stdout
+            assert (REPO_ROOT / src).read_bytes() == head, (
+                f'{src} differs from git HEAD — β1 must not touch the '
+                f'standing corpus'
+            )
 
 
 class TestMetaLayout:
