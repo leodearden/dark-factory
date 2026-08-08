@@ -568,8 +568,13 @@ async def collect_done_counts(
 ) -> dict[str, int]:
     """Return a ``{project_label: done_count}`` map for all reachable projects.
 
-    Uses the compact ``fetch_statuses`` (the same source the burndown collector
-    uses) so the count agrees with the burndown snapshot.
+    Uses the compact ``fetch_statuses`` because only a per-status count is
+    needed here.  NOTE: this is no longer the burndown collector's source —
+    that switched to ``fetch_tasks`` (task 3543) because the compact map
+    carries no claimant columns and so cannot express the live/stranded
+    split.  The two agree on the ``done`` count (both ultimately read the same
+    task store), but they are separate reads at separate instants, so a task
+    completing between them can show a transient off-by-one.
 
     All projects are fetched concurrently to minimise latency.  Projects whose
     ``fetch_statuses`` returns an offline marker are silently omitted.

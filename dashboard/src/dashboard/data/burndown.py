@@ -3,6 +3,19 @@
 Periodically snapshots task status counts per project into a SQLite table.
 The background collector (in app.py lifespan) writes via a dedicated writable
 connection; route handlers read via DbPool (read-only).
+
+Each snapshot row carries three things beyond the six display zones
+(task 3543 / PRD ι, spec S8/E12):
+
+* ``in_progress_live`` / ``in_progress_stranded`` — a partition of the
+  ``in_progress`` zone, so a window full of strands is legible as such
+  instead of reading as healthy throughput.
+* ``concurrency_cap`` — ``max_concurrent_tasks`` as it stood AT SNAPSHOT
+  TIME, ``NULL`` when unknown.
+
+The collector's single source is ``fetch_tasks`` (MCP ``get_tasks``): the
+compact ``fetch_statuses`` map carries no claimant columns, so the split
+cannot be derived from it at all.
 """
 
 from __future__ import annotations
@@ -22,8 +35,9 @@ from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
+    read_max_concurrent_tasks,
 )
-from dashboard.data.tasks import fetch_statuses, task_is_stranded
+from dashboard.data.tasks import fetch_tasks, task_is_stranded
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -207,7 +221,12 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now = datetime.now(UTC).isoformat()  # clock-exempt: single-capture writer
+        now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
+        # One instant for the whole cycle: the ``ts`` written to every row and
+        # the reference the strand verdicts are judged against must be the SAME
+        # capture, or a row could claim a strand count that its own timestamp
+        # contradicts.
+        now = now_dt.isoformat()
         # config.project_root is already resolved by DashboardConfig.__post_init__
         resolved_root = str(config.project_root)
 
@@ -266,11 +285,19 @@ async def collect_snapshot(
             roots_to_snapshot.append(root_str)
 
         # Phase 2 — Parallel read:
-        # Each fetch_statuses call hits fused-memory MCP independently;
+        # Each fetch_tasks call hits fused-memory MCP independently;
         # return_exceptions=True isolates per-project network failures so a
         # single offline server can't sink the whole cycle.
+        #
+        # SOURCE: fetch_tasks (MCP get_tasks), NOT the ~95%-smaller
+        # fetch_statuses (get_statuses).  get_statuses returns a bare
+        # {id: status} map with no claimant columns, so the live/stranded
+        # split is physically underivable from it.  The collector runs once
+        # per _SAMPLE_INTERVAL_SECONDS (600s), so the larger payload is a
+        # ten-minute cost, not a per-render one — and it collapses the
+        # collector onto ONE source instead of two that can disagree.
         all_results = await asyncio.gather(
-            *(fetch_statuses(client, config, root) for root in roots_to_snapshot),
+            *(fetch_tasks(client, config, root) for root in roots_to_snapshot),
             return_exceptions=True,
         )
 
@@ -280,19 +307,34 @@ async def collect_snapshot(
         # cannot roll back rows that were already committed for earlier projects.
         for root_str, result in zip(roots_to_snapshot, all_results, strict=True):
             if isinstance(result, BaseException):
-                logger.warning('Failed to fetch statuses for %s', root_str, exc_info=result)
+                logger.warning('Failed to fetch tasks for %s', root_str, exc_info=result)
                 continue
-            if not isinstance(result, dict):
-                logger.warning('Unexpected fetch_statuses result for %s: %r', root_str, type(result))
+            # The offline marker is a dict, a healthy result is a list — check
+            # the marker FIRST so a known outage is reported as an outage
+            # rather than as a malformed result.
+            if isinstance(result, dict) and result.get('offline'):
+                logger.debug('fetch_tasks offline for %s: %s', root_str, result.get('error'))
                 continue
-            if result.get('offline'):
-                logger.debug('fetch_statuses offline for %s: %s', root_str, result.get('error'))
+            if not isinstance(result, list):
+                logger.warning('Unexpected fetch_tasks result for %s: %r', root_str, type(result))
                 continue
-            statuses: dict[int, str | None] = {
-                k: v for k, v in result.items() if isinstance(k, int)
-            }
+            tasks = [t for t in result if isinstance(t, Mapping)]
             try:
-                counts = _count_statuses(statuses)
+                counts = _count_zones(tasks, now_dt)
+                # One cap read per ROOT (not per task): it touches the
+                # filesystem, and the value is a per-project scalar.  Stored on
+                # the row because max_concurrent_tasks is hot-reloadable — see
+                # BURNDOWN_SCHEMA's concurrency_cap comment.
+                cap = read_max_concurrent_tasks(root_str)
+                if cap is not None and counts['in_progress'] > cap:
+                    logger.warning(
+                        'Concurrency cap breached for %s: %d in-progress vs cap %d '
+                        '(%d stranded)',
+                        root_str,
+                        counts['in_progress'],
+                        cap,
+                        counts['in_progress_stranded'],
+                    )
                 await conn.execute(
                     _INSERT_SNAPSHOT_SQL,
                     (
@@ -304,13 +346,11 @@ async def collect_snapshot(
                         counts['deferred'],
                         counts['cancelled'],
                         counts['done'],
-                        # A counter that cannot see the claimant columns has no
-                        # split to report; default to all-live so conservation
-                        # (live + stranded == in_progress) still holds and the
-                        # unknown errs toward under-reporting strands.
-                        counts.get('in_progress_live', counts['in_progress']),
-                        counts.get('in_progress_stranded', 0),
-                        counts.get('concurrency_cap'),
+                        counts['in_progress_live'],
+                        counts['in_progress_stranded'],
+                        # NULL, never 0, when the cap is unknown: a stored 0
+                        # would read as a cap of zero and alarm on every row.
+                        cap,
                     ),
                 )
                 await conn.commit()
