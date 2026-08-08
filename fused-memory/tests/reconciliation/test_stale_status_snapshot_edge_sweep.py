@@ -763,6 +763,102 @@ class TestExtractSnapshotEdgeTaskIds:
             'Blocked tasks 1020 and 1030 plus 3 pending others are pending.'
         ) == set()
 
+    # ----------------------------------------------------------------- #
+    # task 3079 — 'stalled' as a recognized non-terminal marker
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # the finding's verbatim stale edge fact — a hyphenated compound
+            (
+                'Tasks 1020, 1030, and 1031 are pairwise-stalled as of 2026-04-29.',
+                {1020, 1030, 1031},
+            ),
+            (
+                'Tasks 1020, 1030, and 1031 are pairwise-stalled and remain pending.',
+                {1020, 1030, 1031},
+            ),
+            # every other path must reach the new marker too — the module's
+            # standing rule is that a marker addition is checked against ALL
+            # paths, not just the one that motivated it
+            ('Task 5 is stalled.', {5}),
+            ('Task 5 is pairwise-stalled.', {5}),
+            ("Task 5's status is stalled.", {5}),
+            ('Task 5 is in a stalled status.', {5}),
+            ('Stalled tasks: 1020, 1030', {1020, 1030}),
+        ],
+    )
+    def test_stalled_is_a_recognized_marker(self, fact, expected):
+        """'stalled' asserts a non-terminal status. (task 3079)
+
+        REPRO, and the reason the 1020/1030/1031 cluster was unreachable
+        even in principle: SNAPSHOT_STATUS_RE — the whole-fact gate — did
+        not know the word, so extraction short-circuited to set() before
+        any reference parsing ran. A perfect plural-enumeration parser
+        alone would still not have selected this edge.
+
+        The cluster asserts a stalled (i.e. non-terminal, still-live)
+        condition on tasks that are now done, which is squarely in this
+        sweep's remit.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # THE reason 'stalled' belongs in _TRANSITIVE_MARKER_ALT rather
+            # than _ADJECTIVE_MARKER_ALT: like 'blocked' it is also a common
+            # transitive verb, and these are permanently-true historical
+            # facts. The optional-copula adjective arm would match them and
+            # retire them the moment task 5 went done.
+            'Task 5 stalled the merge queue.',
+            'Task 5 stalled the release for a week.',
+            'Tasks 1020 and 1030 stalled the merge queue.',
+            # negation / past-exit
+            'Task 5 is no longer stalled.',
+            "Task 5's status is no longer stalled.",
+        ],
+    )
+    def test_stalled_precision_guards(self, fact):
+        """Shapes the new marker must NOT extract. (task 3079)
+
+        Mirrors the task-3042 transitive-verb hardening exactly: 'stalled'
+        is admitted only in copula/article form, so the bare verb reading
+        stays out of every path.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_stalled_count_quantity_is_stripped_from_aggregate_segment(self):
+        """'3 stalled' must not leak a bare id 3. (task 3079)
+
+        The non-obvious half of the module's standing marker-addition rule.
+        Widening _STATUS_MARKER_ALT feeds four consumers; three are safe by
+        construction (the gate merely admits a fact; the phrase form
+        requires the literal noun 'status'; the list introducer requires
+        adjacency to the list noun). COUNT_QUANTITY_RE is the one that is
+        NOT — it strips 'N <count-noun>' spans from an aggregate segment
+        before bare-digit collection, so a marker missing from ITS
+        alternation turns a count phrase into a spurious task id.
+        """
+        ids = extract_snapshot_edge_task_ids('Stalled tasks: 1020, 1030, and 3 stalled others')
+        assert ids == {1020, 1030}
+        assert 3 not in ids
+
+    def test_compound_prefix_is_a_single_hyphenated_token(self):
+        """The compound prefix cannot cross whitespace. (task 3079)
+
+        'pairwise-stalled' anchors to its copula via a bounded optional
+        '\\w+-' prefix. Deliberately ONE hyphenated token: were it allowed
+        to span whitespace it would become an open-class gap and re-admit
+        the readings the mandatory-copula arms exist to exclude — here, a
+        merge that is blocked rather than the tasks.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Tasks 1020 and 1030 are awaiting a blocked merge.'
+        ) == set()
+        assert extract_snapshot_edge_task_ids('Task 5 is awaiting stalled work.') == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
