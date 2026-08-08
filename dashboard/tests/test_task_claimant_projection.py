@@ -11,6 +11,8 @@ projection at its two seams:
 * :func:`dashboard.data.tasks.task_is_stranded` — the single dashboard-side
   strand predicate, a thin wrapper that binds ``STRANDED_HEARTBEAT_TTL`` and
   ``resolve_now`` onto :func:`shared.task_claimant.is_stranded`.
+* :func:`dashboard.data.active_tasks._build_task_row` — stamps the two raw
+  columns plus the computed ``stranded`` boolean onto every task row.
 
 The delegation is asserted by patching the shared predicate, so the dashboard's
 notion of "stranded" can never silently fork from the shared one (INV-5).
@@ -23,7 +25,9 @@ from unittest.mock import patch
 
 import pytest
 
+from dashboard.data import active_tasks as active_tasks_mod
 from dashboard.data import tasks as tasks_mod
+from dashboard.data.active_tasks import _build_task_row
 from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL, _shape_task, task_is_stranded
 
 _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
@@ -211,3 +215,170 @@ class TestTaskIsStrandedDelegates:
             task_is_stranded(task, now=other)
 
         assert shared.call_args.args[1] == other
+
+
+# ---------------------------------------------------------------------------
+# (c) active_tasks._build_task_row projects the strand onto every task row
+# ---------------------------------------------------------------------------
+
+
+def _task(**overrides) -> dict:
+    """A dashboard-shaped task row as ``_shape_task`` emits it."""
+    task = {
+        'id': 42,
+        'title': 'a task',
+        'description': '',
+        'details': '',
+        'status': 'in-progress',
+        'priority': 'medium',
+        'dependencies': [],
+        'metadata': {},
+        'updated_at': _iso(_NOW),
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+    }
+    task.update(overrides)
+    return task
+
+
+def _rt(agent: str | None = None) -> dict:
+    """A ``_runtime_fields``-shaped dict; ``agent`` is the worktree-presence signal."""
+    return {
+        'agent': agent,
+        'loops': 0,
+        'attempts': 0,
+        'started': 0,
+        'lane': None,
+        'phase': None,
+        'lane_state': None,
+        'runtime_offline': False,
+    }
+
+
+class TestBuildTaskRowStrandProjection:
+    def test_row_carries_claimant_fields_and_stranded(self):
+        row = _build_task_row(
+            'p',
+            _task(claimant_run_id='run/sess/pid=1', heartbeat_at=_iso(_NOW)),
+            42,
+            _rt(),
+            'p/T-42',
+            now=_NOW,
+        )
+
+        assert row['claimant_run_id'] == 'run/sess/pid=1'
+        assert row['heartbeat_at'] == _iso(_NOW)
+        assert row['stranded'] is False
+
+    def test_worktree_agent_with_null_claimant_is_stranded(self):
+        """THE defect this task removes.
+
+        ``agent`` is set purely from ``entry.has_worktree`` — a leftover
+        worktree directory, not evidence that anything is running.  A task
+        showing ``claude-task-42`` with a dead claimant is exactly the
+        strand that previously read as healthy.  The two signals must be
+        independent fields: the row keeps its ``agent`` AND reports
+        ``stranded=True``.
+        """
+        row = _build_task_row(
+            'p',
+            _task(claimant_run_id=None, heartbeat_at=None),
+            42,
+            _rt(agent='claude-task-42'),
+            'p/T-42',
+            now=_NOW,
+        )
+
+        assert row['agent'] == 'claude-task-42'
+        assert row['stranded'] is True
+
+    def test_stranded_is_not_derived_from_agent(self):
+        """A live claimant with NO worktree is not stranded."""
+        row = _build_task_row(
+            'p',
+            _task(claimant_run_id='run/sess/pid=1', heartbeat_at=_iso(_NOW)),
+            42,
+            _rt(agent=None),
+            'p/T-42',
+            now=_NOW,
+        )
+
+        assert row['agent'] is None
+        assert row['stranded'] is False
+
+    def test_stale_heartbeat_is_stranded(self):
+        row = _build_task_row(
+            'p',
+            _task(
+                claimant_run_id='run/sess/pid=1',
+                heartbeat_at=_iso(_NOW - STRANDED_HEARTBEAT_TTL - timedelta(minutes=1)),
+            ),
+            42,
+            _rt(agent='claude-task-42'),
+            'p/T-42',
+            now=_NOW,
+        )
+
+        assert row['stranded'] is True
+
+    @pytest.mark.parametrize('status', ['blocked', 'done', 'pending', 'cancelled'])
+    def test_terminal_and_non_in_progress_rows_are_not_stranded(self, status):
+        row = _build_task_row(
+            'p', _task(status=status), 42, _rt(agent='claude-task-42'), 'p/T-42', now=_NOW
+        )
+
+        assert row['stranded'] is False
+
+    def test_missing_claimant_keys_degrade_to_none_not_keyerror(self):
+        """A pre-migration row lacks both columns entirely."""
+        task = _task()
+        del task['claimant_run_id']
+        del task['heartbeat_at']
+
+        row = _build_task_row('p', task, 42, _rt(), 'p/T-42', now=_NOW)
+
+        assert row['claimant_run_id'] is None
+        assert row['heartbeat_at'] is None
+        # No claimant evidence is not evidence of liveness.
+        assert row['stranded'] is True
+
+    def test_existing_row_keys_are_unchanged(self):
+        row = _build_task_row('p', _task(), 42, _rt(), 'p/T-42', now=_NOW)
+
+        for key in (
+            'id', 'project', 'title', 'description', 'details', 'status',
+            'agent', 'loops', 'attempts', 'lane', 'phase', 'lane_state',
+            'runtime_offline', 'meta_files', 'train', 'external_deps', 'prd',
+        ):
+            assert key in row
+
+
+class TestBuildTaskRowClockDiscipline:
+    def test_threads_the_caller_supplied_now(self):
+        task = _task(claimant_run_id='run/sess/pid=1', heartbeat_at=_iso(_NOW))
+
+        with patch.object(
+            active_tasks_mod, 'task_is_stranded', return_value=False
+        ) as predicate:
+            _build_task_row('p', task, 42, _rt(), 'p/T-42', now=_NOW)
+
+        predicate.assert_called_once_with(task, now=_NOW)
+
+    def test_caller_now_beats_the_live_clock(self):
+        """A heartbeat that is fresh relative to the SUPPLIED now — but ancient
+        relative to the live clock — must read as live.
+
+        Proves the row's verdict derives from the threaded instant, not from a
+        clock read inside the row builder.
+        """
+        historical = datetime(2020, 1, 1, tzinfo=UTC)
+        row = _build_task_row(
+            'p',
+            _task(claimant_run_id='run/sess/pid=1', heartbeat_at=_iso(historical)),
+            42,
+            _rt(),
+            'p/T-42',
+            now=historical + timedelta(seconds=5),
+        )
+
+        assert row['stranded'] is False
