@@ -396,6 +396,8 @@ class TestIterErrorNeighborhoods:
         assert n['attempt_input_summary'] == json.dumps({'command': 'false'}, sort_keys=True)
         assert n['error_content'] == 'Exit code 1'
         assert n['index'] == 1
+        assert n['exit_code'] == 1
+        assert n['designed_outcome'] is None
 
     def test_ignores_non_error_result(self):
         records = [
@@ -431,6 +433,102 @@ class TestIterErrorNeighborhoods:
         assert neighborhoods[0]['attempt_tool'] is None
         assert neighborhoods[0]['attempt_input_summary'] is None
         assert neighborhoods[0]['error_content'] == 'boom'
+        assert neighborhoods[0]['exit_code'] is None
+        assert neighborhoods[0]['designed_outcome'] is None
+
+    def test_every_neighborhood_carries_the_two_classification_keys(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        for n in mod.iter_error_neighborhoods(records):
+            assert set(n) == {
+                'index', 'attempt_tool', 'attempt_input_summary',
+                'error_content', 'exit_code', 'designed_outcome',
+            }
+
+    def test_ceiling_result_is_enriched_with_code_and_label(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'watcher-rearm.sh'}, id='tu-c')),
+            _tool_result('tu-c', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] == 124
+        assert n['designed_outcome'] is not None
+
+    def test_plain_error_without_a_code_is_unclassified(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-p')),
+            _tool_result('tu-p', 'something broke', is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] is None
+        assert n['designed_outcome'] is None
+
+
+# ---------------------------------------------------------------------------
+# iter_genuine_errors / iter_designed_outcomes — a TOTAL, LOSSLESS partition
+# of iter_error_neighborhoods on `designed_outcome is None`. The scan itself
+# stays single-source-of-truth; only the split is new.
+# ---------------------------------------------------------------------------
+
+def _mixed_error_records():
+    """2 declared CEILINGs + 1 bare exit-124 + 1 genuine exit-2 failure."""
+    return [
+        _assistant(_tool_use('Bash', {'command': 'w1'}, id='tu-c1')),
+        _tool_result('tu-c1', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'w2'}, id='tu-c2')),
+        _tool_result('tu-c2', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'poll'}, id='tu-t')),
+        _tool_result('tu-t', 'timed out after 600s, exit=124', is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')),
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True),
+    ]
+
+
+class TestErrorNeighborhoodPartition:
+    def test_genuine_errors_are_exactly_the_undesigned_ones(self):
+        genuine = mod.iter_genuine_errors(_mixed_error_records())
+
+        assert len(genuine) == 1
+        assert genuine[0]['exit_code'] == 2
+        assert genuine[0]['designed_outcome'] is None
+
+    def test_designed_outcomes_are_exactly_the_rest(self):
+        designed = mod.iter_designed_outcomes(_mixed_error_records())
+
+        assert len(designed) == 3
+        assert all(d['designed_outcome'] is not None for d in designed)
+
+    def test_partition_is_disjoint(self):
+        records = _mixed_error_records()
+
+        genuine_ids = {id(n) for n in mod.iter_genuine_errors(records)}
+        designed_ids = {id(n) for n in mod.iter_designed_outcomes(records)}
+
+        # Compare by index -- the two calls build separate dicts.
+        assert not (
+            {n['index'] for n in mod.iter_genuine_errors(records)}
+            & {n['index'] for n in mod.iter_designed_outcomes(records)}
+        )
+        assert genuine_ids and designed_ids
+
+    def test_partition_is_total_and_lossless(self):
+        records = _mixed_error_records()
+
+        recombined = (
+            mod.iter_designed_outcomes(records) + mod.iter_genuine_errors(records)
+        )
+        all_neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert sorted(recombined, key=lambda n: n['index']) == all_neighborhoods
 
 
 # ---------------------------------------------------------------------------
