@@ -767,3 +767,186 @@ class TestConfirmIsolatedRerunVerdictTotality:
             f'Expected exactly ONE merge-lane INFO naming both the offending '
             f'node-id and the "not suppressing" verdict; got {rendered!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# S7: NEVER RAISES + fail CLOSED (INV-1), and the unsupported-call-site path.
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmIsolatedRerunVerdictNeverRaises:
+    """The merge path (merge_queue.py) has NO VerifyInfraError handler, so an
+    uncaught raise here stalls the merge queue. Every test asserts
+    `result is not None` FIRST, so a regression to a bare None return is
+    caught as a distinct failure rather than as a confusing attribute error.
+    """
+
+    def _run(self, verify_module, config, module_configs, failing, worktree, **kw):
+        kw.setdefault('call_site', 'merge_gate')
+        return asyncio.run(
+            verify_module.confirm_isolated_rerun_verdict(
+                worktree, config, module_configs, failing, **kw,
+            )
+        )
+
+    def test_run_verification_raising_fails_closed_to_red(
+        self, tmp_path: Path,
+    ) -> None:
+        """Merge stays RED. Fail-closed, not fail-open."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeSuppression, FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(side_effect=RuntimeError('boom')),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s is not None, 'the discriminator is TOTAL — never None'
+        assert isinstance(s, FlakeSuppression), s
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+
+    def test_grouping_helper_raising_fails_closed_to_red(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(
+                verify_module,
+                '_group_node_ids_by_subproject',
+                MagicMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s is not None
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+
+    def test_node_id_extraction_raising_fails_closed_with_a_tuple(
+        self, tmp_path: Path,
+    ) -> None:
+        """The handler must not itself blow up on an unbound local — so
+        node_ids and call_site have to be bound BEFORE the try (α's
+        record_flake_occurrence sets this precedent)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(
+                verify_module,
+                '_extract_failing_test_ids',
+                MagicMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s is not None
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+        assert isinstance(s.test_ids, tuple), s.test_ids
+
+    def test_psi_read_raising_does_not_change_the_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """A TELEMETRY read must never change a gate's answer: still
+        passes_in_isolation on a clean re-run, with psi simply absent."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(
+                verify_module,
+                'read_psi_sample',
+                MagicMock(side_effect=OSError('/proc/pressure/cpu unreadable')),
+            ),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s is not None
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
+        assert s.psi_cpu_some10 is None, s.psi_cpu_some10
+
+    def test_chronic_marker_call_site_is_unconfirmable_not_an_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """A real FlakeCallSite member with no β policy (task κ owns it) is a
+        KNOWN-UNKNOWN, not a defect: `unconfirmable` with a naming reason is
+        the honest, countable answer. Routing it through the fail-closed
+        exception path would both mislabel it and hide it from θ's class-1
+        rate."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path, call_site='chronic_marker',
+            )
+
+        assert s is not None
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == 'unsupported_call_site:chronic_marker', (
+            s.unconfirmable_reason
+        )
+        assert s.test_ids == (), s.test_ids
+        rv.assert_not_awaited()
+
+    def test_uncoercible_call_site_fails_closed_without_raising(
+        self, tmp_path: Path,
+    ) -> None:
+        """A garbage call_site is a PROGRAMMING error, so it fails closed —
+        but it still may not raise into the merge path."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeSuppression, FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path, call_site='not_a_real_site',
+            )
+
+        assert s is not None
+        assert isinstance(s, FlakeSuppression), s
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
