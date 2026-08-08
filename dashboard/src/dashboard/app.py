@@ -1343,6 +1343,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
         events_by_task,
         offline_projects,
         paused_projects,
+        recovery_events,
     ), snapshot_at = await get_scheduler_snapshot(http_client, config)
     return JSONResponse(
         redux_api.shape_scheduler(
@@ -1352,6 +1353,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             events_by_task=events_by_task,
             offline_projects=offline_projects,
             paused_projects=paused_projects,
+            recovery_events=recovery_events,
             snapshot_at=snapshot_at,
         )
     )

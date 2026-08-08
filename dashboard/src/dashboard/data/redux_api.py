@@ -1076,15 +1076,33 @@ def shape_scheduler(
     events_by_task: dict,
     offline_projects: list,
     paused_projects: list,
+    recovery_events: dict,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
     sparkline lists are still aliased to the caller's objects.  This is benign
     because the collector builds fresh dicts, but callers must not mutate the
     inner objects if they need the originals to remain unchanged.
+
+    ``recovery_events`` arrives from the collector keyed by project label
+    (see the shape contract in ``dashboard.data.scheduler``) and is projected
+    onto the wire as two fields:
+
+    * ``recovery_events`` — a FLAT list; every row already carries its own
+      ``project`` tag, so flattening loses nothing and the UI can render one
+      table without walking a nested map.
+    * ``recovery_event_counts`` — ``{project_label: int}``.  A project that
+      answered but had no sweeps reads ``0``; an OFFLINE project has no key at
+      all, because it never appears in the collector's map.  That asymmetry is
+      the point: zero and unknown must not collapse, or a dead orchestrator
+      renders as a quiet one.
+
+    ``recovery_events`` is a required keyword: a new collector element must be
+    threaded through here deliberately, and until it is the mismatch is a loud
+    ``TypeError`` rather than a field that silently never reaches the UI.
     """
     return {
         'SCHEDULER': {
@@ -1097,6 +1115,12 @@ def shape_scheduler(
             'offline_projects': list(offline_projects),
             'paused': bool(paused_projects),
             'paused_projects': list(paused_projects),
+            'recovery_events': [
+                ev for rows_ in recovery_events.values() for ev in rows_
+            ],
+            'recovery_event_counts': {
+                label: len(rows_) for label, rows_ in recovery_events.items()
+            },
         }
     }
 

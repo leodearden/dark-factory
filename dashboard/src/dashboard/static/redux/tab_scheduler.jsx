@@ -364,6 +364,14 @@ function SchedulerTab() {
     offline_projects = [],
     paused = false,
     paused_projects = [],
+    // Recovery/strand sweep events (PRD task-escalation-state-graph D2/S6),
+    // shaped by redux_api.shape_scheduler.  `recovery_events` is the flat row
+    // list (each row already tagged with `project`); `recovery_event_counts`
+    // is {project: n}.  A project with 0 ANSWERED and had no sweeps; a project
+    // MISSING from the counts map is offline (see the offline banner below),
+    // never quiet — the two must not read the same.
+    recovery_events = [],
+    recovery_event_counts = {},
   } = sched;
 
   // Sub-tab: 'tasks' or 'modules'
@@ -533,6 +541,21 @@ function SchedulerTab() {
 
   const snapshotLabel = snapshot_at ? `snapshot ${fmtDateTime(snapshot_at)}` : 'no snapshot';
 
+  // Recovery-sweep totals — read straight off the shaped payload.  Never
+  // re-derived by re-filtering events_by_task on the client: those sparklines
+  // are already narrowed to task_skipped, so a client-side derivation would
+  // always report zero sweeps no matter how many the sweep actually emitted.
+  const recoveryTotal = recovery_events.length;
+  const recoveryByType = recovery_events.reduce((acc, e) => {
+    const k = e.event_type || 'unknown';
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {});
+  const recoveryHint = [
+    Object.entries(recovery_event_counts).map(([p, n]) => `${p}: ${n}`).join(', '),
+    Object.entries(recoveryByType).map(([t, n]) => `${t} ×${n}`).join(', '),
+  ].filter(Boolean).join(' — ');
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%', position: 'relative' }}>
 
@@ -567,6 +590,16 @@ function SchedulerTab() {
           </div>
         );
       })()}
+
+      {/* Recovery-sweep count — a count surface only, no new panel.  Sits
+           beside the existing event surfaces so a sweep that vetoed, left, or
+           converted a strand is visible at all; before this the dashboard
+           requested only task_skipped and every sweep row landed invisibly. */}
+      {recoveryTotal > 0 && (
+        <div className="badge info" style={{ padding: '6px 12px', fontSize: 11 }} title={recoveryHint}>
+          ⟳ {recoveryTotal} recovery sweep event{recoveryTotal !== 1 ? 's' : ''}
+        </div>
+      )}
 
       {/* Active-Pins strip */}
       <div className="panel" style={{ padding: '8px 12px' }}>
