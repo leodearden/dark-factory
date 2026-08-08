@@ -1199,3 +1199,165 @@ class TestConfirmIsolatedRerunVerdictMainProbe:
         commands = [c.args[2].test_command for c in rv.await_args_list]
         assert any(FAILED_ID in cmd for cmd in commands), commands
         assert any(OTHER_ID in cmd for cmd in commands), commands
+
+
+# ---------------------------------------------------------------------------
+# S11: PURITY (INV-5) and SAME-TREE (INV-3), asserted BEHAVIOURALLY — no
+# source-text greps.
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmIsolatedRerunVerdictIsPure:
+    """The discriminator OBSERVES; it does not act.
+
+    Side-effects belong to the recorder (task ε). This purity is what lets the
+    discriminator run wherever the worktree is — local or remote — with the
+    dispatcher doing the recording.
+    """
+
+    def _drive_both_sites(self, verify_module, config, tmp_path, rerun_result):
+        """Drive merge_gate and main_probe through the same re-run outcome."""
+        out = []
+        for site in ('merge_gate', 'main_probe'):
+            out.append(
+                asyncio.run(
+                    verify_module.confirm_isolated_rerun_verdict(
+                        tmp_path, config, [_module_config('orchestrator')],
+                        _failing_result(), call_site=site,
+                    )
+                )
+            )
+        return out
+
+    def test_emits_no_event_and_touches_no_streak(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        before = verify_module._merge_flake_suppression_streak
+
+        for rerun in (_result(True), _result(False)):
+            emit = MagicMock()
+            bump = MagicMock()
+            with (
+                patch.object(
+                    verify_module, 'run_verification', AsyncMock(return_value=rerun),
+                ),
+                patch.object(verify_module, '_emit_merge_flake_suppressed', emit),
+                patch.object(
+                    verify_module, '_bump_suppression_streak_and_maybe_escalate', bump,
+                ),
+            ):
+                self._drive_both_sites(verify_module, config, tmp_path, rerun)
+
+            emit.assert_not_called()
+            bump.assert_not_called()
+
+        assert verify_module._merge_flake_suppression_streak == before, (
+            'the discriminator must not mutate the suppression streak'
+        )
+
+    def test_writes_no_ledger_row(self, tmp_path: Path) -> None:
+        """Recording is the recorder's job (task ε) — and NOT writing is
+        exactly what makes the discriminator safe to run on a remote host."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        for rerun in (_result(True), _result(False)):
+            record = MagicMock()
+            debt = MagicMock()
+            with (
+                patch.object(
+                    verify_module, 'run_verification', AsyncMock(return_value=rerun),
+                ),
+                patch('orchestrator.flake_ledger.record_flake_occurrence', record),
+                patch('orchestrator.flake_ledger.open_debt', debt),
+            ):
+                self._drive_both_sites(verify_module, config, tmp_path, rerun)
+
+            record.assert_not_called()
+            debt.assert_not_called()
+
+    def test_same_tree_never_mints_a_worktree(self, tmp_path: Path) -> None:
+        """INV-3: the discriminator judges the tree it was HANDED. No `git
+        worktree add`/`remove`, and every re-run targets that same path."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        git_calls: list = []
+
+        def _record_git(cmd, **kwargs):
+            git_calls.append(cmd)
+            raise AssertionError(f'no git call expected, got {cmd!r}')
+
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch('orchestrator.git_ops._run', side_effect=_record_git),
+        ):
+            self._drive_both_sites(verify_module, config, tmp_path, _result(True))
+
+        assert git_calls == [], git_calls
+        for call in rv.await_args_list:
+            assert call.args[0] is tmp_path, (
+                f'every isolated re-run must target the GIVEN worktree, got '
+                f'{call.args[0]!r}'
+            )
+
+    def test_injected_now_makes_observed_at_reproducible(
+        self, tmp_path: Path,
+    ) -> None:
+        """§8.3's (test_id, observed_at, call_site) idempotency key depends on
+        the stamp being taken at OBSERVATION time — so an injected `now` must
+        reproduce exactly across two back-to-back calls."""
+        from datetime import UTC, datetime
+
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        fixed = datetime(2026, 8, 7, 12, 34, 56, tzinfo=UTC)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            stamps = [
+                asyncio.run(
+                    verify_module.confirm_isolated_rerun_verdict(
+                        tmp_path, config, [_module_config('orchestrator')],
+                        _failing_result(), call_site='merge_gate', now=fixed,
+                    )
+                ).observed_at
+                for _ in range(2)
+            ]
+
+        assert stamps[0] == stamps[1] == fixed.isoformat(), stamps
+
+    def test_uninjected_now_advances_between_observations(
+        self, tmp_path: Path,
+    ) -> None:
+        """With now=None the stamp is wall-clock and strictly increasing, so
+        two genuine observations of the same test are distinct ledger rows
+        rather than one deduped away."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            stamps = [
+                asyncio.run(
+                    verify_module.confirm_isolated_rerun_verdict(
+                        tmp_path, config, [_module_config('orchestrator')],
+                        _failing_result(), call_site='merge_gate',
+                    )
+                ).observed_at
+                for _ in range(2)
+            ]
+
+        assert stamps[0] < stamps[1], stamps
