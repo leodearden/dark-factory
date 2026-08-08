@@ -130,10 +130,33 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   // the other array, and the gap message would print "1 of 0 runs".  It gets
   // its own named state rather than a silently-picked winner.
   const seriesMismatch = labels.length !== points;
-  // A series with a hole cannot be drawn honestly by charts.jsx (see
-  // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
-  // anything from a threshold.
-  const plottable = Chart && gaps === 0 && points > 0 && !seriesMismatch;
+  // A holed series IS drawn (task 3490).  charts.jsx delegates its scale and
+  // path math to spark_path.js, which excludes non-finite samples from the
+  // extrema, keeps index-based x positions so the axis does not shift under a
+  // hole, and emits separate M-started subpaths so the line is genuinely
+  // DISCONTINUOUS across one.  A hole therefore reads as a hole rather than as
+  // a measured plunge to the chart floor, and the gap count is disclosed
+  // alongside the drawing.
+  //
+  // What is still NOT drawable is a series in which NOTHING was measured: the
+  // path builders return an empty line, Sparkline/StepSpark return null, and
+  // the cell would render a blank 26px box.  So the gate counts the samples
+  // the primitive will ACTUALLY draw and requires at least one.  `points > 0`
+  // is not restated: gaps <= points always, so `plotted > 0` implies it, and
+  // the no-runs state keeps its own arm below.
+  //
+  // `plotted` only means what its name says because trendGaps counts exactly
+  // what spark_path.js's isPlottable rejects (memory_evals_fmt.js; the
+  // agreement is pinned executably in dashboard/tests/js/memory_evals_fmt.test.mjs).
+  //
+  // NO THRESHOLD, still: `> 0` is a count-of-nothing check in the same family
+  // as the `points === 0` arm below — not a fraction, a proportion or a
+  // tunable.  Suppressing on some SHARE of holes was considered and rejected:
+  // it would be a locally-invented threshold, and this file consumes the
+  // server's judgments rather than re-deriving them.  Do not "improve" this
+  // into a ratio.
+  const plotted = points - gaps;
+  const plottable = Chart && plotted > 0 && !seriesMismatch;
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
