@@ -10,9 +10,12 @@ write directly into a tmp fleet dir (ORCH_FLEET_DIR).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -215,6 +218,123 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
 
 def _load_state(state_path):
     return json.loads(state_path.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Process-group containment (task 3798).
+#
+# The mirror of this test lives in tests/scripts/test_orchestrator_watchdog.py
+# as test_boundary_run_drain_script_timeout_kills_the_whole_process_group. The
+# two are deliberately NOT cross-imported: these directories cannot import each
+# other's test modules, which is the same constraint that forced
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim into existence. What
+# they DO share is the one thing that matters -- a single spawn implementation
+# in df_pytest_isolation.run_in_new_session.
+# ---------------------------------------------------------------------------
+
+# PIPE-CLOSING: the background child redirects its stdio away from the pipes it
+# inherited. See the test below for why that redirection is load-bearing.
+_PIPE_CLOSING_LEAKER = '''\
+sleep 300 >/dev/null 2>&1 &
+echo $! > "$LEAK_PIDFILE"
+echo MAIN_UP
+sleep 300
+'''
+
+
+def _read_leaked_pid(pidfile, *, timeout=10.0):
+    """Poll until the leaker records its grandchild's pid, then return it.
+
+    Polls rather than reading once: the file is created by a `>` redirection
+    and filled by a separate write, so a single read can catch it empty.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = pidfile.read_text().strip()
+        except OSError:
+            text = ""
+        if text.isdigit():
+            return int(text)
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"the leaker never recorded a pid in {pidfile} within {timeout}s "
+                f"(last read: {text!r}); the harness is broken, which says nothing "
+                "either way about process-group containment.",
+                pytrace=False,
+            )
+        time.sleep(0.05)
+
+
+def _wait_gone(pid, *, timeout=3.0):
+    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False  # alive and owned by someone else -- a recycled pid
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """_run_script's timeout must reach the poll loops the script forks.
+
+    subprocess.run's timeout path kill()s the DIRECT CHILD only, so a
+    backgrounded grandchild survives, is reparented to systemd --user, and
+    spends its grace unattended -- 86 concurrent orphans on 2026-08-06 and 82
+    more on 2026-08-07 (task 3798).
+
+    WHY THE LEAKER REDIRECTS ITS BACKGROUND CHILD'S STDIO, AND WHY THAT MUST
+    NOT BE "SIMPLIFIED" AWAY: a background child that KEPT the inherited
+    stdout/stderr pipes would hold their write ends open, so any drain run
+    against it after the kill never sees EOF. This test drives the REAL
+    spawner; with the stdio redirected to /dev/null nothing holds the pipe, the
+    timeout is raised on schedule, and a regression fails CLEANLY on the
+    surviving pid below. Dropping the `>/dev/null 2>&1` makes this test's
+    behaviour depend on internals of whatever the spawner does after its kill,
+    which is not what it is here to pin.
+
+    Points SCRIPT at the synthetic leaker rather than the real script: it is
+    read at call time inside _run_script, and the production script must never
+    be driven by a test that exists to observe a timeout.
+    """
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(_PIPE_CLOSING_LEAKER)
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    leaked_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_script(
+                bin_dir, state_path, fleet_dir, "--drain",
+                env={"LEAK_PIDFILE": str(pidfile)},
+                timeout=2,
+            )
+
+        leaked_pid = _read_leaked_pid(pidfile)
+        assert _wait_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _run_script timed out. The timeout "
+            "killed only the direct child, so every poll loop the script forked "
+            "is now an orphan free to spend its grace and then issue a REAL "
+            "systemctl restart. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
 
 
 def _decode(maybe_bytes):
