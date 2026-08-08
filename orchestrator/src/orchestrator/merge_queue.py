@@ -14881,7 +14881,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """THE verify-abort teardown: signal the REMOTE verify, then cancel and
         reap the LOCAL verify task (task 3204).
 
-        The sole caller of :meth:`_abort_remote_verify` — enforced by
+        The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
+        ``verify_task.cancel()`` — enforced by
         test_merge_queue_concurrent_verify.py's
         ``TestVerifyTeardownChokepoint``. Its six callers are the two ``stop()``
         drain paths (finalizing head and ``_inflight``), the head-failure
@@ -14912,6 +14913,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         a ``CancelledError`` stopping the verifier loop is correct behaviour,
         and flattening the flag either way would be a silent behaviour change
         on one path or the other.
+
+        CAVEAT — a PROPAGATING abort SKIPS the local reap. On the default path
+        the cancel-and-reap below never runs, so *verify_task* is left live;
+        the two steps only no-op independently for their ``None`` cases, not
+        for this one. That is deliberately the pre-extraction behaviour of
+        every one of the six sites (none wrapped the abort in ``try/finally``
+        either), and it is narrow in practice: :meth:`_abort_remote_verify`
+        swallows ``Exception`` itself, so only a ``BaseException`` — in
+        practice a ``CancelledError`` delivered because THIS coroutine is
+        already being torn down — can escape. Who reaps then: at the cascade
+        the entry is still on ``_inflight``, so ``stop()``'s ``_inflight``
+        drain tears it down (shutdown-defensive, so it cannot itself be
+        derailed the same way); at the
+        three ``_run_inflight_verify`` triggers the escaping error is this
+        coroutine's own cancellation, so the nested ``_run_post_merge_verify``
+        future it owns unwinds with the teardown that delivered it. Making the
+        reap unconditional was considered and NOT done here: it would add an
+        ``await`` to a ``finally`` on a cancellation-unwind path — a behaviour
+        change on exactly the paths this refactor promised to leave alone.
 
         Deliberately NOT owned here: each site's ``not verify_task.done()``
         guard. Sites 1 and 2 have one and the cascade deliberately does not, so
