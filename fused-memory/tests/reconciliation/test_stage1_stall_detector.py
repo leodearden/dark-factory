@@ -16,7 +16,6 @@ Gate-backlog age check (task 3017):
 from __future__ import annotations
 
 import importlib.util
-import re
 import sys
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -784,15 +783,22 @@ class TestMaybeEscalateStalledGateBacklog:
         assert stamp in combined  # the gate_escalated_at value
 
         # The summary must state a live-truthful anchor (the gate_escalated_at
-        # stamp), not a filing-time-computed elapsed-hours figure that goes
-        # stale while the escalation sits open (task 3520).
+        # stamp) plus the static, never-staling threshold fact — not a
+        # filing-time-computed elapsed-hours figure that goes stale while the
+        # escalation sits open (task 3520). Naming the threshold alongside the
+        # anchor keeps a compact-drain (summary-only) read legible without a
+        # mental diff against "now".
         assert 'has awaited a human decision since' in submitted.summary
         assert stamp in submitted.summary
-        # Scoped to `summary`, not `combined`: the detail block legitimately
-        # retains a filing-time hours value (age_hours_at_filing), and the
-        # fallback summary legitimately names the 48h threshold, so this
-        # negative must not be applied to either of those.
-        assert re.search(r'\d+(?:\.\d+)?h\b', submitted.summary) is None
+        assert 'past the 48h gate-backlog threshold' in submitted.summary
+        # Concrete negative (not a shape-based regex): pins that the stale,
+        # filing-time-computed age (49h, from hours_ago=49 above) never leaks
+        # into the summary. Scoped to `summary`, not `combined` — the detail
+        # block legitimately retains a filing-time hours value
+        # (age_hours_at_filing), and the summary now legitimately names the
+        # static 48h threshold, so a shape regex over `\d+h` would false-
+        # positive on that intentional, truthful content.
+        assert '49' not in submitted.summary
 
         # The filing-time age is still retained in detail, but relabeled
         # `age_hours_at_filing` so it no longer reads as a live counter.
