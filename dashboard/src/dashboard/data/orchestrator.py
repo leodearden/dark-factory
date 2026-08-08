@@ -72,14 +72,28 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     return default_root.resolve()
 
 
+def _expand_env_placeholders(value: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:default}`` in an orchestrator-config scalar.
+
+    Matches orchestrator ``config.py`` behaviour: an unset ``VAR`` with no
+    default expands to the empty string, and callers decide what that means
+    (for both readers below: "unknown", never a usable value).
+    """
+    import os
+
+    return re.sub(
+        r'\$\{([^:}]+)(?::([^}]*))?\}',
+        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
+        value,
+    )
+
+
 def _read_project_root_from_config(config_path: str) -> Path | None:
     """Extract ``project_root`` from an orchestrator config YAML file.
 
     Handles ``${VAR:default}`` env-var expansion for the project_root value.
     Returns ``None`` if the file can't be read or doesn't contain project_root.
     """
-    import os
-
     import yaml
 
     try:
@@ -91,14 +105,129 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     value = raw.get('project_root')
     if not isinstance(value, str):
         return None
-    # Expand ${VAR:default} patterns (matching orchestrator config.py behavior)
-    expanded = re.sub(
-        r'\$\{([^:}]+)(?::([^}]*))?\}',
-        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
-        value,
-    )
-    p = Path(expanded)
+    p = Path(_expand_env_placeholders(value))
     return p.resolve() if p.is_absolute() else None
+
+
+def _load_config_mapping(path: Path) -> dict | None:
+    """``yaml.safe_load`` *path* and return it if it is a mapping, else ``None``.
+
+    Never raises: this runs inside the burndown collector loop, where an
+    exception would take down a whole collection cycle — strictly worse than
+    an unknown value. ``ValueError`` covers ``UnicodeDecodeError`` for a
+    non-text file.
+    """
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _coerce_concurrency_cap(value: object, path: Path) -> int | None:
+    """Coerce a raw ``max_concurrent_tasks`` value to a usable cap, or ``None``.
+
+    ``None`` means UNKNOWN, which the parity alarm must never conflate with
+    "not breaching". Absent/null is silent (a project simply may not set a
+    cap); a *malformed* value logs a WARNING naming the file and the value,
+    because that is a config defect an operator needs to see.
+
+    Boundaries:
+
+    * ``bool`` is rejected explicitly — it is an ``int`` subclass, so a bare
+      ``isinstance(value, int)`` would silently read ``true`` as a cap of 1.
+    * ``0`` is KEPT as a real cap ("dispatch nothing"). Tasks still
+      in-progress against a 0 cap are a genuine breach; reporting that as
+      unknown would hide it.
+    * Negative caps are nonsense and rejected.
+    * A numeric *string* is accepted after ``${VAR:default}`` expansion —
+      that is how a config spells an env-driven int.
+    """
+    if value is None:
+        logger.debug('No max_concurrent_tasks in %s', path)
+        return None
+
+    raw = value
+    if isinstance(value, bool):
+        cap = None
+    elif isinstance(value, int):
+        cap = value
+    elif isinstance(value, str):
+        expanded = _expand_env_placeholders(value).strip()
+        try:
+            cap = int(expanded)
+        except ValueError:
+            cap = None
+    else:
+        cap = None
+
+    if cap is None or cap < 0:
+        logger.warning(
+            'Ignoring unusable max_concurrent_tasks %r in %s — treating the '
+            'concurrency cap as unknown',
+            raw,
+            path,
+        )
+        return None
+    return cap
+
+
+def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
+    """Read *project_root*'s orchestrator concurrency cap, or ``None`` if unknown.
+
+    This is the burndown parity alarm's denominator. ``max_concurrent_tasks``
+    is green-tier hot-reloadable (CLAUDE.md), i.e. TIME-VARYING, so the
+    collector calls this once per snapshot and stores the answer ON the
+    snapshot row: comparing a historical in-progress census against today's
+    cap would forgive a past breach after a cap raise and invent one after a
+    cut. Callers must treat ``None`` as UNKNOWN, never as "not breaching".
+
+    Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
+    reuses its filename constants so the two cannot fork: the canonical
+    ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
+    disk (a present-but-capless live config must not be masked by a stale
+    legacy file), and only its outright absence falls through to
+    ``_LEGACY_CONFIG_NAMES`` in order, taking the first that yields a cap.
+
+    Unlike that startup-time discovery helper, the legacy-spelling nudge here
+    is logged at DEBUG, not WARNING: this runs every collection cycle
+    (~10 min per project), so a WARNING would be recurring log spam rather
+    than the bounded once-per-process reminder that one is.
+
+    Never raises — see :func:`_load_config_mapping`.
+    """
+    from dashboard.config import _CANONICAL_CONFIG_NAME, _LEGACY_CONFIG_NAMES
+
+    root = Path(project_root)
+
+    canonical = root / _CANONICAL_CONFIG_NAME
+    if canonical.is_file():
+        data = _load_config_mapping(canonical)
+        if data is None:
+            return None
+        return _coerce_concurrency_cap(data.get('max_concurrent_tasks'), canonical)
+
+    for legacy_name in _LEGACY_CONFIG_NAMES:
+        legacy_path = root / legacy_name
+        if not legacy_path.is_file():
+            continue
+        data = _load_config_mapping(legacy_path)
+        if data is None:
+            continue
+        cap = _coerce_concurrency_cap(data.get('max_concurrent_tasks'), legacy_path)
+        if cap is not None:
+            logger.debug(
+                'Project %s: read max_concurrent_tasks from legacy config path %s '
+                '(expected %s)',
+                root.name,
+                legacy_path,
+                _CANONICAL_CONFIG_NAME,
+            )
+            return cap
+    return None
 
 
 def find_running_orchestrators() -> list[dict]:
