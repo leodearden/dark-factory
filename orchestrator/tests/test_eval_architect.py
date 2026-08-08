@@ -1588,10 +1588,11 @@ async def _run_architect_eval_hermetic(
     ``MagicMock`` deliberately: a bare MagicMock's ``.get(model)`` returns a
     truthy Mock, which would send ``resolve_cost_usd`` down its price-table
     branch and multiply Mocks into ``cost_usd``. The default ``invoke_agent``
-    return likewise carries REAL integer token counts for the same reason —
-    ``result.input_tokens`` must be an int, not a truthy Mock that ``or 0``
-    cannot rescue. Both make the harness model reality so a RED here is caused
-    by production behaviour, never by the double.
+    return likewise carries REAL integer token/turn counts for EVERY usage leaf
+    the runner reads (input/output, both cache counts, turns) for the same
+    reason — a truthy Mock is one that ``or 0`` cannot rescue, and it would
+    land verbatim in the persisted cell. Both make the harness model reality so
+    a RED here is caused by production behaviour, never by the double.
 
     ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
     RAISE — the harness-crash shape where the eval orch config (and therefore
@@ -1610,6 +1611,7 @@ async def _run_architect_eval_hermetic(
     invoke_return = arch_result if arch_result is not None else MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
         input_tokens=12_000, output_tokens=3_000,
+        cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
@@ -2186,6 +2188,49 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['input_tokens'] == 0
         assert persisted['output_tokens'] == 0
+        # Same ``int | None`` contract for the cache counts (this AgentResult
+        # leaves both at their None default).
+        assert persisted['cache_read_tokens'] == 0
+        assert persisted['cache_create_tokens'] == 0
+
+    async def test_cache_tokens_and_turns_are_stamped(self):
+        """The REST of the token profile ``collect_metrics`` stamps.
+
+        These price nothing, but a native Claude run is cache-read dominated:
+        a cell reporting 12k input / 3k output beside a zeroed cache block
+        reads as a far smaller run than it was, so the persisted evidence must
+        be symmetric with the implementer path's (reviewer: completeness).
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cache_read_tokens'] == 48_000
+        assert persisted['cache_create_tokens'] == 6_000
+        assert persisted['turns_used'] == 9
+        # output_tokens ÷ that leg's own duration — the identical formula
+        # collect_metrics uses, over the same duration workflow_duration_ms
+        # carries.
+        assert persisted['workflow_duration_ms'] == 4567
+        assert persisted['tokens_per_second'] == pytest.approx(
+            round(3_000 / (4567 / 1000), 2),
+        )
+        assert result.metrics['cache_read_tokens'] == 48_000
+
+    async def test_zero_duration_cell_reports_zero_tokens_per_second(self):
+        """A timed-out cell has no duration to divide by — 0.0, not a
+        ZeroDivisionError that would lose the whole cell."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            invoke_side_effect=TimeoutError(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['tokens_per_second'] == 0.0
+        assert persisted['turns_used'] == 0
+        assert result.metrics['tokens_per_second'] == 0.0
 
     async def test_proxied_candidate_is_flagged_local(self):
         """``ANTHROPIC_BASE_URL`` set == a PROXIED endpoint, the signal Invariant
@@ -2328,8 +2373,6 @@ class TestArchitectCellResolvesCostProvenance:
         That path never invoked the architect (0 tokens, $0.00), so no price
         table could have changed the number anyway.
         """
-        from orchestrator.evals.metrics import EvalMetrics as _EM
-
         result, mocks = await _run_architect_eval_hermetic(
             self._cfg(env_overrides={}),
             produced_plan=_well_formed_plan(),
@@ -2341,14 +2384,47 @@ class TestArchitectCellResolvesCostProvenance:
         assert persisted['cap_tainted'] is True
         assert 'harness_error' in (persisted['invocation_error'] or '')
         assert persisted['cost_usd'] == pytest.approx(0.0)
-        assert persisted['cost_source'] in {
-            'price_table', 'cli', 'unpriced_proxy', 'mixed',
-        }
-        # The documented default is still a member of the vocabulary.
-        assert _EM().cost_source in {
-            'price_table', 'cli', 'unpriced_proxy', 'mixed',
-        }
+        # A concrete label, not merely "some member of the vocabulary": nothing
+        # was spent, so the resolution is skipped and the documented 'cli'
+        # default stands (reviewer: an `in {the whole vocabulary}` check cannot
+        # fail, so it pinned nothing).
+        assert persisted['cost_source'] == 'cli'
         assert result.metrics['cap_tainted'] is True
+
+    async def test_zero_spend_proxied_cell_does_not_warn_about_pricing(
+        self, caplog,
+    ):
+        """A cell that spent NOTHING has no provenance to resolve.
+
+        The timeout / harness-error / pre-invoke-cap paths never bind
+        ``result``, so they reach the resolution with 0 tokens and $0.00.
+        Resolving anyway would fire the LOUD unpriced-proxy WARNING for spend
+        that never happened on EVERY timed-out proxied cell — training
+        operators to ignore the warning that matters — and would label a $0.00
+        figure 'unpriced_proxy' as though the degradation were real. The
+        loud-over-silent norm is about REAL degradation (reviewer: log-noise).
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                invoke_side_effect=TimeoutError(),
+                orch_prices={},
+            )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+        assert persisted['cost_source'] == 'cli'
+        assert result.metrics['cost_source'] == 'cli'
+        assert not [
+            r for r in caplog.records
+            if 'No configured price for proxied-endpoint model' in r.message
+        ], (
+            'A $0.00 / 0-token cell must not emit the unpriced-proxy '
+            f'degradation WARNING; got {[r.message for r in caplog.records]}'
+        )
 
 
 @pytest.mark.asyncio

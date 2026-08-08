@@ -461,18 +461,37 @@ class TestComposeCostSource:
 
         assert compose_cost_source(primary, secondary_cost_usd=-1.0) == primary
 
-    def test_secondary_source_is_overridable(self):
-        """The ``secondary`` default names the plan judge's always-native-cloud
-        provenance; a caller with a differently-sourced second component states
-        it, rather than the helper hardcoding one caller's assumption."""
-        from orchestrator.evals.metrics import compose_cost_source
 
-        assert compose_cost_source(
-            'price_table', secondary_cost_usd=0.42, secondary='price_table',
-        ) == 'price_table'
-        assert compose_cost_source(
-            'cli', secondary_cost_usd=0.42, secondary='unpriced_proxy',
-        ) == 'mixed'
+class TestIsProxiedEndpoint:
+    """Task 3656 (amendment): the proxied-endpoint predicate has ONE home.
+
+    ``ANTHROPIC_BASE_URL`` decides both whether ``build_eval_orch_config``
+    seeds the proxied price table (task 2820) and whether ``collect_metrics`` /
+    ``run_architect_eval`` stop trusting the CLI's own cost figure. Three
+    inline copies of the same env read could drift — a seeded table beside a
+    "native, trust the CLI" flag would resolve one candidate's cost two
+    different ways — so all three call the same helper.
+    """
+
+    @pytest.mark.parametrize('env_overrides,expected', [
+        ({'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}, True),
+        ({'ANTHROPIC_BASE_URL': '', 'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({}, False),
+        (None, False),
+    ])
+    def test_predicate(self, env_overrides, expected):
+        from orchestrator.evals.metrics import is_proxied_endpoint
+
+        assert is_proxied_endpoint(env_overrides) is expected
+
+    def test_runner_uses_the_metrics_singleton(self):
+        """Identity, not mere equality — a re-declared local copy in runner.py
+        (the price-table seeding site) would fail this, mirroring
+        ``TestCostPrimitivesSingleHome``'s pin on the cost primitives."""
+        from orchestrator.evals import metrics, runner
+
+        assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
 
 
 # ---------------------------------------------------------------------------

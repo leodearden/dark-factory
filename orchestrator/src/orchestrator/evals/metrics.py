@@ -485,6 +485,26 @@ def blend_composite(
     return round(min(max(blended, 0.0), 1.0), 4)
 
 
+def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
+    """Whether *env_overrides* points the CLI at a PROXIED endpoint.
+
+    ``ANTHROPIC_BASE_URL`` is the single leaf that tells a vLLM/proxy candidate
+    apart from a native-cloud one, and THREE sites key on it: ``runner
+    .build_eval_orch_config`` (which seeds :func:`claude_endpoint_price_table`
+    into ``config.prices`` for a proxied candidate, task 2820),
+    :func:`collect_metrics` and ``runner.run_architect_eval`` (both of which
+    pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost flag).
+    Those three MUST agree — a seeded price table beside a "native, trust the
+    CLI figure" flag would resolve one candidate's cost two different ways — so
+    the predicate gets ONE home rather than three copies a future change to the
+    proxy signal (an additional env leaf, say) could silently desynchronise
+    (the single-home discipline of task 2459; reviewer: code-reuse).
+
+    Total: ``None``, an empty mapping and an empty URL are all native-cloud.
+    """
+    return bool((env_overrides or {}).get('ANTHROPIC_BASE_URL'))
+
+
 # ``_FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
 # PROXIED endpoint whose model is unlisted — Invariant P5 / the
 # loud-over-silent-degradation norm) and ``_rate`` (the PriceEntry-or-dict
@@ -549,12 +569,7 @@ def resolve_cost_usd(
     return cost, 'unpriced_proxy'
 
 
-def compose_cost_source(
-    primary: str,
-    *,
-    secondary_cost_usd: float,
-    secondary: str = 'cli',
-) -> str:
+def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
     """Collapse a TWO-COMPONENT cost sum's provenance to ONE honest label.
 
     :func:`resolve_cost_usd` answers "where did THIS figure come from?" for a
@@ -595,15 +610,18 @@ def compose_cost_source(
     passes straight through ``_summarize_cost_source``), and means an operator
     reading ``mixed`` need not learn which level produced it.
 
-    *secondary* defaults to ``'cli'`` — the plan judge's always-native-cloud
-    provenance — but is a parameter rather than a hardcoded assumption so a
-    future caller with a differently-sourced second component states its own.
+    The second component's source is ``'cli'`` BY CONSTRUCTION (the judge's
+    native-cloud opus call), so it is NOT a parameter: a ``secondary=`` keyword
+    would be speculative generality with no caller to justify it (reviewer:
+    over-engineering). A future caller whose second component IS differently
+    sourced adds the keyword then — a non-breaking change, since every call
+    site today means ``'cli'``.
 
     Pure: no I/O, no config, mirroring :func:`resolve_cost_usd`.
     """
     if secondary_cost_usd <= 0.0:
         return primary
-    return primary if primary == secondary else 'mixed'
+    return primary if primary == 'cli' else 'mixed'
 
 
 def coerce_cost_usd(value: object) -> float:
@@ -694,7 +712,10 @@ async def collect_metrics(
     # Inference speed metrics
     duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
     tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
-    is_local = bool(workflow.config.env_overrides.get('ANTHROPIC_BASE_URL'))
+    # Via the shared predicate, NOT an inline env read: the same signal decides
+    # whether build_eval_orch_config seeds the proxied price table, so the two
+    # must not be able to drift apart (see is_proxied_endpoint).
+    is_local = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's

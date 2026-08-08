@@ -47,6 +47,7 @@ from .metrics import (
     collect_metrics,
     compose_cost_source,
     detect_invocation_error,
+    is_proxied_endpoint,
     resolve_cost_usd,
 )
 from .profile import apply_eval_profile
@@ -283,18 +284,19 @@ def build_eval_orch_config(
         )
     # Task 2820 (ν follow-up, escalation esc-2479-1 finding #3): auto-merge
     # claude_endpoint_price_table() into config.prices whenever THIS
-    # candidate's env_overrides carries a proxied ANTHROPIC_BASE_URL — the
-    # identical leaf collect_metrics reads (`is_local = bool(workflow.config
-    # .env_overrides.get('ANTHROPIC_BASE_URL'))`) before calling
-    # resolve_cost_usd(model=workflow.config.models.implementer,
-    # prices=workflow.config.prices, ...). Without this, an operator who
-    # forgets to seed prices manually silently gets cost_source=
-    # 'unpriced_proxy' (there's already a loud WARNING on that fallback, so
-    # this is convenience hardening, not a silent-fail fix). Merge, not
-    # replace: profiled.prices (the base/manually-seeded table) wins on
-    # conflict, mirroring claude_endpoint_price_table()'s own
-    # default-table-then-candidate-table override order.
-    if config.env_overrides.get('ANTHROPIC_BASE_URL'):
+    # candidate runs against a PROXIED endpoint — the SAME predicate
+    # collect_metrics and run_architect_eval read before calling
+    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # (metrics.is_proxied_endpoint) instead of three inline env reads: the
+    # table that gets seeded and the flag that decides whether to trust the CLI
+    # figure must never disagree. Without this, an operator who forgets to seed
+    # prices manually silently gets cost_source='unpriced_proxy' (there's
+    # already a loud WARNING on that fallback, so this is convenience
+    # hardening, not a silent-fail fix). Merge, not replace: profiled.prices
+    # (the base/manually-seeded table) wins on conflict, mirroring
+    # claude_endpoint_price_table()'s own default-table-then-candidate-table
+    # override order.
+    if is_proxied_endpoint(config.env_overrides):
         seeded_prices = {
             model: PriceEntry(**rates)
             for model, rates in claude_endpoint_price_table().items()
@@ -618,7 +620,10 @@ async def run_architect_eval(
     operator-visible answer to the mixed-provenance question, rather than one
     label quietly standing in for two sources. A NATIVE candidate resolves
     ``'cli'`` beside a ``'cli'`` judge, so today's cells keep both figure and
-    label byte-identical.
+    label byte-identical. A cell that spent NOTHING (timeout, harness error,
+    pre-invoke cap) skips the resolution altogether: $0.00 has no provenance to
+    resolve, and resolving it would attach a loud degradation WARNING to spend
+    that never happened.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -658,14 +663,23 @@ async def run_architect_eval(
     # honest zeros must already exist.
     arch_input_tokens = 0
     arch_output_tokens = 0
+    # The REST of the token profile ``collect_metrics`` stamps on the implementer
+    # path. Not P5 inputs — they price nothing — but on a native Claude run the
+    # cache reads typically DOMINATE the profile, so a cell reporting input/output
+    # beside a zeroed cache block would read as a far smaller run than it was
+    # (reviewer: completeness). Pre-try for the same reason as above.
+    arch_cache_read_tokens = 0
+    arch_cache_create_tokens = 0
+    arch_turns = 0
     # Whether this candidate runs against a PROXIED endpoint, the third P5
     # input. Read from the EvalConfig — not the built orch config — because it
     # is literally what ``invoke_agent(env_overrides=config.env_overrides)``
     # below is handed, and because reading it here means a harness crash inside
-    # the try cannot leave the proxy signal unknowable. Byte-identical to the
-    # condition ``build_eval_orch_config`` keys its price-table seeding on, so
-    # the seeded table and the trust-the-CLI flag can never disagree.
-    is_local = bool(config.env_overrides.get('ANTHROPIC_BASE_URL'))
+    # the try cannot leave the proxy signal unknowable. Through the SAME
+    # ``is_proxied_endpoint`` predicate ``build_eval_orch_config`` keys its
+    # price-table seeding on (and ``collect_metrics`` reads on the implementer
+    # path), so the seeded table and the trust-the-CLI flag cannot drift apart.
+    is_local = is_proxied_endpoint(config.env_overrides)
     arch_duration_ms = 0
     outcome = 'done'
     # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
@@ -743,6 +757,11 @@ async def run_architect_eval(
         # rather than a None that would poison the price-table arithmetic.
         arch_input_tokens = result.input_tokens or 0
         arch_output_tokens = result.output_tokens or 0
+        # Same ``or 0`` contract: both cache counts are ``int | None`` too, and
+        # ``turns`` is 0 when the provider does not track it.
+        arch_cache_read_tokens = result.cache_read_tokens or 0
+        arch_cache_create_tokens = result.cache_create_tokens or 0
+        arch_turns = result.turns or 0
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
@@ -969,13 +988,36 @@ async def run_architect_eval(
     #     .prices for a PROXIED candidate (task 2820), and that merge is exactly
     #     what makes 'price_table' reachable here instead of the degraded
     #     'unpriced_proxy'.
-    resolved_arch_cost, arch_cost_source = resolve_cost_usd(
-        arch_input_tokens,
-        arch_output_tokens,
-        model=config.model,
-        prices=orch_config.prices if orch_config is not None else None,
-        cli_cost_usd=arch_cost_usd,
-        is_local_model=is_local,
+    #
+    # SKIPPED entirely when NOTHING was spent — the timeout, harness-error and
+    # pre-invoke cap paths never bind ``result``, so they arrive here with 0
+    # tokens and $0.00. There is no provenance to resolve for a figure that is
+    # not there, and resolving it anyway would fire the LOUD unpriced-proxy
+    # WARNING for spend that never happened on EVERY timed-out or crashed
+    # proxied cell — training operators to ignore the warning that matters, and
+    # labelling a $0.00 cell 'unpriced_proxy' as if the degradation were real
+    # (reviewer: log-noise). The label then stays the documented 'cli' default,
+    # which is exactly what a $0.00 architect cell has always read.
+    if arch_input_tokens or arch_output_tokens or arch_cost_usd:
+        resolved_arch_cost, arch_cost_source = resolve_cost_usd(
+            arch_input_tokens,
+            arch_output_tokens,
+            model=config.model,
+            prices=orch_config.prices if orch_config is not None else None,
+            cli_cost_usd=arch_cost_usd,
+            is_local_model=is_local,
+        )
+    else:
+        resolved_arch_cost, arch_cost_source = 0.0, 'cli'
+
+    # Inference speed for the architect leg, the same formula collect_metrics
+    # uses one path over (output tokens ÷ that leg's own duration, which is
+    # what workflow_duration_ms below carries). Guarded: a timed-out or crashed
+    # cell has arch_duration_ms == 0.
+    arch_duration_secs = arch_duration_ms / 1000 if arch_duration_ms else 0.0
+    arch_tps = (
+        round(arch_output_tokens / arch_duration_secs, 2)
+        if arch_duration_secs > 0 else 0.0
     )
     metrics = EvalMetrics(
         plan_quality=plan_quality,
@@ -1019,10 +1061,11 @@ async def run_architect_eval(
         # plan judge is always a native-cloud opus call. judge_cost_usd is still
         # the judge's SHARE of this total, not a separately-resolved addend.
         cost_usd=resolved_arch_cost + judge_cost_usd,
-        # ONE label for a TWO-component sum: the default secondary='cli' is the
-        # plan judge's always-native-cloud-opus provenance, so this reads
-        # 'mixed' exactly when the judge actually spent AND the two components'
-        # sources disagree — never letting one label quietly stand in for two.
+        # ONE label for a TWO-component sum: the second component is the plan
+        # judge, always-native-cloud opus and therefore always CLI-sourced, so
+        # this reads 'mixed' exactly when the judge actually spent AND the two
+        # components' sources disagree — never letting one label quietly stand
+        # in for two.
         cost_source=compose_cost_source(
             arch_cost_source, secondary_cost_usd=judge_cost_usd,
         ),
@@ -1033,6 +1076,15 @@ async def run_architect_eval(
         input_tokens=arch_input_tokens,
         output_tokens=arch_output_tokens,
         is_local_model=is_local,
+        # The REST of that run's profile — priced by nothing, but stamped for
+        # the same reason: an architect cell reporting input/output beside a
+        # zeroed cache block reads as a much smaller run than it was (native
+        # Claude runs are cache-read dominated). Keeps the architect cell's
+        # token/turn block symmetric with collect_metrics' implementer one.
+        cache_read_tokens=arch_cache_read_tokens,
+        cache_create_tokens=arch_cache_create_tokens,
+        turns_used=arch_turns,
+        tokens_per_second=arch_tps,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,
         cap_tainted=tainted,
