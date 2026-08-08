@@ -379,3 +379,142 @@ class TestVelocitySparkWiring:
             tabs_jsx_body,
             re.DOTALL,
         )
+
+
+# ---------------------------------------------------------------------------
+# live/stranded split bands + parity alarm banner (task 3543, step-19)
+# ---------------------------------------------------------------------------
+
+
+def _extract_function_body(source: str, func_name: str) -> str:
+    """Extract a top-level ``function <func_name>(`` up to the next top-level
+    ``function`` declaration (or EOF).
+
+    Scopes structural assertions to one component inside the 1360-line
+    tabs.jsx, so an assertion cannot be satisfied by OrchTab or MergeTab.
+    Mirrors the identically-named per-file helpers in
+    test_tab_tasks_status_counts.py / test_tab_orchestrators.py — the helper
+    is deliberately NOT shared across those modules.
+    """
+    start_match = re.search(rf'^function {re.escape(func_name)}\(', source, re.MULTILINE)
+    assert start_match is not None, f'function {func_name}( not found in tabs.jsx'
+    start = start_match.start()
+    next_match = re.search(r'^function \w+\(', source[start + 1 :], re.MULTILINE)
+    end = start + 1 + next_match.start() if next_match else len(source)
+    return source[start:end]
+
+
+@pytest.fixture(scope='module')
+def burn_tab_body(tabs_jsx_body):
+    """BurnTab's own source text, scoped away from the other tab components."""
+    body = _extract_function_body(tabs_jsx_body, 'BurnTab')
+    # Anti-vacuity: a regex that matches nothing must not pass silently, so
+    # every assertion below runs against a body proven non-empty.
+    assert body
+    return body
+
+
+@pytest.fixture(scope='module')
+def data_js_body(_client):
+    return _client.get('/static/redux/data.js').text
+
+
+class TestBurnTabSplitBands:
+    def test_aggregate_stack_splits_in_progress(self, burn_tab_body):
+        """The aggregate stack must band live and stranded, not one in_progress."""
+        assert re.search(r"key:\s*'in_progress_live',[^}]*values:\s*b\.in_progress_live", burn_tab_body)
+        assert re.search(
+            r"key:\s*'in_progress_stranded',[^}]*values:\s*b\.in_progress_stranded", burn_tab_body
+        )
+
+    def test_per_project_stack_splits_in_progress(self, burn_tab_body):
+        """The per-project stack must carry the same two bands off pb."""
+        assert re.search(r"key:\s*'in_progress_live',[^}]*values:\s*pb\.in_progress_live", burn_tab_body)
+        assert re.search(
+            r"key:\s*'in_progress_stranded',[^}]*values:\s*pb\.in_progress_stranded", burn_tab_body
+        )
+
+    def test_no_undivided_in_progress_band_remains(self, burn_tab_body):
+        """The single in_progress band must be GONE from both stacks.
+
+        Leaving it in place alongside the split would double-count in-progress
+        work in a stacked area — the chart would show a total no census ever
+        produced.
+        """
+        assert not re.search(r"key:\s*'in_progress'\s*,", burn_tab_body)
+
+    def test_stranded_band_uses_a_distinct_alarm_colour(self, burn_tab_body):
+        """Stranded must not reuse the live band's colour, or the split is invisible.
+
+        It also must not reuse CP.bad, which the blocked band already owns in
+        the same stack — two identically-coloured adjacent bands are worse
+        than no split.
+        """
+        stranded_bands = re.findall(r"key:\s*'in_progress_stranded',\s*color:\s*(CP\.\w+)", burn_tab_body)
+        assert stranded_bands, 'no stranded band with a CP.* colour found'
+        for colour in stranded_bands:
+            assert colour not in ('CP.accent', 'CP.bad')
+        assert len(set(stranded_bands)) == 1, 'both stacks must use one stranded colour'
+
+    def test_both_legends_name_the_split(self, burn_tab_body):
+        """Both hardcoded legends must list stranded, or the band is unlabelled."""
+        legends = re.findall(r"\[\[\s*'done'.*?\]\]", burn_tab_body, re.DOTALL)
+        assert len(legends) == 2, f'expected 2 hardcoded legends, found {len(legends)}'
+        for legend in legends:
+            assert 'stranded' in legend
+            assert re.search(r"'(live|in-progress \(live\)|active)'", legend), (
+                'the live band needs its own legend entry'
+            )
+
+
+class TestBurnTabParityBanner:
+    def test_banner_is_gated_on_parity_alarm(self, burn_tab_body):
+        """The banner renders only when the server says the cap was breached.
+
+        Gating on anything client-derived (e.g. comparing a rendered
+        in_progress against a cap) would re-introduce the render-time
+        comparison that a hot-reloaded cap makes dishonest.
+        """
+        assert re.search(r'b\.parity_alarm', burn_tab_body)
+
+    def test_banner_shows_peak_against_cap(self, burn_tab_body):
+        """The banner must show the peak and the cap it breached, not just a word."""
+        assert 'parity_peak' in burn_tab_body
+        assert 'parity_cap' in burn_tab_body
+
+    def test_banner_names_the_breaching_projects(self, burn_tab_body):
+        """The aggregate banner must name which project(s) breached."""
+        assert 'parity_projects' in burn_tab_body
+
+    def test_banner_uses_the_bad_badge_precedent(self, burn_tab_body):
+        """Follows tab_scheduler.jsx's stranded-parks banner: a div.badge.bad."""
+        assert re.search(r'className="badge bad"', burn_tab_body)
+
+    def test_no_client_side_cap_comparison(self, burn_tab_body):
+        """The JSX must not re-derive the breach by comparing counts to a cap."""
+        assert not re.search(r'in_progress\w*\s*>\s*\w*[Cc]ap', burn_tab_body)
+
+
+class TestBurndownSeedShape:
+    """data.js's BURNDOWN seed must match the wire shape.
+
+    A cold client renders from this seed before the first poll lands; a key
+    missing here renders an `undefined` band rather than an empty one.  Only
+    the per-series keys are pinned here — dashboard/tests/js/data_poll.test.mjs
+    already covers the endpoint-key inventory executably.
+    """
+
+    def test_seed_carries_the_split_series(self, data_js_body):
+        seed = re.search(r'BURNDOWN:\s*\{[^}]*\}', data_js_body)
+        assert seed, 'BURNDOWN seed not found in data.js'
+        assert 'in_progress_live' in seed.group(0)
+        assert 'in_progress_stranded' in seed.group(0)
+
+    def test_seed_carries_the_parity_fields(self, data_js_body):
+        seed = re.search(r'BURNDOWN:\s*\{[^}]*\}', data_js_body)
+        assert seed, 'BURNDOWN seed not found in data.js'
+        body = seed.group(0)
+        assert 'parity_alarm' in body
+        assert 'parity_cap' in body
+        assert 'parity_peak' in body
+        assert 'parity_projects' in body
