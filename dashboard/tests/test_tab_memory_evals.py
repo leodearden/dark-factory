@@ -1604,35 +1604,54 @@ def test_no_client_side_alarm_derivation(
             )
 
 
-def test_trend_holes_are_never_handed_to_a_chart_primitive(
+def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A series containing a hole must NOT be drawn — charts.jsx cannot
-    represent one, so drawing it fabricates a measurement.
+    """A series containing a hole IS drawn, with its missing samples disclosed
+    alongside it.  The chart is gated on AT LEAST ONE DRAWABLE SAMPLE, never on
+    zero holes.
 
-    The defect: charts.jsx's `Sparkline` (:42-53) and `StepSpark` (:66-90) do
-    plain arithmetic with no null handling — `Math.max(...values, 1)`,
-    `Math.min(...values, 0)`, `y = height - ((v - min) / range) * height` — in
-    which a `null` coerces to 0.  A hole handed to them is therefore drawn as a
-    REAL point at the chart floor, joined by a line segment to its neighbours
-    and indistinguishable from a measured regression to zero.  For a
-    `proportion` metric sitting at 0.95 that reads as a plunge and recovery
-    that never happened.
+    HISTORY: this test previously pinned the opposite invariant — a holed
+    series was suppressed entirely.  Its sole justification was that charts.jsx
+    could not REPRESENT a hole: `Sparkline` and `StepSpark` did plain
+    arithmetic with no null handling, so a `null` coerced to 0 and was drawn as
+    a real point at the chart floor, joined to its neighbours — for a
+    `proportion` metric sitting at 0.95, a plunge and recovery that never
+    happened.  Task 3436 removed that limitation: the scale/path math moved to
+    spark_path.js, which excludes non-finite samples from the extrema, keeps
+    index-based x positions so the axis does not shift, and emits separate
+    M-started subpaths so the line is genuinely discontinuous across a hole.
 
-    That directly contradicts this file's own `dash()` invariant — "Missing
-    scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
-    measured zero".  The trend column was the one place it was violated.
+    DECISION (task 3490): with the primitive hole-aware, the suppression was a
+    workaround for a fixed defect, so it is retired.  Three facts settled it.
+    The trend window is 90 runs (memory_evals.py `_TREND_RUN_CAP`), so
+    suppressing on any hole discards up to 89 real measurements to avoid
+    disclosing 1 missing one — itself a silent degradation.  The dominant
+    real-world source of a hole is a metric INTRODUCED MID-WINDOW
+    (memory_evals.py: "a legitimate shape"), so suppression withheld the chart
+    for a newly-added metric until the entire window rolled over, exactly when
+    an operator most wants the shape.  And a fraction-of-holes threshold was
+    rejected outright: this file consumes the server's judgments and never
+    re-derives them, and no server field authorises a draw/suppress fraction.
 
-    The fix is suppression, not compaction: the array is still passed through
-    verbatim (guarded above), but a series the primitive cannot represent is
-    not drawn at all.
+    What replaced the old invariant is NOT "no gate".  `gaps === 0` was
+    silently doing double duty as the ALL-HOLE guard: a series of nothing but
+    holes yields an empty path, both primitives `return null`, and the cell
+    renders a blank 26px box — the failure
+    test_empty_trend_is_a_named_state_not_an_empty_chart_box exists to prevent.
+    So the gate now counts what will actually be DRAWN
+    (`plotted = points - gaps`) and requires at least one.
     """
     body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
-    # (iv) hole DETECTION must still exist and still run — the fix is to act on
-    #      the count, not to stop counting.
+    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (iv) hole DETECTION must still exist and still run.  UNCHANGED by the
+    #      decision, and required MORE than before: the count is now both the
+    #      operator-facing disclosure and an input to the chart gate.
     assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
         'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
         'memory_evals_fmt.js (task 3481) so node can execute it. Two '
@@ -1653,57 +1672,103 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
         'ignoring the count is the defect this test exists to prevent.'
     )
 
-    # (ii) the gap count must participate in the guard on the <Chart render
-    #      site.  Two spellings are accepted — an inline `Chart && !gaps`, or a
-    #      named local (`plottable` / `hasGaps` / ...) combining both — because
-    #      the invariant is "the count gates the chart", not one exact phrasing.
+    # (ii') the gap count must still reach the `<Chart ...>` render site — but
+    #       now as the SUBTRAHEND that yields the drawable-sample count, not as
+    #       a zero-equality veto.  Derived in two hops so the gate's meaning is
+    #       readable from the source: a count local that consumes both the
+    #       series length and the gap count, then a gate that consumes `Chart`
+    #       and that count and reaches a `{<local>` JSX position.
     #
-    #      KEPT DELIBERATELY, against a review suggestion to delete this block
-    #      as identifier-spelling introspection covered by the `bare` negative
-    #      check below.  Measured, not argued: regressing the JSX to
-    #      `const plottable = Chart;` (gate removed, holed series reaches the
-    #      primitive) fails HERE and `bare` passes it — `bare` only matches the
-    #      literal `{Chart &&` / `{Chart ?` spelling, so any named local evades
-    #      it entirely.  The two are not redundant: this is the only POSITIVE
-    #      check that a gate exists at all, and deleting it silently reopens
-    #      the defect 5ad120a0b3 fixed (charts.jsx coerces null to 0 and draws
-    #      a fabricated plunge to the chart floor; see task 3436).
-    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', body)
-    via_local = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
-    ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
-            via_local = decl.group(1)
+    #       KEPT DELIBERATELY, against a review suggestion to delete this block
+    #       as identifier-spelling introspection covered by the `bare` negative
+    #       check below.  Measured, not argued: regressing the JSX to
+    #       `const plottable = Chart;` (gate removed, an all-hole series reaches
+    #       the primitive) fails HERE and `bare` passes it — `bare` only matches
+    #       the literal `{Chart &&` / `{Chart ?` spelling, so any named local
+    #       evades it entirely.  The two are not redundant: this is the only
+    #       POSITIVE check that a gate exists at all, and deleting it lets the
+    #       cell hand a series of nothing but holes to a primitive that returns
+    #       null, leaving the blank 26px box.
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
+        'it cannot subtract the gap count from it to learn how many samples '
+        'the primitive will actually draw.'
+    )
+    points_local = points_decl.group(1)
+
+    # The drawable count: a plain arithmetic local (NOT the gate itself, hence
+    # the `Chart` exclusion) combining the series length and the gap count.
+    plotted_local = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body):
+        name, text = decl.group(1), decl.group(0)
+        if name == 'gaps' or re.search(r'\bChart\b', text):
+            continue
+        if re.search(r'\b' + re.escape(points_local) + r'\b', text):
+            plotted_local = name
             break
-    assert inline or via_local, (
-        'the `<Chart ...>` render site is not gated on the gap count. A holed '
-        'series must not reach a charts.jsx primitive: declare e.g. '
-        '`const plottable = Chart && gaps === 0;` and render the chart only '
-        'when it holds.'
+    assert plotted_local is not None, (
+        'MemoryEvalMetricRow never derives the DRAWABLE-sample count. The '
+        f'chart is gated on how many samples the primitive will draw, so a '
+        f'`const plotted = {points_local} - gaps;` local (any name, but not '
+        '`gaps` and not the gate itself) must exist. Without it the gate is '
+        'either back to a zero-hole veto or blind to an all-hole series.'
     )
 
-    # ...and the bare `Chart` guard must be gone, so no path reaches the
-    # primitive without the gap check.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    gate_local = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
+        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
+            continue
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
+            gate_local = decl.group(1)
+            break
+    assert gate_local is not None, (
+        'the `<Chart ...>` render site is not gated on the drawable-sample '
+        f'count `{plotted_local}`. Expected a single-line '
+        f'`const plottable = Chart && {plotted_local} > 0 && ...;` whose local '
+        'reaches a `{<local>` JSX position. A series in which NOTHING was '
+        'measured must not reach a primitive: sparkPaths returns an empty '
+        'line, Sparkline/StepSpark return null, and the cell renders a blank '
+        '26px box.'
+    )
+
+    # (ii'-negative) the RETIRED suppression must be gone. Without this,
+    #                leaving `gaps === 0` in the gate would keep the old
+    #                behaviour while every other assertion above passed.
+    suppression = re.search(r'\bgaps\s*(?:===?)\s*0|!\s*gaps\b', code)
+    assert suppression is None, (
+        f'a zero-gap veto survives: {suppression.group(0)!r}. Task 3490 '
+        'retired it — a holed series is DRAWN by the hole-aware primitive and '
+        f'its gaps disclosed. The gate is `{plotted_local} > 0` (at least one '
+        'drawable sample), never "no holes at all".'
+    )
+
+    # ...and no path may reach the primitive around the named gate. `<Chart `
+    # (the element itself) and `!Chart` (the no-kind arm) do not match this;
+    # only an inline `{Chart &&` / `{Chart ?` render guard does, and such a
+    # guard would hand an ALL-HOLE series to a primitive that returns null.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)', body)
     assert bare is None, (
-        f'a chart render site is still guarded by `Chart` alone: '
-        f'{bare.group(0)!r} — a holed series would reach the primitive '
-        'through it.'
+        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
+        f'it bypasses the `{gate_local}` gate, so a series in which nothing '
+        'was measured would reach the primitive and render a blank box.'
     )
 
-    # (iii) a suppressed series must still DISCLOSE its gap count — silently
-    #       withholding the sparkline would read as a render bug.  Asserted
-    #       structurally (the `gaps` local reaches a JSX render position in
-    #       comment-stripped source) rather than as operator-facing copy:
-    #       pinning the sentence would fail the suite on any rewording while
-    #       proving nothing extra about the branch, which is the rule this
+    # (iii) a DRAWN holed series must still DISCLOSE how many samples are
+    #       missing — a line with unexplained breaks in it reads as a render
+    #       bug.  Asserted structurally (the `gaps` local reaches a JSX render
+    #       position in comment-stripped source) rather than as operator-facing
+    #       copy: pinning the sentence would fail the suite on any rewording
+    #       while proving nothing extra about the branch, which is the rule this
     #       file states at lines 1134-1138 and 1203-1211.
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count is computed but never reaches render position. A '
-        'holed series must disclose how many samples are missing — the '
-        'operator still gets value, current_value, n, denominator, direction '
-        'and the verdict badge, and only the sparkline is withheld.'
+        'holed series is now drawn, so the count is the ONLY thing that '
+        'explains the breaks in the line — the operator still gets value, '
+        'current_value, n, denominator, direction and the verdict badge, but '
+        'nothing would say how many runs produced no sample.'
     )
 
 
