@@ -1711,7 +1711,7 @@ class TestProceduralTopicGuardClustersDefault:
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 6
+        assert len(clusters) >= 7
 
     def test_default_seeds_all_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1722,6 +1722,7 @@ class TestProceduralTopicGuardClustersDefault:
         assert 'architect-report-task-already-done-main-reachability' in topic_ids
         assert 'architect-plan-revalidation-requeue-lock' in topic_ids
         assert 'ruff-format-not-an-enforced-gate' in topic_ids
+        assert 'npx-pyright-eacces-agent-sandbox' in topic_ids
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
         cluster = _seeded_cluster('pytest-xdist-serial-override')
@@ -2216,6 +2217,47 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+
+class TestNpxPyrightEaccesAgentSandboxCluster:
+    """Topic-guard cluster for the "`npx pyright` fails with npm EACCES on
+    /home/leo/.npm/_cacache" family (gate task 3417, still blocked behind
+    3524 -- its 21-entry cluster awaits a consolidation ruling).
+
+    Unlike the earlier seeds, this cluster is internally CONTRADICTORY rather
+    than merely redundant: some members assert root-owned npm-cache files and
+    prescribe a `sudo chown` that is a MEASURED no-op, while others carry the
+    corrected agent-sandbox diagnosis. The phrase set is therefore keyed on
+    the invariant SYMPTOM, not on the adjudicated correct cause, so it catches
+    both readings -- see the derivation comment on the seed in schema.py.
+    """
+
+    TOPIC_ID = 'npx-pyright-eacces-agent-sandbox'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_cluster_present_and_routes_to_gate_3417(self):
+        """The registration + hint contract.
+
+        The hint has to carry three things a routed writer needs, because
+        the block is SOFT and the hint is the only thing they read: the gate
+        task to add context to (3417), the fact that the `sudo chown` remedy
+        several members prescribe is a CONFIRMED NO-OP -- so a writer cannot
+        re-derive the harmful fix from the same symptom -- and the task that
+        owns the real fix (3162).
+
+        The phrase list is deliberately NOT asserted here; it is owned by
+        ``test_cluster_present_with_expected_phrases`` below, so the list is
+        pinned in exactly one place.
+        """
+        cluster = self._cluster()
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+        assert '3417' in cluster.hint
+        assert 'no-op' in cluster.hint.lower()
+        assert '3162' in cluster.hint
 
 
 class TestWriteTriageConfig:
