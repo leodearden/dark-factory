@@ -370,3 +370,76 @@ class TestGetMemoryContextFiltersForeignFacts:
         assert 'dark_factory' in caplog.text
         assert 'filtered' in caplog.text.lower()
         assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
+@pytest.mark.asyncio
+class TestMemoryContextProvenanceCaveat:
+    """A standing caveat covers the leak channel the tag filter cannot reach.
+
+    ``filter_foreign_project_results`` only ever fires on Mem0-sourced
+    results that carry a project tag. Every Graphiti-sourced result is
+    untagged today (metadata == {}), so it survives the filter unclassified
+    — the caveat is what converts "agent cd's/reads into a recalled
+    'crates/reify-compiler' path" into "agent verifies the path first" for
+    that untagged channel.
+    """
+
+    async def test_caveat_present_and_precedes_first_section(
+        self, briefing: BriefingAssembler,
+    ):
+        envelope = _mcp_search_envelope([
+            _result('1', 'Own project fact.', metadata={'project_id': 'dark_factory'}),
+        ])
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
+            context = await briefing._get_memory_context('3609')
+
+        assert context.splitlines()[0] == '# Context'
+        assert briefing.project_id in context
+
+        lower = context.lower()
+        for token in ('verify', 'cd', 'worktree', 'do not'):
+            assert token in lower, f'caveat missing load-bearing token {token!r}'
+
+        # The caveat must precede the first '## ' section heading. Locate the
+        # project_id mention that establishes the caveat is present (the
+        # earliest one after the heading) and confirm it comes before that
+        # heading — the JSON section body below also names the project, but
+        # only as a later occurrence.
+        caveat_mention = context.index(briefing.project_id, len('# Context'))
+        first_section = context.index('\n## ')
+        assert caveat_mention < first_section
+
+    async def test_caveat_absent_when_no_sections_survive(self, briefing: BriefingAssembler):
+        envelope = {'result': {'content': []}}
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
+            context = await briefing._get_memory_context('3609')
+
+        assert context == '# Context\n\n_No memory context available._'
+
+    async def test_caveat_present_alongside_untagged_foreign_path_content(
+        self, briefing: BriefingAssembler,
+    ):
+        """The census failure mode: untagged content naming a foreign path.
+
+        The result carries no project tag at all (metadata == {}), so the
+        filter cannot classify — let alone drop — it; it renders verbatim.
+        The caveat must still be present so the agent is warned to verify
+        the path before treating it as real.
+        """
+        envelope = _mcp_search_envelope([
+            _result(
+                '1',
+                "A park on 'crates/reify-compiler/src' blocks acquire of "
+                "'crates/reify-compiler'.",
+                metadata={},
+            ),
+        ])
+
+        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
+            context = await briefing._get_memory_context('3609')
+
+        assert 'crates/reify-compiler' in context
+        assert briefing.project_id in context
+        assert 'verify' in context.lower()
