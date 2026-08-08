@@ -47,7 +47,11 @@ import pytest  # noqa: F401
 import pytest_asyncio  # noqa: F401
 from _fm_helpers import poll_until
 
-import fused_memory.services.durable_queue as dq_module  # noqa: F401
+# The REAL upstream classes — see the module docstring for why this import is
+# correct here and deliberately absent from test_durable_queue.py.
+from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError
+
+import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
 
 
@@ -104,3 +108,85 @@ def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
     )
     kwargs.update(overrides)
     return DurableWriteQueue(**kwargs)
+
+
+class TestUpstreamNotFoundMessageFormat:
+    """Pin graphiti_core's not-found message text (0.28.2, errors.py:22-27 and
+    :54-59) by deriving every expectation FROM the constructed exception.
+
+    Never assert against a hand-copied literal like ``f'node {u} not found'``:
+    that would keep passing after an upstream reword while the parser silently
+    stopped recognising the real thing. Building the input with
+    ``str(NodeNotFoundError(u))`` makes such an upgrade turn this test RED,
+    which is the whole point of the pin.
+    """
+
+    def test_parses_node_not_found_uuid(self):
+        """NodeNotFoundError('<uuid>') -> 'node <uuid> not found' -> '<uuid>'."""
+        u = _uuid()
+        message = str(NodeNotFoundError(u))
+        assert dq_module._parse_not_found_uuid(message) == u, (
+            f'Failed to recover the uuid from graphiti_core '
+            f'NodeNotFoundError({u!r}), whose message is {message!r}. If '
+            f'graphiti-core reworded this, update _NOT_FOUND_MESSAGE_RE — the '
+            f'exception carries no .uuid attribute, so the message is the only '
+            f'carrier.'
+        )
+
+    def test_parses_edge_not_found_uuid(self):
+        """EdgeNotFoundError('<uuid>') -> 'edge <uuid> not found' -> '<uuid>'."""
+        u = _uuid()
+        message = str(EdgeNotFoundError(u))
+        assert dq_module._parse_not_found_uuid(message) == u, (
+            f'Failed to recover the uuid from graphiti_core '
+            f'EdgeNotFoundError({u!r}), whose message is {message!r}.'
+        )
+
+
+class TestParserFailsOpen:
+    """Anything that is not EXACTLY the pinned format returns None.
+
+    None routes the caller back to the ordinary retry policy, so an upstream
+    reword — or any similarly-worded message from elsewhere — degrades to
+    today's retry behaviour and NEVER to permanent failure. This is the
+    direction the fail-open invariant mandates: a missed permanent failure
+    costs four extra retries; a false permanent failure discards a write.
+    """
+
+    def test_fused_memory_own_not_found_messages_do_not_match(self):
+        """fused-memory defines its OWN unrelated NodeNotFoundError
+        (backends/graphiti_client.py:219). Its messages signal a CONFIRMED
+        absence in a different lookup and must not be parsed as upstream's."""
+        u = _uuid()
+        for message in (
+            f'Entity node not found: {u}',                        # :1086, :1983, :2006
+            f'Episodic node not found in group g1: {u}',          # :876
+            "No entity found with name: 'Foo'",                   # :2034
+            f"Entity node not found in source_graph 'src': {u}",  # cross_graph_move.py:342
+        ):
+            assert dq_module._parse_not_found_uuid(message) is None, (
+                f'fused-memory\'s own not-found text {message!r} must not parse '
+                f'as graphiti_core\'s pinned format.'
+            )
+
+    @pytest.mark.parametrize(
+        'message',
+        [
+            'uuid abc-123 not found',   # task 3585's test literal — must NOT match
+            '',
+            'node not found',           # no uuid at all
+            'node a b not found',       # \S+ must not span the space
+            'Node {u} not found',       # wrong case
+            'NODE x not found',
+            'node x not found.',        # trailing punctuation breaks the anchor
+            'prefix node x not found',  # unanchored prefix
+            'node x not found suffix',  # unanchored suffix
+            'nodes x not found',
+            'edgy x not found',
+        ],
+    )
+    def test_non_matching_shapes_return_none(self, message):
+        assert dq_module._parse_not_found_uuid(message) is None, (
+            f'{message!r} must not parse as the pinned not-found format; '
+            f'got {dq_module._parse_not_found_uuid(message)!r}.'
+        )
