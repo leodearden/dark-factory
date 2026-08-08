@@ -23,15 +23,25 @@ from typing import Any
 
 import pytest
 import startup_completion_fixtures as scf
+from _oauth_accounts import ALL_TOKEN_LETTERS, available_tokens
 
 from shared import cli_invoke
 
-# Live re-probe gate — mirrors test_cli_invoke_integration.py's _AVAILABLE_TOKENS
-# discovery, and startup_completion_probe._oauth_token's wider A..G sweep, so a
-# machine with no accounts records a legible skip instead of a spurious failure.
-_OAUTH_TOKEN_PRESENT = any(
-    os.environ.get(f'CLAUDE_OAUTH_TOKEN_{c}') for c in 'ABCDEFG'
-)
+# Live re-probe gate — the account scan is IMPORTED from _oauth_accounts, the
+# single home for it (task 3700), so a machine with no accounts records a
+# legible skip instead of a spurious failure.  This comment used to name
+# test_cli_invoke_integration.py's _AVAILABLE_TOKENS as what it mirrored; that
+# module no longer defines the scan, it imports it, and the "mirror" here was a
+# hand-rolled `for c in 'ABCDEFG'` that could have drifted from it silently —
+# which is exactly what had happened to the third copy, in test_usage_gate.
+#
+# ALL_TOKEN_LETTERS, not the fleet set _oauth_accounts defaults to: this gate
+# asks only "is there ANY account at all?", it spends no fleet capacity, and the
+# interactive/primary account A is a legitimate answer.  Narrowing it to the
+# fleet set would make a single-account machine report a failure it cannot act
+# on.  startup_completion_probe._oauth_token uses the same set for the same
+# reason.
+_OAUTH_TOKEN_PRESENT = bool(available_tokens(os.environ, ALL_TOKEN_LETTERS))
 
 # ONE pinned copy per concept, asserted equal to the module's own constant by
 # TestPinnedConstants.  Restating a closed set here is deliberate — a silent
