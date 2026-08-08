@@ -26,6 +26,8 @@ capability."
 from __future__ import annotations
 
 import logging
+import statistics
+from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +42,15 @@ _SERVICE_RESTART = 'service_restart'
 #: Event types :func:`iter_hold_spans` reads.  Everything else in the stream is
 #: skipped without touching the open-span map.
 _INTERESTING = frozenset({_ACQUIRED, _RELEASED, _SERVICE_RESTART})
+
+#: Holds per module kept in the rolling window.  PARKING_MODEL_REPORT.md:116-126
+#: measures the *last 10* holds; a longer window drags in holds that stopped
+#: being representative, a shorter one is noise.
+DEFAULT_WINDOW = 10
+
+#: Fewest pooled samples that will produce a prediction at all.  Below this the
+#: predictor REFUSES (returns None) rather than answer from one or two holds.
+DEFAULT_MIN_SAMPLES = 3
 
 
 @dataclass(frozen=True)
@@ -246,3 +257,88 @@ def iter_hold_spans(
             'hold_history: %d span(s) still open at end of stream — dropped (no observed end)',
             len(open_spans),
         )
+
+
+class HoldHistory:
+    """Rolling per-module lock-hold durations, and the median predictor over them.
+
+    One bounded :class:`collections.deque` per module key, ``maxlen=window``, so
+    eviction is a property of the container rather than something every read
+    path has to remember to slice.  Module keys are the depth-coarsened path
+    prefixes ``Scheduler._get_modules`` produces (scheduler.py:7418-7455) and are
+    matched EXACTLY — no prefix or parent rollup, because the lock layer already
+    treats those as distinct keys.
+
+    The window is keyed by module alone, deliberately not by (task, module): the
+    measured signal (PARKING_MODEL_REPORT.md:116-126) is "how long do holds on
+    THIS module tend to run", and per-task keying would shatter it into windows
+    of one or two samples that could never clear ``min_samples``.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int = DEFAULT_WINDOW,
+        min_samples: int = DEFAULT_MIN_SAMPLES,
+    ) -> None:
+        self._window = int(window)
+        self._min_samples = int(min_samples)
+        self._samples: dict[str, deque[float]] = {}
+
+    # --- feeding ----------------------------------------------------------
+
+    def record(self, module: str, duration: float) -> None:
+        """File one observed hold duration (seconds) against *module*."""
+        if not module:
+            return
+        window = self._samples.get(module)
+        if window is None:
+            window = self._samples[module] = deque(maxlen=self._window)
+        window.append(float(duration))
+
+    def record_span(self, span: HoldSpan) -> None:
+        """File a :class:`HoldSpan` — the shape :func:`iter_hold_spans` yields.
+
+        ``truncated`` spans ARE recorded.  Their end was imposed, not fabricated,
+        so the duration is a real lower bound on a real hold
+        (PARKING_MODEL_REPORT.md:102: "the lock did block others until then").
+        Dropping them would bias the window toward short, tidy holds — precisely
+        the ones least worth predicting.
+        """
+        self.record(span.module, span.duration)
+
+    # --- reading ----------------------------------------------------------
+
+    def _pooled(self, modules: Iterable[str]) -> list[float]:
+        """Every sample from every named module, deduplicating the module list.
+
+        A task whose paths coarsen to the same module twice must not have that
+        module's window counted twice — that would silently double its weight in
+        the pooled median.
+        """
+        pooled: list[float] = []
+        for module in dict.fromkeys(modules):
+            pooled.extend(self._samples.get(module, ()))
+        return pooled
+
+    def sample_count(self, modules: Iterable[str]) -> int:
+        """How many samples back a :meth:`predicted_hold` over *modules*.
+
+        Exposed for tests and for task η's diagnostics, which need to say WHY a
+        prediction was refused rather than just that it was.
+        """
+        return len(self._pooled(modules))
+
+    def predicted_hold(self, modules: Iterable[str]) -> float | None:
+        """Median hold (seconds) across the pooled windows of *modules*.
+
+        POOLED, not a median-of-medians: a module with 10 samples should weigh
+        more than one with 3, because it is the better-evidenced key.
+
+        Returns None when there is nothing to answer from — see step-10, which
+        raises that floor from "any sample at all" to ``min_samples``.
+        """
+        pooled = self._pooled(modules)
+        if not pooled:
+            return None
+        return float(statistics.median(pooled))
