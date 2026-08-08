@@ -1356,7 +1356,12 @@ def create_mcp_server(
         'rather than reconstructing it. A search(query=...) instruction is NOT '
         'an acceptable replacement value — re-deriving at read time resolves '
         'back to the superseded duplicates this consolidation is collapsing. '
-        'Terminal (done/cancelled) citers are reported, never rewritten.'
+        'Terminal (done/cancelled) citers are reported, never rewritten. '
+        'If there is no surviving entry to repoint to — a plain drop rather '
+        'than a consolidation — pass '
+        "metadata={'allow_dangling_citations': True} to accept dangling these "
+        'citations deliberately; the override is recorded at WARNING along '
+        'with every citer it strands.'
     )
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
