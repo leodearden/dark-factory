@@ -1355,7 +1355,9 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
 # ---------------------------------------------------------------------------
 
 
-def test_tab_escalations_strip_pinning_tile(tab_escalations_jsx_body: str) -> None:
+def test_tab_escalations_strip_pinning_tile(
+    tab_escalations_jsx_body: str, tab_escalations_jsx_code: str,
+) -> None:
     """The fifth tile counts open items that PIN a task's recovery.
 
     Reduced from the SAME `lifespan.open_items` array the 6h-breach tile
@@ -1389,7 +1391,12 @@ def test_tab_escalations_strip_pinning_tile(tab_escalations_jsx_body: str) -> No
         'array as breachCount — deriving it from a second source would let the '
         'strip and the analytics badges disagree about one payload.'
     )
-    assert not re.search(r'pins_recovery\s*===\s*false', strip_fn), (
+    # The anti-pattern check runs against the COMMENT-STRIPPED source: the
+    # render code carries a comment naming `=== false` as the thing not to do,
+    # and a whole-body grep cannot tell a warning from a violation.
+    strip_code = _extract_function_body(tab_escalations_jsx_code, 'EscalationStatStrip')
+    assert strip_code, 'Could not locate EscalationStatStrip in the comment-stripped source.'
+    assert not re.search(r'pins_recovery\s*===\s*false', strip_code), (
         'EscalationStatStrip compares pins_recovery === false — the key is ABSENT '
         'when unknown, so an equality test mislabels unannotated items. Count on '
         'truthiness.'
