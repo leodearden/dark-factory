@@ -6,12 +6,15 @@ The watchdog module has a hyphenated filename so it cannot be imported via
 No live systemd runtime is needed — all subprocess.run calls are monkeypatched.
 """
 
+import contextlib
 import importlib.util
 import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
+import sys
 import time
 import types
 
@@ -19,6 +22,15 @@ import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
+
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
+# subproject directories (orchestrator/, shared/, ...) resolve as namespace
+# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
+# docstring exists to prevent. Mirrors test_deploy_clock_isolation.py.
+if str(REPO_ROOT.resolve()) not in sys.path:
+    sys.path.append(str(REPO_ROOT.resolve()))
+
+from df_pytest_isolation import run_in_new_session  # noqa: E402
 
 
 def _load_watchdog() -> types.ModuleType:
@@ -3360,6 +3372,127 @@ def _boundary_run_drain_script(
 
 def _boundary_load_state(state_path):
     return json.loads(state_path.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Process-group containment (task 3798).
+#
+# Mirrors scripts/tests/test_restart_all_orchestrators.py::
+# test_run_script_timeout_kills_the_whole_process_group. The two are
+# deliberately NOT cross-imported -- these directories cannot import each
+# other's test modules, the same constraint that forced
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim into existence.
+# What they DO share is the one thing that matters: a single spawn
+# implementation in df_pytest_isolation.run_in_new_session.
+# ---------------------------------------------------------------------------
+
+# PIPE-CLOSING: the background child redirects its stdio away from the pipes it
+# inherited. See the test below for why that redirection is load-bearing.
+_BOUNDARY_PIPE_CLOSING_LEAKER = '''\
+sleep 300 >/dev/null 2>&1 &
+echo $! > "$LEAK_PIDFILE"
+echo MAIN_UP
+sleep 300
+'''
+
+
+def _boundary_read_leaked_pid(pidfile, *, timeout=10.0):
+    """Poll until the leaker records its grandchild's pid, then return it.
+
+    Polls rather than reading once: the file is created by a `>` redirection
+    and filled by a separate write, so a single read can catch it empty.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = pidfile.read_text().strip()
+        except OSError:
+            text = ""
+        if text.isdigit():
+            return int(text)
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"the leaker never recorded a pid in {pidfile} within {timeout}s "
+                f"(last read: {text!r}); the harness is broken, which says nothing "
+                "either way about process-group containment.",
+                pytrace=False,
+            )
+        time.sleep(0.05)
+
+
+def _boundary_wait_gone(pid, *, timeout=3.0):
+    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False  # alive and owned by someone else -- a recycled pid
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_boundary_run_drain_script_timeout_kills_the_whole_process_group(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_boundary_run_drain_script's timeout must reach the forked poll loops.
+
+    subprocess.run's timeout path kill()s the DIRECT CHILD only, so a
+    backgrounded grandchild survives, is reparented to systemd --user, and
+    spends its grace unattended -- 86 concurrent orphans on 2026-08-06 and 82
+    more on 2026-08-07 (task 3798).
+
+    WHY THE LEAKER REDIRECTS ITS BACKGROUND CHILD'S STDIO, AND WHY THAT MUST
+    NOT BE "SIMPLIFIED" AWAY: a background child that KEPT the inherited
+    stdout/stderr pipes would hold their write ends open, so any drain run
+    against it after the kill never sees EOF. This test drives the REAL
+    spawner; with the stdio redirected to /dev/null nothing holds the pipe, the
+    timeout is raised on schedule, and a regression fails CLEANLY on the
+    surviving pid below. Dropping the `>/dev/null 2>&1` makes this test's
+    behaviour depend on internals of whatever the spawner does after its kill,
+    which is not what it is here to pin.
+
+    Points RESTART_ALL_SCRIPT at the synthetic leaker rather than the real
+    script: it is read at call time inside _boundary_run_drain_script, and the
+    production script must never be driven by a test that exists to observe a
+    timeout.
+    """
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(_BOUNDARY_PIPE_CLOSING_LEAKER)
+    monkeypatch.setattr(sys.modules[__name__], "RESTART_ALL_SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
+    )
+
+    leaked_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _boundary_run_drain_script(
+                bin_dir, state_path, fleet_dir, tmp_path / "clock.json",
+                env={"LEAK_PIDFILE": str(pidfile)},
+                timeout=2,
+            )
+
+        leaked_pid = _boundary_read_leaked_pid(pidfile)
+        assert _boundary_wait_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _boundary_run_drain_script timed "
+            "out. The timeout killed only the direct child, so every poll loop "
+            "the script forked is now an orphan free to spend its grace and "
+            "then issue a REAL systemctl restart. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
 
 
 def _boundary_decode(maybe_bytes):
