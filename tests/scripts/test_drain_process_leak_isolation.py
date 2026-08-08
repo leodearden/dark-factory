@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -44,6 +45,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
+# Reused, not re-derived. pytest's fixture marker is private and MOVED between
+# 8.x and 9.x; `_fixture_marker` already accepts both spellings and fails loudly
+# when it finds neither, which is the whole value of the helper — a second copy
+# would be a second thing to update the next time pytest moves it. Resolves
+# because `tests/scripts/conftest.py` puts this directory on sys.path (pytest's
+# --import-mode=importlib deliberately does not), the same mechanism
+# `test_skills_module_config_decision.py` uses for its sibling probe. A bare
+# import, never an importorskip: if the sibling stops importing, say so loudly.
+from test_deploy_clock_isolation import _fixture_marker  # noqa: E402
+
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     DRAIN_SCRIPT_CMDLINE_MARKER,
@@ -56,6 +67,13 @@ from df_pytest_isolation import (  # noqa: E402
     run_in_new_session,
     wait_proof_grace_secs,
 )
+
+# NOT `from df_pytest_isolation import _df_no_leaked_drain_processes`. Importing
+# a FIXTURE into a test module binds it as a module-scoped fixture that SHADOWS
+# the conftest's, so the registration test below would resolve its own import
+# and pass with the conftest wiring deleted — precisely the dead defence it
+# exists to detect. Reach it through the module instead.
+_GUARD_NAME = '_df_no_leaked_drain_processes'
 
 # ---------------------------------------------------------------------------
 # Synthetic leakers.
@@ -574,3 +592,261 @@ class TestLeakedDrainProcessReason:
         assert DRAIN_SCRIPT_CMDLINE_MARKER in reason
         assert '3798' in reason
         assert 'run_in_new_session' in reason
+
+
+class TestGuardIsLiveInThisRun:
+    """The fixture is WIRED, not merely defined.
+
+    Everything above tests pure functions against synthetic ``/proc`` trees and
+    ``tmp_path`` leakers; all of it would stay green if the fixture were never
+    loaded by any conftest.  This class is the only assertion that the defence
+    is actually armed in the process running it — the difference between a wired
+    defence and a dead one.
+    """
+
+    def test_the_guard_fixture_exists(self) -> None:
+        assert hasattr(df_pytest_isolation, _GUARD_NAME), (
+            f'df_pytest_isolation defines no {_GUARD_NAME}; the pure scan '
+            'helpers above protect nothing on their own.'
+        )
+
+    def test_the_guard_fixture_is_session_scoped_and_autouse(self) -> None:
+        """Both properties pinned STRUCTURALLY, not by inspection of behaviour.
+
+        A function-scoped or non-autouse variant would still import cleanly and
+        keep every test above green while protecting nothing: without
+        ``autouse`` nothing would ever request it, and function scope would both
+        cost a /proc sweep per test across ~90 files times every xdist worker
+        AND miss a leak from a module- or session-scoped fixture, which is
+        exactly where expensive subprocess setup tends to live.
+        """
+        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+
+        assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
+        assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
+
+    def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
+        """The conftest binding is real WIRING, not a dormant definition.
+
+        pytest only collects fixtures bound into a conftest's namespace, which
+        is why df_pytest_isolation's fixtures are imported there under
+        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
+        breaks nothing visible except this assertion.
+        """
+        try:
+            request.getfixturevalue(_GUARD_NAME)
+        except pytest.FixtureLookupError:
+            pytest.fail(
+                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
+                'test-root conftest to import it from df_pytest_isolation '
+                '(`# noqa: F401 — the binding IS the wiring`); without that, '
+                'this whole suite runs with no leaked-drain-process guard.',
+                pytrace=False,
+            )
+
+    def test_the_session_token_is_stamped_into_the_environment(self) -> None:
+        """The token is in ``os.environ`` NOW, which is what makes the guard free.
+
+        Both real spawners build their child env from ``dict(os.environ)``, so a
+        token stamped there tags every descendant with no per-spawner change —
+        the same "the defect class is a spawner that forgets" reasoning as
+        3797's clock redirect. Stamped anywhere else (a fixture argument, an
+        explicit env key at each call site) the next spawner would silently opt
+        out, and `leaked_drain_processes` fails CLOSED on an absent token, so
+        the guard would report all-clear forever.
+        """
+        token = os.environ.get(LEAK_TOKEN_ENV)
+
+        assert token, (
+            f'{LEAK_TOKEN_ENV} is unset in this run, so nothing this suite '
+            'spawns is attributable to it and the guard can never match.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The guard's FAILURE contract, exercised through a real nested pytest run.
+#
+# Everything above pins the helpers, the marker and the registration; none of it
+# pins what a leak actually DOES to the run. A refactor that warned instead of
+# failing, or moved the check into a fixture nobody requests, would leave every
+# test in this file green while the defence emitted nothing an exit code could
+# carry. Only a nested run can observe "the process exits non-zero even though
+# every test passed", because a fixture cannot fail its own session.
+# ---------------------------------------------------------------------------
+
+# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
+# without it pytest walks up looking for an inifile and would inherit this
+# repo's addopts (`--import-mode=importlib -m 'not smoke ...'`).
+_NESTED_INI = '[pytest]\n'
+
+_NESTED_CONFTEST = '''\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from df_pytest_isolation import _df_no_leaked_drain_processes  # noqa: F401
+'''
+
+# NAMED for the marker and nothing else. The guard matches this basename in
+# /proc/<pid>/cmdline, and a test that reached for the REAL script to earn that
+# match would be executing production fleet-restart code — spawning systemctl
+# against live units — from inside a unit test. This is a throwaway file the
+# test writes into tmp_path that merely happens to share the name.
+_LEAKER_NAME = 'restart-all-orchestrators.sh'
+_LEAKED_PIDFILE_NAME = 'leaked.pid'
+
+# 45s: long enough to still be alive at the nested session's teardown (~2-4s)
+# by a wide margin, short enough that a residue from a BROKEN guard expires on
+# its own rather than sitting on the box. The trailing statement keeps bash
+# from exec-ing the sleep in its own process and taking the marker with it —
+# measured while implementing 3798 (a one-line `sleep` script keeps `bash
+# <path>` as its cmdline on this box), and cheap insurance across bash versions.
+_NESTED_LEAKER = '''\
+sleep 45
+echo unreachable-inside-this-test
+'''
+
+
+def _nested_test_source(*, leaks: bool) -> str:
+    """Source for the nested test module — which PASSES either way.
+
+    The spawn mirrors both real spawners: ``dict(os.environ)`` for the child
+    env, which is what hands it the NESTED session's token. That is also what
+    keeps THIS session's guard blind to it — a different token — so the outer
+    run cannot fail on the leak its own test deliberately created.
+    """
+    body = (
+        (
+            '    proc = subprocess.Popen(\n'
+            '        ["bash", str(SCRIPT)],\n'
+            '        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
+            '        start_new_session=True, env=dict(os.environ),\n'
+            '    )\n'
+            '    PIDFILE.write_text(str(proc.pid))\n'
+        )
+        if leaks
+        else '    pass\n'
+    )
+    return (
+        'import os\n'
+        'import subprocess\n'
+        'from pathlib import Path\n'
+        '\n'
+        'HERE = Path(__file__).resolve().parent\n'
+        f'SCRIPT = HERE / {_LEAKER_NAME!r}\n'
+        f'PIDFILE = HERE / {_LEAKED_PIDFILE_NAME!r}\n'
+        '\n'
+        '\n'
+        'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is the surviving process, not this result."""\n'
+        + body
+    )
+
+
+def _nested_run(root: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp tree.
+
+    *root* is passed in rather than derived so the caller knows the pidfile path
+    BEFORE the run starts, and can therefore reap a leaker even when this call
+    raises.
+
+    The 120s cap is under pytest-timeout's own ``--timeout=300`` per-test axe, so
+    a wedged nested run reports as this test's failure rather than as the whole
+    outer session being killed mid-assertion.
+    """
+    root.mkdir(parents=True)
+    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
+    (root / 'pytest.ini').write_text(_NESTED_INI)
+    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
+    (root / _LEAKER_NAME).write_text(_NESTED_LEAKER)
+    (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
+    return subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
+        cwd=root, capture_output=True, text=True, timeout=120,
+    )
+
+
+def _read_pid_file(pidfile: Path) -> int | None:
+    """The pid the nested test recorded, or ``None`` if it never got that far."""
+    try:
+        text = pidfile.read_text().strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _reap_leaker(pid: int | None) -> None:
+    """SIGKILL a nested run's leaker — group and all — after proving it is ours.
+
+    The identity check is not ceremony. ``os.killpg`` aimed at a pid the kernel
+    has already RECYCLED is task 845's failure, where it resolved to the
+    ``systemd --user`` manager's group and killed the user's entire login
+    session (see ``shared/src/shared/proc_group.py``). The nested pytest process
+    has already exited by the time we read its pidfile, so this pid is exactly
+    as stale as that one was. Matching the marker in ``/proc/<pid>/cmdline``
+    first means a recycled pid is skipped rather than signalled.
+
+    The GROUP, not just the pid, because the leaker's ``sleep`` is a child: the
+    guard reports only the marker-carrying bash, so killing that alone would
+    leave the sleep orphaned for the rest of its 45s.
+    """
+    if pid is None:
+        return
+    try:
+        cmdline = (Path('/proc') / str(pid) / 'cmdline').read_bytes()
+    except OSError:
+        return  # already gone — the guard reaps what it reports
+    if DRAIN_SCRIPT_CMDLINE_MARKER.encode() not in cmdline:
+        return  # a recycled pid: never signal a group we cannot identify
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+    _reap(pid)
+
+
+class TestTheGuardFailsTheRunEndToEnd:
+    """A leak must cost the RUN, not merely log something."""
+
+    def test_a_leaked_drain_process_fails_a_session_whose_tests_all_passed(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / 'leaking'
+        pidfile = root / _LEAKED_PIDFILE_NAME
+        try:
+            result = _nested_run(root, leaks=True)
+            combined = result.stdout + result.stderr
+            leaked_pid = _read_pid_file(pidfile)
+
+            assert result.returncode != 0, (
+                'a run that leaked a drain process exited 0 — the guard is '
+                f'inert. stdout={result.stdout!r}'
+            )
+            assert '1 passed' in combined, (
+                'the nested TEST must still pass, or this proves nothing about '
+                f'a green suite being caught. output={combined!r}'
+            )
+            assert leaked_pid is not None, (
+                f'the nested test recorded no pid in {pidfile}; the harness is '
+                'broken, which says nothing either way about the guard.'
+            )
+            assert str(leaked_pid) in combined, (
+                f'the guard did not name the leaked pid {leaked_pid}. Triage '
+                f'has to be possible from the failure output alone: {combined!r}'
+            )
+            assert 'run_in_new_session' in combined, combined
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_the_same_harness_without_the_leak_exits_zero(self, tmp_path: Path) -> None:
+        """Non-vacuity control: the identical nested tree, minus the spawn.
+
+        Without it the failure above could be any nested-harness breakage — a
+        bad ini, an unimportable module, a missing pytest.
+        """
+        result = _nested_run(tmp_path / 'clean', leaks=False)
+
+        assert result.returncode == 0, (
+            f'the control run failed for an unrelated reason: '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert 'LEAKED' not in result.stdout
