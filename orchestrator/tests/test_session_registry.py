@@ -3158,23 +3158,31 @@ def test_main_write_decision_stamps_escalations_dir(
     assert Path(listed[0].escalations_dir).is_absolute()
 
 
-def test_main_write_decision_escalations_dir_defaults_empty(
+def test_main_write_decision_refuses_when_escalations_dir_omitted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Omitting --escalations-dir yields '' on the filed record: the flag is
-    optional, and a queue-less record keeps today's project-only-scoped
-    reaper behaviour (mirrors --severity's default at
-    test_main_write_decision_severity_defaults_empty).
+    """Omitting --escalations-dir is an INVOCATION error, not a default.
+
+    DecisionRecords are fleet-global (``~/.claude/fleet/decisions/``) but an
+    ``esc-<taskid>-<n>`` id is unique only WITHIN one queue, and a project
+    may run several (task 3528). A record filed without its queue stamp is
+    therefore cross-queue-ambiguous -- exactly the legacy population task
+    3640 had to back-fill out of, and which must not be allowed to regrow
+    through this verb. So the flag is ``required=True``, joining --id /
+    --project / --text on this same subparser (and mirroring the sibling
+    ``reap-decisions``, whose --escalations-dir has always been required):
+    argparse exits 2 and NOTHING is filed.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
 
-    assert rc == 0
-    listed = sr.list_decisions(root=tmp_path)
-    assert len(listed) == 1
-    assert listed[0].escalations_dir == ''
+    assert excinfo.value.code == 2
+    assert '--escalations-dir' in capsys.readouterr().err
+    assert sr.list_decisions(root=tmp_path) == []
 
 
 def test_main_write_decision_prints_filed_id(
