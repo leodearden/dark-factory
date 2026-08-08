@@ -210,27 +210,37 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {/* FOUR DISTINCTLY worded suppression states, all reusing the
-            "no chart, value only" shape chartForKind already establishes.
-            They assert different things and must not be collapsed:
+        {/* FIVE structurally distinct trend states. The four that draw no
+            chart are DISTINCTLY worded, all reusing the "no chart, value only"
+            shape chartForKind already establishes. They assert different
+            things and must not be collapsed:
 
+              * drawn chart — INCLUDING a holed series. Since task 3436 the
+                primitive breaks the line at every hole instead of coercing it
+                to a floor value, so missing data is no longer a reason to
+                withhold the shape; the gap count is disclosed beside it
+                (task 3490).
               * unknown kind — a RENDERING gap; the payload passes the value
                 through verbatim and files an `unknown_kind` issue for it.
               * length disagreement — a MALFORMED payload: labels and values are
                 parallel arrays, so nothing else this cell could say about the
                 series would be trustworthy. Named, never silently reconciled
                 by picking one length over the other.
-              * holed series — normal, fully-explained MISSING DATA: some runs
-                produced no sample, and the count says how many.
-              * no runs — the metric simply has NOT BEEN MEASURED yet. Folding
-                this into the gap message would print "0 of 0 runs produced no
-                sample", a nonsense sentence that reads as a bug.
+              * no runs — the metric simply has NOT BEEN MEASURED yet.
+              * not one sample — the metric HAS run, but every run came back
+                empty, so there is nothing for the primitive to draw a point
+                from. Kept separate from "no runs" because they are different
+                facts about the metric: collapsing them would tell an operator
+                that a measured-but-empty metric had never run. Folding either
+                into the other's wording would also print a nonsense sentence
+                like "none of the 0 runs produced a sample", which reads as a
+                bug — the very outcome these states exist to prevent.
 
             `!Chart` stays first: an unrenderable kind is the more actionable
-            fact than an empty or malformed series.  In every case the row still
-            shows value, current_value, n, denominator, direction and the
-            verdict badge — the operator loses a 160px sparkline, never the
-            signal. */}
+            fact than an empty or malformed series.  In every suppressed case
+            the row still shows value, current_value, n, denominator, direction
+            and the verdict badge — the operator loses a 160px sparkline, never
+            the signal. */}
         {plottable
           ? (
             <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
@@ -268,15 +278,25 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
                     no runs yet — nothing to chart
                   </span>
                 )
-                : (
-                  <span
-                    className="mono"
-                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
-                    data-testid="memory-eval-trend-gaps"
-                  >
-                    no chart — {gaps} of {labels.length} runs produced no sample
-                  </span>
-                )}
+                // Stated explicitly rather than left as the chain's `else`. An
+                // unconditional final arm would print "none of the N runs
+                // produced a sample" for ANY future reason `plottable` turns
+                // false — a confident false statement about the data, which is
+                // worse than the blank box these states exist to prevent. The
+                // `null` terminator below is unreachable by construction:
+                // reaching it needs Chart && plotted > 0 && !seriesMismatch,
+                // which is exactly what `plottable` already says.
+                : plotted === 0
+                  ? (
+                    <span
+                      className="mono"
+                      style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                      data-testid="memory-eval-trend-all-gaps"
+                    >
+                      no chart — none of the {points} runs produced a sample
+                    </span>
+                  )
+                  : null}
         {/* Footer count reads `points`, the SAME local the states above are
             derived from — never the labels array's own length, which would
             contradict the no-runs state whenever the two arrays disagree. */}
