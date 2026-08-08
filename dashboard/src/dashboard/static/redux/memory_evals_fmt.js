@@ -90,19 +90,35 @@ function ageText(seconds) {
 // is behaviourally tested under `node --test`
 // (dashboard/tests/js/spark_path.test.mjs).
 //
-// The local suppression below is nonetheless RETAINED for now: a holed series
-// is NOT DRAWN (see `plottable` in tab_memory_evals.jsx) and the gap count is
-// disclosed in text instead.  This is the same invariant `dash()` states for
-// scalars — a synthetic zero reads as a measured zero — applied to the trend
-// column.  Re-enabling this trend chart now that the primitive is hole-aware
-// is a product decision with its own test churn
-// (test_tab_memory_evals.py::test_trend_holes_are_never_handed_to_a_chart_primitive
-// pins the current behaviour), and is filed as separate follow-up work.
+// RESOLVED (task 3490): the holed series IS now drawn, by that hole-aware
+// primitive.  This count is therefore no longer a SUPPRESSION TRIGGER but a
+// DISCLOSURE — it says how many of the runs produced no sample, next to a line
+// that visibly breaks at each of them.  It has a second job too:
+// tab_memory_evals.jsx subtracts it from the series length to learn how many
+// samples the primitive will actually draw, and gates the chart on that being
+// at least one.  (A series in which NOTHING was measured is still not drawable:
+// the path builders return an empty line and the chart renders as nothing.)
+//
+// The predicate below deliberately MIRRORS spark_path.js's `isPlottable`
+// rather than importing it: no classic script under static/redux depends on
+// another classic script — each is a leaf consumed only by .jsx — so importing
+// would make this the first such edge, needing a dual-resolution shim plus a
+// new index.html load-order contract, for a four-token definition.  The
+// agreement between the two copies is pinned executably instead, in
+// dashboard/tests/js/memory_evals_fmt.test.mjs, which walks one shared sample
+// vocabulary through BOTH.  Keep them in step: if this under-counts, the
+// subtracted total overstates the drawable samples and a series of nothing but
+// holes slips through the chart gate and renders as an empty box.
 function trendGaps(values) {
   if (!values) return 0;
   let gaps = 0;
   for (let i = 0; i < values.length; i++) {
-    if (values[i] === null || values[i] === undefined) gaps += 1;
+    // A sample counts as a hole unless it is a finite number.  That admits an
+    // honest 0 and rejects null/undefined (no sample), NaN/±Infinity (garbage
+    // that blanks the chart) and non-numbers (a numeric string would coerce
+    // silently through the path arithmetic and plot as if measured).
+    const v = values[i];
+    if (!(typeof v === 'number' && Number.isFinite(v))) gaps += 1;
   }
   return gaps;
 }
