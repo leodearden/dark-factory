@@ -304,6 +304,34 @@ def check(
     dispatches (done/cancelled/deferred) — see
     ``live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES``.
 
+    ``task_metadata`` (task 3751) is the task's raw ``metadata`` payload, as
+    the caller already holds it. It is OPTIONAL and defaults to ``None``, in
+    which case the derived ``task_kind=None`` / ``pure_gate=False``
+    reproduce the prior behavior EXACTLY — every caller that does not pass
+    it is unaffected. It is coerced once via :func:`_coerce_metadata_dict`
+    (dict or JSON-object string; anything else — invalid JSON, a list, a
+    number — degrades to ``None``), so a malformed blob fails safe TOWARD
+    live rather than raising. The coercion happens only inside the
+    ``set_task_status`` branch, so no other gate pays for it. Two detector
+    inputs are derived from it:
+
+    * ``task_kind`` — forwarding this makes ``live_workflow_detector``'s
+      PRE-EXISTING rule 2 (blocked + deterministic, task 2067) and rule 3
+      (blocked + normal + bare, task 2409) reachable from this gate FOR THE
+      FIRST TIME. Gate 2 previously forwarded only ``status``, so no
+      task_kind-scoped rule had ever fired here. That is an intended,
+      in-direction consequence of the plumbing — both rules exist precisely
+      to stop the bare project-wide lock being read as per-task evidence,
+      and Gate 2 is the one place where that misreading actually blocks a
+      write — not an accident. It is pinned by an explicit test rather than
+      left as a silent behavior change.
+    * ``pure_gate`` — :func:`is_pure_gate_metadata`, carrying task 3751's
+      rule 5 (pending + deterministic + pure gate). A pure gate
+      (``always_escalates`` truthy, no ``before_done``) never acquires a
+      worktree or branch, so the bare lock is never evidence for it; a
+      pending deterministic task WITH ``before_done`` keeps the signal
+      because it may be mid-deploy inside ``DeterministicRunner``.
+
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
     ``ReconStaleSnapshotRejected``. Checked last so a terminal/live-workflow
@@ -339,30 +367,42 @@ def check(
             corrective_path=TERMINAL_CORRECTIVE_PATH,
         )
 
-    if op == 'set_task_status' and is_workflow_live_for_task(
-        task_id, project_root, status=live_status,
-    ):
-        return _reject(
-            op=op,
-            task_id=task_id,
-            agent_id=agent_id,
-            error_type='ReconLiveWorkflowWriteRejected',
-            reason=(
-                f'recon-stage write blocked: task {task_id} has a live '
-                'workflow (worktree/branch or orchestrator lock active); '
-                'recon-stage agents may not write status while a workflow '
-                'is live.'
-            ),
-            hint=(
-                'A live orchestrator workflow (worktree, recent commit, or '
-                'project-level lock) is active for this task. Recon-stage '
-                'status writes would race the pipeline and are rejected; '
-                'wait for the workflow to complete.'
-            ),
-            live_status=live_status,
-            target_status=target_status,
-            snapshot_token=snapshot_token,
-        )
+    if op == 'set_task_status':
+        # Derived inside this branch only — no other gate pays for the
+        # coercion. `_coerce_metadata_dict` yields None for anything that is
+        # not a dict / JSON-object string, so a malformed or absent blob
+        # degrades to task_kind=None / pure_gate=False: fail-safe TOWARD
+        # live. See this function's Gate 2 docstring paragraph for what the
+        # two derived values unlock (detector rules 2/3/5).
+        parsed_metadata = _coerce_metadata_dict(task_metadata)
+        if is_workflow_live_for_task(
+            task_id,
+            project_root,
+            status=live_status,
+            task_kind=(parsed_metadata or {}).get('task_kind'),
+            pure_gate=is_pure_gate_metadata(parsed_metadata),
+        ):
+            return _reject(
+                op=op,
+                task_id=task_id,
+                agent_id=agent_id,
+                error_type='ReconLiveWorkflowWriteRejected',
+                reason=(
+                    f'recon-stage write blocked: task {task_id} has a live '
+                    'workflow (worktree/branch or orchestrator lock active); '
+                    'recon-stage agents may not write status while a workflow '
+                    'is live.'
+                ),
+                hint=(
+                    'A live orchestrator workflow (worktree, recent commit, or '
+                    'project-level lock) is active for this task. Recon-stage '
+                    'status writes would race the pipeline and are rejected; '
+                    'wait for the workflow to complete.'
+                ),
+                live_status=live_status,
+                target_status=target_status,
+                snapshot_token=snapshot_token,
+            )
 
     if snapshot_token is not None and snapshot_token != live_status:
         return _reject(
