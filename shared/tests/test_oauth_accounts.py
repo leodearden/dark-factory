@@ -349,3 +349,81 @@ class TestFleetConsumersResolveThroughSingleHome:
             'test_cli_invoke_integration', CLAUDE_OAUTH_TOKEN_A='tok-a'
         )
         assert module._AVAILABLE_TOKENS == []
+
+
+class TestAnyAccountConsumersResolveThroughSingleHome:
+    """The startup-probe pair must resolve through the single home's ALL set.
+
+    These two sites answer a DIFFERENT question from the fleet consumers above
+    — "is there ANY account at all, so this degrades to a legible skip?" — and
+    so they legitimately scan ``A``..``G``.  That difference is why the single
+    home owns two named sets instead of collapsing everything onto one.
+
+    The identity guard is the part that goes red: today each site loops its own
+    hand-rolled ``for c in 'ABCDEFG'`` and holds no reference to
+    ``_oauth_accounts`` at all.  The behavioural assertions already pass — they
+    are carried as regression pins that the rewire must not disturb, and in
+    particular that this half must NOT be narrowed to the fleet set.
+    """
+
+    def test_probe_delegates_to_the_single_home(self):
+        import startup_completion_probe
+
+        assert startup_completion_probe.first_available_token is first_available_token
+
+    def test_probe_reaches_the_interactive_primary_account(self, monkeypatch):
+        """The direction that must NOT regress to the fleet set.
+
+        A machine holding only the interactive/primary account still has an
+        account; narrowing this site to ``B``..``G`` would make it report a
+        spurious failure instead of running.
+        """
+        for ch in ALL_TOKEN_LETTERS:
+            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'tok-a')
+
+        import startup_completion_probe
+
+        assert startup_completion_probe._oauth_token() == (
+            'CLAUDE_OAUTH_TOKEN_A',
+            'tok-a',
+        )
+
+    def test_probe_returns_the_first_hit_in_scan_order(self, monkeypatch):
+        for ch in ALL_TOKEN_LETTERS:
+            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_G', 'tok-g')
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_D', 'tok-d')
+
+        import startup_completion_probe
+
+        assert startup_completion_probe._oauth_token() == (
+            'CLAUDE_OAUTH_TOKEN_D',
+            'tok-d',
+        )
+
+    def test_probe_returns_none_with_no_accounts(self, monkeypatch):
+        for ch in ALL_TOKEN_LETTERS:
+            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
+
+        import startup_completion_probe
+
+        assert startup_completion_probe._oauth_token() is None
+
+    def test_fixture_gate_sees_the_interactive_primary_account(
+        self, reload_module_under_env
+    ):
+        module = reload_module_under_env(
+            'test_startup_completion_fixtures', CLAUDE_OAUTH_TOKEN_A='tok-a'
+        )
+        assert module._OAUTH_TOKEN_PRESENT is True
+
+    def test_fixture_gate_sees_account_g(self, reload_module_under_env):
+        module = reload_module_under_env(
+            'test_startup_completion_fixtures', CLAUDE_OAUTH_TOKEN_G='tok-g'
+        )
+        assert module._OAUTH_TOKEN_PRESENT is True
+
+    def test_fixture_gate_is_false_with_no_accounts(self, reload_module_under_env):
+        module = reload_module_under_env('test_startup_completion_fixtures')
+        assert module._OAUTH_TOKEN_PRESENT is False
