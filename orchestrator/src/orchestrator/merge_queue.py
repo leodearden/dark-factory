@@ -7730,16 +7730,14 @@ cascade remerge (VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING ->
 REDISPATCH_PARKED).
 
 MQ-reliability kappa (task 2169) adds two further backward edges,
-DISPATCHING -> QUEUED and VERIFYING -> QUEUED, for the three
-``_queue.put_nowait(req)`` re-arm sites that put an in-flight request BACK
-on the external input queue with its request_id and result Future intact
-(operator-halt pre-dispatch requeue in ``_dispatch_item``, operator-halt
-mid-verify requeue in ``_run_inflight_verify``, and the head-failure
-cascade's downstream self-requeue in the verifier loop) — see
-:meth:`SpeculativeMergeWorker._note_requeue`. Unlike the forward edges
-above, these three sites are wired via the dynamic-current-state helper
-rather than a hardcoded *from_state*, so a registered item legally lands
-back at QUEUED regardless of which of the two states it was requeued from.
+DISPATCHING -> QUEUED and VERIFYING -> QUEUED, for the re-arm sites that put
+an in-flight request BACK on the external input queue with its request_id and
+result Future intact. Since task 3204 those sites all run through the single
+:meth:`SpeculativeMergeWorker._requeue_request` chokepoint, whose docstring
+enumerates them. Unlike the forward edges above, the re-arm is wired via the
+dynamic-current-state helper :meth:`SpeculativeMergeWorker._note_requeue`
+rather than a hardcoded *from_state*, so a registered item legally lands back
+at QUEUED regardless of which of the two states it was requeued from.
 
 kappa also adds the DISPATCHING <-> MERGING pair for the dispatch-time
 staleness/chain-invalidation remerge inside ``_dispatch_item`` (Mechanism 2):
@@ -9110,6 +9108,70 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if current is None:
             return
         self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
+
+    def _requeue_request(self, req: MergeRequest) -> None:
+        """THE requeue recipe: put *req* back on ``_queue`` and re-arm both the
+        ledger and the lifecycle registry, atomically (task 3204).
+
+        The sole chokepoint for re-queuing an in-flight request — enforced by
+        test_merge_queue_lifecycle_registry.py's
+        ``TestRequeueRecipeHasASingleChokepoint``, which fails if any
+        ``_queue.put_nowait`` or ``on_requeued`` call site appears outside this
+        method. Its five callers are the head-failure cascade's downstream
+        self-requeue, the operator-halt mid-verify abort, the dead-verify
+        no-progress abort, the ``MergeVerifyLeaseContended`` defer, and the
+        pre-dispatch operator halt in :meth:`_dispatch_item`.
+
+        Three effects, and all three are load-bearing:
+
+        - **queue** — the request re-enters the pipeline through the normal
+          drain. Its Future is deliberately left PENDING: a requeue is a DEFER
+          for re-verify, not a resolution, and the waiter receives the outcome
+          of the RE-dispatch.
+        - **ledger** (MQ-invariants eta, task 1992) — dropping the entry is what
+          stops this parked request ageing out into a stuck-request escalation
+          while it sits on ``_queue``; the next ``on_dequeue`` re-arms it with a
+          fresh clock.
+        - **registry** (MQ-reliability kappa, task 2169) — mirror the re-arm
+          onto the lifecycle registry. Task 3082 found this line MISSING at the
+          dead-verify site, i.e. one requeue site of five moved the LEDGER
+          without moving the REGISTRY, and proved two facts about it:
+
+          (i)  ``live_obj=req`` is not decoration. :meth:`_note_transition`
+               REPLACES ``_live_items[rid]`` with the MergeRequest, and
+               ``_finalizing_head_entry()`` only counts ``InflightEntry``
+               values — so it is that OBJECT SWAP, not the state change, that
+               prevents a phantom finalize head.
+          (ii) A registry left at VERIFYING makes ``_buffer_owned_request``
+               treat the re-queued original as a re-entrant twin and hand it to
+               ``_coalesce_reentrant_drain``, which DROPS it — so the request
+               never re-enters the pipeline at all.
+
+        ATOMICITY. This method is deliberately a plain ``def`` containing no
+        ``await``, so the three effects cannot be interleaved with anything:
+        the merger loop's drain can never observe the request on ``_queue``
+        while the registry still reads VERIFYING. Keeping it synchronous makes
+        that guarantee structural rather than conventional — an ``async``
+        helper that also owned the worktree teardown would re-introduce an
+        await boundary inside the exact sequence task 3082 closed. The
+        ``TestRequeueRequestHelperContract`` unit tests pin both the sync-ness
+        and the three effects.
+
+        Deliberately NOT owned here, and left at each call site:
+
+        - the worktree step. It is non-adjacent at three of the five sites (the
+          dead-verify branch releases ~60 lines earlier, shared with the
+          busy-loop-capped branch; the lease-contended defer releases, then
+          sleeps out its backoff, and only then requeues), and the sites use
+          different functions — :meth:`_release_or_cleanup` with a ``spec_warm``
+          flag at three, :meth:`_cleanup_owned_merge_worktree` under
+          ``contextlib.suppress`` at one, none at the cascade.
+        - the ``InflightStatus.REQUEUED`` / ``REQUEUED_PREDISPATCH`` return
+          sentinel, which differs per site.
+        """
+        self._queue.put_nowait(req)
+        self._request_ledger.on_requeued(req.request_id)
+        self._note_requeue(req.request_id, live_obj=req)
 
     def _advance_if_at(
         self,
@@ -14215,15 +14277,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             ):
                                 _entry_req = _entry.item.request
                                 if not _entry_req.result.done():
-                                    self._queue.put_nowait(_entry_req)
-                                    # MQ-invariants eta (task 1992): Future left
-                                    # deliberately pending — remove the ledger
-                                    # entry so this parked request never ages
-                                    # out; the next dequeue re-arms it fresh.
-                                    self._request_ledger.on_requeued(_entry_req.request_id)
-                                    # MQ-reliability kappa (task 2169): mirror
-                                    # the re-arm onto the lifecycle registry.
-                                    self._note_requeue(_entry_req.request_id, live_obj=_entry_req)
+                                    self._requeue_request(_entry_req)
                                 continue
                             # MQ-reliability kappa follow-up (task 2441,
                             # amended per review): this is the ONE
@@ -15289,14 +15343,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     with contextlib.suppress(BaseException):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
-                    self._queue.put_nowait(req)
-                    # MQ-invariants eta (task 1992): Future left deliberately
-                    # pending — remove the ledger entry so this parked request
-                    # never ages out; the next dequeue re-arms it fresh.
-                    self._request_ledger.on_requeued(req.request_id)
-                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
-                    # the lifecycle registry.
-                    self._note_requeue(req.request_id, live_obj=req)
+                    self._requeue_request(req)
                     # task 3003 amend (robustness): an operator-halt requeue is
                     # NOT a contended-lane defer — a verify was running, so the
                     # lane lock had been acquired.  Close any open streak so its
@@ -15404,41 +15451,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if not req.result.done():
                             req.result.set_result(err_outcome)
                         return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
-                    # MQ-invariants eta (task 1992): Future left deliberately
-                    # pending — this is a DEFER for re-verify, not a resolution;
-                    # the re-queued request re-enters through the normal drain
-                    # and its waiter receives the outcome of the RE-dispatch.
-                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
-                    # the lifecycle registry.
-                    #
-                    # task 3082: `_note_requeue` was MISSING here — the one
+                    # This is the site task 3082 repaired: it was the one
                     # requeue site of five that moved the LEDGER without moving
-                    # the REGISTRY. Two facts that make the line load-bearing:
-                    #  (i) `live_obj=req` is not decoration —
-                    #      `_note_transition` REPLACES `_live_items[rid]` with
-                    #      the MergeRequest, and `_finalizing_head_entry()` only
-                    #      counts `isinstance(obj, InflightEntry)` values, so it
-                    #      is that OBJECT SWAP (not the state change) that
-                    #      prevents a phantom finalize head.
-                    # (ii) a registry left at VERIFYING makes
-                    #      `_buffer_owned_request` treat the re-queued original
-                    #      as a duplicate/re-entrant twin and hand it to
-                    #      `_coalesce_reentrant_drain`, which drops it — so the
-                    #      request never re-enters the pipeline at all.
-                    #
-                    # ATOMICITY: no `await` between the put_nowait and this
-                    # call, so the merger loop's drain can never observe the
-                    # request on `_queue` while the registry still reads
-                    # VERIFYING.
-                    #
-                    # Sibling sites carrying the identical recipe (see task 3204
-                    # for the pending helper extraction): the cascade downstream
-                    # self-requeue, the operator-halt abort above, the
-                    # MergeVerifyLeaseContended defer below, and the
-                    # pre-dispatch operator halt in `_dispatch_item`.
-                    self._queue.put_nowait(req)
-                    self._request_ledger.on_requeued(req.request_id)
-                    self._note_requeue(req.request_id, live_obj=req)
+                    # the REGISTRY. The recipe — and why each of its three
+                    # effects is load-bearing — now lives in
+                    # `_requeue_request`'s docstring.
+                    self._requeue_request(req)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -15470,8 +15488,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # raiser refused to proceed rather than act UNPROTECTED. This is a
             # transient "come back later," not a verify failure — DEFER by
             # re-queuing for a later re-verify, mirroring the operator-halt
-            # abort branch above VERBATIM (release_or_cleanup + put_nowait +
-            # on_requeued + _note_requeue + InflightStatus.REQUEUED).
+            # abort branch above VERBATIM (_release_or_cleanup +
+            # _requeue_request + InflightStatus.REQUEUED).
             # req.result is left PENDING and the per-task dead-verify-abort
             # counter is untouched, so this never counts as a dead-verify abort
             # or a 'blocked' resolution. Placed BEFORE the generic
@@ -15746,9 +15764,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
             if _backoff:
                 await asyncio.sleep(_backoff)
-            self._queue.put_nowait(req)
-            self._request_ledger.on_requeued(req.request_id)
-            self._note_requeue(req.request_id, live_obj=req)
+            self._requeue_request(req)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
@@ -16711,14 +16727,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # None/truthy guard needed here (task ο).
             with contextlib.suppress(BaseException):
                 await self._cleanup_owned_merge_worktree(item.merge_wt)
-            self._queue.put_nowait(req)
-            # MQ-invariants eta (task 1992): Future left deliberately pending —
-            # remove the ledger entry so this parked request never ages out;
-            # the next dequeue re-arms it fresh.
-            self._request_ledger.on_requeued(req.request_id)
-            # MQ-reliability kappa (task 2169): mirror the re-arm onto the
-            # lifecycle registry.
-            self._note_requeue(req.request_id, live_obj=req)
+            self._requeue_request(req)
             self._remerge_occurred = False  # halt → reset chain flag
             return InflightEntry(
                 item=item,

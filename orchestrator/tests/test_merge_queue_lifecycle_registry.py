@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import textwrap
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1222,8 +1223,22 @@ class TestRequeueRequestHelperContract:
             '_requeue_request must stay sync: an await between the put_nowait and '
             'the _note_requeue re-opens exactly the window task 3082 closed'
         )
-        src = inspect.getsource(type(worker)._requeue_request)
-        assert 'await ' not in src, f'_requeue_request must contain no await:\n{src}'
+        # AST, not a substring grep: the docstring legitimately discusses
+        # `await`, and this repo's guard convention is against
+        # inspect.getsource substring tripwires as brittle.
+        body = ast.parse(
+            textwrap.dedent(inspect.getsource(type(worker)._requeue_request)),
+        )
+        suspend_points = [
+            node for node in ast.walk(body)
+            if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+        ]
+        assert suspend_points == [], (
+            '_requeue_request must contain no suspension point: an await between '
+            'the put_nowait and the _note_requeue lets the merger loop drain a '
+            'request whose registry still reads VERIFYING — the exact window '
+            f'task 3082 closed. Found at lines {[n.lineno for n in suspend_points]}'
+        )
 
 
 # ---------------------------------------------------------------------------
