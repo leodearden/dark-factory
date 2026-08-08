@@ -7,6 +7,7 @@ Step 3 (RED → step-4 GREEN): list-gate helpers
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,49 @@ from fused_memory.middleware.lock_charter_guard import (
     lock_charter_error,
 )
 
+# ---------------------------------------------------------------------------
+# _resolve_reify_root — layout-independent reify-checkout discovery (task 3843).
+#
+# Feeds BOTH cross-repo call sites below: _REIFY_GUARD_SCRIPT (Tier-2 drift
+# guard, just below) and _REIFY_REPO_ROOT (corpus->allowlist guard, further
+# down — see the pointer comment at its old site).
+# ---------------------------------------------------------------------------
+
+_REIFY_ROOT_ENV = 'REIFY_ROOT'
+_REIFY_GUARD_RELPATH = Path('scripts') / 'lock-charter-guard.sh'
+
+
+def _resolve_reify_root(start: Path | None = None) -> Path | None:
+    """Locate the reify checkout, independent of bare-checkout vs worktree layout.
+
+    Measured first-hand (task 3843), from this test file's own location:
+
+        worktree:       parents[3]/reify -> /home/leo/src/dark-factory/.worktrees/reify  (absent)
+                         parents[5]/reify -> /home/leo/src/reify                          (present)
+        bare checkout:   parents[3]/reify -> /home/leo/src/reify                          (present)
+                         parents[5]/reify -> /home/reify                                  (absent)
+
+    '.worktrees/<id>' contributes exactly two path segments, so parents[5] is
+    correct in a worktree and parents[3] is correct in a bare checkout — no
+    single fixed index is correct in both layouts. Task 3843's title-level
+    prescription (change parents[5] to parents[3]) is therefore a REGRESSION:
+    applied literally, it would silently skip both reify-dependent guards in
+    every worktree — which is where orchestrator verify runs. Do not "fix"
+    this back to a fixed parents[N] index.
+
+    Walks the ancestors of `start` (default __file__), nearest first, and
+    returns the first ancestor `a` for which `a / 'reify' / _REIFY_GUARD_RELPATH`
+    is a file, or None if no ancestor has it. Nearest-first is load-bearing: it
+    reaches /home/leo/src before /home/leo and /, so a stray higher-up `reify`
+    directory (e.g. a bare one with no scripts/lock-charter-guard.sh inside)
+    cannot shadow the real sibling checkout.
+    """
+    for ancestor in Path(start or __file__).resolve().parents:
+        if (ancestor / 'reify' / _REIFY_GUARD_RELPATH).is_file():
+            return ancestor / 'reify'
+    return None
+
+
 _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 
 # ---------------------------------------------------------------------------
@@ -34,9 +78,10 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 #
 # Tier 2 (test_extension_drift_guard_vs_reify_script): cross-source guard.
 #   Invokes the real reify/scripts/lock-charter-guard.sh --list-extensions and
-#   compares its output to sorted(FILE_EXTENSIONS).  Skipped when the script
-#   is not present (e.g. in a standalone fused-memory checkout).  Run this in
-#   any environment that has both repos checked out side-by-side.
+#   compares its output to sorted(FILE_EXTENSIONS).  Skipped when no reify
+#   checkout is discoverable (see `_resolve_reify_root`, above; e.g. in a
+#   standalone fused-memory checkout — override with REIFY_ROOT).  Run this
+#   in any environment that has both repos checked out side-by-side.
 # ---------------------------------------------------------------------------
 
 # The canonical α/γ vector — update this list AND FILE_EXTENSIONS together.
@@ -59,10 +104,16 @@ _CANONICAL_EXTENSIONS = [
     'yaml', 'yml',
 ]
 
-# Path to the reify script (siblings repos under the same src/ directory).
-# Resolved from the test file location; works in the dark-factory worktree
-# layout: <src>/dark-factory/.worktrees/<n>/fused-memory/tests/ → <src>/reify/
-_REIFY_GUARD_SCRIPT = Path(__file__).parents[5] / 'reify' / 'scripts' / 'lock-charter-guard.sh'
+# Resolved once at import time via _resolve_reify_root (defined above), which
+# is layout-independent — see its docstring for why a fixed parents[N] index
+# cannot work in both a bare checkout and a dark-factory worktree.
+# _REIFY_REPO_ROOT also feeds the corpus->allowlist guard further down (moved
+# up here from its old site — see the pointer comment left there — so both
+# reify call sites share one resolution).
+_REIFY_REPO_ROOT: Path | None = _resolve_reify_root()
+_REIFY_GUARD_SCRIPT: Path | None = (
+    _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH if _REIFY_REPO_ROOT is not None else None
+)
 
 
 def _reify_guard_vector(flag: str) -> list[str]:
@@ -109,8 +160,11 @@ def test_extension_drift_guard():
 
 
 @pytest.mark.skipif(
-    not _REIFY_GUARD_SCRIPT.is_file(),
-    reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    _REIFY_GUARD_SCRIPT is None or not _REIFY_GUARD_SCRIPT.is_file(),
+    reason=(
+        'reify checkout not discoverable (standalone checkout; cross-repo drift '
+        'check skipped) — set REIFY_ROOT to override'
+    ),
 )
 def test_extension_drift_guard_vs_reify_script():
     """Tier-2 (cross-source): sorted(FILE_EXTENSIONS) must match reify --list-extensions.
@@ -633,12 +687,15 @@ def test_accept_corpus_covers_every_canonical_extension():
 # Corpus → allowlist guard — the direction the originating incident failed in
 # ---------------------------------------------------------------------------
 
-# Repo roots, resolved from this test file's location.  __file__ lives at
+# Repo root, resolved from this test file's location.  __file__ lives at
 # <repo>/fused-memory/tests/, so parents[2] is the dark-factory checkout root
-# (works in a worktree too); reify is a sibling under the same src/ directory,
-# same resolution _REIFY_GUARD_SCRIPT uses.
+# — works in a worktree too, unlike the reify sibling hop (see
+# _resolve_reify_root's docstring near the top of this module for why).
 _DF_REPO_ROOT = Path(__file__).parents[2]
-_REIFY_REPO_ROOT = Path(__file__).parents[5] / 'reify'
+# _REIFY_REPO_ROOT used to be defined here as `Path(__file__).parents[5] / 'reify'`
+# (a bare-checkout regression — task 3843). It now lives beside
+# _REIFY_GUARD_SCRIPT, above, resolved once via _resolve_reify_root() so both
+# reify call sites share one layout-independent resolution.
 
 
 def _tracked_entries(repo_root: Path) -> tuple[list[str], list[str]] | None:
@@ -688,8 +745,9 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
 @pytest.mark.parametrize(
     ('repo', 'repo_root'),
     [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
+    ids=['dark-factory', 'reify'],
 )
-def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path):
+def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | None):
     """No REAL tracked file may classify as a directory because of a missing ext.
 
     Direction: **corpus → allowlist**.  This is the failure mode that produced
@@ -746,6 +804,12 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path):
     design — the escape hatch is ``files=[]``, i.e. declaring NO charter at all,
     which is exactly the silent under-locking #3248 fixes.
     """
+    if repo_root is None:
+        pytest.skip(
+            f'{repo} checkout not discoverable (_resolve_reify_root found no '
+            f'ancestor with reify/scripts/lock-charter-guard.sh); set REIFY_ROOT '
+            f'to override'
+        )
     if not repo_root.is_dir():
         pytest.skip(f'{repo} checkout not present at {repo_root}')
     paths = _tracked_file_paths(repo_root)
