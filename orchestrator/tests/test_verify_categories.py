@@ -765,6 +765,60 @@ class TestPytestInternalerrorArchivesForHumanTriage:
         assert verify._should_archive_category('pytest_internalerror') is True
 
 
+class TestEnvTransientArchivesForHumanTriage:
+    """task 3683: ENV_TRANSIENT must archive its verify log.
+
+    ENV_TRANSIENT is the ONLY one of the three categories this task
+    adjudicates with a non-NONE ``retry_kind`` (``RetryKind.ENV_SERIAL``), so
+    it is the only one where "it self-clears before it reaches anyone" is even
+    arguable. It does not hold, for two independent reasons:
+
+      1. The ENV_SERIAL retry is a SINGLE bounded re-run — "retrying test
+         command once, forced serial" (verify.py:5221-5233). Once it is spent,
+         a still-ENV_TRANSIENT result surfaces exactly like a retry_kind=NONE
+         row.
+      2. Per task 3367 the gate is ``category == ENV_TRANSIENT and
+         attempt.test.cmd is not None and attempt.test.rc != 0``
+         (verify.py:5220-5223), so a LINT or TYPE leg classified ENV_TRANSIENT
+         gets ZERO retries and is "reported directly ... and infra-transient at
+         the merge lane". Since 3367 there are three ToolKind-INDEPENDENT
+         ENV_TRANSIENT producers (a broken ``_merge-verify`` worktree, restart
+         collateral, a mis-resolved pyright interpreter — esc-3359-1), so this
+         is a live path, not a corner case.
+
+    Past the retry it shares the family terminus: workflow.py:9020 retries it
+    on flat ``in INFRA_TRANSIENT_CATEGORIES`` membership for
+    ``config.verify_infra_retry_max_attempts`` (default 5) attempts and, on
+    exhaustion, stamps ``escalate_to_human=True`` / ``category='infra_issue'``
+    (:9060-9067) → blocking level-1 ``Escalation`` at :14791. Corroborated by
+    merge_queue.py:3134 → workflow.py:10305 and by verify.py:7255 →
+    harness.py:11325.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:258), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.ENV_TRANSIENT].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.ENV_TRANSIENT not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('env_transient') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('env_transient') is True
+
+
 class TestEnvironmentalCategoriesOutrankCodeFaults:
     """_worst_category must pick the infra root cause over a co-occurring
     downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
