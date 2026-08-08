@@ -1566,6 +1566,7 @@ async def _run_architect_eval_hermetic(
     arch_success: bool = True,
     invoke_side_effect=None,
     arch_result=None,
+    orch_prices: dict | None = None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1579,6 +1580,17 @@ async def _run_architect_eval_hermetic(
     carrying the campaign 429 payload (``api_error_status=429`` +
     "You've hit your session limit · resets 8pm"), which the MagicMock cannot
     express because every attribute access on it returns a truthy Mock.
+
+    ``orch_prices`` seeds the PRICE TABLE on the patched ``build_eval_orch_config``
+    return, which the runner reads to resolve the architect component's cost
+    provenance (Invariant P5). It defaults to an EMPTY dict rather than a bare
+    ``MagicMock`` deliberately: a bare MagicMock's ``.get(model)`` returns a
+    truthy Mock, which would send ``resolve_cost_usd`` down its price-table
+    branch and multiply Mocks into ``cost_usd``. The default ``invoke_agent``
+    return likewise carries REAL integer token counts for the same reason —
+    ``result.input_tokens`` must be an int, not a truthy Mock that ``or 0``
+    cannot rescue. Both make the harness model reality so a RED here is caused
+    by production behaviour, never by the double.
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -1590,6 +1602,7 @@ async def _run_architect_eval_hermetic(
 
     invoke_return = arch_result if arch_result is not None else MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
+        input_tokens=12_000, output_tokens=3_000,
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
@@ -1616,7 +1629,9 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.agents.briefing.BriefingAssembler',
                 MagicMock(return_value=briefing_instance)))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
-                MagicMock(return_value=MagicMock())))
+                MagicMock(return_value=MagicMock(
+                    prices=orch_prices if orch_prices is not None else {},
+                ))))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
