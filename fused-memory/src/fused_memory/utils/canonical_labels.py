@@ -26,7 +26,13 @@ shape it copies.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+from fused_memory.utils.validation import (
+    PathShapedProjectIdError,
+    canonicalize_project_id,
+)
 
 #: The registry of referent kinds and the bare node-name label each renders.
 #: Deliberately holds only 'task' today; 'escalation' is the PRD's next entry
@@ -34,6 +40,39 @@ from dataclasses import dataclass
 #: entry here, which is the whole point of routing every caller through one
 #: module.
 _KIND_LABELS: dict[str, str] = {'task': 'Task'}
+
+# ANCHORED (whole-string) task-node name: a bare 'task(s) N', optionally padded
+# with whitespace, case-insensitive. Anchoring means names that merely mention a
+# task ('Task 42 orchestrator', 'reify task 12') or resemble but aren't a
+# task-node name ('subtask 5', 'multitask 3', 'taskforce 9') never match, so
+# they are never renamed.
+#
+# The separator alternation REQUIRES at least one of whitespace, '#' or ':'.
+# That is load-bearing: 'task #1153' and 'Task: 132' — two of the PRD's 53
+# measured variant splits, structurally invisible to this pattern's ancestor
+# '^\s*tasks?\s+(\d+)\s*$' — now match, while 'task132' still does NOT. The
+# obvious spelling 'tasks?\s*#?\s*(\d+)' would have matched 'task132' too,
+# silently widening what _normalize_task_node_names renames.
+_TASK_NODE_NAME_PATTERN = re.compile(r'^\s*tasks?(?:\s*[#:]\s*|\s+)(\d+)\s*$', re.IGNORECASE)
+
+# The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
+# name, '<project_id>:<task_number>'. Shares that pattern's letter-start and
+# >=3-character qualifier rules, so clock times ('12:30') and short non-project
+# tokens ('w6:2', 'py:3') never parse as a project. Case-SENSITIVE start class
+# with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
+_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)\s*$')
+
+# Task-vocabulary words are never project ids. Matched with fullmatch() against
+# the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
+# 'Sub-Tasks') collapses onto this one check, while a real project id that
+# merely starts with 'task' ('taskmaster') is not rejected.
+#
+# Moved verbatim from cross_project_refs, where it guards the ONE rejection the
+# split consumer's decisive 'episode touched a node named Task N' guard cannot
+# make: for 'Task: 2500' that node is exactly what extraction produces, so the
+# guard is guaranteed to CO-OCCUR rather than to filter, and the split would
+# move a LOCAL task's facts onto a bogus 'task:2500' entity.
+_TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -85,3 +124,56 @@ class Referent:
         if self.project_id:
             return f'{self.project_id}:{self.number}'
         return f'{_KIND_LABELS[self.kind]} {self.number}'
+
+
+def parse_node_name(name: str) -> Referent | None:
+    """Parse an entity *name* as a whole task label, or return None.
+
+    ANCHORED by design: this answers "is this entity NAME a task label?", not
+    "does this text mention a task" (:func:`scan_content` answers that). So a
+    name that merely contains a task reference — 'Task 42 orchestrator',
+    'reify task 12' — returns None and its node is left untouched.
+
+    Two forms parse:
+
+    - The bare local form 'task(s) N', separated by whitespace, '#' or ':',
+      in any case and tolerant of padding, yielding an OWN-project referent
+      ('task #1153' -> ``Task 1153``).
+    - The project-qualified form '<project_id>:N', yielding a FOREIGN referent
+      whose qualifier is canonicalized but never normalized AWAY ('reify:132'
+      stays ``reify:132``; flattening it to ``Task 132`` is precisely the
+      cross-project collapse utils/cross_project_refs.py exists to detect).
+
+    Digits are preserved VERBATIM, never int-normalized, so a referent never
+    invents or reformats a task number ('task 0132' -> ``Task 0132``, and
+    ``Referent('0132') != Referent('132')``).
+
+    Returns None for a path-shaped qualifier rather than canonicalizing it: a
+    mangled path must never be silently mapped into a new, wrong project key
+    (RCA §4). Also None for a task-VOCABULARY qualifier ('subtask: 2500'),
+    which is local task vocabulary, not a project id.
+    """
+    local = _TASK_NODE_NAME_PATTERN.match(name)
+    if local is not None:
+        # Ordering matters: the local pattern is tried FIRST, which is what
+        # makes a vocabulary-qualified name like 'Task: 132' resolve to the
+        # local referent it is, rather than to a project named 'task'.
+        return Referent(kind='task', number=local.group(1))
+
+    qualified = _QUALIFIED_NODE_NAME_PATTERN.match(name)
+    if qualified is None:
+        return None
+    qualifier, number = qualified.group(1), qualified.group(2)
+    try:
+        project_id = canonicalize_project_id(qualifier)
+    except PathShapedProjectIdError:
+        # Defensive: the pattern cannot capture a '/' or a leading '-', so this
+        # is unreachable today. Kept so a future pattern relaxation refuses the
+        # name instead of raising into a caller's write path.
+        return None
+    if _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id):
+        # 'subtask: 2500' / 'sub-task: 2500'. The local pattern already claimed
+        # every spelling that IS a local label ('Task: 132'), so anything
+        # reaching here is a word-glued lookalike, not a task label at all.
+        return None
+    return Referent(kind='task', project_id=project_id, number=number)
