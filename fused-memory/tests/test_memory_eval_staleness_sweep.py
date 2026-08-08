@@ -318,5 +318,77 @@ class TestSuccessorPointerItems:
         assert m.successor_pointer_items([], {}) == []
 
 
+class TestSupersededSurfacing:
+    """Both-present-only exposure over corpus-discovered (successor, superseded) pairs."""
+
+    def test_a_pair_with_only_one_member_present_contributes_nothing(self):
+        """Not to the count AND not to the exposure.
+
+        An absent successor is a findability question; charging it here as
+        well would double-weight one defect against two metrics.
+        """
+        m = _mod()
+        obs = m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_A, UUID_C])
+        assert obs.pairs_comparable == 0
+        assert obs.still_surfacing == 0
+        assert obs.inversions == ()
+        assert m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B]).pairs_comparable == 0
+
+    def test_a_superseded_entry_ranked_above_its_successor_is_counted(self):
+        m = _mod()
+        obs = m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B, UUID_A])
+        assert obs.pairs_comparable == 1
+        assert obs.still_surfacing == 1
+        assert len(obs.inversions) == 1
+
+    def test_a_superseded_entry_ranked_below_is_comparable_but_not_counted(self):
+        m = _mod()
+        obs = m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_A, UUID_B])
+        assert obs.pairs_comparable == 1
+        assert obs.still_surfacing == 0
+        assert obs.inversions == ()
+
+    def test_a_superseded_entry_appearing_at_all_is_in_the_detail_records(self):
+        m = _mod()
+        obs = m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_A, UUID_B])
+        assert len(obs.records) == 1
+        record = obs.records[0]
+        assert record.successor_id == UUID_A
+        assert record.superseded_id == UUID_B
+        assert record.successor_rank == 1
+        assert record.superseded_rank == 2
+
+    def test_rank_is_list_position_so_two_runs_agree(self):
+        """Equal scores resolve by returned order, never by an unstable re-sort.
+
+        A tie that flapped between runs would read to leaf alpha as a real
+        regression.
+        """
+        m = _mod()
+        ranked = [UUID_B, UUID_A, UUID_C]
+        assert m.rank_index(ranked) == {UUID_B: 1, UUID_A: 2, UUID_C: 3}
+        first = m.superseded_surfacing([(UUID_A, UUID_B)], ranked)
+        second = m.superseded_surfacing([(UUID_A, UUID_B)], list(ranked))
+        assert first == second
+
+    def test_a_repeated_id_keeps_its_best_rank(self):
+        m = _mod()
+        assert m.rank_index([UUID_A, UUID_B, UUID_A]) == {UUID_A: 1, UUID_B: 2}
+
+    def test_several_pairs_against_one_ranked_list(self):
+        m = _mod()
+        obs = m.superseded_surfacing(
+            [(UUID_A, UUID_B), (UUID_C, UUID_A)], [UUID_B, UUID_A, UUID_C],
+        )
+        assert obs.pairs_comparable == 2
+        assert obs.still_surfacing == 2
+
+    def test_an_empty_pair_set_is_zero_exposure(self):
+        m = _mod()
+        obs = m.superseded_surfacing([], [UUID_A])
+        assert obs.pairs_comparable == 0
+        assert obs.records == ()
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
