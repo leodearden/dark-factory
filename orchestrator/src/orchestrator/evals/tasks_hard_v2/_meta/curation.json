@@ -70,6 +70,23 @@
     "planrate_only": 22,
     "finding": "SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean \"Merge task/<id> into main\" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for \u03b31, though it does not block \u03b21 \u2014 D9's planRate-only mechanism handles it."
   },
+  "ceilings": {
+    "max_architect_turns": 120,
+    "max_architect_turns_note": "know-live production dark-factory-orchestrator.yaml carries max_turns: {architect: 120}; the census keys on exhaustion at 121 turns = that ceiling + 1. The pool must run at the same ceiling or it cannot reproduce the failures it was selected for.",
+    "timeout_minutes": 180,
+    "derivation": {
+      "source": "events.duration_ms in <project_root>/data/orchestrator/runs.db, over the census population itself (the same predicate as census filter_sql)",
+      "substitution_note": "The PRD names \"v1 wall-clock dumps\" as the derivation source, but data/eval-campaign/fable-architect-only-results.json carries no duration field at all \u2014 its 72 records hold only task_id / config_name / outcome / trial / plan_quality / plan_steps / cost_usd. Deriving from it is impossible, so runs.db events.duration_ms is the substituted (and richer) source. The substitution is recorded here so the threshold is not mistaken for a guess.",
+      "sample_n": 46,
+      "observed_max_minutes": 28.1,
+      "p95_minutes": 22.1,
+      "p50_minutes": 14.9,
+      "all_architect_max_minutes": 106.3,
+      "all_architect_sample_note": "all_architect_max_minutes is the max over EVERY architect invocation_end in the three checkouts (n=14701), not just the census population \u2014 the strictest bound available.",
+      "headroom": "180 min is 6.4x the observed max-at-exhaustion (28.1 min, n=46) and 1.7x the all-time architect max (106.3 min), so the timeout provably cannot bind before the 120-turn or budget ceiling.",
+      "why_it_matters": "runner.py raises the eval to outcome=\"timeout\" on asyncio.TimeoutError and deliberately does NOT taint-exclude it, so a binding timeout scores a kept 0.0 \u2014 manufacturing an artificial failure on a set already selected for being hard."
+    }
+  },
   "candidates": [
     {
       "task_id": "2320",

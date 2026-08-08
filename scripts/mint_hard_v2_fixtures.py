@@ -471,6 +471,7 @@ def run_census(strict: bool = True) -> int:
 
 POOL_DIR = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'evals' / 'tasks_hard_v2'
 CURATION_JSON = POOL_DIR / '_meta' / 'curation.json'
+CURATION_MD = POOL_DIR / 'CURATION.md'
 
 
 def _candidate_row(cand: Candidate) -> dict:
@@ -513,6 +514,107 @@ def _candidate_row(cand: Candidate) -> dict:
     if not excluded:
         row['mint_mode'] = 'referenced' if cand.merge_sha else 'planrate_only'
     return row
+
+
+# The architect turn ceiling in production (know-live's
+# dark-factory-orchestrator.yaml `max_turns: {architect: 120}`). Exhaustion is
+# observed at 121 = this ceiling + 1, which is what the census filter keys on,
+# so the pool must be run at the SAME ceiling or it cannot reproduce the
+# failures it was selected for.
+MAX_ARCHITECT_TURNS = 120
+
+# The PRD's provisional floor. Kept because the measurement below clears it
+# with room to spare — see `_build_ceilings`.
+TIMEOUT_MINUTES = 180
+
+_ALL_ARCHITECT_DURATION_SQL = """\
+SELECT MAX(duration_ms) FROM events
+WHERE event_type='invocation_end' AND role='architect' AND duration_ms IS NOT NULL\
+"""
+
+
+def _all_architect_max_ms(runs_db: Path | str) -> int:
+    conn = connect_ro(runs_db)
+    try:
+        row = conn.execute(_ALL_ARCHITECT_DURATION_SQL).fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row and row[0] else 0
+
+
+def _build_ceilings() -> dict:
+    """Measure the wall-clock evidence and emit the ceilings block.
+
+    ``timeout_minutes`` is DERIVED, not guessed: it is shown to clear both the
+    observed max-at-exhaustion and the all-time architect max, so the timeout
+    provably cannot bind before the turn or budget ceiling. That matters
+    because ``runner.py`` deliberately does not taint-exclude a timeout — a
+    binding one would score a kept 0.0 and manufacture an artificial failure.
+    """
+    census_ms: list[int] = []
+    all_max_ms = 0
+    for root_str in SOURCE_CHECKOUTS.values():
+        runs_db = Path(root_str) / 'data' / 'orchestrator' / 'runs.db'
+        census_ms.extend(census_durations_ms(runs_db))
+        all_max_ms = max(all_max_ms, _all_architect_max_ms(runs_db))
+
+    minutes = sorted(d / 60_000 for d in census_ms)
+    observed_max = round(max(minutes), 1) if minutes else 0.0
+    p95 = round(_percentile(minutes, 95), 1) if minutes else 0.0
+    p50 = round(_percentile(minutes, 50), 1) if minutes else 0.0
+    all_max = round(all_max_ms / 60_000, 1)
+
+    return {
+        'max_architect_turns': MAX_ARCHITECT_TURNS,
+        'max_architect_turns_note': (
+            'know-live production dark-factory-orchestrator.yaml carries '
+            'max_turns: {architect: 120}; the census keys on exhaustion at '
+            '121 turns = that ceiling + 1. The pool must run at the same '
+            'ceiling or it cannot reproduce the failures it was selected for.'
+        ),
+        'timeout_minutes': TIMEOUT_MINUTES,
+        'derivation': {
+            'source': (
+                'events.duration_ms in <project_root>/data/orchestrator/runs.db, '
+                'over the census population itself (the same predicate as '
+                'census filter_sql)'
+            ),
+            'substitution_note': (
+                'The PRD names "v1 wall-clock dumps" as the derivation source, '
+                'but data/eval-campaign/fable-architect-only-results.json '
+                'carries no duration field at all — its 72 records hold only '
+                'task_id / config_name / outcome / trial / plan_quality / '
+                'plan_steps / cost_usd. Deriving from it is impossible, so '
+                'runs.db events.duration_ms is the substituted (and richer) '
+                'source. The substitution is recorded here so the threshold '
+                'is not mistaken for a guess.'
+            ),
+            'sample_n': len(minutes),
+            'observed_max_minutes': observed_max,
+            'p95_minutes': p95,
+            'p50_minutes': p50,
+            'all_architect_max_minutes': all_max,
+            'all_architect_sample_note': (
+                'all_architect_max_minutes is the max over EVERY architect '
+                'invocation_end in the three checkouts (n=14701), not just the '
+                'census population — the strictest bound available.'
+            ),
+            'headroom': (
+                f'{TIMEOUT_MINUTES} min is '
+                f'{TIMEOUT_MINUTES / observed_max:.1f}x the observed '
+                f'max-at-exhaustion ({observed_max} min, n={len(minutes)}) and '
+                f'{TIMEOUT_MINUTES / all_max:.1f}x the all-time architect max '
+                f'({all_max} min), so the timeout provably cannot bind before '
+                f'the {MAX_ARCHITECT_TURNS}-turn or budget ceiling.'
+            ),
+            'why_it_matters': (
+                'runner.py raises the eval to outcome="timeout" on '
+                'asyncio.TimeoutError and deliberately does NOT taint-exclude '
+                'it, so a binding timeout scores a kept 0.0 — manufacturing an '
+                'artificial failure on a set already selected for being hard.'
+            ),
+        },
+    }
 
 
 def author_manifest(census_date: str) -> dict:
@@ -585,18 +687,148 @@ def author_manifest(census_date: str) -> dict:
                 f'mechanism handles it.'
             ),
         },
+        'ceilings': _build_ceilings(),
         'candidates': rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# render_curation_md — a PURE function of the manifest
+# ---------------------------------------------------------------------------
+
+def _md_cell(text: str) -> str:
+    """Escape a value for a markdown table cell (pipes break the columns)."""
+    return str(text).replace('|', '\\|').replace('\n', ' ').strip()
+
+
+def render_curation_md(manifest: dict) -> str:
+    """Render CURATION.md from *manifest*. Pure: no wall-clock, no env, no I/O.
+
+    Purity is load-bearing — a byte-equality test re-renders this and compares
+    it to the committed file, so the human table can never silently drift from
+    the machine manifest. The census date is DATA in the manifest, never
+    ``datetime.now()``.
+    """
+    census = manifest['census']
+    ceilings = manifest['ceilings']
+    derivation = ceilings['derivation']
+    rows = manifest['candidates']
+    included = [r for r in rows if r['decision'] == 'include']
+    excluded = [r for r in rows if r['decision'] == 'exclude']
+
+    out: list[str] = []
+    add = out.append
+
+    add('# CURATION — fable-trial-v2 curated hard fixture pool')
+    add('')
+    add('<!-- GENERATED FILE — do not edit by hand.')
+    add('     Rendered from `_meta/curation.json` by')
+    add('     `scripts/mint_hard_v2_fixtures.py --author`, and pinned')
+    add('     byte-for-byte by `test_hard_v2_fixture_pool.py`. Edit the')
+    add('     manifest and regenerate. -->')
+    add('')
+    add(f'- **Task**: {manifest["task"]}')
+    add(f'- **PRD**: `{manifest["prd"]}`')
+    add(f'- **Cohort**: `{manifest["cohort"]}`')
+    add(f'- **Candidates**: {len(rows)} — {len(included)} included, '
+        f'{len(excluded)} excluded')
+    add('')
+
+    add('## Census')
+    add('')
+    add(f'- **Source**: `{census["source"]}`')
+    add(f'- **Census date**: {census["census_date"]}')
+    add('')
+    add('```sql')
+    add(census['filter_sql'])
+    add('```')
+    add('')
+    add(census['filter_note'])
+    add('')
+    add('| project | distinct tasks |')
+    add('|---|---:|')
+    for project, n in census['counts'].items():
+        add(f'| {project} | {n} |')
+    add(f'| **total** | **{sum(census["counts"].values())}** |')
+    add('')
+
+    add('## Curation criterion')
+    add('')
+    add(manifest['curation_criterion'])
+    add('')
+    add(manifest['adversarial_scan'])
+    add('')
+
+    add('## Candidates')
+    add('')
+    add('`brief chars` is recorded as EVIDENCE for each judgement, never as '
+        'the rule.')
+    add('')
+    add('| task_id | project | brief chars | status | decision | mint mode | reason |')
+    add('|---|---|---:|---|---|---|---|')
+    for r in rows:
+        add(
+            f'| {_md_cell(r["task_id"])} '
+            f'| {_md_cell(r["project"])} '
+            f'| {r["brief_chars"]} '
+            f'| {_md_cell(r["status"])} '
+            f'| {_md_cell(r["decision"])} '
+            f'| {_md_cell(r.get("mint_mode") or "—")} '
+            f'| {_md_cell(r["reason"])} |'
+        )
+    add('')
+
+    add('## Ceilings')
+    add('')
+    add(f'- `max_architect_turns`: **{ceilings["max_architect_turns"]}** — '
+        f'{ceilings["max_architect_turns_note"]}')
+    add(f'- `timeout_minutes`: **{ceilings["timeout_minutes"]}**')
+    add('')
+    add('### Timeout derivation')
+    add('')
+    add(f'- **Source**: {derivation["source"]}')
+    add(f'- **Substitution**: {derivation["substitution_note"]}')
+    add(f'- **Measured** (n={derivation["sample_n"]}): '
+        f'max {derivation["observed_max_minutes"]} min, '
+        f'p95 {derivation["p95_minutes"]} min, '
+        f'p50 {derivation["p50_minutes"]} min.')
+    add(f'- **All architect invocations**: max '
+        f'{derivation["all_architect_max_minutes"]} min. '
+        f'{derivation["all_architect_sample_note"]}')
+    add(f'- **Headroom**: {derivation["headroom"]}')
+    add(f'- **Why it matters**: {derivation["why_it_matters"]}')
+    add('')
+
+    add('## Merge-SHA availability — the SPLIT majority')
+    add('')
+    add(manifest['merge_sha_availability']['finding'])
+    add('')
+    add(f'- `referenced` (single clean merge commit): '
+        f'**{manifest["merge_sha_availability"]["referenced"]}**')
+    add(f'- `planrate_only` (SPLIT / direct-landed): '
+        f'**{manifest["merge_sha_availability"]["planrate_only"]}**')
+    add('')
+    add('A `planrate_only` fixture carries NO `reference` key at all and '
+        'instead stamps `provenance.reference_unavailable` with the cause '
+        'plus `provenance.baseline_source` with the ladder rung that produced '
+        'its `pre_task_commit`. An empty `reference: {}` block would be '
+        'indistinguishable from a capture that silently failed; omitting the '
+        'key and recording why makes it a positive, auditable fact.')
+    add('')
+
+    return '\n'.join(out) + '\n'
 
 
 def run_author(census_date: str) -> int:
     manifest = author_manifest(census_date)
     CURATION_JSON.parent.mkdir(parents=True, exist_ok=True)
     CURATION_JSON.write_text(json.dumps(manifest, indent=2) + '\n')
+    CURATION_MD.write_text(render_curation_md(manifest))
     included = sum(1 for r in manifest['candidates'] if r['decision'] == 'include')
     print(f'wrote {CURATION_JSON} — {len(manifest["candidates"])} candidate(s), '
           f'{included} included, '
           f'{len(manifest["candidates"]) - included} excluded')
+    print(f'wrote {CURATION_MD} (generated from the manifest)')
     return 0
 
 
