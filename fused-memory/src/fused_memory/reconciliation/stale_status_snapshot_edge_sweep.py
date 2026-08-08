@@ -494,6 +494,55 @@ SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
 _ENUM_SEP_ALT = r'(?:\s*+,\s*+|\s++)(?:(?:and|&|/)\s++)?(?:task\s*+)?#?\s*+'
 _ENUM_IDS_ALT = r'\d++(?:' + _ENUM_SEP_ALT + r'\d++)+'
 
+# Two independently-necessary constraints that together establish the
+# enumeration is the copula's SUBJECT rather than a preposition's
+# complement (amendment, reviewer_comprehensive correctness-precision
+# finding, task 3079). Adjacency to the copula does NOT establish
+# subjecthood — that was exactly the defect.
+#
+# (1) Plural agreement. If the enumeration really is the subject, the
+# copula must agree with it, so 'is'/'was'/'remains' can only belong to
+# some OTHER, singular subject ('The merge of tasks A and B is blocked' —
+# the MERGE is blocked). 'Tasks A and B is pending' is malformed English,
+# so nothing legitimate is lost. Note the shared _COPULA_ALT is
+# deliberately left untouched and still serves the other paths; only this
+# path narrows.
+_PLURAL_COPULA_ALT = r'(?:are|were|remain)'
+
+# (2) Preposition negative lookbehinds. Agreement alone is NOT sufficient:
+# when the outer head is itself PLURAL the plural copula agrees with THAT
+# head and the over-selection survives ('Dependencies for tasks A and B are
+# blocked', 'The merges of tasks A and B are blocked', 'Reviews of tasks A,
+# B, and C are pending' — all ordinary phrasings for this repo's memory
+# corpus, all verified still over-selecting under a copula-only fix). The
+# two remedies are complementary and ship together: agreement is a general
+# grammatical constraint with no vocabulary to maintain, and the lookbehind
+# covers the plural-outer-head residue agreement cannot see.
+#
+# Python requires FIXED-WIDTH lookbehind, so same-width prepositions are
+# grouped into one alternation and different widths MUST be separate
+# lookbehinds — a single '(?<!\b(?:of|for|with)\s)' raises 'look-behind
+# requires fixed-width pattern' at import. Each is \b-anchored, which is
+# what keeps 'Migration tasks'/'Verification tasks' matching (the 'on' in
+# 'Migration' is not \b-preceded). These are zero-width assertions
+# evaluated once per candidate start, so they add no measurable cost.
+#
+# Deliberate residual, in the fail-safe under-selection direction: the
+# guard is a closed list, so an unlisted preposition (e.g. 'concerning') or
+# a multi-space/newline gap before 'tasks' still slips through, and a
+# genuine subject-position enumeration directly preceded by one of these
+# words is missed.
+_ENUM_NO_PREP_LB = (
+    r'(?<!\b(?:of|in|on|to|re)\s)'  # width 3
+    r'(?<!\bfor\s)'  # width 4
+    r'(?<!\bwith\s)'  # width 5
+    r'(?<!\b(?:among|about)\s)'  # width 6
+    r'(?<!\bacross\s)'  # width 7
+    r'(?<!\bagainst\s)'  # width 8
+    r'(?<!\bbetween\s)'  # width 8
+    r'(?<!\bregarding\s)'  # width 10
+)
+
 # Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
 # 3079). Before this, such an edge yielded NO ids at all — not merely the
 # first, which is the precise question the finding asks. TASK_REF_RE anchors
@@ -530,8 +579,9 @@ _ENUM_IDS_ALT = r'\d++(?:' + _ENUM_SEP_ALT + r'\d++)+'
 # pending') instead breaks the copula adjacency and kills the match
 # outright — under-selection, the fail-safe direction, and pinned by a test.
 PLURAL_ENUM_SNAPSHOT_RE: re.Pattern[str] = re.compile(
-    r'\btasks\b\s*#?\s*(?P<ids>' + _ENUM_IDS_ALT + r')\s*,?\s*'
-    + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:all\s+)?(?:an?\s+)?'
+    _ENUM_NO_PREP_LB
+    + r'\btasks\b\s*#?\s*(?P<ids>' + _ENUM_IDS_ALT + r')\s*,?\s*'
+    + _PLURAL_COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:all\s+)?(?:an?\s+)?'
     + _COMPOUND_PREFIX + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
