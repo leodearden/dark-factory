@@ -577,6 +577,20 @@ async def test_worker_created_path_emits_journal_event(
             message='worker did not resolve the ticket',
         )
 
+        # The ticket is terminalised (via asyncio.shield) *before* the
+        # worker builds and journals the task_created event (see
+        # _process_add_tickets_batch_prepared / _process_add_ticket in
+        # task_interceptor.py), so the poll above can observe the
+        # post-pending status one event-loop hop before _journal actually
+        # runs. Close that narrow window with a short second bounded poll
+        # on the emission itself: a genuine regression (event never
+        # emitted) still fails fast, just in ~2s instead of the full 10s.
+        await poll_until(
+            lambda: journal_calls,
+            timeout=2.0,
+            message='ticket resolved but no journal event was emitted',
+        )
+
     # Exactly one task_created event must have been journalled
     task_created_events = [
         e for e in journal_calls
