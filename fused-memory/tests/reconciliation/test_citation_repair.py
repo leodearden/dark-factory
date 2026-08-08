@@ -313,3 +313,222 @@ class TestRepairCorroborationGates:
             assert _dump(await journal.get_run(RUN_ID)) == before
         finally:
             await journal.close()
+
+
+class TestRepairResolutionErrors:
+    """Shape and resolution refusals, every one leaving the blob untouched."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_id', ['beacf7fc', '96cddd4d-edge', '', 'not-a-uuid'])
+    @pytest.mark.parametrize('field', ['memory_id', 'replacement_memory_id'])
+    async def test_non_canonical_uuid_refused_before_any_lookup(
+        self, tmp_path, field, bad_id
+    ):
+        """A non-canonical id is rejected BEFORE the service is called.
+
+        Same full-36-char requirement ``citation_verifier.is_concrete_memory_id``
+        already enforces for a forwarding pointer: an 8-char prefix is not a
+        valid id, and looking one up would just return not-found and read as
+        'confirmed absent'.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            kwargs = {'memory_id': DANGLING, 'replacement_memory_id': SUCCESSOR}
+            kwargs[field] = bad_id
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                store='mem0',
+                repaired_by='run:caller-1',
+                **kwargs,
+            )
+
+            assert outcome['error'] == 'invalid_uuid_shape'
+            assert outcome['error_type'] == 'ReconReportInvalidUuid'
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_store_refused_before_any_lookup(self, tmp_path):
+        """``store='graphiti'`` is refused, not silently mis-verified.
+
+        ``get_memory_by_id`` is a Mem0/Qdrant point read, so every graphiti
+        citation would resolve to None and be classified confirmed-dangling —
+        the tool would destroy valid graph provenance. Verifying a graph
+        citation needs a different primitive; refusing loudly leaves that as a
+        clean separate extension rather than a silent wrong answer.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING, store='graphiti')])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='graphiti',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'unsupported_store'
+            assert outcome['error_type'] == 'ReconCitationUnsupportedStore'
+            assert 'get_memory_by_id' in outcome['hint']
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_target_run(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id='2b1d1b4e-0000-4000-8000-000000000000',
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'target_run_not_found'
+            assert outcome['error_type'] == 'ReconCitationTargetRunNotFound'
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_finding_absent_from_every_stage(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-nope',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            # Reuses recon-report's existing spelling so a consumer branching on
+            # cite_memory's errors sees ONE vocabulary, not two.
+            assert outcome['error'] == 'finding_unknown'
+            assert outcome['error_type'] == 'ReconReportFindingUnknown'
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_finding_does_not_cite_the_memory(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(SIBLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'citation_not_present'
+            assert outcome['error_type'] == 'ReconCitationNotPresent'
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_raw_non_stage_report_entry_is_inert(self, tmp_path):
+        """The cross-stage scan skips raw entries and finds the real stage.
+
+        ``journal.get_run`` deliberately keeps ``_error`` / ``_resume`` entries
+        as plain dicts. A scan that assumed every value was a StageReport would
+        crash on exactly the runs most likely to need repair.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            # The finding lives in a LATER stage, behind the raw entry, so the
+            # scan must both skip the raw value and keep going.
+            findings=[],
+            extra_stage_reports={
+                '_error': RAW_ERROR_ENTRY,
+                '_resume': {'resumed_at': '2026-07-26T04:00:00Z'},
+                'integrity_check': {
+                    'stage': 'integrity_check',
+                    'started_at': '2026-07-26T04:30:00Z',
+                    'completed_at': '2026-07-26T04:31:15Z',
+                    'items_flagged': [_finding('f-1', [_citation(DANGLING)])],
+                    'stats': {},
+                },
+            },
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['stage'] == 'integrity_check'
+            after = _dump(await journal.get_run(RUN_ID))
+            assert after['_error'] == RAW_ERROR_ENTRY
+            assert after['_resume'] == {'resumed_at': '2026-07-26T04:00:00Z'}
+            repaired = after['integrity_check']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+        finally:
+            await journal.close()
