@@ -549,3 +549,117 @@ def combine_surfacing(observations: list[SurfacingObservation]) -> SurfacingObse
         records=records,
         inversions=inversions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Family (3) — entries asserting LIVE task state for a terminal task
+#
+# Every predicate this family needs already has a single home in
+# fused_memory.reconciliation.task_filter. Nothing here re-derives one:
+# TASK_REF_RE decides what a task reference is, and
+# frames_live_task_status_as_current_fact decides what counts as asserting
+# live state. See referenced_task_ids/terminal_staleness for why that matters
+# beyond INV-5 tidiness.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StalenessRecord:
+    """One entry framing a terminal task's state as a current fact."""
+
+    record_id: str
+    task_id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class StalenessObservation:
+    """Family (3)'s exposure, event count and detail.
+
+    ``entries_referencing_terminal`` is the metric's ``n`` — entries that
+    reference a terminal task AT ALL, not the whole corpus. An entry that
+    never mentions a terminal task cannot make this claim, so charging it to
+    the exposure would make the rate track corpus growth instead of staleness.
+    """
+
+    entries_referencing_terminal: int
+    stale: int
+    records: tuple[StalenessRecord, ...]
+
+
+def referenced_task_ids(record: dict) -> set[str]:
+    """Task ids *record* references, from its content AND its ``task_id`` metadata.
+
+    ``TASK_REF_RE`` (``task N`` / ``df N`` / ``#N``, never a bare number) is
+    the reconciliation filter's own definition of a task reference, imported
+    rather than restated: a second spelling here would drift from the one the
+    recon stages enforce, and the two would disagree about the same sentence.
+
+    The metadata half matters at corpus scale — the census measures 18,850
+    live records carrying ``task_id`` — and is normalised to ``str`` because
+    it is written as both an int and a string.
+    """
+    from fused_memory.reconciliation.task_filter import TASK_REF_RE  # noqa: PLC0415
+
+    ids = set(TASK_REF_RE.findall(record.get('content') or ''))
+    raw = (record.get('metadata') or {}).get('task_id')
+    if isinstance(raw, (str, int)) and not isinstance(raw, bool) and str(raw).strip():
+        ids.add(str(raw).strip())
+    return ids
+
+
+def terminal_staleness(records: list[dict], terminal_task_ids) -> StalenessObservation:
+    """Entries asserting live state for a task in *terminal_task_ids*.
+
+    *terminal_task_ids* accepts either a ``Mapping`` of ``id -> status`` (what
+    :func:`fetch_terminal_task_ids` returns, and what carries the status into
+    the detail) or a bare set of ids, which reports ``'terminal'``.
+
+    The live-state judgement is delegated ENTIRELY to
+    ``task_filter.frames_live_task_status_as_current_fact``. That is INV-5,
+    but it is also a performance requirement: ``POINT_IN_TIME_CHECK_RE``'s two
+    ``(?=.*...)`` lookaheads under ``re.DOTALL`` are quadratic in content
+    length (measured 2.2 ms at 424 characters against 794 ms at 4240), and the
+    helper prefilters with the lookahead-free ``LIVE_TASK_STATUS_RE`` so the
+    expensive pattern only ever runs on the rare entry that already looks
+    live. Calling the two regexes directly here — in either order — would
+    re-derive the predicate AND silently drop the ordering that keeps a
+    corpus-scale scan tractable.
+
+    Exposure counts ENTRIES, not (entry, task) pairs: one entry naming three
+    terminal tasks is one chance to be stale. The detail still names every
+    (entry, task) pair, because that is what an operator has to go and fix.
+
+    Terminal is ``shared.task_statuses.TERMINAL`` — ``done`` and ``cancelled``
+    only. ``deferred`` is NOT terminal, and an entry asserting live state for
+    a deferred task is not making a false claim.
+    """
+    from fused_memory.reconciliation import task_filter  # noqa: PLC0415
+
+    statuses = terminal_task_ids if isinstance(terminal_task_ids, dict) else {}
+    terminal = set(terminal_task_ids)
+    if not terminal:
+        return StalenessObservation(entries_referencing_terminal=0, stale=0, records=())
+
+    exposed = 0
+    stale = 0
+    found: list[StalenessRecord] = []
+    for record in records:
+        hits = sorted(referenced_task_ids(record) & terminal)
+        if not hits:
+            continue
+        exposed += 1
+        if not task_filter.frames_live_task_status_as_current_fact(record.get('content') or ''):
+            continue
+        stale += 1
+        record_id = str(record.get('id') or '')
+        found.extend(
+            StalenessRecord(
+                record_id=record_id,
+                task_id=task_id,
+                status=str(statuses.get(task_id, 'terminal')),
+            )
+            for task_id in hits
+        )
+    return StalenessObservation(
+        entries_referencing_terminal=exposed, stale=stale, records=tuple(found),
+    )
