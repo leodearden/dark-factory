@@ -23,7 +23,7 @@ from dashboard.data.orchestrator import (
     _resolve_project_root,
     find_running_orchestrators,
 )
-from dashboard.data.tasks import fetch_statuses
+from dashboard.data.tasks import fetch_statuses, task_is_stranded
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,12 @@ _STATUS_MAP: dict[str, str] = {
 
 _ZONE_KEYS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done')
 
+# The in_progress zone's live/stranded split (task 3543 / PRD ι, spec S8).
+# First-class snapshot columns, but NOT display zones: they partition
+# ``in_progress`` rather than sitting alongside it, so summing _ZONE_KEYS still
+# yields the task total.
+_SPLIT_KEYS = ('in_progress_live', 'in_progress_stranded')
+
 _INSERT_SNAPSHOT_SQL = (
     'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
     'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -63,11 +69,57 @@ _INSERT_SNAPSHOT_SQL = (
 
 
 def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
-    """Count statuses (id → status) by mapped display zone."""
+    """Count statuses (id → status) by mapped display zone.
+
+    Superseded by :func:`_count_zones` for the collector, which needs the
+    claimant columns that the ``{id: status}`` map does not carry.  Retained
+    for callers that only have statuses to hand.
+    """
     counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
     for raw in statuses.values():
         zone = _STATUS_MAP.get(raw or 'pending', 'pending')
         counts[zone] += 1
+    return counts
+
+
+def _count_zones(tasks: list[Mapping[str, Any]], now: datetime) -> dict[str, int]:
+    """Count shaped task rows by display zone, splitting ``in_progress``.
+
+    Returns the six :data:`_ZONE_KEYS` counts plus :data:`_SPLIT_KEYS`
+    (``in_progress_live`` / ``in_progress_stranded``), which partition the
+    ``in_progress`` zone rather than adding to it.
+
+    Takes shaped task rows (as ``dashboard.data.tasks._shape_task`` emits) and
+    NOT the ``{id: status}`` map, because the split needs the claimant columns
+    that only ``get_tasks`` carries.
+
+    *now* is the reference instant for the strand verdict, supplied by the
+    caller (the collector captures one instant per cycle) — this function never
+    reads the clock.
+
+    **The split is a subtraction, deliberately.** ``in_progress_stranded`` is
+    counted directly via :func:`dashboard.data.tasks.task_is_stranded`, and
+    ``in_progress_live`` is then ``zone_total - stranded``.  Never derive
+    ``live`` independently (e.g. via ``has_live_claimant``, which carries
+    neither the status gate nor the ``metadata.infra_hold`` carve-out): only
+    the subtraction makes the conservation invariant
+    ``live + stranded == in_progress`` true by construction, and that invariant
+    is what makes the stacked chart and the parity alarm auditable.
+
+    A consequence worth naming: ``_STATUS_MAP`` folds BOTH 'in-progress' and
+    'review' into the ``in_progress`` zone, but ``is_stranded`` hard-gates on
+    ``status == 'in-progress'`` and can never fire for a 'review' row.  A
+    claimant-less review row therefore lands in ``live``.  That under-reports
+    strands and never over-reports them, which is the correct direction to err
+    for a surface that raises alarms.
+    """
+    counts: dict[str, int] = {k: 0 for k in (*_ZONE_KEYS, *_SPLIT_KEYS)}
+    for task in tasks:
+        zone = _STATUS_MAP.get(task.get('status') or 'pending', 'pending')
+        counts[zone] += 1
+        if task_is_stranded(task, now=now):
+            counts['in_progress_stranded'] += 1
+    counts['in_progress_live'] = counts['in_progress'] - counts['in_progress_stranded']
     return counts
 
 
