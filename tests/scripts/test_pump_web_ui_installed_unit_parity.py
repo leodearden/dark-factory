@@ -20,8 +20,9 @@ Sibling module: test_know_live_installed_unit_parity.py (task 3642) does the
 identical job for orchestrator-know-live.service, and this module is
 structured on it.
 
-Scope is deliberately narrow: ONE property of exactly one unit, at two
-layers — not a byte-parity sweep across the fleet:
+Scope is deliberately narrow: ONE invariant of exactly one unit — that its
+RestartMaxDelaySec=/RestartSteps= backoff pair actually engages — checked at
+two layers, not a byte-parity sweep across the fleet:
 
   1. FILE layer — the installed unit FILE on disk.
   2. MANAGER layer — systemd --user's LOADED view of the unit, via
@@ -29,6 +30,20 @@ layers — not a byte-parity sweep across the fleet:
      corrected unit into place without `daemon-reload` leaves the manager
      holding the stale unit, so a file-only check would bless a host whose
      backoff is still inert.
+
+BOTH directives are pinned at BOTH layers, deliberately. The pair is the
+invariant; either directive alone is inert, so pinning only one leaves a
+hole. The file layer's shared helper is CONDITIONAL — it returns early when
+no cap is declared — which means a stale re-install or hand drop-in that
+dropped BOTH lines would pass it vacuously; a manager layer reading only
+RestartSteps would in turn pass a drop-in that pinned steps with no cap.
+Each layer covers the other's blind spot only if both read both.
+
+The expected RestartSteps value is DERIVED from the committed template at
+assertion time, never hard-coded. Hard-coding it means the day the template
+legitimately changes, a fully reconciled host goes RED and the failure
+message actively misdirects — asserting the template says something it no
+longer says, and prescribing an install+reload that has already been done.
 
 Byte-parity against the committed template is deliberately NOT the invariant
 pinned here, even though task 3763's step-4 does produce a byte-identical
@@ -46,11 +61,19 @@ full `diff -u` of installed vs committed pump-web-ui (architect, 2026-08-08)
 found RestartSteps=4 to be the ONLY non-comment delta in the entire file —
 ExecStart= is already byte-identical between the two — so there is no such
 drift here and no parser for this module to own. Consequently this module
-defines no helpers of its own beyond the skip guard, and needs no portable
-PARSER-layer section: the one non-trivial helper it reuses,
-`systemctl_user_show`, is negative-case-owned by the sibling module (task
-3763 lifted it into systemd_unit_invariants.py when this module became its
-second consumer; its four-case parametrized guard stayed put).
+defines NO helpers of its own at all, and needs no portable PARSER-layer
+section: every helper it uses lives in systemd_unit_invariants.py and is
+negative-case-owned elsewhere. Task 3763 lifted three of them there rather
+than copying them out of the sibling — `systemctl_user_show` (whose
+four-case parametrized guard stayed put in the sibling, mirroring how
+test_dashboard_service_template.py owns assert_restart_backoff_effective's),
+plus `INSTALLED_UNIT_DIR`, `require_installed_unit` and
+`SYSTEMCTL_SKIP_REASON` when this module became their second consumer.
+INSTALLED_UNIT_DIR especially: it mirrors a path written in another
+language's file (scripts/setup-host.sh), and a mis-mirrored copy does not
+fail loudly — it degrades to require_installed_unit() skipping, a guard that
+silently checks nothing, which is precisely what the mirroring exists to
+prevent. One copy can be kept right; N copies drift.
 
 PRE-FIX BASELINE, recorded so a future reader knows this module arrived RED
 and was not written to match an already-green host. Measured by the
@@ -107,51 +130,46 @@ import shutil
 
 import pytest
 from systemd_unit_invariants import (
+    INSTALLED_UNIT_DIR,
+    SYSTEMCTL_SKIP_REASON,
     assert_restart_backoff_effective,
+    require_installed_unit,
+    restart_directive,
     systemctl_user_show,
 )
 
-# Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`)
-# exactly. Deliberately NOT XDG_CONFIG_HOME-aware: the installer itself does
-# not honour that variable, so making this guard honour it would only ever
-# point the guard at a directory setup-host.sh never writes to — the unit
-# would not be found there, _require_installed_unit would skip, and the
-# guard would silently check nothing while the real installed unit (at
-# $HOME/.config/systemd/user, unconditionally) drifted. Mirroring the
-# installer's actual, non-configurable path is the whole point of a parity
-# guard.
-UNIT_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
-
 UNIT_BASENAME = "orchestrator-pump-web-ui.service"
-INSTALLED_UNIT_PATH = UNIT_DIR / UNIT_BASENAME
+INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
+
+# The committed template the installed copy is propagated FROM. Read at
+# assertion time rather than hard-coding the expected RestartSteps value:
+# a hard-coded '4' turns any future edit of the template (say to
+# RestartSteps=5, correctly re-installed) into a RED test on a FULLY
+# RECONCILED host, whose failure message would then misdirect the operator
+# by claiming the template says 4 when it does not — and whose printed
+# remediation (`install` + `daemon-reload`) would already have been done.
+# parents[2] because this file is <repo>/tests/scripts/<name>.py.
+COMMITTED_UNIT_PATH = pathlib.Path(__file__).parents[2] / "scripts" / UNIT_BASENAME
+
+# What `systemctl show -p RestartMaxDelayUSec` reports for a unit that
+# declares NO cap — measured on this host (systemd 255.4) across every
+# installed --user unit with no RestartMaxDelaySec= line: uniformly
+# `infinity`, never `0` and never absent. So "the property is present and
+# non-zero" is NOT evidence a cap was loaded; only "present and not this
+# sentinel" is.
+_NO_CAP_SENTINEL = "infinity"
 
 # Remediation for either layer below: both failures have the same fix, and
 # the second command is not optional — without the reload the manager keeps
-# serving the stale unit and only the FILE-layer test goes green.
+# serving the stale unit and only the FILE-layer test goes green. Both
+# layers really do interpolate it: the FILE layer delegates its assertion to
+# the shared helper (whose generic message points at an unrelated template),
+# so it re-raises with this appended rather than leaving the operator the
+# one message that never mentions re-installing THIS unit.
 _REMEDIATION = (
     f"To reconcile: `install -m 0644 scripts/{UNIT_BASENAME} "
     f"{INSTALLED_UNIT_PATH}` then `systemctl --user daemon-reload`."
 )
-
-_SYSTEMCTL_SKIP_REASON = (
-    "systemctl is not installed; this test requires a live systemd --user "
-    "manager and has no fixture-based fallback (see module docstring)"
-)
-
-
-def _require_installed_unit() -> pathlib.Path:
-    """Return INSTALLED_UNIT_PATH, or skip if it does not exist on this host.
-
-    A fresh checkout or a CI runner has no ~/.config/systemd/user at all —
-    that is an environment fact, not a defect in the unit, so this skips
-    rather than fails.
-    """
-    if not INSTALLED_UNIT_PATH.exists():
-        pytest.skip(
-            f"{INSTALLED_UNIT_PATH} does not exist on this host (fresh "
-            "checkout or CI runner with no installed orchestrator units)"
-        )
-    return INSTALLED_UNIT_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +189,20 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     already applies to the COMMITTED template — this is that check applied to
     the INSTALLED file instead. Its last-occurrence-wins directive reader is
     correct here because a <unit>.d/ drop-in merges by appending.
+
+    The shared helper's own failure message is written for the COMMITTED
+    fleet and points at scripts/jcodemunch-watcher.service.template as the
+    worked example — accurate, but it never mentions re-installing THIS unit
+    or running daemon-reload, which is the only thing that fixes a drifted
+    HOST copy. Since this is the layer an operator hits first, the assertion
+    is re-raised with _REMEDIATION appended rather than delegating the
+    operator-facing guidance to a message that cannot know about the host.
     """
-    path = _require_installed_unit()
-    assert_restart_backoff_effective(path)
+    path = require_installed_unit(UNIT_BASENAME)
+    try:
+        assert_restart_backoff_effective(path)
+    except AssertionError as exc:
+        raise AssertionError(f"{exc}\n{_REMEDIATION}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +211,9 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason=SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_restart_steps_effective() -> None:
-    """systemd --user's LOADED view must report RestartSteps=4, not just the file.
+    """systemd --user's LOADED view must carry BOTH halves of the backoff pair.
 
     Not redundant with the file-layer check above: `cp`-ing a corrected unit
     into place without `systemctl --user daemon-reload` leaves the MANAGER
@@ -193,30 +222,91 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
     actually happened. Arrived RED reporting RestartSteps=0 — systemd's
     zero-value default, confirming the manager had never loaded a
     RestartSteps= value for this unit at all.
+
+    Pins the PAIR, not just RestartSteps, because the invariant this module
+    exists to protect is the 10s->60s curve, which takes both directives. The
+    file layer's helper is CONDITIONAL — it returns early when no cap is
+    declared — so a stale re-install or hand drop-in that dropped BOTH
+    directives would leave the file layer vacuously green, and a manager
+    layer reading only RestartSteps would pass a drop-in that pinned steps
+    with no cap. Neither half alone closes that.
+
+    Two measured systemd 255.4 facts drive the exact shape below, both
+    non-obvious enough that getting them wrong yields a guard that silently
+    checks nothing:
+
+      - The queryable property is `RestartMaxDelayUSec`, NOT the directive
+        spelling `RestartMaxDelaySec`. Verified: `systemctl --user show <unit>
+        -p RestartMaxDelaySec` exits 0 with EMPTY stdout — the
+        unsupported-property shape systemctl_user_show deliberately reports as
+        ABSENT — so asserting on the directive spelling would skip on every
+        host forever.
+      - A unit declaring NO cap reports `RestartMaxDelayUSec=infinity`, not
+        `0` and not absent (verified across every installed --user unit on
+        this host lacking a RestartMaxDelaySec= line). So the assertion is
+        "not the infinity sentinel", not "non-zero" — the latter is vacuously
+        true exactly when the cap is missing.
+
+    The manager renders the loaded cap as a duration (`RestartMaxDelaySec=60`
+    in the file surfaces here as `1min`), so this asserts a cap IS loaded
+    rather than pinning a rendering — reproducing systemd's duration
+    formatter to predict the exact string would be a second, more brittle
+    guard for no extra signal. The file layer already pins the declared value.
     """
-    _require_installed_unit()
-    shown = systemctl_user_show(UNIT_BASENAME, "RestartSteps")
+    require_installed_unit(UNIT_BASENAME)
+    properties = ("RestartSteps", "RestartMaxDelayUSec")
+    shown = systemctl_user_show(UNIT_BASENAME, *properties)
     if shown is None:
         pytest.skip(
             "systemctl --user show could not be queried (no user D-Bus "
             "session in this runner)"
         )
-    if "RestartSteps" not in shown:
+    missing = [prop for prop in properties if prop not in shown]
+    if missing:
         pytest.skip(
-            f"systemctl --user show {UNIT_BASENAME} -p RestartSteps returned "
-            "no RestartSteps= property at all (empty stdout, not merely an "
-            "empty value) — most likely this host's systemd predates 254, "
+            f"systemctl --user show {UNIT_BASENAME} returned no "
+            f"{', '.join(missing)} property at all (empty stdout, not merely "
+            "an empty value) — most likely this host's systemd predates 254, "
             "which introduced RestartSteps=/RestartMaxDelaySec=. Verified: "
             "`systemctl --user show <unit> -p <unsupported-property>` exits "
             "0 with empty stdout, so there is nothing for this guard to "
             "assert against an unsupported property."
         )
-    steps = shown.get("RestartSteps")
-    assert steps == "4", (
+
+    # Derived, never hard-coded: see COMMITTED_UNIT_PATH's comment. A literal
+    # here would go RED on a correctly-reconciled host the day the template
+    # changes, and would print a remediation that had already been performed.
+    assert COMMITTED_UNIT_PATH.is_file(), (
+        f"{COMMITTED_UNIT_PATH} is missing, so this guard cannot derive the "
+        "RestartSteps= value the host is supposed to have. That path is "
+        "in-repo, not host state — a missing committed template is a repo "
+        "defect, not an environment fact, so this fails rather than skips."
+    )
+    expected_steps = restart_directive(COMMITTED_UNIT_PATH, "RestartSteps")
+    assert expected_steps is not None, (
+        f"the committed {COMMITTED_UNIT_PATH} declares no RestartSteps= line, "
+        "so its own RestartMaxDelaySec= is inert at the source and there is "
+        "nothing coherent for this host guard to require. Fix the template "
+        "first — tests/scripts/test_systemd_restart_backoff.py is the gate "
+        "that owns that invariant for committed units."
+    )
+
+    steps = shown["RestartSteps"]
+    assert steps == expected_steps, (
         f"systemctl --user show {UNIT_BASENAME} -p RestartSteps reports "
-        f"RestartSteps={steps!r}, not '4'. The committed "
-        f"scripts/{UNIT_BASENAME} declares RestartSteps=4; a value of '0' is "
-        "systemd's default and means the manager never loaded that line, so "
-        "RestartMaxDelaySec=60 is being ignored and every restart waits a "
-        f"flat RestartSec=10. {_REMEDIATION}"
+        f"RestartSteps={steps!r}, but the committed {COMMITTED_UNIT_PATH} "
+        f"declares RestartSteps={expected_steps}. A value of '0' is systemd's "
+        "default and means the manager never loaded that line, so the cap is "
+        "being ignored and every restart waits a flat RestartSec. "
+        f"{_REMEDIATION}"
+    )
+
+    cap = shown["RestartMaxDelayUSec"]
+    assert cap != _NO_CAP_SENTINEL, (
+        f"systemctl --user show {UNIT_BASENAME} -p RestartMaxDelayUSec "
+        f"reports {cap!r}, systemd's no-cap default. RestartSteps="
+        f"{steps} is loaded but has no ceiling to interpolate TOWARD, so the "
+        "escalating backoff this unit advertises does not run as described. "
+        "The manager is serving a unit with no RestartMaxDelaySec= — either a "
+        f"stale copy or a <unit>.d/ drop-in overriding it. {_REMEDIATION}"
     )

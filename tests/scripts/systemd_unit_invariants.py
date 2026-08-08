@@ -20,6 +20,57 @@ import pathlib
 import re
 import subprocess
 
+import pytest
+
+# ---------------------------------------------------------------------------
+# Installed-unit location
+#
+# Where setup-host.sh actually writes.  Lifted here by task 3763 from
+# tests/scripts/test_know_live_installed_unit_parity.py (task 3642) when
+# tests/scripts/test_pump_web_ui_installed_unit_parity.py became the second
+# host-coupled parity module and would otherwise have copied all three
+# symbols verbatim — the same trigger condition, and the same reasoning, that
+# brought systemctl_user_show here.  UNIT_DIR is the sharpest case for
+# single-sourcing: it mirrors a path in another language's file, so every
+# additional copy is another chance to mis-mirror, and a mis-mirror does not
+# fail — it degrades to require_installed_unit() skipping, i.e. a guard that
+# silently checks nothing, which is the exact failure mode the mirroring
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+# Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`)
+# exactly.  Deliberately NOT XDG_CONFIG_HOME-aware: the installer itself does
+# not honour that variable, so making these guards honour it would only ever
+# point them at a directory setup-host.sh never writes to — the unit would not
+# be found there, require_installed_unit would skip, and the guard would
+# silently check nothing while the real installed unit (at
+# $HOME/.config/systemd/user, unconditionally) drifted.  Mirroring the
+# installer's actual, non-configurable path is the whole point of a parity
+# guard.
+INSTALLED_UNIT_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
+
+SYSTEMCTL_SKIP_REASON = (
+    "systemctl is not installed; this test requires a live systemd --user "
+    "manager and has no fixture-based fallback (see module docstring)"
+)
+
+
+def require_installed_unit(basename: str) -> pathlib.Path:
+    """Return INSTALLED_UNIT_DIR/*basename*, or skip if it is absent on this host.
+
+    A fresh checkout or a CI runner has no ~/.config/systemd/user at all —
+    that is an environment fact, not a defect in the unit, so this skips
+    rather than fails.
+    """
+    path = INSTALLED_UNIT_DIR / basename
+    if not path.exists():
+        pytest.skip(
+            f"{path} does not exist on this host (fresh checkout or CI "
+            "runner with no installed orchestrator units)"
+        )
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Restart backoff
 #

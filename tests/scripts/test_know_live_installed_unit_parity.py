@@ -75,6 +75,18 @@ Half of that is now done, and the split is deliberate:
     test at the bottom of this file), mirroring how
     test_dashboard_service_template.py owns assert_restart_backoff_
     effective's guard.
+  - ALSO MOVED — `UNIT_DIR` (now `INSTALLED_UNIT_DIR`),
+    `_require_installed_unit` (now `require_installed_unit`, parameterized
+    by basename) and `_SYSTEMCTL_SKIP_REASON` (now
+    `SYSTEMCTL_SKIP_REASON`), on the same trigger and in the same amendment
+    pass. These carry no parsing logic, so no negative-case owner moved
+    with them, but INSTALLED_UNIT_DIR is the sharpest single-sourcing case
+    in the set: it mirrors a path defined in another language's file
+    (scripts/setup-host.sh:114), so each copy is another chance to
+    mis-mirror, and a mis-mirror does not fail — it degrades to
+    require_installed_unit() skipping, i.e. a guard that silently checks
+    nothing, the exact failure mode the mirroring exists to prevent. Two
+    consumers today, one more per future per-unit parity module.
   - STAYED LOCAL — `_config_arg_from_exec_start` and
     `_argv_from_exec_start_show`. Both still have exactly one consumer
     (this module), so lifting them would buy no de-duplication today. The
@@ -93,48 +105,26 @@ import subprocess
 
 import pytest
 from systemd_unit_invariants import (
+    INSTALLED_UNIT_DIR,
+    SYSTEMCTL_SKIP_REASON,
     assert_restart_backoff_effective,
+    require_installed_unit,
     restart_directive,
     systemctl_user_show,
 )
 
-# Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`)
-# exactly. Deliberately NOT XDG_CONFIG_HOME-aware: the installer itself does
-# not honour that variable, so making this guard honour it would only ever
-# point the guard at a directory setup-host.sh never writes to — the unit
-# would not be found there, _require_installed_unit would skip, and the
-# guard would silently check nothing while the real installed unit (at
-# $HOME/.config/systemd/user, unconditionally) drifted. Mirroring the
-# installer's actual, non-configurable path is the whole point of a parity
-# guard.
-UNIT_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
-
 UNIT_BASENAME = "orchestrator-know-live.service"
-INSTALLED_UNIT_PATH = UNIT_DIR / UNIT_BASENAME
+INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
+
+# The committed template the installed copy is propagated FROM; parents[2]
+# because this file is <repo>/tests/scripts/<name>.py. Read at assertion
+# time rather than hard-coding the expected RestartSteps value — see the
+# derivation note in the MANAGER-layer test below.
+COMMITTED_UNIT_PATH = pathlib.Path(__file__).parents[2] / "scripts" / UNIT_BASENAME
 
 # Mirrors tests/scripts/test_orchestrator_service_files.py:543 — copied
 # inline (not imported across test modules) per this module's reuse note.
 CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
-
-_SYSTEMCTL_SKIP_REASON = (
-    "systemctl is not installed; this test requires a live systemd --user "
-    "manager and has no fixture-based fallback (see module docstring)"
-)
-
-
-def _require_installed_unit() -> pathlib.Path:
-    """Return INSTALLED_UNIT_PATH, or skip if it does not exist on this host.
-
-    A fresh checkout or a CI runner has no ~/.config/systemd/user at all —
-    that is an environment fact, not a defect in the unit, so this skips
-    rather than fails.
-    """
-    if not INSTALLED_UNIT_PATH.exists():
-        pytest.skip(
-            f"{INSTALLED_UNIT_PATH} does not exist on this host (fresh "
-            "checkout or CI runner with no installed orchestrator units)"
-        )
-    return INSTALLED_UNIT_PATH
 
 
 def _config_arg_from_exec_start(exec_start_value: str) -> str | None:
@@ -218,7 +208,7 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     the COMMITTED template — this is that same check applied to the
     INSTALLED file instead.
     """
-    path = _require_installed_unit()
+    path = require_installed_unit(UNIT_BASENAME)
     assert_restart_backoff_effective(path)
 
 
@@ -232,7 +222,7 @@ def test_installed_unit_file_execstart_config_is_canonical() -> None:
     template on this line); this guards against a FUTURE setup-host.sh run
     re-installing a stale template that regresses it.
     """
-    path = _require_installed_unit()
+    path = require_installed_unit(UNIT_BASENAME)
     exec_start = restart_directive(path, "ExecStart")
     assert exec_start is not None, f"{path} declares no ExecStart= line"
     config_arg = _config_arg_from_exec_start(exec_start)
@@ -254,7 +244,7 @@ def test_installed_unit_file_execstart_config_is_canonical() -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason=SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_restart_steps_effective() -> None:
     """systemd --user's LOADED view must report RestartSteps=4, not just the file.
 
@@ -266,10 +256,18 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
     --user show orchestrator-know-live.service -p RestartSteps` reported
     RestartSteps=0 — systemd's zero-value default, confirming the manager
     had not reloaded the RestartSteps=4 line at all. Task 3642's step-2 ran
-    `daemon-reload` and restarted the unit, so this now pins RestartSteps=4
-    as the reconciled state rather than asserting the pre-fix RED.
+    `daemon-reload` and restarted the unit, so this now pins the reconciled
+    state rather than asserting the pre-fix RED.
+
+    The expected value is DERIVED from the committed template rather than
+    hard-coded (task 3763 amendment, applied here because this module was
+    already being edited for the shared-helper lift). A literal '4' would
+    turn any future legitimate template edit into a RED test on a fully
+    reconciled host, with a failure message that misdirects by asserting the
+    template says 4 when it no longer does — and a prescribed remediation
+    that had already been carried out.
     """
-    _require_installed_unit()
+    require_installed_unit(UNIT_BASENAME)
     shown = systemctl_user_show(UNIT_BASENAME, "RestartSteps")
     if shown is None:
         pytest.skip(
@@ -286,19 +284,33 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
             "0 with empty stdout, so there is nothing for this guard to "
             "assert against an unsupported property."
         )
+    assert COMMITTED_UNIT_PATH.is_file(), (
+        f"{COMMITTED_UNIT_PATH} is missing, so this guard cannot derive the "
+        "RestartSteps= value the host is supposed to have. That path is "
+        "in-repo, not host state — a missing committed template is a repo "
+        "defect, not an environment fact, so this fails rather than skips."
+    )
+    expected_steps = restart_directive(COMMITTED_UNIT_PATH, "RestartSteps")
+    assert expected_steps is not None, (
+        f"the committed {COMMITTED_UNIT_PATH} declares no RestartSteps= line, "
+        "so its own RestartMaxDelaySec= is inert at the source and there is "
+        "nothing coherent for this host guard to require. Fix the template "
+        "first — tests/scripts/test_systemd_restart_backoff.py is the gate "
+        "that owns that invariant for committed units."
+    )
     steps = shown.get("RestartSteps")
-    assert steps == "4", (
+    assert steps == expected_steps, (
         f"systemctl --user show {UNIT_BASENAME} -p RestartSteps reports "
-        f"RestartSteps={steps!r}, not '4'. The committed "
-        "scripts/orchestrator-know-live.service declares RestartSteps=4; "
-        "propagate it with `install -m 0644 scripts/orchestrator-know-live"
-        f".service {INSTALLED_UNIT_PATH}` followed by `systemctl --user "
-        f"daemon-reload` and `systemctl --user restart {UNIT_BASENAME}`."
+        f"RestartSteps={steps!r}, but the committed {COMMITTED_UNIT_PATH} "
+        f"declares RestartSteps={expected_steps}; propagate it with "
+        f"`install -m 0644 scripts/{UNIT_BASENAME} {INSTALLED_UNIT_PATH}` "
+        f"followed by `systemctl --user daemon-reload` and `systemctl --user "
+        f"restart {UNIT_BASENAME}`."
     )
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason=SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     """systemd --user's LOADED ExecStart= argv must carry the canonical --config basename.
 
@@ -319,7 +331,7 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     the drop-in-only regression this layer exists to catch actually
     requires.
     """
-    _require_installed_unit()
+    require_installed_unit(UNIT_BASENAME)
     shown = systemctl_user_show(UNIT_BASENAME, "ExecStart")
     if shown is None:
         pytest.skip(
@@ -351,7 +363,7 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
 # PARSER layer — portable, fixture-string coverage for the token parsers
 #
 # Deliberately NOT @pytest.mark.integration and NOT gated on
-# _require_installed_unit()/systemctl: these read no host state, only
+# require_installed_unit(UNIT_BASENAME)/systemctl: these read no host state, only
 # inline fixture strings, so they run in the default suite on every
 # machine — including CI and every other dev box, where the four tests
 # above skip. Without a negative-case owner of its own, a regression in
