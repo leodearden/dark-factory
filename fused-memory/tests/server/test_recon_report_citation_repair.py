@@ -270,3 +270,80 @@ class TestRepairToolViaFastMCP:
         rendered = render_recon_report_tool_guidance()
         assert rendered.strip()
         assert 'repair_memory_citation' not in rendered
+
+
+_QUALIFIED_TOOL = 'mcp__recon-report__repair_memory_citation'
+
+
+class TestRepairToolDisallowList:
+    """Per-stage gating: Stage 3 must not repair what Stage 3 detects.
+
+    Mirrors ``test_recon_report_standing_decision.py::TestStandingDecisionDisallowList``
+    — this is the SECOND recon-report tool that writes past in-process state, so
+    it rides its own additive sublist. The journal is not the ledger, so folding
+    it into ``DISALLOW_RECON_REPORT_LEDGER_WRITES`` would make that name lie and
+    would couple two grants that need to move independently.
+
+    The per-stage split is the substance:
+
+    * Stage 3 (``integrity_check``) is read-only by contract AND is the stage
+      that DETECTS a dangling cross-run citation. Letting it also repair would
+      break the contract and collapse detect-and-repair into one unaccountable
+      actor.
+    * Stage 1 keeps it — Stage 1 is where a supersession deletes the predecessor
+      memory, i.e. where cross-run citations become dangling in the first place,
+      and it is already ``citation_verifier``'s own caller.
+    * Stage 2 keeps it — Stage 2 is the remediation stage whose blocked attempt
+      originated this task.
+    """
+
+    def test_tool_in_dedicated_sublist(self):
+        from fused_memory.reconciliation.cli_stage_runner import (
+            DISALLOW_RECON_REPORT_JOURNAL_WRITES,
+        )
+
+        assert _QUALIFIED_TOOL in DISALLOW_RECON_REPORT_JOURNAL_WRITES
+
+    def test_tool_in_stage3_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+
+        assert _QUALIFIED_TOOL in STAGE3_DISALLOWED
+
+    def test_tool_not_in_stage1_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+
+        assert _QUALIFIED_TOOL not in STAGE1_DISALLOWED
+
+    def test_tool_not_in_stage2_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE2_DISALLOWED
+
+        assert _QUALIFIED_TOOL not in STAGE2_DISALLOWED
+
+    @pytest.mark.asyncio
+    async def test_denial_names_tools_that_actually_exist(self):
+        """A denial that names a non-existent tool is decoration, not gating.
+
+        The same anti-decoration check ``test_stages.py`` applies to
+        ``DISALLOW_ESCALATION_READS``: enumerate the LIVE tool surface and
+        require every denied name to be on it. A typo'd or renamed entry denies
+        nothing and reads, to the next person, as though it does.
+        """
+        from fused_memory.reconciliation.cli_stage_runner import (
+            DISALLOW_RECON_REPORT_JOURNAL_WRITES,
+        )
+
+        mcp = create_recon_report_server(_state())
+        registered = {tool.name for tool in await mcp.list_tools()}
+
+        prefix = 'mcp__recon-report__'
+        denied = set()
+        for qualified in DISALLOW_RECON_REPORT_JOURNAL_WRITES:
+            assert qualified.startswith(prefix), qualified
+            denied.add(qualified[len(prefix) :])
+
+        stale = denied - registered
+        assert not stale, (
+            'DISALLOW_RECON_REPORT_JOURNAL_WRITES names recon-report tools that '
+            f'are not registered by create_recon_report_server: {sorted(stale)}. '
+            'A denial that names nothing denies nothing.'
+        )
