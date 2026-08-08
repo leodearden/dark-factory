@@ -347,3 +347,69 @@ class TestRepairToolDisallowList:
             f'are not registered by create_recon_report_server: {sorted(stale)}. '
             'A denial that names nothing denies nothing.'
         )
+
+
+class TestReconReportComponentsJournalWiring:
+    """``_build_recon_report_components`` threads the journal, or degrades loudly.
+
+    Mirrors ``test_recon_report_citations.py::TestReconReportComponentsWiring``.
+    The journal rides the same optional-service injection pattern as
+    ``memory_service`` / ``task_interceptor``: a defaulted keyword arg, so every
+    existing caller — two ``main.py`` sites and three test modules — keeps
+    working untouched.
+
+    The reconciliation-DISABLED boot path has no journal to pass, and the tool
+    must then answer ``journal_unavailable`` rather than half-work against a
+    store that does not exist.
+    """
+
+    def _make_config(self):
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+            ServerConfig,
+        )
+
+        return FusedMemoryConfig(
+            server=ServerConfig(recon_report_port=8003, host='127.0.0.1'),
+            reconciliation=ReconciliationConfig(recon_report_state_ttl_seconds=300),
+        )
+
+    def test_journal_is_injected_when_supplied(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        sentinel = object()
+        state, _, _ = _build_recon_report_components(
+            self._make_config(), recon_journal=sentinel
+        )
+        assert state._journal is sentinel
+
+    def test_existing_call_shape_still_works_without_a_journal(self):
+        """Backward compatibility: the arg is optional, and absent means None."""
+        from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_report import ReconReportState
+
+        state, _, _ = _build_recon_report_components(self._make_config())
+        assert isinstance(state, ReconReportState)
+        assert state._journal is None
+
+    @pytest.mark.asyncio
+    async def test_state_without_journal_degrades_rather_than_raising(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        state, _, _ = _build_recon_report_components(self._make_config())
+        state.start_report(
+            run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+        )
+
+        result = await state.repair_memory_citation(
+            run_id=CALLER_RUN,
+            target_run_id=TARGET_RUN,
+            finding_id='f-1',
+            memory_id=DANGLING,
+            store='mem0',
+            replacement_memory_id=SUCCESSOR,
+        )
+
+        assert result['error'] == 'journal_unavailable'
+        assert result['error_type'] == 'ReconReportJournalUnavailable'
