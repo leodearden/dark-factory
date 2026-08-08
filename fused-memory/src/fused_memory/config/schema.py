@@ -942,9 +942,97 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
         ),
         ProceduralTopicCluster(
             topic_id='npx-pyright-eacces-agent-sandbox',
+            # Reviewer (robustness, task 3862): phrases are literal substrings
+            # drawn VERBATIM from gate task 3417's corpus, RE-SCOPED from a
+            # fresh search rather than from any fixed count in 3417's
+            # description (3417's own standing instruction -- the cluster was
+            # still growing, adding 8+ entries in the week to 2026-08-07).
+            # Measured over all 21 members: every one reaches >= 2 distinct
+            # hits, min 2, max 7, 14 distinct hit-profiles. Per-phrase
+            # coverage: 'npx pyright' 21/21, '/home/leo/.npm' 17/21, 'EACCES'
+            # 16/21, '_cacache' / '.venv/bin/pyright' / 'npm_config_cache'
+            # 11/21 each, 'sudo chown -R 1000:1000' 9/21. 'npx pyright' and
+            # 'npm_config_cache' are JOINTLY LOAD-BEARING for the two
+            # at-threshold members (dfdad23e, a883f914, both exactly 2 hits):
+            # dropping either sinks them, and dropping any of the other five
+            # sinks nobody.
+            #
+            # SYMPTOM-KEYED RATIONALE -- the reason this seed does not look
+            # like the six above. This cluster's members CONTRADICT EACH OTHER
+            # on causation rather than merely paraphrasing: a0c39676, 92ff6daa
+            # and 03b783d5 assert root-owned npm-cache files and prescribe a
+            # `sudo chown` that is a MEASURED no-op, while 6a02360d, f9c9ea2a,
+            # ae11c43e and 43ac56de carry the corrected agent-sandbox
+            # diagnosis. A guard keyed on the correct diagnosis (sandbox /
+            # landlock / compute_write_set) would therefore block only the
+            # already-right entries and let the harmful chown restatements
+            # keep landing -- inverting the guard's purpose. So the anchors are
+            # the INVARIANT SYMPTOM ('npx pyright', 'EACCES', '_cacache',
+            # '/home/leo/.npm'), which catches both readings with one list.
+            # 'sudo chown -R 1000:1000' is the single wrong-diagnosis phrase
+            # kept: it is the exact npm advice literal including the uid:gid,
+            # retained so a future write whose ONLY hook is the harmful remedy
+            # is still catchable.
+            #
+            # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
+            # above): bare 'root-owned' and the verbatim npm string 'cache
+            # folder contains root-owned files' are omitted although both are
+            # among the most literally common strings in the corpus. Measured,
+            # not assumed -- with either seeded, a generic docker/CI note
+            # ("mounted cache folder contains root-owned files ... EACCES ...
+            # chown the mount") reaches 2 hits and would be soft-blocked and
+            # mis-routed here. Memory f9c9ea2a makes the hazard concrete by
+            # explicitly distinguishing the recorded pump-web-ui / know-live
+            # "architect-level toolchain-cache redirect" EACCES entries as a
+            # DIFFERENT failure class -- exactly what those phrases would
+            # falsely capture. Coverage loses nothing: all 21 members still
+            # clear the 2-hit bar without them. 'type_check_command' is
+            # omitted as a config-key name that appears in any module-config
+            # discussion and was measured to cost ZERO coverage when dropped.
+            #
+            # NESTING EXCLUSION: '/home/leo/.npm/_cacache' is omitted because
+            # it NESTS inside both '/home/leo/.npm' and '_cacache', so a
+            # single occurrence would score three distinct hits and satisfy
+            # min_phrase_hits alone. Same hazard as 'ruff format --check'
+            # above; asserted over ALL clusters by
+            # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
+            #
+            # TWO ACCEPTED RESIDUALS, both PINNED by positive tests so a
+            # future tuner can tell them from a regression:
+            # (1) entry 37743789, which gate 3417 EXPLICITLY EXCLUDES as a
+            #     distinct root cause (a sandboxed network-fetch hang, fixed
+            #     with `npx --offline`), scores 4 hits and WILL match. This is
+            #     unavoidable: its FIRST symptom is literally the same EACCES
+            #     symptom and the matcher has no negative-phrase arm. No
+            #     phrase separates them either -- the discriminating
+            #     vocabulary lives only in the excluded entry. Accepted
+            #     because the block is SOFT and routes to 3417, whose
+            #     description documents this very exclusion, so the writer
+            #     lands on the right reading.
+            #     (test_known_residual_excluded_offline_hang_entry_matches)
+            # (2) a pyright version-pin note ('.venv/bin/pyright is 1.1.408
+            #     while npx pyright resolves 1.1.411') scores 2. Judged
+            #     ON-TOPIC rather than a false positive: 3417's steward
+            #     addendum wants exactly that version-inequivalence detail
+            #     folded into the canonical entry, since it CORRECTS member
+            #     1db61279's "(same version)" claim.
+            #     (test_known_residual_pyright_version_pin_note_matches)
+            #
+            # Registered PROSPECTIVELY while gate 3417 is still blocked behind
+            # 3524, following the task-3013 and task-3435 precedents: the
+            # guard is forward-looking (it only blocks NEW writes, never
+            # existing entries), so seeding now stops the cluster growing
+            # while the consolidation ruling is parked. Consolidating or
+            # editing the 21 members is deliberately NOT done here -- that is
+            # 3417's content-shaping judgment call.
             phrases=[
                 'npx pyright',
                 'EACCES',
+                '_cacache',
+                '/home/leo/.npm',
+                '.venv/bin/pyright',
+                'npm_config_cache',
+                'sudo chown -R 1000:1000',
             ],
             min_phrase_hits=2,
             hint=(
