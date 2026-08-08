@@ -6214,6 +6214,143 @@ class TestSearchMem0Filtering:
         assert len(results) == 1, 'Non-planned result must NOT be excluded'
 
 
+class TestSearchMem0RrfFields:
+    """Task 3658: _search_mem0 stamps store_rank/store_score and scores via RRF.
+
+    The Mem0 cosine no longer reaches relevance_score at all — it moves to
+    metadata['store_score'], the honest per-store signal the E1 retrieval probe
+    and the task 3212 telemetry read.  relevance_score becomes the ordinal
+    fused value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rank_is_contiguous_over_survivors_and_score_is_rrf(self, service):
+        """Ranks are 1-based over survivors; a planned skip does not consume one."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-1', 'memory': 'Postgres for persistence', 'score': 0.79,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+                {
+                    # Skipped (planned) — must NOT consume rank 2.
+                    'id': 'm-planned', 'memory': 'PRD: maybe GraphQL', 'score': 0.71,
+                    'metadata': {'category': 'decisions_and_rationale', 'planned': True},
+                },
+                {
+                    'id': 'm-3', 'memory': 'Qdrant for vectors', 'score': 0.62,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('storage', scope, 10)
+
+        assert [r.id for r in results] == ['m-1', 'm-3']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'A result skipped for planned=True must not consume a rank'
+        )
+        assert [r.metadata['store_score'] for r in results] == [0.79, 0.62], (
+            'store_score must carry the raw Mem0 cosine verbatim'
+        )
+        for r in results:
+            assert isinstance(r.metadata['store_score'], float)
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            )
+            assert r.relevance_score != pytest.approx(r.metadata['store_score']), (
+                'The cosine must no longer reach relevance_score'
+            )
+
+    @pytest.mark.asyncio
+    async def test_preexisting_metadata_keys_survive_stamping(self, service):
+        """category/planned and other backend keys coexist with the two new keys."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-p', 'memory': 'PRD: planned thing', 'score': 0.88,
+                    'metadata': {
+                        'category': 'procedural_knowledge',
+                        'planned': True,
+                        'topic': 'docs-prd-landing',
+                    },
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('planned', scope, 10, include_planned=True)
+
+        meta = results[0].metadata
+        assert meta['category'] == 'procedural_knowledge'
+        assert meta['planned'] is True
+        assert meta['topic'] == 'docs-prd-landing'
+        assert meta['store_rank'] == 1
+        assert meta['store_score'] == 0.88
+        assert results[0].category == MemoryCategory.procedural_knowledge
+
+    @pytest.mark.asyncio
+    async def test_stamping_does_not_mutate_the_backend_response_dict(self, service):
+        """_search_mem0 must COPY the backend metadata dict before stamping.
+
+        `meta` is the dict object lifted straight out of the Mem0Backend.search
+        response; stamping into it would mutate the caller's response structure
+        in place — invisible in the common path, and exactly the kind of
+        aliasing bug no other test would catch.
+        """
+        from fused_memory.models.scope import Scope
+
+        meta_1 = {'category': 'observations_and_summaries'}
+        meta_2 = {'category': 'observations_and_summaries'}
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-a', 'memory': 'A', 'score': 0.9, 'metadata': meta_1},
+                {'id': 'm-b', 'memory': 'B', 'score': 0.8, 'metadata': meta_2},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        for original in (meta_1, meta_2):
+            assert 'store_rank' not in original, (
+                'store_rank leaked into the backend response dict (aliasing bug)'
+            )
+            assert 'store_score' not in original, (
+                'store_score leaked into the backend response dict (aliasing bug)'
+            )
+        # The results carry the stamped copies.
+        assert results[0].metadata is not meta_1
+        assert results[0].metadata['store_rank'] == 1
+        assert results[1].metadata['store_rank'] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_score_defaults_to_zero_and_still_gets_a_rank(self, service):
+        """A result with no 'score' key keeps the existing 0.0 default."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-noscore', 'memory': 'No score field', 'metadata': {}},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        assert len(results) == 1
+        assert results[0].metadata['store_score'] == 0.0
+        assert results[0].metadata['store_rank'] == 1
+        assert results[0].relevance_score == pytest.approx(1.0 / (RRF_K + 1))
+
+
 class TestSearchMem0CreatedAt:
     """step-1 (task-1369): _search_mem0 propagates Mem0 server-stamped created_at to MemoryResult."""
 
