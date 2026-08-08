@@ -277,3 +277,115 @@ class TestProvenanceConflictSinkRecordFromRejection:
         assert detail['gate_source'] == 'dispatch-gate'
         assert detail['evidence_commit'] == 'abc'
         assert sink.should_skip('42') is True
+
+
+class TestArbitrationPendingReopenAtArm:
+    """``arbitration_pending`` inherits ``should_skip``'s invalidation arm.
+
+    ``should_skip`` deliberately RELEASES when the task's current
+    ``reopen_at`` no longer matches the recorded one — "the task was
+    reopened again since the conflict was recorded — a fresh write attempt
+    is warranted" — and ``merge_queue.py`` names that arm as its self-heal.
+    A reopen_at-agnostic durable hold would OVERRIDE it and wedge a
+    re-reopened task forever (no dispatch, no flip) until a human resolved
+    the L2, i.e. fixing a restart bug by installing a permanent one.
+
+    The data for doing it durably is already on the record: ``record()``
+    serialises ``reopen_at`` into the escalation's ``detail`` JSON.  Records
+    here are built through the real ``record()`` against a real
+    ``EscalationQueue`` so the ``detail`` shape is never hand-faked.
+
+    Deliberate asymmetry, pinned below: EVERY ambiguity resolves to HOLD.
+    Releasing is the action that lets a contested task move, so it must
+    require positive evidence that the arbitration is stale; the absence of
+    evidence is never enough.
+    """
+
+    _R1 = '2026-07-15T00:00:00+00:00'
+    _R2 = '2026-07-20T00:00:00+00:00'
+
+    def _sink_with_conflict(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+        _record(sink)
+        return sink, queue.get_by_task('42', status='pending')
+
+    def test_moved_on_reopen_at_releases_the_hold(self, tmp_path):
+        """The task was reopened after the conflict — the hold must release."""
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows, reopen_at=self._R2) is False
+
+    def test_same_reopen_at_holds(self, tmp_path):
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows, reopen_at=self._R1) is True
+
+    def test_iso8601_drift_still_holds(self, tmp_path):
+        """``...Z`` vs ``...+00:00`` is the drift ``_reopen_at_matches``
+        exists to absorb — a naive ``==`` would wrongly RELEASE here.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(
+            rows, reopen_at='2026-07-15T00:00:00Z',
+        ) is True
+
+    def test_omitted_reopen_at_holds(self, tmp_path):
+        """No ``reopen_at`` kwarg (the ``_UNKNOWN_REOPEN`` sentinel) — the
+        same "caller has no metadata handy" arm ``should_skip`` already has.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows) is True
+
+    def test_unparseable_detail_holds(self, tmp_path):
+        """A record whose ``detail`` cannot yield a recorded ``reopen_at``
+        carries no evidence that the arbitration is stale, so it HOLDS.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        for bad_detail in ('not json', None):
+            rows[0].detail = bad_detail
+            assert sink.arbitration_pending(
+                rows, reopen_at=self._R2,
+            ) is True, f'detail={bad_detail!r} must hold'
+
+    def test_non_provenance_records_never_hold(self, tmp_path):
+        """A pending blocking L2 in another category is the ANY-LEVEL veto's
+        business, not the arbitration hold's.
+        """
+        from escalation.models import Escalation
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+        )
+        rows = [
+            Escalation(
+                id='esc-42-1',
+                task_id='42',
+                agent_role='implementer',
+                severity='blocking',
+                category='design_concern',
+                summary='an open handoff on task 42',
+                level=2,
+            ),
+        ]
+
+        assert sink.arbitration_pending(rows) is False
+
+    def test_none_records_do_not_hold(self, tmp_path):
+        """An unreadable store is the CALLER's disposition (store_unavailable),
+        not something this method may quietly convert into a hold.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+        )
+
+        assert sink.arbitration_pending(None) is False

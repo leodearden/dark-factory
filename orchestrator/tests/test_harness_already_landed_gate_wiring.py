@@ -1186,6 +1186,107 @@ class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
             'write attempt at all'
         )
 
+    async def test_moved_on_reopen_at_dispatches_instead_of_flipping(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A re-reopened task escapes the hold by DISPATCHING, never by flipping.
+
+        Pins the whole composition.  The hold inherits ``should_skip``'s
+        reopen_at invalidation arm, so a task reopened AFTER its conflict was
+        recorded releases it — otherwise fixing the cold-memo bug would
+        install a permanent wedge (no dispatch, no flip, until a human
+        resolves the L2).  But releasing the hold does NOT mean "flip to
+        done": the still-pending urgent L2 is then caught by the any-level
+        veto, so the gate abstains and the task dispatches.
+
+        Both the pre-3534 behaviour (auto-flip past a pending L2 — defect E8
+        itself) and a reopen_at-agnostic hold (wedge forever) are wrong here.
+        Only this composition is right.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        later_reopen_at = '2026-07-20T00:00:00+00:00'
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': later_reopen_at}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        # The conflict was recorded against the EARLIER reopen_at.
+        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False, (
+            'a re-reopened task must escape by dispatching, not by the gate '
+            'flipping it past a still-pending L2'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 0, (
+            'the any-level veto must catch the still-pending L2 before any '
+            'done-write is attempted'
+        )
+
+    async def test_plain_l2_pin_still_dispatches(self, mock_orch_config) -> None:
+        """A pending non-provenance L2 belongs to the any-level VETO, not the
+        hold — so the gate abstains (``False``) rather than withholding.
+
+        Regression fence against broadening the hold into the veto's cases.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_store_unavailable_still_vetoes_without_holding(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """The hold cannot see an unreadable store, and must not pretend to.
+
+        ``records=None`` is the caller's ``store_unavailable`` disposition
+        (task 3534 step-4) — the gate still ABSTAINS with its WARNING rather
+        than the hold silently upgrading a failed read into a withhold.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            '42' in m and ('store' in m.lower() or 'read' in m.lower())
+            for m in messages
+        ), messages
+
 
 def _wired_absent_branch_harness(mock_orch_config) -> Harness:
     """Bare harness with resolve_branch_sha -> None (branch ref does not
