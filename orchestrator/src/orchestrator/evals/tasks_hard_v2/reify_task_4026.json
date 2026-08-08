@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_4026",
+  "name": "Add SPEED_OF_LIGHT + BOLTZMANN_CONSTANT physical constants to std.units",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "e21d0470260076a7655114a765e1266cdbf74a9d",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Add SPEED_OF_LIGHT + BOLTZMANN_CONSTANT physical constants to std.units",
+    "description": "Complete the spec \u00a711.3 std.units physical-constants promise (pi/g/c/boltzmann). Currently only STANDARD_GRAVITY() (=g) exists at units.ri:82; pi is a compiler builtin (constants.rs BUILTIN_NAMES); c and boltzmann are MISSING.\n\nAppend two zero-arg pub fn constants to crates/reify-compiler/stdlib/units.ri, in the existing STANDARD_GRAVITY() idiom (Reify lacks top-level const):\n- SPEED_OF_LIGHT() -> Velocity { 299792458.0 * 1m / 1s } \u2014 c = 299792458 m/s exactly (SI definition).\n- BOLTZMANN_CONSTANT() -> Energy / Temperature { 0.00000000000000000000001380649 * 1J / 1K } \u2014 k_B = 1.380649e-23 J/K exactly (2019 SI redefinition). Return type as a type expression Energy/Temperature (no J/K dimension alias exists among the 35).\nCRITICAL: write the Boltzmann value in DECIMAL form, NOT scientific notation \u2014 1.38e-23 does NOT parse in value position (verified; convention documented at modal_analysis.ri:32-33 and solver_buckling.ri). Doc-comment cites the SI reference. No change needed for pi/g \u2014 note that in the task.\n\nPRD: docs/prds/v0_6/stdlib-reconstruction.md task \u03b6\n\nUser-observable signal: examples/stdlib/constants.ri uses SPEED_OF_LIGHT() and BOLTZMANN_CONSTANT() in dimensioned `let`s, compiles with zero Severity::Error and `reify eval` prints c \u2248 2.998e8 m/s and k_B \u2248 1.38e-23 J/K (values matched to the SI definitions). G6 premise verified: c=299792458 m/s, k_B=1.380649e-23 J/K are the exact SI values.\nConsumer: a designer using physical constants in loads/energy calcs (CI example); terminal leaf.\nModules touched: reify-compiler (stdlib/units.ri), examples"
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/4026 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

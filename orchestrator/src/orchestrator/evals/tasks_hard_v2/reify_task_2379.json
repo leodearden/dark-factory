@@ -1,0 +1,43 @@
+{
+  "id": "reify_task_2379",
+  "name": "Money dimension: quantity-literal + currency-mass arithmetic integration tests",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "7d2ed24d28946576e638517d3c2e6feb22045c00",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Money dimension: quantity-literal + currency-mass arithmetic integration tests",
+    "description": "Develop end-to-end tests for quantity-literal and currency-mass arithmetic in the Money dimension, including user-defined unit conversions."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-compiler/tests",
+    "crates/reify-eval/tests"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "reference_unavailable": "No single \"Merge task/2379 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

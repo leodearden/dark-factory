@@ -1,0 +1,43 @@
+{
+  "id": "df_task_882",
+  "name": "Fix workflow.run DONE early-return \u2014 28 test regressions from commit b242030313",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "fd4758fcffb0f7317fecabf206736203993d9af5",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Fix workflow.run DONE early-return \u2014 28 test regressions from commit b242030313",
+    "description": "CRITICAL regression. Commit b242030313 added an early-return at workflow.py:350-355 that catches ALL of _plan()'s WorkflowOutcome.DONE returns, including the normal happy-path success at workflow.py:847. This short-circuits every successful workflow before EXECUTE/VERIFY/REVIEW/MERGE run. The state-guard fix has been confirmed absent from workflow.py lines 354-359 as of 2026-04-21 code inspection._plan() returns DONE in two cases: - Happy-path success (workflow.py:847) \u2014 state remains WorkflowState.PLAN - _mark_blocked recovery for 'branch already on main' (workflow.py:2488) \u2014 state is set to WorkflowState.DONE on line 2478 The new guard doesn't distinguish these. 28 tests fail: all of TestHappyPath, TestCompletionJudge, TestVerifyDebugfixLoop, TestReviewLoop, TestPostRebaseVerifyFailure, TestBlastRadiusExpansion, TestArtifactsIntegrity, TestPlanLockAndProvenance, TestCorruptedIterationLogEscalation, TestReviewerErrors, TestGhostLoopGuard, TestWipRecoveryNoAdvance, TestPrerequisitesValidation. The new test TestPlanDoneEarlyReturn.test_plan_done_returns_without_execute passes only because it stubs _plan with AsyncMock, bypassing the real semantic. Suggested fix: guard the early-return with state check at workflow.py:350: `if plan_outcome == WorkflowOutcome.DONE and self.state == WorkflowState.DONE: return plan_outcome`. This matches the invariant \u2014 _mark_blocked recovery transitions state to DONE before returning; happy-path _plan leaves state as PLAN. Related: task 876 (architectural refactor to move recovery out of _mark_blocked) can proceed independently. Acceptance: all 28 tests pass; TestPlanDoneEarlyReturn refactored to set workflow.state=DONE before run() to match real semantic."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/882 into main\" commit exists in /home/leo/src/dark-factory (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

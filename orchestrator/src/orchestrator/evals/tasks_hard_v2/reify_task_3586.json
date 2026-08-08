@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_3586",
+  "name": "PNv2 vertex-side attribute widening (BRepKind::Vertex + extract_vertices + per-op seeding)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "6485f8f53be371440860f66a4a6df97cee003501",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "PNv2 vertex-side attribute widening (BRepKind::Vertex + extract_vertices + per-op seeding)",
+    "description": "PRD: docs/prds/v0_3/mesh-morphing-phase-2.md task \u03b1 (PNv2-owned per portfolio approach E)\n\nExtend PNv2's attribute table to vertices symmetrically with existing face/edge seeding. Today `BRepKind` at `crates/reify-types/src/geometry.rs:54-71` only has `Edge` / `Face`; `OcctKernel` lacks `extract_vertices`; per-op attribute populators don't seed vertex attributes. This blocks mesh-morph Stage-B vertex bijection and the Gmsh `NodeAttachment` producer.\n\nDeliverables (per PRD \u00a73.1):\n- `BRepKind::Vertex` variant added to `crates/reify-types/src/geometry.rs:54-71`.\n- `OcctKernel::extract_vertices(handle) -> Result<Vec<GeometryHandleId>, QueryError>` mirroring `extract_edges` / `extract_faces` at `crates/reify-kernel-occt/src/handle.rs:293-318` and the stub at `crates/reify-kernel-occt/src/stubs.rs:80-95`. Each vertex registered with `BRepKind::Vertex`.\n- `Role::CornerVertex` variants per PRD \u00a72 Q-MM2-1 table (box `CornerVertex { x_face: \u00b1X, y_face: \u00b1Y, z_face: \u00b1Z }`; extrude/revolve/sweep/loft `CapCornerVertex { face: CapFace }`).\n- Per-op attribute populators extended in `crates/reify-eval/src/topology_attribute_propagation.rs` (sweeps) and `crates/reify-eval/src/primitive_attribute_seed.rs` (primitives) to seed vertex attributes alongside face/edge.\n- Wired through `engine_build.rs` realization-ops path symmetrically.\n- Deterministic `local_index` ordering follows PNv2's centroid \u2192 normal \u2192 construction-order rule.\n- Out of scope: Cone/Torus/Tube vertex seeding (deferred per parent PNv2 audit M-008); Manifold KernelAttributeHook vertex MeshGL walk (PNv2 M-018 stub).\n\nUser-observable signal (D-discipline per PRD \u00a78 task \u03b1): new test `extract_vertices_and_attribute_seeding_box` in `crates/reify-eval/tests/topology_attribute_vertex_seeding.rs` asserts:\n- `extract_vertices(box_handle).len() == 8`\n- Each vertex carries a `TopologyAttribute` entry with `Role::CornerVertex` and stable `(feature_id, local_index)` across a `thickness`-param tick.\n\nGap register: resolves GR-023 / M-002 vertex-widening half (cross-PRD seam owned by PNv2 PRD per portfolio approach E). PNv2 PRD eventual re-decomposition will absorb this as `done` via same-PRD supersession.\n\nDependencies: NONE (foundation of the bundle).\n\nCrates touched: reify-types, reify-kernel-occt, reify-eval.\n\n---\nRe-filed 2026-05-14 from docs/prds/v0_3/mesh-morphing-phase-2.md (was lost in 2026-05-13 SIGABRT pending re-decompose; sibling \u03b4=3535 was recovered via worktree-orphans). Original task ID was 3595."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/3586 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

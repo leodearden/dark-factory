@@ -1,0 +1,45 @@
+{
+  "id": "reify_task_2696",
+  "name": "Stdlib type-system: MomentOfInertia + Density + Stress/Strain dims + Tensor surface-syntax",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "ce759ec04de91ebcc7a7fbebc112658b0b057638",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Stdlib type-system: MomentOfInertia + Density + Stress/Strain dims + Tensor surface-syntax",
+    "description": "Slice (a) of the topology-selectors-PRD wiring debt (esc-2325-47 triage, 2026-04-29 audit). Three concrete gaps:\n\n**1. Missing named dimensions in `crates/reify-types/src/dimension.rs::NAMED_DIMENSIONS`** (currently 30 entries; `Pressure` is present but the following are not):\n- `MomentOfInertia` (mass \u00d7 length\u00b2) \u2014 required for `moment_of_inertia` return\n- `Density` (mass \u00d7 length\u207b\u00b3, mass-density not magnetic-flux-density) \u2014 required for the `density` parameter of `moment_of_inertia` and `center_of_mass`\n- `Stress` \u2014 dimensionally identical to `Pressure` (kg\u00b7m\u207b\u00b9\u00b7s\u207b\u00b2); design call: surface as a separate named dim, or expose as `type Stress = Scalar<Pressure>` alias in stdlib? Recommend stdlib alias to keep `NAMED_DIMENSIONS` orthogonal-to-base-units.\n- `Strain` \u2014 dimensionless ratio of length over length; same pattern: stdlib `type Strain = Scalar<Dimensionless>` alias, no `NAMED_DIMENSIONS` entry.\n- The user's directive (option C) is \"we'll need these soon\" \u2014 anticipate v0.2 stress/strain work even though this task lands v0.1.\n\n**2. Surface syntax for parametric `Tensor<rank, n, quantity>` and `Matrix<rows, cols, quantity>`**:\n- `Type::Tensor { rank: usize, n: usize, quantity: Box<Type> }` exists in `crates/reify-types/src/ty.rs:56-58` (shipped under task #228)\n- BUT the grammar's `type_arg_list` (`tree-sitter-reify/grammar.js:601-605`) accepts only `type_expr` arguments (= `choice(parameterized_type, identifier)`). Integer literal type-args are NOT accepted today.\n- Audit found ZERO hits for `Tensor<` / `Matrix<` in `examples/*.ri` or `crates/reify-compiler/stdlib/*.ri` \u2014 surface forms are unreachable.\n- Design choice (decide in task plan; PRD prefers (i)):\n  - (i) Extend grammar: allow `integer_literal` as a `type_arg_list` element. Matches PRD spelling `Tensor<2, 3, MomentOfInertia>`. Small grammar change + parser regen + lowering.\n  - (ii) Concatenated-name spelling like `Tensor2x3<MomentOfInertia>`. Matches existing `Display` impl `Tensor{rank}x{n}<{quantity}>` from `ty.rs:322`. No grammar change.\n  Recommend (i) \u2014 PRD already wrote literal-int args; ergonomics matter for matrix-heavy code.\n\n**3. Wire surface\u2192IR**: extend type-resolution (current home: `crates/reify-compiler/src/functions.rs:124` mentions Point3/Vector3 as examples but the actual rule for parametric type lowering needs to be located \u2014 likely `type_resolution.rs` once the implementer tracks down the existing `Vector3<Force>` / `Point3<Length>` resolution path) to recognize `Tensor` / `Matrix` parametric forms and lower to `Type::Tensor` / `Type::Matrix`.\n\n**4. Tests**:\n- Dimension round-trip: each new entry \u2192 `DimensionVector::canonical_name()` returns the spelled name\n- Type-resolution unit test: a `.ri` snippet with `fn f() -> Tensor<2, 3, MomentOfInertia> { ... }` parses and resolves to `Type::tensor(2, 3, Type::Scalar[MomentOfInertia])`\n- Display round-trip: same Tensor type \u2192 `format!(\"{}\", ty)` yields a stable string\n\n**Files**:\n- `crates/reify-types/src/dimension.rs` \u2014 new consts (`MOMENT_OF_INERTIA`, `MASS_DENSITY` to disambiguate from existing `MAGNETIC_FLUX_DENSITY`) + NAMED_DIMENSIONS additions\n- `tree-sitter-reify/grammar.js` (option (i) above) + regenerated parser\n- `crates/reify-compiler/src/<type-resolution-path>` \u2014 surface\u2192IR lowering for parametric Tensor/Matrix\n- Stdlib `type Stress = \u2026` / `type Strain = \u2026` aliases in `crates/reify-compiler/stdlib/*.ri` (pick the file that hosts existing dimensional aliases)\n\n**Out of scope**: stdlib registration of `moment_of_inertia` / `center_of_mass` etc. as language-level built-ins \u2014 that is task (c). FFI plumbing \u2014 already shipped via #2325/#2327.\n\n**Acceptance**: a fixture `.ri` file with `fn f(b: Solid, density: Scalar<Density>) -> Tensor<2, 3, MomentOfInertia> { ... }` parses and type-resolves cleanly (compile_with_stdlib produces no error-severity diagnostics for the type signature itself; the body can return `undef` until task (c) wires the actual builtin).\n\nPRD reference: `docs/prds/topology-selectors.md` \u00a73.9 + triage esc-2325-47."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-types/src",
+    "tree-sitter-reify",
+    "crates/reify-compiler/src",
+    "crates/reify-compiler/stdlib"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "reference_unavailable": "No single \"Merge task/2696 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

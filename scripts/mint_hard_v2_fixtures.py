@@ -832,6 +832,166 @@ def run_author(census_date: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --mint — drive the canonical task_sampler pipeline over the include rows
+# ---------------------------------------------------------------------------
+
+_REPO_OF_PROJECT = {'reify': 'reify', 'dark_factory': 'df', 'know_live': 'kl'}
+
+
+def _is_ancestor_of_main(repo_root: Path | str, commit: str) -> bool:
+    """True if *commit* is reachable from ``main`` (hence not GC-eligible)."""
+    proc = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', commit, 'main'],
+        cwd=str(repo_root), capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def _import_sampler():
+    """Import ``task_sampler`` from this repo's orchestrator package."""
+    src = REPO_ROOT / 'orchestrator' / 'src'
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from orchestrator.evals import task_sampler
+    return task_sampler
+
+
+async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
+                    ceilings: dict) -> dict:
+    """Build one fixture record from an adjudicated ``include`` row."""
+    repo = _REPO_OF_PROJECT[row['project']]
+    cand = sampler.CompletedTaskCandidate(
+        task_id=row['task_id'],
+        project=row['project'],
+        project_root=row['project_root'],
+        title=row['title'],
+        description=row['description'],
+        complexity=row.get('complexity'),
+        modules=list(row.get('modules') or []),
+        merge_sha=row['merge_sha'] or '',
+    )
+
+    if row['mint_mode'] == 'referenced':
+        pre, post = await sampler.resolve_task_commits_from_merge(
+            cand.project_root, row['merge_sha'],
+        )
+        cand.pre_commit, cand.post_commit = pre, post
+        reference = await sampler.capture_reference(cand.project_root, pre, post)
+    else:
+        # planRate-only: no landed post SHA exists, so there is nothing to
+        # diff and nothing to pin. The baseline comes off the recorded rung.
+        cand.pre_commit = row['baseline_sha']
+        cand.post_commit = ''
+        reference = sampler.ReferenceCapture(
+            post_task_commit='', files=0, insertions=0, deletions=0,
+        )
+
+    record = sampler.build_fixture_record(
+        cand, reference, sampler.default_verify_commands(repo), plan=None,
+        cohort='fable-trial-v2-hard', sampled_at=sampled_at, seed=seed,
+    )
+    record['provenance']['baseline_source'] = row['baseline_source']
+
+    if row['mint_mode'] == 'referenced':
+        # The pin is a stability guarantee (it keeps `post` off the GC path),
+        # not a correctness precondition — the reference block already carries
+        # the SHA. So a read-only checkout degrades to a RECORDED failure
+        # rather than making the whole pool un-mintable.
+        try:
+            await sampler.pin_eval_branch(
+                cand.project_root, record['id'], cand.post_commit,
+            )
+            record['provenance']['eval_branch_pinned'] = True
+        except (RuntimeError, OSError) as exc:
+            reachable = _is_ancestor_of_main(cand.project_root, cand.post_commit)
+            record['provenance']['eval_branch_pinned'] = False
+            record['provenance']['eval_branch_pin_error'] = (
+                f'pin_eval_branch(evals/{record["id"]}) failed: {exc}'
+            )
+            record['provenance']['eval_branch_pin_impact'] = (
+                'None for retrievability. The reference block carries the post '
+                'SHA directly and materialize_reference_diff works off the '
+                'pre/post SHAs, not the branch; the pin only holds the commit '
+                'off the GC path. post_task_commit IS an ancestor of main in '
+                'this checkout, so it is reachable and not GC-eligible '
+                'regardless. Re-run --mint from a checkout with write access '
+                'to restore the belt-and-braces ref.'
+                if reachable else
+                'The reference block still carries the post SHA, but the '
+                'commit is NOT reachable from main in this checkout and is '
+                'not held by a ref — it is GC-eligible. Re-pin from a '
+                'checkout with write access before relying on it.'
+            )
+            print(f'  WARNING: could not pin evals/{record["id"]}: {exc}',
+                  file=sys.stderr)
+    else:
+        # Omit the key entirely and record WHY. An empty `reference: {}` block
+        # is indistinguishable from a capture that silently failed, which is
+        # exactly the degradation D9 exists to abolish.
+        record.pop('reference', None)
+        record['provenance']['reference_unavailable'] = (
+            f'No single "Merge task/{row["task_id"]} into main" commit exists '
+            f'in {row["project_root"]} (SPLIT / direct-landed, or several '
+            f'merges carry this id), so no landed post-commit is available to '
+            f'diff against. This fixture is planRate-only: it is scored on '
+            f'plan production, never on reference-diff similarity. Its '
+            f'pre_task_commit came from baseline rung '
+            f'{row["baseline_source"]!r}.'
+        )
+
+    # runner.py reads both straight off the task record (task.get with 50 / 60
+    # defaults), so a fixture missing them silently runs at the wrong ceiling.
+    record['max_architect_turns'] = ceilings['max_architect_turns']
+    record['timeout_minutes'] = ceilings['timeout_minutes']
+    return record
+
+
+async def _run_mint(sampled_at: str, seed: int) -> int:
+    import asyncio  # noqa: F401  (imported for symmetry with the caller)
+
+    sampler = _import_sampler()
+    manifest = json.loads(CURATION_JSON.read_text())
+    ceilings = manifest['ceilings']
+
+    includes = [c for c in manifest['candidates'] if c['decision'] == 'include']
+    # The manifest carries only the curation fields; re-read title/description
+    # from each task db so the fixture's task_definition is the real brief.
+    by_project: dict[str, list[dict]] = {}
+    for row in includes:
+        by_project.setdefault(row['project'], []).append(row)
+    for project, rows in by_project.items():
+        root = Path(SOURCE_CHECKOUTS[project])
+        cands = [
+            Candidate(task_id=r['task_id'], project=project, project_root=str(root))
+            for r in rows
+        ]
+        enrich_from_task_db(cands, root / '.taskmaster' / 'tasks' / 'tasks.db')
+        for row, cand in zip(rows, cands, strict=True):
+            row['title'] = cand.title
+            row['description'] = cand.description
+            row['complexity'] = cand.complexity
+            row['modules'] = cand.modules
+
+    POOL_DIR.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for row in includes:
+        record = await _mint_one(sampler, row, sampled_at, seed, ceilings)
+        (POOL_DIR / f'{record["id"]}.json').write_text(
+            json.dumps(record, indent=2) + '\n',
+        )
+        written += 1
+        print(f'  wrote {record["id"]}.json ({row["mint_mode"]}, '
+              f'baseline={row["baseline_source"]})')
+    print(f'wrote {written} fixture(s) to {POOL_DIR}')
+    return 0
+
+
+def run_mint(sampled_at: str, seed: int) -> int:
+    import asyncio
+    return asyncio.run(_run_mint(sampled_at, seed))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -839,10 +999,19 @@ def main(argv: list[str] | None = None) -> int:
                       help='Re-run the architect-exhaustion census and print it')
     mode.add_argument('--author', action='store_true',
                       help='(Re)generate _meta/curation.json from the live dbs')
+    mode.add_argument('--mint', action='store_true',
+                      help='Mint the fixture JSONs from the manifest include rows')
     parser.add_argument('--census-date', default=None,
                         help='ISO date stamped into the manifest (required with '
                              '--author; passed in rather than read from the '
                              'clock so the manifest stays reproducible)')
+    parser.add_argument('--sampled-at', default=None,
+                        help='ISO timestamp stamped into every minted fixture '
+                             '(required with --mint; injected at the CLI '
+                             'boundary, mirroring cli._run_eval_sample, so the '
+                             'minting library stays wall-clock-free)')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Recorded in each fixture\'s provenance')
     parser.add_argument('--no-strict', action='store_true',
                         help='Report census drift without a non-zero exit')
     args = parser.parse_args(argv)
@@ -853,6 +1022,10 @@ def main(argv: list[str] | None = None) -> int:
         if not args.census_date:
             parser.error('--author requires --census-date')
         return run_author(args.census_date)
+    if args.mint:
+        if not args.sampled_at:
+            parser.error('--mint requires --sampled-at')
+        return run_mint(args.sampled_at, args.seed)
     return 2
 
 

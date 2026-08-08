@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_3822",
+  "name": "RBD-\u03b1: MassProperties + JointForce + MotionTrajectory structure defs in stdlib (PSD inertia validation)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "2ceaf9ec17c849ba0402009b0de5d698eabb2597",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "RBD-\u03b1: MassProperties + JointForce + MotionTrajectory structure defs in stdlib (PSD inertia validation)",
+    "description": "Author the Phase-1 foundation structure_defs for rigid-body dynamics in a NEW stdlib module crates/reify-compiler/stdlib/dynamics.ri:\n\n- `MassProperties { mass: Mass, com: Point3, inertia: Tensor3x3, origin: Frame3 }` per PRD \u00a74.1. Tensor3x3 = symmetric 3\u00d73 inertia tensor stored as [[Real;3];3] Matrix at value level.\n- `JointForce { joint_id: BodyId, value: JointForceValue }` per PRD \u00a74.2; JointForceValue is a tagged union mirroring JointValue: ScalarForce(Real) prismatic, ScalarTorque(Real) revolute/coupling, CylForce([Real;2]), PlanarForce([Real;3]), SphereForce([Real;3]), ZeroForce (fixed).\n- `TrajectorySample { t: Time, values: List<JointValue>, vels: List<JointValue>, accels: List<JointValue> }` and `MotionTrajectory { mechanism: Mechanism, samples: List<TrajectorySample> }` per PRD \u00a74.3.\n\nCtor constraint validation (structure_def constraint block): mass >= 0 (zero allowed for massless intermediate links; warn on use); inertia symmetric PSD \u2014 eigenvalue check at MassProperties(...) ctor time, violation emits E_DynamicsInertiaNotPSD per PRD \u00a74.1.\n\nPRD: docs/prds/v0_3/rigid-body-dynamics.md task \u03b1\n\nUser-observable signal: compile test asserts the structure_defs resolve to expected templates; ctor MassProperties(mass: ..., inertia: non_psd_matrix, ...) emits E_DynamicsInertiaNotPSD (ctor returns Undef).\nConsumer: \u03b2 (body_mass_props builds MassProperties), \u03b7 (inverse_dynamics returns List<JointForce>), \u03b4/\u03b5 (MotionTrajectory/TrajectorySample consumers) \u2014 intra-batch.\nCrates touched: crates/reify-compiler/stdlib/dynamics.ri (NEW), reify-compiler constraint validation.\n\nCross-PRD prereq (report-only, not wired by this batch): SIR-\u03b1 task 3540 (Value::StructureInstance ctor lowering) \u2014 DONE/merged 2026-05-16, so this prereq is already satisfied."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/3822 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

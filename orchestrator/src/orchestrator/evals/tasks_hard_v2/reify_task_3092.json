@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_3092",
+  "name": "Real libgmsh FFI binding via conda-forge env (libgmsh 4.15.2 at /opt/reify-deps) \u2014 replace stub GmshKernel from task 2925",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "3f6cbf9f45873ccf30d5a2ae000bc59c5e673124",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Real libgmsh FFI binding via conda-forge env (libgmsh 4.15.2 at /opt/reify-deps) \u2014 replace stub GmshKernel from task 2925",
+    "description": "Replace the stub `GmshKernel` shipped by task 2925's foundation plan with a real libgmsh C-API binding. This is the production deliverable that completes 2925's original 'library-linked' charter, split off so the foundation/scaffolding work and the FFI work are sized as separate tasks per may07 plan-revalidation analysis."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/3092 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

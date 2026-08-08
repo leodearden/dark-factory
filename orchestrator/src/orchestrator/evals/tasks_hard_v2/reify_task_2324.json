@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_2324",
+  "name": "Wire OCCT geometry ops into .ri-language stdlib + eval dispatch (closest_point, on, angle_between_surfaces)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "66b9b752bd21bb8d2494e5b23f22cbd85c2e113a",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Wire OCCT geometry ops into .ri-language stdlib + eval dispatch (closest_point, on, angle_between_surfaces)",
+    "description": "Register `closest_point`, `on(point, geometry)`, and `angle_between_surfaces` in the Reify .ri-language stdlib and wire eval-pipeline dispatch (GeometryQuery kernel dispatch path). All FFI primitives have shipped: Task 2828 (closest_point_on_shape \u2014 done), 2829 (point_on_shape \u2014 done), 2830 (surface_angle \u2014 done), 2832 (surface_normal_at/curvature_at \u2014 done). Remaining scope: .ri-language stdlib declarations, GeometryQuery dispatch path from compiled expressions, and language-level smoke tests (`closest_point(p, box)`, `on(p, sphere)`, `angle_between_surfaces(face_a, face_b)`)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "reference_unavailable": "No single \"Merge task/2324 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

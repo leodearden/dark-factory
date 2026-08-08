@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_3883",
+  "name": "RBD-\u03b1.1a: MassProperties structure_def shell in NEW stdlib/dynamics.ri + stdlib_loader registration",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "2ceaf9ec17c849ba0402009b0de5d698eabb2597",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "RBD-\u03b1.1a: MassProperties structure_def shell in NEW stdlib/dynamics.ri + stdlib_loader registration",
+    "description": "Narrowed (R3 split) from prior 3883 scope after two consecutive planning runs hit max_turns. See steward note in details. PRD: docs/prds/v0_3/rigid-body-dynamics.md \u00a74.1 + \u00a710 Phase 1 task \u03b1.\n\nSCOPE (this task ONLY \u2014 PSD validator + new diagnostic moved to follow-up 3883.b):\n\n1. Create NEW stdlib module `crates/reify-compiler/stdlib/dynamics.ri` with ONLY the `MassProperties` structure_def shell + `constraint mass >= 0`:\n   ```\n   structure def MassProperties {\n       param mass: Mass;\n       param com: Point3<Length>;\n       param inertia: Matrix<3, 3, Real>;\n       param origin: Frame3;\n       constraint mass >= 0;\n   }\n   ```\n   Type-name reconciliation per steward addendum:\n   - `Tensor3x3` \u2192 `Matrix<3, 3, Real>` (precedent: `crates/reify-compiler/stdlib/solver_elastic.ri:308`)\n   - bare `Point3` \u2192 `Point3<Length>` (precedent: `crates/reify-compiler/stdlib/constitutive.ri:54`)\n   - `Frame3` exists as `Type::Frame(3)` in `crates/reify-types/src/ty.rs`; verify .ri surface syntax via reify-syntax.\n\n2. Register in `crates/reify-compiler/src/stdlib_loader.rs` `load_stdlib()` `sources: Vec<(&str, &str)>` table: add `(\"std.dynamics\", include_str!(\"../stdlib/dynamics.ri\"))` AFTER `std.units` and `std.si_units` (dynamics depends on `Mass`/`Length`). Tail position after `std.fdm` is the safe default \u2014 no later module references dynamics.\n\n3. Compile-resolution test: a stdlib-loader / type-resolution test that `MassProperties` resolves to its expected structure_def template (model after existing stdlib tests). NO eval-level ctor or PSD test in this task.\n\nCONSTRAINT-BLOCK SYNTAX reference points:\n- `crates/reify-compiler/stdlib/tolerancing.ri:30-38` (single inline constraint, cleanest)\n- `crates/reify-compiler/stdlib/solver_elastic.ri:167-226` (5 separate constraint lines)\n- `crates/reify-compiler/stdlib/solver_buckling.ri:75-96` (3 constraints)\nAll use inline boolean expressions over param/let bindings \u2014 exactly what this task needs.\n\nEXPLICITLY OUT OF SCOPE (covered by follow-up task spawned 2026-05-26):\n- E_DynamicsInertiaNotPSD diagnostic variant\n- Rust-side eigenvalue PSD validator\n- ctor hook at engine_eval.rs:1794\n- e2e test `dynamics_ctor_validation_e2e.rs`\n\nUser-observable signal (leaf): MassProperties structure_def resolves through stdlib loading; type checking accepts a well-typed MassProperties literal.\n\nCrates touched (this task): `crates/reify-compiler/stdlib/dynamics.ri` (NEW), `crates/reify-compiler/src/stdlib_loader.rs`. NO changes to reify-types or reify-eval in this task.\n\nOriginal cross-PRD prereq (already satisfied, report-only): SIR-\u03b1 task 3540 \u2014 DONE/merged 2026-05-16."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/3883 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

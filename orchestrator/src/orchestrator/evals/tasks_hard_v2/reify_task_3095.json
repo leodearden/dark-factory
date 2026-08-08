@@ -1,0 +1,50 @@
+{
+  "id": "reify_task_3095",
+  "name": "Real OpenVDB C++ FFI via conda-forge env (libopenvdb 13.0.0 at /opt/reify-deps) \u2014 replace pure-Rust stub kernel",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "fe3b8ab103a234802e4b5969a6a6f9de2929cf37",
+  "post_task_commit": "70f0449139aaef9474e93aafca35cb993dfc29ca",
+  "task_definition": {
+    "title": "Real OpenVDB C++ FFI via conda-forge env (libopenvdb 13.0.0 at /opt/reify-deps) \u2014 replace pure-Rust stub kernel",
+    "description": "Wire `crates/reify-kernel-openvdb` to the real OpenVDB C++ library installed by `setup-dev.sh` via the conda-forge `reify-deps` env at `/opt/reify-deps`. Replace stub method bodies that currently return \"real FFI deferred\". HARD dependency for v0.4 shells (mid-surface extraction) and v0.3 imported-field-source (OpenVDB grid I/O)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "70f0449139aaef9474e93aafca35cb993dfc29ca",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "merge_first_parent",
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_3095) failed: Command git update-ref refs/heads/evals/reify_task_3095 70f0449139aaef9474e93aafca35cb993dfc29ca failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_3095': cannot lock ref 'refs/heads/evals/reify_task_3095': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_3095.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "70f0449139aaef9474e93aafca35cb993dfc29ca",
+    "diff_stat": {
+      "files": 19,
+      "insertions": 2130,
+      "deletions": 51
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

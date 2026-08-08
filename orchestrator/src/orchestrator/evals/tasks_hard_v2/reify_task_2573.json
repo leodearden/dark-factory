@@ -1,0 +1,54 @@
+{
+  "id": "reify_task_2573",
+  "name": "[v0.2] persistent-naming-v2 task 5a: extrude + revolve (standard OCCT hooks)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "4e12e7a06d3d74ee51098b739a6d124dd03cf909",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "[v0.2] persistent-naming-v2 task 5a: extrude + revolve (standard OCCT hooks)",
+    "description": "Wire attribute attachment for extrude (`BRepPrimAPI_MakePrism`) and revolve (`BRepPrimAPI_MakeRevol`). Both expose standard `BRepAlgoAPI_*`-style `Modified`/`Generated`/`IsDeleted` history maps, so this task uses the standard hooks established by task 2590 \u2014 no custom history mappers required here."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-eval/src/engine_build.rs",
+    "crates/reify-eval/src/lib.rs",
+    "crates/reify-eval/src/topology_attribute_propagation.rs",
+    "crates/reify-eval/tests/topology_attribute_extrude_revolve_e2e.rs",
+    "crates/reify-kernel-occt/cpp/occt_wrapper.cpp",
+    "crates/reify-kernel-occt/cpp/occt_wrapper.h",
+    "crates/reify-kernel-occt/src/ffi.rs",
+    "crates/reify-kernel-occt/src/handle.rs",
+    "crates/reify-kernel-occt/src/lib.rs",
+    "crates/reify-kernel-occt/src/stubs.rs",
+    "crates/reify-kernel-occt/tests/extrude_with_history_integration.rs",
+    "crates/reify-kernel-occt/tests/revolve_with_history_integration.rs",
+    "crates/reify-types/src/geometry.rs"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "reference_unavailable": "No single \"Merge task/2573 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

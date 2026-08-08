@@ -1,0 +1,40 @@
+{
+  "id": "reify_task_4086",
+  "name": "FEA result-model \u03b3: GUI engine FEA dispatch wiring (register_compute_fns + pending_solve_cancel producer + fixture realization)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "a18a30657416a4cbcfefbb58cbed314b0fddffbb",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "FEA result-model \u03b3: GUI engine FEA dispatch wiring (register_compute_fns + pending_solve_cancel producer + fixture realization)",
+    "description": "Wire the GUI engine so a FEA solve produces a real (non-Undef) ElasticResult AT ALL (esc-2962-66 root cause). Three parts: (1) call reify_eval::compute_targets::register_compute_fns(&mut engine) in BOTH gui/src-tauri/src/engine.rs Engine::new (:1367) and from_engine (:893) \u2014 today zero GUI call sites (test-only), so solve_elastic_static body-inlines to the { ElasticResult() } stub and every field incl. max_von_mises is Undef in the GUI; (2) add the pending_solve_cancel PRODUCER in gui/src-tauri/src/commands.rs \u2014 set Some(handle) when a solve starts, clear on completion (consumer cancel_solve_impl exists at :321-333, producer absent, :59 always None); (3) add `let body = box(length, width, height)` to examples/fea_cantilever_smoke.ri (no realization today).\n\nPRD: docs/prds/v0_4/fea-result-model.md task \u03b3 (contract \u00a74.5).\n\nUser-observable signal: GUI integration test (debug MCP) \u2014 load the cantilever fixture, solve, assert a non-Undef ElasticResult with real max_von_mises (~6 MPa) reaches the GUI (B4); pending_solve_cancel is Some during solve and cleared after, rapid retick cancels prior solve with no orphaned threads (B7).\nConsumer: \u03b4 (GUI surface-vertex path), \u03b5 (2962)\nModules touched: gui/src-tauri/src/engine.rs, gui/src-tauri/src/commands.rs, examples/fea_cantilever_smoke.ri"
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "reference_unavailable": "No single \"Merge task/4086 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

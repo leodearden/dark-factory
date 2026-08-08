@@ -1,0 +1,50 @@
+{
+  "id": "reify_task_3228",
+  "name": "GUI: wire multi-file `import` resolution via compile_project + project_root",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "5150d11bcb346d5d663c6012ed46927a598399b2",
+  "post_task_commit": "6a2ab68641375b7f00450f8092470a555f59dc50",
+  "task_definition": {
+    "title": "GUI: wire multi-file `import` resolution via compile_project + project_root",
+    "description": "EngineSession in the GUI compiles a single .ri file via compile_with_stdlib, which never invokes ModuleResolver. As a result, user `import foo` declarations in the GUI silently fail to load sibling .ri modules \u2014 the imported module's pub items are absent from the engine, and instantiations of imported types yield empty engine state with no surfaced error. Wire the GUI engine to use module_dag::compile_project with project_root = entry_path.parent() (and the configured stdlib_root) so multi-file user projects work the same way they already do in tests and the LSP's goto-def."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "6a2ab68641375b7f00450f8092470a555f59dc50",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "merge_first_parent",
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_3228) failed: Command git update-ref refs/heads/evals/reify_task_3228 6a2ab68641375b7f00450f8092470a555f59dc50 failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_3228': cannot lock ref 'refs/heads/evals/reify_task_3228': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_3228.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "6a2ab68641375b7f00450f8092470a555f59dc50",
+    "diff_stat": {
+      "files": 2,
+      "insertions": 439,
+      "deletions": 2
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

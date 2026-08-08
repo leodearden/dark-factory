@@ -1,0 +1,52 @@
+{
+  "id": "reify_task_2336",
+  "name": "Harden Analytical Field Source Kind Type-Checking",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "37b14401702c99d41a3007b345921513fdd51804",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Harden Analytical Field Source Kind Type-Checking",
+    "description": "Implement type-checking for the lambda body in analytical field sources against declared Domain -> Codomain signatures."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-compiler/src/functions.rs",
+    "crates/reify-compiler/tests/compile_builder_smoke_tests.rs",
+    "crates/reify-compiler/tests/field_compile_tests.rs",
+    "crates/reify-compiler/tests/prepass_consolidation_tests.rs",
+    "crates/reify-compiler/tests/silent_defaults_tests.rs",
+    "crates/reify-compiler/tests/type_alias_compile_tests.rs",
+    "crates/reify-eval/src/test_runner.rs",
+    "crates/reify-eval/tests/field_eval_tests.rs",
+    "crates/reify-expr/tests/field_eval_tests.rs",
+    "crates/reify-types/src/diagnostics.rs",
+    "docs/prds/field-source-kinds.md"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "reference_unavailable": "No single \"Merge task/2336 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}
