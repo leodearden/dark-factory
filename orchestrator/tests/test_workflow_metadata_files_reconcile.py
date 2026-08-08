@@ -24,13 +24,25 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeScheduler
+from _workflow_helpers import FakeScheduler, same_module_siblings
 from shared.locking import directory_locks
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+# The depth these tests pin on their MagicMock config, in ONE place.
+#
+# Every `files_to_modules(..., _LOCK_DEPTH)` precondition below and every
+# `config.lock_depth` pin must read this same name.  Re-typing the literal in
+# both places looks harmless but is the failure mode task 3866 exists to
+# document: if a pin is ever swapped for a real config (which resolves the
+# LIVE operational lock_depth via the autouse `_isolate_orch_config` fixture),
+# a re-typed precondition keeps asserting the old depth and keeps PASSING
+# while the code under test runs at a depth where the premise is false — a
+# silently-wrong test instead of a loud precondition failure.
+_LOCK_DEPTH = 2
 
 
 def _make_workflow(
@@ -48,7 +60,7 @@ def _make_workflow(
     config = MagicMock(spec_set=_spec)
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = project_root
 
     update_task = AsyncMock(return_value=True)
@@ -434,7 +446,7 @@ def _make_replan_workflow(
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = max_review_cycles
     config.max_amendment_rounds = 1
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = tmp_path / 'proj'
     # Real reviewer model string so _reviewer_config_fingerprint() (task 2749)
     # yields a deterministic, non-None digest — mirrors
@@ -573,9 +585,9 @@ class TestReplanScopeReconcile:
     ):
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(
@@ -601,7 +613,7 @@ class TestReplanScopeReconcile:
             f'got {snapshots[1]["blast"]!r}'
         )
         widened_files = [*initial_files, new_file]
-        assert wf.modules == files_to_modules(widened_files, 2), (
+        assert wf.modules == files_to_modules(widened_files, _LOCK_DEPTH), (
             'wf.modules must cover the new file module before the 2nd '
             f'EXECUTE; got {wf.modules!r}'
         )
@@ -609,12 +621,15 @@ class TestReplanScopeReconcile:
     async def test_same_module_widen_persists_via_update_task_before_next_execute(
         self, tmp_path: Path,
     ):
-        f1 = 'a/b/c/d/e.py'
-        f2 = 'a/b/c/d/f.py'
-        assert files_to_modules([f1], 2) == files_to_modules([f1, f2], 2), (
-            'precondition: f1 and f2 must map to the SAME module set'
-        )
-        modules = files_to_modules([f1], 2)
+        # Derived from _LOCK_DEPTH, not a fixed literal: a hardcoded
+        # `a/b/c/d/{e,f}.py` pair only shares a module while lock_depth <= 4,
+        # so at a deeper setting the SAME-module premise below becomes
+        # unsatisfiable (task 3866).
+        f1, f2 = same_module_siblings(_LOCK_DEPTH)
+        assert files_to_modules([f1], _LOCK_DEPTH) == files_to_modules(
+            [f1, f2], _LOCK_DEPTH,
+        ), 'precondition: f1 and f2 must map to the SAME module set'
+        modules = files_to_modules([f1], _LOCK_DEPTH)
 
         wf, scheduler = _make_replan_workflow(
             tmp_path=tmp_path, initial_files=[f1], modules=modules,
@@ -652,9 +667,9 @@ class TestReplanScopeReconcile:
         lock."""
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(
