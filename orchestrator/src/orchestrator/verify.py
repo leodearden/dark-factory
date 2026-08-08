@@ -7857,6 +7857,9 @@ class _RerunPolicy:
     #: Verdict-vocabulary tail of the "mapping yielded nothing usable" line;
     #: the caller's alone (the shared helper only knows 'unconfirmable').
     unmapped_log_tail: str
+    #: Verdict-vocabulary tail of the catch-all "unexpected error" WARNING.
+    #: Per-site so each gate's operator grep survives the extraction verbatim.
+    error_log_tail: str
     #: How this site re-runs ONE scoped subproject group.
     engine: Callable[
         [Path, 'OrchestratorConfig', ModuleConfig], Awaitable[_RerunObservation],
@@ -7936,101 +7939,160 @@ async def confirm_isolated_rerun_verdict(
     (INV-2). Both existing gates map every non-``passes_in_isolation`` verdict
     back to ``None`` at their wrapper, so no gate's behaviour changes today;
     what changes is that the reason is now stated instead of dropped.
+
+    NEVER RAISES (INV-1), and an unexpected exception deliberately maps to
+    ``fails_in_isolation`` rather than ``unconfirmable``: the merge path
+    (merge_queue.py) has no ``VerifyInfraError`` handler, so the only safe
+    default is "merge stays red". That is a different judgement from the
+    named-``unconfirmable`` paths, which are cases we UNDERSTAND well enough
+    to say we could not tell — an unhandled exception is not.
     """
-    policy = _CALL_SITE_POLICY[FlakeCallSite(call_site)]
+    # Bound BEFORE the try so the except handler can never hit an unbound
+    # local and re-raise a NameError out of a public entry point (α's
+    # record_flake_occurrence sets this precedent for the same reason).
+    node_ids: list[str] = []
+    try:
+        coerced_site: FlakeCallSite | str = FlakeCallSite(call_site)
+    except ValueError:
+        # Keep the raw string on the returned FlakeSuppression: the dataclass
+        # has no runtime validation, and α's record_flake_occurrence already
+        # coerces + degrades loudly through B12 rather than persisting a
+        # guess. Fall through to the catch-all so this fails CLOSED.
+        coerced_site = call_site
 
-    node_ids = _extract_failing_test_ids(failing_result.test_output)
-    if not node_ids:
-        # We examined NOTHING — an opaque/lint/type-only failure names no test.
-        # test_ids is empty, which §8 permits only on an `unconfirmable` row.
-        return _observe(
-            FlakeVerdict.unconfirmable, (),
-            call_site=call_site, runner=runner,
-            reason='no_recoverable_node_ids', now=now,
-        )
-
-    # Map each node-id to its owning subproject over the given module_configs
-    # + the on-disk worktree, via the SHARED helper (see its docstring for the
-    # probe rules and the ambiguity WARNING). mc_by_prefix is the single source
-    # for both the helper argument and the per-group lookup below.
-    mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-    groups = _group_node_ids_by_subproject(
-        worktree, mc_by_prefix, node_ids, log_label=policy.log_label,
-    )
-    # `not groups`, NOT `is None`: BOTH sentinels must fail closed. Falling
-    # into the groups.items() loop with an empty dict would exit having run
-    # ZERO isolated re-runs and then report `passes_in_isolation` — a full
-    # suppression verdict on zero evidence, letting a genuinely red merge land.
-    if not groups:
-        # Name the offending node-ids HERE so this ONE line answers both
-        # "which tests failed to map?" and "what did the gate decide?" without
-        # correlating a second line: the shared helper's own INFO names the
-        # first unmappable node-id but only knows the neutral 'unconfirmable',
-        # while the verdict vocabulary is the CALLER's alone (hence
-        # policy.unmapped_log_tail). Rendering `groups` also separates the
-        # reachable None case from the defensive-only {}. The preview is
-        # bounded — a mass failure can extract hundreds of node-ids, and a log
-        # line is not a report.
-        shown = node_ids[:10]
-        extra = len(node_ids) - len(shown)
-        logger.info(
-            '%s: node-id -> subproject mapping yielded nothing usable (%r) '
-            'for %s%s in %s — unconfirmable, %s',
-            policy.log_label, groups, shown,
-            f' (+{extra} more)' if extra else '', worktree,
-            policy.unmapped_log_tail,
-        )
-        # We DID examine these specific tests, so they are named (PRD B6) —
-        # unlike the "nothing to examine" branch above.
-        return _observe(
-            FlakeVerdict.unconfirmable, node_ids,
-            call_site=call_site, runner=runner,
-            reason='node_ids_unmapped_to_subproject', now=now,
-        )
-
-    # Each subproject group gets its own scoped + forced-serial +
-    # generous-timeout isolated re-run in the SAME worktree (INV-3 — the
-    # discriminator judges the tree it was handed and never mints another).
-    # ALL groups must confirm green.
-    for prefix, group_node_ids in groups.items():
-        mc = mc_by_prefix[prefix]
-        scoped_cmd = _with_pytest_timeout_str(
-            _serial_pytest_str(
-                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-            ),
-            policy.timeout_secs,
-        )
-        scoped_mc = replace(
-            mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
-        )
-        observation = await policy.engine(worktree, config, scoped_mc)
-        # Groups are evaluated IN ORDER and the FIRST non-pass short-circuits,
-        # preserving today's early `return None` — a later group's verdict
-        # cannot rescue an earlier one, so there is nothing to gain by
-        # continuing and a full re-run's cost to lose.
-        if observation.outcome is not _RerunOutcome.passed:
-            if policy.log_group_not_confirmed is not None:
-                policy.log_group_not_confirmed(prefix, observation)
-            if observation.outcome is _RerunOutcome.unconfirmable:
-                # We could not RE-RUN, which is not evidence the test is red.
-                # Reporting this as `fails_in_isolation` would launder an
-                # infrastructure failure into a verdict about the code.
-                return _observe(
-                    FlakeVerdict.unconfirmable, node_ids,
-                    call_site=call_site, runner=runner,
-                    reason=f'infra_transient_rerun:{observation.category or "unknown"}',
-                    now=now,
-                )
+    try:
+        policy = _CALL_SITE_POLICY[coerced_site]  # type: ignore[index]
+    except (KeyError, TypeError):
+        if isinstance(coerced_site, FlakeCallSite):
+            # A VALID member with no β policy — a known-unknown (chronic_marker
+            # is task κ's), not a defect. Answering honestly keeps it countable
+            # in θ's class-1 rate instead of hiding it in the exception path.
+            logger.info(
+                'confirm_isolated_rerun_verdict: no policy registered for '
+                'call_site %r — unconfirmable', str(coerced_site),
+            )
             return _observe(
-                FlakeVerdict.fails_in_isolation, node_ids,
-                call_site=call_site, runner=runner, now=now,
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason=f'unsupported_call_site:{coerced_site}', now=now,
+            )
+        logger.warning(
+            'confirm_isolated_rerun_verdict: uncoercible call_site %r — '
+            'failing closed to red', call_site,
+        )
+        return _observe(
+            FlakeVerdict.fails_in_isolation, (),
+            call_site=coerced_site, runner=runner, now=now,
+        )
+
+    try:
+        node_ids = _extract_failing_test_ids(failing_result.test_output)
+        if not node_ids:
+            # We examined NOTHING — an opaque/lint/type-only failure names no
+            # test. test_ids is empty, which §8 permits only on `unconfirmable`.
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason='no_recoverable_node_ids', now=now,
             )
 
-    policy.log_success(node_ids, worktree)
-    return _observe(
-        FlakeVerdict.passes_in_isolation, node_ids,
-        call_site=call_site, runner=runner, now=now,
-    )
+        # Map each node-id to its owning subproject over the given
+        # module_configs + the on-disk worktree, via the SHARED helper (see its
+        # docstring for the probe rules and the ambiguity WARNING).
+        # mc_by_prefix is the single source for both the helper argument and
+        # the per-group lookup below.
+        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+        groups = _group_node_ids_by_subproject(
+            worktree, mc_by_prefix, node_ids, log_label=policy.log_label,
+        )
+        # `not groups`, NOT `is None`: BOTH sentinels must fail closed. Falling
+        # into the groups.items() loop with an empty dict would exit having run
+        # ZERO isolated re-runs and then report `passes_in_isolation` — a full
+        # suppression verdict on zero evidence, letting a genuinely red merge
+        # land.
+        if not groups:
+            # Name the offending node-ids HERE so this ONE line answers both
+            # "which tests failed to map?" and "what did the gate decide?"
+            # without correlating a second line: the shared helper's own INFO
+            # names the first unmappable node-id but only knows the neutral
+            # 'unconfirmable', while the verdict vocabulary is the CALLER's
+            # alone (hence policy.unmapped_log_tail). Rendering `groups` also
+            # separates the reachable None case from the defensive-only {}.
+            # The preview is bounded — a mass failure can extract hundreds of
+            # node-ids, and a log line is not a report.
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
+            logger.info(
+                '%s: node-id -> subproject mapping yielded nothing usable (%r) '
+                'for %s%s in %s — unconfirmable, %s',
+                policy.log_label, groups, shown,
+                f' (+{extra} more)' if extra else '', worktree,
+                policy.unmapped_log_tail,
+            )
+            # We DID examine these specific tests, so they are named (PRD B6)
+            # — unlike the "nothing to examine" branch above.
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason='node_ids_unmapped_to_subproject', now=now,
+            )
+
+        # Each subproject group gets its own scoped + forced-serial +
+        # generous-timeout isolated re-run in the SAME worktree (INV-3 — the
+        # discriminator judges the tree it was handed and never mints another).
+        # ALL groups must confirm green.
+        for prefix, group_node_ids in groups.items():
+            mc = mc_by_prefix[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                policy.timeout_secs,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            observation = await policy.engine(worktree, config, scoped_mc)
+            # Groups are evaluated IN ORDER and the FIRST non-pass
+            # short-circuits, preserving today's early `return None` — a later
+            # group's verdict cannot rescue an earlier one, so there is nothing
+            # to gain by continuing and a full re-run's cost to lose.
+            if observation.outcome is not _RerunOutcome.passed:
+                if policy.log_group_not_confirmed is not None:
+                    policy.log_group_not_confirmed(prefix, observation)
+                if observation.outcome is _RerunOutcome.unconfirmable:
+                    # We could not RE-RUN, which is not evidence the test is
+                    # red. Reporting this as `fails_in_isolation` would launder
+                    # an infrastructure failure into a verdict about the code.
+                    return _observe(
+                        FlakeVerdict.unconfirmable, node_ids,
+                        call_site=coerced_site, runner=runner,
+                        reason=(
+                            f'infra_transient_rerun:'
+                            f'{observation.category or "unknown"}'
+                        ),
+                        now=now,
+                    )
+                return _observe(
+                    FlakeVerdict.fails_in_isolation, node_ids,
+                    call_site=coerced_site, runner=runner, now=now,
+                )
+
+        policy.log_success(node_ids, worktree)
+        return _observe(
+            FlakeVerdict.passes_in_isolation, node_ids,
+            call_site=coerced_site, runner=runner, now=now,
+        )
+
+    except Exception:
+        logger.warning(
+            '%s: unexpected error — %s',
+            policy.log_label, policy.error_log_tail, exc_info=True,
+        )
+        return _observe(
+            FlakeVerdict.fails_in_isolation, tuple(node_ids),
+            call_site=coerced_site, runner=runner, now=now,
+        )
 
 
 #: call_site -> per-site calibration for the ONE discriminator. See
@@ -8044,6 +8106,7 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
         timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
         requires_clean_other_legs=False,
         unmapped_log_tail='not suppressing',
+        error_log_tail='failing closed to red',
         engine=_merge_gate_isolated_rerun,
         log_success=_log_merge_gate_success,
         log_group_not_confirmed=_log_merge_gate_group_not_confirmed,
