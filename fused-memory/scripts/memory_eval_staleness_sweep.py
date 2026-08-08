@@ -81,6 +81,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -247,6 +248,20 @@ def pointer_targets(record: dict) -> list[PointerRef]:
     return refs
 
 
+def is_readable_target(target: Any) -> bool:
+    """True when *target* can be handed to a Qdrant point-id read.
+
+    ONE predicate behind both the disclosure (:func:`malformed_pointer_refs`)
+    and the read plan (:func:`unique_pointer_targets`), because they are the
+    same question and two spellings of it drift. The drift is not theoretical:
+    a looser read plan hands Qdrant's ``retrieve`` an id it rejects outright,
+    and since ``retrieve`` takes a LIST of ids, one malformed pointer anywhere
+    in the corpus would fail the read and take down a sweep that exists to
+    report on exactly that kind of damage.
+    """
+    return isinstance(target, str) and bool(_UUID_RE.match(target))
+
+
 def malformed_pointer_refs(refs: list[PointerRef]) -> list[PointerRef]:
     """The refs whose target is not a memory-id-shaped string.
 
@@ -256,9 +271,7 @@ def malformed_pointer_refs(refs: list[PointerRef]) -> list[PointerRef]:
     to know how much of it is "the target is gone" versus "the pointer was
     never writable in the first place", because the two have different fixes.
     """
-    return [ref for ref in refs if not (
-        isinstance(ref.target, str) and _UUID_RE.match(ref.target)
-    )]
+    return [ref for ref in refs if not is_readable_target(ref.target)]
 
 
 def unique_pointer_targets(refs: list[PointerRef]) -> list[str]:
@@ -269,13 +282,14 @@ def unique_pointer_targets(refs: list[PointerRef]) -> list[str]:
     first-seen rather than sorted so a run's store-access sequence is
     reproducible from the scan alone.
 
-    Non-string targets are excluded — they cannot be handed to a point-id
-    read at all. They are not thereby forgiven: :func:`dangling_census` still
-    counts them unresolved, and :func:`malformed_pointer_refs` names them.
+    Targets failing :func:`is_readable_target` are excluded — they cannot be
+    handed to a point-id read at all. They are not thereby forgiven:
+    :func:`dangling_census` still counts them unresolved off their absence
+    from the resolution map, and :func:`malformed_pointer_refs` names them.
     """
     seen: dict[str, None] = {}
     for ref in refs:
-        if isinstance(ref.target, str) and ref.target:
+        if is_readable_target(ref.target):
             seen.setdefault(ref.target, None)
     return list(seen)
 
@@ -859,3 +873,278 @@ def metric_families_not_measured(series) -> list[str]:
     """
     present = {metric.metric_id for metric in series.metrics}
     return [metric_id for metric_id in pinned_metric_ids() if metric_id not in present]
+
+
+# ---------------------------------------------------------------------------
+# The async I/O band
+#
+# Deliberately thin: fetch, normalise, hand off to the pure functions above.
+# Every judgement this sweep makes lives up there, which is what keeps the
+# whole of it assertable in the merge lane without a store. Nothing here
+# calls a mutating method — the read-only guarantee is a property of this
+# band's call list, and the test double enforces it by raising on writes.
+# ---------------------------------------------------------------------------
+
+SWEEP_CATEGORIES: tuple[str, ...] = (
+    'procedural_knowledge',
+    'preferences_and_norms',
+    'observations_and_summaries',
+)
+"""The Mem0-primary categories a sweep enumerates, δ's ``_ALL_CATEGORIES``.
+
+Mem0-primary only: ``scroll_by_metadata`` is a Qdrant payload scroll, so the
+three Graphiti-primary categories are not reachable through it at all. The
+report names that scope rather than leaving a near-zero count to be misread
+as an empty graph.
+"""
+
+_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
+"""Payload keys tried in order for a scrolled record's text.
+
+``data`` is the canonical scroll-payload key and is tried first; ``memory``
+is a search-layer key that can appear stale on a scroll payload; ``content``
+is a defensive third. Same order and same reasoning as δ's ``fetch_memories``
+— the two runners read the same payloads and must agree about which string is
+the memory.
+"""
+
+
+async def fetch_pointer_records(
+    memory: Any,
+    project_id: str,
+    *,
+    categories: Iterable[str] = SWEEP_CATEGORIES,
+    scan_limit: int = 5000,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
+    """Enumerate *project_id*'s Mem0 records, with the scan's own limits disclosed.
+
+    Issues ONE ``scroll_by_metadata`` per category. That is the enumeration,
+    not a missed optimisation: the primitive builds an AND-equality filter,
+    has no OR, and REJECTS an empty filter dict outright ("use get_all()"), so
+    there is no single whole-corpus call to widen into.
+
+    Each raw record is normalised to the ``{'id', 'content', 'metadata'}``
+    shape every pure function above takes, so a live run drives exactly the
+    code path the merge-lane tests cover.
+
+    Args:
+        memory: Live (or mock) MemoryService. Only ``mem0.scroll_by_metadata``
+            is touched.
+        project_id: Project scope to scan.
+        categories: Categories to enumerate (default: :data:`SWEEP_CATEGORIES`).
+        scan_limit: Max points PER CATEGORY.
+
+    Returns:
+        ``(records, scan_stats)``. *scan_stats* maps each category to
+        ``{'scanned': n, 'truncated': 0|1}``, counted PER CATEGORY so a cap
+        firing on one is never reported as a clean scan of the whole corpus.
+        ``truncated`` is an int so it can be summed into ``corpus.counts``
+        directly. This disclosure is the price of not paginating: the census
+        below is honest about being a capped sample, rather than silently
+        presenting one as a census.
+
+    Raises:
+        TimeoutError: A Qdrant read timeout propagates rather than degrading
+            to an empty list, so a timed-out scan is never mistaken for an
+            empty corpus — the same no-silent-fail posture the primitive
+            itself adopted.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    scope = Scope(project_id=project_id)
+    records: list[dict[str, Any]] = []
+    scan_stats: dict[str, dict[str, int]] = {}
+
+    for category in categories:
+        # A repeated category (δ hit this too) would append a second copy of
+        # every record under the SAME id, doubling every pointer edge the
+        # census then counts. scan_stats already holds that category's
+        # numbers, so skipping loses nothing from the disclosure.
+        if category in scan_stats:
+            continue
+        raw_records = await memory.mem0.scroll_by_metadata(
+            scope, {'category': category}, limit=scan_limit,
+        ) or []
+        scan_stats[category] = {
+            'scanned': len(raw_records),
+            'truncated': int(len(raw_records) >= scan_limit),
+        }
+        for raw in raw_records:
+            payload = raw.get('metadata') or {}
+            content = ''
+            for key in _CONTENT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    content = value
+                    break
+            records.append({
+                'id': str(raw.get('id') or ''),
+                'content': content,
+                'metadata': payload,
+            })
+    return records, scan_stats
+
+
+async def resolve_pointer_targets(
+    memory: Any,
+    project_id: str,
+    refs: list[PointerRef],
+) -> dict[str, bool]:
+    """Corroborate every pointer target in *refs* against the live store.
+
+    One ``get_memory_by_id`` per UNIQUE target (see
+    :func:`unique_pointer_targets`): a target cited by several sources costs
+    one read, but the read itself is never skipped. Marking a target resolved
+    because it happened to appear in the scroll already in hand would make the
+    census self-confirming — the scroll is capped and category-scoped, so a
+    target outside it exists yet would read as dangling. INV-3: corroborate
+    against ground truth, never against the snapshot that raised the question.
+
+    Malformed targets are absent from the result rather than mapped to
+    ``False``: they were never handed to a read, so this map says nothing
+    about them. :func:`dangling_census` treats that absence as unresolved and
+    :func:`malformed_pointer_refs` names them, which keeps "the target is
+    gone" and "the pointer was never writable" separable in the report.
+
+    Raises:
+        TimeoutError: Propagated, never folded into the unresolved count. The
+            primitive distinguishes "genuinely absent" from "backend timed
+            out" precisely so this caller can too; reporting a blip as a
+            dangling pointer would fabricate a defect and fire an α alarm on
+            an infrastructure hiccup.
+    """
+    resolution: dict[str, bool] = {}
+    for target in unique_pointer_targets(refs):
+        resolution[target] = await memory.get_memory_by_id(project_id, target) is not None
+    return resolution
+
+
+async def fetch_surfacing_ranks(
+    memory: Any,
+    project_id: str,
+    refs: list[PointerRef],
+    *,
+    limit: int = 10,
+) -> SurfacingObservation:
+    """Score every ``supersedes`` edge in *refs* against its own search.
+
+    One search per edge, using the SUCCESSOR's content as the query: the
+    question this family asks is "when the corpus is asked about what the
+    successor says, does the entry it replaced come back above it?", and only
+    a query derived from the successor's own text poses it. A shared or
+    synthetic query would measure a different thing for every pair.
+
+    Each edge is therefore scored against the ranked list of its own query and
+    the per-edge observations are folded by :func:`combine_surfacing`. Rank is
+    list POSITION, so equal scores resolve by returned order and two runs over
+    the same list produce the same count — a tie that flapped would read to
+    leaf α as a real regression.
+
+    An edge whose successor content is empty is skipped rather than searched
+    with an empty query: an empty query's ranking is arbitrary, and scoring
+    against it would manufacture inversions from noise.
+    """
+    observations: list[SurfacingObservation] = []
+    for ref in refs:
+        if ref.key != 'supersedes' or not isinstance(ref.target, str):
+            continue
+        query = (ref.source_content or '').strip()
+        if not query:
+            continue
+        results = await memory.search(query, project_id=project_id, limit=limit)
+        ranked_ids = [str(getattr(r, 'id', '') or '') for r in (results or [])]
+        observations.append(
+            superseded_surfacing([(ref.source_id, ref.target)], ranked_ids),
+        )
+    return combine_surfacing(observations)
+
+
+@dataclass(frozen=True)
+class TerminalTaskJoin:
+    """Terminal task statuses for family (3), or a NAMED reason there are none.
+
+    The two are not the same fact and must not collapse into one empty
+    mapping. A run that could not reach the task backend omits the metric for
+    lack of exposure — and so does a run that reached it and found no terminal
+    task referenced anywhere. Only one of those means the family was measured
+    and came back clean; ``skipped_reason`` is what lets the report say which.
+    """
+
+    statuses: dict[str, str]
+    """Terminal task id → its terminal status, for the detail records."""
+
+    skipped_reason: str | None = None
+
+    @property
+    def available(self) -> bool:
+        """True when the join actually ran, whatever it found."""
+        return self.skipped_reason is None
+
+
+async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
+    """Read terminal task statuses through the SQLite task backend.
+
+    Terminal is ``shared.task_statuses.TERMINAL`` — ``done`` and ``cancelled``
+    only. ``deferred`` is deliberately NOT terminal: a deferred task can still
+    be picked up, so an entry asserting live state about one is not stale.
+
+    Follows ``sweep_orphan_flag_markers._resolve_terminal_task_ids``'s
+    start/get_statuses/close-in-``finally`` shape, and its status-only read —
+    ``get_statuses`` never decodes a metadata column, which matters at a task
+    tree this size.
+
+    Ids are normalised to ``str`` because :func:`referenced_task_ids` yields
+    strings (``TASK_REF_RE`` matches text): an int key surviving here would
+    silently never intersect, and the family would report clean.
+
+    A missing or failing backend degrades to a NAMED skip rather than an
+    exception: this is a read-only reporting sweep and the other three
+    families are still measurable without the task tree. It does not degrade
+    to a silent empty set — see :class:`TerminalTaskJoin`.
+    """
+    from shared.task_statuses import TERMINAL  # noqa: PLC0415
+
+    taskmaster = getattr(config, 'taskmaster', None)
+    if taskmaster is None:
+        return TerminalTaskJoin(
+            statuses={},
+            skipped_reason=(
+                'taskmaster is not configured, so no task statuses could be read. '
+                'The task-terminal-staleness family was NOT measured — its absence '
+                'from the metrics is a gap, not a clean result.'
+            ),
+        )
+
+    from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+        SqliteTaskBackend,
+    )
+
+    try:
+        backend = SqliteTaskBackend(taskmaster)
+        await backend.start()
+        try:
+            statuses = await backend.get_statuses(taskmaster.project_root)
+        finally:
+            await backend.close()
+    except Exception as exc:
+        # exc_info so a genuine wiring failure stays distinguishable in the
+        # logs from the unconfigured no-op above, which never reaches here.
+        logger.warning(
+            'memory_eval_staleness_sweep: terminal task status read failed; '
+            'the task-terminal-staleness family will be reported as skipped.',
+            exc_info=True,
+        )
+        return TerminalTaskJoin(
+            statuses={},
+            skipped_reason=(
+                f'reading task statuses failed ({type(exc).__name__}: {exc}). '
+                'The task-terminal-staleness family was NOT measured — its absence '
+                'from the metrics is a gap, not a clean result.'
+            ),
+        )
+
+    return TerminalTaskJoin(statuses={
+        str(task_id): str(status)
+        for task_id, status in (statuses or {}).items()
+        if status in TERMINAL
+    })

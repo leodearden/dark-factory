@@ -24,6 +24,7 @@ import functools
 import importlib.util
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -132,11 +133,16 @@ class TestPointerTargets:
     def test_the_other_pointer_keys_get_the_same_tolerance(self, key):
         """Same None/scalar/list ambiguity, same normalizer (INV-5)."""
         m = _mod()
-        assert m.pointer_targets(_record(**{key: None})) == []
-        scalar = m.pointer_targets(_record(**{key: UUID_A}))
+        # Typed locals, not inline **{...}: a bare dict literal splatted into
+        # **metadata reads to pyright as a possible bind of record_id/content.
+        absent: dict[str, Any] = {key: None}
+        one: dict[str, Any] = {key: UUID_A}
+        many: dict[str, Any] = {key: [UUID_A, UUID_B]}
+        assert m.pointer_targets(_record(**absent)) == []
+        scalar = m.pointer_targets(_record(**one))
         assert [r.target for r in scalar] == [UUID_A]
         assert [r.key for r in scalar] == [key]
-        listed = m.pointer_targets(_record(**{key: [UUID_A, UUID_B]}))
+        listed = m.pointer_targets(_record(**many))
         assert [r.target for r in listed] == [UUID_A, UUID_B]
 
     def test_a_malformed_member_is_retained_not_dropped(self):
@@ -847,18 +853,134 @@ class TestResolvePointerTargets:
         resolution = await m.resolve_pointer_targets(memory, 'dark_factory', refs)
 
         # A non-id-shaped value cannot be handed to a point-id read at all --
-        # but it is not thereby forgiven: dangling_census still counts it
-        # unresolved off its absence from this map.
+        # Qdrant's retrieve() rejects it, and because retrieve takes a LIST of
+        # ids one bad pointer would fail the read and take down the very sweep
+        # that exists to report it. It is not thereby forgiven: dangling_census
+        # still counts it unresolved off its absence from this map.
         assert memory.get_memory_by_id.await_count == 0
         assert resolution == {}
         census = m.dangling_census(refs, resolution)
         assert census.unresolved == 2
+
+    async def test_the_read_plan_and_the_disclosure_share_one_predicate(self):
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'one', supersedes=['not-a-uuid', UUID_A]))
+
+        # Two spellings of "is this target readable?" drift, and the drift is
+        # what sends an unreadable id to Qdrant. Whatever one names malformed,
+        # the other must decline to read -- asserted as a partition, not as
+        # two independently restated shapes.
+        readable = set(m.unique_pointer_targets(refs))
+        malformed = {ref.target for ref in m.malformed_pointer_refs(refs)}
+        assert readable == {UUID_A}
+        assert malformed == {'not-a-uuid'}
+        assert readable & malformed == set()
+        assert readable | malformed == {ref.target for ref in refs}
 
     async def test_an_empty_ref_set_issues_no_reads(self):
         m = _mod()
         memory = _mock_memory()
         assert await m.resolve_pointer_targets(memory, 'dark_factory', []) == {}
         assert memory.get_memory_by_id.await_count == 0
+
+
+class _Hit:
+    """One search result, in the duck-typed shape MemoryResult presents."""
+
+    def __init__(self, result_id: str):
+        self.id = result_id
+
+
+@pytest.mark.asyncio
+class TestFetchSurfacingRanks:
+    """One search per supersedes edge, derived from the successor's own text."""
+
+    async def test_the_query_is_the_successors_content(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[_Hit('rec-1'), _Hit(UUID_B)])
+
+        await m.fetch_surfacing_ranks(memory, 'dark_factory', refs, limit=7)
+
+        # The family asks "when the corpus is asked about what the successor
+        # says, does the entry it replaced come back above it?" -- only a query
+        # derived from the successor's own text poses that question.
+        memory.search.assert_awaited_once()
+        assert memory.search.await_args.args[0] == 'the successor text'
+        assert memory.search.await_args.kwargs == {'project_id': 'dark_factory', 'limit': 7}
+
+    async def test_only_supersedes_edges_are_searched(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'a correction', corrects=UUID_B)),
+            *m.pointer_targets(_record('rec-2', 'a child', parent_id=UUID_C)),
+        ]
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        # corrects/parent_id are counted by dangling-pointers only: neither
+        # asserts that one entry REPLACED another, so neither has a surfacing
+        # order to be wrong about.
+        assert memory.search.await_count == 0
+        assert obs.pairs_comparable == 0
+
+    async def test_an_empty_successor_content_is_not_searched(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', '   ', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        # An empty query's ranking is arbitrary; scoring against it would
+        # manufacture inversions out of noise.
+        assert memory.search.await_count == 0
+        assert obs.pairs_comparable == 0
+
+    async def test_each_edge_is_scored_against_its_own_query_and_folded(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-2', 'successor two', supersedes=UUID_C)),
+        ]
+        memory = MagicMock()
+        memory.search = AsyncMock(side_effect=[
+            [_Hit(UUID_B), _Hit('rec-1')],   # superseded ABOVE its successor
+            [_Hit('rec-2'), _Hit(UUID_C)],   # superseded below: comparable, not counted
+        ])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert memory.search.await_count == 2
+        assert obs.pairs_comparable == 2
+        assert obs.still_surfacing == 1
+        assert [r.successor_id for r in obs.inversions] == ['rec-1']
+
+    async def test_a_half_present_pair_is_neither_counted_nor_exposed(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[_Hit('rec-1')])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        # Both-present-only exposure survives the round trip through the store:
+        # an absent superseded entry carries no possibility of an inversion.
+        assert obs.pairs_comparable == 0
+        assert obs.still_surfacing == 0
 
 
 class _BackendDouble:
