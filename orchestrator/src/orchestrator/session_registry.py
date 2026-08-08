@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -899,6 +900,51 @@ def set_decision_escalations_dir(
 
     return _mutate_decision(
         decision_id, _set, caller='set_decision_escalations_dir', root=root
+    )
+
+
+def merge_decision_enrichment(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> DecisionRecord:
+    """Fold a SECOND watcher's filing into an existing OPEN decision (task 3559).
+
+    Implements the MODE-2 rule verbatim: a second watcher observing the same
+    underlying human gate through a DIFFERENT escalation queue must ENRICH
+    the existing open record -- never overwrite, clobber, or downgrade what
+    the first watcher wrote. That shape is not hypothetical: task 3528
+    requirement (b) records ``esc-5914-1`` surfacing the same reify gate on
+    both dark_factory queues at once, and the cockpit must show it as ONE
+    row, carrying the best information either watcher has.
+
+    Field policy:
+
+    - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
+      is the whole reason these two records are being merged.
+    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
+      (CUSTODY). A second watcher must not restamp queue age, re-open or
+      close the record (that is update_decision_state's job), or reset an
+      operator's C5 cockpit boost.
+    - ``text`` / ``task_id`` / ``escalation_id`` / ``session_id`` /
+      ``options`` -- keep *existing* where it is non-empty; take *incoming*
+      ONLY to fill a field the first filer left empty/None. That fill is
+      what makes this enrichment rather than a no-op.
+    - ``severity``           -- ``_max_decision_severity``: never downgrade.
+    - ``escalations_dir``    -- see the queue-stamp arm below.
+
+    PURE and side-effect-free apart from the conflicting-stamp warning: it
+    returns a NEW record via dataclasses.replace and mutates neither
+    argument, so it stays trivially testable in isolation from the CLI verb
+    and a caller holding the pre-merge record still sees what it read.
+    """
+    return dataclasses.replace(
+        existing,
+        text=existing.text or incoming.text,
+        task_id=existing.task_id or incoming.task_id,
+        escalation_id=existing.escalation_id or incoming.escalation_id,
+        session_id=existing.session_id or incoming.session_id,
+        options=existing.options or incoming.options,
+        severity=_max_decision_severity(existing.severity, incoming.severity),
     )
 
 
