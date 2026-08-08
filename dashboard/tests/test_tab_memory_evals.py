@@ -1771,6 +1771,38 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
         'nothing would say how many runs produced no sample.'
     )
 
+    # (iii-b) ...and the disclosure must also reach the DRAWN ARM ITSELF, in
+    #         that element's own opening tag, so the breaks are explained where
+    #         they appear (on hover) and not only in the footer below.
+    #
+    #         Matched on the WHOLE opening tag — anchored on the testid, taking
+    #         the `[^<>]` runs on BOTH sides — rather than by a directional
+    #         `gaps ... <testid>` window.  A one-sided window would encode JSX
+    #         attribute ORDER, which is not behaviour: reordering to
+    #         `<div style={...} data-testid="..." title={gaps ? ... : span}>`
+    #         renders identically yet would fail a before-the-testid regex.
+    #         `[^<>]` still confines the match to a SINGLE opening tag, so a
+    #         `gaps` mention in a neighbouring element cannot satisfy it — that
+    #         confinement is what gives the assertion its meaning.
+    tag = re.search(r'<[^<>]*data-testid="memory-eval-trend-chart"[^<>]*>', row_body)
+    assert tag is not None, (
+        'no single opening tag carries `data-testid="memory-eval-trend-chart"`. '
+        'Either the drawn-chart arm is gone entirely — this assertion is also '
+        'the vacuity guard for the one below, which would otherwise pass '
+        'trivially — or an attribute expression inside that opening tag now '
+        'contains a bare `<`/`>` operator (e.g. `title={plotted > 0 ? ...}`), '
+        'which ends the `[^<>]` run early. If it is the latter, hoist the '
+        'comparison into a named local above the JSX, which this file already '
+        'does everywhere else.'
+    )
+    assert re.search(r'\bgaps\b', tag.group(0)), (
+        'the drawn-chart element does not consume `gaps` in its own opening '
+        'tag. The sparkline is drawn with a break at every missing sample; '
+        'without the count in that element\'s `title=`, an operator hovering '
+        'the broken line gets no account of why it is broken. Attribute ORDER '
+        'inside the tag is deliberately NOT constrained.'
+    )
+
 
 def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     tab_memory_evals_jsx_body: str,
