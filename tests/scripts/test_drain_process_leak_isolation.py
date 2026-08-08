@@ -433,7 +433,12 @@ class TestWaitProofGraceSecs:
 # testable without leaking a single real process.
 # ---------------------------------------------------------------------------
 
-_DRAIN_CMDLINE = b'bash\x00/repo/scripts/restart-all-orchestrators.sh\x00--drain\x00'
+# Built FROM the module's own marker, not from a hardcoded copy of it: that is
+# what makes these tests pin "the scan finds what the module says it looks for"
+# rather than "the scan finds this string I happened to type twice".
+_DRAIN_CMDLINE = (
+    b'bash\x00/repo/scripts/' + DRAIN_SCRIPT_CMDLINE_MARKER.encode() + b'\x00--drain\x00'
+)
 _OTHER_CMDLINE = b'bash\x00/repo/scripts/some-other-script.sh\x00'
 
 
@@ -468,7 +473,7 @@ class TestLeakedDrainProcesses:
         leaks = leaked_drain_processes('tok', proc_root=tmp_path)
 
         assert [pid for pid, _ in leaks] == [4242]
-        assert 'restart-all-orchestrators.sh' in leaks[0][1]
+        assert DRAIN_SCRIPT_CMDLINE_MARKER in leaks[0][1]
 
     def test_the_drain_marker_alone_is_not_enough(self, tmp_path: Path) -> None:
         """A genuine or concurrent --drain must NEVER fail this suite.
@@ -560,12 +565,12 @@ class TestLeakedDrainProcessReason:
         wording — the message is triage text and must stay editable.
         """
         reason = leaked_drain_process_reason([
-            (4242, 'bash /repo/scripts/restart-all-orchestrators.sh --drain'),
-            (4243, 'bash /repo/scripts/restart-all-orchestrators.sh --drain'),
+            (4242, f'bash /repo/scripts/{DRAIN_SCRIPT_CMDLINE_MARKER} --drain'),
+            (4243, f'bash /repo/scripts/{DRAIN_SCRIPT_CMDLINE_MARKER} --drain'),
         ])
 
         assert reason is not None
         assert '4242' in reason and '4243' in reason
-        assert 'restart-all-orchestrators.sh' in reason
+        assert DRAIN_SCRIPT_CMDLINE_MARKER in reason
         assert '3798' in reason
         assert 'run_in_new_session' in reason
