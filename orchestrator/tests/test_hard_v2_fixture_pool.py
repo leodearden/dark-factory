@@ -171,6 +171,102 @@ class TestCandidatesBlock:
 # Layout — the manifest is invisible to _load_fixture_dir's glob
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The ceilings block — derived and shown not to bind, never guessed
+# ---------------------------------------------------------------------------
+
+class TestCeilings:
+    def test_max_architect_turns_matches_production(self, manifest: dict) -> None:
+        # 120 is know-live's production max_turns.architect — the ceiling whose
+        # exhaustion at 121 turns DEFINED the census. Any other value would
+        # mint a pool that cannot reproduce the failures it was selected for.
+        assert manifest['ceilings']['max_architect_turns'] == 120
+
+    def test_timeout_clears_the_prd_floor(self, manifest: dict) -> None:
+        assert manifest['ceilings']['timeout_minutes'] >= 180
+
+    def test_timeout_clears_twice_the_observed_max(self, manifest: dict) -> None:
+        # The timeout must provably not bind before the turn/budget ceiling:
+        # runner.py deliberately does NOT taint-exclude a timeout, so a binding
+        # timeout would score a kept 0.0 and manufacture an artificial failure.
+        ceilings = manifest['ceilings']
+        derivation = ceilings['derivation']
+        assert ceilings['timeout_minutes'] >= 2 * derivation['observed_max_minutes']
+
+    def test_derivation_is_fully_populated(self, manifest: dict) -> None:
+        derivation = manifest['ceilings']['derivation']
+        for key in ('observed_max_minutes', 'p95_minutes', 'sample_n',
+                    'all_architect_max_minutes', 'source'):
+            assert key in derivation, key
+        assert derivation['sample_n'] > 0
+        assert derivation['observed_max_minutes'] > 0
+        assert derivation['p95_minutes'] <= derivation['observed_max_minutes']
+        assert 'duration_ms' in derivation['source']
+
+    def test_derivation_records_the_substituted_source(self, manifest: dict) -> None:
+        # The PRD names "v1 wall-clock dumps" as the source, but
+        # data/eval-campaign/fable-architect-only-results.json carries NO
+        # duration field. The substitution must be recorded, or the threshold
+        # reads as basis-free.
+        note = manifest['ceilings']['derivation']['substitution_note']
+        assert 'fable-architect-only-results.json' in note
+        assert 'runs.db' in note
+
+    def test_timeout_clears_the_all_time_architect_max(self, manifest: dict) -> None:
+        derivation = manifest['ceilings']['derivation']
+        assert (manifest['ceilings']['timeout_minutes']
+                > derivation['all_architect_max_minutes'])
+
+
+# ---------------------------------------------------------------------------
+# CURATION.md is generated — the human table cannot drift from the manifest
+# ---------------------------------------------------------------------------
+
+class TestCurationMdIsGenerated:
+    def test_exists(self) -> None:
+        assert CURATION_MD.exists(), f'missing {CURATION_MD}'
+
+    def test_rerender_is_byte_identical(self, manifest: dict) -> None:
+        # The load-bearing invariant: two hand-maintained artifacts drift
+        # silently, so the table is a pure function of the manifest.
+        import sys
+        sys.path.insert(0, str(REPO_ROOT / 'scripts'))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            '_mint_driver_for_render', REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py',
+        )
+        assert spec is not None and spec.loader is not None
+        driver = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = driver
+        spec.loader.exec_module(driver)
+
+        assert driver.render_curation_md(manifest) == CURATION_MD.read_text()
+
+    def test_renderer_is_pure(self, manifest: dict) -> None:
+        # No wall-clock / no env, or the byte-equality test above is flaky.
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location(
+            '_mint_driver_purity', REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py',
+        )
+        assert spec is not None and spec.loader is not None
+        driver = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = driver
+        spec.loader.exec_module(driver)
+        assert driver.render_curation_md(manifest) == driver.render_curation_md(manifest)
+
+    def test_table_names_every_candidate(self, manifest: dict) -> None:
+        text = CURATION_MD.read_text()
+        for c in manifest['candidates']:
+            assert f'| {c["task_id"]} |' in text, (
+                f'candidate {c["project"]}/{c["task_id"]} is missing from the table'
+            )
+
+    def test_records_the_split_majority_finding(self, manifest: dict) -> None:
+        text = CURATION_MD.read_text()
+        assert manifest['merge_sha_availability']['finding'] in text
+
+
 class TestMetaLayout:
     def test_meta_dir_holds_no_file_the_fixture_glob_would_reach(self) -> None:
         # _load_fixture_dir globs '*.json' NON-recursively against tasks_dir.
