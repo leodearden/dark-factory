@@ -97,6 +97,11 @@ def _parse_ts(raw: Any) -> float | None:
         return None
 
 
+def _clean_modules(modules: Iterable[str]) -> list[str]:
+    """Non-empty string module keys, in order — the live feed's input guard."""
+    return [m for m in modules if isinstance(m, str) and m]
+
+
 def _modules_of(row: dict) -> list[str]:
     """Module list from a lock event's ``data`` payload.
 
@@ -113,6 +118,49 @@ def _modules_of(row: dict) -> list[str]:
     if not isinstance(modules, list):
         return []
     return [m for m in modules if isinstance(m, str) and m]
+
+
+#: One open hold per (task_id, module) -> its start, in POSIX seconds.  Both the
+#: durable seed and the live feed keep one of these; the two ``_apply_*``
+#: helpers below are the ONLY things that mutate it (INV-5), so the seed and the
+#: feed cannot drift on what an acquire or a release means.
+OpenSpans = dict[tuple[str, str], float]
+
+
+def _apply_acquire(
+    open_spans: OpenSpans, task_id: str, modules: Iterable[str], at: float,
+) -> Iterator[HoldSpan]:
+    """Open a span per module, force-closing a DOUBLE-ACQUIRE at *at*.
+
+    PARKING_MODEL_REPORT.md:101.  The prior span is yielded, not discarded — it
+    really did block other tasks — and the new span starts at *at* rather than
+    keeping the old start, which would make the eventual release re-count the
+    prefix just yielded.
+    """
+    for module in modules:
+        key = (task_id, module)
+        prior_start = open_spans.get(key)
+        if prior_start is not None:
+            yield HoldSpan(task_id, module, prior_start, at, truncated=True)
+        open_spans[key] = at
+
+
+def _apply_release(
+    open_spans: OpenSpans, task_id: str, modules: Iterable[str], at: float,
+) -> Iterator[HoldSpan]:
+    """Close the named modules' spans, ignoring ORPHAN-RELEASEs.
+
+    Only the modules NAMED are closed: ``release_subset`` emits a partial
+    release for the modules a plan refinement narrowed away while the task keeps
+    holding the rest (scheduler.py:6954-6959).  A release with no open span is
+    an orphan (3,594 DF / 5,780 reify in the measured trace) and is skipped —
+    the ``if task_id in open_acquires`` guard from analyze_modules.py:145.
+    """
+    for module in modules:
+        start = open_spans.pop((task_id, module), None)
+        if start is None:
+            continue
+        yield HoldSpan(task_id, module, start, at)
 
 
 def iter_hold_spans(
@@ -232,23 +280,12 @@ def iter_hold_spans(
             continue
         task_id = str(raw_task_id)
 
+        # The acquire/release rules themselves live in the two module-level
+        # helpers, shared verbatim with HoldHistory's live feed (INV-5).
         if event_type == _ACQUIRED:
-            for module in _modules_of(r):
-                key = (task_id, module)
-                prior_start = open_spans.get(key)
-                if prior_start is not None:
-                    # DOUBLE-ACQUIRE (PARKING_MODEL_REPORT.md:101): force-close
-                    # the previous span here.  Re-opening at `at` rather than
-                    # keeping `prior_start` matters — keeping it would make the
-                    # eventual release re-count the prefix just yielded.
-                    yield HoldSpan(task_id, module, prior_start, at, truncated=True)
-                open_spans[key] = at
+            yield from _apply_acquire(open_spans, task_id, _modules_of(r), at)
         else:
-            for module in _modules_of(r):
-                start = open_spans.pop((task_id, module), None)
-                if start is None:
-                    continue  # ORPHAN-RELEASE — span never opened.
-                yield HoldSpan(task_id, module, start, at)
+            yield from _apply_release(open_spans, task_id, _modules_of(r), at)
 
     yield from _drain_boundaries_through(float('inf'))
 
@@ -288,6 +325,11 @@ class HoldHistory:
         self._min_samples = int(min_samples)
         self._samples: dict[str, deque[float]] = {}
         self._seeded = False
+        #: Holds open RIGHT NOW, fed by :meth:`observe_acquired` /
+        #: :meth:`observe_released`.  Separate from the seed's own transient map:
+        #: the seed replays history that has already ended, this tracks holds
+        #: still running, which is what :meth:`predicted_remaining` reads.
+        self._open: OpenSpans = {}
 
     # --- seeding from durable history -------------------------------------
 
@@ -368,6 +410,28 @@ class HoldHistory:
         """
         self.record(span.module, span.duration)
 
+    # --- the live in-process feed -----------------------------------------
+
+    def observe_acquired(self, task_id: str, modules: Iterable[str], *, at: float) -> None:
+        """Note that *task_id* took the lock on *modules* at *at* (POSIX seconds).
+
+        Routed through the same ``_apply_acquire`` the durable seed uses, so a
+        double-acquire is force-closed and recorded here exactly as it would be
+        when replayed off the event log (INV-5).
+        """
+        for span in _apply_acquire(self._open, str(task_id), _clean_modules(modules), float(at)):
+            self.record_span(span)
+
+    def observe_released(self, task_id: str, modules: Iterable[str], *, at: float) -> None:
+        """Note that *task_id* released *modules* at *at* — records the durations.
+
+        Only the modules NAMED are closed (partial releases are real), and a
+        release with no open span is an orphan and records nothing.  Both rules
+        come from the shared ``_apply_release``.
+        """
+        for span in _apply_release(self._open, str(task_id), _clean_modules(modules), float(at)):
+            self.record_span(span)
+
     # --- reading ----------------------------------------------------------
 
     def _pooled(self, modules: Iterable[str]) -> list[float]:
@@ -420,3 +484,35 @@ class HoldHistory:
         if len(pooled) < self._min_samples:
             return None
         return float(statistics.median(pooled))
+
+    def open_modules(self, task_id: str) -> list[str]:
+        """Modules *task_id* is holding right now, in acquire order."""
+        wanted = str(task_id)
+        return [module for (tid, module) in self._open if tid == wanted]
+
+    def predicted_remaining(self, task_id: str, *, now: float) -> float | None:
+        """Seconds *task_id* is predicted to keep holding its locks, or None.
+
+        ``max(0.0, predicted_hold(open modules) - elapsed)``, where *elapsed*
+        runs from the task's EARLIEST open hold — it has been blocking others
+        since its first acquire, and measuring from the latest would under-count
+        the elapsed time and over-state how much is left.  That is the
+        optimistic direction, and the one that hurts: it keeps a waiting task
+        waiting.
+
+        0.0 and None are DIFFERENT answers and callers must keep them apart.
+        0.0 means "predicted to have finished already, and hasn't" — a live,
+        actionable fact about an overdue holder.  None means there is no
+        prediction at all: the task holds nothing, or its modules are below
+        ``min_samples``.  Collapsing the overdue case into None would erase the
+        one signal a waiting caller most needs; returning a negative number
+        would read as time credit that does not exist, hence the floor.
+        """
+        wanted = str(task_id)
+        starts = [start for (tid, _module), start in self._open.items() if tid == wanted]
+        if not starts:
+            return None
+        predicted = self.predicted_hold(self.open_modules(wanted))
+        if predicted is None:
+            return None
+        return max(0.0, predicted - (float(now) - min(starts)))
