@@ -557,15 +557,29 @@ CURATOR_CLASSIFIER_MARKERS: tuple[str, ...] = (
 (fused_memory/src/fused_memory/middleware/task_curator.py) and the
 code-module classifier (orchestrator/src/orchestrator/harness.py)."""
 
-HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = ('# context', '## agent identity', '# task')
-"""Injected orchestrator-briefing heading literals
-(orchestrator/src/orchestrator/agents/briefing.py: ``_get_memory_context``
-emits '# Context'; ``_agent_identity`` emits '## Agent Identity'; the role
-prompt templates emit '# Task'). All three must co-occur as line-anchored
-headings (matched via all(), not any() -- the same false-positive guard as
-ORCHESTRATED_TASK_MARKERS) so a genuine human turn that happens to open
-with '# Task', or that quotes '# Context' mid-prose, is never excluded
-from the gold user_corrections section."""
+HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = (
+    '# context', '## context', '## agent identity', '# task',
+)
+"""ANCHOR heading literals for an injected orchestrator briefing
+(orchestrator/src/orchestrator/agents/briefing.py): ``_get_memory_context``
+emits '# Context' (:1118) and, on its memory-unavailable exception path, a
+'## Context' sub-block (:1113); ``_agent_identity`` emits '## Agent
+Identity' (:98); the role prompt templates emit '# Task' (:188/261/1024).
+At least one anchor must be present as a line-anchored heading for a turn
+to classify as briefing-injected -- see :func:`is_harness_injected_turn`
+for the corroboration rule that goes with it."""
+
+HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
+    '## project context', '## conventions', '## recent decisions',
+    '## task context', '# action',
+)
+"""CORROBORATING heading literals -- the structural sub-blocks a real
+briefing carries alongside an anchor
+(orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
+:1091, '## Conventions' :1096, '## Recent Decisions' :1101, '## Task
+Context' :1109 inside ``_get_memory_context``'s sections list; '# Action'
+in the role prompt templates at :193/:496/:1038). Never sufficient alone:
+a human turn headed '## Conventions' carries no anchor and stays gold."""
 
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
@@ -579,13 +593,37 @@ harness prompt literals as one-line additions."""
 
 def is_harness_injected_turn(text: str) -> bool:
     """True when *text* is harness-injected rather than genuine human-typed
-    input: either the orchestrator's briefing preamble (all
-    HARNESS_BRIEFING_HEADINGS co-occur, each as its own stripped line) or a
-    harness prose preamble (any HARNESS_PROMPT_MARKERS substring)."""
+    input: either the orchestrator's briefing preamble or a harness prose
+    preamble (any HARNESS_PROMPT_MARKERS substring).
+
+    The briefing rule is ANCHOR + CORROBORATOR: at least one
+    HARNESS_BRIEFING_HEADINGS anchor must appear as its own stripped line,
+    AND at least two DISTINCT briefing headings (anchors union
+    HARNESS_BRIEFING_SUBHEADINGS) must be present in total.
+
+    This replaces the original all-of-three rule ('# Context' AND '## Agent
+    Identity' AND '# Task'), which the 07-31 confusion census showed was too
+    strict to catch the shape actually injected most often: cluster 1.1(b)
+    (plans/confusion-census-2026-07-31.md:79/:85) sighted a context-ONLY
+    injection -- '# Context' followed by '## Project Context' and the
+    memory-search JSON dump, with neither '## Agent Identity' nor '# Task'
+    present -- passing the filter BY CONSTRUCTION and being rendered as a
+    fabricated gold "User Correction" in four dispatched-task digests.
+
+    Both false-positive guards the original all() was written to protect
+    still hold, for reasons the relaxation preserves rather than tolerates:
+    a genuine human turn opening with a lone '# Task' has one heading and
+    NO corroborator, so it falls below the >=2 threshold; and a '# Context'
+    quoted mid-prose is not a stripped line at all, so it is never a
+    heading -- matching stays line-anchored and never substring.
+    """
     lowered = text.lower()
     lines = {line.strip() for line in lowered.splitlines()}
-    if all(heading in lines for heading in HARNESS_BRIEFING_HEADINGS):
-        return True
+    anchors = [h for h in HARNESS_BRIEFING_HEADINGS if h in lines]
+    if anchors:
+        corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
+        if len(anchors) + len(corroborators) >= 2:
+            return True
     return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
 
 
