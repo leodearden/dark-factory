@@ -9651,3 +9651,203 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'reify esc-5564-1 scenario, Stage 1 flagging its own consolidator '
             f'output on writing style alone; got {result!r}'
         )
+
+    # ---- KEEP half of the SIGNAL + INV-2 annotation contract (step-5) ------
+
+    _MEMORY_ID_B = '99999999-8888-7777-6666-555555555555'
+
+    @pytest.mark.asyncio
+    async def test_keep_when_cited_entry_has_a_foreign_agent_id(self):
+        """(KEEP) An unrecognised writer is real signal — never cleared."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record('attacker-xyz'))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            "A flag whose cited entry carries a foreign agent_id ('attacker-xyz') "
+            f'must be KEPT — dropping it would disable the detection; got {result!r}'
+        )
+        provenance = flag.get('authorship_provenance')
+        assert provenance is not None, (
+            'A surviving candidate must carry an authorship_provenance annotation '
+            'so a consumer reads the checked provenance as a field rather than '
+            're-deriving it from the description prose (INV-2)'
+        )
+        assert provenance['decision'] == 'kept_foreign_author', (
+            f"decision must name WHY the flag survived; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': 'attacker-xyz',
+                'classification': 'foreign',
+            },
+        ], (
+            'the annotation must record the memory_id, the agent_id actually read '
+            f'(verbatim), and its classification; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_stored_agent_id_is_none(self):
+        """(KEEP) A null agent_id is unknown provenance, not house authorship."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record(None))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A flag whose cited entry stores agent_id=None must be KEPT; got {result!r}'
+        )
+        provenance = flag['authorship_provenance']
+        assert provenance['decision'] == 'kept_missing_agent_id', (
+            f"expected kept_missing_agent_id; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {'memory_id': self._MEMORY_ID, 'agent_id': None, 'classification': 'missing'},
+        ], (
+            'the annotation must record the absent agent_id verbatim (None) so the '
+            f'gap is legible without a re-read; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_agent_id_is_absent_from_the_payload(self):
+        """(KEEP) No agent_id key at all — indistinguishable from unknown."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record(include_agent_id=False),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A flag whose cited entry has no agent_id key must be KEPT; got {result!r}'
+        )
+        assert flag['authorship_provenance']['decision'] == 'kept_missing_agent_id'
+        assert flag['authorship_provenance']['checked'][0]['classification'] == 'missing'
+
+    @pytest.mark.asyncio
+    async def test_keep_when_agent_id_is_an_empty_string(self):
+        """(KEEP) An empty agent_id carries no provenance."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record(''))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f"A flag whose cited entry stores agent_id='' must be KEPT; got {result!r}"
+        )
+        assert flag['authorship_provenance']['checked'][0] == {
+            'memory_id': self._MEMORY_ID,
+            'agent_id': '',
+            'classification': 'missing',
+        }
+
+    @pytest.mark.asyncio
+    async def test_keep_when_citations_are_mixed_internal_and_foreign(self):
+        """(KEEP) A partially-internal claim is not cleared — one foreign
+        citation is enough to keep the whole flag standing."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(cited_memories=[
+            {'memory_id': self._MEMORY_ID, 'store': 'mem0', 'metadata_fingerprint': {}},
+            {'memory_id': self._MEMORY_ID_B, 'store': 'mem0', 'metadata_fingerprint': {}},
+        ])
+        by_id = {
+            self._MEMORY_ID: self._record('recon-stage-memory_consolidator'),
+            self._MEMORY_ID_B: self._record('attacker-xyz'),
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: by_id[memory_id],
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A flag citing one house-authored AND one foreign-authored entry must '
+            f'be KEPT — a partially-internal claim is not cleared; got {result!r}'
+        )
+        provenance = flag['authorship_provenance']
+        assert provenance['decision'] == 'kept_mixed_authors', (
+            f"expected kept_mixed_authors; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': 'recon-stage-memory_consolidator',
+                'classification': 'internal',
+            },
+            {
+                'memory_id': self._MEMORY_ID_B,
+                'agent_id': 'attacker-xyz',
+                'classification': 'foreign',
+            },
+        ], (
+            'the annotation must name every checked citation and its own verdict, '
+            f'in citation order; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('cited', [[], None])
+    async def test_keep_candidate_with_no_citations(self, cited):
+        """(KEEP) An unattributable claim stays flaggable — and performs no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        if cited is None:
+            flag.pop('cited_memories')
+        else:
+            flag['cited_memories'] = cited
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A candidate flag citing nothing must be KEPT — an unattributable '
+            f'claim stays flaggable; got {result!r}'
+        )
+        memory_service.get_memory_by_id.assert_not_called()
+        assert flag['authorship_provenance'] == {
+            'checked': [],
+            'decision': 'kept_no_resolvable_citations',
+        }
