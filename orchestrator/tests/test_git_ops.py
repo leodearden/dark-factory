@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -5077,6 +5078,48 @@ class TestRunWorktreeMissing:
         assert not isinstance(exc.value, WorktreeMissing)
 
 
+async def _wait_for_child_pid(
+    pid_file: Path, *, timeout: float = 5.0, interval: float = 0.1,
+) -> int:
+    """Poll for *pid_file* to appear and return its pid.
+
+    The child writes its pid to a sibling ``<path>.tmp`` file and
+    ``os.replace()``s it into place, so the *moment* ``pid_file.exists()``
+    the file is guaranteed to hold complete, parseable content — no window
+    where the parent can observe a just-created-but-empty file (the old
+    ``open(path, 'w').write(...)`` pattern raced ``open``'s truncate against
+    the buffered ``write``) nor a torn/partial read of an in-progress write
+    (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
+    convention used by ``wait_for_pgid_file`` in
+    test_laptop_warm_verify_boundary.py.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            with contextlib.suppress(ValueError):
+                return int(pid_file.read_text().strip())
+        await asyncio.sleep(interval)
+    pytest.fail(
+        f'child never wrote its pid to {pid_file} within {timeout}s (it may '
+        'never have started, or was killed before it could flush the pid '
+        'write)'
+    )
+
+
+async def _assert_child_reaped(
+    child_pid: int, *, timeout: float = 5.0, interval: float = 0.1,
+) -> None:
+    """Poll until *child_pid* is gone; fail if it outlives *timeout*."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(interval)
+    pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -5094,62 +5137,52 @@ class TestRunCancellationReapsChild:
         pid_file = tmp_path / 'child.pid'
         # A child that records its own pid then sleeps far longer than the
         # wait_for timeout below — simulates a persistently-hung script.
+        # The pid is written to a sibling .tmp file and atomically renamed
+        # into place so `pid_file` only ever appears fully written (task
+        # 3851) — see _wait_for_child_pid.
         script = (
             'import os, time, sys\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=1.0
+                # 5.0s (not e.g. 1.0s) gives the python3 interpreter
+                # comfortable room to start up and flush its pid write
+                # under load before cancellation kills it — still far
+                # below the child's 60s sleep, so this stays a genuine
+                # cancel-a-hung-script scenario rather than a natural
+                # completion.
+                _run(['python3', '-c', script]), timeout=5.0
             )
 
         # Wait for the child to have written its pid (should be near-instant).
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         # The cancelled _run must have killed + reaped the child by now — no
         # zombie, no orphan still sleeping.
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
         script = (
             'import os, time\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
         task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        await _assert_child_reaped(child_pid)
 
 
 def _write_stored_title(worktree: Path, title: str) -> None:
