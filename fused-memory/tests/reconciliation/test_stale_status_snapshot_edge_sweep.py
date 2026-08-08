@@ -719,6 +719,13 @@ class TestExtractSnapshotEdgeTaskIds:
         than an id. Requiring 2+ ids keeps the path's subject unambiguous.
         The well-formed singular shape still routes through
         INDIVIDUAL_SNAPSHOT_RE unchanged.
+
+        This also pins the separator against a defect the first draft of
+        _ENUM_IDS_ALT had: with every separator element optional, the
+        repeated group could match between two adjacent digits of a SINGLE
+        number, so '1020' parsed as '102' + '0' and this fact satisfied a
+        rule meant to require two ids. The separator's leading comma-or-
+        whitespace is now mandatory.
         """
         assert extract_snapshot_edge_task_ids('Tasks 1020 are pending.') == set()
         assert extract_snapshot_edge_task_ids('Task 1020 is pending.') == {1020}

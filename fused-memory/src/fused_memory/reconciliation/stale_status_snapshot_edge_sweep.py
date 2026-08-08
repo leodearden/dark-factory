@@ -360,6 +360,72 @@ SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# The enumeration tail of a plural multi-task snapshot: '1020, 1030, and
+# 1031', '1020 and 1030', '1020, task 1030 and task 1031' (task 3079).
+#
+# Requires TWO OR MORE ids by construction (the repeated group is '+', not
+# '*'), so a plural head over a single stray digit is never matched — after
+# a plural noun a lone number is more likely a count than an id, and the
+# well-formed singular shape already routes through INDIVIDUAL_SNAPSHOT_RE.
+#
+# The separator must absorb the OXFORD COMMA (', and'), not merely ',' or
+# 'and' individually: a single-token separator alternation silently misses
+# the finding's verbatim fact. Its alphabet is deliberately closed — digits,
+# whitespace, ',', 'and'/'&'/'/', an optional repeated 'task'/'#' reference
+# token — which is what lets the ids group be scanned for bare digits
+# directly (see PLURAL_ENUM_SNAPSHOT_RE).
+#
+# The separator's LEADING element (a comma or whitespace) is mandatory and
+# cannot match empty. That is what actually enforces the two-or-more-ids
+# requirement: with every element optional, the repeated group matched
+# between two adjacent digits of a SINGLE number, so '1020' parsed as
+# '102' + '0' and 'Tasks 1020 are pending' wrongly satisfied a rule meant
+# to need two ids.
+_ENUM_SEP_ALT = r'(?:\s*,\s*|\s+)(?:(?:and|&|/)\s+)?(?:task\s*)?#?\s*'
+_ENUM_IDS_ALT = r'\d+(?:' + _ENUM_SEP_ALT + r'\d+)+'
+
+# Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
+# 3079). Before this, such an edge yielded NO ids at all — not merely the
+# first, which is the precise question the finding asks. TASK_REF_RE anchors
+# '\btask\b' and so does not match the plural head 'Tasks'; and even if it
+# did, the enumeration tail carries no reference token of its own.
+#
+# Three anchoring properties, mirroring the adjacency discipline every other
+# path in this module already follows:
+#
+# (a) The copula is MANDATORY — no optional-copula arm. This is the same
+#     remedy INDIVIDUAL_SNAPSHOT_RE's transitive arm uses, and it is what
+#     refuses the transitive-verb reading 'Tasks 1020, 1030, and 1031
+#     blocked task 5' (a permanently-true historical fact). Because the
+#     copula is mandatory, using _STATUS_MARKER_ALT whole — including the
+#     transitive-capable markers — is safe here.
+# (b) The marker must sit immediately after the enumeration and its copula,
+#     with only closed-class function words (adverb, 'all', article) in
+#     between, so 'Tasks 1020 and 1030 were merged into the active branch'
+#     does not match — the BRANCH is active, not the tasks.
+# (c) Bare digits are collected from the 'ids' capture group ONLY, never
+#     from the whole fact, preserving the module invariant that a '\d+'
+#     contributes an id only from inside an already-detected,
+#     marker-anchored span (see _BARE_DIGIT_RE).
+#
+# On (c): the aggregate path additionally strips COUNT_QUANTITY_RE spans
+# from its segment before collecting digits, because a colon/bracket segment
+# is free text that really can contain '...and 3 pending others'. This path
+# needs no such strip and deliberately omits it: _ENUM_IDS_ALT's alphabet
+# admits no count noun in the first place, so the strip could never fire
+# usefully — while it WOULD misfire on the reference-token separator, where
+# '1020 task 1030' matches COUNT_QUANTITY_RE's '\d+\s+tasks?' and stripping
+# it would silently drop the legitimate leading id. A count phrase adjacent
+# to a real enumeration ('tasks 1020 and 1030 plus 3 pending others are
+# pending') instead breaks the copula adjacency and kills the match
+# outright — under-selection, the fail-safe direction, and pinned by a test.
+PLURAL_ENUM_SNAPSHOT_RE: re.Pattern[str] = re.compile(
+    r'\btasks\b\s*#?\s*(?P<ids>' + _ENUM_IDS_ALT + r')\s*,?\s*'
+    + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:all\s+)?(?:an?\s+)?'
+    + _STATUS_MARKER_ALT + r'\b',
+    re.IGNORECASE,
+)
+
 # Detects the start of an aggregate list segment: '<marker> tasks [' or
 # '<marker> tasks are [' or '<marker> tasks:' or '<marker> tasks are:'. The
 # 'open' group records which delimiter opened the segment ('[' vs ':') so
@@ -407,9 +473,11 @@ LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
 # bracket segment. Mirrors task_filter._CLAUSE_SPLIT_RE.
 _CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
-# Bare digit token — used only within an already-detected list segment, so
-# a bare '\d+' never contributes a candidate id outside that scoped context
-# (dates/commit-hashes/ports in ordinary prose are never list segments).
+# Bare digit token — used only within an already-detected, marker-anchored
+# span: an aggregate list segment, or a plural enumeration's 'ids' capture
+# group (task 3079). A bare '\d+' therefore never contributes a candidate id
+# outside that scoped context (dates/commit-hashes/ports in ordinary prose
+# are neither).
 _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 
 
@@ -467,7 +535,13 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
          marker, but only when the marker is immediately followed by the
          literal noun 'status' — the token that makes the span an
          explicit status assertion rather than an incidental mention.
-      5. Aggregate form: for each detected list segment ('<marker> tasks
+      5. Plural enumeration form: extract ids via PLURAL_ENUM_SNAPSHOT_RE,
+         which reaches 'Tasks A, B and C are <marker>' — a shape carrying
+         no per-id reference token, so every id was previously
+         unreachable (task 3079). The copula is mandatory and the marker
+         must be adjacent to it; digits are collected from the match's
+         'ids' group only.
+      6. Aggregate form: for each detected list segment ('<marker> tasks
          are [...]' / '<marker> tasks: ...'), strip COUNT_QUANTITY_RE
          spans from that segment only (so an embedded count phrase doesn't
          contribute a spurious id) and collect its bare digit tokens. The
@@ -485,6 +559,9 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
     ids |= {int(m.group(1)) for m in GENITIVE_STATUS_RE.finditer(fact)}
     ids |= {int(m.group(1)) for m in SNAPSHOT_STATUS_PHRASE_RE.finditer(fact)}
+
+    for enum in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
 
     for intro in LIST_INTRODUCER_RE.finditer(fact):
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
