@@ -706,16 +706,20 @@ class _FalkorDouble:
         )
 
 
-class _UnreachableDouble:
+class _UnreachableDouble(_FalkorDouble):
     """A graph handle whose ``ro_query`` raises, standing in for a down FalkorDB.
 
-    A real class, never MagicMock, for the same reason as ``_FalkorDouble``
-    above. It carries no rows at all: the point is the store never answers.
+    A real class, never MagicMock, for the same reason as ``_FalkorDouble``.
+    It SUBCLASSES that double rather than standing alone so it inherits every
+    write-path tripwire: an unreachable store is no excuse for the builder to
+    reach for a write-capable path on the way out, and a bare stand-in would
+    have quietly stopped checking. It carries no rows — the point is that the
+    store never answers at all.
     """
 
     def __init__(self, exc: BaseException):
+        super().__init__([])
         self.exc = exc
-        self.ro_queries: list[str] = []
 
     async def ro_query(self, cypher, *args, **kwargs):
         self.ro_queries.append(cypher)
@@ -1896,7 +1900,7 @@ class _StubReaderFactory:
     could pass while the real one writes.
     """
 
-    def __init__(self, double: _FalkorDouble | _UnreachableDouble):
+    def __init__(self, double: _FalkorDouble):
         self.double = double
         self.calls: list[dict] = []
 
