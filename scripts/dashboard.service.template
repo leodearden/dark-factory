@@ -31,6 +31,22 @@ ExecStart=__UV_PATH__ run --project dashboard \
 # Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__
 
+# Data root for the dashboard's own databases (burndown, metrics, runs,
+# escalations, memory-evals). Declared explicitly (task 3572) rather than left
+# to the Path.cwd() fallback in dashboard/src/dashboard/config.py, which made
+# the data root an undeclared SIDE EFFECT of WorkingDirectory= — correct only
+# by coincidence, so an edit to that directive silently relocated every DB.
+#
+# This does NOT retire WorkingDirectory=: ExecStart's RELATIVE
+# `--project dashboard` still resolves against the cwd systemd sets from it.
+#
+# KEEP THIS VALUE EQUAL TO WorkingDirectory=. Enforced by
+# tests/scripts/test_dashboard_service_template.py::
+# test_project_root_env_matches_working_directory_in_both_unit_files and, for
+# the installed copy, by scripts/check_dashboard_unit_parity.py — see
+# UnitSpec.env_matches_directive there for the full rationale.
+Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__
+
 # Restart policy: always restart on failure, back off up to 60s.
 # RestartSteps is load-bearing here, not decorative. Without it systemd logs
 # "Service has RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." at
