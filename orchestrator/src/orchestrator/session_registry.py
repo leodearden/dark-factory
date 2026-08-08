@@ -2452,8 +2452,22 @@ def _run_write_decision(
     passes the SAME queue dir it later reaps with, so this fleet-global
     decision can be joined back to the right per-queue escalation-id
     namespace: ids are unique only within one queue, and a project may run
-    several (task 3528). Omitting it stores '' and keeps today's
-    project-only-scoped reaper behaviour, so no existing caller breaks.
+    several (task 3528). It is MANDATORY (task 3559), on two layers: the
+    parser marks it ``required=True`` so an OMITTED flag exits 2, and this
+    verb additionally refuses a stamp that NORMALIZES to nothing -- which
+    argparse cannot see, since ``--escalations-dir ''`` satisfies a required
+    flag. An unstamped fleet-global record is cross-queue-ambiguous, and is
+    exactly the legacy population task 3640 had to back-fill; it must not be
+    allowed to regrow through this verb.
+
+    ``UNKNOWN_QUEUE`` is likewise refused HERE, even though it normalizes
+    non-empty. It is a back-fill-only sentinel (set_decision_escalations_dir,
+    task 3640) meaning "investigated, could not determine", and every reaper
+    refuses a decision so stamped -- so a record filed with it could only
+    ever be closed by hand, which is strictly worse than the '' record this
+    verb already refuses. A watcher always knows its own queue by
+    construction (it is the same dir it passes to reap-decisions), so there
+    is no legitimate write-path caller.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -2468,6 +2482,38 @@ def _run_write_decision(
     an optional repeatable ``--option`` flag here rather than widening this
     verb's other args.
     """
+    # CRITICAL: both stamp guards live HERE, in the CLI verb, and NOT in
+    # write_decision() -- do not "helpfully" push them down into the writer.
+    # write_decision() is the single atomic path the C8 watcher and the C5
+    # cockpit share by PRD design (fleet-cockpit-prd.md:177-179), and it has
+    # direct in-repo callers that legitimately write queue-less records:
+    # cockpit/tests/test_app.py, and tests/scripts/test_backfill_decision_
+    # queue_stamp.py, which must be able to CONSTRUCT the unstamped legacy
+    # population in order to test back-filling it. The contract being
+    # enforced is "how a WATCHER invokes write-decision", which is this
+    # verb's boundary, not the writer's.
+    stamp = normalize_escalations_dir(escalations_dir)
+    if not stamp:
+        logger.error(
+            'write-decision refusing to file %s: --escalations-dir is mandatory and '
+            'normalized to nothing. A DecisionRecord is fleet-global but an '
+            'esc-<taskid>-<n> id is unique only within one queue, so a queue-less '
+            'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
+            decision_id,
+        )
+        return
+    if stamp == UNKNOWN_QUEUE:
+        logger.error(
+            'write-decision refusing to file %s: --escalations-dir %s is a '
+            'back-fill-only sentinel (set_decision_escalations_dir, task 3640) and no '
+            'reaper will ever close a decision stamped with it -- only a human could. '
+            'A watcher knows its own queue by construction; pass the real queue dir '
+            'you also reap with.',
+            decision_id,
+            UNKNOWN_QUEUE,
+        )
+        return
+
     record = DecisionRecord(
         id=decision_id,
         project=project,
@@ -2477,7 +2523,7 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
         severity=severity,
-        escalations_dir=normalize_escalations_dir(escalations_dir),
+        escalations_dir=stamp,
     )
     if write_decision(record):
         print(record.id)
