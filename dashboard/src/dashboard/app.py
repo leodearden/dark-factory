@@ -40,6 +40,7 @@ from dashboard.data.burndown import (
     aggregate_burndown_series,
     collect_snapshot,
     downsample,
+    ensure_snapshot_columns,
 )
 from dashboard.data.cap_history import (
     AccountsSummary,
@@ -213,6 +214,23 @@ class _BurndownStore(AsyncSqliteBase):
     def connection(self) -> aiosqlite.Connection:
         """Public accessor for the open connection; raises RuntimeError if not opened."""
         return self._require_conn()
+
+    async def open(self) -> None:
+        """Open, then bring an existing DB up to the current column set.
+
+        ``BURNDOWN_SCHEMA`` is applied with ``CREATE TABLE IF NOT EXISTS``, so a
+        burndown.db created before a column was added never gains it from the
+        DDL alone.  Migrating here — before ``_burndown_loop`` can run — is what
+        keeps the collector from ever meeting an un-migrated table.  Closes the
+        connection on failure so a half-open store is never left behind.
+        """
+        await super().open()
+        try:
+            await ensure_snapshot_columns(self.connection)
+            await self.connection.commit()
+        except BaseException:
+            await self.close()
+            raise
 
 
 class _MetricsStore(AsyncSqliteBase):

@@ -38,10 +38,30 @@ CREATE TABLE IF NOT EXISTS snapshots (
     blocked     INTEGER NOT NULL DEFAULT 0,
     deferred    INTEGER NOT NULL DEFAULT 0,
     cancelled   INTEGER NOT NULL DEFAULT 0,
-    done        INTEGER NOT NULL DEFAULT 0
+    done        INTEGER NOT NULL DEFAULT 0,
+    -- The in_progress zone's live/stranded split (task 3543). Partitions
+    -- in_progress; it does not add to the six zones.
+    in_progress_live     INTEGER NOT NULL DEFAULT 0,
+    in_progress_stranded INTEGER NOT NULL DEFAULT 0,
+    -- max_concurrent_tasks in force AT SNAPSHOT TIME. Nullable on purpose:
+    -- NULL means "cap unknown", which is not a breach. Storing 0 instead would
+    -- read as a cap of zero and alarm on every snapshot. The cap is green-tier
+    -- hot-reloadable, so the only honest denominator for a historical row is
+    -- the cap that was in force at that instant.
+    concurrency_cap      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
 """
+
+# Columns added after the original 6-zone schema shipped, in the order
+# ensure_snapshot_columns adds them. ``CREATE TABLE IF NOT EXISTS`` is a no-op
+# against an existing DB, so these reach a live burndown.db only via the
+# migration.
+_ADDED_SNAPSHOT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('in_progress_live', 'INTEGER NOT NULL DEFAULT 0'),
+    ('in_progress_stranded', 'INTEGER NOT NULL DEFAULT 0'),
+    ('concurrency_cap', 'INTEGER'),
+)
 
 # Maps raw task statuses to the 6 display zones.
 _STATUS_MAP: dict[str, str] = {
@@ -63,9 +83,38 @@ _ZONE_KEYS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'don
 _SPLIT_KEYS = ('in_progress_live', 'in_progress_stranded')
 
 _INSERT_SNAPSHOT_SQL = (
-    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done, '
+    'in_progress_live, in_progress_stranded, concurrency_cap) '
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 )
+
+
+async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
+    """Bring an existing ``snapshots`` table up to the current column set.
+
+    Additive only: probes ``PRAGMA table_info`` and issues one
+    ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, never drops
+    or rewrites anything, so pre-existing rows keep their data and take the
+    column defaults (``0`` for the split, ``NULL`` for the cap — an honest
+    "unknown", since no cap was recorded at the time).
+
+    Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
+    ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
+    deployed burndown.db.  Without this, the widened
+    :data:`_INSERT_SNAPSHOT_SQL` would fail on the first collection cycle after
+    deploy.  Call it at store open, before the collector runs.
+
+    Mirrors fused-memory's ``_migrate_v1_to_v2`` probe-then-add idiom.  The
+    caller commits.
+    """
+    cursor = await conn.execute('PRAGMA table_info(snapshots)')
+    existing = {row[1] for row in await cursor.fetchall()}
+    await cursor.close()
+    for column, ddl in _ADDED_SNAPSHOT_COLUMNS:
+        if column in existing:
+            continue
+        await conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
+        logger.info('burndown: added snapshots.%s (%s)', column, ddl)
 
 
 def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
@@ -255,6 +304,13 @@ async def collect_snapshot(
                         counts['deferred'],
                         counts['cancelled'],
                         counts['done'],
+                        # A counter that cannot see the claimant columns has no
+                        # split to report; default to all-live so conservation
+                        # (live + stranded == in_progress) still holds and the
+                        # unknown errs toward under-reporting strands.
+                        counts.get('in_progress_live', counts['in_progress']),
+                        counts.get('in_progress_stranded', 0),
+                        counts.get('concurrency_cap'),
                     ),
                 )
                 await conn.commit()

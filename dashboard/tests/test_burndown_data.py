@@ -83,10 +83,19 @@ def _insert_snapshot(
     deferred: int = 0,
     cancelled: int = 0,
     done: int = 0,
+    in_progress_live: int | None = None,
+    in_progress_stranded: int = 0,
+    concurrency_cap: int | None = None,
 ) -> None:
+    # Default the split to all-live so the conservation invariant
+    # (live + stranded == in_progress) holds for fixtures that do not care
+    # about it; a NULL cap is the honest "unknown".
+    if in_progress_live is None:
+        in_progress_live = in_progress - in_progress_stranded
     conn.execute(
         _INSERT_SNAPSHOT_SQL,
-        (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
+        (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done,
+         in_progress_live, in_progress_stranded, concurrency_cap),
     )
 
 
@@ -2239,7 +2248,8 @@ def _make_burndown_db_with_series(
     for ts, done, cancelled, blocked, deferred, in_progress, pending in rows:
         conn.execute(
             _INSERT_SNAPSHOT_SQL,
-            (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
+            (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done,
+             in_progress, 0, None),
         )
     conn.commit()
     conn.close()
