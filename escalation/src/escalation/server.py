@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -30,6 +30,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
 )
+from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 from escalation.queue import observed_submit_response as _observed_submit_response
 
@@ -294,6 +295,105 @@ _COMPACT_ESCALATION_FIELDS = (
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
 )
+
+# get_pending_escalations(compact=True) additionally keeps its computed
+# pins_recovery annotation: the dashboard reads compact records, so dropping it
+# here would blank the whole PINNING surface.  Kept as a separate tuple so
+# get_task_escalations — which never computes the annotation — is untouched.
+_COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+# Task statuses from which a recovery/redispatch is still possible.  A record
+# on a task outside this set pins nothing: there is no recovery to block.
+_RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
+
+
+async def _annotate_pins_recovery(
+    queue: EscalationQueue,
+    harness: Any,
+    escalations: Sequence[Any],
+    dicts: list[dict[str, Any]],
+    *,
+    level: int | None,
+) -> None:
+    """Stamp ``pins_recovery`` on *dicts* in place, or leave the key ABSENT.
+
+    See ``get_pending_escalations``' docstring for the contract.  The key is
+    omitted rather than defaulted to ``[]`` on every path where the answer is
+    unknown, because ``[]`` reads as "nothing pins this task" — the esc-3163
+    collapse that routes a genuinely-pinned strand down the wrong branch.
+    """
+    if not dicts:
+        return
+    scheduler = getattr(harness, 'scheduler', None) if harness is not None else None
+    if scheduler is None:
+        logger.debug(
+            'pins_recovery omitted for %d pending record(s): no orchestrator '
+            'harness/scheduler wired in, so task status is unreadable',
+            len(dicts),
+        )
+        return
+
+    task_ids = sorted({e.task_id for e in escalations})
+    try:
+        statuses, err = await scheduler.get_statuses(task_ids)
+    except Exception as exc:  # noqa: BLE001 — an annotation must never fail the tool
+        logger.debug('pins_recovery omitted: status read raised: %s', exc)
+        return
+    if err is not None:
+        # get_statuses' failure shape is ({}, exc); reading only the dict would
+        # make a failed read indistinguishable from "no tasks" and report [].
+        logger.debug('pins_recovery omitted: status read failed: %s', err)
+        return
+
+    # classify_pins judges a record against its task's WHOLE open set, so a
+    # filtered view must not become a filtered classification.  Only a `level`
+    # filter narrows that set; without one the selection already IS the full
+    # open set for every task it mentions.
+    if level is None:
+        open_by_task: dict[str, list[Any]] = {}
+        for esc in escalations:
+            open_by_task.setdefault(esc.task_id, []).append(esc)
+    else:
+        open_by_task = {}
+        for tid in task_ids:
+            try:
+                open_by_task[tid] = queue.get_by_task(tid, status='pending')
+            except Exception as exc:  # noqa: BLE001
+                logger.debug('pins_recovery omitted for task %s: re-read failed: %s', tid, exc)
+
+    reports: dict[str, Any] = {}
+    live_by_task: dict[str, bool] = {}
+    for tid in task_ids:
+        if tid not in open_by_task:
+            continue
+        try:
+            live = bool(harness.is_workflow_active(tid))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('pins_recovery omitted for task %s: liveness read failed: %s', tid, exc)
+            continue
+        live_by_task[tid] = live
+        # live_claimant_id is unavailable here (the harness exposes no composed
+        # claimant id), which classify_pins treats as UNKNOWN and fails safe to
+        # pinning for a live-claimant L0.  Fail-safe is the correct direction:
+        # this annotation must never under-report a pin.
+        reports[tid] = classify_pins(tid, open_by_task[tid], live_claimant=live)
+
+    for esc, d in zip(escalations, dicts, strict=True):
+        tid = esc.task_id
+        status = statuses.get(tid)
+        report = reports.get(tid)
+        if status is None or report is None:
+            logger.debug(
+                'pins_recovery omitted for %s: task %s status/classification unresolved',
+                d.get('id'), tid,
+            )
+            continue
+        pins = (
+            status in _RECOVERABLE_STATUSES
+            and not live_by_task.get(tid, True)
+            and esc.id in report.queue_handoff
+        )
+        d['pins_recovery'] = [tid] if pins else []
 
 
 def create_server(
@@ -1060,7 +1160,7 @@ def create_server(
         return esc.to_dict()
 
     @mcp.tool()
-    def get_pending_escalations(
+    async def get_pending_escalations(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
@@ -1087,6 +1187,25 @@ def create_server(
         context small as the pending pile grows; fetch the full record for a
         specific id via ``get_escalation`` only when you are about to act on it.
         Default False preserves the full-dict shape for existing callers.
+
+        *pins_recovery* — each returned dict carries a computed
+        ``pins_recovery`` list: ``[task_id]`` when THIS record is what stops
+        that task from being recovered/redispatched, else ``[]``.  It is the
+        conjunction of four things (spec S8): the task is ``in-progress`` or
+        ``blocked`` (there is something to recover), no live claimant holds it
+        (it is stranded, not running), the record lands in
+        :attr:`~escalation.pins.PinReport.queue_handoff` (so an info record and
+        a dead L0 do NOT pin — derived from the classifier, never from
+        ``bool(open_escalations)``), and the task's status could be read.
+
+        The key is **OMITTED entirely** — never emitted as ``[]`` — when the
+        annotation cannot be computed: no harness/scheduler wired in, the
+        status read failed or raised, or that record's task is missing from
+        the status map.  A false ``[]`` reads as "nothing pins this task",
+        which is the exact collapse (esc-3163) that
+        :attr:`~escalation.pins.PinReport.store_unavailable` exists to
+        prevent, so callers must treat an absent key as UNKNOWN and render
+        nothing rather than "not pinning".
         """
         if task_id:
             escalations = queue.get_by_task(task_id, status='pending', level=level)
@@ -1094,12 +1213,15 @@ def create_server(
             escalations = queue.get_pending()
             if level is not None:
                 escalations = [e for e in escalations if e.level == level]
+
+        dicts = [e.to_dict() for e in escalations]
+        await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
         if compact:
-            return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
-                for d in (e.to_dict() for e in escalations)
-            ]
-        return [e.to_dict() for e in escalations]
+            # `if k in d` because pins_recovery is deliberately absent when
+            # unknown — projecting it unconditionally would KeyError on
+            # exactly the degraded path the omission contract exists for.
+            return [{k: d[k] for k in _COMPACT_PENDING_FIELDS if k in d} for d in dicts]
+        return dicts
 
     @mcp.tool()
     def get_task_escalations(
