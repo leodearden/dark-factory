@@ -350,13 +350,34 @@ def scan_content(
     # so the rare same-offset pair keeps its discovery order.
     found.sort(key=lambda item: item[0])
 
-    refs: list[Referent] = []
+    deduped: list[Referent] = []
     seen: set[tuple[str, str, str]] = set()
     for _offset, referent in found:
         key = (referent.kind, referent.project_id, referent.number)
         if key in seen:
             continue
         seen.add(key)
-        refs.append(referent)
+        deduped.append(referent)
 
-    return LabelScan(refs=refs)
+    # A number claimed by BOTH an own-project and a foreign-qualified referent
+    # cannot say which task the facts belong to. The partition is SYMMETRIC:
+    # both referents are derived from the same ambiguous prose, so handing a
+    # consumer the local one as clean evidence would be a confidently-wrong
+    # answer, not a safe fallback. Refuse both rather than pick either.
+    #
+    # It is per-NUMBER, not per-content, so one contested number never
+    # suppresses an unrelated clean ref elsewhere in the same body.
+    #
+    # Note the self-qualified reclassification above runs BEFORE this: that is
+    # why 'reify:5181 and task 5181' in group reify is a single own-project
+    # referent (deduped) rather than a local-vs-foreign contest.
+    local_numbers = {r.number for r in deduped if not r.project_id}
+    foreign_numbers = {r.number for r in deduped if r.project_id}
+    contested = local_numbers & foreign_numbers
+
+    # Digits are compared as literals, never int-normalized, so '0250' and
+    # '250' are different numbers and create no false contest.
+    return LabelScan(
+        refs=[r for r in deduped if r.number not in contested],
+        ambiguous=[r for r in deduped if r.number in contested],
+    )
