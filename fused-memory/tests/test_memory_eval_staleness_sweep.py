@@ -1128,5 +1128,373 @@ class TestFetchTerminalTaskIds:
         assert 'task-terminal-staleness' in m.metric_families_not_measured(series)
 
 
+# ---------------------------------------------------------------------------
+# The read-only run band, driven end to end through the real main()
+#
+# "Never writes" is asserted as BEHAVIOUR, not as a comment: the double below
+# raises on every mutating method, so a run that completes is a run that never
+# wrote. The meta-test proves the tripwire actually fires, because a double
+# that silently tolerated a write would make every test above vacuous.
+# ---------------------------------------------------------------------------
+
+class _ReadOnlyViolation(AssertionError):
+    """Raised by the double when the sweep touches a mutation path."""
+
+
+class _ServiceDouble:
+    """A MemoryService stand-in that cannot be written to.
+
+    Implements only the three read primitives this sweep is allowed to use
+    and records every call, so the band can be asserted on rather than
+    guessed at. Every write path is a tripwire.
+    """
+
+    def __init__(self, *, scrolls=None, by_id=None, searches=None):
+        self._scrolls = dict(scrolls or {})
+        self._by_id = dict(by_id or {})
+        self._searches = dict(searches or {})
+        self.scroll_calls: list[tuple[str, dict, int]] = []
+        self.id_reads: list[str] = []
+        self.search_calls: list[str] = []
+        self.initialized = False
+        self.closed = False
+        self.mem0 = self
+
+    # -- the read paths the sweep is allowed to use ------------------------
+    async def scroll_by_metadata(self, scope, filters, limit=1000, **kwargs):
+        self.scroll_calls.append((scope.project_id, dict(filters), limit))
+        return list(self._scrolls.get(filters.get('category'), []))
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.id_reads.append(memory_id)
+        return self._by_id.get(memory_id)
+
+    async def search(self, query, project_id='main', limit=10, **kwargs):
+        self.search_calls.append(query)
+        return list(self._searches.get(query, []))
+
+    # -- lifecycle ---------------------------------------------------------
+    async def initialize(self):
+        self.initialized = True
+
+    async def close(self):
+        self.closed = True
+
+    # -- every write path is a tripwire ------------------------------------
+    async def add_memory(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called add_memory')
+
+    async def add_episode(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called add_episode')
+
+    async def add_system_record(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called add_system_record')
+
+    async def delete_memory(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called delete_memory')
+
+    async def delete_episode(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called delete_episode')
+
+    async def update_edge(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called update_edge')
+
+    async def merge_entities(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called merge_entities')
+
+    async def delete_entity(self, *a, **kw):
+        raise _ReadOnlyViolation('the sweep called delete_entity')
+
+
+def _seeded_double() -> _ServiceDouble:
+    """A corpus with one live supersedes edge, one dangling edge, one stale entry."""
+    return _ServiceDouble(
+        scrolls={'procedural_knowledge': [
+            _raw_point(UUID_A, {
+                'data': 'the successor text', 'supersedes': UUID_B,
+            }),
+            _raw_point('rec-corrects', {
+                'data': 'a correction', 'corrects': UUID_C,
+            }),
+            _raw_point('rec-stale', {
+                'data': 'Task 4802 status=in-progress claimant_run_id=abc',
+            }),
+        ]},
+        # UUID_B resolves; UUID_C was never written, so that edge dangles.
+        by_id={UUID_B: {'id': UUID_B, 'content': 'the predecessor', 'metadata': {}}},
+        searches={'the successor text': [_Hit(UUID_B), _Hit(UUID_A)]},
+    )
+
+
+def _install_run_band(monkeypatch, double, *, taskmaster_statuses=None, project_root='/repo'):
+    """Point the lazily-imported MemoryService and config at test stand-ins.
+
+    No test-only seam in the script: ``_run`` imports both inside the function
+    (the D8 pattern), so patching the module attributes is enough to drive the
+    real argparse/_run/emit path end to end.
+    """
+    import fused_memory.services.memory_service as ms  # noqa: PLC0415
+    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
+    from fused_memory.config import schema  # noqa: PLC0415
+
+    taskmaster = (
+        None if taskmaster_statuses is None
+        else types.SimpleNamespace(project_root=project_root)
+    )
+    monkeypatch.setattr(ms, 'MemoryService', lambda config: double)
+    monkeypatch.setattr(
+        schema, 'FusedMemoryConfig',
+        lambda *a, **kw: types.SimpleNamespace(taskmaster=taskmaster),
+    )
+    monkeypatch.setattr(
+        sqlite_task_backend, 'SqliteTaskBackend',
+        lambda cfg: _BackendDouble(cfg, statuses=taskmaster_statuses or {}),
+    )
+
+
+def _run_main(monkeypatch, tmp_path, double, *extra_argv, taskmaster_statuses=None):
+    """Drive the real ``main()`` with the stamp pinned, returning its exit code."""
+    from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: PLC0415
+
+    _install_run_band(monkeypatch, double, taskmaster_statuses=taskmaster_statuses)
+    monkeypatch.setenv(RUN_STAMP_ENV_VAR, STAMP)
+    return _mod().main([
+        '--project-id', 'dark_factory',
+        '--metrics-root', str(tmp_path),
+        *extra_argv,
+    ])
+
+
+class TestReadOnlyGuarantee:
+    """A run that completes is a run that never wrote."""
+
+    def test_a_full_run_never_touches_a_write_path(self, monkeypatch, tmp_path, capsys):
+        double = _seeded_double()
+
+        code = _run_main(
+            monkeypatch, tmp_path, double, taskmaster_statuses={'4802': 'done'},
+        )
+
+        assert code == 0
+        assert double.initialized and double.closed
+        # And it did real work rather than completing by doing nothing.
+        assert double.scroll_calls
+        assert double.id_reads
+        assert capsys.readouterr().out
+
+    def test_the_double_would_have_caught_a_write(self):
+        """The tripwire fires — otherwise every assertion above is vacuous."""
+        import asyncio  # noqa: PLC0415
+
+        double = _ServiceDouble()
+        for method in (
+            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
+            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+        ):
+            with pytest.raises(_ReadOnlyViolation):
+                asyncio.run(getattr(double, method)())
+
+    def test_the_store_is_closed_even_when_the_sweep_raises(self, monkeypatch, tmp_path):
+        double = _seeded_double()
+        monkeypatch.setattr(
+            double, 'scroll_by_metadata',
+            _raising(TimeoutError('qdrant read timed out')),
+        )
+
+        with pytest.raises(TimeoutError):
+            _run_main(monkeypatch, tmp_path, double)
+
+        assert double.closed
+
+
+def _raising(exc):
+    async def _fail(*a, **kw):
+        raise exc
+    return _fail
+
+
+class TestArgparseBand:
+    """The CLI surface — and, load-bearing, what is absent from it."""
+
+    def test_the_flag_set_is_exactly_this(self):
+        parser = _mod().build_parser()
+        flags = {opt for action in parser._actions for opt in action.option_strings}
+        assert flags == {
+            '-h', '--help',
+            '--project-id',
+            '--scan-limit',
+            '--config',
+            '--metrics-root',
+            '--eval-id',
+            '--no-metrics',
+        }
+
+    def test_there_is_no_mutation_flag(self):
+        parser = _mod().build_parser()
+        flags = {opt for action in parser._actions for opt in action.option_strings}
+        # Asserted by equality above too, but named here because THIS is the
+        # guarantee: a sweep that reports has no --apply to grow into.
+        assert flags.isdisjoint({'--apply', '--fix', '--prune', '--delete', '--repair'})
+
+    def test_the_defaults_are_this_leafs_own(self):
+        m = _mod()
+        args = m.build_parser().parse_args(['--project-id', 'dark_factory'])
+        assert args.eval_id == 'e4-staleness-sweep'
+        assert args.metrics_root == m._DEFAULT_METRICS_ROOT
+        assert args.no_metrics is False
+        assert args.scan_limit > 0
+
+    def test_project_id_is_required(self):
+        with pytest.raises(SystemExit):
+            _mod().build_parser().parse_args([])
+
+
+class TestArtifactEmission:
+    """What a run leaves on disk, under the stamp it was pinned to."""
+
+    def test_both_artifacts_land_under_the_eval_id_and_round_trip(
+        self, monkeypatch, tmp_path,
+    ):
+        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+
+        _run_main(
+            monkeypatch, tmp_path, _seeded_double(), taskmaster_statuses={'4802': 'done'},
+        )
+
+        metrics_path = tmp_path / 'e4-staleness-sweep' / f'metrics-{STAMP}.json'
+        report_path = tmp_path / 'e4-staleness-sweep' / f'report-{STAMP}.txt'
+        assert metrics_path.exists()
+        assert report_path.exists()
+
+        series = load_metric_series(metrics_path)
+        assert series.eval_id == 'e4-staleness-sweep'
+        assert series.run_stamp == STAMP
+        # Every family measurable from this seeded corpus is measured.
+        assert _ids(series) == {
+            'superseded-still-surfacing',
+            'dangling-pointers',
+            'successor-pointer-present',
+            'task-terminal-staleness',
+        }
+
+    def test_eval_id_overrides_the_directory(self, monkeypatch, tmp_path):
+        _run_main(monkeypatch, tmp_path, _seeded_double(), '--eval-id', 'e4-scratch')
+
+        assert (tmp_path / 'e4-scratch' / f'metrics-{STAMP}.json').exists()
+        assert not (tmp_path / 'e4-staleness-sweep').exists()
+
+    def test_no_metrics_prints_the_report_and_writes_nothing(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        code = _run_main(monkeypatch, tmp_path, _seeded_double(), '--no-metrics')
+
+        assert code == 0
+        assert capsys.readouterr().out
+        assert list(tmp_path.iterdir()) == []
+
+
+def _sweep(monkeypatch, tmp_path, double, *, taskmaster_statuses=None, scan_limit=100):
+    """Run the sweep band directly and return its outcome.
+
+    ``run_sweep`` returns the sections under their machine keys (β's
+    ProbeOutcome precedent), so what a run DISCLOSED is answerable without a
+    test-only global in the script and without pattern-matching English.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
+
+    taskmaster = (
+        None if taskmaster_statuses is None
+        else types.SimpleNamespace(project_root='/repo')
+    )
+    monkeypatch.setattr(
+        sqlite_task_backend, 'SqliteTaskBackend',
+        lambda cfg: _BackendDouble(cfg, statuses=taskmaster_statuses or {}),
+    )
+    return asyncio.run(_mod().run_sweep(
+        double,
+        project_ids=('dark_factory',),
+        scan_limit=scan_limit,
+        out_root=tmp_path,
+        stamp=STAMP,
+        config=types.SimpleNamespace(taskmaster=taskmaster),
+        write_metrics=False,
+    ))
+
+
+class TestReport:
+    """Every family is NAMED, so an absence can never read as health."""
+
+    def _sections(self, monkeypatch, tmp_path, double, **kwargs):
+        outcome = _sweep(monkeypatch, tmp_path, double, **kwargs)
+        return {section.key: section for section in outcome.sections}
+
+    def test_every_family_has_a_named_section(self, monkeypatch, tmp_path):
+        sections = self._sections(
+            monkeypatch, tmp_path, _seeded_double(), taskmaster_statuses={'4802': 'done'},
+        )
+        # Keyed on structure, not on prose: a copy edit must not fail this,
+        # but a section that stops being emitted must.
+        assert {
+            'superseded_surfacing', 'dangling_pointers', 'task_terminal_staleness',
+        } <= set(sections)
+
+    def test_an_unmeasured_family_is_named_rather_than_omitted_silently(
+        self, monkeypatch, tmp_path,
+    ):
+        # No task backend -> the staleness family has no exposure and emits no
+        # metric. The run must SAY so; a metric that quietly stops existing
+        # reads to a human as one that had nothing to report.
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+        assert 'not_measured' in sections
+        assert 'task-terminal-staleness' in sections['not_measured'].text
+
+    def test_a_skipped_task_backend_is_its_own_disclosure(self, monkeypatch, tmp_path):
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+        assert 'task_backend_skipped' in sections
+
+    def test_a_reached_task_backend_produces_no_skip_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        sections = self._sections(
+            monkeypatch, tmp_path, _seeded_double(), taskmaster_statuses={'4802': 'done'},
+        )
+        assert 'task_backend_skipped' not in sections
+
+    def test_a_truncated_scan_is_its_own_disclosure(self, monkeypatch, tmp_path):
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double(), scan_limit=3)
+        # Three seeded records against a limit of three: the scroll may have
+        # stopped short, and a capped sample presented as a census is the one
+        # thing this report must never do.
+        assert 'scan_truncation' in sections
+
+    def test_an_uncapped_scan_produces_no_truncation_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+        assert 'scan_truncation' not in sections
+
+    def test_malformed_pointer_members_get_their_own_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        double = _ServiceDouble(scrolls={'procedural_knowledge': [
+            _raw_point('rec-bad', {'data': 'x', 'supersedes': ['not-a-uuid']}),
+        ]})
+        sections = self._sections(monkeypatch, tmp_path, double)
+        # "The target is gone" and "the pointer was never writable" have
+        # different fixes, so a dangling count must not merge them.
+        assert 'malformed_pointers' in sections
+        assert 'not-a-uuid' in sections['malformed_pointers'].text
+
+    def test_the_unresolved_targets_are_named_not_just_counted(
+        self, monkeypatch, tmp_path,
+    ):
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+        # A bare count tells an operator that something dangles but not which
+        # pointer to go and look at.
+        assert UUID_C in sections['dangling_pointers'].text
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
