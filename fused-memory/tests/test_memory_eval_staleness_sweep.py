@@ -495,5 +495,173 @@ class TestTaskTerminalStaleness:
         assert obs.stale == 1
 
 
+STAMP = '20260808T120000Z'
+
+
+def _full_inputs():
+    """One of every family, all with non-zero exposure."""
+    m = _mod()
+    refs = [
+        *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+        *m.pointer_targets(_record('rec-2', 'a correction', corrects=UUID_C)),
+    ]
+    resolution = {UUID_B: True, UUID_C: False}
+    return {
+        'census': m.dangling_census(refs, resolution),
+        'tripwire_items': m.successor_pointer_items(refs, resolution),
+        'surfacing': m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B, UUID_A]),
+        'staleness': m.terminal_staleness(
+            [_record('rec-3', 'Task 4802 status=in-progress')], {'4802': 'done'},
+        ),
+        'corpus_counts': {'procedural_knowledge': 12},
+        'project_id': 'dark_factory',
+        'stamp': STAMP,
+    }
+
+
+def _ids(series) -> set[str]:
+    return {metric.metric_id for metric in series.metrics}
+
+
+def _metric(series, metric_id):
+    for metric in series.metrics:
+        if metric.metric_id == metric_id:
+            return metric
+    raise AssertionError(f'series carries no {metric_id!r}: {sorted(_ids(series))}')
+
+
+class TestBuildSeries:
+    """The artifact this leaf owns — and the metrics it must NOT emit."""
+
+    def test_the_series_identifies_this_leaf(self):
+        from shared.memory_eval_metrics import SCHEMA_VERSION  # noqa: PLC0415
+
+        series = _mod().build_series(**_full_inputs())
+        assert series.eval_id == 'e4-staleness-sweep'
+        assert series.schema_version == SCHEMA_VERSION
+        assert series.run_stamp == STAMP
+        assert series.corpus.project_id == 'dark_factory'
+
+    def test_it_emits_exactly_the_four_metrics_this_leaf_owns(self):
+        m = _mod()
+        series = m.build_series(**_full_inputs())
+        assert _ids(series) == set(m.pinned_metric_ids())
+        assert _ids(series) == {
+            'superseded-still-surfacing',
+            'dangling-pointers',
+            'successor-pointer-present',
+            'task-terminal-staleness',
+        }
+
+    def test_it_never_emits_beta_metrics(self):
+        series = _mod().build_series(**_full_inputs())
+        assert 'superseded-above-successor' not in _ids(series)
+        assert 'canonical-in-top-5' not in _ids(series)
+        assert 'claim-recall' not in _ids(series)
+        assert 'contamination-share' not in _ids(series)
+
+    def test_kinds_and_directions_per_family(self):
+        m = _mod()
+        series = m.build_series(**_full_inputs())
+        for metric_id in (
+            'superseded-still-surfacing', 'dangling-pointers', 'task-terminal-staleness',
+        ):
+            metric = _metric(series, metric_id)
+            assert metric.kind == 'count'
+            assert metric.direction == 'higher_is_worse'
+            assert metric.denominator is None
+            assert metric.items is None
+        tripwire = _metric(series, 'successor-pointer-present')
+        assert tripwire.kind == 'tripwire'
+        assert tripwire.direction is None
+        assert tripwire.denominator is None
+
+    def test_the_tripwire_value_is_its_failing_item_count(self):
+        m = _mod()
+        inputs = _full_inputs()
+        tripwire = _metric(m.build_series(**inputs), 'successor-pointer-present')
+        assert tripwire.n == len(tripwire.items)
+        assert tripwire.value == sum(1 for i in tripwire.items if not i.passed)
+
+    def test_the_count_values_and_exposures(self):
+        m = _mod()
+        inputs = _full_inputs()
+        series = m.build_series(**inputs)
+        dangling = _metric(series, 'dangling-pointers')
+        assert dangling.value == inputs['census'].unresolved
+        assert dangling.n == inputs['census'].examined
+        surfacing = _metric(series, 'superseded-still-surfacing')
+        assert surfacing.value == inputs['surfacing'].still_surfacing
+        assert surfacing.n == inputs['surfacing'].pairs_comparable
+        staleness = _metric(series, 'task-terminal-staleness')
+        assert staleness.value == inputs['staleness'].stale
+        assert staleness.n == inputs['staleness'].entries_referencing_terminal
+
+    def test_a_zero_exposure_family_is_absent_not_zero(self):
+        """A fabricated 0/0 datapoint entering alpha's baseline window is worse
+        than a gap in it — and parent_id makes this live, not hypothetical."""
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['census'] = m.dangling_census([], {})
+        inputs['tripwire_items'] = []
+        inputs['surfacing'] = m.EMPTY_SURFACING
+        inputs['staleness'] = m.terminal_staleness([], set())
+        series = m.build_series(**inputs)
+        assert series.metrics == []
+        assert m.metric_families_not_measured(series) == list(m.pinned_metric_ids())
+
+    def test_each_family_can_be_absent_independently(self):
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['surfacing'] = m.EMPTY_SURFACING
+        series = m.build_series(**inputs)
+        assert 'superseded-still-surfacing' not in _ids(series)
+        assert 'dangling-pointers' in _ids(series)
+        assert m.metric_families_not_measured(series) == ['superseded-still-surfacing']
+
+    def test_details_path_is_a_filename_never_an_absolute_path(self):
+        """The artifact directory gets copied and served; an absolute path
+        from this machine would be a dangling pointer there."""
+        series = _mod().build_series(**_full_inputs())
+        for metric in series.metrics:
+            assert metric.details_path == f'report-{STAMP}.txt'
+            assert '/' not in metric.details_path
+
+    def test_corpus_counts_carry_the_scan_disclosure(self):
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['corpus_counts'] = {
+            'procedural_knowledge_scanned': 12,
+            'procedural_knowledge_truncated': 1,
+        }
+        counts = m.build_series(**inputs).corpus.counts
+        assert counts['procedural_knowledge_scanned'] == 12
+        assert counts['procedural_knowledge_truncated'] == 1
+        # And the runner's own disclosures ride along in the same mapping.
+        assert counts['pointer_refs_malformed'] == 0
+        assert counts['pointers_supersedes_examined'] == 1
+
+    def test_a_caller_key_colliding_with_a_computed_disclosure_raises(self):
+        """Silently overwriting either one would hide a narrowing."""
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['corpus_counts'] = {'pointer_refs_malformed': 999}
+        with pytest.raises(ValueError, match='collides'):
+            m.build_series(**inputs)
+
+    def test_the_series_round_trips_and_passes_the_real_validator(self):
+        import json  # noqa: PLC0415
+
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            parse_metric_series,
+            serialize_metric_series,
+            validate_metric_series,
+        )
+
+        series = _mod().build_series(**_full_inputs())
+        validate_metric_series(series)
+        assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
