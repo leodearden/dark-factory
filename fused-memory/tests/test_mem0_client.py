@@ -10,7 +10,7 @@ from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
-from fused_memory.backends.mem0_client import Mem0Backend
+from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -1317,6 +1317,37 @@ class TestMem0BackendUpdate:
             'expected no non-None metadata kwarg when caller omits it, got '
             f'{call.kwargs.get("metadata")!r}'
         )
+
+
+class TestIsMissingCollectionError:
+    """`is_missing_collection_error` tells a genuinely-absent Qdrant collection
+    ("zero memories" — a true empty result) apart from a real backend failure
+    that callers must still surface per no-silent-fail (task 2949).
+
+    step-1 (RED): the predicate does not exist yet.
+    """
+
+    def test_missing_collection_404_is_true(self):
+        """Qdrant's stable missing-collection 404 is the ONLY matching shape."""
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b"Collection `fused_solar_challenge` doesn't exist!",
+            {},
+        )
+        assert is_missing_collection_error(exc) is True
+
+    def test_non_404_unexpected_response_is_false(self):
+        """A 500 is a real backend failure, not an empty collection."""
+        exc = UnexpectedResponse(500, 'Internal Server Error', b'boom', {})
+        assert is_missing_collection_error(exc) is False
+
+    def test_generic_exception_is_false(self):
+        assert is_missing_collection_error(RuntimeError('qdrant down')) is False
+
+    def test_timeout_error_is_false(self):
+        """A timeout must keep propagating — it is not evidence of 'no data'."""
+        assert is_missing_collection_error(TimeoutError()) is False
 
 
 # ---------------------------------------------------------------------------
