@@ -156,6 +156,139 @@ def canonical_slugs() -> list[str]:
     return [slug for _, slug in canonical_family()]
 
 
+def marked_span(md_text: str, name: str, *, source: str) -> str:
+    """The text strictly between ``<!-- name:begin … -->`` and ``<!-- name:end -->``.
+
+    The begin marker's own explanatory comment is EXCLUDED from the returned
+    span: it names this test module's path and a task number, either of which a
+    claim regex downstream could match, so a span that swallowed it would pin the
+    comment instead of the prose.
+
+    Loud on a missing, duplicated or inverted marker, never a ``''`` return. An
+    empty span satisfies every claim check by containing no claims; a duplicated
+    marker is the same failure one level down, since silently taking the first
+    span leaves the second copy unpinned and free to drift.
+    """
+    begin_marker = f"<!-- {name}:begin"
+    end_marker = f"<!-- {name}:end -->"
+
+    begin_count = md_text.count(begin_marker)
+    assert begin_count == 1, (
+        f"{source}: expected exactly one `{begin_marker}` marker, found "
+        f"{begin_count} (task 3802). This marker delimits a span whose contents "
+        f"are pinned against the live invariant family. If it was deleted, "
+        f"restore it around the claim it named; if it was duplicated, one of the "
+        f"two spans is unpinned and free to drift."
+    )
+    end_count = md_text.count(end_marker)
+    assert end_count == 1, (
+        f"{source}: expected exactly one `{end_marker}` marker closing "
+        f"`{begin_marker}`, found {end_count} (task 3802) — restore the closing "
+        f"marker directly below the pinned claim."
+    )
+
+    begin_index = md_text.index(begin_marker)
+    end_index = md_text.index(end_marker)
+    assert begin_index < end_index, (
+        f"{source}: the `{name}:end` marker precedes its `{name}:begin` marker "
+        f"(task 3802) — the span is inverted, so it delimits everything except "
+        f"the claim it was meant to pin. Swap them."
+    )
+
+    comment_close = md_text.index("-->", begin_index)
+    assert comment_close < end_index, (
+        f"{source}: the `{begin_marker}` comment is never closed with `-->` "
+        f"before the `{name}:end` marker (task 3802)."
+    )
+    return md_text[comment_close + len("-->") : end_index]
+
+
+_RANGE_CLAIM_RE = re.compile(r"INV-(\d+)\.\.(?:INV-)?(\d+)")
+
+_CARDINAL_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+_CARDINAL_CLAIM_RE = re.compile(
+    r"\b(" + "|".join(_CARDINAL_WORDS) + r"|\d+)\s+(?:invariants|ids|slugs)\b",
+    re.IGNORECASE,
+)
+
+
+def assert_family_claims(
+    span_text: str,
+    family: list[tuple[int, str]],
+    *,
+    source: str,
+    span_name: str,
+    allow_no_claim: bool = False,
+) -> None:
+    """Every LIVE family-size claim inside a marked span must name the real size.
+
+    Two claim shapes, both measured in the live docs: an ``INV-<a>..[INV-]<b>``
+    range token, which must be ``1..len(family)``, and a ``<cardinal>
+    invariants|ids|slugs`` phrase, which must name ``len(family)``.
+
+    Applied ONLY inside marked spans, never file-wide. Both docs also carry
+    HISTORICAL ranges that are correct as written ("INV-1..INV-5 encode the
+    agent-legibility survey's cross-cutting root causes"), and a blanket rule
+    could only be greened by falsifying them.
+
+    A span carrying NEITHER claim shape is loud unless *allow_no_claim*. That
+    guards the marker drifting off the sentence it was meant to wrap: a prose
+    edit that moves the claim out of the span otherwise leaves this check green
+    while the claim it names is no longer pinned at all.
+    """
+    size = len(family)
+    found_a_claim = False
+
+    for match in _RANGE_CLAIM_RE.finditer(span_text):
+        found_a_claim = True
+        low, high = int(match.group(1)), int(match.group(2))
+        assert (low, high) == (1, size), (
+            f"{source} span {span_name!r}: the range claim {match.group(0)!r} is "
+            f"stale (task 3802) — the live family parsed from "
+            f"{_repo_relative(NORMATIVE_DOC)} is INV-1..INV-{size}. Update the "
+            f"sentence inside the marker, or move the marker if this range is a "
+            f"HISTORICAL claim (a founding subset, a dated addendum) that is "
+            f"correct as written and must not be pinned."
+        )
+
+    for match in _CARDINAL_CLAIM_RE.finditer(span_text):
+        found_a_claim = True
+        token = match.group(1).lower()
+        # A spelled-out cardinal, else a bare integer — the regex admits only
+        # those two shapes, so int() cannot raise here.
+        claimed = _CARDINAL_WORDS[token] if token in _CARDINAL_WORDS else int(token)
+        assert claimed == size, (
+            f"{source} span {span_name!r}: the count claim {match.group(0)!r} is "
+            f"stale (task 3802) — the live family parsed from "
+            f"{_repo_relative(NORMATIVE_DOC)} has {size} invariants. Update the "
+            f"count inside the marker, or de-number the sentence so it cannot go "
+            f"stale again (the fix CONTRIBUTING.md §6 took)."
+        )
+
+    assert found_a_claim or allow_no_claim, (
+        f"{source} span {span_name!r}: carries neither an `INV-<a>..<b>` range "
+        f"nor a `<cardinal> invariants|ids|slugs` phrase (task 3802), so it pins "
+        f"nothing. The marker has most likely drifted off the sentence it was "
+        f"meant to wrap — move it back, or pass allow_no_claim=True at the call "
+        f"site if this span is deliberately pinned for something else. Span "
+        f"text: {span_text!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------

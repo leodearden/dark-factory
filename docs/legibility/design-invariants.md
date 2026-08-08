@@ -12,7 +12,16 @@ cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
 ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
 the confusion census's optional `invariant_violated` field all reference
-them. Numeric aliases INV-1..INV-8 are prose convenience only.
+them.
+
+<!-- inv-family-claim-intro:begin
+     A LIVE claim about the current family size — pinned by
+     scripts/tests/test_design_invariants_consistency.py. Add an invariant and
+     this range goes red until it names the whole family. The historical ranges
+     above (the survey's INV-1..INV-5 founding subset, the dated INV-6..INV-7 /
+     INV-8 additions) are correct as written and deliberately unpinned. -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:end -->
 
 Adding or removing an invariant? Append/remove its trigger shape in
 `skills/prd/references/gates.md` §G7 **in the same commit** — that list is
@@ -216,12 +225,16 @@ heartbeat firing above a threshold (INV-4 applied to scheduling).
 
 ## Census seam
 
+<!-- inv-family-claim-census:begin
+     A LIVE claim about the current family size — pinned by
+     scripts/tests/test_design_invariants_consistency.py. -->
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
 The slug vocabulary is *this* doc — the eight ids above. The coding pipeline
 that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census
 batches is an enforcement gap: file a guard task.
+<!-- inv-family-claim-census:end -->
 
 ## Fixtures
 
