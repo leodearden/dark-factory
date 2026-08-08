@@ -54,6 +54,29 @@ mistake a partial sweep for a complete one. A truncated ``--apply`` (``--limit``
 reached, or the scan otherwise capped) exits non-zero for the same reason: it
 covered an unknown fraction of the corpus.
 
+``--apply`` HAS A PRECONDITION, and it is machine-enforced (task 3686). Before
+scanning anything, an ``--apply`` run probes whether this process can actually
+create a file in mem0's history directory
+(``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``).
+If it cannot, the run REFUSES to start: nothing is scanned, nothing is mutated,
+and the refusal surfaces as ``aborted: true`` and exit 2.
+
+That guard exists because of a measured loss. This sweep was run under
+``--apply`` from a sandboxed agent session, where the two halves of a repair
+land on different substrates: the Qdrant delete is a NETWORK call to
+``localhost:6333`` (landlock governs the filesystem only, so it SUCCEEDED)
+while mem0's history write is a SQLite write under ``~/.mem0`` (DENIED). The
+mutation split in half and memory ``7d073281-4c5d-4ba3-a01c-3a167f4460f4`` left
+the store without its repaired text ever being written back. Because landlock
+cannot block the network delete, no sandbox write-set change could have made
+the mutation atomic -- only refusing to start bounds the blast radius. The
+general policy: mutating memory operations go through the fused-memory MCP
+server, the unsandboxed owner of the store; an in-sandbox script must never
+mutate the shared store directly.
+
+A dry run is NOT gated on write capability -- it mutates nothing, so the
+classification report stays obtainable from anywhere, sandboxed or not.
+
 The delete/re-add is VERIFIED-PERSISTED, not assumed. ``MemoryService.add_memory``
 swallows a Mem0 write failure into ``AddMemoryResponse.message`` as
 ``[mem0_error: ...]`` and returns NORMALLY, so a returned response is not by
@@ -135,6 +158,10 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
 
 logger = logging.getLogger('sweep_toolcall_xml_leak')
@@ -601,6 +628,37 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # against the same enforcement setting even if the config object is edited
     # mid-sweep.
     enforcement = resolve_metadata_enforcement(memory_service)
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # It has to precede the first mutation, and there is no safe later slot:
+    # ``_repair_record`` calls ``delete_memory`` OUTSIDE any try, and mem0's
+    # ``_delete_memory`` removes the Qdrant point BEFORE writing its SQLite
+    # history. So in a write-denied environment the point is already gone by
+    # the time the history write fails, and no re-add is attempted -- the
+    # measured 7d073281 loss. A per-record probe would detect a run-wide
+    # condition one destroyed record too late.
+    #
+    # The two halves of a repair sit on different substrates, which is why the
+    # environment can deny one and not the other: the Qdrant delete is a
+    # NETWORK call to localhost:6333, while mem0's history write is a
+    # FILESYSTEM write under ~/.mem0. Landlock governs the filesystem only.
+    #
+    # Gated on ``not dry_run`` so a read-only run stays pure-read and needs no
+    # write capability at all.
+    if not dry_run:
+        try:
+            assert_store_mutation_allowed(operation='sweep_toolcall_xml_leak --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'sweep_toolcall_xml_leak: --apply NOT started (fail-closed) -- this '
+                'process cannot write mem0\'s history directory, so a repair would '
+                'delete the Qdrant point and then fail to write the replacement. '
+                'Nothing was scanned and nothing was mutated. Route the repair '
+                'through the fused-memory MCP server, or re-run from an '
+                'unsandboxed operator shell.'
+            )
+            raise
 
     scan = await memory_service.scan_memory_content(
         project_id=args.project_id,

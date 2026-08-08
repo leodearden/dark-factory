@@ -10,3 +10,109 @@ test_command: "uv run --project sampler --directory sampler pytest tests/ --tb=s
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project sampler --directory sampler ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py sampler/tests"
 type_check_command: "uv run --project sampler --directory sampler pyright src/ tests/"
+
+# Per-module verify budget (task 3473). Before this, sampler declared nothing
+# here and fell HARD through to the repo-root whole-fleet ceiling.
+#
+# (1) MEASUREMENT PROVENANCE. Six runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239, plus a planning-time trial of
+# the same command. All rc=0, all reporting 52 passed. EVERY FIGURE IS
+# CONTENDED — a 32-core host running /proc/loadavg 139-252 throughout — and
+# none is quoted as an unloaded one, per orchestrator/tests/warm-lane/README.md.
+#
+#      8.78s wall /  4.08s pytest @ loadavg 148.02  <- the CONVENIENT figure
+#      9.64s wall /  6.05s pytest @ loadavg 191.12  (6-way concurrent wave)
+#     10.51s wall /  5.74s pytest @ loadavg 195.51
+#     14.54s wall /  7.25s pytest @ loadavg 157.45  (planning-time trial)
+#     15.98s wall /  7.03s pytest @ loadavg 252.01
+#     18.94s wall /  7.70s pytest @ loadavg 148.31
+#     22.49s wall / 12.16s pytest @ loadavg 139.53  <- the INCONVENIENT one
+#
+# (1a) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
+# On THIS module the caveat is effectively moot. W is a SERIAL run (22.49s),
+# larger than the wave row (9.64s), and the declared 600s is the FLOOR at ~27x
+# W rather than the 2.6x arithmetic — so any plausible nine-way inflation is
+# absorbed many times over. Recorded for uniformity with the siblings.
+#
+# (2) SIZING — AND THE ARITHMETIC IS DELIBERATELY NOT FOLLOWED HERE.
+# W = 22.49s, the worst run. 2.6 x W = 58.5, which rounds to a 100-SECOND
+# budget. That is arithmetically defensible and operationally reckless, so it is
+# NOT what is declared. The 600s ABSOLUTE FLOOR binds instead:
+#     B = max(600, ceil_to_100(2.6 x W)) = max(600, 100) = 600.
+#
+# The reason is measured, not cautious-by-temperament. This host has a DOCUMENTED
+# ~3x run-to-run spread for byte-identical commands on byte-identical trees
+# (scripts/orchestrator.yaml records 310.33s -> 914.61s), and sampler's own seven
+# figures already span 2.6x (8.78s -> 22.49s) at nothing worse than the ordinary
+# load this box carries. A sub-minute ceiling on a 52-test suite would therefore
+# manufacture `infra_timeout` on the HONEST GREEN PATH fleet-wide on the first
+# genuinely loaded day — which is the exact defect task 3350 exists to remove,
+# reintroduced one level down. Declaring a budget a green run cannot clear
+# surfaces no hangs at all; it only produces false failures.
+#
+# 600s is not a fresh guess either: it is tests/scripts/orchestrator.yaml's own
+# declared value, so the floor is PRECEDENT. It is the tightest number honestly
+# declarable for a suite this cheap on a host this contended.
+#
+# (2a) CONSEQUENCE FOR THE GUARD, stated rather than left to be discovered: the
+# guard's measurement-derived floor `(int(2 * W) // 100) * 100` evaluates to
+# ZERO for sampler, so that assertion is VACUOUS here. What actually holds this
+# module are the other five assertions — declared-at-all, strictly-below-root,
+# honoured by the real resolver, survives the plan->execution bridge, and the
+# cold fall-through. The guard says so in its own docstring too; a guard that
+# overstates its reach is the same defect wearing a test's clothes.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally: tests/scripts' 600 ~= 2.6 x 233.50 and scripts' 2400 ~= 2.6 x
+# 930.59, and scripts/orchestrator.yaml states it kept the multiple identical
+# across the two on purpose. Sampler is the module where the floor, rather than
+# the multiple, does the work.
+#
+# (4) WHAT THIS ACTUALLY BUYS: 3600s -> 600s, a 6x narrowing — the joint-largest
+# in this task, despite 600s being ~27x the worst observed run. That the ratio
+# to the real cost stays large is the honest price of the floor, not an
+# oversight.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 600s = ~30 minutes, not ~10, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 6x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests. The
+# merge-verify and background paths pass max_retries=0 and pay 600s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: no build step
+# whose cold cost would justify a separate cold budget. Per
+# verify._resolve_verify_timeout, an unset module cold knob does NOT inherit the
+# 600 below — it falls through to the repo-root verify_cold_command_timeout_secs
+# (5400), and on a MERGE-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml and not overridden
+# by the root yaml). Gated by assertion (f) of the guard below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 600s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['sampler'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one. Note
+# that this suite would have to grow ~27x before the value below binds, but the
+# recorded W must still be kept true: it is what makes the vacuity of the
+# derived floor visible to the next reader.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[sampler].
+verify_command_timeout_secs: 600

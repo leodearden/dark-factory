@@ -645,6 +645,174 @@ class TestLaneLockHolderPids:
 
 
 # ---------------------------------------------------------------------------
+# Task 3604: `lane_lock_holder_pids_strict` — the same parse, without the
+# fail-safe swallowing.
+#
+# The wrapper above answers "no known holders" for THREE different situations:
+# nobody holds it, the lock file is gone, and the lock table could not be read.
+# That is right for its production callers (git_ops.py's acquire-timeout paths,
+# where an exception turns a diagnosable stall into a broken merge) and WRONG
+# for a caller asserting a NEGATIVE — "the lane is free" — because two of those
+# three situations mean the caller could not tell, and rendering them as
+# "nobody holds it" makes a leak assertion pass vacuously.
+#
+# Every case below is written as an explicit A/B against the fail-safe wrapper,
+# because the divergence is the thing under test, not either behaviour alone.
+# ---------------------------------------------------------------------------
+
+
+class TestLaneLockHolderPidsStrict:
+    """lane_lock_holder_pids_strict parses identically but never swallows an OSError."""
+
+    def test_missing_lock_file_raises_instead_of_returning_empty(self, tmp_path: Path):
+        """An absent lock file is UNKNOWN to the strict variant, not "no holders".
+
+        The wrapper's ``[]`` here is indistinguishable from "nobody holds it",
+        which is exactly what let a genuinely-leaked lane read as free: with
+        the lock file unlinked underneath a still-held fd, ``os.stat`` fails,
+        the read yields ``[]``, and the caller concludes the lane is nobody's.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        absent = tmp_path / 'absent.lock'
+        locks = tmp_path / 'locks'
+        locks.write_text('313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n')
+
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(absent, locks_path=locks)
+
+        assert lane_lock_holder_pids(absent, locks_path=locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_unreadable_locks_table_raises_instead_of_returning_empty(
+        self, tmp_path: Path
+    ):
+        """An unreadable kernel lock table means NO rows were examined at all.
+
+        The resulting ``[]`` carries no information whatsoever about the target
+        inode, so the strict variant refuses to render it as an answer.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        missing_locks = tmp_path / 'nope'
+
+        with pytest.raises(OSError):
+            lane_lock_holder_pids_strict(lock_path, locks_path=missing_locks)
+
+        assert lane_lock_holder_pids(lock_path, locks_path=missing_locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_parses_identically_to_the_fail_safe_wrapper(self, tmp_path: Path):
+        """ANTI-FORK PIN: the wrapper must not grow a second copy of the parse.
+
+        The parse is the delicate part (hex MAJ:MIN vs decimal inode, ``->``
+        waiter rows, thread-flocks reported against the tgid) and was
+        established by hand-verified forensics from reify ``esc-5548-5``. Two
+        independently-maintained copies would drift, and the test module would
+        then be modelling a parse no production caller uses.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309, waiter=True)
+            + '\n'
+            + _locks_row(lock_path, 5150, row_id=310, kind='POSIX')
+            + '\n'
+            + _locks_row(other, 6001, row_id=311)
+            + '\n'
+        )
+
+        strict = lane_lock_holder_pids_strict(lock_path, locks_path=locks)
+        assert strict == lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_malformed_rows_are_still_tolerated(self, tmp_path: Path):
+        """Per-ROW tolerance is deliberately UNCHANGED by the strict variant.
+
+        ``/proc/locks`` is a system-wide table. A row this parser cannot
+        understand belonging to some unrelated process does not make THIS
+        caller's answer about THIS inode unknown, so raising on it would couple
+        every lane-lock check to arbitrary system state. The line the strict
+        variant draws is between "this ROW is odd" (skip) and "the whole ANSWER
+        is unknown" (raise) — the latter being the only case where no rows were
+        examined at all.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids_strict
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            '\n'
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            '312: FLOCK\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
+
+    def test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core(self):
+        """STRUCTURAL PIN: production imports the wrapper, never the strict core.
+
+        The module now exports two names one word apart, and only the
+        fail-safe one is safe in :mod:`orchestrator.git_ops`: all four call
+        sites there sit on acquire-timeout paths, where an ``OSError`` would
+        convert a diagnosable stall into a broken merge — precisely the outcome
+        both docstrings warn about.
+
+        Nothing else pins that. An autocomplete slip importing the ``_strict``
+        variant into ``git_ops`` would type-check, pass every case in this file
+        unchanged, and surface only as an unhandled
+        ``FileNotFoundError``/``PermissionError`` mid-merge on a host where the
+        lock file was cleaned or ``/proc/locks`` is unreadable — the worst
+        possible place to discover it. Same class of guard as
+        ``test_reset_acquires_through_the_shared_guarded_seam``: assert on the
+        BINDING, because the defect is which name got imported, not what any
+        one function does.
+        """
+        import orchestrator.git_ops as git_ops_mod
+        import orchestrator.verify_cancel as verify_cancel_mod
+
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is verify_cancel_mod.lane_lock_holder_pids
+        ), (
+            'git_ops must bind the FAIL-SAFE wrapper — binding the strict core '
+            'would make a missing lock file or an unreadable /proc/locks raise '
+            'from inside an acquire-timeout path'
+        )
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is not verify_cancel_mod.lane_lock_holder_pids_strict
+        ), (
+            'the wrapper must not have been aliased to the strict core — that '
+            'would satisfy the identity check above while silently deleting '
+            'the fail-safe policy every git_ops call site depends on'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
 # fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
 # per-dispatch --request-id, so this uses a request-id-independent fixed key

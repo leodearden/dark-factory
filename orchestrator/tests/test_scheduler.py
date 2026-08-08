@@ -4838,6 +4838,258 @@ class TestBlastRadiusRefinement:
         )
 
 
+class TestBlastRadiusRequeueEmitsRelease:
+    """The blast-radius acquire-failure requeue must free its locks through
+    ``Scheduler.release`` — the single writer, and the only path that emits a
+    full-release ``lock_released`` (contract C5, task 3818).
+
+    Why the bare ``self.lock_table.release(task_id)`` bypass this pins
+    against was a stuck-lock hazard rather than a merely-silent release is
+    written up once, in
+    orchestrator/tests/test_lock_release_single_writer_guard.py's module
+    docstring.  These tests pin its observable consequences.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        event_store = _RecordingEventStore()
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        sched.finish_startup()
+        return sched
+
+    # Task '936' holds lib.rs while 'other' holds the conformance.rs it needs,
+    # so try_acquire_additional must fail and drive the requeue branch.
+    # Mirrors test_acquire_failure_persists_sanitized_files' contention recipe.
+    HELD = 'crates/reify-compiler/src/lib.rs'
+    NEEDED = 'crates/reify-compiler/src/conformance.rs'
+
+    @staticmethod
+    def _arrange_contention(scheduler: Scheduler) -> None:
+        lt = scheduler.lock_table
+        assert lt.try_acquire(
+            '936', [TestBlastRadiusRequeueEmitsRelease.HELD]
+        )
+        assert lt.try_acquire(
+            'other', [TestBlastRadiusRequeueEmitsRelease.NEEDED]
+        )
+        # Mocked for hermeticity (no network I/O), as the sibling class does.
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    @staticmethod
+    async def _requeue(scheduler: Scheduler) -> bool:
+        return await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=[TestBlastRadiusRequeueEmitsRelease.HELD],
+            needed=[TestBlastRadiusRequeueEmitsRelease.NEEDED],
+        )
+
+    @staticmethod
+    def _lock_released_events(scheduler: Scheduler) -> list[tuple[str, dict]]:
+        event_store = scheduler.event_store
+        assert event_store is not None
+        return [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if e[0] == str(EventType.lock_released)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_lock_released_payload_carries_held_modules(
+        self, scheduler: Scheduler
+    ):
+        """The requeue emits exactly one lock_released, naming the modules the
+        task actually held.
+
+        An empty/missing `modules` list is the stuck-lock artifact: a consumer
+        pairing lock_acquired with lock_released can never close the hold.
+        """
+        self._arrange_contention(scheduler)
+        depth = scheduler.config.lock_depth
+        expected = [normalize_lock(self.HELD, depth)]
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        released = self._lock_released_events(scheduler)
+        assert len(released) == 1, (
+            'the blast-radius requeue must emit exactly one lock_released '
+            f'(routing through Scheduler.release); got {released}'
+        )
+        assert released[0][1]['task_id'] == '936'
+        assert released[0][1]['data'].get('modules') == expected, (
+            'lock_released must carry the modules held at release time; got '
+            f'{released[0][1]["data"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_teardown_release_after_requeue_still_emits_exactly_once(
+        self, scheduler: Scheduler
+    ):
+        """Exactly one lock_released per acquire across requeue AND teardown.
+
+        The requeue returns False, and the workflow then runs its ordinary
+        slot-exit ``scheduler.release(task_id)``.  That second call must find
+        nothing held and stay silent, so a consumer pairing lock_acquired with
+        lock_released sees exactly one close — not two, and (the bypass's
+        actual failure mode, where the emptied _held made *both* releases
+        silent) not zero.
+        """
+        self._arrange_contention(scheduler)
+        depth = scheduler.config.lock_depth
+        expected = [normalize_lock(self.HELD, depth)]
+
+        ok = await self._requeue(scheduler)
+        assert ok is False
+
+        # The teardown release the workflow runs when the slot exits.
+        scheduler.release('936')
+
+        released = [
+            e for e in self._lock_released_events(scheduler)
+            if e[1]['task_id'] == '936'
+        ]
+        assert len(released) == 1, (
+            'requeue + teardown must close the hold exactly once; got '
+            f'{released}'
+        )
+        assert released[0][1]['data'].get('modules') == expected, (
+            'the single emit must be the requeue\'s, carrying the held '
+            f'modules; got {released[0][1]["data"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_write_failure_keeps_locks_held_and_silent(
+        self, scheduler: Scheduler
+    ):
+        """The complementary half of INV-6: a failed status write must NOT
+        release.
+
+        When ``set_task_status`` exhausts its retries the branch early-returns
+        with the locks deliberately still held, so the modules stay reserved
+        for a task that is still nominally in-progress and the next reconcile
+        can revert it.  Since the reroute this is the *only* path that leaves
+        the task dispatched-and-locked, so a refactor that hoisted the release
+        above the try/except — or added one inside the handler — would
+        silently free locks under a running task.
+        """
+        self._arrange_contention(scheduler)
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('backend unreachable')
+        )
+        scheduler._dispatched.add('936')
+        scheduler._dispatched_priority['936'] = 'medium'
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        # Non-vacuity: the branch under test is only reached if the status
+        # write was actually attempted (and raised) — without this the
+        # still-held / still-dispatched assertions below would also pass if
+        # the requeue had bailed out earlier for an unrelated reason.
+        assert scheduler.set_task_status.await_count == 1, (  # type: ignore[attr-defined]
+            'the status write must have been attempted and raised; got '
+            f'{scheduler.set_task_status.await_count} awaits'  # type: ignore[attr-defined]
+        )
+        assert scheduler.lock_table.is_held('936'), (
+            'locks must stay held when the status write fails, else another '
+            'task claims the modules of a still-in-progress task'
+        )
+        assert self._lock_released_events(scheduler) == [], (
+            'no lock_released may be emitted on the status-write-failed path'
+        )
+        assert '936' in scheduler._dispatched, (
+            'the task stays dispatched for reconcile to recover'
+        )
+        assert '936' not in scheduler._requeue_until, (
+            'no requeue happened, so no cooldown may be armed'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_write_precedes_lock_release(
+        self, scheduler: Scheduler
+    ):
+        """INV-6: the status write stays AHEAD of the release.
+
+        Recorded as one interleaved sequence rather than inferred from the
+        line's textual position, so a future refactor that hoists the release
+        above the status write fails here instead of silently letting an
+        observer see a freed lock on a still-in-progress task.
+        """
+        self._arrange_contention(scheduler)
+        order: list[str] = []
+
+        def _note_status(*_args, **_kwargs) -> None:
+            order.append('status')
+
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_note_status
+        )
+
+        event_store = scheduler.event_store
+        assert event_store is not None
+        real_emit = event_store.emit
+
+        def _spy_emit(event_type, **kwargs) -> None:
+            if str(event_type) == str(EventType.lock_released):
+                order.append('release')
+            return real_emit(event_type, **kwargs)
+
+        event_store.emit = _spy_emit  # type: ignore[method-assign]
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        assert 'status' in order, f'set_task_status was never awaited; got {order}'
+        assert 'release' in order, (
+            f'no lock_released was emitted during the requeue; got {order}'
+        )
+        assert order.index('status') < order.index('release'), (
+            'the status write must precede the lock release so no observer '
+            f'sees a freed lock on a still-in-progress task; got {order}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_requeue_clears_dispatch_guard_and_arms_cooldown(self):
+        """The reroute also restores the dispatch-guard clear and arms the
+        existing anti-hot-loop requeue cooldown.
+
+        Built with an injected clock (test_harness_reblock_guard's idiom)
+        rather than the class fixture so the deadline is deterministic.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        clock = [1000.0]
+        scheduler = Scheduler(
+            config,
+            event_store=_RecordingEventStore(),  # type: ignore[arg-type]
+            time_source=lambda: clock[0],
+        )
+        scheduler.finish_startup()
+        self._arrange_contention(scheduler)
+        # Model a live dispatch that the requeue must retract.
+        scheduler._dispatched.add('936')
+        scheduler._dispatched_priority['936'] = 'medium'
+
+        ok = await self._requeue(scheduler)
+
+        assert ok is False
+        assert '936' not in scheduler._dispatched, (
+            'the requeue must clear the dispatch guard, else _eligible_for_'
+            'dispatch refuses the task forever'
+        )
+        assert '936' not in scheduler._dispatched_priority
+        assert scheduler._requeue_until.get('936') == pytest.approx(
+            1000.0 + config.requeue_cooldown_secs
+        ), (
+            'the requeue must arm the cooldown so the scheduler cannot '
+            're-dispatch straight back into the same contention; got '
+            f'{scheduler._requeue_until.get("936")!r}'
+        )
+
+
 class TestBlastRadiusModuleCacheSeam:
     """The acquire-failure path's cache write and metadata persist must route
     through the single-writer seam / sanitize contract (task 2122 step-5/6),

@@ -198,6 +198,7 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import (
+    INDETERMINATE_VERDICT_CATEGORIES,
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
@@ -2797,6 +2798,19 @@ async def _run_post_merge_verify(
     #   local RunnerUnavailable   → fail-SAFE: emit verify_cross_check_inconclusive
     #                               and TRUST the remote green (never block a land
     #                               on a local infra hiccup — DriftDetector Invariant 5).
+    #   local INDETERMINATE       → fail-SAFE (task 3173): the local leg returned
+    #                               NORMALLY with passed=False, but EVERY failing leg
+    #                               it reported is verdict-less — today that means
+    #                               each was killed by an external signal
+    #                               (INDETERMINATE_VERDICT_CATEGORIES == {infra_kill};
+    #                               disk_full, semaphore_timeout and env_transient
+    #                               were adjudicated OUT and keep their veto). Emit
+    #                               verify_cross_check_inconclusive and TRUST the
+    #                               remote green — see the invariant on that arm.
+    #                               A MIXED run (one completed failing leg plus one
+    #                               killed leg) takes the DIVERGE arm, even though
+    #                               severity dominance makes its aggregate category
+    #                               'infra_kill'.
     if (
         runner is not None
         and verify.passed
@@ -2888,7 +2902,86 @@ async def _run_post_merge_verify(
                 req.task_id, merge_sha, runner.name, exc,
             )
         else:
-            if local_verify.passed == verify.passed:
+            # INVARIANT (task 3173): only a COMPLETED failing verdict on either
+            # host may veto a completed PASS.  A leg that was killed by an
+            # external signal, ran out of disk, or lost a semaphore never
+            # produced a verdict AT ALL — it holds no evidence about the branch,
+            # so discarding an already-built, already-verified merge commit on
+            # its say-so is pure waste.  Measured case: merge_sha b1ac2c7f, a
+            # completed 1097s remote PASS thrown away because the local leg was
+            # SIGKILLed at 0.31s under host load, then surfaced to the human as
+            # "Post-merge verification failed: Failures: lint issues" — a
+            # branch-blaming sentence about a process that emitted zero
+            # diagnostics.
+            #
+            # Same fail-SAFE shape as the two `except` arms above (emit
+            # verify_cross_check_inconclusive, do NOT quarantine, do NOT
+            # escalate, do NOT adopt a verdict — leave `verify` = the remote
+            # green so the `if not verify.passed:` path below is skipped and the
+            # land proceeds).  They are unreachable here only because a killed
+            # leg returns NORMALLY with passed=False instead of raising.
+            #
+            # The registry names only `infra_kill`, and every exclusion is an
+            # adjudicated CategoryPolicy.verdict_indeterminate row rather than
+            # set arithmetic over the infra-transient set:
+            #   - infra_timeout / pytest_internalerror / disk_full fail the
+            #     "the branch could not have CAUSED this" half — an introduced
+            #     deadlock, a conftest that raises only on this host's
+            #     interpreter, and a diff whose build artifacts fill the disk
+            #     are all non-completions a diff can genuinely cause;
+            #   - env_transient / semaphore_timeout fail the "the evidence is
+            #     structural, not text the branch can forge" half — see the
+            #     residuals verify_classify's own docstrings document at
+            #     :498-508 and :438-453.
+            # All of those keep vetoing (fail CLOSED), as does an EMPTY
+            # category.  Note the registry is UNRELATED to
+            # merge_disposition.MergeFailureDisposition.INDETERMINATE, which is
+            # post-failure attribution one layer up.
+            #
+            # GATE ON EVERY FAILING LEG, NOT THE AGGREGATE CATEGORY (task 3173
+            # review).  severity_rank makes `_worst_category` let a rank-1
+            # INFRA_KILL DOMINATE a co-occurring rank-11 TEST_FAILURE — correct
+            # for "how bad was this run" (retry budget, archival, the infra
+            # hold), catastrophic if read as "this run produced no verdict".  A
+            # trust anchor whose test leg COMPLETED and blamed the branch,
+            # alongside an unrelated SIGKILLed lint leg, aggregates to
+            # category='infra_kill'; keying the veto off that single value
+            # would discard the completed, branch-blaming evidence this
+            # cross-check exists to collect (task 2822) and land the remote
+            # PASS.  Only a run in which EVERY failing leg is verdict-less may
+            # decline to veto.  A None list ("not recorded" — an older remote's
+            # wire payload, or any result not produced by run_verification) and
+            # an empty one ("no legs recorded") both fall through to the
+            # `.passed ==` comparison below, i.e. fail CLOSED.
+            local_failing_legs = local_verify.failing_leg_categories or []
+            if not local_verify.passed and local_failing_legs and all(
+                c in INDETERMINATE_VERDICT_CATEGORIES for c in local_failing_legs
+            ):
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.verify_cross_check_inconclusive,
+                        task_id=req.task_id,
+                        data={
+                            'merge_sha': merge_sha,
+                            'remote_runner': runner.name,
+                            'local_category': local_verify.category,
+                            'local_failing_leg_categories': local_failing_legs,
+                            'reason': (
+                                f'local trust-anchor produced no verdict on any '
+                                f'failing leg (legs={local_failing_legs!r}, '
+                                f'category={local_verify.category!r}): '
+                                f'{local_verify.summary}'
+                            ),
+                        },
+                    )
+                logger.warning(
+                    'Task %s: local cross-check trust-anchor produced NO verdict '
+                    'for %s (remote=%s, category=%s, failing_legs=%s) — trusting '
+                    'the remote green (fail-safe, DriftDetector Invariant 5): %s',
+                    req.task_id, merge_sha, runner.name,
+                    local_verify.category, local_failing_legs, local_verify.summary,
+                )
+            elif local_verify.passed == verify.passed:
                 # AGREE — both green.  Emit parity telemetry and proceed to land.
                 if event_store is not None:
                     event_store.emit(
@@ -7703,7 +7796,27 @@ def _request_id_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> str:
     return obj.request.request_id
 
 
+def _request_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> MergeRequest:
+    """Return the underlying :class:`MergeRequest` for *obj* (task 3082).
+
+    The object-level counterpart of :func:`_request_id_of` — same three-shape
+    dispatch, same reason for the three shapes existing (see that function's
+    docstring). Kept literally beside it so a future FOURTH ``_live_items``
+    shape has exactly one place to be taught.
+
+    Sole caller: :meth:`SpeculativeMergeWorker._coalesce_reentrant_drain`,
+    which needs the live object's ``result`` future — not just its id — to tell
+    a re-drain of the LIVE ORIGINAL apart from a duplicate twin.
+    """
+    if isinstance(obj, InflightEntry):
+        return obj.item.request
+    if isinstance(obj, MergeRequest):
+        return obj
+    return obj.request
+
+
 _LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX = '__merge_lifecycle_transition_rejected__'
+_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX = '__merge_coalesce_live_original__'
 
 
 def _lifecycle_transition_rejected_sentinel(request_id: str) -> str:
@@ -7794,6 +7907,107 @@ def _alarm_illegal_lifecycle_transition(
                 'request_id': request_id,
                 'from_state': str(from_state),
                 'to_state': str(to_state),
+            },
+        )
+
+
+def _alarm_coalesce_live_original(
+    escalation_queue: Any,
+    request: MergeRequest,
+    current_state: ItemLifecycleState,
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for a re-entrant drain of the LIVE
+    ORIGINAL request object (task 3082).
+
+    Modeled verbatim on :func:`_alarm_illegal_lifecycle_transition`'s dedup'd
+    ``has_open_l1``/``make_id`` idiom. Fires at most ONCE per open episode per
+    request_id. OBSERVATION + ESCALATION only: never mutates queue/inflight
+    state (PRD design decision 4: invariants escalate loudly, degrade never).
+
+    Distinct from the benign task-2852 journal-recovery twin, which is a
+    DIFFERENT object carrying its own fresh, unobserved future. When the
+    arriving item IS the live original, some requeue site put it back on
+    ``_queue`` without returning the registry to QUEUED, so the drain
+    chokepoint mistook a genuinely live request for a duplicate — a
+    requeue-wiring bug.
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_coalesce_live_original'``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = f'{_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX}{request.request_id}'
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    summary = (
+        f'Re-entrant merge drain of the LIVE ORIGINAL request '
+        f'{request.request_id!r} (branch={request.branch.bare_id}, registry at '
+        f'{current_state!r}) — a requeue-wiring bug, not a benign duplicate twin'
+    )
+    detail = (
+        f'request_id: {request.request_id}\n'
+        f'task_id: {request.task_id}\n'
+        f'branch: {request.branch.bare_id}\n'
+        f'registry current state: {current_state!r}\n'
+        '\n'
+        'The merge drain chokepoint received the SAME MergeRequest object that '
+        'is already live in the lifecycle registry (matched by result-future '
+        'identity), not a distinct journal-recovery twin. That means a requeue '
+        'site put this request back on _queue WITHOUT returning the registry to '
+        'QUEUED, so _buffer_owned_request classified a genuinely live request '
+        'as a duplicate and coalesced it away.\n'
+        '\n'
+        'The request was NOT buffered and its Future was deliberately left '
+        'PENDING — resolving it would hand the real waiter a fabricated '
+        "'already_merged' AND silence the merge_request_stuck watchdog (the "
+        'request ledger drops any resolved entry before the stuck sweep sees '
+        'it). Expect a merge_request_stuck alarm for this request_id as the '
+        'slower backstop if it is never re-dispatched.\n'
+        '\n'
+        'This condition is unreachable in normal operation: every requeue site '
+        'pairs on_requeued with _note_requeue, so it fires only if a requeue '
+        'site has regressed. Start there: find the on_requeued call that put '
+        'this request_id back on _queue and check it also called _note_requeue.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-lifecycle-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_coalesce_live_original',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Find the requeue site that re-queued request_id '
+            f'{request.request_id!r} without calling _note_requeue — check the '
+            'abort/defer branches of _run_inflight_verify, _dispatch_item, and '
+            'the head-failure cascade. The registry read '
+            f'{current_state!r} instead of QUEUED at the drain.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=request.task_id,
+            data={
+                'request_id': request.request_id,
+                'current_state': str(current_state),
+                'category': 'merge_coalesce_live_original',
             },
         )
 
@@ -9042,6 +9256,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
         ``_inflight`` deque.
 
+        task 3082: that window is now bounded on EVERY exit, not just the ones
+        that finalize — ``_finalize_inflight``'s DROPPED and REQUEUED sentinel
+        exits dispose of the entry explicitly rather than relying on a caller
+        to retire it later (see that method's docstring, SENTINEL
+        DISPOSITION). Before that fix both exits returned with the
+        ``InflightEntry`` still in ``_live_items``, so this method returned a
+        PHANTOM finalize head for the rest of the process lifetime —
+        mis-reporting ``head_of_line``/``verify_in_progress``, injecting a
+        stale lease into ``snapshot()``'s ``occupancy.by_host`` for an
+        actually-free host, and (the latent wedge) keeping a DEAD merge commit
+        at the :meth:`frozen_prefix_tip`, since
+        :meth:`_frozen_inflight_entries` appends this head whenever its phase
+        is in {verifying, gate_reverify, finalizing}.
+
         *inflight_ids*, if given, is used verbatim instead of re-deriving
         ``{e.item.request.request_id for e in self._inflight}``. Callers
         that already materialized that set for their own purposes (e.g.
@@ -9660,43 +9888,98 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         clobber of the live original's durable entry under that same
         request_id.
 
-        Logs loudly at WARNING — deliberately NOT an escalation: once
-        recognized here the divergence is HANDLED and benign, and
-        escalating would re-introduce the exact
-        ``merge_lifecycle_transition_rejected`` noise this task removes
-        (PRD design decision 4: invariants escalate loudly, degrade never —
-        satisfied here via the WARNING without silently degrading).
+        Two cases, discriminated by RESULT-FUTURE IDENTITY against the live
+        registry object (task 3082) — see :func:`_request_of`:
 
-        Also, defensively:
+        **A genuine TWIN** (a distinct object with its own fresh, unobserved
+        future — the confirmed journal-recovery shape). Logged loudly at
+        WARNING and deliberately NOT escalated: once recognized here the
+        divergence is HANDLED and benign, and escalating would re-introduce
+        the exact ``merge_lifecycle_transition_rejected`` noise task 2852
+        removes (PRD design decision 4: invariants escalate loudly, degrade
+        never — satisfied via the WARNING without silently degrading). Its
+        ``result`` Future is resolved (if not already done) to a benign
+        ``MergeOutcome(status='already_merged')`` so no hypothetical waiter
+        hangs forever. For THIS case only, that resolution is robustness
+        rather than a correctness dependency.
 
-          * resolves *item*'s ``result`` Future (if not already done) to a
-            benign ``MergeOutcome(status='already_merged')`` so no
-            (hypothetical) waiter on the twin's future hangs forever — the
-            confirmed journal-recovery twin has a fresh, unobserved future,
-            so this is robustness, not a correctness dependency; and
-          * emits a ``merge_coalesced`` observability event
-            (``source='duplicate_submission'``) via the shared
-            :func:`_emit_merge_coalesced` helper, None-safe when this
-            worker has no ``_event_store`` wired.
+        **The LIVE ORIGINAL** (the same ``result`` future the live registry
+        object carries). Logged at ERROR and ESCALATED via
+        :func:`_alarm_coalesce_live_original`, and its Future is deliberately
+        left PENDING. Here the resolution is load-bearing and WRONG in both
+        directions: it lies to a REAL waiter (an ``already_merged`` that
+        escalation's server maps to ``'done'``), and it silences the only
+        watchdog that would catch the wedge — the request ledger's
+        ``sweep_resolved`` drops any ``done()`` entry before the stuck sweep
+        sees it, so ``merge_request_stuck`` never fires. Leaving it pending
+        re-arms that alarm as the slower backstop, so the two signals are
+        complementary rather than duplicative. Unreachable in normal
+        operation: every requeue site pairs ``on_requeued`` with
+        ``_note_requeue``, so it fires only if a requeue site regresses.
+
+        In BOTH cases a ``merge_coalesced`` observability event is emitted via
+        the shared :func:`_emit_merge_coalesced` helper (None-safe when this
+        worker has no ``_event_store`` wired) — observability must not depend
+        on which branch was taken. The ``source`` DISCRIMINATES them, because
+        the two conditions are not the same event: ``'duplicate_submission'``
+        for a twin, which carries the established meaning at every other
+        emission site (attached to an in-flight merge, will receive that
+        merge's outcome), versus ``'live_original_redrain'`` for the live
+        original, where nothing is coalesced at all — the request is dropped,
+        its future stays PENDING and no outcome will ever arrive. Consumers
+        aggregating coalesces must exclude the latter rather than count a
+        wedge as a benign attach.
         """
-        logger.warning(
-            'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
-            'merge submission for request_id=%s branch=%s; registry already at '
-            '%s. Coalescing as a benign no-op — NOT buffering a divergent '
-            'twin, NOT escalated.',
-            item.request_id, item.branch.bare_id, current_state,
-        )
-        if not item.result.done():
-            item.result.set_result(
-                MergeOutcome(
-                    status='already_merged',
-                    reason=(
-                        'duplicate/re-entrant merge submission coalesced onto '
-                        'in-flight/landed request'
-                    ),
-                ),
+        # task 3082: is the arriving item the LIVE ORIGINAL, or a genuine twin?
+        # Discriminated by FUTURE identity, deliberately NOT by object identity
+        # of the item: `_live_items[rid]` legitimately changes SHAPE across the
+        # pipeline (MergeRequest -> SpeculativeItem -> InflightEntry) while
+        # carrying the SAME `request.result`, so an `is`-on-the-item check would
+        # fail open exactly when the entry is deepest in the pipeline — which is
+        # when this bug bites.
+        _live_obj = self._live_items.get(item.request_id)
+        _live_req = _request_of(_live_obj) if _live_obj is not None else None
+        _is_live_original = _live_req is not None and _live_req.result is item.result
+
+        if _is_live_original:
+            logger.error(
+                'merge_queue: _buffer_owned_request: re-entrant drain of the LIVE '
+                'ORIGINAL request_id=%s branch=%s; registry at %s. NOT buffering '
+                'and NOT resolving its Future (a real waiter is attached) — this '
+                'is a requeue-wiring bug, not a benign duplicate twin. Escalated.',
+                item.request_id, item.branch.bare_id, current_state,
             )
-        _emit_merge_coalesced(self._event_store, item, source='duplicate_submission', eta=None)
+            _alarm_coalesce_live_original(
+                self._escalation_queue, item, current_state,
+                event_store=self._event_store,
+            )
+        else:
+            logger.warning(
+                'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
+                'merge submission for request_id=%s branch=%s; registry already at '
+                '%s. Coalescing as a benign no-op — NOT buffering a divergent '
+                'twin, NOT escalated.',
+                item.request_id, item.branch.bare_id, current_state,
+            )
+            if not item.result.done():
+                item.result.set_result(
+                    MergeOutcome(
+                        status='already_merged',
+                        reason=(
+                            'duplicate/re-entrant merge submission coalesced onto '
+                            'in-flight/landed request'
+                        ),
+                    ),
+                )
+        # Emitted UNCONDITIONALLY in both branches: observability must not depend
+        # on which one was taken — but with a DISCRIMINATING source, since only
+        # the twin was actually coalesced onto a merge that will deliver it an
+        # outcome (see the docstring).
+        _emit_merge_coalesced(
+            self._event_store, item,
+            source='live_original_redrain' if _is_live_original else 'duplicate_submission',
+            eta=None,
+        )
 
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
@@ -14975,6 +15258,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # its start stamp behind would let a much later, unrelated
                     # contention cap out terminally on its first defer.
                     self._clear_contended_lease_streak(req.task_id)
+                    # task 3082: dispose of the registry entry AT THE SITE, the
+                    # same per-site ownership every requeue branch has. Nothing
+                    # will ever re-enter for a DROPPED request_id (the sole
+                    # waiter's future is already cancelled), so TERMINAL + the
+                    # `_live_items` pop is the only correct end state — and
+                    # leaving it to `_finalize_inflight`'s sentinel chokepoint
+                    # alone would make that chokepoint the SOLE owner, so any
+                    # future path consuming this result without finalizing would
+                    # silently strand a phantom finalize head. `_retire_item` is
+                    # idempotent, so the chokepoint call stays valid as defence
+                    # in depth (symmetric with the REQUEUED branches below).
+                    self._retire_item(req.request_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -15109,8 +15404,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if not req.result.done():
                             req.result.set_result(err_outcome)
                         return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+                    # MQ-invariants eta (task 1992): Future left deliberately
+                    # pending — this is a DEFER for re-verify, not a resolution;
+                    # the re-queued request re-enters through the normal drain
+                    # and its waiter receives the outcome of the RE-dispatch.
+                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
+                    # the lifecycle registry.
+                    #
+                    # task 3082: `_note_requeue` was MISSING here — the one
+                    # requeue site of five that moved the LEDGER without moving
+                    # the REGISTRY. Two facts that make the line load-bearing:
+                    #  (i) `live_obj=req` is not decoration —
+                    #      `_note_transition` REPLACES `_live_items[rid]` with
+                    #      the MergeRequest, and `_finalizing_head_entry()` only
+                    #      counts `isinstance(obj, InflightEntry)` values, so it
+                    #      is that OBJECT SWAP (not the state change) that
+                    #      prevents a phantom finalize head.
+                    # (ii) a registry left at VERIFYING makes
+                    #      `_buffer_owned_request` treat the re-queued original
+                    #      as a duplicate/re-entrant twin and hand it to
+                    #      `_coalesce_reentrant_drain`, which drops it — so the
+                    #      request never re-enters the pipeline at all.
+                    #
+                    # ATOMICITY: no `await` between the put_nowait and this
+                    # call, so the merger loop's drain can never observe the
+                    # request on `_queue` while the registry still reads
+                    # VERIFYING.
+                    #
+                    # Sibling sites carrying the identical recipe (see task 3204
+                    # for the pending helper extraction): the cascade downstream
+                    # self-requeue, the operator-halt abort above, the
+                    # MergeVerifyLeaseContended defer below, and the
+                    # pre-dispatch operator halt in `_dispatch_item`.
                     self._queue.put_nowait(req)
                     self._request_ledger.on_requeued(req.request_id)
+                    self._note_requeue(req.request_id, live_obj=req)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -15564,6 +15892,56 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           DROPPED       — sole-waiter abandoned: cancel_and_release, _n_failed=True.
           REQUEUED      — operator halt (item already back on _queue):
                           cancel_and_release, _n_failed=True.
+
+        SENTINEL DISPOSITION (task 3082) — canonical statement; the sentinel
+        branch below carries only a pointer back here.
+
+        INVARIANT: a DROPPED or REQUEUED item is NOT finalizing and must never
+        be recorded as such. That is why the VERIFYING -> FINALIZING hop sits
+        AFTER the sentinel check rather than immediately past the ``await``
+        (superseding task 2444's placement, which was necessary but not
+        sufficient), and it is what makes the requeue-site ``_note_requeue``
+        asymmetry harmless in BOTH directions: a registry left at VERIFYING
+        would have the hop record a requeued item as FINALIZING and strand a
+        phantom head (see :meth:`_finalizing_head_entry`), while a registry
+        already bounced to QUEUED is neither fired-on nor tolerated by
+        :meth:`_advance_if_at` and would escalate a rejected transition on
+        every dead-verify abort. Below the sentinel check, neither shape
+        reaches the hop at all.
+
+        Both sentinel exits also dispose of the entry EXPLICITLY, because
+        returning without a disposition leaves this ``InflightEntry`` in
+        ``_live_items`` at a non-terminal state — a phantom finalize head for
+        the rest of the process lifetime. The two exits get DIFFERENT
+        dispositions deliberately:
+
+          · DROPPED  — the sole waiter has gone, so nothing will ever re-enter
+            for this request_id: :meth:`_retire_item` (TERMINAL + the
+            ``_live_items`` pop) is the only correct end state. The abandon
+            site in :meth:`_run_inflight_verify` owns this too, so the call
+            here is idempotent defence in depth, symmetric with REQUEUED.
+          · REQUEUED — the request is on ``_queue`` and MUST re-enter through
+            the drain, so retiring it would strand it in the opposite
+            direction (:meth:`_buffer_owned_request` re-registers only when
+            current is None, and TERMINAL is neither None nor QUEUED, so it
+            would be coalesce-dropped on arrival). Bounce it to QUEUED
+            instead, passing ``live_obj=req``.
+
+        The REQUEUED repair is guarded on current == VERIFYING, the ONLY state
+        a stranded in-flight requeue can present that also has a legal QUEUED
+        edge. The guard is load-bearing, not cosmetic, in two directions: an
+        unconditional call would attempt QUEUED -> QUEUED for the normal case
+        (requeue site already bounced it), and a merely-not-QUEUED guard would
+        fire on a legitimately RACED requeue — the merger loop's speculative
+        look-ahead drains and buffers ``_queue`` while this method is suspended
+        at ``await entry.verify_task``, so a correctly-wired requeue can already
+        read LANE_BUFFERED/MERGING/AWAITING_VERIFY by the time we resume. Both
+        would route an illegal edge into :meth:`_note_transition` and re-fire
+        the very ``merge_lifecycle_transition_rejected`` escalation this fix
+        retires. Defence in depth for a future requeue site that forgets the
+        call — NOT a substitute for per-branch symmetry, which every requeue
+        site still owns and which is pinned by the on_requeued/_note_requeue
+        pairing tests in test_merge_queue_lifecycle_registry.py.
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
@@ -15611,8 +15989,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Firing the FINALIZING hop here (before the await) would mislabel a
             # wedged verify as finalizing (regression caught by esc-2173-6:
             # test_wedged_verify_is_armed_and_alarmed_then_resolves_cleanly). The hop
-            # now fires just past the await, before any sentinel/RU/fail/pass handling
-            # (all of which already assume FINALIZING).
+            # now fires just past the await AND just past the DROPPED/REQUEUED
+            # sentinel check (task 3082 — a dropped/requeued item is not
+            # finalizing), before the RU/fail/pass handling (all of which already
+            # assume FINALIZING).
 
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
             # Handled inline in _dispatch_item: merge_wt already cleaned, req already
@@ -15651,6 +16031,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if entry.verify_task is not None:
                 vr = await entry.verify_task
 
+            # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
+            # See this method's docstring, SENTINEL DISPOSITION (task 3082):
+            # deliberately ABOVE the VERIFYING -> FINALIZING hop below, because
+            # a dropped/requeued item is not finalizing; DROPPED -> retire,
+            # REQUEUED -> idempotent bounce to QUEUED, guarded on VERIFYING so a
+            # merger-loop-raced requeue already past QUEUED is left alone.
+            if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
+                _cancel_release = True
+                _n_failed_val = True  # abandon / operator-halt → chain stale
+                if vr.status == InflightStatus.DROPPED:
+                    self._retire_item(req.request_id)
+                elif self._lifecycle.current(req.request_id) == ItemLifecycleState.VERIFYING:
+                    self._note_requeue(req.request_id, live_obj=req)
+                return False
+
             # MQ-reliability lambda (task 2173): the verify await has returned, so
             # the item is now genuinely finalizing — fire the VERIFYING -> FINALIZING
             # hop here (deferred from the _finalizing_head assignment above so a
@@ -15658,9 +16053,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # before: passthrough / pre-dispatch-sentinel entries already returned
             # above and never reach here, but keep the guard explicit so the legal
             # edge (VERIFYING -> FINALIZING) is never mis-applied to an entry sitting
-            # at DISPATCHING/QUEUED. Every path below (DROPPED/REQUEUED, RUNNER_
-            # UNAVAILABLE's FINALIZING -> MERGING, FAIL/skip, PASS) already assumes
-            # FINALIZING as its from-state.
+            # at DISPATCHING/QUEUED. Every path below (RUNNER_UNAVAILABLE's
+            # FINALIZING -> MERGING, FAIL/skip, PASS) already assumes FINALIZING as
+            # its from-state.
+            #
+            # task 3082: this hop sits below the DROPPED/REQUEUED sentinel check
+            # above, not merely past the `await` — see this method's docstring,
+            # SENTINEL DISPOSITION, for why both dispositions of the earlier
+            # placement were wrong.
             #
             # task 2852 (SHARPER RCA mr-99585bb8): routed through _advance_if_at
             # instead of a hardcoded-from_state _note_transition call — a
@@ -15717,12 +16117,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         ItemLifecycleState.TERMINAL,
                     }),
                 )
-
-            # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
-            if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
-                _cancel_release = True
-                _n_failed_val = True  # abandon / operator-halt → chain stale
-                return False
 
             # ── (d) RUNNER_UNAVAILABLE ───────────────────────────────────────
             # Remote runner died.  Quarantine the host (so acquire() skips it)

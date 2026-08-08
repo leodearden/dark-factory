@@ -27,9 +27,13 @@ def _fallback_records(caplog):
 
     Requiring INFO specifically is what pins the level choice: a future
     "upgrade" to WARNING yields zero matches and fails the positive test.  INFO
-    and not WARNING is deliberate — the canonical deployment relies on the cwd
-    path by design (the systemd units pin ``WorkingDirectory`` on purpose), so
-    a WARNING would cry wolf on the supported configuration.
+    and not WARNING is deliberate — an un-configured invocation is a normal,
+    supported way to run the dashboard (a bare ``python -m dashboard`` from a
+    checkout, a test, a container without the unit), not a degraded state.  It
+    is no longer the canonical deployment's own path: since task 3572 both
+    systemd units set the variable explicitly.  The tests below are unaffected
+    either way — each sets or unsets it itself rather than depending on what the
+    units declare.
     """
     return [
         r

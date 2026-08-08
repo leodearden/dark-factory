@@ -32,13 +32,15 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 14-member closed output domain of verify._classify_failure today
-# (the 12 legacy category strings plus task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
-# host-infrastructure categories), including the '' (NONE) empty-string
-# sentinel (default of _worst_category on empty input; a member of both
-# _CATEGORY_PRIORITY and _ARCHIVE_DENY_LIST).
+# The exact 15-member closed output domain of verify._classify_failure today
+# (the 12 legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
+# host-infrastructure categories, and task 3173's INFRA_KILL external-signal
+# category), including the '' (NONE) empty-string sentinel (default of
+# _worst_category on empty input; a member of both _CATEGORY_PRIORITY and
+# _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
     'infra_timeout',
+    'infra_kill',
     'disk_full',
     'semaphore_timeout',
     'cargo_cli_error',
@@ -56,15 +58,15 @@ _EXPECTED_CATEGORY_VALUES = {
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 14 category strings."""
+    """FailureCategory is a StrEnum with exactly the 15 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_fourteen(self):
+    def test_member_count_is_fifteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 14
+        assert len(list(FailureCategory)) == 15
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -111,7 +113,7 @@ class TestRetryKind:
 
 
 class TestCategoryPolicyShape:
-    """CategoryPolicy is a dataclass with the 5 documented fields."""
+    """CategoryPolicy is a dataclass with the 6 documented fields."""
 
     def test_has_expected_fields(self):
         import dataclasses
@@ -121,8 +123,22 @@ class TestCategoryPolicyShape:
         field_names = {f.name for f in dataclasses.fields(CategoryPolicy)}
         assert field_names == {
             'severity_rank', 'archive', 'preexisting_probe',
-            'is_infra_transient', 'retry_kind',
+            'is_infra_transient', 'verdict_indeterminate', 'retry_kind',
         }
+
+    def test_verdict_indeterminate_has_no_default(self):
+        """A new category must ADJUDICATE whether its non-completion is
+        branch-causable, not inherit an answer: getting it wrong in the True
+        direction is a false-GREEN (task 3173)."""
+        import dataclasses
+
+        from orchestrator.verify_categories import CategoryPolicy
+        field = next(
+            f for f in dataclasses.fields(CategoryPolicy)
+            if f.name == 'verdict_indeterminate'
+        )
+        assert field.default is dataclasses.MISSING
+        assert field.default_factory is dataclasses.MISSING
 
 
 class TestCategoryPolicyExhaustive:
@@ -132,9 +148,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_fourteen(self):
+    def test_row_count_is_fifteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 14
+        assert len(CATEGORY_POLICY) == 15
 
 
 class TestCategoryPolicyGoldenRows:
@@ -148,6 +164,7 @@ class TestCategoryPolicyGoldenRows:
         assert row.archive is False
         assert row.preexisting_probe is False
         assert row.is_infra_transient is False
+        assert row.verdict_indeterminate is False
         assert row.retry_kind == RetryKind.TIMEOUT
 
     def test_env_transient_row(self):
@@ -155,13 +172,19 @@ class TestCategoryPolicyGoldenRows:
         row = CATEGORY_POLICY[FailureCategory.ENV_TRANSIENT]
         assert row.retry_kind == RetryKind.ENV_SERIAL
         assert row.is_infra_transient is True
+        # REVIEW AMENDMENT (task 3173): flipped True -> False. Retrying an
+        # env_transient is still worthwhile (is_infra_transient stays True and
+        # RetryKind.ENV_SERIAL is untouched), but it may no longer overrule
+        # another host's PASS — see TestIndeterminateExclusionsAreAdjudicated
+        # .test_excludes_env_transient for the residual that forced this.
+        assert row.verdict_indeterminate is False
         assert row.archive is False
         assert row.preexisting_probe is False
 
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 13
+        assert row.severity_rank == 14
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +257,7 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import CATEGORY_PRIORITY
         assert CATEGORY_PRIORITY == [
             'infra_timeout',
+            'infra_kill',
             'disk_full',
             'semaphore_timeout',
             'cargo_cli_error',
@@ -266,13 +290,14 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
         assert frozenset({
             'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
-            'disk_full', 'semaphore_timeout',
+            'disk_full', 'semaphore_timeout', 'infra_kill',
         }) == PREEXISTING_BREAK_SKIP_CATEGORIES
 
     def test_infra_transient_categories_matches_legacy_sweep_set(self):
         from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
         assert frozenset({
             'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
+            'infra_kill',
         }) == INFRA_TRANSIENT_CATEGORIES
 
 
@@ -292,6 +317,7 @@ class TestShouldArchive:
         ('category', 'expected'),
         [
             ('infra_timeout', False),
+            ('infra_kill', True),
             ('cargo_cli_error', True),
             ('compile_error', False),
             ('tree_sitter_generate_error', True),
@@ -622,3 +648,279 @@ class TestEnvironmentalCategoriesOutrankCodeFaults:
     def test_semaphore_timeout_outranks_test_failure(self):
         from orchestrator.verify import _worst_category
         assert _worst_category(['semaphore_timeout', 'test_failure']) == 'semaphore_timeout'
+
+
+# ---------------------------------------------------------------------------
+# PART 3 (task 3173): INFRA_KILL — a leg terminated by an EXTERNAL signal
+# (SIGKILL/SIGTERM/SIGINT/SIGHUP) never produced an exit verdict at all, so it
+# must not be reported as a branch fault.
+#
+# The measured incident: a merge-verify lint leg was SIGKILLed at 0.31s under
+# host load; ``classify_failure`` fell through to UNKNOWN_TEST_FAILURE (a
+# blocking, branch-blaming verdict) and the leg went on to discard the OTHER
+# host's completed 1097s PASS behind merge commit b1ac2c7f.
+#
+# RED today: FailureCategory.INFRA_KILL and INDETERMINATE_VERDICT_CATEGORIES
+# do not exist, so every test below fails on attribute access / ImportError.
+# ---------------------------------------------------------------------------
+
+
+class TestInfraKillCategory:
+    """INFRA_KILL is a new FailureCategory member with an infra-transient
+    policy row that — uniquely among the infra categories — ARCHIVES.
+    """
+
+    def test_member_exists_with_expected_value(self):
+        from orchestrator.verify_categories import FailureCategory
+        assert FailureCategory.INFRA_KILL == 'infra_kill'
+        assert FailureCategory.INFRA_KILL.value == 'infra_kill'
+
+    def test_policy_row(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        row = CATEGORY_POLICY[FailureCategory.INFRA_KILL]
+        assert row.severity_rank == 1
+        assert row.archive is True
+        assert row.preexisting_probe is False
+        assert row.is_infra_transient is True
+        assert row.verdict_indeterminate is True
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_is_infra_transient_registry_member(self):
+        from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+        assert 'infra_kill' in INFRA_TRANSIENT_CATEGORIES
+
+    def test_is_preexisting_break_skip_member(self):
+        from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
+        assert 'infra_kill' in PREEXISTING_BREAK_SKIP_CATEGORIES
+
+    def test_archives_unlike_every_other_infra_category(self):
+        # The ONLY forensic handle for an off-box, un-reproducible kill: the
+        # incident was diagnosable solely because the archive existed.
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, should_archive
+        assert 'infra_kill' not in ARCHIVE_DENY_LIST
+        assert should_archive('infra_kill') is True
+
+    def test_outranks_every_output_derived_category_but_not_a_timeout(self):
+        # A kill means "no verdict was produced", so it must dominate any
+        # co-occurring output-derived category — but INFRA_TIMEOUT keeps rank 0.
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        assert CATEGORY_PRIORITY[0:3] == ['infra_timeout', 'infra_kill', 'disk_full']
+
+
+class TestIndeterminateVerdictCategories:
+    """The derived registry naming the categories whose leg produced NO
+    completed verdict AND whose non-completion the branch could not have
+    caused — which therefore may not veto another host's completed PASS
+    (merge_queue's per-land cross-check).
+    """
+
+    def test_registry_exists_and_contains_infra_kill(self):
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+        assert 'infra_kill' in INDETERMINATE_VERDICT_CATEGORIES
+
+    def test_membership_is_exactly_the_adjudicated_set(self):
+        # The whole golden set, spelled out. Adding a row here widens the set
+        # of local failures that may be overruled by a remote PASS, so it is
+        # pinned exactly rather than by spot-checks.
+        #
+        # REVIEW AMENDMENT (task 3173): narrowed from four members to one.
+        # The predicate gained a part (3): the classifier's EVIDENCE for the
+        # row must be a STRUCTURAL, out-of-band signal the branch cannot forge
+        # in text. merge_queue never sees ground truth — it only ever sees
+        # `classify_failure`'s OUTPUT — so a category is only safe here if a
+        # branch-caused failure cannot be MISCLASSIFIED into it. disk_full,
+        # semaphore_timeout and env_transient each fail (2) or (3) and are
+        # adjudicated out below; infra_kill alone is grounded in a waitpid
+        # status rather than a text match.
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+        assert set(INDETERMINATE_VERDICT_CATEGORIES) == {'infra_kill'}
+
+    def test_is_derived_from_the_policy_rows_not_the_infra_transient_set(self):
+        # REGRESSION GUARD (amendment, task 3173): the registry was first
+        # spelled `INFRA_TRANSIENT_CATEGORIES - {INFRA_TIMEOUT}` — a no-op
+        # subtraction, since INFRA_TIMEOUT is is_infra_transient=False. It
+        # was therefore a second NAME for the infra-transient set, and the
+        # exclusion tests below passed vacuously. The two sets answer
+        # different questions and must not collapse again.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+        assert INDETERMINATE_VERDICT_CATEGORIES != INFRA_TRANSIENT_CATEGORIES
+        assert INDETERMINATE_VERDICT_CATEGORIES < INFRA_TRANSIENT_CATEGORIES
+        assert frozenset(
+            c for c, p in CATEGORY_POLICY.items() if p.verdict_indeterminate
+        ) == INDETERMINATE_VERDICT_CATEGORIES
+
+    def test_excludes_infra_timeout(self):
+        # DESIGN DECISION (plan.json, task 3173): a hang is one of the few
+        # non-completions a branch can genuinely CAUSE (an infinite loop or a
+        # deadlock introduced by the diff), so a local timeout must keep
+        # vetoing a remote PASS — fail CLOSED there. Landing on a local
+        # timeout would be the false-GREEN class tasks 2822/1700 hardened.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'infra_timeout' not in INDETERMINATE_VERDICT_CATEGORIES
+        # Non-vacuous: the exclusion is an adjudicated row, not a side effect
+        # of infra_timeout being absent from some other set.
+        assert CATEGORY_POLICY[FailureCategory.INFRA_TIMEOUT].verdict_indeterminate is False
+
+    def test_excludes_pytest_internalerror(self):
+        # DESIGN DECISION (amendment, task 3173): pytest_internalerror is
+        # is_infra_transient=True — retrying it is usually worthwhile — but
+        # `^INTERNALERROR>` is raised at COLLECTION time, which a conftest.py
+        # or plugin added by the diff can trigger, and may trigger only on
+        # this host's interpreter/plugin set. So it produced no verdict, but
+        # the branch may well have caused that: fail CLOSED, keep the veto.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'pytest_internalerror' in INFRA_TRANSIENT_CATEGORIES
+        assert 'pytest_internalerror' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert CATEGORY_POLICY[FailureCategory.PYTEST_INTERNALERROR].verdict_indeterminate is False
+
+    def test_no_completed_verdict_category_is_ever_indeterminate(self):
+        """A category that DID reach an exit decision about the branch can
+        never be overruled — the registry only ever names non-completions."""
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+        for category in (
+            'test_failure', 'unknown_test_failure', 'compile_error',
+            'cargo_cli_error', 'npm_error', 'tree_sitter_generate_error',
+            'flock_error', 'passed', '',
+        ):
+            assert category not in INDETERMINATE_VERDICT_CATEGORIES, category
+
+    def test_is_a_frozenset_of_categories(self):
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            FailureCategory,
+        )
+        assert isinstance(INDETERMINATE_VERDICT_CATEGORIES, frozenset)
+        assert INDETERMINATE_VERDICT_CATEGORIES.issubset(set(FailureCategory))
+
+
+class TestIndeterminateExclusionsAreAdjudicated:
+    """REVIEW AMENDMENT (task 3173, blocking finding 2 — ENV_TRANSIENT
+    false-GREEN): the three rows that were originally waved in on "it's a host
+    condition the diff cannot reach", re-adjudicated against the SHARPENED
+    three-part predicate.
+
+    The added part (3) is the one that matters here: merge_queue never observes
+    ground truth about WHY a leg failed — it only ever sees the STRING
+    ``classify_failure`` returned. So a row whose IDEAL condition is host-only
+    but whose PATTERN can swallow a branch-caused failure is still a
+    false-GREEN, and part (2) alone does not catch that. Every exclusion below
+    asserts both the registry membership AND the underlying policy field, so
+    none of them can pass vacuously if the registry is ever re-derived from
+    some other set.
+    """
+
+    def test_excludes_env_transient(self):
+        # Fails part (3). `_classify_environmental`'s OWN docstring
+        # (verify_classify.py:498-508) documents the accepted residual: shape-1
+        # `_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE` matches a bare
+        # "<read verb> ... No such file or directory", and the rustc-span veto
+        # only disambiguates rustc's OWN phrasing. A non-rustc guard or build
+        # script tripping over a file THE DIFF DELETED OR RENAMED emits text
+        # that is indistinguishable from worktree-removal collateral, and still
+        # classifies ENV_TRANSIENT. That is a branch-caused failure wearing a
+        # host-condition label, so it must keep its veto — fail CLOSED. The row
+        # flips back only once shape-1 carries a POSITIVE worktree-removal
+        # anchor. `is_infra_transient` is untouched: retrying is still right.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'env_transient' in INFRA_TRANSIENT_CATEGORIES
+        assert 'env_transient' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert CATEGORY_POLICY[FailureCategory.ENV_TRANSIENT].verdict_indeterminate is False
+
+    def test_excludes_semaphore_timeout(self):
+        # Fails part (3), on the IDENTICAL residual shape as env_transient
+        # above — leaving it True after fixing env_transient on these grounds
+        # would repeat the very inconsistency the review flagged.
+        # verify_classify.py:438-453 records the task-2748/2821 "Known gap"
+        # verbatim: a deterministic SHELL-script gate assertion (the docstring's
+        # own example is a manifest-drift check — precisely a BRANCH-caused
+        # failure) that quotes a lock token plus a timeout token but emits no
+        # grounded verdict marker still satisfies the loose `_LOCK_TOKEN_RE` +
+        # `_TIMEOUT_TOKEN_RE` co-occurrence and is still classified
+        # SEMAPHORE_TIMEOUT.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'semaphore_timeout' in INFRA_TRANSIENT_CATEGORIES
+        assert 'semaphore_timeout' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT].verdict_indeterminate is False
+
+    def test_excludes_disk_full(self):
+        # Fails part (2), NOT part (3) — the distinction is worth keeping
+        # explicit. Unlike the two rows above, DISK_FULL's ENOSPC markers ARE
+        # solid evidence that the disk really was full; the classification is
+        # not in doubt. What is in doubt is CAUSATION: a diff that generates
+        # very large build artifacts, or whose new test emits a runaway log,
+        # can genuinely cause the ENOSPC itself. So the branch COULD have
+        # caused this non-completion, and a local disk_full keeps its veto.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'disk_full' in INFRA_TRANSIENT_CATEGORIES
+        assert 'disk_full' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert CATEGORY_POLICY[FailureCategory.DISK_FULL].verdict_indeterminate is False
+
+    def test_infra_kill_is_the_only_member_and_its_evidence_is_structural(self):
+        # The positive half of the adjudication: infra_kill is the sole member
+        # because it is the ONLY category whose evidence is a waitpid status
+        # rather than a text match — part (3) holds by construction, since a
+        # branch cannot make the kernel report a negative returncode by
+        # printing anything.
+        #
+        # The non-vacuous grounding for that claim is `is_external_kill_rc`
+        # reading the RAW asyncio returncode and nothing else: the ordinary
+        # branch-caused OOM kills a memory-hungry GRANDCHILD, and the
+        # `start_new_session=True` shell wrapper (verify.py:3423-3443) reports
+        # that as POSITIVE 137, which the predicate rejects. Only a signal
+        # delivered to our OWN direct child yields the negative rc.
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            FailureCategory,
+        )
+        from orchestrator.verify_classify import (
+            ToolKind,
+            classify_failure,
+            is_external_kill_rc,
+        )
+        assert frozenset({FailureCategory.INFRA_KILL}) == INDETERMINATE_VERDICT_CATEGORIES
+        assert is_external_kill_rc(-9) is True
+        assert is_external_kill_rc(137) is False
+        assert classify_failure(
+            ToolKind.PYTEST, 137, 'Killed\n', False
+        ) is not FailureCategory.INFRA_KILL
+
+    def test_registry_stays_a_strict_subset_of_infra_transient(self):
+        # Keeps `test_is_derived_from_the_policy_rows_not_the_infra_transient_set`
+        # non-vacuous at the NEW size: with one member left, the two sets must
+        # still be distinct objects with a proper-subset relation, not a
+        # coincidental equality that would let the registry silently collapse
+        # back into "another name for the infra-transient set".
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+        assert INDETERMINATE_VERDICT_CATEGORIES < INFRA_TRANSIENT_CATEGORIES
+        assert len(INDETERMINATE_VERDICT_CATEGORIES) == 1

@@ -26,8 +26,8 @@ class TestIdentityLockFor:
     """GraphitiBackend._identity_lock_for(group_id) returns a per-group_id asyncio.Lock.
 
     Synchronous accessor (returns the Lock, not a coroutine); lazily creates and
-    caches one Lock per group_id, mirroring DurableWriteQueue._group_locks
-    (durable_queue.py:136, 259-260). Needs no initialized driver.
+    caches one Lock per group_id, mirroring DurableWriteQueue._group_locks in
+    fused_memory/services/durable_queue.py. Needs no initialized driver.
     """
 
     def test_returns_asyncio_lock(self, mock_config):
@@ -58,8 +58,8 @@ class TestIdentityLockFor:
 class TestResolveOrCreateEntityResolve:
     """GraphitiBackend._resolve_or_create_entity(name, *, group_id) — 0/1-match
     resolve/no-op fast path (no collapse machinery), mirroring the
-    TestMergeEntities.backend_with_mocks orchestration-mock pattern
-    (test_merge_entities.py:154)."""
+    TestMergeEntities.backend_with_mocks orchestration-mock pattern in
+    test_merge_entities.py."""
 
     @pytest.fixture
     def backend_with_mocks(self, mock_config, make_backend):
@@ -111,8 +111,8 @@ class TestResolveOrCreateEntityCollapse:
     """GraphitiBackend._resolve_or_create_entity(name, *, group_id) — >=2-match
     collapse path: folds every non-survivor duplicate into the survivor-first
     match from find_duplicate_entity_nodes via merge_entities, mirroring the
-    TestMergeEntities.backend_with_mocks orchestration-mock pattern
-    (test_merge_entities.py:154)."""
+    TestMergeEntities.backend_with_mocks orchestration-mock pattern in
+    test_merge_entities.py."""
 
     @pytest.fixture
     def backend_with_mocks(self, mock_config, make_backend):

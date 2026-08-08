@@ -628,7 +628,7 @@ class TestRunSegmentedRoster:
         assert without_roster != output
 
         def _classify(test_out: str):
-            passed, category, cause_hint, _summary = _summarize_checks(
+            passed, category, cause_hint, _summary, _leg_categories = _summarize_checks(
                 1, test_out, False, 'uv run pytest tests/',
                 0, '', False, 'uv run ruff check src/',
                 0, '', False, 'npx pyright',
@@ -643,7 +643,7 @@ class TestRunSegmentedRoster:
         _rc, output, _timed_out, _seg_dicts = await self._mixed_run(tmp_path, _PYTEST_RED)
         from orchestrator.verify import _summarize_checks  # noqa: PLC0415
 
-        _passed, _category, cause_hint, _summary = _summarize_checks(
+        _passed, _category, cause_hint, _summary, _leg_categories = _summarize_checks(
             1, output, False, 'uv run pytest tests/',
             0, '', False, 'uv run ruff check src/',
             0, '', False, 'npx pyright',

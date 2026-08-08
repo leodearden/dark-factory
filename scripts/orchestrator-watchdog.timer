@@ -4,6 +4,14 @@ Description=Orchestrator escalation-MCP health probe (every 60s)
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=60
+# systemd's DEFAULT AccuracySec is 1min, which would widen this 60s probe's
+# elapse window from [60s, 65s] to [60s, 120s] — roughly halving how fast the
+# fleet watchdog notices a dead orchestrator. Not new policy: this is the value
+# the host has actually been running since 2026-05-26, which the committed
+# transcription (task 1368) dropped. Restored by task 3424 BEFORE installing
+# the committed timer, so that install is a parity fix and not a supervision
+# regression. Pinned by tests/scripts/test_orchestrator_service_files.py.
+AccuracySec=5s
 
 [Install]
 WantedBy=timers.target

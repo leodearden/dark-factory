@@ -461,6 +461,20 @@ class PlanQualityVerdict:
     # Trailing and defaulted, so every existing 3-arg construction (including
     # the parse-failure fallback below) is unaffected and keeps reading None.
     invocation_error: str | None = None
+    # USD spend of THIS verdict's own judge invocation (eval-revival υ).
+    # ``0.0`` when no invocation happened (the pre-invoke unjudgeable-artifact
+    # refusal below) or when the caller constructed the verdict itself — the
+    # same trailing-defaulted shape as ``invocation_error`` immediately above,
+    # for the same reason: every existing construction site keeps working.
+    # ``run_architect_eval`` reads this to fold the judge's spend into the
+    # cell's own ``cost_usd`` (metrics.py's documented judge_cost_usd-is-a-
+    # SUBSET-of-cost_usd contract). Every POST-invoke construction site below
+    # coerces via ``metrics.coerce_cost_usd`` before assigning here, so
+    # DECLARED type and ACTUAL runtime type agree even under a test double —
+    # a direct dataclass construction (like this default, or the legacy
+    # 3-arg call sites) is the only way this field can hold anything the
+    # helper did not already validate.
+    cost_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -541,6 +555,19 @@ async def judge_plan_quality(
     infra cause stays distinguishable from an unparseable answer; the caller
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
+
+    COST ACCOUNTING (eval-revival υ): the returned verdict's ``cost_usd``
+    reports THIS invocation's own USD spend — every path that reached
+    ``invoke_agent`` (success, transport refusal, NaN, parse failure) carries
+    that call's real cost, whatever the verdict turned out to be; only the
+    PRE-invoke unjudgeable-artifact refusal above, which returns before
+    ``invoke_agent`` is ever called, reports ``0.0``. Each of those four
+    POST-invoke sites coerces ``result.cost_usd`` through
+    :func:`~orchestrator.evals.metrics.coerce_cost_usd` (amendment,
+    reviewer design-coherence) before it rides the verdict, so the
+    dataclass's declared ``float`` type is actually true at every
+    construction site — not just enforced by whichever caller happens to
+    read it defensively.
     """
     # Name WHICH cell to go look at, whichever key the caller populated:
     # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
@@ -584,6 +611,10 @@ async def judge_plan_quality(
                 'plan carries no steps — not a judgeable artifact; scored on '
                 f'the deterministic structural floor ({floor})'
             ),
+            # cost_usd stays the dataclass default (0.0): no invoke_agent call
+            # happened on this path, so recording any spend would fabricate
+            # it — the same anti-fabrication discipline that governs
+            # plan_quality and invocation_error on this exact return.
         )
 
     task_name = task.get('name', task.get('id', 'unknown'))
@@ -643,8 +674,10 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
     # the parse-failure fallback — making an infra refusal indistinguishable
     # from a judge that answered badly. Local import: keeps judge.py's
     # module-level import surface unchanged (and there is no cycle either way —
-    # metrics.py does not import judge).
-    from .metrics import detect_invocation_error
+    # metrics.py does not import judge). coerce_cost_usd is the SAME producer-
+    # side coercion used at every POST-invoke return below (amendment,
+    # reviewer design-coherence) — see its docstring in metrics.py.
+    from .metrics import coerce_cost_usd, detect_invocation_error
 
     invocation_error = detect_invocation_error(result)
     if invocation_error:
@@ -657,6 +690,8 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             per_criterion={},
             reasoning=f'plan judge invocation refused: {invocation_error}',
             invocation_error=invocation_error,
+            # A refused invocation still burned tokens — real spend, not $0.
+            cost_usd=coerce_cost_usd(result.cost_usd),
         )
 
     # Parse verdict — structured_output first, else json.loads(output); a
@@ -689,6 +724,9 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
                         f'Plan judge answered a non-finite plan_quality '
                         f'(NaN) for {cell}'
                     ),
+                    # The judge DID run and produced an answer (a nonsense
+                    # one) — real spend, not $0.
+                    cost_usd=coerce_cost_usd(result.cost_usd),
                 )
             plan_quality = clamp_unit_score(raw_quality)
             # See clamp_unit_score's docstring for why the schema bound alone
@@ -711,10 +749,24 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality=None,
             per_criterion={},
             reasoning='Plan judge output parse failure',
+            # The judge DID run and produced output (just unparseable) —
+            # real spend, not $0.
+            cost_usd=coerce_cost_usd(result.cost_usd),
         )
 
     return PlanQualityVerdict(
         plan_quality=plan_quality,
         per_criterion=verdict.get('per_criterion', {}) or {},
         reasoning=verdict.get('reasoning', ''),
+        # Coerced at the producer via the shared metrics.coerce_cost_usd
+        # helper (amendment, reviewer design-coherence): isinstance-gated,
+        # so a bare MagicMock — as the pre-existing judge tests construct,
+        # without setting cost_usd — degrades to 0.0 instead of leaking a
+        # non-float into a field declared ``float`` (verified: MagicMock
+        # configures __float__ to return 1.0, so a naive float() coercion
+        # would have silently FABRICATED spend instead; isinstance avoids
+        # that trap). This makes the declared type actually true at every
+        # construction site, not enforced only by the runner's defensive
+        # read (_verdict_cost_usd, now itself built on this same helper).
+        cost_usd=coerce_cost_usd(result.cost_usd),
     )

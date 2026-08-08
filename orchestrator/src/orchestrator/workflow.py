@@ -1192,6 +1192,17 @@ class TaskWorkflow:
 
         self._steward_factory = steward_factory
         self._steward: Any | None = None
+        # Give-up signal of the MOST RECENT _wait_for_resolution call (task
+        # 3536): True when that wait ended by expiring its idle window rather
+        # than by the L0s clearing.  The two are indistinguishable from the
+        # wait's `str` return — on expiry it dismisses the orphans and, finding
+        # no open L1, returns the collected resolutions exactly as a successful
+        # wait does — but they mean opposite things to a caller that must not
+        # proceed past an UNADJUDICATED gating record.  Only the merge-entry
+        # gate (_handle_merge_gate_escalations) consumes it today; run()'s
+        # ESCALATED branch deliberately ignores it and keeps resuming the
+        # implementer on expiry.
+        self._steward_wait_expired: bool = False
         # In-process StewardOutcome channel (task 2248 / W9-delta): created
         # lazily in _ensure_steward_started and registered on the steward via
         # set_outcome_channel — replaces the escalation-queue forensic re-read
@@ -2683,19 +2694,18 @@ class TaskWorkflow:
                     # returns inside _mark_blocked (~L3125–3168) but
                     # bypasses it so we do NOT file an L1 for what is an
                     # intentional steward terminal decision.
-                    current_status = await self.scheduler.get_status(self.task_id)
-                    if current_status == 'done':
-                        self._enter_phase(WorkflowState.DONE)
-                        return WorkflowOutcome.DONE
-                    if current_status in WORKFLOW_PRESERVE_STATUSES:
-                        logger.info(
-                            'Task %s: steward set status to %s during '
-                            'escalation resolution — preserving, exiting '
-                            'resume loop',
-                            self.task_id, current_status,
-                        )
-                        self._enter_phase(WorkflowState.BLOCKED)
-                        return WorkflowOutcome.BLOCKED
+                    #
+                    # The guard itself lives in
+                    # _honour_steward_terminal_decision — ONE copy shared with
+                    # _handle_merge_gate_escalations, which needs the identical
+                    # (and identically ORDER-SENSITIVE) logic.  See that
+                    # method's docstring for why 'done' must be tested before
+                    # WORKFLOW_PRESERVE_STATUSES.
+                    _terminal = await self._honour_steward_terminal_decision(
+                        context='during escalation resolution',
+                    )
+                    if _terminal is not None:
+                        return _terminal
 
                     # Fix 2 — anti-thrash guard for repeated infra-issue
                     # resumes on the same root cause.  Status is confirmed
@@ -3435,8 +3445,18 @@ class TaskWorkflow:
 
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
-        # lockstep) — a divergence here means some path bypassed it. Purely
-        # observational: logs + escalates, never blocks the merge.
+        # lockstep) — a divergence here means some path bypassed it. NOT
+        # observational: _escalate_scope_invariant_violation files a
+        # severity='blocking', level=0 record, which _is_gating_escalation
+        # classifies as GATING, so the bail 12 lines below stops this
+        # dispatch's merge. (This has been true since task 1619; the comment
+        # that claimed "never blocks the merge" was corrected in task 3536.)
+        # As of that task the gate is safe to trip: it is bounded (exactly one
+        # steward wait, never a second) and recoverable (a steward that consumes
+        # the L0 lets the merge retry IN-SLOT without burning a re-dispatch; an
+        # unresolved or re-escalated gate parks the row as `blocked` with an L1
+        # instead of stranding it in-progress). See
+        # _handle_merge_gate_escalations.
         # The stamp above already read this task's backend metadata blob;
         # thread it in rather than issuing a second identical get_task on the
         # merge hot path (review amendment). A None/unreadable prefetch falls
@@ -3454,14 +3474,20 @@ class TaskWorkflow:
         # D4 accepted consequence: a pending critical/urgent from a
         # prior incarnation DOES gate a fresh run — stop-the-line
         # semantics.  See _is_gating_escalation for the full policy.
+        # Task 3536 (γ₁) extends, and does not weaken, that consequence:
+        # what changed is the DISPOSITION *after* the gate fires, not
+        # which records fire it.  The gate now hands off to the shared
+        # bounded ESCALATED machinery (steward + _wait_for_resolution)
+        # instead of returning ESCALATED with no steward and no status
+        # write — so stop-the-line no longer means "strand".  Nothing
+        # merges past an open gating record either way; the task now
+        # either resolves it in-slot and merges, or parks visibly as
+        # `blocked` for a human.  See _handle_merge_gate_escalations.
         gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
         if gating:
-            logger.warning(
-                'Task %s: %d gating escalation(s) at MERGE entry '
-                '— bailing to ESCALATED',
-                self.task_id, len(gating),
-            )
-            return WorkflowOutcome.ESCALATED
+            _gate = await self._handle_merge_gate_escalations(gating)
+            if _gate is not None:
+                return _gate
 
         # Ghost-loop early exit (PRD workflow-state-machine α, MP-1/MP-2): a
         # MergeProvenance hit or the _has_prior_implementation fallback both
@@ -3636,6 +3662,365 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 'Merge retries exhausted after steward resolutions'
             )
+        return None
+
+    async def _honour_steward_terminal_decision(
+        self, *, context: str,
+    ) -> WorkflowOutcome | None:
+        """Honour a TERMINAL DECISION the steward took on the row, else ``None``.
+
+        ONE copy of a guard both post-``_wait_for_resolution`` resume paths
+        need: ``run()``'s ESCALATED branch (before resuming the implementer)
+        and :meth:`_handle_merge_gate_escalations` (before resuming the merge).
+        Extracted in task 3536's review pass — it had been duplicated verbatim,
+        both copies load-bearing AND order-sensitive, so a future edit to one
+        (a new preserve status, a ``merge-deferred`` special case) would have
+        silently diverged from the other.
+
+        The steward is the ONLY workflow role holding
+        ``mcp__fused-memory__set_task_status`` (``roles.py:1131-1133``), and its
+        prompt directs it to park rows — done / cancelled / deferred /
+        blocked — while resolving an L0 (e.g. it queued a follow-up task that
+        is now the durable fix and deferred this one onto it).  That decision
+        IS an adjudication, so honouring it costs nothing.  The two call sites
+        pay very different prices for ignoring it:
+
+        * ``run()`` — the resume loop keeps invoking implementer/debugger until
+          the verify-attempt budget exhausts: $7-8 per cycle on a task the
+          steward already parked.  Recoverable.
+        * merge entry — the branch LANDS ON MAIN, and for a non-terminal park
+          like ``deferred`` (not in ``TERMINAL_STATUSES``, so no server
+          rejection fires) ``_finalise_merged_done`` then silently overwrites
+          the row to ``done``.  NOT recoverable: re-dispatch cannot un-merge a
+          branch.
+
+        Deliberately BYPASSES :meth:`_mark_blocked`: the status is already on
+        the row, so nothing needs writing, and filing an L1 would page a human
+        about a decision a steward already made.  Callers must therefore invoke
+        this BEFORE any sibling ``_mark_blocked(..., escalate_to_human=True)``
+        branch — see :meth:`_handle_merge_gate_escalations`, where a later
+        placement would file an L1 for a deliberate park and attempt
+        ``set_task_status('blocked')`` over a terminal row.
+
+        **Branch ORDER is load-bearing, not stylistic.**
+        ``WORKFLOW_PRESERVE_STATUSES`` is a SUPERSET of ``TERMINAL_STATUSES``
+        and CONTAINS ``'done'``, so testing membership first would return
+        BLOCKED for a ``done`` row — and ``outcome_allows_status(BLOCKED,
+        'done')`` is False, which makes ``run()``'s SM-2 exit consistency check
+        (:3248) raise ``AssertionError``.  Conversely
+        ``outcome_allows_status(DONE, 'done')`` is True and
+        ``outcome_allows_status(BLOCKED, x)`` is True for every other member of
+        the set, so this exact split is the only SM-2-consistent one.  Do not
+        reorder, and do not introduce a second literal status set.
+
+        Args:
+            context: Short phrase naming WHERE the decision was observed (e.g.
+                ``'during escalation resolution'``), interpolated into the log
+                line so the two call sites stay distinguishable in a journal.
+
+        Returns:
+            ``DONE`` / ``BLOCKED`` when the steward parked the row — with the
+            matching phase already entered, so ``run()``'s ``report.phase ==
+            self.machine.state`` assertion (:3228) holds — or ``None`` when the
+            row carries no terminal decision and the caller should carry on.
+        """
+        current_status = await self.scheduler.get_status(self.task_id)
+        if current_status == 'done':
+            logger.info(
+                'Task %s: steward set status to done %s — preserving',
+                self.task_id, context,
+            )
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
+        if current_status in WORKFLOW_PRESERVE_STATUSES:
+            logger.info(
+                'Task %s: steward set status to %s %s — preserving',
+                self.task_id, current_status, context,
+            )
+            self._enter_phase(WorkflowState.BLOCKED)
+            return WorkflowOutcome.BLOCKED
+        return None
+
+    async def _handle_merge_gate_escalations(
+        self, gating: list[Escalation],
+    ) -> WorkflowOutcome | None:
+        """Dispose of the gating escalation(s) found at MERGE entry (task 3536).
+
+        A deliberate mirror of ``run()``'s ESCALATED branch (workflow.py:
+        2636-2647) — ``_enter_phase(ESCALATED)`` →
+        :meth:`_ensure_steward_started` → :meth:`_wait_for_resolution` →
+        ``except _StewardReescalated`` → :meth:`_mark_blocked`, plus that
+        branch's steward-terminal-decision guard, which honours a row the
+        steward parked while resolving instead of proceeding over it.  The
+        guard is not copied but SHARED —
+        :meth:`_honour_steward_terminal_decision`, called from both — so the
+        two paths cannot drift.
+        PRD
+        ``plans/task-escalation-state-graph-prd.md`` D1: uniformity is the
+        point — ONE ESCALATED semantics, not two.  Before this, the gate did a
+        bare ``return WorkflowOutcome.ESCALATED`` with no steward, no wait and
+        no task-status write; ``harness._run_slot``'s ``finally``
+        (harness.py:7949-7972) then cleared the claimant while writing no
+        status, leaving ``in-progress`` + NULL claimant + an open gating
+        record with nothing running to advance it (spec
+        ``docs/task-escalation-state-spec.md`` E1).
+
+        **Invariant (spec S1) — every non-``None`` return of this method
+        happens only once the successor status is ON THE ROW**: written by
+        :meth:`_mark_blocked` on the block paths, or already written by the
+        steward and deliberately preserved on the terminal-decision path.
+        Either way the caller never sees an outcome the row does not back.
+        There must be no bare
+        ``return WorkflowOutcome.ESCALATED`` anywhere on this path; a future
+        edit that reintroduces one reintroduces the strand.  Note that
+        ``_mark_blocked`` may itself legitimately return ``ESCALATED`` (its
+        ``StewardReescalatedL1`` branch, :14077) — that is spec-blessed
+        precisely because the row was already written.
+
+        Returns ``None`` when the gate cleared and the caller should fall
+        through to the merge retry loop IN-SLOT: no re-dispatch is burned and
+        the row stays ``in-progress`` under the live claimant for the whole
+        wait (spec §4 — ``in-progress`` covers Path-A escalated-waiting).  That
+        exit STOPS AND CLEARS THE STEWARD FIRST — the merge tail runs git in
+        ``self.worktree`` and the steward's poll loop invokes its agent there
+        too; see the block comment at the return itself.
+
+        **Bounded (spec S5).**  The whole path costs at most ONE steward wait
+        per merge entry: the post-wait gate re-check is SINGLE-SHOT, so a
+        still-open or newly-filed gating record parks the task rather than
+        buying another wait.  Note precisely what that bounds and what it does
+        not: :meth:`_wait_for_resolution`'s window is an IDLE deadline,
+        REFRESHED by another full window on every observed advance of
+        ``_steward_progress_counter()`` (:12578-12586).  So the hold is one
+        window for a SILENT producer, and up to
+        ``steward_max_attempts + steward_max_timeouts_per_escalation`` windows
+        for a steward that keeps invoking its agent without resolving — bounded
+        by the steward's own attempt ceilings, not by a single window.  What
+        this method adds is that the gate never buys a SECOND wait, and the
+        expiry park reports the MEASURED elapsed time rather than the
+        configured window (review amendment).  Two deliberate divergences from
+        ``run()``'s ESCALATED branch are documented at the branches that
+        differ — expiry blocks here instead of resuming, and the re-check does
+        not loop.  Two, still: the terminal-decision guard is a MIRROR of
+        ``run()`` (literally the same method), not a third divergence, so the
+        count stays checkable.
+
+        The gate PREDICATE is untouched (PRD out-of-scope fence): this method
+        never re-decides what gates, only what happens next.  The post-wait
+        re-check calls the same :func:`_is_gating_escalation`, so there is
+        exactly one gate policy in this file.
+        """
+        logger.warning(
+            'Task %s: %d gating escalation(s) at MERGE entry '
+            '— entering the bounded ESCALATED wait',
+            self.task_id, len(gating),
+        )
+        # MERGE → ESCALATED projects IN_PROGRESS → BLOCKED, which
+        # is_legal_transition allows for ActorClass.ORCHESTRATOR.  The machine
+        # is in-memory, so this writes NO task row — it only makes the in-slot
+        # wait observable in phase_enter/phase_exit telemetry exactly as Path
+        # A's is, and keeps _mark_blocked's blocked_from_phase stamp reporting
+        # an escalation park rather than MERGE.
+        self._enter_phase(WorkflowState.ESCALATED)
+        await self._ensure_steward_started()
+        logger.info(
+            'Task %s: waiting for merge-entry escalation resolution', self.task_id,
+        )
+        # Measure the ACTUAL wall clock the wait consumed.  The derived window
+        # below is only the IDLE deadline: _wait_for_resolution REFRESHES it by
+        # another full window every time _steward_progress_counter() advances
+        # (:12578-12586), so a steward that keeps invoking its agent can hold
+        # this slot for N windows.  Reporting the configured window as if it
+        # were the elapsed time would hand the human triaging the park a number
+        # several multiples smaller than reality (review amendment).
+        _wait_started = asyncio.get_event_loop().time()
+        try:
+            await self._wait_for_resolution()
+        except _StewardReescalated as reesc:
+            # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
+            # default False so the row actually lands `blocked` (spec S1); the
+            # merge_phase=True carve-out writes no status at all (spec
+            # divergence E2) and this path is exiting the slot, not retrying a
+            # queue submission.
+            return await self._mark_blocked(
+                'Steward re-escalated to human',
+                detail=_format_reescalation_detail(reesc.escalations),
+                skip_escalation=True,
+            )
+        waited = asyncio.get_event_loop().time() - _wait_started
+        # Honour a steward TERMINAL DECISION taken while resolving the gate —
+        # the guard shared with run()'s ESCALATED branch, which carries the
+        # full rationale and the load-bearing branch ORDER.
+        #
+        # This must run FIRST, before both branches below, because both call
+        # _mark_blocked(escalate_to_human=True): a steward that parks the row
+        # and then goes quiet would otherwise earn an L1 for a decision that
+        # WAS an adjudication, and _mark_blocked would also try
+        # set_task_status('blocked') over a terminal row, routing into
+        # _handle_terminal_exit_rejection's bypass-done detection.
+        _terminal = await self._honour_steward_terminal_decision(
+            context='while resolving the merge-entry gate',
+        )
+        if _terminal is not None:
+            return _terminal
+        if self._steward_wait_expired:
+            # The wait ended by expiring, not by anyone adjudicating the gating
+            # record — the backstop auto-dismissed the orphan L0(s) to unblock
+            # the waiter.  DELIBERATELY diverges from run()'s ESCALATED branch,
+            # which resumes the implementer on this same expiry: there, more
+            # implementer work is safe and the pipeline re-gates afterwards; at
+            # MERGE entry there is no later gate, so resuming means merging
+            # past an unadjudicated blocking record — repend-PRD D4
+            # stop-the-line forbids it.
+            #
+            # escalate_to_human=True rather than the default L0-then-steward
+            # route: the steward has just demonstrably gone silent on this very
+            # task, so filing a fresh L0 for it would buy a second full grace
+            # window from a producer that is not answering.
+            window = (
+                self.config.timeouts.steward + self.config.steward_completion_timeout
+            )
+            # `waited` is MEASURED, `window` is CONFIGURED, and they are not
+            # interchangeable: the window is an idle deadline refreshed on
+            # every observed steward invocation, so the elapsed time is one
+            # window for a silent producer and N windows for a busy-but-
+            # unproductive one.  The human triaging this park reasons from the
+            # measured number, so it leads (review amendment).
+            return await self._mark_blocked(
+                f'Merge-entry gate: {len(gating)} gating escalation(s) '
+                f'unresolved when the steward wait expired',
+                detail=(
+                    f'The MERGE-entry gate waited {waited:.1f}s of wall clock '
+                    f'before the steward wait gave up (configured idle window '
+                    f'{window:.0f}s = timeouts.steward '
+                    f'{self.config.timeouts.steward:.0f}s + '
+                    f'steward_completion_timeout '
+                    f'{self.config.steward_completion_timeout:.0f}s; that window '
+                    f'is an IDLE deadline, refreshed for another full window '
+                    f'each time the steward was observably still working, so '
+                    f'the elapsed time can be several multiples of it). The '
+                    f'steward never resolved the gating record(s); the backstop '
+                    f'auto-dismissed the orphan level-0(s) to unblock the wait. '
+                    f'Nothing adjudicated the gate, so the merge was NOT '
+                    f'attempted (stop-the-line). Gating records at entry:\n'
+                    + '\n'.join(
+                        f'  {e.id} (severity={e.severity}, level={e.level}, '
+                        f'category={e.category}): {e.summary}'
+                        for e in gating
+                    )
+                ),
+                escalate_to_human=True,
+            )
+        # SINGLE-SHOT re-check.  The wait can return having cleared what it was
+        # waiting on while a DIFFERENT gating record is open — most sharply a
+        # born-at-L2 filed mid-resolution, which the wait cannot see at all
+        # (its loop polls level-0, its stop-the-line check ran at entry before
+        # the record existed, and its tail's has_open_l1 matches level-1).
+        # Without this, such a record is merged straight past.  Re-uses the
+        # SAME _is_gating_escalation predicate rather than an equivalent
+        # inline condition, so there is exactly one gate policy in this file.
+        #
+        # Deliberately NOT a loop back into the machinery.  Boundedness (spec
+        # S5): the whole merge-entry gate path must cost at most ONE steward
+        # wait, and a steward that keeps chaining fresh records would otherwise
+        # hold the slot for an unbounded NUMBER of waits — the unbounded-hold
+        # defect this task exists to remove.  (One wait is itself bounded by
+        # the steward's attempt ceilings, not by a single idle window; see the
+        # docstring.)  Contrast run()'s ESCALATED branch, which
+        # legitimately loops because each pass re-invokes the implementer and
+        # can make real progress; the merge-entry gate does no work between
+        # passes, so a second wait is pure latency with no new information.
+        # D4 is preserved either way — nothing merges past an open gating
+        # record — only the disposition differs: a visible `blocked` park with
+        # an L1 for a human rather than another automated wait.
+        still_gating = [
+            e for e in self._check_escalations() if _is_gating_escalation(e)
+        ]
+        if still_gating:
+            # STOP-THEN-CLEAR before parking, the same idiom the gate-cleared
+            # exit below and _wait_for_resolution's give-up branch (:12620-
+            # 12623) use.  Unlike the sibling exits, this one reaches
+            # _mark_blocked with the steward STILL LIVE — the expiry branch's
+            # steward was already stopped by the wait itself, and the
+            # _StewardReescalated branch's L2 is out of the steward's reach —
+            # and _mark_blocked(escalate_to_human=True) fires
+            # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
+            # self.worktree: the SAME worktree TaskSteward invokes its agent in
+            # (steward.py:542, 590).  Leaving the poll loop live is therefore
+            # the two-agents-one-worktree hazard here too, just with the
+            # dry-run investigator in place of the merge tail (review
+            # amendment).  Stopping first also closes the narrower race the
+            # single-shot re-check opens: a live steward can resolve the record
+            # microseconds after the re-check read it, making the freshly-filed
+            # L1 and the `blocked` park spurious.  Suppressed for the same
+            # reason as every other stop() on a degraded path — a failing stop
+            # must not convert a park into a workflow crash.  Safe with respect
+            # to _mark_blocked: its escalate_to_human branch returns before any
+            # _ensure_steward_started, so clearing the reference here cannot
+            # cause a fresh steward to be built behind our back.
+            if self._steward is not None:
+                with contextlib.suppress(Exception):
+                    await self._steward.stop()
+                self._steward = None
+            return await self._mark_blocked(
+                f'Merge-entry gate: {len(still_gating)} gating escalation(s) '
+                f'still open after the steward wait',
+                detail=(
+                    'The MERGE-entry gate re-checked after the steward wait '
+                    'concluded and found gating record(s) still open — either '
+                    'never resolved, or filed during the resolution. The merge '
+                    'was NOT attempted (stop-the-line), and the gate does not '
+                    're-enter the wait: one bounded window per merge entry, '
+                    'then a human decides. Open gating records:\n'
+                    + '\n'.join(
+                        f'  {e.id} (severity={e.severity}, level={e.level}, '
+                        f'category={e.category}): {e.summary}'
+                        for e in still_gating
+                    )
+                ),
+                escalate_to_human=True,
+            )
+        # Gate cleared — resume the merge in this same slot.  STOP THE STEWARD
+        # FIRST, before _enter_phase and before returning to the merge tail.
+        # Ordering is load-bearing, not tidiness, and this is the SAME safety
+        # requirement _wait_for_resolution's give-up branch states at :12546-
+        # 12565: TaskSteward._loop is a persistent poll loop (steward.py:
+        # 259-273) that keeps picking up fresh L0s and invoking its agent with
+        # cwd = self.worktree (steward.py:542, 590).  Everything downstream of
+        # this return — _recover_before_merge, `git rev-parse HEAD`,
+        # rebase_onto_main, run_scoped_verification, _submit_to_merge_queue —
+        # operates on that same worktree, so leaving the loop live is the
+        # two-agents-one-worktree hazard: a rebase onto a tree the steward
+        # agent is mid-write in either fails on a dirty tree / index.lock, or
+        # rides unreviewed steward commits onto main.
+        #
+        # This exposure is NEW with the bounded wait and unique to THIS exit.
+        # The pre-γ₁ gate returned ESCALATED without ever constructing a
+        # steward, so nothing was ever live in the worktree during a merge; and
+        # unlike run()'s ESCALATED branch — which resumes only the implementer
+        # and re-gates afterwards — there is no later gate here to catch a bad
+        # merge, and no re-dispatch can un-merge a branch.  The sibling exits
+        # above do not need it: they never reach the merge tail, and run()'s
+        # `finally` stops the steward on the way out of the slot.
+        #
+        # stop() cancels the loop task (steward.py:209-217) and on the stock
+        # `steward: "claude"` backend the resulting CancelledError propagates
+        # into cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
+        # terminates the agent's whole process group — so an in-flight agent
+        # genuinely stops writing rather than merely being detached from.
+        # Clearing the reference is the existing stop-then-clear idiom
+        # (cf. :6807-6809 / :6851-6853 / :12579-12582): a later _mark_blocked
+        # on the merge tail then builds a FRESH steward through
+        # _ensure_steward_started rather than awaiting a cancelled loop that
+        # can never publish.  Suppressed because a failing stop() must not
+        # convert a cleared gate into a workflow crash — the merge is still
+        # safe to attempt if the loop was already dead.
+        if self._steward is not None:
+            with contextlib.suppress(Exception):
+                await self._steward.stop()
+            self._steward = None
+        # BLOCKED → IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
+        self._enter_phase(WorkflowState.MERGE)
         return None
 
     def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
@@ -12200,6 +12585,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return ''
 
+        # Reset once per wait, AFTER the no-queue early return, so each wait
+        # reports its OWN outcome and a stale True from an earlier wait can
+        # never leak into a later one (task 3536).
+        self._steward_wait_expired = False
+
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
 
@@ -12316,6 +12706,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # that can never publish.  Suppressed because this is cleanup on
                 # an already-degraded path: a failing stop() must not convert a
                 # wait-timeout into a workflow crash.
+                #
+                # Task 3536: record the give-up for callers that must tell it
+                # apart from a genuine resolution.  They cannot do so from this
+                # method's return value — the tail below dismisses the orphans
+                # and, with no open L1, returns the collected resolutions
+                # exactly as a successful wait does.  run()'s ESCALATED branch
+                # deliberately ignores the flag (resuming the implementer on
+                # expiry is safe there: it does more work and the pipeline
+                # re-gates later).  The merge-entry gate must NOT — there is no
+                # later gate, and merging past a record that a backstop
+                # auto-dismissed rather than anyone ADJUDICATING would violate
+                # repend-PRD D4 stop-the-line.
+                self._steward_wait_expired = True
                 if self._steward is not None:
                     with contextlib.suppress(Exception):
                         await self._steward.stop()
@@ -13398,14 +13801,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _check_scope_invariant(
         self, *, backend_metadata: dict | None = None,
     ) -> None:
-        """Tripwire (task 2505): warn + escalate if ``plan.files`` and
-        ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
+        """Tripwire (task 2505): warn + escalate when ``plan.files`` needs a
+        LOCK MODULE that ``metadata.files`` does not cover, at MERGE entry.
 
         The scope-reconciliation choke point (``_reconcile_scope_locks`` /
         ``_set_task_scope``) keeps ``plan.files`` and ``metadata.files`` in
         lockstep on every path that changes either. This surfaces a genuine
         divergence loudly (the project's loud-over-silent-degradation norm)
         rather than letting scope drift ship silently into a merge.
+
+        The escalation this files is a BLOCKING LEVEL-0 record
+        (:meth:`_escalate_scope_invariant_violation`), which
+        :func:`_is_gating_escalation` classifies as gating — so it GATES the
+        merge at the bail immediately below this call site, routing the task
+        into the bounded ESCALATED machinery
+        (:meth:`_handle_merge_gate_escalations`). A divergence therefore stops
+        the line for this dispatch; it is not merely observed. That hold is
+        bounded — exactly one steward wait, never a second — and always ends in
+        either an in-slot merge retry or a visible ``blocked`` park.
 
         Compared at MODULE (lock) granularity, NOT file granularity. Locks —
         the only thing ``metadata.files`` functionally drives — are
@@ -13428,6 +13841,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot
         check" and skipped, not "divergent" — a read failure must not wedge
         an otherwise-valid merge or false-escalate.
+
+        Directional, not symmetric (task 3429): ``metadata.files`` is the
+        sole input the scheduler derives this task's file locks from (see
+        ``Scheduler._get_modules``), so the only question this tripwire can
+        meaningfully answer at merge entry is whether the held locks COVER
+        every module the plan is about to edit — a containment question,
+        not an equality one. ``plan_modules - metadata_modules`` non-empty
+        (PLAN-EXTRA: the plan needs a module the locks do not cover) is
+        unsafe and escalates. A ``metadata.files`` module SUPERSET is safe —
+        wider locks cannot let two tasks collide, they can only
+        over-serialise — and is logged at INFO instead of escalating.
+        Measured basis: of the 11 plan.files/metadata.files divergence
+        strands observed on dark-factory (2026-08-06), 9 were
+        superset-shaped, 7 of those because the task's own test file lives
+        in a sibling directory (``scripts/foo.sh`` vs
+        ``scripts/tests/test_foo.py`` normalize to different modules at
+        ``lock_depth`` >= 2) — a structural false-positive class, not bad
+        luck.
 
         Args:
             backend_metadata: Optional pre-read backend metadata blob. The
@@ -13456,37 +13887,100 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
         )
-        if plan_modules == metadata_modules:
+        if not plan_modules and metadata_modules:
+            # An empty plan_modules is NOT evidence of a safe wider lock: the
+            # containment test below (`uncovered = plan_modules -
+            # metadata_modules`) is vacuously empty for an empty LHS
+            # regardless of what metadata_modules holds, so it cannot tell
+            # "the plan genuinely needs nothing" apart from "plan.files was
+            # lost, never populated, or every entry was directory-shaped and
+            # alpha-stripped by sanitize_files_for_persist" (review
+            # amendment, task 3429). Escalate rather than silently logging
+            # this as the benign-superset case below —
+            # loud-over-silent-degradation.
+            logger.warning(
+                'Task %s: plan.files resolves to NO lock modules at MERGE '
+                'entry (self.plan files=%s) while metadata.files is '
+                'non-empty (files=%s, modules=%s) — an empty plan cannot be '
+                'verified as a safe superset, escalating rather than '
+                'treating it as benign',
+                self.task_id, self.plan.get('files'), sorted(metadata_files),
+                sorted(metadata_modules),
+            )
+            self._escalate_scope_invariant_violation(
+                sorted(plan_files), sorted(metadata_files), sorted(plan_modules),
+            )
+            return
+        uncovered = plan_modules - metadata_modules
+        if not uncovered:
+            if metadata_modules != plan_modules:
+                logger.info(
+                    'Task %s: metadata.files is a benign lock-module SUPERSET '
+                    'of plan.files at MERGE entry — locks %s are wider than '
+                    'the plan needs (extra: %s); not a divergence, no '
+                    'escalation. plan modules=%s, metadata modules=%s',
+                    self.task_id, sorted(metadata_modules),
+                    sorted(metadata_modules - plan_modules),
+                    sorted(plan_modules), sorted(metadata_modules),
+                )
             return
         logger.warning(
-            'Task %s: plan.files/metadata.files LOCK-MODULE divergence detected '
-            'at MERGE entry — plan modules=%s (files=%s), metadata modules=%s '
-            '(files=%s)',
-            self.task_id, sorted(plan_modules), sorted(plan_files),
-            sorted(metadata_modules), sorted(metadata_files),
+            'Task %s: plan.files needs lock module(s) %s that metadata.files '
+            'does NOT cover, at MERGE entry — plan modules=%s (files=%s), '
+            'metadata modules=%s (files=%s)',
+            self.task_id, sorted(uncovered), sorted(plan_modules),
+            sorted(plan_files), sorted(metadata_modules), sorted(metadata_files),
         )
         self._escalate_scope_invariant_violation(
-            sorted(plan_files), sorted(metadata_files),
+            sorted(plan_files), sorted(metadata_files), sorted(uncovered),
         )
 
     def _escalate_scope_invariant_violation(
         self, plan_files: list[str], metadata_files: list[str],
+        uncovered_modules: list[str],
     ) -> None:
-        """Submit an ``infra_issue`` escalation for a plan.files/metadata.files
-        divergence caught by :meth:`_check_scope_invariant` (task 2505).
-        Mirrors :meth:`_escalate_plan_overwrite`'s submission shape.
+        """Submit an ``infra_issue`` escalation for the UNSAFE-direction
+        plan.files/metadata.files divergence caught by
+        :meth:`_check_scope_invariant` (task 2505; narrowed to this one
+        direction by task 3429) — either the plan needs a lock module that
+        metadata.files does not cover, or plan.files itself is empty/fully
+        alpha-stripped and thus unverifiable as a safe metadata.files
+        superset (review amendment, task 3429). Mirrors
+        :meth:`_escalate_plan_overwrite`'s submission shape.
+
+        The ``summary`` string is load-bearing: ``harness._is_scope_divergence_orphan``
+        discriminates this entire escalation class on the substring
+        ``'plan.files/metadata.files divergence detected'``. Keep it verbatim;
+        only ``detail`` is free to evolve.
         """
         summary = (
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
         )
-        detail = (
-            f'plan.files={plan_files} but metadata.files={metadata_files} — '
-            f'these derive DIFFERENT lock-module sets at lock_depth='
-            f'{self.config.lock_depth} (a benign same-module file delta does '
-            f'NOT reach here). The scope-reconciliation choke point '
-            f'(_reconcile_scope_locks/_set_task_scope) should keep the module '
-            f'sets in lockstep on every path that changes either.'
-        )
+        if plan_files:
+            detail = (
+                f'plan.files={plan_files} but metadata.files={metadata_files}. At '
+                f'lock_depth={self.config.lock_depth} the plan needs lock '
+                f'module(s) {uncovered_modules} that metadata.files does NOT '
+                f'cover. metadata.files is the only input the scheduler derives '
+                f"this task's file locks from, so this task is about to merge "
+                f'edits to module(s) it holds no lock on. Only this direction '
+                f'escalates (task 3429): a metadata.files module SUPERSET is '
+                f'benign — a wider lock cannot let two tasks collide, only '
+                f'over-serialise — and is logged at INFO with no escalation. A '
+                f'same-module file-level delta does not reach here at all.'
+            )
+        else:
+            detail = (
+                f'plan.files is EMPTY at MERGE entry (metadata.files='
+                f'{metadata_files}). A plan with no lock modules cannot be '
+                f'verified as a safe metadata.files superset — containment is '
+                f'vacuously true for an empty plan regardless of what '
+                f'metadata.files holds, so this looks identical to a '
+                f'lost/never-populated plan.files (or one whose entries were '
+                f'all directory-shaped and stripped by '
+                f'sanitize_files_for_persist). Escalating rather than '
+                f'silently treating this as benign (task 3429 amendment).'
+            )
         logger.error(f'Task {self.task_id}: {summary}')
 
         if not self.escalation_queue:

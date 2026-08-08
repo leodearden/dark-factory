@@ -74,6 +74,11 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+docstring-code-format = true

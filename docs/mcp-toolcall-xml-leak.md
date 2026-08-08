@@ -224,6 +224,36 @@ python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive
 > The db file itself is mode `0644`, uid 1000, `W_OK=True` — this is an
 > environment property, not a filesystem permissions defect, and not a sweep
 > defect. Run `--apply` from an ordinary interactive shell.
+>
+> **This is now MACHINE-ENFORCED, not left to memory** (task 3686). Before it
+> scans anything, an `--apply` run probes whether this process can actually
+> create a file in mem0's history directory
+> (`fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed`).
+> If it cannot, the run refuses to start: nothing is scanned, nothing is
+> mutated, and the refusal surfaces as `aborted: true` and exit 2. A dry run is
+> deliberately **not** gated — it mutates nothing, so the classification report
+> stays obtainable from anywhere.
+>
+> The general policy the guard encodes:
+>
+> > **Mutating memory operations go through the fused-memory MCP server — the
+> > single, unsandboxed owner of the store. An in-sandbox script must never
+> > mutate the shared store directly.**
+>
+> That works because `.mcp.json` declares fused-memory as a separate HTTP
+> process (`http://127.0.0.1:8002/mcp`), so an MCP write executes outside the
+> calling agent's landlock. Note the asymmetry that caused this incident is
+> unfixable by sandbox configuration: landlock governs the **filesystem only**
+> and can never block the Qdrant network delete, so no write-set widening could
+> have made the two-phase mutation atomic. Adding `~/.mem0` to the sandbox
+> write-set was considered and declined for that reason among others — see
+> `docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md` §"Decision (2)".
+>
+> **The one record lost to this has been recovered** (task 3686). `7d073281` was
+> re-added via the MCP `add_memory` tool and lives under a new id; see
+> `docs/toolcall-xml-leak-sweep-2026-08-05/recovery-tracking.json` for that id
+> and how the write was verified. Do **not** re-run the sweep to recover a
+> record — that is what the rest of this runbook warns against.
 
 `--apply` exits **non-zero** if it left any `manual_review` record behind, so
 a partial sweep can never be mistaken for a complete one, and likewise if the

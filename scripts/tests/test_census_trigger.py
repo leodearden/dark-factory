@@ -592,8 +592,16 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 
     fetcher = ct.default_status_fetcher(tmp_path)
 
-    with pytest.raises(ct.StatusFetchUnavailable):
+    # match + __cause__ pin the network-failure branch specifically --
+    # StatusFetchUnavailable also wraps an absent httpx (ImportError), a
+    # non-2xx response, and an _extract_tool_result parse failure, so
+    # asserting only the exception type would still pass if the fake ever
+    # stopped exercising the network path. The fake above raises OSError
+    # (not the narrower ConnectionError -- OSError is what a real errno-111
+    # connection refusal actually is), so pin __cause__ to that.
+    with pytest.raises(ct.StatusFetchUnavailable, match="unreachable at") as excinfo:
         fetcher()
+    assert isinstance(excinfo.value.__cause__, OSError)
 
 
 class _FakeHttpxResponse:

@@ -130,16 +130,24 @@ class DashboardConfig:
     port: int = 8080
     # Derived from cwd, never a hardcoded absolute path (task 3503): a literal
     # silently pointed every un-configured consumer on every other host at one
-    # developer's checkout.
+    # developer's checkout.  That reason still stands, and this default stays.
     #
-    # Production behaviour is UNCHANGED because of a two-sided contract, and the
-    # units are the load-bearing half: both dashboard/dark-factory-dashboard.service
-    # and scripts/dashboard.service.template pin WorkingDirectory to the repo root
-    # and neither sets DASHBOARD_PROJECT_ROOT, so cwd resolves to exactly what the
-    # literal returned.  A future edit that drops or changes WorkingDirectory
-    # therefore silently relocates every derived DB path (burndown, metrics, runs,
-    # escalations, memory-evals) — from_env() logs the cwd-derived root at INFO so
-    # that relocation is at least visible in the journal.
+    # The canonical deployment no longer RELIES on it, though: both
+    # dashboard/dark-factory-dashboard.service and scripts/dashboard.service.template
+    # now set Environment=DASHBOARD_PROJECT_ROOT=<repo root> explicitly (task 3572),
+    # so from_env() takes the env branch there and the data root is DECLARED rather
+    # than inferred from those units' WorkingDirectory= pinning.  Why, and what
+    # keeps the two in step, is recorded once — on that Environment= line in the
+    # units, and on UnitSpec.env_matches_directive in
+    # scripts/check_dashboard_unit_parity.py.
+    #
+    # This fallback is what still applies to NON-systemd invocations — a bare
+    # `python -m dashboard` from a checkout, a test, a container without the unit —
+    # and what would apply again if that Environment= line were ever dropped.
+    # WorkingDirectory= is retained too and load-bearing in its own right (ExecStart's
+    # relative `--project dashboard` resolves against the cwd systemd sets from it);
+    # it is pinned by tests/scripts/test_dashboard_service_template.py::
+    # test_working_directory_is_pinned_in_both_unit_files.
     project_root: Path = field(default_factory=Path.cwd)
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
@@ -257,12 +265,17 @@ class DashboardConfig:
         CONSTRUCTED config, so the journal always names the root the databases
         actually hang off — instead of being an invisible default.
 
-        INFO and not WARNING, deliberately: the canonical deployment relies on
-        the cwd path BY DESIGN — the systemd units pin ``WorkingDirectory`` on
-        purpose — so a WARNING would be crying wolf on the supported
-        configuration, unlike the ``_discover_escalation_urls`` WARNINGs in this
-        same module, which flag genuinely degraded states.  INFO still surfaces
-        the root in ``journalctl`` at uvicorn's default log level.
+        Since task 3572 the canonical deployment SETS the variable, so this line
+        no longer fires there at all; when it does fire it marks a genuinely
+        un-configured invocation — a bare ``python -m dashboard`` from a
+        checkout, a test, a container without the unit.
+
+        The level stays INFO all the same, and that is a considered choice
+        rather than an oversight: changing it is outside task 3572's scope, and
+        an un-configured invocation is a normal, supported way to run the
+        dashboard, not a degraded state like the ``_discover_escalation_urls``
+        WARNINGs in this same module.  INFO still surfaces the root in
+        ``journalctl`` at uvicorn's default log level.
 
         ``from_env()`` is called once per process (app.py's ``lifespan``,
         ``__main__.py``), so this is one line per process lifetime — never per

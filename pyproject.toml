@@ -27,6 +27,7 @@ extraPaths = [
     # test_root_pyright_extrapaths_resolves_scripts_imports (task 3456).
     "scripts",
     "scripts/legibility",
+    "scripts/local-model-serving",
     "cockpit/src",
     "dashboard/src",
     "escalation/src",

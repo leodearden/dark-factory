@@ -30,6 +30,7 @@ from shared.memory_eval_metrics import (
     report_artifact_path,
     run_stamp,
     validate_metric_series,
+    validate_stamp,
     write_metric_series,
 )
 
@@ -640,6 +641,25 @@ class TestStampShapeIsEnforcedNotAssumed:
         """
         with pytest.raises(MetricSchemaError):
             validate_metric_series(_make_series(run_stamp='٢٠٢٦٠٧٠٤T٠٣١٥٠٠Z'))
+
+    def test_the_public_checker_returns_the_stamp_it_accepted(self):
+        """Pinned directly, because it is exported and called cross-package.
+
+        Every other assertion here reaches ``validate_stamp`` through a caller
+        that discards its return value, so all of them would still pass if it
+        started returning ``None`` or a normalized copy — and a cross-package
+        caller that uses it as a pass-through (``path = validate_stamp(s, ...)``)
+        would break silently. The contract is: the input object, unchanged.
+        """
+        stamp = '20260704T031500Z'
+        assert validate_stamp(stamp, what='a stamp') == stamp
+
+    def test_the_what_label_reaches_the_message(self):
+        # The whole point of a caller-supplied `what=`: the raiser names WHICH
+        # stamp was bad, so an out-of-module caller's failure is actionable
+        # without a traceback into this module.
+        with pytest.raises(MetricSchemaError, match='my-label'):
+            validate_stamp('2026-07-04T03:15:00Z', what='my-label')
 
     def test_a_well_formed_stamp_still_passes_everywhere(self, tmp_path):
         # The guard must not be so tight that the real thing fails: one stamp

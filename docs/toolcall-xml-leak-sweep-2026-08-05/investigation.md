@@ -323,34 +323,98 @@ not of the sweep — which behaved correctly throughout: it recorded the error o
 the record, kept going rather than discarding the report, and refused all 40
 `manual_review` records.
 
+This is now **machine-enforced rather than remembered** (task 3686): `--apply`
+runs a fail-closed capability preflight before it scans anything, and refuses to
+start where mem0's history directory cannot be written. See decision (2) below.
+
 ### Recovery
 
-The content is not lost, because it was committed first. To restore
-`7d073281`, re-add the 415-char `repaired_content` from `dry-run-report.json`
-(the clean, leak-free text) **from a non-sandboxed session**. Note the memory
-id will necessarily differ. Per the runbook, do **not** re-run the sweep to
-recover it.
+The content was not lost, because it was committed first. `7d073281` has since
+been **recovered** (task 3686): the 415-char `repaired_content` from
+`dry-run-report.json` — the clean, leak-free text — was re-added and now lives
+under the new id `184723b4-5f5d-4464-ba34-3818f303a768`. A re-add necessarily
+mints a new id, so the old one stays absent by design.
+`recovery-tracking.json` is the machine-checked record of that pairing. Per the
+runbook, the sweep was **not** re-run to recover it.
 
-**Not yet done — tracked as task 3686.** It was left for a human deliberately —
-re-adding text to the shared corpus mints a new id and is a mutation whose
-authorisation is not this task's to assume — and the escalation that asked for
-that decision (`esc-3567-2`) was auto-dismissed on timeout rather than answered,
-which is why the ask was converted into a task rather than left as prose. Task
-3686 carries both open decisions together, because they share a root cause and
-whoever performs the re-add must already have settled the second one — a
-recovery attempted from a still-sandboxed session fails identically:
+**DONE — task 3686.** Both decisions this task carried are now closed. They were
+carried together because they share a root cause and whoever performs the re-add
+must already have settled the second one — a recovery attempted from a
+still-sandboxed session fails identically:
 
 1. the recovery above; and
 2. whether `--apply`-class operations should be blocked from sandboxed sessions
    outright, or the sandbox permit file creation under `~/.mem0`.
 
-Until one lands, no agent session should run this sweep — or any
-`delete_memory` — with `--apply`.
+#### Decision (1) — the recovery: done
 
-When the re-add happens, flip `recovered` to `true` in `recovery-tracking.json`
-and record the new memory id there. The artifact test asserts that pairing
-(`recovered: false` forbids a `new_id`; `true` requires one), so the tracker
-cannot drift out of step with the store.
+The 415-char `repaired_content` was re-added and now lives under
+`184723b4-5f5d-4464-ba34-3818f303a768`; `recovery-tracking.json` carries the new
+id, the mechanism, the timestamp and how the write was verified. The re-add went
+through the **MCP tool** `mcp__fused-memory__add_memory`, not an in-process
+script — see the topology note below for why that works from a sandboxed
+session when a script does not. It was verified three ways before `recovered`
+was flipped, because `MemoryService.add_memory` swallows a mem0 backend failure
+into `message` as `[mem0_error: ...]` and returns normally: the sweep's own
+`readd_persisted` predicate, an independent `get_memory_by_id`, and a re-hash of
+the STORED text against the pinned digest (byte-identical), plus the production
+detector confirming it leak-free.
+
+#### Decision (2) — the sandbox policy: fail-closed preflight
+
+**Chosen: hard-block mutating in-process store operations behind a capability
+preflight. Widening the sandbox write-set to include `~/.mem0` was considered
+and DECLINED.** The policy in one line:
+
+> Mutating memory operations go through the fused-memory MCP server — the
+> single, unsandboxed owner of the store. An in-sandbox script must never
+> mutate the shared store directly.
+
+This is enforced by `fused_memory.utils.store_mutation_preflight`, which
+`--apply` now calls before it scans anything: it probes whether this process can
+actually create a file in mem0's history directory, and refuses the run if it
+cannot. It probes real capability rather than inferring "am I sandboxed?" from a
+role or env var, because a process cannot reliably introspect its own
+confinement — and because `os.access(W_OK)` is provably insufficient here: in
+the measured failure it returned `True` on a directory that still refused file
+creation.
+
+Four reasons the write-set widening was declined:
+
+- **(i) Blast radius.** `~/.mem0` holds shared production state. The write-set
+  is code-derived in a frozen `WriteSet` consumed by every sandboxed
+  `implementer`/`debugger`/`simple_task` invocation, so granting it would hand
+  *every* task agent write access to the shared history db — inverting the
+  sandbox PRD's worktree-containment goal to fix one script, and churning
+  `WriteSet.digest()`, the operator-diffable identity emitted on every
+  `sandbox_applied` event.
+- **(ii) Insufficiency.** Landlock governs the **filesystem only**. The Qdrant
+  delete is a network call to `localhost:6333` that it can never block, so no
+  write-set change can make the two-phase mutation atomic. Widening lowers the
+  *probability* of a split mutation; only refusing to start bounds its *blast
+  radius*.
+- **(iii) Ownership.** The generic carve-out pre-creation problem is already
+  owned by pending **task 3419**, whose `metadata.files` overlap
+  `write_set.py` / `landlock_exec.py` / `test_write_set.py` exactly. A narrow
+  `.mem0` duplicate here would collide with it.
+- **(iv) Inertness.** `sandbox.*` is not in `RELOADABLE_FIELDS`, so a
+  config-shaped fix would not take effect until a fleet restart.
+
+#### The topology that makes the policy workable
+
+The fused-memory MCP server is a **separate, unsandboxed HTTP process** —
+`.mcp.json` declares it as `{"type": "http", "url": "http://127.0.0.1:8002/mcp"}`.
+A mutation routed through an MCP tool therefore executes in *that* process,
+entirely outside the calling agent's landlock. This is why memory operations
+routed through MCP are unaffected by agent sandboxing, and why the recovery
+above was executable from a sandboxed session while the original in-process
+script write was not. It is also why the policy costs nothing operationally: the
+supported path already works everywhere.
+
+The agent tool surface was already fail-closed in the other direction — `roles.py`
+grants no workflow role `delete_memory` or `update_memory`. The remaining hole
+was in-sandbox *scripts* constructing their own `MemoryService`, which is exactly
+where the preflight is wired.
 
 ---
 
