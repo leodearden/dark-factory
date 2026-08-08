@@ -3353,7 +3353,24 @@ def _boundary_run_drain_script(
     bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=20
 ):
     """Run the REAL restart-all-orchestrators.sh --drain with the fake
-    systemctl prepended onto PATH."""
+    systemctl prepended onto PATH.
+
+    The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
+    plain subprocess.run: subprocess.run's timeout kill()s the direct child
+    only, and this script forks poll loops that outlived it by up to 27.8h,
+    reparented to systemd --user. `_boundary_decode` below still applies -- the
+    re-raised TimeoutExpired carries the partial output the timeout tests
+    assert on.
+
+    That helper is now the SINGLE spawn implementation shared with
+    scripts/tests/test_restart_all_orchestrators.py::_run_script. These two
+    directories cannot import each other's test modules, so their duplicated
+    harnesses have historically had to be policed by hand (task 3336's three
+    collapsed tasks.db fixtures; test_boundary_fake_systemctl_matches_unit_
+    suite_verbatim, which exists solely to cross-check the two fake systemctls).
+    For the spawn path specifically, the "which of the two copies did I fix"
+    hazard can no longer recur -- there is only one copy.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
@@ -3361,11 +3378,9 @@ def _boundary_run_drain_script(
     full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
     if env:
         full_env.update(env)
-    return subprocess.run(
+    return run_in_new_session(
         ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
         env=full_env,
-        capture_output=True,
-        text=True,
         timeout=timeout,
     )
 
