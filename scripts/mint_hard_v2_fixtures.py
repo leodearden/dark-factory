@@ -148,6 +148,90 @@ DONE_DESPITE_UNACTIONABLE: tuple[tuple[str, str], ...] = (
     ('reify', '2573'), ('reify', '3095'), ('reify', '4370'),
 )
 
+# ---------------------------------------------------------------------------
+# The continuity back-fill
+# ---------------------------------------------------------------------------
+#
+# Three fixtures from the STANDING corpus are re-banded into the v2 cohort so
+# the v2 campaign overlaps v1's population. They are NOT census candidates —
+# they are carried across verbatim from their canonical fixture and their
+# lineage is machine-checked against it, so the v2 record can never become a
+# divergent re-authoring of the same id.
+CONTINUITY_SOURCE_DIR = 'orchestrator/src/orchestrator/evals/tasks'
+
+CONTINUITY_FIXTURES: tuple[dict, ...] = (
+    {
+        'id': 'reify_task_12',
+        'source_path': f'{CONTINUITY_SOURCE_DIR}/reify_task_12.json',
+        'reason': (
+            'The v1 trial graded plan_quality against a valid reference on '
+            'exactly ONE fixture, so its plan-quality signal rested on n=1. '
+            'Re-banding this fixture into the v2 cohort under a reference '
+            'captured from its own committed pre/post SHAs is what closes '
+            'that confound.'
+        ),
+    },
+    {
+        'id': 'reify_task_27',
+        'source_path': f'{CONTINUITY_SOURCE_DIR}/reify_task_27.json',
+        'reason': (
+            'Second reify continuity anchor: a high-complexity task from the '
+            'same repo as the v1 n=1 fixture, so a v1-to-v2 delta on reify is '
+            'not read off a single record.'
+        ),
+    },
+    {
+        'id': 'df_task_18',
+        'source_path': f'{CONTINUITY_SOURCE_DIR}/df_task_18.json',
+        'reason': (
+            'The dark-factory continuity anchor, so the overlap with v1 spans '
+            'both repos rather than reify alone.'
+        ),
+    },
+)
+
+CONTINUITY_RATIONALE = (
+    'These three fixtures are back-filled from the standing corpus so the v2 '
+    'campaign shares part of its population with v1 and the two are '
+    'comparable rather than merely adjacent. The v1 trial could grade '
+    'plan_quality against a valid reference on only one fixture; re-banding '
+    'these under references captured from their own committed pre/post SHAs '
+    'closes that n=1 confound. Each record is built from the canonical '
+    'fixture under evals/tasks/ — same pre_task_commit, same '
+    'post_task_commit, same task_definition, same verify_commands — and the '
+    'equality is asserted by test, so "reference by copy, do not duplicate '
+    'content divergently" is machine-checked rather than conventional. '
+    'Capturing the reference here (rather than copying a post-iota-2 fixture) '
+    'is the same capture_reference call iota-2 makes for the standing corpus, '
+    'so beta-1 is self-contained and creates no cross-task coupling.'
+)
+
+# A continuity fixture's baseline is INHERITED, not ladder-resolved: it comes
+# from a fixture whose pre/post predate the ladder, and df_task_18's
+# pre_task_commit is not its post's first parent, so stamping
+# `merge_first_parent` would be a false provenance. Distinct rung name, so the
+# weaker/other provenance stays visible instead of masquerading.
+CONTINUITY_BASELINE_SOURCE = 'standing_fixture_inherited'
+
+
+# The source dbs are LIVE: the three orchestrators keep running, so new
+# architect exhaustions keep landing in `events` and the census count grows
+# over time. That is expected and does NOT invalidate the pool — the manifest
+# pins the exact recorded task_ids, so the curated 41 stay reproducible as
+# long as none of them DISAPPEAR. Only a missing recorded id means the pool
+# can no longer be re-derived.
+CENSUS_DRIFT_GUIDANCE = (
+    'The source dbs are live, so purely ADDITIVE drift (new exhaustions since '
+    'the recorded census_date) is expected and harmless: the manifest pins the '
+    'exact recorded task_ids and the curated pool is a dated snapshot, not a '
+    'standing query. Refusing to re-author, which would silently pull '
+    'uncurated candidates into the pool. Compare the live ids against '
+    'census.task_ids in _meta/curation.json: if every recorded id is still '
+    'present, the pool is intact and this exit is informational. If a recorded '
+    'id is MISSING, the pool genuinely can no longer be re-derived from these '
+    'dbs — investigate before touching the manifest.'
+)
+
 
 class BaselineUnresolved(RuntimeError):
     """No rung of the baseline ladder produced a commit.
@@ -459,8 +543,7 @@ def run_census(strict: bool = True) -> int:
 
     if strict and counts != EXPECTED_CENSUS_COUNTS:
         print(f'\nCENSUS DRIFT: got {counts}, expected {EXPECTED_CENSUS_COUNTS}. '
-              f'The recorded pool is no longer reproducible from these dbs; '
-              f'refusing to silently re-scope it.', file=sys.stderr)
+              f'{CENSUS_DRIFT_GUIDANCE}', file=sys.stderr)
         return 1
     return 0
 
@@ -633,7 +716,8 @@ def author_manifest(census_date: str) -> dict:
         raise RuntimeError(
             f'author_manifest: census drift — got {counts}, expected '
             f'{EXPECTED_CENSUS_COUNTS}. Refusing to author a manifest whose '
-            f'pool silently differs from the recorded one.'
+            f'pool silently differs from the recorded one. '
+            f'{CENSUS_DRIFT_GUIDANCE}'
         )
 
     rows = [_candidate_row(c) for cands in per_project.values() for c in cands]
@@ -660,6 +744,7 @@ def author_manifest(census_date: str) -> dict:
             'counts': counts,
             'task_ids': {p: [c.task_id for c in cands]
                          for p, cands in per_project.items()},
+            'reproducibility_note': CENSUS_DRIFT_GUIDANCE,
         },
         'curation_criterion': (
             "Exclude a candidate when its brief fails to state an "
@@ -688,6 +773,11 @@ def author_manifest(census_date: str) -> dict:
             ),
         },
         'ceilings': _build_ceilings(),
+        'continuity': {
+            'rationale': CONTINUITY_RATIONALE,
+            'baseline_source': CONTINUITY_BASELINE_SOURCE,
+            'fixtures': [dict(entry) for entry in CONTINUITY_FIXTURES],
+        },
         'candidates': rows,
     }
 
@@ -750,6 +840,8 @@ def render_curation_md(manifest: dict) -> str:
     for project, n in census['counts'].items():
         add(f'| {project} | {n} |')
     add(f'| **total** | **{sum(census["counts"].values())}** |')
+    add('')
+    add(f'**Reproducibility**: {census["reproducibility_note"]}')
     add('')
 
     add('## Curation criterion')
@@ -816,6 +908,27 @@ def render_curation_md(manifest: dict) -> str:
         'key and recording why makes it a positive, auditable fact.')
     add('')
 
+    continuity = manifest['continuity']
+    add('## Continuity back-fill')
+    add('')
+    add(continuity['rationale'])
+    add('')
+    add('| fixture | source | why |')
+    add('|---|---|---|')
+    for entry in continuity['fixtures']:
+        add(f'| `{_md_cell(entry["id"])}` '
+            f'| `{_md_cell(entry["source_path"])}` '
+            f'| {_md_cell(entry["reason"])} |')
+    add('')
+    add(f'These carry `provenance.baseline_source: '
+        f'{continuity["baseline_source"]}` rather than a ladder rung — their '
+        f'baseline is inherited from the canonical fixture, not resolved '
+        f'here, and `df_task_18`\'s `pre_task_commit` is not its post '
+        f'commit\'s first parent, so claiming `merge_first_parent` would be a '
+        f'false provenance. They are the ONLY fixtures whose ids overlap the '
+        f'standing corpus, and that overlap is pinned by test.')
+    add('')
+
     return '\n'.join(out) + '\n'
 
 
@@ -848,6 +961,21 @@ def _is_ancestor_of_main(repo_root: Path | str, commit: str) -> bool:
     return proc.returncode == 0
 
 
+def _refs_pointing_at(repo_root: Path | str, commit: str) -> list[str]:
+    """Return every ref that points at *commit* (empty if none do).
+
+    The second half of the retrievability question. Ancestry of ``main`` is not
+    the only thing that holds a commit off the GC path — an existing
+    ``evals/<id>`` branch (exactly what ``pin_eval_branch`` would have created)
+    does too. A task-branch tip that was squashed or rebased onto main is NOT
+    an ancestor of main yet is still perfectly safe if a ref holds it, so
+    reporting GC-eligibility from ancestry alone would raise a false alarm.
+    """
+    out = _git(['for-each-ref', '--points-at', commit, '--format=%(refname)'],
+               repo_root)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def _import_sampler():
     """Import ``task_sampler`` from this repo's orchestrator package."""
     src = REPO_ROOT / 'orchestrator' / 'src'
@@ -855,6 +983,159 @@ def _import_sampler():
         sys.path.insert(0, str(src))
     from orchestrator.evals import task_sampler
     return task_sampler
+
+
+async def _pin_or_record_failure(
+    sampler, record: dict, project_root: str, post: str,
+) -> None:
+    """Pin ``evals/<id>`` at *post*, recording the failure rather than raising.
+
+    The pin is a stability guarantee (it keeps *post* off the GC path), not a
+    correctness precondition — the reference block already carries the SHA. So
+    a read-only checkout degrades to a RECORDED failure rather than making the
+    whole pool un-mintable. ``pin_eval_branch`` uses ``update-ref``, so
+    re-pinning an already-pinned branch at the same SHA is a no-op.
+    """
+    try:
+        await sampler.pin_eval_branch(project_root, record['id'], post)
+        record['provenance']['eval_branch_pinned'] = True
+    except (RuntimeError, OSError) as exc:
+        record['provenance']['eval_branch_pinned'] = False
+        record['provenance']['eval_branch_pin_error'] = (
+            f'pin_eval_branch(evals/{record["id"]}) failed: {exc}'
+        )
+
+        # Retrievability has TWO independent guarantors: reachability from
+        # main, or any ref pointing at the commit. Reporting from ancestry
+        # alone would cry wolf on a task-branch tip that an `evals/<id>`
+        # branch already holds — and a field that raises false alarms stops
+        # being read.
+        preamble = (
+            'The reference block carries the post SHA directly and '
+            'materialize_reference_diff works off the pre/post SHAs, not the '
+            'branch; the pin only holds the commit off the GC path. '
+        )
+        if _is_ancestor_of_main(project_root, post):
+            impact = (
+                f'None for retrievability. {preamble}post_task_commit IS an '
+                f'ancestor of main in this checkout, so it is reachable and '
+                f'not GC-eligible regardless. Re-run --mint from a checkout '
+                f'with write access to restore the belt-and-braces ref.'
+            )
+        elif (holders := _refs_pointing_at(project_root, post)):
+            impact = (
+                f'None for retrievability. {preamble}post_task_commit is NOT '
+                f'an ancestor of main (it is a task-branch tip, not a merge '
+                f'commit), but it is already held by {len(holders)} ref(s) — '
+                f'{", ".join(holders)} — so it is not GC-eligible. The '
+                f'intended evals/{record["id"]} pin is among them, i.e. the '
+                f'pin this run could not write already exists at this exact '
+                f'SHA and the update-ref would have been a no-op.'
+            )
+        else:
+            impact = (
+                f'ACTION NEEDED. {preamble}post_task_commit is NOT an '
+                f'ancestor of main in this checkout and NO ref points at it, '
+                f'so it is GC-eligible and the reference diff can be lost. '
+                f'Re-pin from a checkout with write access before relying '
+                f'on it.'
+            )
+        record['provenance']['eval_branch_pin_impact'] = impact
+        print(f'  WARNING: could not pin evals/{record["id"]}: {exc}',
+              file=sys.stderr)
+
+
+async def _mint_continuity_one(sampler, entry: dict, sampled_at: str, seed: int,
+                               ceilings: dict) -> dict:
+    """Re-band one STANDING fixture into the v2 cohort.
+
+    Built from the canonical fixture's OWN committed ``pre_task_commit`` /
+    ``post_task_commit`` via ``capture_reference`` — the same call ι2 makes for
+    the standing corpus — so β1 gets a valid reference block immediately with
+    no dependency on a sibling task landing. Everything that identifies the
+    task (``task_definition``, ``project``, ``project_root``,
+    ``verify_commands``, ``modules``, ``complexity``, the frozen ``plan``) is
+    carried across verbatim; only the v2 banding (cohort, ceilings,
+    provenance) is added. Nothing is written back to ``evals/tasks/``.
+    """
+    source_path = REPO_ROOT / entry['source_path']
+    src = json.loads(source_path.read_text())
+
+    task_id = src['id'].split('_task_', 1)[1]
+    cand = sampler.CompletedTaskCandidate(
+        task_id=task_id,
+        project=src['project'],
+        project_root=src['project_root'],
+        title=src['task_definition']['title'],
+        description=src['task_definition']['description'],
+        complexity=src.get('complexity'),
+        modules=list(src.get('modules') or []),
+        pre_commit=src['pre_task_commit'],
+        post_commit=src['post_task_commit'],
+        # The standing fixtures predate provenance capture and record no merge
+        # commit, so there is none to carry. Recorded as None below.
+        merge_sha='',
+    )
+
+    reference = await sampler.capture_reference(
+        cand.project_root, cand.pre_commit, cand.post_commit,
+    )
+    if reference.files <= 0:
+        # A reference-less continuity fixture would defeat the entire point of
+        # the back-fill (closing v1's n=1 plan_quality confound), so an empty
+        # capture is a hard stop, not a shrug.
+        raise RuntimeError(
+            f'_mint_continuity_one: capture_reference over '
+            f'{cand.pre_commit}..{cand.post_commit} in {cand.project_root} '
+            f'produced an EMPTY diff for {src["id"]}. The continuity fixture '
+            f'exists to carry a valid reference; refusing to mint one that '
+            f'cannot be graded against it.'
+        )
+
+    record = sampler.build_fixture_record(
+        cand, reference, src['verify_commands'], plan=src.get('plan'),
+        cohort='fable-trial-v2-hard', sampled_at=sampled_at, seed=seed,
+        plan_source='standing_fixture',
+    )
+
+    # The id and name are DERIVED by build_fixture_record; a mismatch would
+    # mean the v2 record is not the same fixture, which is the exact
+    # divergence the continuity contract forbids.
+    if record['id'] != src['id'] or record['name'] != src['name']:
+        raise RuntimeError(
+            f'_mint_continuity_one: derived id/name '
+            f'({record["id"]!r}/{record["name"]!r}) does not match the source '
+            f'({src["id"]!r}/{src["name"]!r}) — refusing to mint a divergent '
+            f'copy under a continuity id.'
+        )
+
+    record['provenance']['merge_sha'] = None
+    record['provenance']['derived_from'] = entry['source_path']
+    record['provenance']['baseline_source'] = CONTINUITY_BASELINE_SOURCE
+    record['provenance']['continuity_note'] = (
+        f'Re-banded from the standing corpus, not censused. '
+        f'pre_task_commit / post_task_commit / task_definition are carried '
+        f'verbatim from {entry["source_path"]} and asserted equal by test; '
+        f'the reference block was captured here from those same SHAs. The '
+        f'baseline is INHERITED, not ladder-resolved.'
+    )
+
+    # Carry across any key the canonical fixture carries that the record
+    # schema does not produce — `setup_commands` and `max_review_cycles` are
+    # both read by the runner (setup_commands inside run_architect_eval's own
+    # worktree creation), so dropping them would silently change how the
+    # fixture runs in the very campaign this pool feeds.
+    for key, value in src.items():
+        if key not in record:
+            record[key] = value
+
+    await _pin_or_record_failure(
+        sampler, record, cand.project_root, cand.post_commit,
+    )
+
+    record['max_architect_turns'] = ceilings['max_architect_turns']
+    record['timeout_minutes'] = ceilings['timeout_minutes']
+    return record
 
 
 async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
@@ -894,37 +1175,9 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
     record['provenance']['baseline_source'] = row['baseline_source']
 
     if row['mint_mode'] == 'referenced':
-        # The pin is a stability guarantee (it keeps `post` off the GC path),
-        # not a correctness precondition — the reference block already carries
-        # the SHA. So a read-only checkout degrades to a RECORDED failure
-        # rather than making the whole pool un-mintable.
-        try:
-            await sampler.pin_eval_branch(
-                cand.project_root, record['id'], cand.post_commit,
-            )
-            record['provenance']['eval_branch_pinned'] = True
-        except (RuntimeError, OSError) as exc:
-            reachable = _is_ancestor_of_main(cand.project_root, cand.post_commit)
-            record['provenance']['eval_branch_pinned'] = False
-            record['provenance']['eval_branch_pin_error'] = (
-                f'pin_eval_branch(evals/{record["id"]}) failed: {exc}'
-            )
-            record['provenance']['eval_branch_pin_impact'] = (
-                'None for retrievability. The reference block carries the post '
-                'SHA directly and materialize_reference_diff works off the '
-                'pre/post SHAs, not the branch; the pin only holds the commit '
-                'off the GC path. post_task_commit IS an ancestor of main in '
-                'this checkout, so it is reachable and not GC-eligible '
-                'regardless. Re-run --mint from a checkout with write access '
-                'to restore the belt-and-braces ref.'
-                if reachable else
-                'The reference block still carries the post SHA, but the '
-                'commit is NOT reachable from main in this checkout and is '
-                'not held by a ref — it is GC-eligible. Re-pin from a '
-                'checkout with write access before relying on it.'
-            )
-            print(f'  WARNING: could not pin evals/{record["id"]}: {exc}',
-                  file=sys.stderr)
+        await _pin_or_record_failure(
+            sampler, record, cand.project_root, cand.post_commit,
+        )
     else:
         # Omit the key entirely and record WHY. An empty `reference: {}` block
         # is indistinguishable from a capture that silently failed, which is
@@ -983,6 +1236,18 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
         written += 1
         print(f'  wrote {record["id"]}.json ({row["mint_mode"]}, '
               f'baseline={row["baseline_source"]})')
+
+    for entry in manifest['continuity']['fixtures']:
+        record = await _mint_continuity_one(
+            sampler, entry, sampled_at, seed, ceilings,
+        )
+        (POOL_DIR / f'{record["id"]}.json').write_text(
+            json.dumps(record, indent=2) + '\n',
+        )
+        written += 1
+        print(f'  wrote {record["id"]}.json (continuity, from '
+              f'{entry["source_path"]})')
+
     print(f'wrote {written} fixture(s) to {POOL_DIR}')
     return 0
 

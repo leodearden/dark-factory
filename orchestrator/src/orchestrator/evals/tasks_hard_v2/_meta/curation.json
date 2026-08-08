@@ -61,7 +61,8 @@
       "know_live": [
         "543"
       ]
-    }
+    },
+    "reproducibility_note": "The source dbs are live, so purely ADDITIVE drift (new exhaustions since the recorded census_date) is expected and harmless: the manifest pins the exact recorded task_ids and the curated pool is a dated snapshot, not a standing query. Refusing to re-author, which would silently pull uncurated candidates into the pool. Compare the live ids against census.task_ids in _meta/curation.json: if every recorded id is still present, the pool is intact and this exit is informational. If a recorded id is MISSING, the pool genuinely can no longer be re-derived from these dbs \u2014 investigate before touching the manifest."
   },
   "curation_criterion": "Exclude a candidate when its brief fails to state an implementable goal. Never a length threshold: brief_chars is recorded per row as evidence for the judgement, not as the rule.",
   "adversarial_scan": "No candidate in the census is an adversarial/red-team fixture \u2014 all 41 are real product tasks from the three checkouts' task trees. The PRD's skip-adversarial rule therefore excludes nothing here; the scan is recorded so its emptiness is a finding rather than an omission.",
@@ -86,6 +87,27 @@
       "headroom": "180 min is 6.4x the observed max-at-exhaustion (28.1 min, n=46) and 1.7x the all-time architect max (106.3 min), so the timeout provably cannot bind before the 120-turn or budget ceiling.",
       "why_it_matters": "runner.py raises the eval to outcome=\"timeout\" on asyncio.TimeoutError and deliberately does NOT taint-exclude it, so a binding timeout scores a kept 0.0 \u2014 manufacturing an artificial failure on a set already selected for being hard."
     }
+  },
+  "continuity": {
+    "rationale": "These three fixtures are back-filled from the standing corpus so the v2 campaign shares part of its population with v1 and the two are comparable rather than merely adjacent. The v1 trial could grade plan_quality against a valid reference on only one fixture; re-banding these under references captured from their own committed pre/post SHAs closes that n=1 confound. Each record is built from the canonical fixture under evals/tasks/ \u2014 same pre_task_commit, same post_task_commit, same task_definition, same verify_commands \u2014 and the equality is asserted by test, so \"reference by copy, do not duplicate content divergently\" is machine-checked rather than conventional. Capturing the reference here (rather than copying a post-iota-2 fixture) is the same capture_reference call iota-2 makes for the standing corpus, so beta-1 is self-contained and creates no cross-task coupling.",
+    "baseline_source": "standing_fixture_inherited",
+    "fixtures": [
+      {
+        "id": "reify_task_12",
+        "source_path": "orchestrator/src/orchestrator/evals/tasks/reify_task_12.json",
+        "reason": "The v1 trial graded plan_quality against a valid reference on exactly ONE fixture, so its plan-quality signal rested on n=1. Re-banding this fixture into the v2 cohort under a reference captured from its own committed pre/post SHAs is what closes that confound."
+      },
+      {
+        "id": "reify_task_27",
+        "source_path": "orchestrator/src/orchestrator/evals/tasks/reify_task_27.json",
+        "reason": "Second reify continuity anchor: a high-complexity task from the same repo as the v1 n=1 fixture, so a v1-to-v2 delta on reify is not read off a single record."
+      },
+      {
+        "id": "df_task_18",
+        "source_path": "orchestrator/src/orchestrator/evals/tasks/df_task_18.json",
+        "reason": "The dark-factory continuity anchor, so the overlap with v1 spans both repos rather than reify alone."
+      }
+    ]
   },
   "candidates": [
     {

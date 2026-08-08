@@ -33,6 +33,8 @@ The turns-at-exhaustion 121 clause binds the max_turns arm ONLY. Budget exhausti
 | know_live | 1 |
 | **total** | **41** |
 
+**Reproducibility**: The source dbs are live, so purely ADDITIVE drift (new exhaustions since the recorded census_date) is expected and harmless: the manifest pins the exact recorded task_ids and the curated pool is a dated snapshot, not a standing query. Refusing to re-author, which would silently pull uncurated candidates into the pool. Compare the live ids against census.task_ids in _meta/curation.json: if every recorded id is still present, the pool is intact and this exit is informational. If a recorded id is MISSING, the pool genuinely can no longer be re-derived from these dbs — investigate before touching the manifest.
+
 ## Curation criterion
 
 Exclude a candidate when its brief fails to state an implementable goal. Never a length threshold: brief_chars is recorded per row as evidence for the judgement, not as the rule.
@@ -109,4 +111,16 @@ SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the tr
 - `planrate_only` (SPLIT / direct-landed): **22**
 
 A `planrate_only` fixture carries NO `reference` key at all and instead stamps `provenance.reference_unavailable` with the cause plus `provenance.baseline_source` with the ladder rung that produced its `pre_task_commit`. An empty `reference: {}` block would be indistinguishable from a capture that silently failed; omitting the key and recording why makes it a positive, auditable fact.
+
+## Continuity back-fill
+
+These three fixtures are back-filled from the standing corpus so the v2 campaign shares part of its population with v1 and the two are comparable rather than merely adjacent. The v1 trial could grade plan_quality against a valid reference on only one fixture; re-banding these under references captured from their own committed pre/post SHAs closes that n=1 confound. Each record is built from the canonical fixture under evals/tasks/ — same pre_task_commit, same post_task_commit, same task_definition, same verify_commands — and the equality is asserted by test, so "reference by copy, do not duplicate content divergently" is machine-checked rather than conventional. Capturing the reference here (rather than copying a post-iota-2 fixture) is the same capture_reference call iota-2 makes for the standing corpus, so beta-1 is self-contained and creates no cross-task coupling.
+
+| fixture | source | why |
+|---|---|---|
+| `reify_task_12` | `orchestrator/src/orchestrator/evals/tasks/reify_task_12.json` | The v1 trial graded plan_quality against a valid reference on exactly ONE fixture, so its plan-quality signal rested on n=1. Re-banding this fixture into the v2 cohort under a reference captured from its own committed pre/post SHAs is what closes that confound. |
+| `reify_task_27` | `orchestrator/src/orchestrator/evals/tasks/reify_task_27.json` | Second reify continuity anchor: a high-complexity task from the same repo as the v1 n=1 fixture, so a v1-to-v2 delta on reify is not read off a single record. |
+| `df_task_18` | `orchestrator/src/orchestrator/evals/tasks/df_task_18.json` | The dark-factory continuity anchor, so the overlap with v1 spans both repos rather than reify alone. |
+
+These carry `provenance.baseline_source: standing_fixture_inherited` rather than a ladder rung — their baseline is inherited from the canonical fixture, not resolved here, and `df_task_18`'s `pre_task_commit` is not its post commit's first parent, so claiming `merge_first_parent` would be a false provenance. They are the ONLY fixtures whose ids overlap the standing corpus, and that overlap is pinned by test.
 
