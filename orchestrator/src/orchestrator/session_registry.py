@@ -930,13 +930,60 @@ def merge_decision_enrichment(
       ONLY to fill a field the first filer left empty/None. That fill is
       what makes this enrichment rather than a no-op.
     - ``severity``           -- ``_max_decision_severity``: never downgrade.
-    - ``escalations_dir``    -- see the queue-stamp arm below.
+    - ``escalations_dir``    -- BOTH sides are put through
+      normalize_escalations_dir before being compared (never a raw string
+      compare -- that is the fail-open mistake that normalizer's own
+      docstring exists to prevent, and the reaper's axis-2 guard already
+      normalizes both sides for exactly this reason). Then: existing empty
+      -> take incoming; existing ``UNKNOWN_QUEUE`` and incoming real -> take
+      incoming (the record becomes reapable, a genuine enrichment); incoming
+      ``UNKNOWN_QUEUE`` and existing real -> keep existing (never make a
+      reapable record unreapable); both real and DIFFERENT -> keep existing
+      (FIRST-writer-wins) and log a WARNING naming the id and both queues.
+
+    WHY THIS FIELD STAYS A SCALAR rather than becoming a list of queues,
+    despite the cross-queue case obviously wanting one: (1) it would break
+    SILENTLY. normalize_escalations_dir does ``str(value).strip()``, so a
+    list stringifies to ``"['/a', '/b']"`` with no exception and no log, and
+    the reaper's axis-2 guard would then skip EVERY list-stamped decision on
+    EVERY queue -- permanently unreapable, invisibly. from_dict's
+    ``data.get(...) or ''`` likewise admits a list past a str-annotated
+    field unguarded. (2) Task 3640 (merged) hard-commits the field to a
+    scalar, adding UNKNOWN_QUEUE as a THIRD scalar state plus a back-fill
+    that stamps the live population as scalars; a list would contradict
+    shipped, tested behaviour. (3) Widening it needs a SCHEMA_VERSION minor
+    bump (fleet-cockpit-prd.md:180) and belongs to its own task.
+
+    First-writer-wins therefore leaves the known MODE-2 reap gap that
+    test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_
+    its_stamped_queue already pins and accepts -- unchanged in KIND, but now
+    DETERMINISTIC (the first filer's queue) instead of racy (whichever
+    watcher wrote last). The WARNING is what surfaces it.
 
     PURE and side-effect-free apart from the conflicting-stamp warning: it
     returns a NEW record via dataclasses.replace and mutates neither
     argument, so it stays trivially testable in isolation from the CLI verb
     and a caller holding the pre-merge record still sees what it read.
     """
+    existing_queue = normalize_escalations_dir(existing.escalations_dir)
+    incoming_queue = normalize_escalations_dir(incoming.escalations_dir)
+    merged_queue = existing_queue
+    if not existing_queue or (existing_queue == UNKNOWN_QUEUE and incoming_queue != UNKNOWN_QUEUE):
+        # Enrichment: '' or <unknown> -> anything the incoming filer knows.
+        # An incoming '' or <unknown> is no worse than what we hold, and the
+        # `or existing_queue` keeps us from trading a stamp for nothing.
+        merged_queue = incoming_queue or existing_queue
+    elif incoming_queue and incoming_queue != UNKNOWN_QUEUE and incoming_queue != existing_queue:
+        logger.warning(
+            'decision %s was filed from TWO different escalation queues: keeping the '
+            'first filer\'s stamp %s and DISCARDING %s. escalations_dir is a scalar '
+            '(task 3640), so a cross-queue collapse can record only one queue -- this '
+            'record is reapable only by the first one.',
+            existing.id,
+            existing_queue,
+            incoming_queue,
+        )
+
     return dataclasses.replace(
         existing,
         text=existing.text or incoming.text,
@@ -945,6 +992,7 @@ def merge_decision_enrichment(
         session_id=existing.session_id or incoming.session_id,
         options=existing.options or incoming.options,
         severity=_max_decision_severity(existing.severity, incoming.severity),
+        escalations_dir=merged_queue,
     )
 
 
