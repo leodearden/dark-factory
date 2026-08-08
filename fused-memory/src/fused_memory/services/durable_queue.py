@@ -60,6 +60,19 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # the not-found family becomes defensible again — re-derive it from the
 # empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
+#
+# ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
+# above argues the stronger claim. Dropping these names only returns them to
+# the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
+# still spends five backend round-trips plus exponential backoff proving what
+# attempt 1 already showed. Making it terminal on the first attempt is task
+# 3586 (payload-aware classifier: _handle_failure already holds the whole
+# QueueItem and passes none of it to _is_transient, and the 'dead' outcome
+# plus the on_terminal hook below are the machinery it would reuse). If
+# 3586's payload discrimination proves too fine-grained, a blunter terminal
+# counterpart to this set — matched the same way, checked first — is the
+# cheaper fallback. Either shape is 3586's call; 3585 deliberately changed
+# only WHICH errors get the extended budget.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
