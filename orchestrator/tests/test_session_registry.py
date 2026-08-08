@@ -4025,6 +4025,113 @@ def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
     return orch, recon
 
 
+def test_merge_decision_enrichment_fills_an_empty_queue_stamp(tmp_path: Path) -> None:
+    """The case that matters most right after task 3640's back-fill.
+
+    An existing record with ``escalations_dir=''`` is the legacy/unstamped
+    population 3640 had to back-fill. When a watcher files against that id
+    carrying a REAL queue, the merge takes it: that is precisely the
+    "append/update its own queue's escalations_dir entry" the task asks for,
+    and it turns a project-only-scoped record into a properly queue-scoped
+    one.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir='')
+    incoming = _make_decision(escalations_dir=sr.normalize_escalations_dir(orch))
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+
+
+def test_merge_decision_enrichment_keeps_a_conflicting_queue_stamp_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two DIFFERENT real queues: FIRST-writer-wins, loudly.
+
+    The field is a scalar (task 3640 hard-committed that, adding
+    UNKNOWN_QUEUE as a third scalar state), so a cross-queue MODE-2 collapse
+    genuinely cannot record both queues. Keeping the EXISTING stamp makes
+    the outcome DETERMINISTIC (the first filer's queue) rather than racy
+    (whichever watcher wrote last), which is strictly better -- but it is
+    still information loss, so it must never be silent: a WARNING names the
+    decision id and BOTH queue paths.
+    """
+    orch, recon = _two_queues(tmp_path)
+    existing = _make_decision(id='esc-5914-1', escalations_dir=sr.normalize_escalations_dir(orch))
+    incoming = _make_decision(id='esc-5914-1', escalations_dir=sr.normalize_escalations_dir(recon))
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    assert any(
+        'esc-5914-1' in r.getMessage()
+        and str(sr.normalize_escalations_dir(orch)) in r.getMessage()
+        and str(sr.normalize_escalations_dir(recon)) in r.getMessage()
+        for r in warnings
+    )
+
+
+def test_merge_decision_enrichment_does_not_let_the_unknown_sentinel_displace_a_real_queue(
+    tmp_path: Path,
+) -> None:
+    """UNKNOWN_QUEUE loses to a real queue in BOTH directions.
+
+    Existing ``<unknown>`` + incoming real queue -> take the real one: that
+    is a genuine enrichment, since it makes an otherwise permanently
+    unreapable record reapable again.
+
+    Existing real queue + incoming ``<unknown>`` -> keep the real one:
+    the reverse would make a reapable record unreapable, which no reaper
+    could ever undo.
+
+    Belt-and-braces given the CLI verb already refuses the sentinel at its
+    boundary -- but merge_decision_enrichment is a public pure helper and
+    must be correct on its own terms.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    real = sr.normalize_escalations_dir(orch)
+
+    from_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE),
+        _make_decision(escalations_dir=real),
+    )
+    to_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=real),
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE),
+    )
+
+    assert from_unknown.escalations_dir == real
+    assert to_unknown.escalations_dir == real
+
+
+def test_merge_decision_enrichment_treats_equivalent_queue_spellings_as_one(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both sides are NORMALIZED before comparing, never raw-string-compared.
+
+    A dotted / trailing-slash spelling of the SAME queue must not read as a
+    cross-queue conflict -- that is the fail-open mistake
+    normalize_escalations_dir exists to prevent, and the reaper's axis-2
+    guard already normalizes both sides for exactly this reason. No warning
+    is emitted, because nothing conflicts.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir=sr.normalize_escalations_dir(orch))
+    incoming = _make_decision(escalations_dir=f'{orch}/./')
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_main_reap_decisions_does_not_close_across_queues(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
