@@ -252,5 +252,71 @@ class TestDanglingCensus:
         assert census.unresolved_refs == []
 
 
+class TestSuccessorPointerItems:
+    """The tripwire covers the supersedes edge ONLY, keyed by content."""
+
+    def test_one_item_per_supersedes_edge_and_passed_tracks_resolution(self):
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-2', 'successor two', supersedes=UUID_B)),
+        ]
+        items = m.successor_pointer_items(refs, {UUID_A: True, UUID_B: False})
+        assert len(items) == 2
+        assert {item.passed for item in items} == {True, False}
+
+    def test_the_item_key_is_content_derived_not_a_raw_source_uuid(self):
+        """D5 UUID rot: alpha grandfathers by item_key.
+
+        The same content under a rotated source id must keep its key, or a
+        re-consolidation would read to the evaluator as a brand-new failure.
+        """
+        m = _mod()
+        first = m.successor_pointer_items(
+            m.pointer_targets(_record(UUID_C, 'the same words', supersedes=UUID_A)),
+            {UUID_A: False},
+        )
+        rotated = m.successor_pointer_items(
+            m.pointer_targets(_record(UUID_B, 'the same words', supersedes=UUID_A)),
+            {UUID_A: False},
+        )
+        assert first[0].item_key == rotated[0].item_key
+        assert UUID_C not in first[0].item_key
+        assert first[0].item_key.startswith(m.TRIPWIRE_ITEM_PREFIX)
+
+    def test_the_target_discriminates_two_edges_from_one_source(self):
+        m = _mod()
+        items = m.successor_pointer_items(
+            m.pointer_targets(_record('rec-1', 'one successor', supersedes=[UUID_A, UUID_B])),
+            {UUID_A: True, UUID_B: False},
+        )
+        assert len({item.item_key for item in items}) == 2
+
+    def test_item_keys_are_unique_and_sorted(self):
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-2', 'zeta content', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-1', 'alpha content', supersedes=UUID_A)),
+        ]
+        items = m.successor_pointer_items(refs, {UUID_A: True, UUID_B: True})
+        keys = [item.item_key for item in items]
+        assert keys == sorted(keys)
+        assert len(set(keys)) == len(keys)
+
+    def test_parent_id_and_corrects_produce_no_tripwire_items(self):
+        """They are counted by dangling-pointers only.
+
+        Those targets have no stable per-item identity to grandfather on, so a
+        tripwire over them could not express alpha's ratchet.
+        """
+        m = _mod()
+        refs = m.pointer_targets(_record(parent_id=UUID_A, corrects=UUID_B))
+        assert m.successor_pointer_items(refs, {UUID_A: False, UUID_B: False}) == []
+
+    def test_no_supersedes_edges_yields_no_items(self):
+        m = _mod()
+        assert m.successor_pointer_items([], {}) == []
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
