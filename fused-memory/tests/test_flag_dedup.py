@@ -9851,3 +9851,208 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'checked': [],
             'decision': 'kept_no_resolvable_citations',
         }
+
+    # ---- fail-safe / scope / degrade / malformed guards (step-7) -----------
+
+    @pytest.mark.asyncio
+    async def test_keep_when_lookup_raises(self):
+        """(FAIL-SAFE) A backend error is 'unknown', never 'internal' — KEEP the
+        flag, record the unresolved citation, and never propagate the error."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timeout'))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A get_memory_by_id error must KEEP the flag — a failed provenance '
+            f'read is unknown authorship, never confirmed-internal; got {result!r}'
+        )
+        assert flag['authorship_provenance']['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': None,
+                'classification': 'unresolved',
+            },
+        ], (
+            'the unresolved citation must be recorded so the uncertainty is '
+            f'legible; got {flag["authorship_provenance"]["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_memory_not_found(self):
+        """(FAIL-SAFE) A None record (memory not found) is unresolved, not internal."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=None)
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A not-found cited memory must KEEP the flag; got {result!r}'
+        )
+        assert flag['authorship_provenance']['checked'][0]['classification'] == 'unresolved'
+
+    @pytest.mark.asyncio
+    async def test_non_candidate_flag_type_passes_through_without_lookup(self):
+        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type='stale_metadata')
+        before = json.dumps(flag, sort_keys=True)
+        memory_service = AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag]
+        memory_service.get_memory_by_id.assert_not_called()
+        assert json.dumps(flag, sort_keys=True) == before, (
+            'a non-candidate flag must be left byte-identical — in particular it '
+            'must never gain an authorship_provenance key'
+        )
+        assert 'authorship_provenance' not in flag
+
+    @pytest.mark.asyncio
+    async def test_all_non_candidate_batch_performs_zero_lookups(self):
+        """(SCOPE) A batch with no candidates does no I/O at all."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            self._make_authorship_flag(flag_type='stale_metadata'),
+            {'task_id': '7', 'flag_type': 'systemic_pattern', 'description': 'x'},
+        ]
+        memory_service = AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', flags,
+        )
+
+        assert result == flags
+        memory_service.get_memory_by_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('memory_service_falsy', 'project_id'),
+        [(True, 'dark_factory'), (False, ''), (False, None)],
+    )
+    async def test_degrades_to_pass_through_on_falsy_inputs(
+        self, memory_service_falsy, project_id,
+    ):
+        """(DEGRADE) A falsy memory_service or project_id is a no-op pass-through."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = None if memory_service_falsy else AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, project_id, [flag],
+        )
+
+        assert result == [flag], (
+            'a falsy memory_service/project_id must degrade to an unchanged '
+            f'pass-through, mirroring the sibling filters; got {result!r}'
+        )
+        assert 'authorship_provenance' not in flag
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            'not-a-dict',
+            None,
+            {'memory_id': 'aaaa-bbbb', 'store': 'graphiti', 'metadata_fingerprint': {}},
+            {'store': 'mem0', 'metadata_fingerprint': {}},
+            {'memory_id': '', 'store': 'mem0', 'metadata_fingerprint': {}},
+        ],
+    )
+    async def test_unresolvable_citation_shapes_are_skipped_and_cannot_clear(self, entry):
+        """(MALFORMED) Non-dict / non-mem0 / memory_id-less citations are skipped
+        without a lookup, and alone leave nothing that could clear the flag.
+
+        The non-mem0 skip is load-bearing: get_memory_by_id is a Mem0/Qdrant
+        point-id read, so resolving a graphiti edge uuid through it would
+        return not-found for EVERY graph citation (citation_verifier's guard).
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(cited_memories=[entry])
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'citation {entry!r} is unresolvable and must not clear the flag; '
+            f'got {result!r}'
+        )
+        memory_service.get_memory_by_id.assert_not_called()
+        assert flag['authorship_provenance'] == {
+            'checked': [],
+            'decision': 'kept_no_resolvable_citations',
+        }
+
+    @pytest.mark.asyncio
+    async def test_preserves_input_order_and_leaves_non_candidates_untouched(self):
+        """Order-preserving, and only candidate flags are ever touched."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        benign1 = {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'}
+        dropped = self._make_authorship_flag(memory_id=self._MEMORY_ID)
+        benign2 = {'task_id': '2', 'flag_type': 'systemic_pattern', 'description': 'b'}
+        survivor = self._make_authorship_flag(
+            flag_type='possible_fabrication', memory_id=self._MEMORY_ID_B,
+        )
+        benign3 = {'task_id': '3', 'flag_type': 'false_absence', 'description': 'c'}
+        benign_before = json.dumps([benign1, benign2, benign3], sort_keys=True)
+
+        by_id = {
+            self._MEMORY_ID: self._record('recon-stage-task_knowledge_sync'),
+            self._MEMORY_ID_B: self._record('attacker-xyz'),
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: by_id[memory_id],
+        )
+
+        flags = [benign1, dropped, benign2, survivor, benign3]
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', flags,
+        )
+
+        assert result == [benign1, benign2, survivor, benign3], (
+            f'survivors must keep their original relative order; got {result!r}'
+        )
+        assert json.dumps([benign1, benign2, benign3], sort_keys=True) == benign_before, (
+            'non-candidate flags must not be mutated'
+        )
+        assert flags == [benign1, dropped, benign2, survivor, benign3], (
+            'the input list itself must never be mutated'
+        )
