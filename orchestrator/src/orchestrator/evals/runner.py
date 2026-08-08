@@ -711,6 +711,37 @@ async def run_architect_eval(
             config, task, base_config, memory_endpoint=memory_endpoint,
         )
 
+        # 2b. Usage gate for account failover (eval-revival φ).
+        #     This was the LAST eval entry point invoking an agent ungated —
+        #     run_eval (:401-407) and run_end_to_end (:1039-1045) have always
+        #     built one. Ungated, a capped account refuses the architect
+        #     outright and the cell is recorded cap_tainted, i.e. EXCLUDED from
+        #     the reported mean (the taint table above). The 2026-07-28
+        #     architect wave lost ~40% of its cells that way — 37 blocked.
+        #
+        #     Exclusion is NOT neutral, which is why this is a correctness fix
+        #     and not a convenience: the costlier candidate runs longer, is more
+        #     cap-exposed, and so loses MORE cells than its cheaper rival. The
+        #     surviving cells are then a biased sample and the comparison the
+        #     campaign exists to make is silently wrong. Failing over to a
+        #     healthy account measures the candidate instead of the schedule.
+        #
+        #     Enabled-guarded and warn-and-degrade, copied in shape from
+        #     run_eval so all three entry points build the gate identically: a
+        #     gate we cannot construct costs failover, but raising here would
+        #     cost the whole campaign — for a reason having nothing to do with
+        #     the candidate under test.
+        usage_gate: UsageGate | None = None
+        if orch_config.usage_cap.enabled:
+            try:
+                # noqa is TEMPORARY and must be deleted by the call-site swap
+                # below: until the architect invoke is routed through
+                # invoke_with_cap_retry, this gate has no consumer and F841 is
+                # telling the truth.
+                usage_gate = UsageGate(orch_config.usage_cap)  # noqa: F841
+            except Exception as exc:
+                logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+
         # 3. Init artifacts so the architect has a place to write plan.json.
         #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
         #    injected plan-tools server writes to (BUG 1: writer==reader), so
