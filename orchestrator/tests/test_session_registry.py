@@ -4453,6 +4453,196 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     assert listed[0].id == 'esc-5914-1'
 
 
+def _file_decision(**kwargs: str) -> int:
+    """Invoke the write-decision verb with kwargs as --flags, skipping Nones.
+
+    Keeps the MODE-2 end-to-end cases below readable: each is two filings
+    that differ in only a few fields, and spelling both argv lists out in
+    full buries the difference under boilerplate.
+    """
+    argv = ['write-decision']
+    for name, value in kwargs.items():
+        if value is not None:
+            argv += [f'--{name.replace("_", "-")}', value]
+    return sr.main(argv)
+
+
+def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3559), at the CLI boundary.
+
+    The observed esc-5914-1 MODE-2 shape: both dark_factory queues surface
+    the SAME reify gate. The first watcher files a rich record (full text,
+    critical, task + session ids); the second files a poorer view of the
+    same gate through the OTHER queue.
+
+    Before this change _run_write_decision blind-overwrote the whole file,
+    so the second filing won every field: the cockpit row silently lost the
+    first watcher's text and was DOWNGRADED critical -> info. Now the second
+    filing enriches instead -- still exactly ONE row (the collapse-to-one-
+    cockpit-row requirement, task 3528 (b)), but carrying the best
+    information either watcher has, with custody fields untouched.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify?',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.text == 'Adopt the reify plan?'  # never clobbered
+    assert survivor.severity == 'critical'  # never downgraded
+    assert survivor.task_id == '5914'  # never clobbered
+    assert survivor.session_id == 'watcher-df-1'  # never clobbered
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)  # first wins
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.filed_at == filed_at  # queue age not restamped
+
+
+def test_main_write_decision_same_queue_refile_still_fully_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The enrichment branch must not OVER-trigger on a same-queue re-file.
+
+    Both SKILL.md files promise a watcher can re-file its own stable id
+    across a restart and have its UPDATED view land -- and that includes
+    fields going DOWN or empty, since the watcher is the sole authority on
+    its own escalation. Freezing the first values would strand stale prose
+    and a stale severity in the cockpit queue forever.
+
+    The queue stamp is precisely the axis separating "the same watcher
+    re-filing" from "a second watcher on the same gate", so it is the
+    discriminator, and it needs no new field. Complements
+    test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    which pins the no-duplicate half; this pins that even a DOWNGRADE lands
+    when it comes from the same queue.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].text == 'reify? (rephrased)'
+    assert listed[0].severity == 'info'
+    assert listed[0].task_id is None
+
+
+def test_main_write_decision_non_open_record_is_still_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Protection is scoped to an OPEN record, as the task words it.
+
+    An ANSWERED record is a question the human already dealt with; a second
+    watcher filing that id is starting a NEW ask, not enriching a live one,
+    so it gets today's plain overwrite (which re-opens it -- state comes
+    from the incoming record). Enriching instead would silently graft the
+    new question onto a closed row's history.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='esc-5914-1',
+            project='df',
+            text='the old, answered question',
+            state=sr.DecisionState.ANSWERED,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question',
+        escalations_dir=str(recon),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].text == 'a brand new question'
+    assert listed[0].state == sr.DecisionState.OPEN
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+
+
+def test_main_write_decision_enriches_a_legacy_unstamped_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """End-to-end enrichment of the legacy population, through the CLI.
+
+    The unstamped record has to be seeded via write_decision directly,
+    because the verb now makes it impossible to CREATE one -- which is the
+    point of the whole task. A watcher then files that id with its real
+    queue and the record becomes queue-scoped: this is what makes 3640's
+    back-fill terminal rather than a recurring chore, since the residual
+    population can now only shrink.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='esc-5914-1',
+            project='df',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify?',
+        escalations_dir=str(orch),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
+    assert listed[0].text == 'Adopt the reify plan?'  # enriched, not clobbered
+
+
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
