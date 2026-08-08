@@ -45,20 +45,31 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import run_in_new_session  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    LEAK_SELF_TERMINATION_CEILING_SECS,
+    WAIT_PROOF_GRACE_FLOOR_SECS,
+    WAIT_PROOF_GRACE_MULTIPLIER,
+    run_in_new_session,
+    wait_proof_grace_secs,
+)
 
 # ---------------------------------------------------------------------------
 # Synthetic leakers.
 #
 # THE PIPE-HOLDING VARIANT LIVES HERE AND ONLY HERE.  Its background child
-# inherits the spawn's stdout/stderr pipe write ends, so a post-kill drain that
-# is not bounded BLOCKS on it forever.  That is safe to assert against
-# `run_in_new_session` — which bounds its drain — but it must never be pointed
-# at a still-`subprocess.run`-based spawner, where it would HANG the test until
-# pytest-timeout's 300s axe instead of failing.  The tests in
+# inherits the spawn's stdout/stderr pipe write ends, so a drain run against it
+# after the kill never sees EOF — unbounded, it blocks forever.  That is what
+# makes it the right probe for `run_in_new_session`, which bounds its drain.
+#
+# The tests that drive the REAL spawners — in
 # `scripts/tests/test_restart_all_orchestrators.py` and
-# `tests/scripts/test_orchestrator_watchdog.py` that drive the real spawners use
-# a PIPE-CLOSING variant (`>/dev/null 2>&1`) for exactly that reason.
+# `tests/scripts/test_orchestrator_watchdog.py` — use a PIPE-CLOSING variant
+# (`>/dev/null 2>&1`) instead, so their assertions depend only on "is the
+# grandchild alive" and not on what a spawner does after its kill.  (Measured
+# while implementing 3798: stock `subprocess.run` would not actually hang on
+# the pipe-holding variant either — its POSIX timeout branch calls
+# `process.wait()`, never a second `communicate()`.  Pipe-closing remains the
+# right choice there because it pins less, not because the alternative hangs.)
 # ---------------------------------------------------------------------------
 
 _PIPE_HOLDING_LEAKER = '''\
@@ -294,3 +305,118 @@ class TestRunInNewSession:
             f'pgid {ordinary} is an ordinary unrelated group and must be allowed, '
             'or the helper degrades to never group-killing anything.'
         )
+
+
+class TestWaitProofGraceSecs:
+    """The grace a wait-proving test hands its script is DERIVED, not typed.
+
+    Three call sites each hard-coded ``99999`` seconds — 27.8 HOURS. Every one
+    was locally reasonable: the tests prove the drain script is still POLLING
+    rather than fail-opening, which they do by letting their own short
+    ``subprocess`` timeout fire first, so the grace only has to be big enough
+    not to expire mid-test. Nothing in the code stated the OTHER side of the
+    constraint — that the same number also bounds how long a LEAKED poller
+    lives — so nothing pushed back on making it enormous.
+
+    These tests pin both sides at once, in one place, so a future editor cannot
+    restore a 27.8h value at any single site without failing a test that
+    explains why.
+    """
+
+    # The two spawn timeouts actually in use, at the three sites step-9 edits:
+    # test_defer_withholds_restart_while_busy (3s),
+    # test_unknown_grace_withholds_restart_while_absent (3s),
+    # test_boundary4_defers_busy_unit_while_others_proceed (20s).
+    REAL_SPAWN_TIMEOUTS = (3, 20)
+
+    def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
+        """Too SMALL and the wait-proving tests stop proving anything.
+
+        Each asserts "no restart was recorded before my timeout fired". If the
+        grace expired first the script would force-fire, record the restart,
+        and the assertion would fail — so the margin is what keeps those three
+        tests meaningful rather than flaky.
+        """
+        assert WAIT_PROOF_GRACE_MULTIPLIER >= 3, (
+            f'a {WAIT_PROOF_GRACE_MULTIPLIER}x margin over the spawn timeout is '
+            'too tight to absorb scheduling jitter under 32-way xdist load.'
+        )
+        for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace >= spawn_timeout * WAIT_PROOF_GRACE_MULTIPLIER, (
+                f'grace {grace}s for a {spawn_timeout}s spawn timeout is under '
+                f'the {WAIT_PROOF_GRACE_MULTIPLIER}x floor; the script could '
+                'force-fire before the test observes its defer line.'
+            )
+
+    def test_a_leak_self_terminates_within_the_ceiling(self) -> None:
+        """Too LARGE and anything that escapes outlives its own containment.
+
+        This is the actual fix. A leaked poller holding a 99999s grace is still
+        alive 27.8h later — long after pytest's tmpdir GC has removed the fake
+        ``systemctl`` its PATH points at, so its expiry falls through to
+        ``/usr/bin/systemctl`` and restarts REAL units.
+        """
+        assert LEAK_SELF_TERMINATION_CEILING_SECS <= 120, (
+            f'a leaked poller may live {LEAK_SELF_TERMINATION_CEILING_SECS}s; '
+            'the ceiling exists to keep that inside a couple of minutes.'
+        )
+        # The regression this class exists for, stated as a number: the old
+        # value was three orders of magnitude above the ceiling.
+        assert LEAK_SELF_TERMINATION_CEILING_SECS <= 99999 / 100, (
+            'the ceiling must be far below the 99999s (27.8h) that produced 86 '
+            'concurrent orphans on 2026-08-06 and 82 more on 2026-08-07.'
+        )
+        for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace <= LEAK_SELF_TERMINATION_CEILING_SECS, (
+                f'grace {grace}s for a {spawn_timeout}s spawn timeout exceeds '
+                f'the {LEAK_SELF_TERMINATION_CEILING_SECS}s self-termination '
+                'ceiling — a leak from this call site would outlive its fake '
+                'systemctl and reach the real one.'
+            )
+
+    def test_a_floor_applies_to_very_short_timeouts(self) -> None:
+        """A tiny timeout must not derive a grace that expires mid-test.
+
+        Purely multiplicative, a 1s timeout would yield a few seconds of grace
+        — comparable to the script's own startup — and the defer line the test
+        is waiting for might never be printed.
+        """
+        assert WAIT_PROOF_GRACE_FLOOR_SECS >= 10, (
+            f'a {WAIT_PROOF_GRACE_FLOOR_SECS}s floor is under the wall-clock '
+            'cost of the handful of bash+python3 spawns the script makes '
+            'before it reaches its first defer decision.'
+        )
+        for spawn_timeout in (0, 1):
+            assert wait_proof_grace_secs(spawn_timeout) >= WAIT_PROOF_GRACE_FLOOR_SECS
+
+    def test_it_is_monotonic_and_returns_ints(self) -> None:
+        """``int`` is load-bearing, not tidiness.
+
+        The value is stringified into an env var and compared by bash's integer
+        operators; a float would arrive as ``30.0`` and make ``[ "$x" -gt ... ]``
+        fail outright.
+        """
+        previous = None
+        for spawn_timeout in range(0, 61, 5):
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert type(grace) is int, (
+                f'wait_proof_grace_secs({spawn_timeout}) returned '
+                f'{grace!r} ({type(grace).__name__}); bash needs an integer.'
+            )
+            if previous is not None:
+                assert grace >= previous, (
+                    f'grace fell from {previous} to {grace} as the spawn timeout '
+                    'rose; a longer-running spawn cannot need LESS grace.'
+                )
+            previous = grace
+
+    def test_the_two_real_call_site_timeouts_derive_the_documented_values(self) -> None:
+        """Pin the numbers the three call sites will actually carry.
+
+        Fixed here rather than invented at the call sites, so the derivation and
+        the values it produces cannot drift apart silently.
+        """
+        assert wait_proof_grace_secs(3) == 30
+        assert wait_proof_grace_secs(20) == 80
