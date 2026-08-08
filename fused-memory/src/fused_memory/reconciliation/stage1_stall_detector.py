@@ -461,11 +461,20 @@ async def maybe_escalate_stalled_gate_backlog(
       CAN *suppress* a same-task HOR escalation — harmless because the two
       populations are disjoint in practice.
     - Otherwise build an ``Escalation`` with ``level=1``, ``severity='blocking'``,
-      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The
-      human-readable age is recomputed from ``task_by_id[task_id]['metadata']``
-      via ``gate_escalated_age_secs`` for the summary/detail.  Any failure
-      (id-gen, construction, or submit) logs WARNING and excludes the task_id
-      from the returned list.
+      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The summary
+      states the ``gate_escalated_at`` anchor from
+      ``task_by_id[task_id]['metadata']`` — true at any later read time,
+      including through a ``compact=True`` drain, which keeps ``summary`` but
+      drops ``detail`` (see ``_COMPACT_ESCALATION_FIELDS`` in
+      ``escalation/src/escalation/server.py``).  The age recomputed via
+      ``gate_escalated_age_secs`` is retained only as a filing-time forensic
+      value in the detail block (``age_hours_at_filing``), since it goes stale
+      while the escalation sits open.  The ``age_hours is not None`` branch
+      condition doubles as a guard: it holds only when ``gate_escalated_at``
+      parsed successfully, so the summary anchor is provably a real timestamp;
+      an unparseable or absent stamp falls through to the threshold-named
+      fallback summary below instead.  Any failure (id-gen, construction, or
+      submit) logs WARNING and excludes the task_id from the returned list.
 
     Returns the list of task_ids that received a new escalation.  Returns
     ``[]`` immediately when the ``escalation`` package is unavailable.
@@ -501,7 +510,8 @@ async def maybe_escalate_stalled_gate_backlog(
 
         if age_hours is not None:
             summary = (
-                f'Gate task {task_id} has awaited a human decision for {age_hours}h'
+                f'Gate task {task_id} has awaited a human decision since '
+                f'{gate_escalated_at}'
             )
         else:
             summary = (
