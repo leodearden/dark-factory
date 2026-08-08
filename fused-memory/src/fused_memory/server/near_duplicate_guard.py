@@ -247,6 +247,14 @@ def build_near_duplicate_block(
     (``count_snapshot_write_blocked`` et al.): a flat dict with ``error``/
     ``error_type``, echoed ``agent_id``/``content_excerpt``, plus fields
     identifying the matched memory and a remediation ``hint``.
+
+    ``similarity`` is the per-store cosine from ``match.metadata['store_score']``
+    — deliberately NOT ``relevance_score``, which since task 3658 is an ordinal
+    RRF rank score.  The point is that the blocked agent can compare it
+    directly against the ``threshold`` emitted beside it (0.97 vs 0.92); a
+    payload quoting 0.0164 against a threshold of 0.92 would read as a guard
+    malfunction rather than a decision.  ``None`` if the match somehow carries
+    no numeric cosine — an honest absence beats a fabricated number.
     """
     return {
         'error': 'procedural_knowledge_near_duplicate_write_blocked',
@@ -254,7 +262,7 @@ def build_near_duplicate_block(
         'agent_id': agent_id,
         'content_excerpt': content[:200],
         'matched_memory_id': match.id,
-        'similarity': match.relevance_score,
+        'similarity': _cosine_of(match),
         'threshold': threshold,
         'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
