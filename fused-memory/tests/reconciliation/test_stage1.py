@@ -4884,17 +4884,24 @@ class TestStyleOnlyAuthorshipFlagWiring:
                 run_id='run-3138-step9',
             )
 
-        assert house_flag not in report.items_flagged, (
+        # StageReport is a pydantic model and copies the flag dicts at
+        # construction, so the pipeline never touches the locals above — match
+        # survivors by cited memory_id rather than by object identity.
+        survivors_by_memory_id = {
+            f['cited_memories'][0]['memory_id']: f for f in report.items_flagged
+        }
+        assert self._HOUSE_MEMORY_ID not in survivors_by_memory_id, (
             'A possible_injection flag whose cited entry was authored by '
             "'recon-stage-memory_consolidator' must be DROPPED — Stage 1 "
             f'flagging its own output on style alone; got {report.items_flagged!r}. '
             'RED: filter_style_only_authorship_flags is not yet wired into run().'
         )
-        assert foreign_flag in report.items_flagged, (
+        assert self._FOREIGN_MEMORY_ID in survivors_by_memory_id, (
             'The genuinely-foreign-authored flag must SURVIVE; got '
             f'{report.items_flagged!r}'
         )
-        assert foreign_flag['authorship_provenance'] == {
+        survivor = survivors_by_memory_id[self._FOREIGN_MEMORY_ID]
+        assert survivor['authorship_provenance'] == {
             'checked': [
                 {
                     'memory_id': self._FOREIGN_MEMORY_ID,
@@ -4905,7 +4912,7 @@ class TestStyleOnlyAuthorshipFlagWiring:
             'decision': 'kept_foreign_author',
         }, (
             'The surviving flag must carry the agent_id the gate actually checked '
-            f'as a field (INV-2); got {foreign_flag.get("authorship_provenance")!r}'
+            f'as a field (INV-2); got {survivor.get("authorship_provenance")!r}'
         )
         assert report.stats.get('style_only_authorship_flags_dropped') == 1, (
             "run() must set report.stats['style_only_authorship_flags_dropped'] = 1 "
@@ -4917,7 +4924,10 @@ class TestStyleOnlyAuthorshipFlagWiring:
         # picked up by the marker-reclaim tail and its Stage-2 marker
         # acknowledged. If it ran after, dedup_flags would still see the flag.
         assert seen_by_dedup, 'dedup_flags was never called'
-        assert house_flag not in seen_by_dedup[0], (
+        dedup_input_memory_ids = {
+            f['cited_memories'][0]['memory_id'] for f in seen_by_dedup[0]
+        }
+        assert self._HOUSE_MEMORY_ID not in dedup_input_memory_ids, (
             'filter_style_only_authorship_flags must run BEFORE dedup_flags — '
             'landing it after would drop the flag outside the _pre_filter_flags '
             'snapshot window and strand its Stage-2 disposition marker; got '
@@ -4956,7 +4966,9 @@ class TestStyleOnlyAuthorshipFlagWiring:
                 run_id='run-3138-step9b',
             )
 
-        assert report.items_flagged == [foreign_flag]
+        assert len(report.items_flagged) == 1, (
+            f'the foreign-authored flag must survive; got {report.items_flagged!r}'
+        )
         assert report.stats.get('style_only_authorship_flags_dropped') == 0, (
             f'expected the stat present and 0; got stats={report.stats!r}'
         )
