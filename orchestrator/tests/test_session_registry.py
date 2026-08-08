@@ -4261,6 +4261,50 @@ def test_merge_decision_enrichment_does_not_let_the_unknown_sentinel_displace_a_
     assert to_unknown.escalations_dir == real
 
 
+def test_merge_decision_enrichment_does_not_let_the_unknown_sentinel_displace_the_empty_queue(
+    tmp_path: Path,
+) -> None:
+    """The third direction: '' must not be DOWNGRADED to ``<unknown>`` either.
+
+    The two states are not interchangeable "not a real queue" spellings, and
+    ranking them by truthiness (the obvious `if incoming_queue:` reading) gets
+    it backwards. A record stamped '' is the LEGACY population and still
+    closes, via the reaper's project-only fallback. A record stamped
+    ``<unknown>`` is refused BY NAME by every reaper, so it can only ever be
+    closed by a human. Adopting the sentinel therefore takes a reapable record
+    and makes it permanently unreapable -- the mirror image of the '' -> real
+    enrichment above, run backwards, and no reaper can undo it.
+
+    ``<unknown>`` means "investigated, could not determine" and is legitimate
+    ONLY from the back-fill that did the investigating (task 3640,
+    set_decision_escalations_dir). A merge has investigated nothing, so it
+    never gets to acquire the sentinel from the other filer.
+
+    Unreachable through the CLI verb today, which refuses the sentinel on
+    input -- but merge_decision_enrichment is public and must be correct on
+    its own terms. Note the 144-case exhaustive test does NOT cover this: its
+    predicate asserts the (queue, id) pair is vouched for, and ('', id) ->
+    ('<unknown>', id) can still be perfectly vouched for while losing
+    reapability.
+    """
+    to_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir='', escalation_id=None),
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE, escalation_id='esc-1'),
+    )
+    from_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE, escalation_id=None),
+        _make_decision(escalations_dir='', escalation_id='esc-1'),
+    )
+
+    assert to_unknown.escalations_dir == ''
+    # ...and the id does not travel without its queue, per the pair rule.
+    assert to_unknown.escalation_id is None
+    # The reverse was already right and stays right: '' is not an "upgrade"
+    # over an investigated ``<unknown>``, it is just a different unknown.
+    assert from_unknown.escalations_dir == sr.UNKNOWN_QUEUE
+    assert from_unknown.escalation_id is None
+
+
 def test_merge_decision_enrichment_treats_equivalent_queue_spellings_as_one(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

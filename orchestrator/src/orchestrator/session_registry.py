@@ -998,11 +998,23 @@ def _merge_queue_and_escalation_id(
     # nothing. (The `or existing.escalation_id` fallback is reachable only
     # when BOTH ids are unset -- guard (3) above already returned for every
     # case where existing holds an id incoming does not share.)
-    if incoming_queue:
+    #
+    # ADOPTION REQUIRES A *REAL* QUEUE, never UNKNOWN_QUEUE. The sentinel is
+    # not an ordinary stamp that happens to be non-empty: '' still closes
+    # under the reaper's project-only fallback, while ``<unknown>`` is
+    # refused by EVERY reaper by name, so '' -> ``<unknown>`` is a strict
+    # DOWNGRADE of reapability that no reaper could ever undo -- exactly the
+    # loss the '' -> real direction above exists to repair, run backwards.
+    # The sentinel means "investigated, could not determine" and may only be
+    # SET by the back-fill path that did the investigating
+    # (set_decision_escalations_dir, task 3640); a merge never gets to
+    # ACQUIRE it from the other filer. Symmetric with the CLI verb, which
+    # refuses the sentinel on input for the same reason.
+    if incoming_queue and incoming_queue != UNKNOWN_QUEUE:
         return incoming_queue, incoming.escalation_id or existing.escalation_id
-    # Incoming offers no queue at all, so there is nothing to adopt and no
-    # id to take with it: keep our own pair rather than trading a stamp for
-    # nothing.
+    # Incoming offers no adoptable queue -- none at all, or only the
+    # sentinel -- so there is nothing to take and no id to take with it:
+    # keep our own pair rather than trading a stamp for something worse.
     return existing_queue, existing.escalation_id
 
 
@@ -1042,9 +1054,11 @@ def merge_decision_enrichment(
       with a WARNING naming the id and both queues when the discarded one is
       real; first filer's queue undetermined ('' / ``UNKNOWN_QUEUE``) but
       already carrying a different id -> refuse the upgrade, loudly; and
-      otherwise adopt the incoming record's own self-consistent pair, which
-      is the genuine post-3640 enrichment (a legacy unstamped record
-      becoming queue-scoped, or an ``UNKNOWN_QUEUE`` one becoming reapable).
+      otherwise adopt the incoming record's own self-consistent pair PROVIDED
+      its queue is REAL, which is the genuine post-3640 enrichment (a legacy
+      unstamped record becoming queue-scoped, or an ``UNKNOWN_QUEUE`` one
+      becoming reapable). A merge never ACQUIRES ``UNKNOWN_QUEUE`` from the
+      other filer: reapability only ever moves upwards here.
 
     WHY THIS FIELD STAYS A SCALAR rather than becoming a list of queues,
     despite the cross-queue case obviously wanting one: (1) it would break
