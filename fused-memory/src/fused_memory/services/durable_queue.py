@@ -621,9 +621,16 @@ class DurableWriteQueue:
                 "WHERE id = ?",
                 (new_attempts, error_msg, item.id),
             )
+            # operation / group_id / classification are what a triager needs
+            # first, and the log line is all that survives once the queue row is
+            # deleted — after that, get_dead_items can no longer supply them.
+            # The classification separates "doomed from attempt 1" from
+            # "exhausted its budget", which the attempt count alone cannot when
+            # max_attempts is 1.
             logger.warning(
-                'Item %d dead-lettered after %d attempts: %s',
-                item.id, new_attempts, error_msg,
+                'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
+                item.id, item.operation, item.group_id, new_attempts,
+                classification, error_msg,
             )
         else:
             delay = min(
@@ -637,9 +644,13 @@ class DurableWriteQueue:
                 "next_retry_at = ?, error = ? WHERE id = ?",
                 (new_attempts, next_retry, error_msg, item.id),
             )
+            # Kept symmetrical with the dead-letter line above so a retry storm
+            # is attributable to an operation and a project without a second
+            # lookup.
             logger.info(
-                'Item %d retry %d/%d in %.1fs: %s',
-                item.id, new_attempts, limit, delay, error_msg,
+                'Item %d (%s, group_id=%s) retry %d/%d in %.1fs [%s]: %s',
+                item.id, item.operation, item.group_id, new_attempts, limit,
+                delay, classification, error_msg,
             )
         await self._db.commit()
         return ('dead', error_msg) if died else None

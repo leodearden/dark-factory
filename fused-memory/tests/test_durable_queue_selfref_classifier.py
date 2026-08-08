@@ -38,14 +38,13 @@ explicit ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
-import asyncio  # noqa: F401  (used by later steps' e2e tests)
 import json
-import logging  # noqa: F401  (used by the caplog assertions in step-09)
+import logging
 import uuid as uuid_mod
-from unittest.mock import AsyncMock  # noqa: F401  (used by the e2e tests)
+from typing import Any
+from unittest.mock import AsyncMock
 
-import pytest  # noqa: F401
-import pytest_asyncio  # noqa: F401
+import pytest
 from _fm_helpers import poll_until
 
 # The REAL upstream classes — see the module docstring for why this import is
@@ -120,7 +119,9 @@ def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
     """The shared config, matching ``test_durable_queue.py:1571-1586`` exactly
     so attempt counts here are directly comparable to task 3585's: plain budget
     5, extended transient budget 12, sub-second backoff."""
-    kwargs = dict(
+    # Annotated: without it pyright joins the heterogeneous literal values into
+    # a single narrow type and rejects the ** unpacking below.
+    kwargs: dict[str, Any] = dict(
         data_dir=tmp_path / 'queue',
         execute_write=execute,
         workers_per_group=1,
