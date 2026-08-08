@@ -564,6 +564,43 @@ class DurableWriteQueue:
             return value
         return None
 
+    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[str, int]:
+        """Classify *exc* for *item* and return (classification, attempts_limit).
+
+        The three outcomes:
+
+        * ``('permanent', 1)`` — a not-found naming THIS item's own identity
+          uuid. When the missing node is the node this operation exists to
+          create, no number of retries can succeed; that is derived from local
+          state, not guessed from an error type. A limit of 1 (rather than a
+          separate boolean) keeps ``died = new_attempts >= limit`` a single
+          uniform expression at the call site, and also correctly re-kills an
+          item arriving with ``attempts > 0`` — which is exactly what
+          ``replay_dead`` produces, since it resets status but re-executes the
+          identical poison payload. That is the mechanism behind the recorded
+          55-retry item in esc-3561-3.
+        * ``('transient', transient_max_attempts)`` — the existing name-based
+          policy, unchanged.
+        * ``('normal', item.max_attempts)`` — everything else, today's default.
+
+        PERMANENT IS CHECKED FIRST, DELIBERATELY. ``transient_error_names`` is
+        operator-tunable and task 3585 removed the not-found family only from
+        the DEFAULT set — config validation still permits an operator to add
+        names back. Were transient checked first, re-adding 'NodeNotFoundError'
+        would hand a provably-doomed self-referential write the extended budget,
+        resurrecting the very loop this classifier exists to kill. A proof
+        derived from the payload outranks a guess about a class name.
+
+        Both gates fail open independently: an unrecognised message shape and an
+        unresolvable identity each fall through to the ordinary policy.
+        """
+        identity = self._identity_uuid(item)
+        if identity is not None and _parse_not_found_uuid(str(exc)) == identity:
+            return ('permanent', 1)
+        if self._is_transient(exc):
+            return ('transient', self._transient_max_attempts)
+        return ('normal', item.max_attempts)
+
     async def _handle_failure(
         self, item: QueueItem, exc: Exception
     ) -> tuple[str, str | None] | None:
