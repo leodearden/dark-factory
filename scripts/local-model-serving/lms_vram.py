@@ -38,13 +38,12 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
-
 from lms_manifest import ArmEntry
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 MIB_PER_GIB = 1024
 
@@ -466,7 +465,7 @@ def record_baseline(arm_id: str, reading: GpuReading) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         'arm_id': arm_id,
-        'measured_at': datetime.now(timezone.utc).isoformat(),
+        'measured_at': datetime.now(UTC).isoformat(),
         'total_mib': reading.total_mib,
         'used_mib': reading.used_mib,
         'free_mib': reading.free_mib,

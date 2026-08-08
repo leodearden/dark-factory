@@ -39,13 +39,12 @@ import inspect
 import json
 from pathlib import Path
 
-import pytest
-import yaml
-
 import lms_ctl
 import lms_healthcheck
 import lms_manifest
 import lms_vram
+import pytest
+import yaml
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -1837,7 +1836,7 @@ def test_the_probe_cap_is_the_products_own_output_budget():
     )
     config = yaml.safe_load(config_path.read_text())
 
-    assert lms_healthcheck.PROBE_MAX_TOKENS == config['llm']['max_tokens']
+    assert config['llm']['max_tokens'] == lms_healthcheck.PROBE_MAX_TOKENS
 
 
 def test_merge_refuses_a_set_that_does_not_cover_the_manifest():

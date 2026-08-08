@@ -73,7 +73,6 @@ if str(_ORCH_SRC) not in sys.path:
 
 from orchestrator import session_registry as sr  # noqa: E402
 
-
 # The measured provenance discriminator (see resolve_queue_for_decision).
 _WATCHER_SESSION_PREFIX = 'watcher-'
 

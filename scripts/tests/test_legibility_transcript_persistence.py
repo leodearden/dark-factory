@@ -17,21 +17,20 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
-from orchestrator import session_registry
 
+from orchestrator import session_registry
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
-FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -574,7 +573,7 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
-) -> "mod.MissingTranscript":
+) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
         cwd=cwd,

@@ -40,9 +40,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 import lms_vram
+import pytest
 from lms_healthcheck import REPORT_SCHEMA_VERSION, HealthReport
 from lms_manifest import load_arms
 

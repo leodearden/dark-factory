@@ -26,8 +26,9 @@ from pathlib import Path
 
 import census as mod
 import coder
-import config as config_mod
 from legibility import census_trigger
+
+import config as config_mod
 
 
 def _write_legibility_yaml(config_path, *, project_id="target_project", project_root=None):

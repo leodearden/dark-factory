@@ -159,7 +159,7 @@ import pathlib
 import re
 import shlex
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -231,7 +231,6 @@ from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser c
     _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
     parse_unit_directives,
 )
-
 
 # ---------------------------------------------------------------------------
 # Drift records and unit specs

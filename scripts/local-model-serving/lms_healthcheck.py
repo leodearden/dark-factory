@@ -44,16 +44,15 @@ import math
 import sys
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
-
 import lms_ctl
 import lms_vram
 from lms_manifest import ArmEntry, ArmManifestError, load_arms
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 #: Per-request ceiling for the readiness/identity GET.  A plain float, never an
 #: `httpx.Timeout` object: the shared test fake (scripts/tests/conftest.py)
@@ -978,7 +977,7 @@ def _now_iso() -> str:
     """Timezone-AWARE UTC.  A naive stamp would make a stale artifact
     indistinguishable from a fresh one, and this artifact's entire job is to
     prove that a live run happened."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def run_healthcheck(

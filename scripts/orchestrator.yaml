@@ -199,20 +199,19 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same pairing. No
 # --directory, so cwd stays at the worktree root and scripts/ resolves.
 #
-# RULE-SET SURPRISE, recorded so it is not rediscovered (follow-up 3457).
-# --project shared selects the ENVIRONMENT ruff runs from; it does NOT make
-# shared's ruff config apply to files outside shared/. There is no [tool.ruff]
-# table in the repo-root pyproject.toml and no ruff.toml anywhere in the repo,
-# and ruff resolves config hierarchically per file, SKIPPING a pyproject.toml
-# with no [tool.ruff] section. So files under scripts/ are checked against
-# ruff's BUILT-IN defaults (E4/E7/E9 + F), not the members'
-# select = ["E","F","UP","B","SIM","I"]. Verified with `ruff check
-# --show-settings`: a scripts/ file enables E401/E402/E7xx/E9/F only, while a
-# shared/ file additionally enables the B/SIM/UP/I families. tests/scripts/ is
-# in the identical position, so this command inherits exactly the same rule set
-# as its sibling — consistent, but weaker than a workspace member's. Widening
-# it would retroactively change tests/scripts/ gating and surface an unmeasured
-# finding set there, which is outside this task's locks.
+# RULE SET (resolved by task 3457; this block previously recorded the gap).
+# Note --project shared above selects the ENVIRONMENT ruff runs from; it does
+# NOT make shared's ruff config apply to files outside shared/. That is why this
+# gate ran ruff's built-in defaults until the repo-root pyproject.toml declared
+# a [tool.ruff] table, and why the command VALUE below is unchanged by 3457 —
+# only the rule set it resolves changed. Widening surfaced 125 findings here,
+# all FIXED in the same branch as the config change, never excluded.
+#
+# The resolved values, the mechanism, the per-rule measurement and the un-gated
+# residue are stated ONCE, in the [tool.ruff] comment block in the repo-root
+# pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
+# Read them there; do not restate them here, or the two will drift and only one
+# copy is guarded.
 lint_command: "uv run --project shared ruff check scripts/"
 
 # TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.

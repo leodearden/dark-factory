@@ -17,9 +17,10 @@ import shutil
 import subprocess
 
 import pytest
-
 from systemd_unit_invariants import (
     assert_restart_backoff_effective as _assert_restart_backoff_effective,
+)
+from systemd_unit_invariants import (
     restart_directive as _restart_directive,
 )
 

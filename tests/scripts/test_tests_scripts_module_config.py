@@ -33,10 +33,10 @@ from __future__ import annotations
 import pathlib
 
 import yaml
-
-from orchestrator import verify, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
+
+from orchestrator import verify, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

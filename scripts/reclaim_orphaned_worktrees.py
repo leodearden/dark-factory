@@ -571,9 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--parking-root',
         default=None,
-        help=(
-            'Quarantine base to sweep (default: <repo>/%s).' % PARKING_ROOT_NAME
-        ),
+        help=f'Quarantine base to sweep (default: <repo>/{PARKING_ROOT_NAME}).',
     )
     parser.add_argument(
         '--min-age-hours',

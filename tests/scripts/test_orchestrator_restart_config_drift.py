@@ -23,7 +23,6 @@ import pathlib
 
 import pytest
 import yaml
-
 from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]

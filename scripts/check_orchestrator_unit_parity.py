@@ -193,7 +193,7 @@ import argparse
 import dataclasses
 import pathlib
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 from systemd_unit_parity import parse_unit_directives
 

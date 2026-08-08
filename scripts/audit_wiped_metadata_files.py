@@ -373,10 +373,7 @@ def _read_plan_file(plan_path: Path, dir_name: str) -> tuple[str, tuple[str, ...
     if not files:
         return None
     raw_task_id = payload.get("task_id")
-    if raw_task_id is None or raw_task_id == "":
-        key = dir_name
-    else:
-        key = str(raw_task_id)
+    key = dir_name if raw_task_id is None or raw_task_id == "" else str(raw_task_id)
     return key, files
 
 

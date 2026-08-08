@@ -26,7 +26,6 @@ tests/scripts/test_orchestrator_restart_config_drift.py::test_orchestrator_resta
 import pathlib
 
 import pytest
-
 from orchestrator.config import LaneCommand, OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]

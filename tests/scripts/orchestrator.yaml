@@ -170,6 +170,25 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # merge_verify_breadth=full, and type_check widens to this directory form when a
 # touched file classifies STRUCTURAL — hence pre-1 checking the directory form
 # rather than only the per-file one.
+#
+# RULE SET (task 3457). This directory sits in the identical position to
+# scripts/: outside every workspace member, so it resolved ruff's built-in
+# defaults until the repo-root pyproject.toml declared a [tool.ruff] table, and
+# --project shared above did not change that (it selects the ENVIRONMENT ruff
+# runs from, not the config that applies). The lint_command VALUE below is
+# UNCHANGED by 3457 — only the rule set it resolves changed.
+#
+# MEASUREMENT: widening surfaced 25 findings in tests/scripts/, all FIXED in the
+# same branch as the config change, never excluded — task 3350's own
+# fix-don't-weaken precedent, which is also why this command must stay
+# directory-wide and exclude-free.
+#
+# The resolved values, the mechanism and the full rationale are stated ONCE, in
+# the [tool.ruff] comment block in the repo-root pyproject.toml, and held there
+# by test_nonmember_ruff_config.py — which sweeps every non-member directory,
+# this one and scripts/ included, for parity with a live member. Read them
+# there; do not restate them here, or the two will drift and only one copy is
+# guarded.
 lint_command: "uv run --project shared ruff check tests/scripts/"
 type_check_command: "npx pyright tests/scripts/"
 

@@ -57,6 +57,7 @@ asserted against the REAL born-at-L2 writer, which ``tests/scripts/`` cannot
 import).
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -236,10 +237,9 @@ class _JournalLog:
     """
 
     def warning(self, msg: str) -> None:
-        try:
+        # Broad by design: logging must never break a fail-soft path.
+        with contextlib.suppress(Exception):
             log(f"WARNING: {msg}")
-        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft path
-            pass
 
 
 logger = _JournalLog()
@@ -426,10 +426,8 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
         tmp_path = None  # renamed away — nothing to clean up
     except Exception as exc:  # noqa: BLE001 -- a failed stamp must not crash the tick
         if tmp_path is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
         logger.warning(f"save_state: failed to persist state to {path}: {exc!r}")
 
 

@@ -49,6 +49,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
 from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+
 from orchestrator import session_registry  # noqa: E402
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
