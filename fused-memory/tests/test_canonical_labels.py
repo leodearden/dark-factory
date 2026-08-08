@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.utils.canonical_labels import Referent, parse_node_name
+from fused_memory.utils.canonical_labels import (
+    LabelScan,
+    Referent,
+    parse_node_name,
+    scan_content,
+)
 
 
 class TestReferentNodeName:
@@ -184,6 +189,244 @@ class TestParseNodeNameNonMatches:
     )
     def test_returns_none(self, name):
         assert parse_node_name(name) is None
+
+
+class TestLabelScanIsFrozen:
+    """LabelScan is frozen for the same reason Referent is: it is evidence for
+    destructive graph surgery, not a mutable accumulator."""
+
+    def test_both_lists_default_empty(self):
+        scan = LabelScan()
+        assert scan.refs == []
+        assert scan.ambiguous == []
+
+    def test_refs_is_immutable(self):
+        scan = LabelScan()
+        with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError subclasses AttributeError
+            scan.refs = []  # type: ignore[misc]
+
+
+class TestScanContentFindsOwnProjectReferents:
+    """An unqualified prose mention of a task, and a SELF-qualified one, are
+    both referents of the LOCAL task — project_id '' , node_name 'Task N'."""
+
+    @pytest.mark.parametrize(
+        ('content', 'group_id', 'number'),
+        [
+            ('Reify task 5181 was cancelled', 'reify', '5181'),
+            # The '#' form the pre-3667 mention pattern could not see.
+            ('task #1153 is the variant split', 'reify', '1153'),
+        ],
+    )
+    def test_bare_mention_yields_an_own_project_referent(self, content, group_id, number):
+        scan = scan_content(content, group_id=group_id)
+        assert [(r.project_id, r.number) for r in scan.refs] == [('', number)]
+
+    def test_colon_spelled_mention_is_local_vocabulary_not_a_project(self):
+        """'Task: 2500' is a LOCAL task mention. Reading 'task' as a project id
+        would send destructive surgery at a bogus 'task:2500' entity — the one
+        rejection no downstream guard can make (see cross_project_refs)."""
+        scan = scan_content('Task: 2500 is now done', group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == ['Task 2500']
+        assert [r for r in scan.refs if r.project_id == 'task'] == []
+
+    @pytest.mark.parametrize(
+        ('content', 'group_id'),
+        [
+            ('reify:5181 was cancelled', 'reify'),
+            # Both sides are canonicalized before the comparison, so case and
+            # hyphen/underscore spelling differences still count as SELF.
+            ('REIFY:5181 was cancelled', 'reify'),
+            ('Reify-Factory:5181 was cancelled', 'reify_factory'),
+            ('reify_factory:5181 was cancelled', 'Reify-Factory'),
+        ],
+    )
+    def test_self_qualified_ref_is_reclassified_as_own_project(self, content, group_id):
+        """A qualifier naming the CURRENT group is not cross-project, but it IS
+        a genuine local referent — 'reify:5181' in the reify graph really does
+        mean local Task 5181, and extraction collapsing it onto 'Task 5181' is
+        correct, not a bug. Reclassify it rather than dropping it, so a
+        consumer needing the COMPLETE local referent set gets it. (The
+        foreign-only filter in find_cross_project_task_refs reproduces the drop
+        that module wants.)"""
+        scan = scan_content(content, group_id=group_id)
+        assert [(r.project_id, r.node_name) for r in scan.refs] == [('', 'Task 5181')]
+
+
+class TestScanContentFindsCrossProjectReferents:
+    """A qualifier naming a project other than the current group is a FOREIGN
+    referent, rendered as the qualified entity name it should have."""
+
+    def test_foreign_qualifier_yields_a_foreign_referent(self):
+        scan = scan_content('see dark_factory:2500 for context', group_id='reify')
+        assert [(r.project_id, r.number, r.node_name) for r in scan.refs] == [
+            ('dark_factory', '2500', 'dark_factory:2500')
+        ]
+
+    def test_digits_are_preserved_verbatim(self):
+        scan = scan_content('see dark_factory:0250', group_id='reify')
+        assert [r.number for r in scan.refs] == ['0250']
+
+
+class TestScanContentPrecision:
+    """The scan drives destructive edge surgery, so colon-bearing noise that is
+    not a label must never produce a referent. Each entry encodes a specific
+    measured false positive; do not re-derive these narrowings."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            '',
+            'no colons at all here',
+            # Source locations: '.py' is too short AND preceded by a '.'.
+            'see graphiti_client.py:2091 for the call site',
+            'memory_service.py:1077 declares it',
+            # Clock times: a qualifier must start with a letter.
+            'at 12:30 the run started',
+            # URL authorities.
+            'see https://example.com:8080/path',
+            # Too-short qualifiers (<3 chars) are noise, not project ids.
+            'w6:2 is a cell reference',
+            'py:3 is not a project',
+            'a:1 is not a project',
+            # A colon-chained token is not a qualifier.
+            'foo:bar:3 is not a project ref',
+            # A qualifier glued to a preceding word character.
+            '2500dark_factory:2500',
+            # A path-shaped qualifier is rejected by the lookbehind before
+            # canonicalization ever sees it (RCA §4).
+            'see /home/leo/src/dark-factory:2500',
+            # Task vocabulary in qualifier position is rejected, AND the
+            # word-glue lookbehind stops the 'task: N' substring inside it from
+            # counting as a local mention either.
+            'subtask: 2500',
+            'sub-task: 2500',
+            'subtasks: 2500',
+        ],
+    )
+    def test_noise_yields_no_referents(self, content):
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == []
+        assert scan.ambiguous == []
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'dark_factory:2500 relates to subtask 2500',
+            'dark_factory:2500 relates to multitask 2500',
+            'dark_factory:2500 relates to reify-task 2500',
+        ],
+    )
+    def test_word_glued_lookalikes_are_not_local_mentions(self, content):
+        """'subtask 2500' is not a mention of task 2500, mirroring the anchored
+        pattern's refusal to match 'subtask 5'."""
+        scan = scan_content(content, group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_path_shaped_group_id_yields_an_empty_scan(self):
+        """Without a trustworthy local project id, local and foreign referents
+        cannot be told apart — report nothing rather than guess. No raise: the
+        scanner sits on a write path."""
+        scan = scan_content('see dark_factory:2500', group_id='-home-leo-src-reify')
+        assert scan == LabelScan()
+
+
+class TestScanContentOrderingAndDedup:
+    """Positional first-seen order, de-duplicated on (kind, project_id, number)
+    — so the result is deterministic and a consumer can rely on it."""
+
+    def test_multiple_foreign_refs_preserve_first_seen_order(self):
+        content = 'blocked on dark_factory:2500, then stepping:7, then dark_factory:11'
+        scan = scan_content(content, group_id='reify')
+        assert [r.node_name for r in scan.refs] == [
+            'dark_factory:2500',
+            'stepping:7',
+            'dark_factory:11',
+        ]
+
+    def test_local_and_foreign_referents_interleave_by_position(self):
+        """Order is by offset in the content, NOT by which pattern found it —
+        the two passes are merged, not concatenated."""
+        scan = scan_content('task 7 then dark_factory:11 then task 9', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['Task 7', 'dark_factory:11', 'Task 9']
+
+    def test_differently_spelled_qualifiers_dedupe_to_one_referent(self):
+        content = 'dark_factory:2500 and Dark-Factory:2500 and DARK_FACTORY:2500'
+        scan = scan_content(content, group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_repeated_scans_are_deterministic(self):
+        content = 'dark_factory:2500, stepping:7, dark_factory:2500, stepping:7'
+        first = scan_content(content, group_id='reify')
+        second = scan_content(content, group_id='reify')
+        assert [r.node_name for r in first.refs] == ['dark_factory:2500', 'stepping:7']
+        assert [r.node_name for r in first.refs] == [r.node_name for r in second.refs]
+
+
+class TestScanContentAllowlist:
+    """An optional narrowing: when a registry of known project ids is supplied,
+    FOREIGN referents naming an unknown project are dropped."""
+
+    def test_unknown_projects_are_dropped_when_allowlist_supplied(self):
+        content = 'blocked on dark_factory:2500, stepping:3 and unknown_proj:7'
+        scan = scan_content(content, group_id='reify', known_project_ids={'dark_factory'})
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_allowlist_entries_are_canonicalized_before_comparison(self):
+        scan = scan_content(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'Dark-Factory'}
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_allowlist_accepts_a_mapping_of_project_id_to_root(self):
+        """The caller's registry is MemoryService._known_projects, a
+        {project_id: project_root} dict — iterating it yields its keys."""
+        scan = scan_content(
+            'blocked on dark_factory:2500 and stepping:3',
+            group_id='reify',
+            known_project_ids={'dark_factory': '/some/root', 'reify': '/other/root'},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    @pytest.mark.parametrize('allowlist', [None, set(), frozenset(), []])
+    def test_empty_or_missing_allowlist_is_permissive(self, allowlist):
+        """Mirrors validate_known_project_id's documented empty-registry mode:
+        an unavailable registry must NOT silently disable the protection."""
+        content = 'blocked on dark_factory:2500 and stepping:3'
+        scan = scan_content(content, group_id='reify', known_project_ids=allowlist)
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500', 'stepping:3']
+
+    def test_path_shaped_allowlist_entry_is_skipped_not_fatal(self):
+        scan = scan_content(
+            'see dark_factory:2500',
+            group_id='reify',
+            known_project_ids={'dark_factory', '-home-leo-src-oops'},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_own_project_referents_are_never_dropped_by_the_allowlist(self):
+        """The allowlist narrows FOREIGN referents only, and is applied AFTER
+        the self->local reclassification — so an allowlist that omits the
+        current group still cannot suppress a local referent."""
+        scan = scan_content(
+            'task 7 and reify:8', group_id='reify', known_project_ids={'dark_factory'}
+        )
+        assert [r.node_name for r in scan.refs] == ['Task 7', 'Task 8']
+
+
+class TestShapeValidProseMatchesByDesign:
+    """Prose with the '<word>: <number>' shape DOES match — the scanner is
+    deliberately whitespace-tolerant, because that is how humans write a
+    qualified reference. Final precision is delegated to the consumer's own
+    guard (and to the allowlist, when a registry is wired)."""
+
+    def test_prose_colon_number_matches_shape_only(self):
+        scan = scan_content('Total: 42 items', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['total:42']
+
+    def test_allowlist_removes_the_prose_match(self):
+        scan = scan_content('Total: 42 items', group_id='reify', known_project_ids={'dark_factory'})
+        assert scan.refs == []
 
 
 class TestUnregisteredKindIsRejectedLoudly:
