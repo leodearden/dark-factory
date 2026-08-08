@@ -2102,6 +2102,104 @@ class TestArchitectCellRecordsJudgeSpend:
         assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
 
 
+def _token_agent_result(input_tokens, output_tokens, *, cost_usd: float = 1.23):
+    """A REAL ``AgentResult`` carrying explicit token counts.
+
+    Real, not a MagicMock, because the ``int | None`` "provider did not report"
+    shape is exactly what these tests pin — a MagicMock cannot express a
+    genuine ``None`` on an attribute the runner reads.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=True,
+        output='done',
+        cost_usd=cost_usd,
+        duration_ms=4567,
+        turns=3,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+@pytest.mark.asyncio
+class TestArchitectCellStampsTokenUsageAndProxySignal:
+    """Task 3656 step-1: the architect cell must record the run's TOKEN USAGE
+    and its PROXY signal, not leave all three at their dataclass defaults.
+
+    These are the three inputs :func:`~orchestrator.evals.metrics.resolve_cost_usd`
+    needs to resolve cost provenance per Invariant P5. Without them the
+    price-table path is unreachable on the architect side no matter what the
+    resolver is asked, so they are pinned BEFORE the resolution itself
+    (step-5). Every assertion checks the PERSISTED cell as well as the returned
+    result — the persisted JSON is what ``report.py`` and an operator read.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high',
+            role='architect', **kw,
+        )
+
+    async def test_reported_token_counts_are_stamped(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(12_000, 3_000),
+        )
+
+        assert result.metrics['input_tokens'] == 12_000
+        assert result.metrics['output_tokens'] == 3_000
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 12_000
+        assert persisted['output_tokens'] == 3_000
+
+    async def test_unreported_token_counts_persist_as_zero_not_none(self):
+        """``AgentResult`` declares both ``int | None``; a provider that did not
+        report must persist an honest ``0``, never a ``None`` that would poison
+        the arithmetic in ``resolve_cost_usd`` (and ``json`` a bare null into a
+        field the report layer treats as an int)."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(None, None),
+        )
+
+        assert result.metrics['input_tokens'] == 0
+        assert result.metrics['output_tokens'] == 0
+        assert result.metrics['input_tokens'] is not None
+        assert result.metrics['output_tokens'] is not None
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+
+    async def test_proxied_candidate_is_flagged_local(self):
+        """``ANTHROPIC_BASE_URL`` set == a PROXIED endpoint, the signal Invariant
+        P5 keys on to stop trusting the CLI's own cost figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is True
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is True
+
+    async def test_native_candidate_is_not_flagged_local(self):
+        """Today's shape (``architect-opus-max`` / ``architect-fable-max``):
+        native cloud, no proxy, so the CLI cost stays trustworthy."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is False
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is False
+
+
 @pytest.mark.asyncio
 class TestArchitectRunnerJudgeCostReadIsDefensive:
     """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
