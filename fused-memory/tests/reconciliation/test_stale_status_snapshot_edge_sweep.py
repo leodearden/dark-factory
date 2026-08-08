@@ -1224,6 +1224,100 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'the gate'
         )
 
+    @pytest.mark.asyncio
+    async def test_genitive_and_plural_snapshot_edges_invalidated_end_to_end(self):
+        """Deterministic stand-in for "re-run the sweep to confirm coverage"
+        (task 3079), following the task-3042 precedent directly above.
+
+        A LIVE re-run cannot prove anything here: Stage 1 already
+        invalidated and superseded all four of the finding's real edges
+        this cycle, so re-running the sweep would observe nothing and
+        report zero by construction. Replaying both verbatim fact shapes
+        (including the finding's real edge uuid) through the real
+        orchestrator is the repeatable proof that survives long after the
+        incident edges are gone.
+
+        Drives the full enumerate -> extract -> cross-reference ->
+        invalidate path. Both edges reference tasks whose census status is
+        now 'done', so both must be invalidated; the control edge
+        references task 3100, still 'pending', and must be left alone —
+        pinning invalidate-only-on-positively-terminal end-to-end for the
+        two new paths, not just at the pure-function layer.
+
+        The get_statuses assertion is the load-bearing one for the
+        finding's second question: ALL THREE ids of the pairwise fact must
+        reach the cross-reference, not merely the first.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+
+        genitive_edge = {
+            # the finding's real edge uuid and verbatim fact
+            'uuid': '3e78fd74-83a9-48bb-84ba-b13d32050439',
+            'fact': (
+                "Task 2623's status is pending as of 2026-07-14T20:31:00Z, "
+                'linked to memory f20fbf15-41b7-4781-97a6-334f4e1d066a.'
+            ),
+            'name': '',
+        }
+        plural_edge = {
+            'uuid': 'edge-1020-1030-1031',
+            'fact': 'Tasks 1020, 1030, and 1031 are pairwise-stalled as of 2026-04-29.',
+            'name': '',
+        }
+        control_edge = {
+            'uuid': 'edge-3100-control', 'fact': 'Task 3100 is pending.', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [genitive_edge, plural_edge, control_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={
+                '1020': 'done', '1030': 'done', '1031': 'done',
+                '2623': 'done', '3100': 'pending',
+            },
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-3079', now=now,
+        )
+
+        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+            f'Expected both repro-shape edges invalidated and the still-pending '
+            f'control edge left alone, got stats={stats!r}'
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Expected update_edge awaited exactly twice, for the two repro-shape edges only'
+        )
+        invalidated_uuids = {call.args[0] for call in memory_service.update_edge.await_args_list}
+        assert invalidated_uuids == {
+            '3e78fd74-83a9-48bb-84ba-b13d32050439', 'edge-1020-1030-1031',
+        }, (
+            f'Expected only the two repro-shape edges invalidated, never the '
+            f'still-pending control edge, got {invalidated_uuids!r}'
+        )
+        for call in memory_service.update_edge.await_args_list:
+            assert call.kwargs.get('invalid_at') == now, (
+                f'Expected update_edge called with the explicit now= timestamp, got {call!r}'
+            )
+            assert call.kwargs.get('project_id') == 'test_project'
+            assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator'
+            assert call.kwargs.get('causation_id') == 'run-3079'
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert {'1020', '1030', '1031', '2623'} <= set(
+            get_statuses_call.kwargs.get('ids', [])
+        ), (
+            'Expected every candidate id to reach the cross-reference — 2623 from the '
+            'genitive shape, and ALL THREE of 1020/1030/1031 from the pairwise shape '
+            'rather than only the first, which is the precise gap the finding reports'
+        )
+
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — guards
