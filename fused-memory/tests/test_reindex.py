@@ -1,6 +1,7 @@
 """Tests for reindex maintenance: GraphitiBackend stale-embedding queries and ReindexManager."""
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -900,6 +901,52 @@ class TestRunReindex:
         assert call_kwargs.get('api_key') == 'test-key'
         assert call_kwargs.get('embedding_model') == standard_mock_config.embedder.model
         assert call_kwargs.get('embedding_dim') == standard_mock_config.embedder.dimensions
+
+    @pytest.mark.asyncio
+    async def test_reports_when_it_overrides_an_ambient_base_url(
+        self, standard_mock_config, make_fake_maintenance_service, monkeypatch, caplog,
+    ):
+        """The configured endpoint now WINS over OPENAI_BASE_URL, which is an
+        egress change for a re-embed run that used to follow that env var.
+        Announce it — a re-embed silently pointed at a different host would
+        bill and leak to somewhere the operator did not choose.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+        from fused_memory.config.schema import OpenAIProviderConfig
+
+        reset_warning_cache()
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        standard_mock_config.embedder.providers.openai = OpenAIProviderConfig(
+            api_key='test-key', api_url='http://127.0.0.1:5678/v1',
+        )
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+            caplog.at_level(logging.WARNING),
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()
+
+        reset_warning_cache()
+        assert any(
+            'OPENAI_BASE_URL' in r.message and 'http://127.0.0.1:5678/v1' in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_none_provider_block_yields_base_url_none(

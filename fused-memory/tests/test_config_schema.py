@@ -207,34 +207,71 @@ class TestLLMConfigClientClass:
         assert config.structured_output_mode == 'auto'
 
     def test_valid_structured_output_mode_json_object(self):
-        config = LLMConfig(structured_output_mode='json_object')
+        config = LLMConfig(
+            client_class='openai_generic', structured_output_mode='json_object',
+        )
         assert config.structured_output_mode == 'json_object'
 
     def test_invalid_structured_output_mode_raises_validation_error(self):
         with pytest.raises(ValidationError):
             LLMConfig(structured_output_mode='json_schema_strict')  # type: ignore[arg-type]
 
-    def test_shipped_config_yaml_does_not_opt_in(self, monkeypatch):
-        """The shipped deployment YAML must leave BOTH knobs at their defaults.
+    @pytest.mark.parametrize('client_class', ['openai', None])
+    def test_json_object_without_the_generic_client_is_rejected(self, client_class):
+        """The knob pair must not be settable into a silently-inert state.
 
-        Byte-identical guard: uncommenting either knob in config.yaml would
-        change the constructed graphiti LLM client for every existing
-        deployment. The examples in that file are deliberately commented out.
+        structured_output_mode is read on exactly one arm of build_llm_client.
+        An operator who uncomments it but forgets client_class would otherwise
+        get stock Responses-API behaviour with no warning, no log line and no
+        error — the no-silent-fail-soft failure mode
+        (docs/legibility/design-invariants.md). ``None`` covers omitting
+        client_class entirely, i.e. leaving it at its 'openai' default.
         """
-        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
-        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        kwargs = {'structured_output_mode': 'json_object'}
+        if client_class is not None:
+            kwargs['client_class'] = client_class
+
+        with pytest.raises(ValidationError) as exc:
+            LLMConfig(**kwargs)  # type: ignore[arg-type]
+
+        message = str(exc.value)
+        assert 'structured_output_mode' in message and 'client_class' in message, (
+            f'the error must name BOTH knobs so the fix is obvious: {message}'
+        )
+
+    def test_auto_mode_is_accepted_on_every_client_class(self):
+        """The default combination stays valid on both arms — the validator
+        must gate the opt-in, not the shipped configuration."""
+        assert LLMConfig(client_class='openai').structured_output_mode == 'auto'
+        assert LLMConfig(client_class='openai_generic').structured_output_mode == 'auto'
+
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_does_not_opt_in(self, monkeypatch, yaml_name):
+        """The shipped deployment YAMLs must leave BOTH knobs at their defaults.
+
+        Byte-identical guard: uncommenting either knob would change the
+        constructed graphiti LLM client for every existing deployment. The
+        examples in those files are deliberately commented out. Both files are
+        checked — config-docker.yaml is what containerised deployments load, so
+        guarding only config.yaml would leave that half unguarded.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
         cfg = FusedMemoryConfig()
         assert cfg.llm.client_class == 'openai', (
-            'fused-memory/config/config.yaml must leave llm.client_class at its '
+            f'fused-memory/config/{yaml_name} must leave llm.client_class at its '
             "'openai' default — the openai_generic example must stay commented out."
         )
         assert cfg.llm.structured_output_mode == 'auto', (
-            'fused-memory/config/config.yaml must leave llm.structured_output_mode '
+            f'fused-memory/config/{yaml_name} must leave llm.structured_output_mode '
             "at its 'auto' default — the json_object example must stay commented out."
         )
 
-    def test_shipped_config_yaml_shares_one_openai_api_url_default(self, monkeypatch):
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_shares_one_openai_api_url_default(
+        self, monkeypatch, yaml_name,
+    ):
         """llm and embedder provider blocks must resolve to the SAME api_url.
 
         Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
@@ -242,8 +279,8 @@ class TestLLMConfigClientClass:
         literals — but the shipped DEFAULT must stay shared, so a deployment that
         sets only OPENAI_API_URL keeps pointing both at one endpoint.
         """
-        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
-        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
 
         # Unset so the ${...:default} branch is exercised deterministically,
@@ -255,7 +292,7 @@ class TestLLMConfigClientClass:
         assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
         assert (
             cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
-        ), 'llm and embedder api_url defaults must stay identical in config.yaml'
+        ), f'llm and embedder api_url defaults must stay identical in {yaml_name}'
 
         # And when it IS set, both blocks follow it together.
         monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')

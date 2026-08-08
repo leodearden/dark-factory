@@ -12,6 +12,7 @@ away. No FalkorDriver, no Graphiti client, no real graph is touched here.
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,7 +20,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.prompts.models import Message
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import build_llm_client
@@ -124,6 +125,35 @@ class TestBuildLLMClientDefaultOpenAIPath:
 
         with pytest.raises(RuntimeError, match='PREFLIGHT_SENTINEL'):
             build_llm_client(mock_config)
+
+    def test_reports_when_it_overrides_an_ambient_base_url(
+        self, mock_config, monkeypatch, caplog,
+    ):
+        """api_url has a non-None default, so base_url is now ALWAYS passed and
+        config beats the openai SDK's OPENAI_BASE_URL fallback.
+
+        Intended — but a site that routes through a gateway by exporting
+        OPENAI_BASE_URL without setting OPENAI_API_URL has its traffic sent
+        back to api.openai.com by this change. An egress and billing change
+        must not be silent.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+
+        reset_warning_cache()
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', lambda: None,
+        )
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        mock_config.llm.providers.openai.api_url = 'https://api.openai.com/v1'
+
+        with caplog.at_level(logging.WARNING):
+            build_llm_client(mock_config)
+        reset_warning_cache()
+
+        assert any(
+            'OPENAI_BASE_URL' in r.message and 'https://api.openai.com/v1' in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
 
     def test_no_max_tokens_kwarg_on_the_default_arm(self, mock_config, monkeypatch):
         """Byte-identical regression guard for the default (shipped) arm.
@@ -285,7 +315,14 @@ class _Outer(BaseModel):
     note: str
 
 
-def _fake_openai_client(content: str = '{"ok": true}') -> MagicMock:
+# A payload that satisfies _Outer. The wrapper validates what it stopped asking
+# the server to enforce, so a response_model test needs a conforming reply —
+# an off-envelope one is now a (deliberate) retry-then-raise, covered
+# separately below.
+_VALID_OUTER = json.dumps({'items': [{'name': 'Alice'}], 'note': 'n'})
+
+
+def _fake_openai_client(content: str = _VALID_OUTER) -> MagicMock:
     """A stand-in for AsyncOpenAI, injected via OpenAIGenericClient(client=...).
 
     That constructor argument bypasses AsyncOpenAI construction entirely, so
@@ -359,9 +396,12 @@ class TestForceJsonObjectOpenAIGenericClient:
         assert '$ref' in json.dumps(schema)
 
     @pytest.mark.asyncio
-    async def test_override_changes_nothing_but_the_response_format(self):
+    async def test_override_changes_only_the_format_and_the_inlined_schema(self):
         """Everything else the request carries is untouched by the override —
-        so retry, tracing and message construction are unaffected."""
+        so retry, tracing and model/temperature selection are unaffected. The
+        two things that DO differ are the pair: response_format weakens to
+        json_object, and the schema it stopped enforcing moves into the prompt.
+        """
         from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 
         config = GraphitiLLMConfig(api_key='k', model='m', temperature=0.3)
@@ -378,11 +418,107 @@ class TestForceJsonObjectOpenAIGenericClient:
         forced_kwargs = dict(forced_fake.chat.completions.create.call_args.kwargs)
         stock_kwargs.pop('response_format')
         forced_kwargs.pop('response_format')
+
+        stock_messages = stock_kwargs.pop('messages')
+        forced_messages = forced_kwargs.pop('messages')
         assert stock_kwargs == forced_kwargs
+
+        # Same conversation shape; only the final message grows a schema block.
+        assert len(forced_messages) == len(stock_messages)
+        assert forced_messages[:-1] == stock_messages[:-1]
+        assert forced_messages[-1]['role'] == stock_messages[-1]['role']
+        assert forced_messages[-1]['content'].startswith(stock_messages[-1]['content'])
+
+    @pytest.mark.asyncio
+    async def test_inlines_the_schema_the_response_format_no_longer_carries(self):
+        """The compensation for dropping response_model.
+
+        graphiti-core 0.28.2's stock prompts never name the response envelope
+        or its field names — that came exclusively from the json_schema
+        response_format. Forcing json_object without putting the schema
+        somewhere would ask the model for "some valid JSON" and nothing more.
+        """
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client()
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        await client.generate_response(_messages(), response_model=_Outer)
+
+        prompt = fake.chat.completions.create.call_args.kwargs['messages'][-1]['content']
+        assert 'items' in prompt and 'note' in prompt, (
+            'the envelope field names must reach the model in-band'
+        )
+        assert '$defs' in prompt and '_Inner' in prompt, (
+            'the nested submodel definition must travel with the schema'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_response_model_leaves_the_prompt_untouched(self):
+        """Nothing to compensate for when upstream would already use
+        json_object — the messages must go through verbatim."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        stock_fake = _fake_openai_client()
+        forced_fake = _fake_openai_client()
+        config = GraphitiLLMConfig(api_key='k', model='m')
+        stock = OpenAIGenericClient(config=config, client=stock_fake)
+        forced = ForceJsonObjectOpenAIGenericClient(config=config, client=forced_fake)
+
+        await stock.generate_response(_messages())
+        await forced.generate_response(_messages())
+
+        assert (
+            forced_fake.chat.completions.create.call_args.kwargs
+            == stock_fake.chat.completions.create.call_args.kwargs
+        )
 
     @pytest.mark.asyncio
     async def test_returns_the_parsed_payload(self):
-        """The response is still json.loads'd and returned normally."""
+        """A conforming response is still json.loads'd and returned normally —
+        validation inspects it, it does not replace or coerce it."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client(_VALID_OUTER)
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        result = await client.generate_response(_messages(), response_model=_Outer)
+
+        assert result == {'items': [{'name': 'Alice'}], 'note': 'n'}
+
+    @pytest.mark.asyncio
+    async def test_off_envelope_json_raises_instead_of_being_returned(self):
+        """The silent-wrong-output guard.
+
+        Under json_object the server enforces only "some valid JSON". A
+        well-formed but off-envelope payload used to sail straight through to
+        downstream consumers — ``community_operations.py`` reads it with
+        ``.get('summary', '')`` and degrades to empty strings with no error at
+        all. Validating here converts that into a loud failure.
+        """
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client('{"ok": true}')  # valid JSON, wrong shape
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        with pytest.raises(ValidationError):
+            await client.generate_response(_messages(), response_model=_Outer)
+
+    @pytest.mark.asyncio
+    async def test_off_envelope_json_is_re_prompted_before_it_fails(self):
+        """A mismatch must reach upstream's retry loop, not bypass it.
+
+        ``generate_response`` retries on any non-rate-limit, non-transport
+        exception and appends the error text as a new user message. Raising
+        from inside ``_generate_response`` is what buys that self-correction —
+        validating one level up (or in the caller) would not.
+        """
         from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 
         fake = _fake_openai_client('{"ok": true}')
@@ -390,9 +526,57 @@ class TestForceJsonObjectOpenAIGenericClient:
             config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
         )
 
-        result = await client.generate_response(_messages(), response_model=_Outer)
+        with pytest.raises(ValidationError):
+            await client.generate_response(_messages(), response_model=_Outer)
 
-        assert result == {'ok': True}
+        assert fake.chat.completions.create.await_count > 1, (
+            'expected upstream to re-prompt before giving up'
+        )
+        final_messages = fake.chat.completions.create.call_args.kwargs['messages']
+        assert any(
+            'previous response attempt was invalid' in m['content'] for m in final_messages
+        ), 'the retry must carry the validation error back to the model'
+
+    @pytest.mark.asyncio
+    async def test_stock_client_returns_off_envelope_json_unchecked(self):
+        """Control: the behaviour the wrapper deliberately diverges from.
+
+        Pins that the validation above is OURS and not something upstream
+        already did — if a future wheel starts validating, this goes red and
+        the override can be reconsidered.
+        """
+        fake = _fake_openai_client('{"ok": true}')
+        client = OpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        assert await client.generate_response(
+            _messages(), response_model=_Outer,
+        ) == {'ok': True}
+
+    @pytest.mark.asyncio
+    async def test_schema_is_not_restacked_across_retries(self):
+        """The schema is appended to a COPY of the message list.
+
+        Upstream re-calls ``_generate_response`` with the same list it appended
+        its error message to. An in-place append here would stack one schema
+        block per attempt, growing the prompt geometrically.
+        """
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client('{"ok": true}')
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        with pytest.raises(ValidationError):
+            await client.generate_response(_messages(), response_model=_Outer)
+
+        for call in fake.chat.completions.create.call_args_list:
+            blob = json.dumps(call.kwargs['messages'])
+            assert blob.count('JSON Schema:') == 1, (
+                'the inlined schema must appear exactly once per request'
+            )
 
 
 class TestStructuredOutputModeSelection:
@@ -419,8 +603,19 @@ class TestStructuredOutputModeSelection:
         assert isinstance(client, OpenAIGenericClient)
         assert not isinstance(client, ForceJsonObjectOpenAIGenericClient)
 
-    def test_mode_is_inert_on_the_default_openai_arm(self, mock_config, monkeypatch):
-        """structured_output_mode applies ONLY to the generic client."""
+    def test_mode_is_inert_but_LOUD_on_the_default_openai_arm(
+        self, mock_config, monkeypatch, caplog,
+    ):
+        """structured_output_mode applies ONLY to the generic client — and says so.
+
+        Inertness itself is correct (the mode has no meaning for OpenAIClient),
+        but silent inertness is not: an operator who uncomments
+        structured_output_mode without also setting client_class would get
+        stock behaviour and no signal, then debug the llama.cpp $ref failure
+        the knob was supposed to have fixed. LLMConfig rejects that combination
+        at construction; this covers the post-construction mutation path, where
+        pydantic does not re-validate.
+        """
         from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 
         monkeypatch.setattr(
@@ -429,10 +624,45 @@ class TestStructuredOutputModeSelection:
         mock_config.llm.client_class = 'openai'
         mock_config.llm.structured_output_mode = 'json_object'
 
-        client = build_llm_client(mock_config)
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.__name__):
+            client = build_llm_client(mock_config)
 
         assert isinstance(client, OpenAIClient)
         assert not isinstance(client, ForceJsonObjectOpenAIGenericClient)
+
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'structured_output_mode' in m and 'client_class' in m for m in warnings
+        ), f'expected a warning naming BOTH knobs, got {warnings}'
+
+    def test_no_warning_when_the_mode_is_actually_honoured(self, mock_config, caplog):
+        """The warning must not cry wolf on the arm that does read the knob."""
+        mock_config.llm.client_class = 'openai_generic'
+        mock_config.llm.structured_output_mode = 'json_object'
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.__name__):
+            build_llm_client(mock_config)
+
+        assert not [
+            r for r in caplog.records if 'structured_output_mode' in r.message
+        ]
+
+    def test_mode_is_inert_but_LOUD_on_the_anthropic_arm(self, mock_config, caplog):
+        """The anthropic arm never reads the knob either."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        mock_config.llm.provider = 'anthropic'
+        mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='k')
+        mock_config.llm.structured_output_mode = 'json_object'
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.__name__):
+            with patch(
+                'graphiti_core.llm_client.anthropic_client.AnthropicClient',
+                MagicMock(name='AnthropicClient'),
+            ):
+                build_llm_client(mock_config)
+
+        assert any('structured_output_mode' in r.message for r in caplog.records)
 
 
 class TestBuildLLMClientBranchPreservation:

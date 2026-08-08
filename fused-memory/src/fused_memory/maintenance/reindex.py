@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.maintenance._utils import maintenance_service
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,13 @@ async def run_reindex(
         if openai_provider is not None:
             openai_api_key = openai_provider.api_key
             openai_base_url = openai_provider.api_url
+            # Config now wins over an ambient OPENAI_BASE_URL / OPENAI_API_BASE
+            # that used to steer this tool. Same egress change as the graphiti
+            # and mem0 paths; report it rather than silently re-pointing a
+            # re-embed run at a different host.
+            warn_if_ambient_base_url_is_overridden(
+                openai_base_url, context='reindex embedder',
+            )
         embedder_config = OpenAIEmbedderConfig(
             api_key=openai_api_key,
             embedding_model=emb_cfg.model,

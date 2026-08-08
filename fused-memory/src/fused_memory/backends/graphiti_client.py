@@ -33,6 +33,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -146,9 +147,36 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
     anthropic branch is unaffected by it.
     """
+    # LLMConfig's validator already rejects this combination at construction,
+    # but pydantic does not re-validate on attribute assignment, so a config
+    # mutated after loading — how tests and per-arm harnesses build variants —
+    # reaches here unchecked. Warn rather than raise: by this point the config
+    # is loaded and a hard failure would take down a server over a knob that is
+    # merely inert. Covers the anthropic arm too, where the mode is equally
+    # meaningless.
+    if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
+        logger.warning(
+            f'llm.structured_output_mode={cfg.llm.structured_output_mode!r} is IGNORED: '
+            f'it applies only to llm.client_class="openai_generic", and client_class is '
+            f'{cfg.llm.client_class!r} (provider={cfg.llm.provider!r}). The client being '
+            'built will use its stock structured-output behaviour.'
+        )
+
     if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
         api_key = cfg.llm.providers.openai.api_key
         if api_key:
+            # api_url has a non-None default ('https://api.openai.com/v1',
+            # config/schema.py OpenAIProviderConfig), so base_url below is now
+            # ALWAYS passed. That makes config authoritative over the ambient
+            # OPENAI_BASE_URL / OPENAI_API_BASE fallback the openai SDK would
+            # otherwise apply — which is the point of this plumbing, but it is
+            # not a no-op for a site that routes through a gateway by exporting
+            # OPENAI_BASE_URL without setting OPENAI_API_URL: that traffic now
+            # goes back to api.openai.com. An egress/billing change must not be
+            # silent, hence the warning.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='graphiti LLM',
+            )
             llm_config = GraphitiLLMConfig(
                 api_key=api_key,
                 model=cfg.llm.model,
@@ -183,15 +211,17 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # configuration, which a local endpoint may reject outright or
                 # which may overrun its served context.
                 # ForceJsonObjectOpenAIGenericClient overrides only
-                # _generate_response, so it inherits this __init__ unchanged.
-                if cfg.llm.structured_output_mode == 'json_object':
-                    llm_client = ForceJsonObjectOpenAIGenericClient(
-                        config=llm_config, max_tokens=cfg.llm.max_tokens,
-                    )
-                else:
-                    llm_client = OpenAIGenericClient(
-                        config=llm_config, max_tokens=cfg.llm.max_tokens,
-                    )
+                # _generate_response, so it inherits this __init__ unchanged —
+                # which is why the mode can select the CLASS and leave one
+                # shared construction call. Keeping a single call site is
+                # deliberate: two copies of the argument list are how one arm
+                # silently drifts from the other when a kwarg is added.
+                generic_cls: type[OpenAIGenericClient] = (
+                    ForceJsonObjectOpenAIGenericClient
+                    if cfg.llm.structured_output_mode == 'json_object'
+                    else OpenAIGenericClient
+                )
+                llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
                 check_openai_responses_api()
                 llm_client = OpenAIClient(config=llm_config)

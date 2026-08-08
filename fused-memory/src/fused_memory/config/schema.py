@@ -244,6 +244,37 @@ class LLMConfig(BaseModel):
     #                   (backends/llm_clients.ForceJsonObjectOpenAIGenericClient).
     structured_output_mode: Literal['auto', 'json_object'] = Field(default='auto')
 
+    @model_validator(mode='after')
+    def _structured_output_mode_requires_the_generic_client(self):
+        """Reject a structured_output_mode that no client would ever honour.
+
+        ``structured_output_mode`` is read on exactly one arm of
+        ``build_llm_client`` — the ``client_class='openai_generic'`` one. An
+        operator who uncomments ``structured_output_mode: "json_object"`` in
+        config.yaml but forgets ``client_class: "openai_generic"`` would
+        otherwise get stock Responses-API behaviour with no warning, no log
+        line and no error, and then debug the very llama.cpp $ref failure the
+        knob was supposed to have fixed. Silent inertness is exactly what
+        docs/legibility/design-invariants.md's no-silent-fail-soft forbids, so
+        the mismatch is a hard config error.
+
+        Note this only fires at CONSTRUCTION. pydantic does not re-run
+        model validators on attribute assignment (``validate_assignment`` is
+        off), so a config mutated after the fact — which is how tests and
+        per-arm harnesses build variants — slips past. ``build_llm_client``
+        carries the matching runtime warning for that path.
+        """
+        if self.structured_output_mode != 'auto' and self.client_class != 'openai_generic':
+            raise ValueError(
+                f"llm.structured_output_mode={self.structured_output_mode!r} requires "
+                f"llm.client_class='openai_generic', but client_class is "
+                f'{self.client_class!r}. The mode is read only when building '
+                'graphiti-core\'s OpenAIGenericClient; on any other arm it would be '
+                "silently ignored. Set client_class: 'openai_generic' alongside it, or "
+                "leave structured_output_mode at its 'auto' default."
+            )
+        return self
+
 
 # --- Embedder ---
 

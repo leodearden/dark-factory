@@ -24,12 +24,13 @@ construction, no real graph. The LLM path is exercised through the extracted
 ``build_llm_client`` seam, never ``initialize()``.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _mock_openai_server import mock_openai_server
 from graphiti_core.prompts.models import Message
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from fused_memory.backends.graphiti_client import build_llm_client
 from fused_memory.config.schema import (
@@ -57,6 +58,13 @@ class _Extraction(BaseModel):
     """Nested submodel → model_json_schema() emits $defs/$ref."""
 
     items: list[_Inner]
+
+
+# ForceJsonObjectOpenAIGenericClient validates the payload against the
+# response_model it stopped asking the server to enforce, so a mock reply must
+# conform or the request is (correctly) re-prompted. Tests that count requests
+# therefore serve this; the off-envelope path is asserted explicitly below.
+VALID_EXTRACTION = json.dumps({'items': [{'name': 'Alice'}]})
 
 
 @pytest.fixture
@@ -96,6 +104,7 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
         self, no_ambient_openai_env,
     ):
         with mock_openai_server() as server:
+            server.chat_content = VALID_EXTRACTION
             cfg = _config(server.base_url, server.base_url)
             client = build_llm_client(cfg)
             assert client is not None
@@ -121,6 +130,7 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
         mocked create() kwarg. A response_model IS passed, yet the body on the
         wire asks for json_object."""
         with mock_openai_server() as server:
+            server.chat_content = VALID_EXTRACTION
             cfg = _config(server.base_url, server.base_url)
             client = build_llm_client(cfg)
             assert client is not None
@@ -147,6 +157,7 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
         so this pins the recorded request body.
         """
         with mock_openai_server() as server:
+            server.chat_content = VALID_EXTRACTION
             cfg = _config(server.base_url, server.base_url)
             cfg.llm.max_tokens = 2048  # distinct from schema default 4096 and upstream 16384
             client = build_llm_client(cfg)
@@ -180,6 +191,65 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
 
             body = server.requests_to('/chat/completions')[0]['json_body']
             assert body['response_format']['type'] == 'json_schema'
+
+    @pytest.mark.asyncio
+    async def test_schema_travels_in_band_when_the_response_format_drops_it(
+        self, no_ambient_openai_env,
+    ):
+        """Over real HTTP: forcing json_object must not leave the model blind.
+
+        graphiti-core 0.28.2's prompts never name the response envelope — that
+        came only from the json_schema response_format. This asserts on the
+        bytes actually sent that the schema moved into the prompt rather than
+        disappearing.
+        """
+        with mock_openai_server() as server:
+            server.chat_content = VALID_EXTRACTION
+            cfg = _config(server.base_url, server.base_url)
+            client = build_llm_client(cfg)
+            assert client is not None
+
+            await client.generate_response(
+                [Message(role='user', content='Alice knows Bob.')],
+                response_model=_Extraction,
+            )
+
+            body = server.requests_to('/chat/completions')[0]['json_body']
+            assert body['response_format'] == {'type': 'json_object'}
+            prompt = body['messages'][-1]['content']
+            assert 'items' in prompt and '$defs' in prompt, (
+                'the envelope the response_format stopped enforcing must reach '
+                f'the model in the prompt instead; got: {prompt!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_off_envelope_reply_is_re_prompted_then_fails_loudly(
+        self, no_ambient_openai_env,
+    ):
+        """The silent-wrong-output guard, end to end.
+
+        Under json_object the server enforces only "some valid JSON" — exactly
+        what the llama.cpp arm returns when it ignores $ref/$defs. A conforming
+        reply is not something we can assume, so the client checks, re-prompts
+        via upstream's retry loop, and ultimately raises rather than handing
+        off-envelope JSON to downstream ``.get()`` calls that read it as empty.
+        """
+        with mock_openai_server() as server:
+            server.chat_content = '{"ok": true}'  # valid JSON, wrong shape
+            cfg = _config(server.base_url, server.base_url)
+            client = build_llm_client(cfg)
+            assert client is not None
+
+            with pytest.raises(ValidationError):
+                await client.generate_response(
+                    [Message(role='user', content='Alice knows Bob.')],
+                    response_model=_Extraction,
+                )
+
+            chat_requests = server.requests_to('/chat/completions')
+            assert len(chat_requests) > 1, 'expected a re-prompt before giving up'
+            final_prompt = json.dumps(chat_requests[-1]['json_body']['messages'])
+            assert 'previous response attempt was invalid' in final_prompt
 
 
 class TestReindexEmbedderPathReachesConfiguredEndpoint:
@@ -239,6 +309,7 @@ class TestIndependentLLMAndEmbedderEndpoints:
 
         with mock_openai_server() as llm_server, mock_openai_server() as embedder_server:
             assert llm_server.base_url != embedder_server.base_url
+            llm_server.chat_content = VALID_EXTRACTION
             cfg = _config(llm_server.base_url, embedder_server.base_url)
 
             client = build_llm_client(cfg)

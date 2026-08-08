@@ -1484,3 +1484,127 @@ class TestBuildConfigDictEndpointPlumbing:
         assert 'embedding_dims' in embedder_params
         assert 'embedding_model_dims' not in embedder_params
         assert 'embedding_model_dims' in vector_store_params
+
+
+class TestNonDefaultDimsAgainstAnExistingCollection:
+    """The migration hazard behind plumbing embedder.dimensions at all.
+
+    Neither dims key was plumbed before, so a deployment already configured
+    with ``embedder.dimensions != 1536`` was running INERT: mem0 created its
+    Qdrant collection at its own 1536 default and requested 1536-wide vectors.
+    Both now follow the config — but only for a collection that does not exist
+    yet. Changing the knob on a live deployment therefore requires recreating
+    and re-embedding the collection; it is not live-migratable.
+    """
+
+    @staticmethod
+    def _fake_qdrant_client(existing: list[str]):
+        collections = MagicMock()
+        collections.collections = [MagicMock(name=n) for n in existing]
+        # MagicMock(name=...) sets the mock's repr name, not a .name attribute.
+        for mock_col, real_name in zip(collections.collections, existing, strict=True):
+            mock_col.name = real_name
+
+        client = MagicMock()
+        client.get_collections.return_value = collections
+        return client
+
+    def test_existing_collection_is_left_at_its_old_dimensionality(self):
+        """Upstream short-circuits, so the new dims never reach Qdrant.
+
+        Measured against the installed mem0: ``Qdrant.create_col`` returns
+        early when the collection is already listed ('Collection ... already
+        exists. Skipping creation.'). The embedder meanwhile DOES start
+        requesting N-wide vectors, so every subsequent upsert fails on a
+        dimension mismatch at runtime. Pinning it here means a future mem0 that
+        learns to migrate — or to fail loudly — turns this red instead of
+        leaving a stale operator note in place.
+        """
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client(['fused_dark_factory'])
+
+        Qdrant(
+            collection_name='fused_dark_factory',
+            embedding_model_dims=768,
+            client=client,
+        )
+
+        client.create_collection.assert_not_called()
+
+    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
+        """Control: the plumbing does work — on a collection that does not yet
+        exist, which is the only case where changing dimensions is safe."""
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client([])
+
+        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
+
+        client.create_collection.assert_called_once()
+        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
+        assert vectors_config.size == 768
+
+
+class TestAmbientBaseUrlPrecedenceIsReported:
+    """Config is now authoritative over OPENAI_BASE_URL / OPENAI_API_BASE.
+
+    That is intended — a written-down endpoint should beat an inherited env
+    var — but for a site that routed OpenAI traffic through a gateway by
+    exporting OPENAI_BASE_URL without OPENAI_API_URL, it silently sends that
+    traffic back to api.openai.com. An egress and billing change must be
+    announced (docs/legibility/design-invariants.md, no-silent-fail-soft).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_warn_cache(self):
+        from fused_memory.config.env_precedence import reset_warning_cache
+
+        reset_warning_cache()
+        yield
+        reset_warning_cache()
+
+    @pytest.mark.parametrize('var', ['OPENAI_BASE_URL', 'OPENAI_API_BASE'])
+    def test_disagreeing_env_var_is_reported(self, mock_config, monkeypatch, caplog, var):
+        monkeypatch.setenv(var, 'https://gateway.example.invalid/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            var in m and 'https://api.openai.com/v1' in m for m in messages
+        ), f'expected a warning naming {var} and the configured endpoint, got {messages}'
+
+    def test_agreeing_env_var_is_silent(self, mock_config, monkeypatch, caplog):
+        """No warning when the environment and the config already agree —
+        otherwise the signal is noise on a correctly-configured deployment."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'OPENAI_BASE_URL' in r.message]
+
+    def test_unset_env_is_silent(self, mock_config, monkeypatch, caplog):
+        for var in ('OPENAI_BASE_URL', 'OPENAI_API_BASE'):
+            monkeypatch.delenv(var, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'takes precedence' in r.message]
+
+    def test_repeated_builds_warn_only_once(self, mock_config, monkeypatch, caplog):
+        """_build_config_dict runs once per project instance; an unguarded
+        warning would repeat per project and read as a fresh incident."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        backend = Mem0Backend(mock_config)
+
+        with caplog.at_level(logging.WARNING):
+            backend._build_config_dict('c1')
+            backend._build_config_dict('c2')
+
+        hits = [r for r in caplog.records if 'takes precedence' in r.message]
+        # One for the llm block, one for the embedder block — not four.
+        assert len(hits) == 2, [r.message for r in hits]

@@ -6,6 +6,7 @@ from typing import Any
 
 from mem0 import AsyncMemory
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
@@ -144,6 +145,18 @@ class Mem0Backend:
                     # with, and mem0's own default is already 1536
                     # (mem0/configs/vector_stores/qdrant.py), so emitting it
                     # unconditionally is a no-op at the shipped config.
+                    #
+                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
+                    # EXISTING deployment: neither key was plumbed before, so
+                    # such a config was inert — mem0 created the collection at
+                    # its own 1536 default and requested 1536-wide vectors.
+                    # Both now follow the config, but mem0's
+                    # QdrantDB.create_col short-circuits when the collection
+                    # already exists ('Collection ... already exists. Skipping
+                    # creation.'), leaving a 1536-wide collection that every
+                    # N-wide upsert then fails against at runtime. Changing
+                    # embedder.dimensions requires recreating and re-embedding
+                    # the Qdrant collection; it is not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
@@ -151,6 +164,13 @@ class Mem0Backend:
 
         # LLM
         if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+            # See the openai_base_url comment below: config now wins over the
+            # ambient env fallback, which is an egress change for a gateway
+            # deployment that set only OPENAI_BASE_URL. Report it, don't
+            # redirect silently.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='mem0 LLM',
+            )
             config_dict['llm'] = {
                 'provider': 'openai',
                 'config': {
@@ -182,6 +202,9 @@ class Mem0Backend:
 
         # Embedder
         if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
+            warn_if_ambient_base_url_is_overridden(
+                cfg.embedder.providers.openai.api_url, context='mem0 embedder',
+            )
             embedder_config: dict[str, Any] = {
                 'model': cfg.embedder.model,
                 'api_key': cfg.embedder.providers.openai.api_key,
