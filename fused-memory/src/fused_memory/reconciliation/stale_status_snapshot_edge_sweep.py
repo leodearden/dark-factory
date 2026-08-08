@@ -120,12 +120,12 @@ logger = logging.getLogger(__name__)
 
 # Status markers this sweep treats as non-terminal snapshot assertions,
 # split by part of speech. 'active'/'pending'/'in progress' are adjectives
-# only; 'blocked' is ALSO a common transitive verb and so is matched only in
-# copula/article form — see the transitive-verb caveat in the module
-# docstring (task 3042), which mirrors task 2824's on
+# only; 'blocked' and 'stalled' are ALSO common transitive verbs and so are
+# matched only in copula/article form — see the transitive-verb caveat in
+# the module docstring (tasks 3042, 3079), which mirrors task 2824's on
 # task_filter.PRESENT_TENSE_COMPLETION_RE.
 _ADJECTIVE_MARKER_ALT = r'(?:active|pending|in[-\s]?progress)'
-_TRANSITIVE_MARKER_ALT = r'(?:blocked)'
+_TRANSITIVE_MARKER_ALT = r'(?:blocked|stalled)'
 
 # Copula/linking verbs admitted as a closed-class connective. Shared by both
 # arms of INDIVIDUAL_SNAPSHOT_RE — optional for the adjective arm, mandatory
@@ -176,6 +176,20 @@ _GAP_EXCLUDED_ALT = (
 # reviewer_comprehensive correctness-precision finding, task 3042)
 _GAP_NO_TASK_REF = r'(?!(?:task|df|\d)\w*\b)'
 
+# An optional hyphenated-compound modifier immediately before the marker, so
+# 'pairwise-stalled' anchors to its copula exactly as bare 'stalled' does
+# ('Tasks A, B and C are pairwise-stalled' — the finding's verbatim fact).
+#
+# DELIBERATELY a single hyphenated token: '\w+' cannot match whitespace or
+# punctuation, so this admits one compound modifier and nothing else. Were it
+# allowed to span whitespace it would become an open-class gap and re-admit
+# the very readings the mandatory-copula arms exist to exclude ('Tasks A and
+# B are awaiting a blocked merge' — the MERGE is blocked). Used only in the
+# adjacency-anchored arms (individual, genitive, plural enumeration); the
+# phrase form needs no equivalent, since its marker is pinned on the far
+# side by the literal noun 'status'. (task 3079)
+_COMPOUND_PREFIX = r'(?:\w+-)?'
+
 # The union of both marker classes. Derived from the two constants above
 # rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
 # anchored matchers can never drift apart again — before task 3042 they were
@@ -213,9 +227,22 @@ SNAPSHOT_STATUS_RE: re.Pattern[str] = re.compile(
 # from an aggregate list segment before bare-digit extraction, so an
 # embedded count phrase (e.g. '...tasks: 142, 148, and 200 total remain')
 # never contributes a spurious id.
+#
+# This alternation must be kept in step with _STATUS_MARKER_ALT. It is the
+# one _STATUS_MARKER_ALT consumer that is NOT safe by default under a marker
+# widening, and so the concrete reason the module's standing marker-addition
+# rule exists: the gate merely admits a fact for consideration, the phrase
+# form requires the literal noun 'status' after the marker, and the list
+# introducer requires adjacency to the list noun — but a marker missing HERE
+# silently turns a count phrase into a task id ('Stalled tasks: 1020, 1030,
+# and 3 stalled others' would yield a spurious 3). 'stalled' added for task
+# 3079. Deliberately a separate literal list rather than an interpolation of
+# _STATUS_MARKER_ALT: this one also carries non-marker count nouns
+# ('tasks', 'done', 'total', 'deferred'), so the two sets overlap without
+# either containing the other.
 COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
     r'\b\d+\s+(?:tasks?|active|pending|in[-\s]?progress|done|cancell?ed|'
-    r'blocked|deferred|review|total|merge[-\s]?deferred)\b',
+    r'blocked|stalled|deferred|review|total|merge[-\s]?deferred)\b',
     re.IGNORECASE,
 )
 
@@ -239,11 +266,11 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     + r'(?:'
     # adjective arm — optional copula (task 2613 behaviour, unchanged)
     + r'\s*' + _COPULA_ALT + r'?\s*' + _ADVERB_ALT + r'(?:an?\s+)?'
-    + _ADJECTIVE_MARKER_ALT
+    + _COMPOUND_PREFIX + _ADJECTIVE_MARKER_ALT
     + r'|'
     # transitive-capable arm — copula or article is MANDATORY
     + r'\s+(?:' + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?|an?\s+)'
-    + _TRANSITIVE_MARKER_ALT
+    + _COMPOUND_PREFIX + _TRANSITIVE_MARKER_ALT
     + r')\b',
     re.IGNORECASE,
 )
@@ -282,7 +309,7 @@ GENITIVE_STATUS_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
     + r"(?:'|’)s\s+status\s+"
     + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?'
-    + _STATUS_MARKER_ALT + r'\b',
+    + _COMPOUND_PREFIX + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
 
@@ -422,7 +449,7 @@ _ENUM_IDS_ALT = r'\d+(?:' + _ENUM_SEP_ALT + r'\d+)+'
 PLURAL_ENUM_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     r'\btasks\b\s*#?\s*(?P<ids>' + _ENUM_IDS_ALT + r')\s*,?\s*'
     + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:all\s+)?(?:an?\s+)?'
-    + _STATUS_MARKER_ALT + r'\b',
+    + _COMPOUND_PREFIX + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
 
