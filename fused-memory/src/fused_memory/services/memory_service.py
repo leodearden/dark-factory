@@ -3367,6 +3367,30 @@ class MemoryService:
         When include_planned=False (default), edges and memories from planning
         episodes (temporal_context='planning') are excluded.  Set include_planned=True
         to include them — useful for reconciliation and auditing.
+
+        Ordering (task 3658, PRD D4).  Each responding store ranks its own
+        results — Mem0 by cosine descending, Graphiti by its backend rank — and
+        the two are merged by Reciprocal Rank Fusion with ``K = RRF_K``, ties
+        broken by (router primary store, store-internal rank).  The router's
+        primary store is a TIEBREAK ONLY; it is no longer precedence, so
+        neither store can fill ``limit`` and shut the other out.
+
+        Scores.  ``relevance_score`` is the fused RRF value and is **ORDINAL,
+        never a similarity**: single-store rank-1 is 1/61 ~ 0.0164 no matter
+        how good the match is.  Do not threshold it, do not compare it across
+        API versions, and do not compare it to a cosine.  Per-store truth lives
+        in ``metadata``:
+
+          - ``store_rank`` — int, 1-based rank within the store that returned
+            it (over that store's surviving results; deliberately not
+            renumbered by the category filter below, since it is a per-store
+            telemetry fact rather than a position in the merged output).
+          - ``store_score`` — the Mem0 cosine, verbatim; ``None`` for Graphiti,
+            whose public search() exposes no scores at all.
+
+        ``degraded`` / ``failed_stores`` / ``failure_diagnostics`` and
+        per-store error absorption are unchanged: a store that raises or times
+        out is absorbed, and the surviving store's results are still returned.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
@@ -3429,10 +3453,17 @@ class MemoryService:
                     failed_stores.append(store_list[i])
                     failure_diagnostics.append(diag)
 
-        # Sort: primary store results first, then by relevance score
-        def sort_key(r: MemoryResult) -> tuple[int, float]:
-            is_primary = 0 if r.source_store == route.primary_store else 1
-            return (is_primary, -r.relevance_score)
+        # Merge by Reciprocal Rank Fusion (task 3658, PRD D4).  Primary sort is
+        # the fused score descending; the router's primary store is only a
+        # TIEBREAK — it used to be outright precedence, which let one store
+        # fill `limit` and made the other structurally unreachable.  Store rank
+        # is the final tiebreak, which makes the ordering total and
+        # deterministic (is_primary already distinguishes the only two stores
+        # that can tie on score).  Read store_rank defensively so a result from
+        # a future code path that lacks the key can never raise here.
+        def sort_key(r: MemoryResult) -> tuple[float, int, int]:
+            primary_rank = 0 if r.source_store == route.primary_store else 1
+            return (-r.relevance_score, primary_rank, r.metadata.get('store_rank', 0))
 
         results.sort(key=sort_key)
 
