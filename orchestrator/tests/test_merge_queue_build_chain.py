@@ -1007,3 +1007,155 @@ class TestBuildChainDegenerate:
         assert res.truncated_at is None
         assert res.truncated_reason is None
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-13: RED — build_chain clean chain in ONE worktree
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestBuildChainClean:
+    """A clean 3-item chain builds in exactly one worktree."""
+
+    async def _three_disjoint_branches(self, git_repo: Path) -> list[str]:
+        return [
+            await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n'),
+            await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n'),
+            await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n'),
+        ]
+
+    async def test_clean_chain_from_main_sha_head(self, git_repo: Path, monkeypatch):
+        """head == main_sha (the frozen-prefix-empty variant of frozen_prefix_tip)."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        tips = await self._three_disjoint_branches(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        calls = _count_spec_lane_acquires(git_ops, monkeypatch)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        # Order and identity.
+        assert [tid for tid, _ in res.links] == ['101', '102', '103']
+        shas = [sha for _, sha in res.links]
+        assert len(set(shas)) == 3
+        for sha in shas:
+            assert len(sha) == 40
+            assert sha == sha.strip()
+
+        assert res.tip == shas[-1]
+        assert res.depth == 3
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+
+        # Exactly ONE worktree used — this task's headline signal.
+        added = await _worktree_names(git_ops) - before
+        assert added == {'_spec-0'}
+        assert len(calls) == 1
+
+        # Lane ownership on the success path: γ verifies the tip in place.
+        assert res.lane == git_ops.worktree_base / '_spec-0'
+        assert res.lane_warm is True
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.ASSIGNED
+
+        # Cumulative tree correctness — the chain is a real superset, which is
+        # why ONE verify can authorise the whole prefix.
+        assert await _rev_parse(res.lane) == res.tip
+        assert (res.lane / 'a.txt').read_text() == 'edit-101\n'
+        assert (res.lane / 'b.txt').read_text() == 'edit-102\n'
+        assert (res.lane / 'c.txt').read_text() == 'edit-103\n'
+
+        # Linear first-parent history in land order; second parent = branch tip.
+        assert await _rev_parse(res.lane, f'{shas[2]}^1') == shas[1]
+        assert await _rev_parse(res.lane, f'{shas[1]}^1') == shas[0]
+        assert await _rev_parse(res.lane, f'{shas[0]}^1') == head
+        for sha, tip in zip(shas, tips, strict=True):
+            assert await _rev_parse(res.lane, f'{sha}^2') == tip
+
+        # The documented release path works end to end.
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.FREE
+
+    async def test_clean_chain_from_a_frozen_merge_commit_head(self, git_repo: Path):
+        """head == a prior merge commit (the frozen-prefix-non-empty variant)."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/100', 'z.txt', 'edit-100\n')
+        await self._three_disjoint_branches(git_repo)
+        main_sha = await _rev_parse(git_repo)
+
+        # Mimic frozen_prefix_tip: the newest frozen item's merge commit.
+        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seeded = await git_ops.merge_branch_into_worktree(seed_wt, '100')
+        assert seeded.success is True
+        head = seeded.merge_commit
+        assert head is not None
+        await git_ops.cleanup_merge_worktree(seed_wt)
+
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert [tid for tid, _ in res.links] == ['101', '102', '103']
+        assert res.truncated_at is None
+        assert res.lane is not None
+        assert await _rev_parse(res.lane, f'{res.links[0][1]}^1') == head
+        # The frozen head's own content is still present under the chain tip.
+        assert (res.lane / 'z.txt').read_text() == 'edit-100\n'
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_target_depth_stop_is_not_a_truncation(self, git_repo: Path):
+        """cap=6, target_depth=2 over a 3-item snapshot → first two, no truncation."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await self._three_disjoint_branches(git_repo)
+        head = await _rev_parse(git_repo)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=2)
+
+        assert [tid for tid, _ in res.links] == ['101', '102']
+        assert res.tip == res.links[1][1]
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_cap_stop_is_not_a_truncation(self, git_repo: Path):
+        """cap=2, target_depth=6 over a 3-item snapshot → first two, no truncation."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await self._three_disjoint_branches(git_repo)
+        head = await _rev_parse(git_repo)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=2, target_depth=6)
+
+        assert [tid for tid, _ in res.links] == ['101', '102']
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
