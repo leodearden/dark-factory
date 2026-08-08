@@ -46,9 +46,13 @@ if str(REPO_ROOT) not in sys.path:
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    DRAIN_SCRIPT_CMDLINE_MARKER,
     LEAK_SELF_TERMINATION_CEILING_SECS,
+    LEAK_TOKEN_ENV,
     WAIT_PROOF_GRACE_FLOOR_SECS,
     WAIT_PROOF_GRACE_MULTIPLIER,
+    leaked_drain_process_reason,
+    leaked_drain_processes,
     run_in_new_session,
     wait_proof_grace_secs,
 )
@@ -420,3 +424,148 @@ class TestWaitProofGraceSecs:
         """
         assert wait_proof_grace_secs(3) == 30
         assert wait_proof_grace_secs(20) == 80
+
+
+# ---------------------------------------------------------------------------
+# The in-suite guard's pure core.
+#
+# Driven against SYNTHETIC /proc trees under tmp_path, so the scan logic is
+# testable without leaking a single real process.
+# ---------------------------------------------------------------------------
+
+_DRAIN_CMDLINE = b'bash\x00/repo/scripts/restart-all-orchestrators.sh\x00--drain\x00'
+_OTHER_CMDLINE = b'bash\x00/repo/scripts/some-other-script.sh\x00'
+
+
+def _proc_entry(
+    proc_root: Path, pid: int, cmdline: bytes, environ: bytes | None,
+) -> None:
+    """Write one synthetic ``/proc/<pid>`` entry.
+
+    *environ* of ``None`` writes NO environ file at all — the shape of a pid
+    that exited between the directory listing and the read.
+    """
+    entry = proc_root / str(pid)
+    entry.mkdir(parents=True)
+    (entry / 'cmdline').write_bytes(cmdline)
+    if environ is not None:
+        (entry / 'environ').write_bytes(environ)
+
+
+def _environ_with(token: str, *, extra: bytes = b'PATH=/usr/bin\x00') -> bytes:
+    """A NUL-separated environ block carrying *token*, as /proc renders it."""
+    return extra + LEAK_TOKEN_ENV.encode() + b'=' + token.encode() + b'\x00'
+
+
+class TestLeakedDrainProcesses:
+    """Which surviving processes count as THIS session's leak."""
+
+    def test_a_process_matching_both_marker_and_token_is_reported(
+        self, tmp_path: Path,
+    ) -> None:
+        _proc_entry(tmp_path, 4242, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        leaks = leaked_drain_processes('tok', proc_root=tmp_path)
+
+        assert [pid for pid, _ in leaks] == [4242]
+        assert 'restart-all-orchestrators.sh' in leaks[0][1]
+
+    def test_the_drain_marker_alone_is_not_enough(self, tmp_path: Path) -> None:
+        """A genuine or concurrent --drain must NEVER fail this suite.
+
+        `merge_verify_breadth: "full"` runs this suite in many worktrees at
+        once, and the main checkout is machine-operated (CLAUDE.md) — the
+        deployed watchdog and the merge coordinator both run --drain for real.
+        A bare `pgrep -f restart-all-orchestrators.sh` would fail those runs
+        spuriously, which is why the token is required as well.
+        """
+        _proc_entry(tmp_path, 11, _DRAIN_CMDLINE, b'PATH=/usr/bin\x00')
+        _proc_entry(tmp_path, 12, _DRAIN_CMDLINE, _environ_with('another-session'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_a_token_that_merely_prefixes_ours_is_not_a_match(
+        self, tmp_path: Path,
+    ) -> None:
+        """Matched as a whole NUL-delimited assignment, not a substring.
+
+        Without the delimiters, session `tok` would match session `tokZZZ`'s
+        processes and fail a run for another worktree's leak.
+        """
+        _proc_entry(tmp_path, 21, _DRAIN_CMDLINE, _environ_with('tokZZZ'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_the_token_alone_is_not_enough(self, tmp_path: Path) -> None:
+        """These two directories hold ~90 test files that spawn subprocesses.
+
+        Scanning for "any surviving descendant" rather than the drain script
+        would flake constantly on all of them.
+        """
+        _proc_entry(tmp_path, 31, _OTHER_CMDLINE, _environ_with('tok'))
+
+        assert leaked_drain_processes('tok', proc_root=tmp_path) == []
+
+    def test_a_vanished_pid_does_not_raise(self, tmp_path: Path) -> None:
+        """Scanning /proc races process exit by construction."""
+        _proc_entry(tmp_path, 41, _DRAIN_CMDLINE, None)  # no environ file
+        _proc_entry(tmp_path, 42, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert [pid for pid, _ in leaked_drain_processes('tok', proc_root=tmp_path)] == [42]
+
+    def test_non_numeric_proc_entries_are_skipped(self, tmp_path: Path) -> None:
+        """Real /proc holds `self`, `meminfo`, `net`, ... — none of them pids."""
+        (tmp_path / 'meminfo').write_bytes(b'MemTotal: 1 kB\n')
+        (tmp_path / 'self').mkdir()
+        _proc_entry(tmp_path, 51, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert [pid for pid, _ in leaked_drain_processes('tok', proc_root=tmp_path)] == [51]
+
+    def test_an_empty_or_missing_token_matches_nothing(self, tmp_path: Path) -> None:
+        """A falsy token must fail CLOSED on the match, never open.
+
+        Treating it as "match everything" would turn the guard into a
+        suite-wide false-positive generator the first time the fixture failed
+        to stamp its token.
+        """
+        _proc_entry(tmp_path, 61, _DRAIN_CMDLINE, _environ_with('tok'))
+
+        assert leaked_drain_processes('', proc_root=tmp_path) == []
+        assert leaked_drain_processes(None, proc_root=tmp_path) == []
+
+    def test_the_real_proc_tree_is_scannable(self) -> None:
+        """The default proc_root works on this box.
+
+        The task's own evidence — every sampled orphan identified by its
+        `PYTEST_CURRENT_TEST` environ value — already proves environ scanning is
+        permitted here; this pins it so a hardened kernel would fail loudly
+        rather than silently reporting all-clear forever.
+        """
+        leaks = leaked_drain_processes('a-token-no-process-can-carry-3798')
+
+        assert isinstance(leaks, list)
+        assert leaks == []
+
+
+class TestLeakedDrainProcessReason:
+    """The failure message has to be actionable on its own."""
+
+    def test_no_leaks_is_not_a_violation(self) -> None:
+        assert leaked_drain_process_reason([]) is None
+
+    def test_it_names_every_pid_its_cmdline_and_the_remedy(self) -> None:
+        """Mirrors deploy_clock_violation_reason's "name the remedy" convention.
+
+        Asserted on the pid, the cmdline and the remedy SYMBOL, never on prose
+        wording — the message is triage text and must stay editable.
+        """
+        reason = leaked_drain_process_reason([
+            (4242, 'bash /repo/scripts/restart-all-orchestrators.sh --drain'),
+            (4243, 'bash /repo/scripts/restart-all-orchestrators.sh --drain'),
+        ])
+
+        assert reason is not None
+        assert '4242' in reason and '4243' in reason
+        assert 'restart-all-orchestrators.sh' in reason
+        assert '3798' in reason
+        assert 'run_in_new_session' in reason
