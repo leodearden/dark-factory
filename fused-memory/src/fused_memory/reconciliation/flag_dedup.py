@@ -258,6 +258,7 @@ from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
@@ -4026,5 +4027,120 @@ def filter_contamination_ceiling_findings(
             # do NOT append — flag is dropped
         else:
             kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting that an entry's content was injected, fabricated, or
+#: written by someone outside this deployment.  Several spellings are listed
+#: because the family has no committed schema entry — Stage 1 emits it as
+#: free-form LLM output, so the set is a best-effort census of the plausible
+#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
+#: spelling degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
+    'possible_injection',
+    'prompt_injection',
+    'injected_content',
+    'possible_fabrication',
+    'fabricated_content',
+    'foreign_authorship',
+    'suspicious_authorship',
+})
+
+
+async def filter_style_only_authorship_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop injection/fabrication flags whose cited entries are house-authored.
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign to
+    it — it never read the stored ``agent_id``.  Writing style is not evidence
+    of authorship; provenance is.
+
+    A flag is a CANDIDATE iff its ``flag_type`` is in
+    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
+    citation in ``cited_memories`` is resolved via
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
+    ``metadata`` is the raw Qdrant payload and therefore still carries the
+    top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
+    on the search and ``get`` paths — and classified with
+    :func:`~fused_memory.reconciliation.internal_writers.is_internal_writer`.
+
+    **Fail-safe direction**: this filter DROPS a security-shaped signal, so it
+    drops ONLY on positively-confirmed wholly-internal authorship — at least
+    one agent_id resolved AND every resolved one is a recognised house writer.
+    Every other outcome KEEPS the flag: a foreign agent_id, a missing/empty
+    one, a mixed citation set (a partially-internal claim is not cleared), and
+    a candidate with no resolvable citations at all (an unattributable claim
+    stays flaggable).  The asymmetry is deliberate — wrongly keeping a flag
+    costs one noisy finding the next cycle clears, while wrongly dropping one
+    silently disables the detection.
+
+    Non-candidate flags pass through untouched and are never looked up.
+
+    Args:
+        memory_service: Object with an async ``get_memory_by_id(project_id,
+            memory_id)`` method, typically ``self.memory`` in
+            MemoryConsolidator.
+        project_id: Project scope for the lookup.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        Filtered list with confirmed-house-authored authorship flags removed.
+        A new list; the input list and its dicts are never mutated here.
+    """
+    candidate_positions: list[int] = [
+        i for i, flag in enumerate(flags)
+        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+    if not candidate_positions:
+        return list(flags)
+
+    async def _classify(flag: dict[str, Any]) -> list[dict[str, Any]]:
+        """Resolve every mem0 citation on *flag* to a provenance record."""
+        checked: list[dict[str, Any]] = []
+        for entry in flag.get('cited_memories') or []:
+            memory_id = entry.get('memory_id')
+            record = await memory_service.get_memory_by_id(project_id, memory_id)
+            agent_id = (record.get('metadata') or {}).get('agent_id')
+            checked.append({
+                'memory_id': memory_id,
+                'agent_id': agent_id,
+                'classification': 'internal' if is_internal_writer(agent_id) else 'foreign',
+            })
+        return checked
+
+    checked_by_pos: dict[int, list[dict[str, Any]]] = dict(
+        zip(
+            candidate_positions,
+            await asyncio.gather(*[_classify(flags[i]) for i in candidate_positions]),
+            strict=True,
+        ),
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        checked = checked_by_pos.get(i)
+        if checked is None:
+            kept.append(flag)
+            continue
+        if checked and all(c['classification'] == 'internal' for c in checked):
+            logger.info(
+                'reconciliation.style_only_authorship_flag_dropped '
+                'flag_type=%s agent_ids=%s memory_ids=%s',
+                flag.get('flag_type'),
+                [c['agent_id'] for c in checked],
+                [c['memory_id'] for c in checked],
+            )
+            continue  # drop: every cited entry is provably house-authored
+        kept.append(flag)
 
     return kept
