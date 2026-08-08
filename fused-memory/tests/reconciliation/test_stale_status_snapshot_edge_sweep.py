@@ -638,6 +638,16 @@ class TestExtractSnapshotEdgeTaskIds:
             # of the kind SNAPSHOT_STATUS_PHRASE_RE carries.
             "Task 5's status report is pending review.",
             "Task 5's status update is pending.",
+            # HYPHENATED negation / past-exit, reaching the marker through
+            # the compound-modifier prefix rather than through the copula
+            # slot. The closed-class _ADVERB_ALT does not see these — the
+            # inverting token is fused to the marker, not a separate word —
+            # so _COMPOUND_PREFIX carries its own exclusion lookahead.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            "Task 5's status is un-blocked.",
+            "Task 5's status is non-blocked.",
+            "Task 5's status is previously-blocked.",
         ],
     )
     def test_genitive_status_form_precision_guards(self, fact):
@@ -724,6 +734,28 @@ class TestExtractSnapshotEdgeTaskIds:
             'Reviews of tasks 1020, 1030, and 1031 are pending.',
             'Work on tasks 1020 and 1030 is blocked.',
             'The dependency between tasks 1020 and 1030 is blocked.',
+            # DETERMINER between the preposition and the list noun. These
+            # defeated the original fixed-width-lookbehind spelling of the
+            # guard wholesale — one extremely common word re-opened every
+            # entry in the preposition list at once, and the suite's own
+            # positive case 'The tasks 1020 and 1030 are blocked.' is the
+            # head of exactly this shape. Plural agreement does not save
+            # them: 'Statuses'/'Reviews'/'Notes' are plural, which is the
+            # residue the preposition check exists to cover. (amendment,
+            # reviewer_comprehensive correctness-precision finding, task
+            # 3079)
+            'Statuses of the tasks 1020 and 1030 are blocked.',
+            'Reviews for the tasks 1020 and 1030 are pending.',
+            'Notes about the tasks 1020 and 1030 are pending.',
+            'Reviews of these tasks 1020 and 1030 are pending.',
+            'Notes regarding all tasks 1020 and 1030 are pending.',
+            # multi-space / newline gap before the list noun — the other
+            # defect the fixed-offset lookbehind could not see
+            'Reviews for  the\n  tasks 1020 and 1030 are pending.',
+            # HYPHENATED negation / past-exit reaching the marker through
+            # _COMPOUND_PREFIX rather than the closed-class adverb slot
+            'Tasks 1020 and 1030 are un-blocked.',
+            'Tasks 1020 and 1030 are previously-blocked.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
@@ -906,14 +938,76 @@ class TestExtractSnapshotEdgeTaskIds:
 
         'pairwise-stalled' anchors to its copula via a bounded optional
         '\\w+-' prefix. Deliberately ONE hyphenated token: were it allowed
-        to span whitespace it would become an open-class gap and re-admit
-        the readings the mandatory-copula arms exist to exclude — here, a
+        to span whitespace it would additionally admit the multi-word
+        readings the mandatory-copula arms exist to exclude — here, a
         merge that is blocked rather than the tasks.
+
+        NOTE this pins the gap's WIDTH only. Its LEXICAL CLASS is a
+        separate property with its own test below — the two were once
+        conflated, which is how the un-/non-/previously- class slipped in.
         """
         assert extract_snapshot_edge_task_ids(
             'Tasks 1020 and 1030 are awaiting a blocked merge.'
         ) == set()
         assert extract_snapshot_edge_task_ids('Task 5 is awaiting stalled work.') == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 is un-blocked.',
+            'Task 5 is non-blocked.',
+            'Task 5 is not-pending.',
+            'Task 5 is never-blocked.',
+            'Task 5 is previously-blocked.',
+            'Task 5 is formerly-pending.',
+            'Task 5 is once-blocked.',
+            'Task 5 is briefly-stalled.',
+        ],
+    )
+    def test_compound_prefix_refuses_inverting_modifiers(self, fact):
+        """A hyphenated negation / past-exit prefix must not reach the marker.
+
+        (amendment, reviewer_comprehensive correctness-precision finding,
+        task 3079)
+
+        The bare-marker forms of these ARE already refused, for free, by
+        the closed-class ``_ADVERB_ALT`` — 'Task 5 is no longer blocked'
+        and 'Task 5 is not blocked' never matched, because those tokens
+        simply are not in the alternation. The compound prefix reopened
+        the same class through a different door: bounding it to a single
+        non-whitespace-crossing token bounds its WIDTH, not its lexical
+        class, and 'un-'/'non-'/'previously-' are each one '\\w+-' token.
+
+        Each fact here is a permanently-true HISTORICAL or negated
+        assertion. Extracting an id from one means the sweep retires a
+        still-true edge as soon as that id goes done/cancelled — the
+        over-selection direction the module docstring forbids, and
+        unrecoverable, since an invalidated Graphiti edge is not
+        re-validated on the next cycle.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, 1030, and 1031 are pairwise-stalled.', {1020, 1030, 1031}),
+            ('Task 5 is merge-blocked.', {5}),
+            ('Task 5 is self-blocked.', {5}),
+            ('Tasks 7 and 8 are auto-stalled.', {7, 8}),
+            ("Task 5's status is merge-blocked.", {5}),
+        ],
+    )
+    def test_compound_prefix_still_admits_ordinary_modifiers(self, fact, expected):
+        """Non-inverting compound modifiers must keep matching. (task 3079)
+
+        The exclusion above is a closed SUBTRACTION from an open-class
+        prefix, not a whitelist: the observed modifier vocabulary
+        ('pairwise-', 'merge-', 'self-', 'auto-') is not closed, and an
+        unlisted-but-innocent modifier must not silently drop a genuine
+        snapshot. 'pairwise-stalled' is the finding's verbatim fact shape,
+        so this is the case the prefix exists for in the first place.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
 
 
 # --------------------------------------------------------------------------- #
