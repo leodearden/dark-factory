@@ -413,3 +413,139 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
         TripwireItem(item_key=key, passed=passed)
         for key, passed in sorted(by_key.items())
     ]
+
+
+# ---------------------------------------------------------------------------
+# Family (1) — is a superseded entry still outranking its successor?
+#
+# Corpus-DISCOVERED pairs (from live `supersedes` metadata), not registry
+# declared ones. beta's `superseded-above-successor` measures the registry
+# population under a different eval_id; this measures whatever the corpus
+# actually claims about itself today.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SurfacingRecord:
+    """One both-present pair and where each member landed.
+
+    Both ids and both ranks: a bare count tells an operator that something
+    inverted but not which pair to go and look at.
+    """
+
+    successor_id: str
+    superseded_id: str
+    successor_rank: int
+    superseded_rank: int
+
+    @property
+    def inverted(self) -> bool:
+        return self.superseded_rank < self.successor_rank
+
+
+@dataclass(frozen=True)
+class SurfacingObservation:
+    """Family (1)'s exposure, event count and detail.
+
+    ``pairs_comparable`` is the metric's ``n`` and ``still_surfacing`` is its
+    value; ``records`` holds every both-present pair (the superseded entry
+    coming back AT ALL is worth reading even when it came back below its
+    successor) and ``inversions`` the subset that counted.
+    """
+
+    pairs_comparable: int
+    still_surfacing: int
+    records: tuple[SurfacingRecord, ...]
+    inversions: tuple[SurfacingRecord, ...]
+
+
+EMPTY_SURFACING = SurfacingObservation(
+    pairs_comparable=0, still_surfacing=0, records=(), inversions=(),
+)
+"""The zero-exposure observation. ``build_series`` emits no metric for it."""
+
+
+def rank_index(ranked_ids: list[str]) -> dict[str, int]:
+    """``{memory id: 1-based first position}`` over the list the store returned.
+
+    Position, not score: equal ``relevance_score`` values resolve by the order
+    the store handed back rather than by an unstable re-sort, so two runs over
+    the same list produce the same count. A tie that flapped would look to the
+    evaluator like a real regression.
+
+    ``setdefault`` keeps the FIRST occurrence: a store that returned the same
+    id twice has still returned it at its best rank, and taking the later one
+    would report a ranking problem that is really a duplication one.
+    """
+    first_rank: dict[str, int] = {}
+    for index, memory_id in enumerate(ranked_ids, start=1):
+        if memory_id:
+            first_rank.setdefault(memory_id, index)
+    return first_rank
+
+
+def superseded_surfacing(
+    pairs: list[tuple[str, str]],
+    ranked_ids: list[str],
+    *,
+    ranks: dict[str, int] | None = None,
+) -> SurfacingObservation:
+    """Score ``(successor_id, superseded_id)`` *pairs* against one ranked list.
+
+    **Both-present-only exposure.** A pair with just one member in
+    *ranked_ids* contributes nothing to the count AND nothing to
+    ``pairs_comparable``. An inversion can only ever fire on a both-present
+    pair, so a half-present one carries no possibility of an event; charging
+    it to the exposure anyway makes the rate move for the wrong reason. It is
+    also already measured elsewhere — an absent successor is a findability
+    question — and counting it here as well would charge one defect against
+    two metrics, inflating any downstream trend by double-weighting a single
+    fix.
+
+    That is why the metric's ``n`` is the comparable-pair count rather than
+    the number of ``supersedes`` edges discovered: if retrieval improves so
+    that forty pairs come back both-present instead of four, the event count
+    can rise while a discovered-pair ``n`` stays pinned, and leaf α's Poisson
+    tail test would read a retrieval IMPROVEMENT as a rate regression.
+
+    Pass *ranks* (a :func:`rank_index` of the same list) when the caller
+    already has it.
+    """
+    index = rank_index(ranked_ids) if ranks is None else ranks
+    records: list[SurfacingRecord] = []
+    for successor_id, superseded_id in pairs:
+        successor_rank = index.get(successor_id)
+        superseded_rank = index.get(superseded_id)
+        if successor_rank is None or superseded_rank is None:
+            continue
+        records.append(SurfacingRecord(
+            successor_id=successor_id,
+            superseded_id=superseded_id,
+            successor_rank=successor_rank,
+            superseded_rank=superseded_rank,
+        ))
+    inversions = tuple(record for record in records if record.inverted)
+    return SurfacingObservation(
+        pairs_comparable=len(records),
+        still_surfacing=len(inversions),
+        records=tuple(records),
+        inversions=inversions,
+    )
+
+
+def combine_surfacing(observations: list[SurfacingObservation]) -> SurfacingObservation:
+    """Fold per-query observations into the one the artifact reports.
+
+    Each pair is scored against the ranked list of ITS OWN query (the search
+    is derived from the successor's content), so a run produces one
+    observation per pair rather than one for the whole sweep. Exposure and
+    events are additive across those queries; concatenating the details keeps
+    every pair nameable in the report.
+    """
+    records = tuple(r for obs in observations for r in obs.records)
+    inversions = tuple(r for obs in observations for r in obs.inversions)
+    return SurfacingObservation(
+        pairs_comparable=sum(obs.pairs_comparable for obs in observations),
+        still_surfacing=sum(obs.still_surfacing for obs in observations),
+        records=records,
+        inversions=inversions,
+    )
