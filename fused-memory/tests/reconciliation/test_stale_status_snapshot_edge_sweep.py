@@ -32,6 +32,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -858,6 +859,91 @@ class TestExtractSnapshotEdgeTaskIds:
             'Tasks 1020 and 1030 are awaiting a blocked merge.'
         ) == set()
         assert extract_snapshot_edge_task_ids('Task 5 is awaiting stalled work.') == set()
+
+
+# --------------------------------------------------------------------------- #
+# extract_snapshot_edge_task_ids — catastrophic-backtracking regression
+# --------------------------------------------------------------------------- #
+
+
+class TestPluralEnumerationPerformance:
+    """The plural enumeration separator must parse in linear, not exponential, time.
+
+    (amendment, reviewer_comprehensive performance-redos finding, task 3079)
+
+    ``_ENUM_SEP_ALT``'s trailing ``\\s*`` overlaps its own leading
+    ``\\s*,\\s*`` / ``\\s+``, so a whitespace run between two ids can be
+    apportioned between those elements in ``len(run) + 1`` distinct ways.
+    Under ``_ENUM_IDS_ALT``'s ``+`` repetition that is ``(w + 1) ** n``
+    parses, ALL of which get explored when the overall match ultimately
+    FAILS — which is the common case, since most enumerations in real prose
+    are not followed by a copula and a status marker.
+
+    Why this is a liveness property and not a micro-optimisation:
+    ``sweep_stale_status_snapshot_edges`` calls this extractor once per
+    valid edge in an unguarded dict comprehension with no per-edge timeout,
+    over the whole group's edge set (~5868 edges in the task-3042 record).
+    One pathological fact stalls the entire reconciliation cycle.
+
+    SIZING NOTE: the blowup base scales with the WIDTH of the whitespace
+    run — each extra whitespace character adds another way to split it — so
+    the three shapes are ~2**n, ~3**n and ~6**n and are NOT interchangeable.
+    Each size below was measured pre-fix on this branch to land several
+    times over the budget while staying BOUNDED, so a regression presents as
+    a fast failure rather than a hang. A flat ~40-id input would instead
+    cost ~2**40 and hang until the session died.
+    """
+
+    #: Wall-clock budget for a single extract call. Post-fix all three
+    #: variants land at ~0.1ms, a >10,000x margin, so this is nowhere near
+    #: the CI-flake boundary.
+    BUDGET_SECONDS = 1.0
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize(
+        ('sep', 'count'),
+        [
+            # measured pre-fix: ~6.1s (base ~2**n)
+            (', ', 20),
+            # measured pre-fix: ~4.6s (base ~3**n)
+            (',  ', 13),
+            # measured pre-fix: ~16.6s (base ~6**n) — a newline-indented
+            # list of only NINE ids already wedges the sweep, a far lower
+            # real-world trigger threshold than a flat 2**n reading implies
+            (',\n    ', 9),
+        ],
+        ids=['comma-space', 'comma-two-spaces', 'comma-newline-indent'],
+    )
+    def test_long_non_matching_enumeration_parses_in_linear_time(self, sep, count):
+        """A long enumeration that does NOT match must not backtrack exponentially.
+
+        The fact is real prose this module targets: a plural head, a genuine
+        comma-separated id enumeration, and then a verb phrase that is NOT a
+        copula + status marker — so ``PLURAL_ENUM_SNAPSHOT_RE`` fails, which
+        is exactly what forces the engine to explore every apportionment of
+        every whitespace run.
+
+        ``@pytest.mark.timeout(60)`` is only a backstop: pytest-timeout's
+        default signal method cannot interrupt a C-level ``re`` match, so the
+        elapsed-time assertion below is the real regression signal.
+        """
+        ids = [str(1000 + i) for i in range(count)]
+        fact = f'Pending tasks {sep.join(ids)} were reviewed by the merge worker.'
+
+        start = time.perf_counter()
+        extracted = extract_snapshot_edge_task_ids(fact)
+        elapsed = time.perf_counter() - start
+
+        # Correctness is pinned alongside cost, so the budget can never be
+        # satisfied by making the pattern simply stop matching valid input:
+        # 'were reviewed by' is not a copula + status marker, so nothing is a
+        # candidate here regardless of how fast the parse is.
+        assert extracted == set()
+        assert elapsed < self.BUDGET_SECONDS, (
+            f'extract_snapshot_edge_task_ids took {elapsed:.3f}s for {count} ids '
+            f'separated by {sep!r} (budget {self.BUDGET_SECONDS}s) — the '
+            f'enumeration separator is backtracking exponentially'
+        )
 
 
 # --------------------------------------------------------------------------- #
