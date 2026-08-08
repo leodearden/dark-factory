@@ -16,7 +16,6 @@ RESOLVES through it rather than holding a re-inlined copy.
 
 from __future__ import annotations
 
-import pytest
 from _oauth_accounts import (
     ALL_TOKEN_LETTERS,
     FLEET_TOKEN_LETTERS,
@@ -56,7 +55,8 @@ class TestLetterSets:
         one edit, or this goes red.  A restated literal would be a fourth copy
         wearing a single-home badge.
         """
-        assert ALL_TOKEN_LETTERS == ('A', *FLEET_TOKEN_LETTERS)
+        derived_from_fleet = ('A', *FLEET_TOKEN_LETTERS)
+        assert derived_from_fleet == ALL_TOKEN_LETTERS
 
     def test_all_set_reaches_the_interactive_primary_account(self):
         assert 'A' in ALL_TOKEN_LETTERS
@@ -193,7 +193,3 @@ class TestFirstAvailableToken:
     def test_agrees_with_available_tokens_first_entry(self):
         environ = _env('D', 'B', 'G')
         assert first_available_token(environ) == available_tokens(environ)[0]
-
-
-if __name__ == '__main__':  # pragma: no cover
-    raise SystemExit(pytest.main([__file__]))
