@@ -1509,8 +1509,6 @@ def create_mcp_server(
         refused delete is retried next cycle; a silently permitted one
         manufactures the L2.
         """
-        if not isinstance(agent_id, str) or not agent_id.startswith('recon-stage-'):
-            return None, None
         if store != 'mem0':
             return None, None
         if not _taskmaster_configured or project_id not in _kp:
