@@ -125,11 +125,26 @@ class TestRepoOf:
     def test_reify_project_maps_to_reify(self) -> None:
         assert repo_of(_cand(project='reify')) == 'reify'
 
+    def test_know_live_project_id_maps_to_kl(self) -> None:
+        # Third repo axis (task 3631): know-live task 543 is one of the
+        # fable-trial-v2 hard-pool census candidates, so it must classify.
+        assert repo_of(_cand(project='know_live')) == 'kl'
+
+    def test_know_live_hyphenated_fixture_spelling_maps_to_kl(self) -> None:
+        # Same dual-spelling normalisation as df: fused-memory's project_id
+        # 'know_live' and the fixture-JSON project string 'know-live'.
+        assert repo_of(_cand(project='know-live')) == 'kl'
+
     def test_unknown_project_raises_loudly(self) -> None:
         # Loud-over-silent: repo is a hard stratification axis; an
         # unrecognised project is an error, not a silent default.
         with pytest.raises(ValueError):
             repo_of(_cand(project='some-other-project'))
+
+    def test_still_raises_on_unknown_after_third_axis_added(self) -> None:
+        # Adding kl must not soften the ValueError branch into a default.
+        with pytest.raises(ValueError):
+            repo_of(_cand(project='graphify'))
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +359,23 @@ class TestDefaultVerifyCommands:
         assert 'cargo test' in cmds['test']
         assert 'clippy' in cmds['lint']
 
+    def test_kl_uses_know_lives_real_gate_commands(self) -> None:
+        # Read from /home/leo/src/know-live/dark-factory-orchestrator.yaml —
+        # test_command / lint_command / type_check_command. know-live is a
+        # Python repo; its lint gate also runs the import-linter.
+        cmds = default_verify_commands('kl')
+        assert set(cmds) == {'test', 'lint', 'typecheck'}
+        assert cmds['test'] == 'uv run pytest -q'
+        assert cmds['lint'] == 'uv run ruff check src/ tests/ && uv run lint-imports'
+        assert cmds['typecheck'] == 'uv run mypy src/'
+
+    def test_kl_returns_a_fresh_copy(self) -> None:
+        # Fresh-copy contract: mutating the returned dict must not poison the
+        # module-level template for the next caller.
+        cmds = default_verify_commands('kl')
+        cmds['test'] = 'mutated'
+        assert default_verify_commands('kl')['test'] == 'uv run pytest -q'
+
     def test_unknown_repo_raises_loudly(self) -> None:
         with pytest.raises(ValueError):
             default_verify_commands('some-other-repo')
@@ -426,6 +458,23 @@ class TestBuildFixtureRecord:
         assert rec['provenance']['plan_source'] == 'unavailable'
         assert rec['id'] == 'reify_task_99'
         assert rec['project'] == 'reify'
+
+    def test_know_live_candidate_builds_kl_record(self) -> None:
+        # The third repo axis end-to-end: know-live task 543 is a
+        # fable-trial-v2 hard-pool candidate, so _CANONICAL_PROJECT must
+        # resolve 'kl' or build_fixture_record raises KeyError.
+        cand = _cand(
+            task_id='543', project='know_live',
+            project_root='/home/leo/src/know-live',
+            title='know-live 543', description='a brief',
+        )
+        rec = build_fixture_record(
+            cand, _ref(), default_verify_commands('kl'),
+            plan=None, cohort='fable-trial-v2-hard', sampled_at='t',
+        )
+        assert rec['id'] == 'kl_task_543'
+        assert rec['project'] == 'know-live'
+        assert rec['verify_commands'] == default_verify_commands('kl')
 
     def test_record_is_json_serializable(self) -> None:
         # No dataclass / non-JSON types must leak into the emitted fixture.
