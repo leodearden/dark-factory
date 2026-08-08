@@ -454,24 +454,26 @@ def test_scripts_diff_is_lint_gated() -> None:
 
     NOTE on (2) — written in the lock_depth-AGNOSTIC form, never pinning a
     literal such as ``derive_modules(...) == ['scripts']``. Three layers stack
-    here and they do not agree: the pydantic Field default is 2, the
-    package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` ships
-    ``lock_depth: 4`` over it on every load, and THIS project's
-    ``dark-factory-orchestrator.yaml`` overrides that to 12 — so 12 is the
-    EFFECTIVE value under the autouse config binding. ``SAMPLE_TOUCHED_FILE``
-    is 3 path components, below the truncation threshold at 4 AND at 12, so
-    ``derive_modules([SAMPLE_TOUCHED_FILE], cfg.lock_depth)`` returns the full
-    path whole at either depth and the conclusion is unaffected. What matters
-    is that each derived key RESOLVES back to this config. Task 3350's sibling
+    here and they do not agree: the pydantic Field default, the
+    package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` layered
+    over it on every load, and THIS project's ``dark-factory-orchestrator
+    .yaml`` overriding both — the last of which is what the autouse config
+    binding resolves. The conclusion does not turn on which value that is:
+    ``SAMPLE_TOUCHED_FILE`` is 3 path components, below the truncation
+    threshold at every layer, so ``derive_modules([SAMPLE_TOUCHED_FILE],
+    cfg.lock_depth)`` returns the full path whole regardless. What matters is
+    that each derived key RESOLVES back to this config. Task 3350's sibling
     guard hit this exact trap and documented it; pinning the literal would
     re-encode a falsified constant.
 
         CORRECTED IN PLACE (task 3866): this note used to assert "the
-        EFFECTIVE value is 4" and reason "at depth 4". The defaults.yaml half
-        is still true — the package really does ship 4 — but calling 4
-        EFFECTIVE stopped being true when this project moved lock_depth
-        4 -> 12. Recorded rather than silently rewritten, because the note
-        exists precisely to document a falsified constant.
+        EFFECTIVE value is 4" and reason "at depth 4", which stopped being
+        true when this project moved lock_depth 4 -> 12. Recorded rather than
+        silently rewritten, because the note exists precisely to document a
+        falsified constant — and for the same reason the repair states the
+        invariant instead of naming 12, which would only queue up the next
+        correction. Read the number from ``cfg.lock_depth`` if you ever need
+        it; do not assert it in prose.
     """
     discovered = _discovered()
 

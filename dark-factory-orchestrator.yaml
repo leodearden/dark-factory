@@ -303,22 +303,20 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # _discover_module_configs registers a module iff the directory DIRECTLY
 # contains an `orchestrator.yaml` carrying at least one overridable field, and
 # it SKIPS prefix == '.'. A skills/orchestrator.yaml (prefix `skills`, depth 1)
-# is well inside the effective lock_depth — so it WOULD be discovered.
-# Registering one is feasible. It is declined.
+# is inside lock_depth at EVERY layer the config can resolve — the pydantic
+# Field default, the package-bundled defaults.yaml, and this project's own
+# override alike — so it WOULD be discovered. Registering one is feasible. It
+# is declined. And it could never cover conftest.py or df_pytest_isolation.py
+# regardless, so widening the head above was REQUIRED independent of this
+# decision.
 #
 #   CORRECTED IN PLACE (task 3866), same treatment this block gives its own
-#   superseded premises. This sentence used to read "well inside the effective
-#   lock_depth of 4 — the package-bundled defaults.yaml ships lock_depth: 4,
-#   layered over the pydantic Field default of 2". The layering description is
-#   still accurate — the package still ships 4 over a Field default of 2 — but
-#   "effective ... 4" is now FALSE for THIS project: `lock_depth: 12` at line 59
-#   of this very file overrides it. The conclusion is unchanged and the premise
-#   only got stronger: prefix depth 1 is well inside 12 exactly as it was inside
-#   4, so the decision to decline still stands on the same reasoning.
-#
-# And it could never cover conftest.py or
-# df_pytest_isolation.py regardless, so widening the head above was REQUIRED
-# independent of this decision.
+#   superseded premises. This used to read "well inside the effective
+#   lock_depth of 4", which stopped being true when `lock_depth` moved 4 -> 12
+#   (line 59 of this file). The conclusion never depended on the number: depth
+#   1 is inside 2, 4 and 12 alike. So it is now stated as the invariant rather
+#   than re-pinned to 12 — the next retune of that knob falsifies nothing here
+#   and needs no edit to this comment.
 #
 # THE DECIDING FACT, which is what turns a deferral into a decision, and which
 # 3485 could not see because the lever did not exist until its own commit
