@@ -27,7 +27,8 @@ shape it copies.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, field
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -73,6 +74,41 @@ _QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\
 # guard is guaranteed to CO-OCCUR rather than to filter, and the split would
 # move a LOCAL task's facts onto a bogus 'task:2500' entity.
 _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
+
+# An UNANCHORED mention of a task number in prose — the scan-side twin of
+# _TASK_NODE_NAME_PATTERN, sharing its separator alternation so every spelling
+# the anchored parser accepts ('task 5', 'task #5', 'Task: 5') is also seen
+# here. This ONE pattern replaces BOTH of cross_project_refs' pre-3667
+# _BARE_TASK_MENTION_PATTERN and _BARE_TASK_COLON_PATTERN, which differed only
+# in their separator; keeping them apart would leave two vocabulary copies
+# inside the very module that exists to eliminate copies (INV-5).
+#
+# - The '(?<![\w:-])' lookbehind refuses word-glued lookalikes ('subtask 5',
+#   'multitask 3', 'reify-task 12') and — decisively for the colon form — the
+#   'task: N' substring INSIDE 'subtask: N', which would otherwise suppress a
+#   real foreign ref.
+# - '(?!\d)' anchors the number's right edge so a truncated prefix is never
+#   captured.
+_LOCAL_MENTION_PATTERN = re.compile(
+    r'(?<![\w:-])tasks?(?:\s*[#:]\s*|\s+)(\d+)(?!\d)', re.IGNORECASE
+)
+
+# A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
+# from cross_project_refs with its rationale — each clause encodes a specific
+# measured false positive, so do NOT re-derive them.
+#
+# - The lookbehind rejects a qualifier glued to a preceding word character or
+#   path/URL punctuation, which is what keeps source locations
+#   ('graphiti_client.py:2091' — '.py' is preceded by '.'), URL authorities
+#   ('example.com:8080'), colon-chained tokens ('a:b:3') and digit-prefixed
+#   junk ('2500dark_factory:2500') out.
+# - The qualifier must start with a letter, so clock times ('12:30') never
+#   match, and must be at least 3 characters, so short non-project tokens
+#   ('w6:2', 'py:3', 'a:1') never match.
+# - '\s*' around the colon tolerates the spacing humans actually write.
+# - '(?!\d)' anchors the number's right edge so a truncated prefix is never
+#   captured.
+_QUALIFIED_REF_PATTERN = re.compile(r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)(?!\d)')
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -177,3 +213,150 @@ def parse_node_name(name: str) -> Referent | None:
         # reaching here is a word-glued lookalike, not a task label at all.
         return None
     return Referent(kind='task', project_id=project_id, number=number)
+
+
+@dataclass(frozen=True)
+class LabelScan:
+    """The referents found in one body of content.
+
+    Frozen for the same reason :class:`Referent` is: a scan is evidence for
+    destructive graph surgery, not a mutable accumulator.
+    """
+
+    #: Referents safe to act on, in first-seen positional order,
+    #: de-duplicated on (kind, project_id, number).
+    refs: list[Referent] = field(default_factory=list)
+    #: Referents whose number is claimed by BOTH an own-project and a
+    #: foreign-qualified mention in the same content. Such content is
+    #: genuinely ambiguous about which task the facts belong to, so a consumer
+    #: must refuse to act on it and say so loudly rather than guess.
+    ambiguous: list[Referent] = field(default_factory=list)
+
+
+def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset[str] | None:
+    """Canonicalize *known_project_ids*, or return None for permissive mode.
+
+    Returns None when the registry is missing or empty. That is PERMISSIVE by
+    design and mirrors ``validate_known_project_id``'s documented
+    empty-registry mode: failing closed would silently disable this protection
+    entirely on any deployment that never wires the registry, which is the
+    exact silent-degradation failure mode this scanner exists to eliminate.
+
+    A path-shaped registry key is skipped rather than normalized (normalizing a
+    mangled path would mint a new, wrong canonical key — RCA §4) and rather
+    than raised, so one bad entry never disables the whole allowlist.
+    """
+    if not known_project_ids:
+        return None
+    canonical = set()
+    for raw in known_project_ids:
+        try:
+            canonical.add(canonicalize_project_id(raw))
+        except PathShapedProjectIdError:
+            continue
+    return frozenset(canonical)
+
+
+def scan_content(
+    content: str,
+    *,
+    group_id: str,
+    known_project_ids: Collection[str] | None = None,
+) -> LabelScan:
+    """Scan *content* for every task referent it mentions.
+
+    The UNANCHORED counterpart to :func:`parse_node_name`: this answers "what
+    does this prose refer to", reading the VERBATIM body rather than extracted
+    node names or LLM-restated facts, because a project qualifier is exactly
+    what entity extraction discards.
+
+    PRECISION OVER RECALL. Consumers perform destructive edge surgery, so a
+    false positive misattributes a fact — the same bug in the opposite
+    direction. The narrowings that make that safe live in the compiled
+    patterns above and are deliberately conservative.
+
+    KNOWN BLIND SPOTS, so no reader assumes completeness: a node named with
+    bare digits ('1251'), a reference made by task TITLE rather than number,
+    and Greek-letter or codename aliases are all invisible here by design.
+    Recall is the consumer's problem; precision is this module's.
+
+    Args:
+        content: The verbatim body. Falsy content yields an empty scan.
+        group_id: The group the content belongs to (= the local
+            ``project_id``). A reference qualified with this project is not
+            cross-project: it is RECLASSIFIED to an own-project referent, since
+            extraction collapsing 'reify:5181' onto 'Task 5181' inside the
+            reify graph is correct, not a bug. Both sides are canonicalized
+            before the comparison, so case and hyphen/underscore spelling
+            differences still count as local.
+        known_project_ids: Optional registry of known project ids (any
+            collection; a ``{project_id: project_root}`` mapping works, since
+            iterating it yields its keys). When non-empty, FOREIGN referents
+            naming a project outside it are dropped — own-project referents
+            are never dropped by it. When None or empty the filter is
+            PERMISSIVE — see :func:`_canonical_allowlist`.
+
+    Returns:
+        A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
+        not be acted on silently.
+
+    A path-shaped *group_id* yields an empty scan: without a trustworthy local
+    project id, local and foreign references cannot be told apart, and the
+    conservative answer is to report nothing.
+    """
+    if not content:
+        return LabelScan()
+    try:
+        local_project = canonicalize_project_id(group_id)
+    except PathShapedProjectIdError:
+        return LabelScan()
+
+    allowlist = _canonical_allowlist(known_project_ids)
+    found: list[tuple[int, Referent]] = []
+
+    for match in _LOCAL_MENTION_PATTERN.finditer(content):
+        found.append((match.start(), Referent(kind='task', number=match.group(1))))
+
+    for match in _QUALIFIED_REF_PATTERN.finditer(content):
+        qualifier, number = match.group(1), match.group(2)
+        try:
+            project_id = canonicalize_project_id(qualifier)
+        except PathShapedProjectIdError:
+            # Defensive: the pattern cannot capture a '/' or a leading '-', so
+            # this is unreachable today. Kept so a future pattern relaxation
+            # skips the candidate instead of raising into the write path.
+            continue
+        if _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id):
+            # 'Task: 2500' / 'subtask: 2500'. The local pass above already
+            # claimed every spelling that IS a local mention, so dropping this
+            # candidate loses nothing and stops 'task' becoming a project id.
+            continue
+        if project_id == local_project:
+            # Self-qualified: a genuine LOCAL referent, not a foreign one.
+            # Reclassifying rather than dropping keeps the local referent set
+            # complete for consumers that need it; the foreign-only filter in
+            # cross_project_refs.find_cross_project_task_refs reproduces the
+            # drop that module wants.
+            found.append((match.start(), Referent(kind='task', number=number)))
+            continue
+        if allowlist is not None and project_id not in allowlist:
+            continue
+        found.append(
+            (match.start(), Referent(kind='task', project_id=project_id, number=number))
+        )
+
+    # Merge the two passes by OFFSET rather than concatenating them, so the
+    # result reads in the order a human reads the content. Sorting is stable,
+    # so the rare same-offset pair keeps its discovery order.
+    found.sort(key=lambda item: item[0])
+
+    refs: list[Referent] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _offset, referent in found:
+        key = (referent.kind, referent.project_id, referent.number)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(referent)
+
+    return LabelScan(refs=refs)
