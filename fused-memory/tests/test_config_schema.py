@@ -1170,10 +1170,31 @@ class TestQueueConfigTransientErrorFields:
         # get a SHORTER budget than non-transient ones.
         assert cfg.transient_max_attempts >= cfg.max_attempts
 
-    def test_default_transient_error_names_contains_node_not_found(self):
+    def test_default_transient_error_names_excludes_not_found_family(self):
+        """Task 3585: the not-found family is out — esc-3561-3 refuted the
+        visibility-race premise (304 attempts across 28 add_episode calls, 0
+        successes), so these must not get the extended retry budget.
+
+        Both halves matter: the exclusion is what 3585 changed, and the
+        inclusion is what stops a future over-broad prune from quietly gutting
+        the genuinely-transient budget along with it.
+        """
         cfg = QueueConfig()
         assert isinstance(cfg.transient_error_names, list)
-        assert 'NodeNotFoundError' in cfg.transient_error_names
+        for name in ('NodeNotFoundError', 'EdgeNotFoundError', 'EdgesNotFoundError'):
+            assert name not in cfg.transient_error_names, (
+                f'{name} must not be classified transient (task 3585); see '
+                f'DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py for the '
+                f'evidence and the reinstatement condition.'
+            )
+        for name in (
+            'TimeoutError', 'ConnectionError', 'ConnectionResetError',
+            'ServerDisconnectedError', 'OperationalError',
+        ):
+            assert name in cfg.transient_error_names, (
+                f'{name} is genuinely transient and must keep the extended '
+                f'budget; 3585 removed only the not-found family.'
+            )
 
     def test_explicit_overrides_round_trip(self):
         cfg = QueueConfig(transient_max_attempts=20, transient_error_names=['X'])
@@ -1188,6 +1209,71 @@ class TestQueueConfigTransientErrorFields:
         denying one of the two lists' errors the extended retry budget.
         """
         assert set(QueueConfig().transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES
+
+    def test_deployed_config_transient_retry_policy(self, monkeypatch):
+        """Task 3585: the DEPLOYED config (config.yaml layered over the schema
+        defaults) must obey the transient-retry POLICY — not-found family out,
+        every genuinely-transient name in.
+
+        Deliberately a policy check, not an identity check. config.yaml spells
+        transient_error_names as a literal list (a whole-list ${VAR:default} is
+        not expressible — see the comment there), so the deployed FILE is the
+        operator's tuning surface for it. Asserting
+        ``set(...) == DEFAULT_TRANSIENT_ERROR_NAMES`` would advertise the list
+        as retunable and freeze it in the same breath: an operator adding, say,
+        'OSError' after an incident would turn CI red for a legitimate edit.
+        What must survive an operator edit is the 3585 verdict itself, so the
+        contract asserted here is ``deployed ⊇ shipped default`` and
+        ``deployed ∩ not-found-family == ∅`` — additions allowed, the removal
+        and the genuinely-transient budget both protected. Exact code-side
+        agreement between QueueConfig's default and
+        DEFAULT_TRANSIENT_ERROR_NAMES stays pinned by
+        test_transient_error_names_matches_durable_queue_default above.
+
+        transient_max_attempts is asymmetric on purpose: config.yaml exposes it
+        as ``${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}``, so the ENV VAR is its tuning
+        surface and the literal is only the shipped fallback — which can be
+        pinned exactly, but only once the environment is neutralised. Without
+        the delenv calls this test would inherit the runner's environment and
+        go red for exactly the operator tuning the knob exists to permit; the
+        pydantic-settings env source also sits AHEAD of the YAML source in
+        settings_customise_sources, so a nested QUEUE__* var wins outright.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+
+        # Neutralise BOTH tuning surfaces: the ${...} placeholder expanded
+        # inside the YAML, and the nested-env override that precedes it.
+        for var in (
+            'QUEUE_TRANSIENT_MAX_ATTEMPTS',
+            'QUEUE__TRANSIENT_MAX_ATTEMPTS',
+            'QUEUE__TRANSIENT_ERROR_NAMES',
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+
+        deployed = set(cfg.queue.transient_error_names)
+        for name in ('NodeNotFoundError', 'EdgeNotFoundError', 'EdgesNotFoundError'):
+            assert name not in deployed, (
+                f'{name} must not be classified transient in the deployed '
+                f'config (task 3585); see DEFAULT_TRANSIENT_ERROR_NAMES in '
+                f'durable_queue.py for the evidence and the reinstatement '
+                f'condition before re-adding it to config.yaml.'
+            )
+        for name in sorted(DEFAULT_TRANSIENT_ERROR_NAMES):
+            assert name in deployed, (
+                f'{name} is in the shipped DEFAULT_TRANSIENT_ERROR_NAMES but '
+                f'missing from the deployed config.yaml list — the deployed '
+                f'policy may ADD names, never silently drop one and deny it '
+                f'the extended retry budget.'
+            )
+        assert cfg.queue.transient_max_attempts == QueueConfig().transient_max_attempts, (
+            "config.yaml's ${QUEUE_TRANSIENT_MAX_ATTEMPTS:...} fallback has "
+            "drifted from QueueConfig's default; retune via the env var, not "
+            "by re-pinning the literal."
+        )
 
     def test_transient_max_attempts_below_max_attempts_rejected(self):
         """A config that would give transient errors a SHORTER budget than
