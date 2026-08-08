@@ -145,6 +145,7 @@ class TestParseNodeNameMatchesQualifiedForms:
 
     def test_qualified_name_keeps_its_project(self):
         referent = parse_node_name('reify:132')
+        assert referent is not None  # narrows Referent | None -> Referent
         assert referent == Referent(kind='task', project_id='reify', number='132')
         assert referent.node_name == 'reify:132'
 
