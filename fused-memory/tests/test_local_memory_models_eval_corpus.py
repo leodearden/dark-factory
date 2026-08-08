@@ -1544,6 +1544,122 @@ class TestVerifyDistinguishesASamplerChangeFromTampering:
         assert _mod.verify_manifest(bumped, population).status == 'ok'
 
 
+class TestVerifyAttributesARecordParseFailureToTheStore:
+    """A corrupted STORE row is not a broken ARTIFACT.
+
+    ``verify_manifest`` answers two different questions with two different
+    mechanisms: a defect in the manifest is a VERDICT (``bad_manifest``, a
+    documented exit code), and a defect in the store is a FAILURE (a raised
+    ``CorpusBuildError``, no verdict at all). Reporting an unparseable
+    ``created_at`` on a live episode as ``bad_manifest`` sends the reader after
+    the wrong culprit entirely: they re-derive an artifact that was never
+    wrong, while the row that actually needs fixing goes unnamed.
+
+    ``parse_timestamp`` already carries a *field* argument so "a bad manifest
+    criterion and a bad store row are distinguishable in the message" — these
+    tests make the CALLER honour the distinction it was given.
+
+    The two controls pin the other half: narrowing the attribution must not
+    drag the genuinely manifest-attributable failures out with it.
+    """
+
+    def _corrupted(self, created_at: str = 'not-a-timestamp'):
+        """A good manifest plus a population with ONE unparseable created_at.
+
+        The uuid is preserved so the ``missing_episodes`` check does not
+        short-circuit ahead of the windowing this class is about.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        corrupted = [
+            _mod.EpisodeRecord(**{**dataclasses.asdict(r), 'created_at': created_at})
+            if r.uuid == target
+            else r
+            for r in population
+        ]
+        return manifest, corrupted, target
+
+    def test_a_corrupt_store_row_is_not_reported_as_a_bad_manifest(self):
+        """The failure propagates; it is not laundered into a verdict.
+
+        Both halves are asserted in one test because pytest's bare "DID NOT
+        RAISE" would not say WHICH verdict came back, and "it came back as
+        bad_manifest" is the exact regression this class exists to prevent.
+        """
+        manifest, corrupted, _ = self._corrupted()
+        with pytest.raises(_mod.CorpusBuildError):
+            report = _mod.verify_manifest(manifest, corrupted)
+            raise AssertionError(
+                f'a corrupt store row came back as a {report.status!r} verdict '
+                f'instead of raising'
+            )
+
+    def test_the_error_names_the_offending_episode(self):
+        """An operator cannot go and fix a row the message never identifies."""
+        manifest, corrupted, target = self._corrupted()
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, corrupted)
+        assert target in str(excinfo.value)
+
+    def test_an_unparseable_window_bound_is_still_a_bad_manifest(self):
+        """CONTROL: the window BOUND is a manifest value, so it stays a verdict.
+
+        The bound is written by the builder into the artifact; a store row is
+        not. Narrowing the attribution must not sweep this out with it.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        broken = {
+            **manifest,
+            'criteria': {
+                **manifest['criteria'],
+                'window': {'max_created_at': 'not-a-timestamp'},
+            },
+        }
+        report = _mod.verify_manifest(broken, population)
+        assert report.status == 'bad_manifest'
+        assert report.detail
+
+    def test_an_unsatisfiable_recorded_n_is_still_a_bad_manifest(self):
+        """CONTROL: ``select`` stays INSIDE the manifest-attributable clause.
+
+        A recorded ``n`` the sampling frame cannot fill genuinely IS "cannot
+        re-derive from the recorded criteria" — the artifact records something
+        its own criteria do not produce. Pinned so a later implementer cannot
+        over-narrow and turn a real artifact defect into an exit-1 crash.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        unsatisfiable = {
+            **manifest,
+            'criteria': {**manifest['criteria'], 'n': len(population) + 1},
+        }
+        report = _mod.verify_manifest(unsatisfiable, population)
+        assert report.status == 'bad_manifest'
+        assert 're-derive' in report.detail
+
+    def test_the_cli_path_reports_a_corrupt_row_as_a_run_failure_not_a_verdict(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The two code spaces stay disjoint all the way out to the process.
+
+        ``fetch_population`` already pre-validates every row, so the CLI reaches
+        exit 1 before ``verify_manifest`` is ever called — this pins that the
+        operator-visible outcome is "the check never ran", never a bad_manifest
+        verdict about an artifact that is fine.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        rows = [list(row) for row in _cli_rows()]
+        rows[0][4] = 'not-a-timestamp'
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), rows=rows)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert code != _mod.EXIT_CODES['bad_manifest']
+        assert capsys.readouterr().err.strip()
+
+
 class TestVerifyCatchesContentDrift:
     """Hash drift is a DIFFERENT failure from an id mismatch."""
 
