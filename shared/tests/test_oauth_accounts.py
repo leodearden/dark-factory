@@ -17,6 +17,7 @@ RESOLVES through it rather than holding a re-inlined copy.
 from __future__ import annotations
 
 import importlib
+from types import ModuleType
 
 import pytest
 from _oauth_accounts import (
@@ -55,9 +56,9 @@ def reload_module_under_env(monkeypatch):
     module touched is reloaded once more under it — no reload side effect
     escapes to other collected items.
     """
-    reloaded: list[object] = []
+    reloaded: list[ModuleType] = []
 
-    def _reload(module_name: str, **tokens: str):
+    def _reload(module_name: str, **tokens: str) -> ModuleType:
         module = importlib.import_module(module_name)
         if module not in reloaded:
             reloaded.append(module)
