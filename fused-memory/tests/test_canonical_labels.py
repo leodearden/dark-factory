@@ -429,6 +429,94 @@ class TestShapeValidProseMatchesByDesign:
         assert scan.refs == []
 
 
+class TestScanContentAmbiguityPartition:
+    """A task number claimed by BOTH an own-project and a foreign-qualified
+    mention in the same content is genuinely ambiguous about which task the
+    facts belong to. EVERY referent carrying that number goes to .ambiguous
+    and none to .refs — refuse rather than guess.
+
+    The partition is SYMMETRIC on purpose. Marking only the foreign side would
+    hand a consumer a confidently-wrong LOCAL referent derived from provably
+    ambiguous prose; both sides are equally unusable as evidence.
+
+    Ordering note: .ambiguous preserves POSITIONAL order, the same rule
+    TestScanContentOrderingAndDedup pins for .refs. In the content below the
+    qualified ref sits at offset 0 and the bare mention at offset 25 (measured),
+    so 'dark_factory:2500' comes first.
+    """
+
+    def test_same_number_local_and_foreign_is_ambiguous(self):
+        scan = scan_content('dark_factory:2500 blocks task 2500 here', group_id='reify')
+        assert scan.refs == []
+        assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
+
+    @pytest.mark.parametrize(
+        'bare_form',
+        [
+            'task 2500',
+            'Task 2500',
+            'TASK 2500',
+            'tasks 2500',
+            'Task: 2500',
+            # NEW in task 3667: the '#' spelling was invisible to the pre-3667
+            # mention patterns, so this content used to yield a CONFIDENT split.
+            'task #2500',
+        ],
+    )
+    def test_every_bare_spelling_triggers_ambiguity(self, bare_form):
+        scan = scan_content(f'dark_factory:2500 relates to {bare_form}', group_id='reify')
+        assert scan.refs == []
+        assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
+
+    def test_ambiguity_is_per_number_not_per_content(self):
+        """One contested number must never suppress an unrelated clean ref."""
+        content = 'dark_factory:2500 blocks task 2500; also see dark_factory:99'
+        scan = scan_content(content, group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:99']
+        assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
+
+    def test_zero_padded_literals_are_distinct_so_no_false_ambiguity(self):
+        """'250' is a different literal from '0250'. Digits are never
+        int-normalized, so the two numbers never contest each other."""
+        scan = scan_content('dark_factory:0250 relates to task 250', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:0250', 'Task 250']
+        assert scan.ambiguous == []
+
+    @pytest.mark.parametrize(
+        'lookalike',
+        ['subtask 2500', 'multitask 2500', 'reify-task 2500', 'subtask: 2500'],
+    )
+    def test_word_glued_lookalikes_create_no_ambiguity(self, lookalike):
+        """'subtask 2500' is not a mention of task 2500, so it must not make a
+        real foreign ref ambiguous — the regression guard for the unified
+        mention pattern's lookbehind."""
+        scan = scan_content(f'dark_factory:2500 relates to {lookalike}', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == []
+
+    def test_bare_mention_of_a_different_number_does_not_suppress_the_ref(self):
+        """The incident content that motivated the split hook: the bare mention
+        names a DIFFERENT task number, so nothing is contested."""
+        content = 'Reify task 5181 was cancelled; its work was rerouted to dark_factory:2500.'
+        scan = scan_content(content, group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['Task 5181', 'dark_factory:2500']
+        assert scan.ambiguous == []
+
+    def test_self_qualified_plus_bare_mention_is_not_ambiguous(self):
+        """Both spellings denote the SAME own-project referent, so the
+        self->local reclassification (which runs BEFORE this partition) lets
+        dedup collapse them into one unambiguous ref rather than a contest."""
+        scan = scan_content('reify:5181 and task 5181', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['Task 5181']
+        assert scan.ambiguous == []
+
+    def test_ambiguous_referents_are_deduplicated_too(self):
+        content = 'dark_factory:2500 blocks task 2500; dark_factory:2500 again'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == []
+        assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
+
+
 class TestUnregisteredKindIsRejectedLoudly:
     """The kind is registry-extensible ('escalation' is the next entry per the
     PRD) and today's registry holds only 'task'.
