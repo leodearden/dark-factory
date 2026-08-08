@@ -289,6 +289,56 @@ def assert_family_claims(
     )
 
 
+# A backticked token whose ENTIRE content is the canonical slug shape. Requiring
+# the closing backtick immediately after the run is what excludes every
+# backticked non-slug the docs carry beside real slugs: `INV-5` (uppercase),
+# `metadata.g7_waivers` (dot), `docs/legibility/...` (slash), `_run()`
+# (underscore), `G7 waiver: <slug>` (space).
+_SLUG_TOKEN_RE = re.compile(r"`([a-z0-9][a-z0-9-]*)`")
+
+# The family-inventory row's own anchor. A row PREFIX rather than a marked span:
+# it is already a stable, self-describing anchor, and the test asserts there is
+# exactly one such line — which a content heuristic could not.
+_FAMILY_ROW_PREFIX = "| dark-factory |"
+
+
+def slugs_in_span(span_text: str) -> list[str]:
+    """Backticked canonical-slug-shaped tokens, in document order, duplicates kept.
+
+    Duplicates are deliberately NOT collapsed here. The live trigger-shape
+    paragraph names one invariant twice because two distinct trigger shapes map
+    to it, while the family-inventory row must not repeat a slug at all — so
+    multiplicity is the CALLER's decision, and an extractor that de-duplicated
+    would quietly take it away from both.
+
+    Takes a span, not a whole document, precisely because slug-shaped tokens
+    appear in ordinary prose too (gates.md discusses `no-lockstep-duplication` by
+    name outside both enumerations). Delimiting the span is the caller's job.
+    """
+    return _SLUG_TOKEN_RE.findall(span_text)
+
+
+def dark_factory_family_row(md_text: str) -> str:
+    """The single ``| dark-factory |`` row of gates.md's family-inventory table.
+
+    Loud when the row is absent or duplicated, never a ``''`` return. The row is
+    matched by its LINE PREFIX rather than by content: the adjacent ``| reify |``
+    row lists INV-SF slugs of exactly the same lexical shape, so any "table row
+    containing backticked slugs" heuristic would merge two projects' families
+    into a set that equals neither — and would then blame the wrong rows in its
+    diff.
+    """
+    rows = [line for line in md_text.splitlines() if line.startswith(_FAMILY_ROW_PREFIX)]
+    assert len(rows) == 1, (
+        f"skills/prd/references/gates.md: expected exactly one line starting "
+        f"`{_FAMILY_ROW_PREFIX}` in the G7 family-inventory table, found "
+        f"{len(rows)} (task 3802). Absent means this guard would pin nothing; "
+        f"duplicated means one of the two rows is unpinned and free to drift. "
+        f"Matched rows: {rows!r}"
+    )
+    return rows[0]
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------

@@ -176,7 +176,14 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 **If the project has no such file** — most targets don't — G7 is **advisory, not blocking**: screen the batch against the dark-factory trigger shapes below, record any hit in the decomposition record, and do not block on a list the project never adopted. Note the fallback explicitly rather than skipping G7 silently.
 
+<!-- inv-trigger-shapes:begin
+     This list does NOT auto-extend off docs/legibility/design-invariants.md —
+     adding an invariant there requires appending its trigger shape here, in the
+     same step (see the paragraph below). Pinned as a SET by
+     scripts/tests/test_design_invariants_consistency.py: the order is
+     deliberately non-canonical and one invariant deliberately appears twice. -->
 Trigger shapes (dark-factory's family — illustrative of the *method*; re-derive the equivalents from whichever list is normative): adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)? an exit/bail/park/requeue path that can leave a status implying active ownership after its claimant is gone, without the choke point writing the successor first (`status-matches-liveness`)? a park/wait/hold state without a machine-readable owner and a deadline/streak-cap/supervised-queue bound (`holds-owned-and-bounded`)? a coroutine doing blocking or unbounded per-item work on the event-loop thread (`loop-thread-occupancy-bounded`)?
+<!-- inv-trigger-shapes:end -->
 
 This trigger-shape list and the family row above have now drifted out of sync twice (INV-6/7 landed 2026-08-02 without updating this list; the 2026-08-06 addendum added only INV-8's own shape). Collapsing the two enumerations into one site was considered and rejected: the family row is read generically off each project's own normative doc by projects that *have* adopted one (`Application` above already auto-extends there, no drift risk), while this list exists precisely for projects that have *not* — it's a hand-distilled, illustrative example set meant to be pattern-matched, not a pointer into another project's file. Mechanically deriving these short interrogative shapes from `design-invariants.md`'s per-invariant "Checkable design question(s)" (which are full design-review prompts, not short trigger phrases) was also considered but is not a trivial truncation, so it wasn't done here. Until a mechanized derivation lands, this list stays hand-maintained: adding an invariant to `design-invariants.md` requires appending its trigger shape here too, in the same step.
 
