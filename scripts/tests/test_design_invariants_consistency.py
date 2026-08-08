@@ -17,8 +17,7 @@ next invariant exactly like the prose sites were.
 
 THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
   * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
-    ``## INV-N `slug``` headings define the family; its live family-size claims
-    are pinned inside marked spans.
+    ``## INV-N `slug``` headings define the family.
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
     invariant, plus a rehearsal verdict table pinned for COVERAGE (never for its
     rationale prose, which the doc itself declares a point-in-time snapshot).
@@ -26,16 +25,21 @@ THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it must restate NO slug at all.
 
-LIVE FAMILY-SIZE CLAIMS ARE PINNED ONLY INSIDE HTML-COMMENT MARKED SPANS. This
-is load-bearing, not stylistic: both docs also carry HISTORICAL range prose that
-is correct as written and must stay unpinned — design-invariants.md's "INV-1..INV-5
-encode the agent-legibility survey's cross-cutting root causes" (true: that is the
-founding subset's provenance) and the fixtures doc's "INV-1..5 fixtures were seeded
-2026-07-14; INV-6..7 ... 2026-08-02". A blanket "every INV-1..N range must equal
-the family size" rule would land RED against factually-correct prose and could
-only be greened by falsifying history. Markers make the live-vs-historical
-distinction explicit in the doc and mechanically checkable, following the repo's
-existing convention at CONTRIBUTING.md's ``lint-command-mirror`` block.
+STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
+artifacts — the cross-artifact correspondence that fails to auto-extend when an
+invariant lands. It deliberately pins no documentation prose and no family
+COUNT: a regex over a sentence saying "eight" fires on a wording edit rather
+than on real drift, and pinning it forces test scaffolding into a doc that /prd
+G7 and /review phase 2 Read verbatim at run time (task 3802 review remediation
+removed exactly that). The sentences that used to carry counts were de-numbered
+instead, so they cannot go stale and need no guard.
+
+The ONE surviving marked span, ``inv-trigger-shapes`` in gates.md, is a pure
+DELIMITER rather than a wording pin: that file carries decoy backticked slugs
+outside both of its enumerations (`no-lockstep-duplication` discussed in prose,
+a `G7 waiver: <slug>` template), so the trigger-shape SET check needs an
+explicit boundary that a content heuristic could not supply. The marker
+convention follows CONTRIBUTING.md's existing ``lint-command-mirror`` block.
 
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
@@ -203,90 +207,25 @@ def marked_span(md_text: str, name: str, *, source: str) -> str:
     return md_text[comment_close + len("-->") : end_index]
 
 
-_RANGE_CLAIM_RE = re.compile(r"INV-(\d+)\.\.(?:INV-)?(\d+)")
-
-_CARDINAL_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-}
+_CARDINAL_WORDS = (
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+)
 
 _CARDINAL_CLAIM_RE = re.compile(
     r"\b(" + "|".join(_CARDINAL_WORDS) + r"|\d+)\s+(?:invariants|ids|slugs)\b",
     re.IGNORECASE,
 )
-
-
-def assert_family_claims(
-    span_text: str,
-    family: list[tuple[int, str]],
-    *,
-    source: str,
-    span_name: str,
-    allow_no_claim: bool = False,
-) -> None:
-    """Every LIVE family-size claim inside a marked span must name the real size.
-
-    Two claim shapes, both measured in the live docs: an ``INV-<a>..[INV-]<b>``
-    range token, which must be ``1..len(family)``, and a ``<cardinal>
-    invariants|ids|slugs`` phrase, which must name ``len(family)``.
-
-    Applied ONLY inside marked spans, never file-wide. Both docs also carry
-    HISTORICAL ranges that are correct as written ("INV-1..INV-5 encode the
-    agent-legibility survey's cross-cutting root causes"), and a blanket rule
-    could only be greened by falsifying them.
-
-    A span carrying NEITHER claim shape is loud unless *allow_no_claim*. That
-    guards the marker drifting off the sentence it was meant to wrap: a prose
-    edit that moves the claim out of the span otherwise leaves this check green
-    while the claim it names is no longer pinned at all.
-    """
-    size = len(family)
-    found_a_claim = False
-
-    for match in _RANGE_CLAIM_RE.finditer(span_text):
-        found_a_claim = True
-        low, high = int(match.group(1)), int(match.group(2))
-        assert (low, high) == (1, size), (
-            f"{source} span {span_name!r}: the range claim {match.group(0)!r} is "
-            f"stale (task 3802) — the live family parsed from "
-            f"{_repo_relative(NORMATIVE_DOC)} is INV-1..INV-{size}. Update the "
-            f"sentence inside the marker, or move the marker if this range is a "
-            f"HISTORICAL claim (a founding subset, a dated addendum) that is "
-            f"correct as written and must not be pinned."
-        )
-
-    for match in _CARDINAL_CLAIM_RE.finditer(span_text):
-        found_a_claim = True
-        token = match.group(1).lower()
-        # A spelled-out cardinal, else a bare integer — the regex admits only
-        # those two shapes, so int() cannot raise here.
-        claimed = _CARDINAL_WORDS[token] if token in _CARDINAL_WORDS else int(token)
-        assert claimed == size, (
-            f"{source} span {span_name!r}: the count claim {match.group(0)!r} is "
-            f"stale (task 3802) — the live family parsed from "
-            f"{_repo_relative(NORMATIVE_DOC)} has {size} invariants. Update the "
-            f"count inside the marker, or de-number the sentence so it cannot go "
-            f"stale again (the fix CONTRIBUTING.md §6 took)."
-        )
-
-    assert found_a_claim or allow_no_claim, (
-        f"{source} span {span_name!r}: carries neither an `INV-<a>..<b>` range "
-        f"nor a `<cardinal> invariants|ids|slugs` phrase (task 3802), so it pins "
-        f"nothing. The marker has most likely drifted off the sentence it was "
-        f"meant to wrap — move it back, or pass allow_no_claim=True at the call "
-        f"site if this span is deliberately pinned for something else. Span "
-        f"text: {span_text!r}"
-    )
 
 
 # A backticked token whose ENTIRE content is the canonical slug shape. Requiring
@@ -484,8 +423,7 @@ def assert_verdict_table_covers(
 # it cannot quietly fall behind the repo the way the prose sites did.
 PINNED_SITES = {
     "docs/legibility/design-invariants.md": (
-        "SOURCE OF TRUTH — its `## INV-N `slug`` headings define the family; its "
-        "two live family-size claims are pinned inside `inv-family-claim-*` spans"
+        "SOURCE OF TRUTH — its `## INV-N `slug`` headings define the family"
     ),
     "docs/legibility/design-invariants-fixtures.md": (
         "one fixture section per invariant, plus the rehearsal verdict table "
@@ -813,65 +751,60 @@ def test_fixtures_doc_sections_match_the_normative_family() -> None:
 
 
 # ---------------------------------------------------------------------------
-# marked_span / assert_family_claims — fixture-driven tests
+# marked_span — fixture-driven tests
 #
-# Live family-size claims (INV ranges, cardinal counts) are pinned ONLY inside
-# explicit HTML-comment marked spans. See the module docstring: both docs also
-# carry HISTORICAL range prose that is correct as written, so a blanket
-# file-wide rule would land RED against facts and could only be greened by
-# falsifying history.
+# The one surviving marked span is `inv-trigger-shapes` in gates.md, and it is a
+# pure DELIMITER: that file carries decoy backticked slugs outside both of its
+# enumerations (`no-lockstep-duplication` discussed in prose, a `G7 waiver:
+# <slug>` template), so the trigger-shape SET check needs an explicit boundary
+# rather than a content heuristic. The fixtures below therefore name a neutral
+# marker, not one that exists in any committed doc.
 # ---------------------------------------------------------------------------
 
-# The two live family-size claims in the normative doc. Suffixed names rather
-# than one repeated `inv-family-claim` marker: `marked_span` is loud on a
-# DUPLICATE marker (an ambiguous span is how a second, unpinned copy hides), and
-# that loudness is worth more than the cosmetic saving of a shared name.
-_NORMATIVE_CLAIM_SPANS = ("inv-family-claim-intro", "inv-family-claim-census")
-
-# (a) Happy path, modelled on the real doc: the begin marker carries an
+# (a) Happy path, modelled on the real gates.md span: the begin marker carries an
 # explanatory comment naming the pinning test, and that comment's own prose sits
 # OUTSIDE the returned span.
 _SPAN_HAPPY = """\
 Some prose above.
 
-<!-- inv-family-claim-intro:begin
+<!-- a-fixture-span:begin
      Pinned by scripts/tests/test_design_invariants_consistency.py — task 3802. -->
-Numeric aliases INV-1..INV-8 are prose convenience only.
-<!-- inv-family-claim-intro:end -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
 
 Some prose below.
 """
 
 _SPAN_NO_BEGIN = """\
-Numeric aliases INV-1..INV-8 are prose convenience only.
-<!-- inv-family-claim-intro:end -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
 """
 
 _SPAN_NO_END = """\
-<!-- inv-family-claim-intro:begin -->
-Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
 """
 
 _SPAN_DUPLICATE_BEGIN = """\
-<!-- inv-family-claim-intro:begin -->
-Numeric aliases INV-1..INV-8 are prose convenience only.
-<!-- inv-family-claim-intro:begin -->
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:begin -->
 A second, unpinned copy.
-<!-- inv-family-claim-intro:end -->
+<!-- a-fixture-span:end -->
 """
 
 _SPAN_DUPLICATE_END = """\
-<!-- inv-family-claim-intro:begin -->
-Numeric aliases INV-1..INV-8 are prose convenience only.
-<!-- inv-family-claim-intro:end -->
+<!-- a-fixture-span:begin -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:end -->
 More prose.
-<!-- inv-family-claim-intro:end -->
+<!-- a-fixture-span:end -->
 """
 
 _SPAN_INVERTED = """\
-<!-- inv-family-claim-intro:end -->
-Numeric aliases INV-1..INV-8 are prose convenience only.
-<!-- inv-family-claim-intro:begin -->
+<!-- a-fixture-span:end -->
+The wrapped claim, naming `alpha-slug` and `beta-slug`.
+<!-- a-fixture-span:begin -->
 """
 
 # A synthetic family standing in for the live one, so these tests keep asserting
@@ -881,13 +814,13 @@ _FIXTURE_SPAN_NAME = "a-fixture-span"
 
 
 def test_marked_span_returns_only_the_text_between_the_markers() -> None:
-    """(a) The begin comment's own prose is excluded; the wrapped claim is not."""
-    span = marked_span(_SPAN_HAPPY, "inv-family-claim-intro", source=_FIXTURE_SOURCE)
+    """(a) The begin comment's own prose is excluded; the wrapped content is not."""
+    span = marked_span(_SPAN_HAPPY, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
 
-    assert "Numeric aliases INV-1..INV-8 are prose convenience only." in span
+    assert "The wrapped claim, naming `alpha-slug` and `beta-slug`." in span
     assert "Pinned by scripts/tests" not in span, (
         "the begin comment's explanatory prose must sit outside the span — it "
-        f"names a test path and a task number a claim regex could match: {span!r}"
+        f"names a test path a slug-shaped token could be read out of: {span!r}"
     )
     assert "prose above" not in span and "prose below" not in span
 
@@ -907,137 +840,18 @@ def test_marked_span_fails_loudly_on_a_broken_marker(
 ) -> None:
     """A missing, duplicated or inverted marker RAISES — never returns ''.
 
-    Missing is the vacuity hazard: an empty span satisfies every claim check
-    below by containing no claims to check. Duplicated is the same failure one
-    level down — silently taking the first span leaves the second copy of the
-    claim unpinned and free to drift, which is precisely the defect this module
-    exists to catch.
+    Missing is the vacuity hazard: an empty span satisfies the SET comparison it
+    feeds by containing no slugs to compare. Duplicated is the same failure one
+    level down — silently taking the first span leaves the second copy unpinned
+    and free to drift, which is precisely the defect this module exists to catch.
     """
     with pytest.raises(AssertionError) as excinfo:
-        marked_span(markdown_text, "inv-family-claim-intro", source=_FIXTURE_SOURCE)
+        marked_span(markdown_text, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
 
     message = str(excinfo.value)
     assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
-    assert "inv-family-claim-intro" in message, f"{case}: must name the marker: {message!r}"
+    assert _FIXTURE_SPAN_NAME in message, f"{case}: must name the marker: {message!r}"
     assert expected_phrase in message, f"{case}: must diagnose the defect: {message!r}"
-
-
-def test_assert_family_claims_accepts_a_current_range_and_cardinal() -> None:
-    """A span whose range and spelled-out count both name the live size passes."""
-    assert_family_claims(
-        "Numeric aliases INV-1..INV-8 are prose convenience; the eight ids above.",
-        _FIXTURE_FAMILY,
-        source=_FIXTURE_SOURCE,
-        span_name=_FIXTURE_SPAN_NAME,
-    )
-
-
-@pytest.mark.parametrize(
-    ("span_text", "case", "expected_phrase"),
-    [
-        pytest.param(
-            "Numeric aliases INV-1..INV-7 are prose convenience only.",
-            "stale range",
-            "INV-1..INV-7",
-            id="stale-range",
-        ),
-        pytest.param(
-            "The slug vocabulary is *this* doc — the seven ids above.",
-            "stale cardinal",
-            "seven ids",
-            id="stale-cardinal",
-        ),
-        pytest.param(
-            "Walk the batch against all 7 invariants.",
-            "stale numeric cardinal",
-            "7 invariants",
-            id="stale-numeric-cardinal",
-        ),
-        pytest.param(
-            "The founding subset INV-2..INV-8 is not the family.",
-            "range not starting at 1",
-            "INV-2..INV-8",
-            id="range-offset-start",
-        ),
-    ],
-)
-def test_assert_family_claims_rejects_a_stale_claim(
-    span_text: str, case: str, expected_phrase: str
-) -> None:
-    """A range or cardinal disagreeing with the live family size RAISES.
-
-    This is the drift the marked spans exist to catch: the claim reads fine in
-    isolation and only becomes false when an invariant is added, which is exactly
-    when nobody is looking at the sentence that mentions a count.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        assert_family_claims(
-            span_text, _FIXTURE_FAMILY, source=_FIXTURE_SOURCE, span_name=_FIXTURE_SPAN_NAME
-        )
-
-    message = str(excinfo.value)
-    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
-    assert _FIXTURE_SPAN_NAME in message, f"{case}: message must name the span: {message!r}"
-    assert expected_phrase in message, f"{case}: message must quote the claim: {message!r}"
-
-
-def test_assert_family_claims_is_loud_on_a_span_carrying_no_claim() -> None:
-    """A span with neither a range nor a cardinal RAISES by default.
-
-    The failure mode this guards is a marker drifting off the sentence it was
-    meant to wrap — a prose edit that moves the claim out of the span leaves the
-    guard green while the claim it names is no longer pinned at all.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        assert_family_claims(
-            "A gate checklist, not an essay.",
-            _FIXTURE_FAMILY,
-            source=_FIXTURE_SOURCE,
-            span_name=_FIXTURE_SPAN_NAME,
-        )
-
-    message = str(excinfo.value)
-    assert _FIXTURE_SOURCE in message
-    assert _FIXTURE_SPAN_NAME in message
-
-
-def test_assert_family_claims_permits_a_claimless_span_when_explicitly_allowed() -> None:
-    """``allow_no_claim=True`` is the only way to opt a span out of the floor.
-
-    Explicit at the call site, so a span pinned for its slugs rather than its
-    counts says so in code instead of passing vacuously by accident.
-    """
-    assert_family_claims(
-        "A gate checklist, not an essay.",
-        _FIXTURE_FAMILY,
-        source=_FIXTURE_SOURCE,
-        span_name=_FIXTURE_SPAN_NAME,
-        allow_no_claim=True,
-    )
-
-
-def test_normative_doc_family_size_claims_are_current() -> None:
-    """LIVE: design-invariants.md's two marked family-size claims name the real size.
-
-    The doc states the family size twice in prose — "Numeric aliases INV-1..INV-N
-    are prose convenience only" in the intro, and "the slug vocabulary is *this*
-    doc — the <n> ids above" at the Census seam. Neither auto-extends. Both are
-    wrapped in `inv-family-claim-*` markers so this check can find them without a
-    content heuristic, and so a human editing the doc sees at the edit site that
-    the sentence is pinned.
-
-    The doc's HISTORICAL ranges are deliberately NOT wrapped and NOT checked:
-    "INV-1..INV-5 encode the agent-legibility survey's cross-cutting root causes"
-    and the INV-6..INV-7 / INV-8 provenance sentences are true as written, and a
-    blanket file-wide range rule could only be greened by falsifying them.
-    """
-    family = canonical_family()
-    text = NORMATIVE_DOC.read_text(encoding="utf-8")
-    source = _repo_relative(NORMATIVE_DOC)
-
-    for span_name in _NORMATIVE_CLAIM_SPANS:
-        span = marked_span(text, span_name, source=source)
-        assert_family_claims(span, family, source=source, span_name=span_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1171,10 +985,7 @@ def test_gates_family_row_lists_the_whole_family_in_order() -> None:
     Pinned as an ORDERED list, unlike the trigger-shape span below: this row is a
     straight canonical-order transcription today, so ordering is free signal —
     a mis-ordered row means someone edited it by hand against a stale copy.
-    ``assert_family_claims`` additionally pins the row's own `INV-1..N` range
-    token, which is a second thing that does not auto-extend.
     """
-    family = canonical_family()
     text = GATES_DOC.read_text(encoding="utf-8")
     source = _repo_relative(GATES_DOC)
     row = dark_factory_family_row(text)
@@ -1187,9 +998,6 @@ def test_gates_family_row_lists_the_whole_family_in_order() -> None:
         f"Update the row to list every slug in canonical INV-1..N order. It is "
         f"illustrative — the doc is normative — but an illustration naming the "
         f"wrong family is worse than none."
-    )
-    assert_family_claims(
-        row, family, source=source, span_name="the `| dark-factory |` family-inventory row"
     )
 
 
@@ -1331,7 +1139,7 @@ def test_section_span_fails_loudly(
 def test_contributing_does_not_restate_the_invariant_family() -> None:
     """LIVE: CONTRIBUTING.md points at the normative doc instead of copying it.
 
-    Three assertions, one theme — this site is pinned as an ABSENCE:
+    Two assertions, one theme — this site is pinned as an ABSENCE:
 
     (a) WHOLE-FILE, zero canonical slugs. CONTRIBUTING.md §6 used to restate all
         eight, twelve lines above its own rule forbidding restatement. Re-syncing
@@ -1341,21 +1149,10 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
         checkable — it fails the moment anyone re-introduces a copy, which a
         content-equality pin never would.
 
-    (b) WHOLE-FILE, every `INV-<a>..<b>` range names the live family. This
-        deliberately KEEPS the repo-layout bullet's "design-invariants.md
-        (INV-1..INV-N, gates ...)" orienting hint alive rather than deleting it:
-        unlike a slug list it is cheap to keep current, and now it is pinned.
-        ``assert_family_claims`` also covers cardinal-count phrases file-wide,
-        which is strictly stricter and cannot fire on anything but a genuinely
-        stale count — the exact drift this task exists to stop.
-
-    (c) §6 SPAN carries no `<cardinal> invariants` phrase (it said "the single
-        normative copy of the eight invariants") and DOES carry the literal path
-        `docs/legibility/design-invariants.md`, so the bullet stays a working
-        pointer rather than becoming a dangling reference. A pointer that no
-        longer names its target is how a deletion turns into an orphan.
+    (b) §6 SPAN carries no `<cardinal> invariants` phrase and DOES carry the
+        literal path `docs/legibility/design-invariants.md`, so the bullet stays a
+        working pointer rather than becoming a dangling reference.
     """
-    family = canonical_family()
     text = CONTRIBUTING_DOC.read_text(encoding="utf-8")
     source = _repo_relative(CONTRIBUTING_DOC)
 
@@ -1369,8 +1166,6 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
         f"{_repo_relative(NORMATIVE_DOC)} — a restated list here has already "
         f"gone stale once and cannot be kept current by policy alone."
     )
-
-    assert_family_claims(text, family, source=source, span_name="the whole file")
 
     section = section_span(text, _CONTRIBUTING_SECTION, source=source)
 
