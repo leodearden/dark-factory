@@ -276,6 +276,22 @@ async def repair_memory_citation(
     if run is None:
         return _ERR_TARGET_RUN_NOT_FOUND | {'target_run_id': target_run_id}
 
+    # Closed runs only — checked before any Mem0 read. Two halves because the
+    # journal row and the in-process view can disagree: a row can already read
+    # 'completed' while ReconReportState is still writing its entries through.
+    if run.status == 'running' or target_run_id in live_run_ids:
+        return _ERR_RUN_STILL_LIVE | {
+            'target_run_id': target_run_id,
+            'status': str(run.status),
+            'hint': (
+                f'run {target_run_id} is still live; its stage_reports blob is '
+                'rewritten wholesale by the harness at each stage end, so a '
+                'journal-side repair would be silently clobbered. Within a live '
+                'run the ordinary cite_memory / delete_finding path already '
+                'reaches the finding (_resolve_finding is cross-stage).'
+            ),
+        }
+
     located = _find_finding(run, finding_id)
     if located is None:
         return _ERR_FINDING_UNKNOWN | {
@@ -343,12 +359,9 @@ async def repair_memory_citation(
                 ),
             }
 
+    # ── Compute the new citation list (no mutation yet) ───────────────────
     cited = finding.get('cited_memories') or []
-    kept = [
-        entry
-        for entry in cited
-        if not _is_citation_of(entry, memory_id)
-    ]
+    kept = [entry for entry in cited if not _is_citation_of(entry, memory_id)]
     removed_count = len(cited) - len(kept)
     if replacement_memory_id is not None:
         kept.append(
@@ -358,6 +371,28 @@ async def repair_memory_citation(
                 'metadata_fingerprint': _fingerprint_from_record(replacement_record),
             }
         )
+
+    outcome = {
+        'status': 'repaired' if apply else 'dry_run',
+        'target_run_id': target_run_id,
+        'project_id': run.project_id,
+        'stage': stage_name,
+        'finding_id': finding_id,
+        'removed_memory_id': memory_id,
+        'removed_count': removed_count,
+        'replacement_memory_id': replacement_memory_id,
+        'deduped': False,
+        'store': store,
+        'cited_memories': kept,
+    }
+    if not apply:
+        # Everything above already ran — including both corroboration reads —
+        # so the operator learns whether the gates hold before anything is
+        # written. Only the mutation and the write are skipped, which is what
+        # makes this ONE code path rather than a second implementation of
+        # "which entries would be removed" that must stay in lockstep (INV-5).
+        return outcome
+
     finding['cited_memories'] = kept
     finding.setdefault(CITATION_REPAIRS_KEY, []).append(
         build_citation_repair_record(
@@ -376,16 +411,4 @@ async def repair_memory_citation(
         replacement_memory_id,
         repaired_by,
     )
-    return {
-        'status': 'repaired',
-        'target_run_id': target_run_id,
-        'project_id': run.project_id,
-        'stage': stage_name,
-        'finding_id': finding_id,
-        'removed_memory_id': memory_id,
-        'removed_count': removed_count,
-        'replacement_memory_id': replacement_memory_id,
-        'deduped': False,
-        'store': store,
-        'cited_memories': kept,
-    }
+    return outcome
