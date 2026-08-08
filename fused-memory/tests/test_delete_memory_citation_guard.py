@@ -627,6 +627,93 @@ class TestAllowDanglingCitationsEscape:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_override_logs_a_warning_naming_the_memory_id_and_every_dangled_citer(
+        self, mock_service, caplog,
+    ):
+        """The override must leave a TRACE. An escape that lands silently is the
+        same class of defect as the gate that never ran: the operator's stated
+        intent is recorded, but which pointers it stranded is not — which is
+        exactly the enumerate-by-hand step the incident got wrong (3 of 8).
+
+        The WARNING names ``live_citers``, the same list the rejection path
+        reports in ``citing_tasks``: what is being knowingly dangled, not every
+        task that ever mentioned the id. A citer that has already reached a
+        terminal status is not dangled by this delete, so naming it would
+        overstate the damage.
+        """
+        interceptor = _make_interceptor([
+            _task('1311', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1312', 'pending', {
+                'memory_hints': {'entities': [], 'queries': [f'advice {DOOMED} here']},
+            }),
+            _task('1313', 'done', {'cited': DOOMED}),
+            _task('1314', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['status'] == 'deleted'
+        assert [r for r in caplog.records if r.levelname == 'WARNING']
+        assert 'allow_dangling_citations' in caplog.text
+        # The record being destroyed, and the caller who asked for it.
+        assert DOOMED in caplog.text
+        assert 'claude-interactive' in caplog.text
+        # Every live citer this delete strands.
+        assert '1311' in caplog.text
+        assert '1312' in caplog.text
+        # ...and only those: the terminal citer is not dangled by this delete.
+        assert '1313' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_override_warning_names_a_supplied_replacement_it_did_not_use(
+        self, mcp_server, mock_service, interceptor, caplog,
+    ):
+        """Both arguments together are contradictory — "repoint them to this
+        survivor" vs "dangle them knowingly" — so one must be dropped. The
+        override wins, keeping a single code path, but the dropped value is
+        REPORTED rather than silently discarded (the repo's
+        loud-over-silent-degradation norm)."""
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                replacement_memory_id=SURVIVOR,
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        # The override wins: nothing was repointed to the survivor.
+        interceptor.update_task.assert_not_awaited()
+        # But the ignored argument is named, not dropped in silence.
+        assert SURVIVOR in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_the_flag_is_absent(
+        self, mcp_server, mock_service, caplog,
+    ):
+        """The trace belongs to the OVERRIDE, not to every gated delete. An
+        ordinary refusal already returns its citers to the caller structurally,
+        so logging there would be noise on the common path and would dilute the
+        one line an operator needs to find."""
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
+        assert 'allow_dangling_citations' not in caplog.text
+
 
 TOMBSTONE_KEY = 'x_memory_citation_tombstones'
 
