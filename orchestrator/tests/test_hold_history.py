@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import _hold_history_fixtures as F
 import pytest
+
 from orchestrator.hold_history import HoldSpan, iter_hold_spans
 
 
