@@ -184,3 +184,132 @@ class TestRepairHappyPath:
             }
         finally:
             await journal.close()
+
+
+class TestRepairCorroborationGates:
+    """The repair is structurally incapable of rewriting a live claim.
+
+    Each case asserts BOTH the structured refusal AND that the persisted blob is
+    unchanged — a gate that returns an error after having already written would
+    satisfy the first assertion alone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_victim_still_resolves_is_refused(self, tmp_path):
+        """A citation that STILL resolves is never re-pointed.
+
+        This is the gate that keeps the tool from being a provenance-
+        falsification surface: without it, any Stage-1/2 agent could silently
+        re-point a valid, live citation on a closed audit record.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            # The 'dangling' id is in fact alive.
+            memory = FakeMemoryLookup(
+                {DANGLING: {'id': DANGLING, 'metadata': {}}, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'citation_not_dangling'
+            assert outcome['error_type'] == 'ReconCitationNotDangling'
+            assert 'status' not in outcome
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_replacement_not_found_is_refused(self, tmp_path):
+        """A repair may never introduce a SECOND dangling id.
+
+        Without this gate the tool becomes a generator of the very defect it
+        exists to fix.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: None})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'replacement_not_found'
+            assert outcome['error_type'] == 'ReconCitationReplacementNotFound'
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('raising_id', 'exc'),
+        [
+            (DANGLING, TimeoutError('qdrant read timed out')),
+            (SUCCESSOR, TimeoutError('qdrant read timed out')),
+        ],
+        ids=['victim_lookup_raises', 'replacement_lookup_raises'],
+    )
+    async def test_raised_lookup_is_unknown_never_absent(self, tmp_path, raising_id, exc):
+        """A RAISED backend read is 'unknown', not 'absent' — never a repair.
+
+        The same no-silent-fail split ``verify_cited_memories`` already draws for
+        this exact lookup, so the two halves of the invariant cannot disagree
+        about what a backend timeout means. Collapsing a timeout into
+        'confirmed absent' would let a transient Qdrant blip rewrite a live
+        citation.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD} | {raising_id: exc}
+            )
+
+            # Must not propagate: the caller gets a structured verdict, not a raise.
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'verification_error'
+            assert outcome['error_type'] == 'ReconCitationVerificationError'
+            # The raised type is carried as a FACT, not folded into prose.
+            assert outcome['exception_type'] == 'TimeoutError'
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
