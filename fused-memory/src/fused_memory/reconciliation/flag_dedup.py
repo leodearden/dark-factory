@@ -4058,9 +4058,11 @@ def _classify_authorship(agent_id: Any) -> str:
     ``'internal'`` — a recognised house writer (the only value that can clear
     a flag).  ``'missing'`` — no usable provenance at all (absent key, None,
     empty, or a non-string).  ``'foreign'`` — a real agent_id that matches no
-    house writer family.  The two non-internal values are kept distinct
-    because they read very differently to an operator: a foreign id is a
-    positive signal, a missing one is a gap.
+    house writer family.  These are kept distinct because they read very
+    differently to an operator: a foreign id is a positive signal, a missing
+    one is a gap.  (A fourth value, ``'unresolved'``, is assigned by the
+    caller when the record could not be read at all — see
+    :func:`filter_style_only_authorship_flags`.)
     """
     if is_internal_writer(agent_id):
         return 'internal'
@@ -4072,19 +4074,20 @@ def _classify_authorship(agent_id: Any) -> str:
 def _authorship_keep_decision(checked: list[dict[str, Any]]) -> str:
     """Summarise WHY a candidate flag survived, from its checked citations.
 
-    Precedence runs most- to least-specific: a mix of house and non-house
-    citations is the most informative outcome, then a positively-foreign
-    author, then no usable provenance.  ``kept_missing_agent_id`` is the
-    catch-all for "no usable agent_id was obtained for any citation" —
-    whether it was absent from the payload or the lookup could not resolve it.
+    A positively-foreign author is the most informative outcome, and reads
+    differently depending on whether a house writer sits alongside it
+    (``kept_mixed_authors``) or not (``kept_foreign_author``).  Absent any
+    foreign author, the flag can only have survived because some citation
+    yielded no usable agent_id — absent, empty, or unreadable — which is
+    ``kept_missing_agent_id``.
     """
     if not checked:
         return 'kept_no_resolvable_citations'
     classifications = {c['classification'] for c in checked}
-    if 'internal' in classifications:
-        return 'kept_mixed_authors'
     if 'foreign' in classifications:
-        return 'kept_foreign_author'
+        return 'kept_mixed_authors' if 'internal' in classifications else 'kept_foreign_author'
+    # No positively-foreign author, yet the flag survived — so at least one
+    # citation yielded no usable agent_id (absent, empty, or unreadable).
     return 'kept_missing_agent_id'
 
 
@@ -4114,11 +4117,16 @@ async def filter_style_only_authorship_flags(
     drops ONLY on positively-confirmed wholly-internal authorship — at least
     one agent_id resolved AND every resolved one is a recognised house writer.
     Every other outcome KEEPS the flag: a foreign agent_id, a missing/empty
-    one, a mixed citation set (a partially-internal claim is not cleared), and
-    a candidate with no resolvable citations at all (an unattributable claim
-    stays flaggable).  The asymmetry is deliberate — wrongly keeping a flag
-    costs one noisy finding the next cycle clears, while wrongly dropping one
-    silently disables the detection.
+    one, a mixed citation set (a partially-internal claim is not cleared), a
+    citation the backend could not resolve (a raised error or a not-found
+    record is ``'unresolved'`` — unknown, never internal — and is never
+    propagated to the caller), and a candidate with no resolvable citations at
+    all (an unattributable claim stays flaggable).  The asymmetry is
+    deliberate — wrongly keeping a flag costs one noisy finding the next cycle
+    clears, while wrongly dropping one silently disables the detection.
+
+    Degrades to an unchanged pass-through when ``memory_service`` or
+    ``project_id`` is falsy.
 
     Every SURVIVING candidate is annotated with ``authorship_provenance``::
 
@@ -4143,19 +4151,88 @@ async def filter_style_only_authorship_flags(
         flags removed.  The input LIST is never mutated; surviving candidate
         dicts gain the ``authorship_provenance`` key described above.
     """
+    if not memory_service or not project_id:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_already_tracked_systemic_patterns.  Provenance is unreadable,
+        # so nothing can be positively confirmed internal.
+        return list(flags)
+
     candidate_positions: list[int] = [
         i for i, flag in enumerate(flags)
         if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
     ]
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
+    # committed schema entry, so an unrecognised spelling would silently make
+    # the gate a no-op; this log makes that observable (the
+    # filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
+        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
+        )
+
     if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
         return list(flags)
 
     async def _classify(flag: dict[str, Any]) -> list[dict[str, Any]]:
         """Resolve every mem0 citation on *flag* to a provenance record."""
         checked: list[dict[str, Any]] = []
         for entry in flag.get('cited_memories') or []:
+            # Skip anything we cannot — or must not — resolve, without a lookup
+            # and without recording a verdict: a non-dict entry (malformed), an
+            # entry with no truthy memory_id, or a non-mem0 citation.
+            # get_memory_by_id is a Mem0/Qdrant point-id read, so resolving a
+            # graphiti edge uuid through it would return not-found for EVERY
+            # graph citation (citation_verifier's guard).  Such an entry
+            # therefore neither clears a flag nor blocks a clearance — a
+            # candidate citing only these ends up with an empty ``checked`` and
+            # is kept as unattributable.
+            if (
+                not isinstance(entry, dict)
+                or entry.get('store') != 'mem0'
+                or not entry.get('memory_id')
+            ):
+                continue
             memory_id = entry.get('memory_id')
-            record = await memory_service.get_memory_by_id(project_id, memory_id)
+            try:
+                record = await memory_service.get_memory_by_id(project_id, memory_id)
+            except Exception as exc:
+                # A raised backend error is 'unknown', not 'house-authored'.
+                # Record the uncertainty, KEEP the flag, and never propagate —
+                # a check error must not crash the stage.
+                logger.debug(
+                    'reconciliation.style_only_authorship_lookup_error '
+                    'memory_id=%s error=%s',
+                    memory_id, exc,
+                )
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            if not record:
+                # Not found — also unknown, never internal.
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
             agent_id = (record.get('metadata') or {}).get('agent_id')
             checked.append({
                 'memory_id': memory_id,
