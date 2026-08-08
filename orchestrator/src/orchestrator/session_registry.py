@@ -2645,13 +2645,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     write_decision_p.add_argument(
         '--escalations-dir',
-        default='',
+        required=True,
         help=(
-            "the escalation queue dir this decision's --escalation-id belongs to; "
-            'scopes the reaper (see reap-decisions)'
+            "MANDATORY: the escalation queue dir this decision's --escalation-id "
+            'belongs to; scopes the reaper (see reap-decisions). Required because a '
+            'DecisionRecord is fleet-global while an esc-<taskid>-<n> id is unique '
+            'only WITHIN one queue (task 3528), so an unstamped record is '
+            'cross-queue-ambiguous -- the legacy population task 3640 back-filled '
+            'out of. Pass the SAME queue dir you later reap with.'
         ),
     )
 
+    # NOTE: --escalations-dir is required on BOTH halves of the file/reap
+    # pair. reap-decisions has always required it; write-decision joined it
+    # in task 3559, so the two are symmetric rather than each inventing a
+    # convention.
     reap_decisions_p = sub.add_parser(
         'reap-decisions',
         help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
@@ -2669,6 +2677,18 @@ def main(argv: list[str] | None = None) -> int:
     loudly (stderr, via the standard logging machinery) and swallowed here
     rather than raised, so a registry fault can never change the exit code
     of the bash caller (spawn-claude.sh) that invokes this script.
+
+    That contract has always covered runtime FAULTS only -- never a
+    malformed INVOCATION. argparse's own required-argument path raises
+    SystemExit(2) from parse_args() BELOW, i.e. before (and outside) the
+    try/except that implements the rule, and has done so since this parser
+    existed: `write-decision` with no --id/--project/--text exits 2 today.
+    Task 3559 deliberately put --escalations-dir in that same louder class
+    rather than swallowing it, because a queue-less DecisionRecord is
+    cross-queue-ambiguous and silently filing one is worse than a hard stop.
+    A runtime refusal (e.g. an explicitly EMPTY stamp, which argparse cannot
+    distinguish from a supplied one) stays fail-soft: ERROR log, nothing
+    written, nothing printed, rc 0.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
