@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -282,6 +283,30 @@ class ProvenanceConflictSink:
             return True
         del self._memo[task_id]
         return False
+
+    def arbitration_pending(self, records: Iterable[Any] | None) -> bool:
+        """True while a pending ``provenance_conflict`` record binds this task.
+
+        The restart-DURABLE twin of :meth:`should_skip`: decided from the
+        escalation store's own records instead of ``self._memo``, so it
+        survives the two cases the memo cannot cover — a cold memo (fleet
+        redeploy / watchdog restart) and a conflict filed by a different
+        writer site (``merge_queue.py``'s two ``ProvenanceConflictSink``
+        call sites).  ``should_skip`` remains the zero-I/O in-process fast
+        path; this is the correctness backstop underneath it.
+
+        Takes ALREADY-READ records rather than doing its own ``get_by_task``
+        so the caller pays for exactly one store read.  ``records=None`` (an
+        unreadable store) returns ``False``: that disposition belongs to the
+        caller, which already treats a failed read as ``store_unavailable``
+        (see the already-landed dispatch gate's try/except).
+        """
+        if not records:
+            return False
+        return any(
+            getattr(record, 'category', None) == PROVENANCE_CONFLICT_CATEGORY
+            for record in records
+        )
 
     def _escalation_pending(self, escalation_id: str | None) -> bool:
         """True when *escalation_id* is still open (or unverifiable).
