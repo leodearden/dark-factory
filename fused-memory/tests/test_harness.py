@@ -10,6 +10,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -15627,6 +15628,77 @@ class TestHarnessReconcileStatusCorrection:
         assert 'error' in result
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'Expected a WARNING log when add_memory raises'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_collection_404_treated_as_no_prior_corrections(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """A project whose Qdrant collection was never provisioned holds no
+        prior corrections — an empty result, not a reconciliation failure.
+
+        Before task 2949 that 404 fell into the generic handler, so every cycle
+        logged a WARNING and returned an `error` record that Stage 3 then
+        re-flagged as an unresolved integrity issue, forever.
+
+        step-3 (RED): the 404 is still classified as a failure.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=UnexpectedResponse(
+                404,
+                'Not Found',
+                b"Collection `fused_solar_challenge` doesn't exist!",
+                {},
+            )
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._reconcile_status_correction(
+                'solar_challenge', {'1': 'done'}
+            )
+
+        assert result == {
+            'available': True,
+            'found': False,
+            'diverged': False,
+            'superseded': False,
+            'collection_missing': True,
+        }
+        assert 'error' not in result
+        # Structurally the same no-op as "no cached memory": nothing written.
+        harness.memory.add_memory.assert_not_called()
+        harness.memory.delete_memory.assert_not_called()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'a missing collection is an empty result, not a failure — it must '
+            'not emit the per-cycle WARNING the generic handler logs'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_missing_collection_response_still_errors(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """Boundary: ONLY the missing-collection 404 degrades.  A 500 from the
+        same client is a real backend failure and must keep surfacing as an
+        error record + WARNING (no-silent-fail).
+
+        step-3 (RED): guards the step-4 catch against over-matching.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=UnexpectedResponse(500, 'Internal Server Error', b'boom', {})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'solar_challenge', {'1': 'done'}
+            )
+
+        assert 'error' in result
+        assert result['superseded'] is False
+        assert 'collection_missing' not in result
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when the query fails with a non-404'
         )
 
     # ------------------------------------------------------------------ #
