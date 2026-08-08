@@ -28,6 +28,7 @@ from shared.toolcall_markup import (
     PREFILTER_NEEDLES,
     closer_for,
     detect,
+    repair,
 )
 
 # The two calibrations as they are spelled TODAY at their current owners. These
@@ -127,3 +128,201 @@ class TestDetect:
     )
     def test_returns_none_without_raising(self, value):
         assert detect(value) is None
+
+
+# ---------------------------------------------------------------------------
+# Tail-shape builders. Every envelope literal in this file goes through one of
+# these, so the \x3c escape is written once per shape rather than once per use.
+# ---------------------------------------------------------------------------
+
+
+def _closer(name: str) -> str:
+    """The name-echoing closing tag the model drifts into, e.g. description."""
+    return '\x3c/' + name + '>'
+
+
+def _opener(name: str) -> str:
+    """The name-echoing opening tag, e.g. priority."""
+    return '\x3c' + name + '>'
+
+
+def _canonical_opener(name: str) -> str:
+    """The canonical opening tag, e.g. parameter name="priority"."""
+    return '\x3cparameter name="' + name + '">'
+
+
+#: The canonical closing tag. Specimen 4's mis-close, and always a candidate.
+_CANONICAL_CLOSER = '\x3c/parameter>'
+
+
+def _blend_opener(name: str) -> str:
+    """Specimen 1's literal DIALECT BLEND — a stray quote before the bracket.
+
+    PRD section 2.1: ``metadata"`` is the model interpolating between the
+    canonical ``parameter name="X"`` form and the name-echoing ``X`` form.
+    """
+    return '\x3c' + name + '">'
+
+
+def _blend_closer(name: str) -> str:
+    """The closing half of the dialect blend, e.g. ``/metadata"``."""
+    return '\x3c/' + name + '">'
+
+
+# Parameter names of the tools the four specimens were captured from. Real
+# schemas, so the schema-validation accept condition is exercised honestly.
+_SUBMIT_TASK_PARAMS = frozenset(
+    {'project_root', 'title', 'description', 'priority', 'agent_id', 'metadata'}
+)
+_ADD_MEMORY_PARAMS = frozenset(
+    {'content', 'project_id', 'agent_id', 'category', 'metadata', 'session_id'}
+)
+_UPDATE_MEMORY_PARAMS = frozenset({'memory_id', 'content', 'project_id', 'agent_id'})
+
+
+class TestRepairSpecimens:
+    """The four PRD section 2.1 specimens, hand-authored (step 3/4).
+
+    These are the NON-CIRCULAR half of the correctness story: they are written
+    from the PRD's parsed-input column before any corpus exists, so unlike the
+    committed corpus (whose expectation column is machine-generated) they can
+    actually falsify the repairer.
+    """
+
+    def test_s1_total_drift_recovers_all_three_dropped_params(self):
+        """Specimen 1 / boundary row B2 — submit_task 07-30T16:47Z.
+
+        The parser over-consumed to the trailing invoke closer, dumping three
+        whole parameters into ``description``. B2 requires all three back.
+        """
+        clean = 'Investigate the divergence and report back on direction.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'medium' + _closer('priority') + '\n'
+            + _opener('agent_id') + 'claude-task-3688' + _closer('agent_id') + '\n'
+            + _blend_opener('metadata')
+            + '{"source": "agent-followup"}'
+            + _blend_closer('metadata') + '\n'
+            + INVOKE_CLOSER
+        )
+
+        result = repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {
+            'priority': 'medium',
+            'agent_id': 'claude-task-3688',
+            'metadata': '{"source": "agent-followup"}',
+        }
+        assert result.pattern == _closer('description')
+        assert result.misclose == _closer('description')
+
+    def test_s2_partial_drift_recovers_the_unterminated_opener(self):
+        """Specimen 2 / boundary row B1 — submit_task 08-04T12:13Z.
+
+        The drift is only one parameter deep and its value is UNTERMINATED:
+        the parser consumed the closer it was looking for, so ``low`` runs to
+        end-of-string with nothing after it.
+        """
+        clean = 'The scheduler retries this automatically).'
+        value = clean + _closer('description') + '\n' + _canonical_opener('priority') + 'low'
+
+        result = repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {'priority': 'low'}
+        assert result.pattern == _closer('description')
+        assert result.misclose == _closer('description')
+
+    def test_s3_last_parameter_drops_nothing(self):
+        """Specimen 3 / boundary row B4 — add_memory 08-04T16:58Z.
+
+        ``content`` was the LAST parameter, so nothing was dropped. The repair
+        is a pure truncation: an empty ``recovered`` is a success, not a
+        refusal, and the caller's text must come back untouched.
+        """
+        clean = 'The near-duplicate guard rejects this by design.'
+        value = clean + _closer('content') + '\n' + INVOKE_CLOSER
+
+        result = repair(
+            value,
+            param='content',
+            schema_params=_ADD_MEMORY_PARAMS,
+            supplied={'content', 'project_id'},
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {}
+        assert result.pattern == _closer('content')
+        assert result.misclose == _closer('content')
+
+    def test_s4_canonical_closer_misclose(self):
+        """Specimen 4 — update_memory 08-02T21:26Z, the UNGATED boundary.
+
+        The mis-close is the CANONICAL closer, whose name (``parameter``) is
+        not a parameter of update_memory. It is admitted as a candidate anyway
+        — see the plan's first design decision — because otherwise one of the
+        PRD's own four specimens would be unrepairable by construction.
+        """
+        clean = 'Only the escalation-watcher path is scoped).'
+        value = (
+            clean
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('agent_id') + 'escalation-watcher-l2'
+        )
+
+        result = repair(
+            value,
+            param='content',
+            schema_params=_UPDATE_MEMORY_PARAMS,
+            supplied={'memory_id', 'content'},
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {'agent_id': 'escalation-watcher-l2'}
+        assert result.pattern == _CANONICAL_CLOSER
+        assert result.misclose == _CANONICAL_CLOSER
+
+    def test_pattern_is_the_envelope_literal_misclose_is_the_wrong_tag(self):
+        """The two fields differ whenever the mis-closed name is not a literal.
+
+        PRD section 2.2's diagnostic ambiguity in miniature: ``/rationale`` is
+        a real drift but is not in the literal set, so ``pattern`` reports the
+        envelope literal that actually matched (the trailing invoke closer,
+        earliest by text position among the literals) while ``misclose``
+        reports the tag that actually went wrong.
+        """
+        clean = 'Because the split is calibrated in opposite directions.'
+        value = (
+            clean
+            + _closer('rationale') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _closer('agent_id') + '\n'
+            + INVOKE_CLOSER
+        )
+
+        result = repair(
+            value,
+            param='rationale',
+            schema_params={'rationale', 'agent_id'},
+            supplied={'rationale'},
+        )
+
+        assert result is not None
+        assert result.misclose == _closer('rationale')
+        assert result.pattern == INVOKE_CLOSER
+        assert result.recovered == {'agent_id': 'claude-interactive'}
