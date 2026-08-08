@@ -271,6 +271,18 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
+    # archive=True (task 3683): the only row in the infra-transient family
+    # with a non-NONE retry_kind, and the retry still does not keep it away
+    # from a human. ENV_SERIAL is a SINGLE bounded re-run ("retrying test
+    # command once", verify.py:5221-5233), and per task 3367 it fires only
+    # when the TEST leg failed (``attempt.test.cmd is not None and
+    # attempt.test.rc != 0``, :5220-5223) — so a LINT or TYPE leg classified
+    # ENV_TRANSIENT gets ZERO retries and is reported directly. Past that, the
+    # same family terminus: workflow.py:9020's default-5-attempt window stamps
+    # escalate_to_human=True on exhaustion → blocking L1 at :14791 (also
+    # merge_queue.py:3134 and verify.py:7255). Enforced by
+    # ``_assert_infra_transient_rows_archive``.
+    #
     # verdict_indeterminate=False DESPITE is_infra_transient=True: this row
     # fails predicate (3). It previously read "shared-venv mutations and a
     # broken `_merge-verify` worktree — host conditions the diff cannot reach",
@@ -288,7 +300,7 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # carries a POSITIVE worktree-removal anchor rather than being matched by
     # the absence of a rustc span.
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
-        severity_rank=10, archive=False, preexisting_probe=False,
+        severity_rank=10, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.ENV_SERIAL,
     ),

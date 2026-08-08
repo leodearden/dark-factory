@@ -178,7 +178,10 @@ class TestCategoryPolicyGoldenRows:
         # another host's PASS — see TestIndeterminateExclusionsAreAdjudicated
         # .test_excludes_env_transient for the residual that forced this.
         assert row.verdict_indeterminate is False
-        assert row.archive is False
+        # task 3683: flipped False -> True. A separate field from the
+        # verdict_indeterminate amendment above — see
+        # TestEnvTransientArchivesForHumanTriage.
+        assert row.archive is True
         assert row.preexisting_probe is False
 
     def test_none_row(self):
@@ -286,6 +289,13 @@ class TestDerivedRegistriesByteIdentity:
             justified its exclusion is the one fail-OPEN arm and does not
             cover the three that escalate (see
             TestPytestInternalerrorArchivesForHumanTriage).
+          * env_transient (task 3683) — likewise; its ENV_SERIAL retry is a
+            single bounded re-run that fires only for a failing TEST leg (see
+            TestEnvTransientArchivesForHumanTriage).
+
+        No is_infra_transient member remains — the invariant
+        ``INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST == frozenset()``,
+        enforced at import time by ``_assert_infra_transient_rows_archive``.
 
         Every other member is still the legacy value; this stays a
         byte-for-byte pin so an UNINTENDED archive-policy change still reds
@@ -293,7 +303,6 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'env_transient',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
@@ -322,11 +331,12 @@ class TestShouldArchive:
     category — proving the endswith('_error') heuristic can be deleted
     without changing behavior for any of the 12 known categories.
 
-    pytest_internalerror has since been ADJUDICATED away from the legacy
-    value rather than drifting from it (task 3683): it is infra-transient and
-    terminates in a blocking human escalation, so the archived log is that
-    human's only triage artifact — see
-    TestPytestInternalerrorArchivesForHumanTriage.
+    pytest_internalerror and env_transient have since been ADJUDICATED away
+    from the legacy value rather than drifting from it (task 3683): both are
+    infra-transient categories that terminate in a blocking human escalation,
+    so the archived log is that human's only triage artifact — see
+    TestPytestInternalerrorArchivesForHumanTriage and
+    TestEnvTransientArchivesForHumanTriage.
     """
 
     @pytest.mark.parametrize(
@@ -340,7 +350,7 @@ class TestShouldArchive:
             ('flock_error', True),
             ('npm_error', True),
             ('pytest_internalerror', True),
-            ('env_transient', False),
+            ('env_transient', True),
             ('test_failure', False),
             ('unknown_test_failure', True),
             ('passed', False),
