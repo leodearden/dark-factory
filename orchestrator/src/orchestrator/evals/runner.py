@@ -631,6 +631,20 @@ async def run_architect_eval(
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
     # the two must never be confused under one name.
     arch_cost_usd = 0.0
+    # The architect invocation's TOKEN USAGE — the price-table inputs Invariant
+    # P5 needs (see resolve_cost_usd). Pre-try for the same reason arch_cost_usd
+    # is: the timeout and harness-error paths never bind ``result``, so the
+    # honest zeros must already exist.
+    arch_input_tokens = 0
+    arch_output_tokens = 0
+    # Whether this candidate runs against a PROXIED endpoint, the third P5
+    # input. Read from the EvalConfig — not the built orch config — because it
+    # is literally what ``invoke_agent(env_overrides=config.env_overrides)``
+    # below is handed, and because reading it here means a harness crash inside
+    # the try cannot leave the proxy signal unknowable. Byte-identical to the
+    # condition ``build_eval_orch_config`` keys its price-table seeding on, so
+    # the seeded table and the trust-the-CLI flag can never disagree.
+    is_local = bool(config.env_overrides.get('ANTHROPIC_BASE_URL'))
     arch_duration_ms = 0
     outcome = 'done'
     # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
@@ -696,6 +710,11 @@ async def run_architect_eval(
             timeout=timeout_minutes * 60,
         )
         arch_cost_usd = result.cost_usd
+        # ``or 0``, not a bare read: AgentResult declares both ``int | None``,
+        # and a provider that did not report usage must persist an honest 0
+        # rather than a None that would poison the price-table arithmetic.
+        arch_input_tokens = result.input_tokens or 0
+        arch_output_tokens = result.output_tokens or 0
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
@@ -943,6 +962,13 @@ async def run_architect_eval(
         # reader "spend unknown", not "judge-free" (amendment, reviewer
         # robustness).
         cost_usd=arch_cost_usd + judge_cost_usd,
+        # The architect invocation's token usage + its proxy signal — the three
+        # inputs Invariant P5 resolves cost provenance from (resolve_cost_usd).
+        # Stamped on the cell so the persisted JSON carries the evidence behind
+        # its own cost figure, not just the figure.
+        input_tokens=arch_input_tokens,
+        output_tokens=arch_output_tokens,
+        is_local_model=is_local,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,
         cap_tainted=tainted,
