@@ -74,7 +74,7 @@ class TestStateRepairMemoryCitation:
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
             state = _state(memory_service=memory, journal=journal)
-            await state.start_report(
+            state.start_report(
                 run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
             )
 
@@ -125,7 +125,7 @@ class TestStateRepairMemoryCitation:
         """Reconciliation disabled -> a structured refusal, never a half-repair."""
         memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
         state = _state(memory_service=memory)
-        await state.start_report(
+        state.start_report(
             run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
         )
 
@@ -146,7 +146,7 @@ class TestStateRepairMemoryCitation:
         journal = await _seeded_journal(tmp_path)
         try:
             state = _state(journal=journal)
-            await state.start_report(
+            state.start_report(
                 run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
             )
 
@@ -175,7 +175,7 @@ class TestStateRepairMemoryCitation:
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
             state = _state(memory_service=memory, journal=journal)
-            await state.start_report(
+            state.start_report(
                 run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
             )
 
@@ -217,7 +217,9 @@ class TestRepairToolViaFastMCP:
         assert sig.parameters['replacement_memory_id'].default is None
         # Mirrors cite_memory's declared shape so a bad store is rejected at the
         # schema boundary too, not only by the unsupported_store gate.
-        assert sig.parameters['store'].annotation.__args__ == ('graphiti', 'mem0')
+        # recon_report.py carries `from __future__ import annotations`, so the
+        # signature holds the SOURCE TEXT of the annotation, not the object.
+        assert sig.parameters['store'].annotation == "Literal['graphiti', 'mem0']"
 
     @pytest.mark.asyncio
     async def test_end_to_end_tool_call(self, tmp_path):
@@ -225,7 +227,7 @@ class TestRepairToolViaFastMCP:
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
             state = _state(memory_service=memory, journal=journal)
-            await state.start_report(
+            state.start_report(
                 run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
             )
             mcp = create_recon_report_server(state)
