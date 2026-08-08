@@ -555,7 +555,13 @@ class TestAllowDanglingCitationsEscape:
     ):
         """(a) The flag lets the delete through with no replacement supplied —
         and rewrites nothing. It dangles the citation knowingly; it does not
-        silently invent a forwarding pointer."""
+        silently invent a forwarding pointer.
+
+        The response names what was dangled, in the same shape the refusal
+        reports in ``citing_tasks``. A server-side WARNING alone would be
+        invisible to the MCP caller this escape exists to serve, which is the
+        same silent-override defect the placement of the check argues against.
+        """
         result = await _call_delete(
             mcp_server,
             agent_id='claude-interactive',
@@ -565,6 +571,11 @@ class TestAllowDanglingCitationsEscape:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
         interceptor.update_task.assert_not_awaited()
+        assert result['dangled_citation_count'] == 1
+        assert [c['task_id'] for c in result['dangled_citations']] == ['1301']
+        assert result['dangled_citations'][0]['paths'] == ['mem0_canonical_entry']
+        # Nothing was dropped, so there is no ignored-argument noise to report.
+        assert 'ignored_replacement_memory_id' not in result
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('value', ['yes', 1, 'true', None])
@@ -714,8 +725,11 @@ class TestAllowDanglingCitationsEscape:
         mock_service.delete_memory.assert_awaited_once()
         # The override wins: nothing was repointed to the survivor.
         interceptor.update_task.assert_not_awaited()
-        # But the ignored argument is named, not dropped in silence.
+        # But the ignored argument is named, not dropped in silence — in the
+        # log AND in the response, since the MCP caller who supplied it reads
+        # only the latter.
         assert SURVIVOR in caplog.text
+        assert result['ignored_replacement_memory_id'] == SURVIVOR
 
     @pytest.mark.asyncio
     async def test_no_warning_when_the_flag_is_absent(

@@ -1498,7 +1498,12 @@ def create_mcp_server(
         DB is still ``CitationScanFailed``, because the flag means "I accept
         dangling the citers you just showed me" and with nothing enumerated
         there is nothing to knowingly accept. Cost: an override pays the one
-        ``get_tasks`` read. The trace is the point.
+        ``get_tasks`` read. The trace is the point — and it is returned to the
+        caller (``dangled_citations`` / ``dangled_citation_count``, plus
+        ``ignored_replacement_memory_id`` when one was supplied and dropped) as
+        well as logged, because an MCP caller never sees the server's log
+        stream and a bare ``{'status': 'deleted'}`` would be silent to the very
+        session this escape exists to serve.
 
         Why here and not in ``MemoryConsolidator.run()``: the consolidator
         never deletes from Python — the Stage-1 LLM agent calls this very tool
@@ -1610,7 +1615,22 @@ def create_mcp_server(
                 citing_tasks,
                 ignored_replacement,
             )
-            return None, None
+            # ...and report the same enumeration to the CALLER, not just to the
+            # server log. The caller this escape exists to serve drives a
+            # consolidation batch over MCP and never sees the orchestrator's log
+            # stream, so a bare {'status': 'deleted'} would make the override
+            # silent from the only vantage point that matters to them. This
+            # rides the same (None, stats) success channel the repoint path uses
+            # — merged into the tool result by delete_memory — and names the
+            # citers with the same shape the refusal reports in citing_tasks, so
+            # "refused" and "overridden" are diffable rather than two vocabularies.
+            dangled: dict[str, Any] = {
+                'dangled_citations': citing_tasks,
+                'dangled_citation_count': len(citing_tasks),
+            }
+            if replacement_memory_id is not None:
+                dangled['ignored_replacement_memory_id'] = replacement_memory_id
+            return None, dangled
 
         if replacement_memory_id is None:
             return {
