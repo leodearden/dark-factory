@@ -3595,6 +3595,19 @@ class MemoryService:
 
         When include_planned=False (default), results tagged with planned=True
         in their metadata are excluded.  When include_planned=True they are returned.
+
+        Results are ranked by Mem0's own cosine-descending ordering and carry,
+        in metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING results
+            (a result dropped for ``planned`` does not consume a rank).
+          - ``store_score``: Mem0's raw cosine, verbatim and un-clamped — the
+            honest per-store signal for the E1 retrieval probe and the task
+            3212 telemetry.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``: the
+        cosine no longer reaches it, so it is no longer comparable to a
+        similarity.
         """
         # Forward categories so Mem0Backend pushes the filter down to Qdrant
         # (task 1083: prevents false-negatives caused by post-filtering on
@@ -3616,13 +3629,29 @@ class MemoryService:
                 with contextlib.suppress(ValueError):
                     category = MemoryCategory(meta['category'])
 
+            # Rank over SURVIVORS only (task 3658) — a result skipped above must
+            # not consume a rank, since RRF maps rank directly to score.
+            rank = len(results) + 1
+
+            # COPY before stamping: `meta` is the dict object handed back by
+            # Mem0Backend.search, i.e. the caller's own response structure.
+            # Stamping into it would mutate that response in place.  The cosine
+            # is stored raw and un-clamped — store_score is a plain dict value
+            # with no pydantic bound, and clamping would corrupt the honest
+            # per-store signal.  (The old min(score, 1.0) existed only to
+            # satisfy MemoryResult.relevance_score's le=1.0; the RRF value is
+            # <= 1/61, so that clamp is no longer needed there either.)
+            metadata = dict(meta)
+            metadata['store_rank'] = rank
+            metadata['store_score'] = score
+
             results.append(MemoryResult(
                 id=item.get('id', ''),
                 content=content,
                 category=category,
                 source_store=SourceStore.mem0,
-                relevance_score=min(score, 1.0),
-                metadata=meta,
+                relevance_score=_rrf_score(rank),
+                metadata=metadata,
                 created_at=item.get('created_at'),
             ))
         return results
