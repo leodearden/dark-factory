@@ -46,6 +46,7 @@ from .metrics import (
     coerce_cost_usd,
     collect_metrics,
     detect_invocation_error,
+    resolve_cost_usd,
 )
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
@@ -663,6 +664,13 @@ async def run_architect_eval(
     # this a hung architect run would block indefinitely, bounded only by
     # max_budget_usd.
     timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+    # Hoisted out of the try so its PRICE TABLE survives to the cost resolution
+    # after the finally. A harness crash before it is built leaves an explicit
+    # ``None`` (which resolve_cost_usd tolerates) rather than an
+    # UnboundLocalError that would lose the whole cell — and that path never
+    # invoked the architect (0 tokens, $0.00), so no price table could have
+    # changed the number anyway.
+    orch_config: OrchestratorConfig | None = None
     try:
         # 2. Eval orch config (project_root / verify / profile parity).
         orch_config = build_eval_orch_config(
@@ -924,6 +932,31 @@ async def run_architect_eval(
         for stage, marker in (('architect', arch_error), ('judge', judge_error))
         if marker
     ]
+
+    # Cost provenance (Invariant P5) for the ARCHITECT component, through the
+    # SAME seam collect_metrics uses on the implementer path — a proxied
+    # endpoint's own CLI figure is untrustworthy, so it must be resolved rather
+    # than copied. Two non-obvious arguments:
+    #   - ``model=config.model``: this path calls
+    #     ``invoke_agent(model=config.model)`` DIRECTLY, so the EvalConfig's
+    #     model is literally what produced the tokens being priced.
+    #     ``orch_config.models.architect`` would be the WRONG key —
+    #     build_eval_orch_config pins it to the frozen 'opus' default whenever
+    #     architect_config is None, which is every run_architect_eval caller,
+    #     so pricing would silently look up opus for a fable or vLLM candidate.
+    #   - ``prices`` from ``orch_config``, NOT ``base_config``:
+    #     build_eval_orch_config auto-merges claude_endpoint_price_table() into
+    #     .prices for a PROXIED candidate (task 2820), and that merge is exactly
+    #     what makes 'price_table' reachable here instead of the degraded
+    #     'unpriced_proxy'.
+    resolved_arch_cost, arch_cost_source = resolve_cost_usd(
+        arch_input_tokens,
+        arch_output_tokens,
+        model=config.model,
+        prices=orch_config.prices if orch_config is not None else None,
+        cli_cost_usd=arch_cost_usd,
+        is_local_model=is_local,
+    )
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
@@ -961,7 +994,12 @@ async def run_architect_eval(
         # so invocation_error below reads "judge:raised: ...", telling a
         # reader "spend unknown", not "judge-free" (amendment, reviewer
         # robustness).
-        cost_usd=arch_cost_usd + judge_cost_usd,
+        # The architect component is the RESOLVED figure (Invariant P5), never
+        # the raw CLI one; the judge component keeps its CLI figure because the
+        # plan judge is always a native-cloud opus call. judge_cost_usd is still
+        # the judge's SHARE of this total, not a separately-resolved addend.
+        cost_usd=resolved_arch_cost + judge_cost_usd,
+        cost_source=arch_cost_source,
         # The architect invocation's token usage + its proxy signal — the three
         # inputs Invariant P5 resolves cost provenance from (resolve_cost_usd).
         # Stamped on the cell so the persisted JSON carries the evidence behind
