@@ -162,6 +162,21 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=True, verdict_indeterminate=True,
         retry_kind=RetryKind.NONE,
     ),
+    # archive=True (task 3683, generalising task 3679's SEMAPHORE_TIMEOUT
+    # adjudication to the rest of the infra-transient family):
+    # ``retry_kind=NONE`` means no in-verify serial re-run is attempted, and
+    # the bounded windows that DO retry this row are category-AGNOSTIC — they
+    # test flat ``in INFRA_TRANSIENT_CATEGORIES`` membership with no
+    # per-category branch (workflow.py:9020, merge_queue.py:2761,
+    # verify.py:7255) — so exhausting any of them files a BLOCKING level-1
+    # ``infra_issue`` escalation with this row's log as the only triage
+    # artifact beyond a truncated ``failure_report()``. Archival is decided
+    # PER ATTEMPT from the category alone (verify.py:1902), inside the retry
+    # loop, with no knowledge of whether this is the exhausting attempt — so
+    # archive=False discarded the log on the attempt that hands the incident
+    # to a human too. Enforced for the whole family by
+    # ``_assert_infra_transient_rows_archive``.
+    #
     # verdict_indeterminate=False DESPITE is_infra_transient=True: this row
     # fails predicate (2), NOT (3), and the distinction is worth keeping —
     # its ENOSPC markers ARE reliable evidence that the disk really was full,
@@ -171,16 +186,18 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # caused this non-completion and a local disk_full keeps its veto over
     # another host's PASS. Fail CLOSED; only the retry loop treats it as infra.
     FailureCategory.DISK_FULL: CategoryPolicy(
-        severity_rank=2, archive=False, preexisting_probe=False,
+        severity_rank=2, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
-    # archive=True (task 3679): unlike its DISK_FULL sibling this category is
-    # infra-transient but NOT self-clearing — retry_kind=NONE means no serial
-    # re-run is attempted, so it terminates in a blocking human escalation, and
-    # the archived log is then the only triage artifact that human has. Both
-    # live incidents blocked on exactly that (reify data/verify-logs/5848 and
-    # /5893 were never written).
+    # archive=True (task 3679): this category is infra-transient but NOT
+    # self-clearing — retry_kind=NONE means no serial re-run is attempted, so
+    # it terminates in a blocking human escalation, and the archived log is
+    # then the only triage artifact that human has. Both live incidents
+    # blocked on exactly that (reify data/verify-logs/5848 and /5893 were
+    # never written). Task 3683 found the same reasoning holds for every
+    # is_infra_transient row and generalised it — see the DISK_FULL row above
+    # and ``_assert_infra_transient_rows_archive``.
     #
     # verdict_indeterminate=False DESPITE is_infra_transient=True: this row
     # fails predicate (3), on the same residual shape as ENV_TRANSIENT below.

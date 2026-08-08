@@ -274,16 +274,22 @@ class TestDerivedRegistriesByteIdentity:
         ]
 
     def test_archive_deny_list_matches_legacy_set(self):
-        """The legacy set MINUS semaphore_timeout, removed deliberately by
-        task 3679 (that category terminates in a blocking human escalation,
-        so its log is the only triage artifact — see
-        TestSemaphoreTimeoutArchivesForHumanTriage). Every other member is
-        still the legacy value; this stays a byte-for-byte pin so an
-        UNINTENDED archive-policy change still reds here."""
+        """The legacy set MINUS the members removed deliberately, in order:
+
+          * semaphore_timeout (task 3679) — that category terminates in a
+            blocking human escalation, so its log is the only triage artifact
+            (see TestSemaphoreTimeoutArchivesForHumanTriage).
+          * disk_full (task 3683) — same terminus, reached through the
+            identical category-agnostic retry windows (see
+            TestDiskFullArchivesForHumanTriage).
+
+        Every other member is still the legacy value; this stays a
+        byte-for-byte pin so an UNINTENDED archive-policy change still reds
+        here."""
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'pytest_internalerror', 'env_transient', 'disk_full',
+            'pytest_internalerror', 'env_transient',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
@@ -550,11 +556,13 @@ class TestCrossModulePreexistingSingleSourced:
 # serial re-run cannot fix a host condition) ranked just below INFRA_TIMEOUT
 # and above every code-fault category.
 #
-# The pair no longer shares an ARCHIVE policy (task 3679): DISK_FULL keeps
-# archive=False, SEMAPHORE_TIMEOUT is now archive=True. See
-# TestSemaphoreTimeoutArchivesForHumanTriage for the grounding — with
-# retry_kind=NONE, SEMAPHORE_TIMEOUT surfaces to a human rather than
-# self-clearing, and the archived log is that human's only triage artifact.
+# The pair shares an ARCHIVE policy again: task 3679 flipped
+# SEMAPHORE_TIMEOUT to archive=True, and task 3683's audit found the same
+# grounding applies verbatim to DISK_FULL and flipped it too. See
+# TestSemaphoreTimeoutArchivesForHumanTriage and
+# TestDiskFullArchivesForHumanTriage — with retry_kind=NONE both surface to a
+# human rather than self-clearing, and the archived log is that human's only
+# triage artifact.
 #
 # RED today: neither member/row exists yet, so every test below fails on
 # the local ``from orchestrator.verify_categories import FailureCategory``
@@ -567,8 +575,10 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
     """DISK_FULL / SEMAPHORE_TIMEOUT are new FailureCategory members with an
     env_transient-family CATEGORY_POLICY row.
 
-    The two rows are identical EXCEPT for ``archive`` (task 3679):
-    SEMAPHORE_TIMEOUT is archive=True, DISK_FULL remains archive=False.
+    The two rows are identical again, ``archive`` included: task 3679 flipped
+    SEMAPHORE_TIMEOUT to archive=True, and task 3683 found the same grounding
+    holds for DISK_FULL — both are retry_kind=NONE infra-transient rows whose
+    bounded retry windows terminate in a blocking human escalation.
     """
 
     def test_disk_full_value_and_policy(self):
@@ -576,13 +586,13 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
         assert FailureCategory.DISK_FULL.value == 'disk_full'
         row = CATEGORY_POLICY[FailureCategory.DISK_FULL]
         assert row.is_infra_transient is True
-        assert row.archive is False
+        assert row.archive is True
         assert row.preexisting_probe is False
         assert row.retry_kind == RetryKind.NONE
 
     def test_semaphore_timeout_value_and_policy(self):
-        """archive=True since task 3679 — the one field where this row no
-        longer matches its DISK_FULL sibling (see the class docstring)."""
+        """archive=True since task 3679 — matched by its DISK_FULL sibling
+        since task 3683 (see the class docstring)."""
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
         assert FailureCategory.SEMAPHORE_TIMEOUT.value == 'semaphore_timeout'
         row = CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT]
