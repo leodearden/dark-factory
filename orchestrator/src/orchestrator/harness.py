@@ -10320,11 +10320,39 @@ class Harness:
             # path skips claimant resolution entirely for an identical result.
             from escalation.pins import classify_pins  # noqa: PLC0415
 
-            pinned = classify_pins(
-                task_id,
-                self._escalation_queue.get_by_task(task_id, status='pending'),
-                live_claimant=False,
-            )
+            try:
+                rows = self._escalation_queue.get_by_task(
+                    task_id, status='pending',
+                )
+            except Exception:
+                # `classify_pins`'s store-correctness contract, obligation 2:
+                # a read that FAILED must be passed as `records=None`, never
+                # substituted with `[]` — a false "no open escalations" is
+                # exactly the esc-3163 collapse (a genuinely-pinned task
+                # routed down the act-anyway branch).  Letting it propagate
+                # instead would make the disposition invisible: the
+                # scheduler's generic `_consult_already_landed` catch-all
+                # logs a traceback and fails open for the WHOLE gate, so
+                # "never phantom-done on an unreadable store" would be
+                # incidental rather than local and testable.
+                #
+                # `except Exception` is broad on purpose: `get_by_task`
+                # already absorbs per-file JSON/type errors internally, so
+                # what reaches here is filesystem-level (OSError) or an
+                # unexpected store-implementation fault — neither of which
+                # may abort a dispatch tick.
+                logger.warning(
+                    'already-landed dispatch gate: could not READ the '
+                    'escalation store for task %s — treating as '
+                    'store_unavailable and vetoing the auto-done flip '
+                    '(never phantom-done on an unreadable store); '
+                    'dispatching normally',
+                    task_id,
+                    exc_info=True,
+                )
+                rows = None
+
+            pinned = classify_pins(task_id, rows, live_claimant=False)
             if pinned.vetoes_done_flip:
                 logger.info(
                     'already-landed dispatch gate: task %s is NOT eligible for '
