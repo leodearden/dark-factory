@@ -1473,13 +1473,32 @@ def create_mcp_server(
         ``_taskmaster_configured and project_id in _kp`` precondition — but the
         opposite failure posture, deliberately (see below).
 
-        Scoped to consolidation deletes only: a ``recon-stage-*`` ``agent_id``
-        AND ``store == 'mem0'``. The recon-stage predicate mirrors the
-        ``recon_write_policy`` call-site idiom (``task_interceptor.py:893``,
-        :3953) and bounds the blast radius to the path the incident came from,
-        so an interactive delete pays no extra ``get_tasks`` read. The mem0
-        scoping mirrors ``verify_cited_memories``' own: the incident's
-        citations were Mem0 entry UUIDs.
+        Scoped to the RECORD, not to the caller (task 3624): ``store == 'mem0'``
+        and a scannable registered project. "Will this delete dangle a live
+        pointer?" is a property of the entry and the task DB, so an identical
+        delete is gated identically no matter who issues it — including a caller
+        with no ``agent_id`` at all. The original scoping added a
+        ``recon-stage-*`` ``agent_id`` predicate to bound the blast radius; that
+        left the interactive path — how the 25-gate consolidation batch of task
+        3524 is actually driven — landing unguarded, stranding exactly the
+        pointers this gate exists to protect, and it made an unidentified caller
+        the LEAST guarded one. The mem0 scoping mirrors
+        ``verify_cited_memories``' own: the incident's citations were Mem0 entry
+        UUIDs.
+
+        ``allow_dangling_citations`` is the deliberate escape, for a caller with
+        no surviving entry to repoint to — a plain drop rather than a
+        consolidation, which ``replacement_memory_id`` cannot express. It is a
+        property of stated intent, not of identity, so it is available to every
+        caller. It is checked AFTER the scan, not as an early-out, for two
+        reasons: it must be able to NAME what it dangles (the WARNING it emits
+        reuses ``citing_tasks``, and an override that lands silently is the same
+        class of defect as the gate that never ran), and that ordering keeps the
+        fail-closed posture below intact — an override plus an unreadable task
+        DB is still ``CitationScanFailed``, because the flag means "I accept
+        dangling the citers you just showed me" and with nothing enumerated
+        there is nothing to knowingly accept. Cost: an override pays the one
+        ``get_tasks`` read. The trace is the point.
 
         Why here and not in ``MemoryConsolidator.run()``: the consolidator
         never deletes from Python — the Stage-1 LLM agent calls this very tool
@@ -3048,11 +3067,15 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
-        **Consolidation deletes** (a ``recon-stage-*`` caller deleting a
-        ``store='mem0'`` duplicate in favour of a survivor) additionally pass
-        through the citation-repoint gate: task metadata still citing the
+        **Every ``store='mem0'`` delete** passes through the citation-repoint
+        gate, whoever issues it (task 3624): task metadata still citing the
         doomed entry is repointed to *replacement_memory_id* BEFORE the delete
-        runs, and the delete is refused outright if that cannot be done. See
+        runs, and the delete is refused outright if that cannot be done. The
+        gate keys on the record, not the caller — "will this dangle a live
+        pointer?" does not depend on who asked. An uncited entry is unaffected:
+        the scan finds nothing live and the delete proceeds. A delete with no
+        surviving entry to repoint to needs
+        ``metadata={'allow_dangling_citations': True}``. See
         ``_citation_repoint_gate``.
 
         Args:
@@ -3064,7 +3087,14 @@ def create_mcp_server(
                 memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs (may contain _causation_id for
+                recon). Set {'allow_dangling_citations': True} to accept
+                dangling live task citations deliberately, for a drop with no
+                surviving entry to repoint to; only a LITERAL ``True`` counts,
+                the override is recorded at WARNING with every citer it strands,
+                and it does not unlock the fail-closed ``CitationScanFailed``
+                path. The flag is write-time-only and is never forwarded to the
+                store.
             replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
                 this delete supersedes one duplicate in favour of another.
                 Required for a consolidation delete whose id is still cited by a
