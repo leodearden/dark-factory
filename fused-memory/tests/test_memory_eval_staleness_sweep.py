@@ -504,13 +504,59 @@ class TestTaskTerminalStaleness:
 STAMP = '20260808T120000Z'
 
 
-def _full_inputs():
-    """One of every family, all with non-zero exposure."""
+def _full_refs():
+    """The refs behind :func:`_full_inputs` — one citation per target."""
     m = _mod()
-    refs = [
+    return [
         *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
         *m.pointer_targets(_record('rec-2', 'a correction', corrects=UUID_C)),
     ]
+
+
+def _multi_cited_refs():
+    """Refs whose targets are cited more than once — the read-plan case.
+
+    Deliberately a SIBLING of :func:`_full_refs` rather than a widening of it:
+    the single-citation fixture is load-bearing for the rest of
+    ``TestBuildSeries``, and changing its multiplicity in place would move
+    every one of their expected numbers at once.
+
+    THREE refs cite ONE resolved target (``rec-1``/``rec-2`` supersede it,
+    ``rec-3`` corrects it), one ref names a target no read can be issued for
+    at all, and one names a readable target that does not resolve.
+    """
+    m = _mod()
+    return [
+        *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+        *m.pointer_targets(_record('rec-2', 'successor two', supersedes=UUID_B)),
+        *m.pointer_targets(_record('rec-3', 'a correction', corrects=UUID_B)),
+        *m.pointer_targets(_record('rec-4', 'a broken pointer', supersedes='not-a-uuid')),
+        *m.pointer_targets(_record('rec-5', 'cites a ghost', corrects=UUID_C)),
+    ]
+
+
+def _multi_cited_inputs():
+    """:func:`_full_inputs`'s shape over :func:`_multi_cited_refs`."""
+    m = _mod()
+    refs = _multi_cited_refs()
+    resolution = {UUID_B: True}
+    return {
+        'census': m.dangling_census(refs, resolution),
+        'tripwire_items': m.successor_pointer_items(refs, resolution),
+        'surfacing': m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B, UUID_A]),
+        'staleness': m.terminal_staleness(
+            [_record('rec-6', 'Task 4802 status=in-progress')], {'4802': 'done'},
+        ),
+        'corpus_counts': {},
+        'project_id': 'dark_factory',
+        'stamp': STAMP,
+    }
+
+
+def _full_inputs():
+    """One of every family, all with non-zero exposure."""
+    m = _mod()
+    refs = _full_refs()
     resolution = {UUID_B: True, UUID_C: False}
     return {
         'census': m.dangling_census(refs, resolution),
@@ -646,6 +692,103 @@ class TestBuildSeries:
         # And the runner's own disclosures ride along in the same mapping.
         assert counts['pointer_refs_malformed'] == 0
         assert counts['pointers_supersedes_examined'] == 1
+
+    def test_every_disclosure_key_is_asserted_not_merely_spot_checked(self):
+        """The emitted key SET, and every value in it.
+
+        The test above spot-checks two of these keys, which is how a disclosure
+        that reported the wrong number shipped: nothing asserted it. An
+        emitted-SET assertion makes the next disclosure added without coverage
+        fail here rather than slip through the same gap.
+        """
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['corpus_counts'] = {'procedural_knowledge_scanned': 12}
+        counts = m.build_series(**inputs).corpus.counts
+
+        assert set(counts) == {
+            'procedural_knowledge_scanned',
+            'pointer_refs_malformed',
+            'pointer_targets_unique_reads',
+            'surfacing_pairs_observed',
+            'task_terminal_entry_task_pairs',
+            'pointers_supersedes_examined',
+            'pointers_supersedes_resolved',
+            'pointers_supersedes_unresolved',
+            'pointers_corrects_examined',
+            'pointers_corrects_resolved',
+            'pointers_corrects_unresolved',
+        }
+
+        census = inputs['census']
+        assert counts['pointer_refs_malformed'] == len(
+            m.malformed_pointer_refs(census.unresolved_refs),
+        )
+        assert counts['pointer_targets_unique_reads'] == len(
+            m.unique_pointer_targets(_full_refs()),
+        )
+        assert counts['surfacing_pairs_observed'] == len(inputs['surfacing'].records)
+        assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
+        for key, row in census.by_key.items():
+            for field_name, value in row.items():
+                assert counts[f'pointers_{key}_{field_name}'] == value
+
+    def test_the_disclosed_read_count_is_reads_not_citations(self):
+        """``pointer_targets_unique_reads`` IS the plan ``resolve_pointer_targets`` runs.
+
+        Three records citing one resolved target cost ONE live
+        ``get_memory_by_id``, not three — the de-duplication lives in
+        ``unique_pointer_targets``, and that helper is the read plan. Computed
+        from the helper here rather than restated as a literal, so the
+        assertion tracks the read plan instead of a hand-copied number.
+
+        A read-cost field that instead grew with citation density would drift
+        upward as the corpus cross-references itself, and leaf α — which reads
+        this artifact, not this source — would see a trend that no read ever
+        made.
+        """
+        m = _mod()
+        counts = m.build_series(**_multi_cited_inputs()).corpus.counts
+        assert counts['pointer_targets_unique_reads'] == len(
+            m.unique_pointer_targets(_multi_cited_refs()),
+        )
+
+    def test_an_unreadable_target_is_disclosed_but_never_counted_as_a_read(self):
+        """Excluded from the read count, still named by its own key.
+
+        ``resolve_pointer_targets`` issues no read for a target that is not
+        memory-id-shaped, so counting it as a read is a fabricated cost. It is
+        not thereby forgiven: ``pointer_refs_malformed`` is where it stays
+        visible, which is what makes the exclusion a correction rather than a
+        lost disclosure.
+        """
+        m = _mod()
+        inputs = _multi_cited_inputs()
+        counts = m.build_series(**inputs).corpus.counts
+
+        assert 'not-a-uuid' not in m.unique_pointer_targets(_multi_cited_refs())
+        assert counts['pointer_targets_unique_reads'] == len({UUID_B, UUID_C})
+        assert counts['pointer_refs_malformed'] == len(
+            m.malformed_pointer_refs(inputs['census'].unresolved_refs),
+        )
+        assert counts['pointer_refs_malformed'] == 1
+
+    def test_reads_never_exceed_the_edges_that_asked_for_them(self):
+        """One read per distinct readable target, so reads ≤ pointers examined.
+
+        True by construction once the field counts distinct readable targets,
+        and violated by any expression that sums a de-duplicated half with a
+        per-edge one. Asserted against the per-key rows in the same artifact,
+        so the two disclosures cannot disagree about what a unit is.
+        """
+        m = _mod()
+        inputs = _multi_cited_inputs()
+        counts = m.build_series(**inputs).corpus.counts
+        examined = sum(
+            value for key, value in counts.items() if key.endswith('_examined')
+        )
+        assert examined == inputs['census'].examined
+        assert counts['pointer_targets_unique_reads'] <= examined
 
     def test_a_caller_key_colliding_with_a_computed_disclosure_raises(self):
         """Silently overwriting either one would hide a narrowing."""
