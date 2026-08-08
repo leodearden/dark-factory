@@ -640,7 +640,12 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     gate commits" family, registered prospectively ahead of still-blocked
     gate 3342 -- the first cluster whose corpus spans BOTH
     ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
-    entries), which is how it grew uncaught.
+    entries), which is how it grew uncaught. The seventh (task 3862) seeds
+    the "``npx pyright`` aborts with npm EACCES on /home/leo/.npm/_cacache"
+    family, registered prospectively ahead of still-blocked gate 3417 -- the
+    first cluster whose 21 members CONTRADICT EACH OTHER on causation rather
+    than merely paraphrasing one another, which is why its phrases are keyed
+    on the invariant symptom instead of the adjudicated correct diagnosis.
 
     Task 3054 then made per-phrase distinctiveness expressible: the
     report_task_already_done cluster declares its two identifier-shaped
@@ -933,6 +938,31 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'and preferences_and_norms and is still awaiting a consolidation '
                 'ruling. Do NOT add another entry -- update/consolidate the '
                 'existing entries, or add context to gate task 3342.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='npx-pyright-eacces-agent-sandbox',
+            phrases=[
+                'npx pyright',
+                'EACCES',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (`npx pyright` aborting with npm '
+                'EACCES on /home/leo/.npm/_cacache) gated to human task 3417, '
+                'whose 21-entry cluster is still awaiting a consolidation '
+                'ruling. The cluster DISAGREES WITH ITSELF, so read this before '
+                'writing: the `sudo chown -R 1000:1000 /home/leo/.npm` remedy '
+                'several existing entries prescribe is a CONFIRMED NO-OP -- the '
+                'tree is already drwxrwxr-x leo:leo and every agent role runs as '
+                'uid 1000, and npm emits that text for any EACCES it cannot '
+                'explain. The verified cause is the landlock write set: '
+                "compute_write_set()'s ALLOW-LIST has no ~/.npm row "
+                '(orchestrator/src/orchestrator/agents/write_set.py:145-161), so '
+                'npm cannot write _cacache/_logs and aborts before exec\'ing '
+                'pyright. Task 3162 owns the fix. Do NOT add another entry -- '
+                'update/consolidate the existing entries, or add context to gate '
+                'task 3417.'
             ),
         ),
     ]
