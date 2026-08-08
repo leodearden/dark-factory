@@ -80,7 +80,9 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger('memory_eval_staleness_sweep')
 
@@ -145,3 +147,96 @@ start — invisible to the limits evaluator, which scans one root.
 """
 
 _WHITESPACE_RE = re.compile(r'\s+')
+
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+"""What a Mem0 point id looks like. Used ONLY to classify a pointer member as
+well-formed for the disclosure — never to drop one (see
+:func:`malformed_pointer_refs`)."""
+
+
+# ---------------------------------------------------------------------------
+# Family (2a) — pointer extraction
+#
+# THE only place this runner reads a pointer key's raw metadata value, and it
+# reads all three through the one imported normalize_supersedes(). See the
+# module docstring for why a second parser here would re-introduce 3112's
+# char-iteration bug.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PointerRef:
+    """One declared edge: *source_id* ``--[key]-->`` *target*.
+
+    *target* is deliberately typed ``Any``: ``normalize_supersedes`` never
+    drops or coerces a member, so a malformed one (short hex, an int, a
+    ``None`` inside a list) arrives here intact and is reported by name rather
+    than silently discarded — a dropped member is a silently discarded
+    supersession edge.
+
+    *source_content* rides along because the ``successor-pointer-present``
+    tripwire keys its items by CONTENT hash, not by the source UUID (D5,
+    "content-hash item keys (UUID rot)"): leaf α grandfathers by item_key, so
+    a UUID that rotated under re-consolidation would read as a brand-new
+    failure and fire a false alarm. Carrying it on the ref is what lets
+    :func:`successor_pointer_items` stay pure over the refs alone.
+    """
+
+    source_id: str
+    key: str
+    target: Any
+    source_content: str = ''
+
+
+def pointer_targets(record: dict) -> list[PointerRef]:
+    """Every pointer edge *record*'s metadata declares, in :data:`POINTER_KEYS` order.
+
+    All three keys are parsed by the ONE imported
+    :func:`fused_memory.memory_metadata.normalize_supersedes`. D7 mandates the
+    helper for ``supersedes``; ``parent_id`` and ``corrects`` carry the
+    identical ``None``/scalar/list ambiguity, so writing a second local parse
+    for them would be exactly the INV-5 violation D7 forbids *while*
+    re-introducing the bug the helper was written to prevent — iterating a
+    36-character UUID string into 36 single characters, none of which resolve,
+    manufacturing a systematic false dangling-pointer report (task 3112).
+
+    Iteration follows :data:`POINTER_KEYS`, not the metadata dict's insertion
+    order: the latter is an artifact of however the record happened to be
+    written, and letting it leak through would make the emitted ordering — and
+    therefore the report an operator diffs between runs — depend on nothing
+    meaningful.
+
+    Malformed members are RETAINED, matching the helper's no-drop contract;
+    :func:`malformed_pointer_refs` is how they are surfaced.
+    """
+    from fused_memory.memory_metadata import normalize_supersedes  # noqa: PLC0415
+
+    metadata = record.get('metadata') or {}
+    source_id = str(record.get('id') or '')
+    source_content = record.get('content') or ''
+    refs: list[PointerRef] = []
+    for key in POINTER_KEYS:
+        for target in normalize_supersedes(metadata.get(key)):
+            refs.append(PointerRef(
+                source_id=source_id,
+                key=key,
+                target=target,
+                source_content=source_content,
+            ))
+    return refs
+
+
+def malformed_pointer_refs(refs: list[PointerRef]) -> list[PointerRef]:
+    """The refs whose target is not a memory-id-shaped string.
+
+    Reported, never dropped. The census still counts a malformed member as an
+    unresolved pointer — a value that cannot name a memory is a broken edge,
+    not a missing measurement — but an operator reading a dangling count needs
+    to know how much of it is "the target is gone" versus "the pointer was
+    never writable in the first place", because the two have different fixes.
+    """
+    return [ref for ref in refs if not (
+        isinstance(ref.target, str) and _UUID_RE.match(ref.target)
+    )]
