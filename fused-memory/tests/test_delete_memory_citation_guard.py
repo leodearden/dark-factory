@@ -519,6 +519,33 @@ class TestGateAppliesToEveryCaller:
         assert result['error_type'] == 'CitationRepointRequired'
         assert 'allow_dangling_citations' in result['hint']
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'bad_replacement',
+        ['search(query="canonical dispatch advice")', SURVIVOR[:8], DOOMED],
+        ids=['search-instruction', 'truncated-uuid', 'self-repoint'],
+    )
+    async def test_a_bad_replacement_is_not_offered_the_escape(
+        self, mcp_server, bad_replacement,
+    ):
+        """The escape is available to every caller but advertised to only one.
+
+        A caller who reached CitationReplacementInvalid did so BY naming a
+        survivor, so they demonstrably have one and their fix is to correct the
+        value. Dangling a live pointer because a UUID was truncated reproduces
+        the incident this gate closes, so the shared hint must keep saying
+        "copy the correct UUID" and nothing else.
+        """
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=bad_replacement,
+        )
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        assert 'allow_dangling_citations' not in result['hint']
+        assert 'replacement_memory_id' in result['hint']
+
 
 class TestAllowDanglingCitationsEscape:
     """``metadata={'allow_dangling_citations': True}`` is the deliberate escape.
@@ -585,7 +612,12 @@ class TestAllowDanglingCitationsEscape:
         """(b) The ``is True`` half of the house override idiom
         (tools.py:2103-2104). A truthy ``'yes'`` or ``1`` must NOT unlock an
         irreversible delete — the same literal-boolean convention CHANGELOG.md
-        records for ``allow_mcp_markup``."""
+        records for ``allow_mcp_markup``.
+
+        And it must not degrade SILENTLY: a dropped value plus a hint telling
+        the caller to pass the flag they believe they just passed is a retry
+        loop, not a guard. The refusal names the value it ignored.
+        """
         result = await _call_delete(
             mcp_server,
             agent_id='claude-interactive',
@@ -594,6 +626,27 @@ class TestAllowDanglingCitationsEscape:
 
         assert result['error_type'] == 'CitationRepointRequired', value
         mock_service.delete_memory.assert_not_awaited()
+        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert 'literal boolean True' in result['hint']
+
+    @pytest.mark.asyncio
+    async def test_a_literal_false_is_honoured_without_being_reported(
+        self, mcp_server, mock_service,
+    ):
+        """The ignored-value report is for a MALFORMED override, not for a
+        deliberate one. ``False`` is a literal boolean saying "do not override";
+        answering it with "your override was ignored" would be noise on a caller
+        who did exactly the right thing."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': False},
+        )
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
+        assert 'ignored_override' not in result
+        assert 'literal boolean True' not in result['hint']
 
     @pytest.mark.asyncio
     async def test_override_does_not_defeat_the_fail_closed_scan_error(

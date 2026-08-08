@@ -1356,12 +1356,40 @@ def create_mcp_server(
         'rather than reconstructing it. A search(query=...) instruction is NOT '
         'an acceptable replacement value — re-deriving at read time resolves '
         'back to the superseded duplicates this consolidation is collapsing. '
-        'Terminal (done/cancelled) citers are reported, never rewritten. '
-        'If there is no surviving entry to repoint to — a plain drop rather '
-        'than a consolidation — pass '
-        "metadata={'allow_dangling_citations': True} to accept dangling these "
-        'citations deliberately; the override is recorded at WARNING along '
-        'with every citer it strands.'
+        'Terminal (done/cancelled) citers are reported, never rewritten.'
+    )
+    # (task 3624) The escape is advertised on the CitationRepointRequired
+    # refusal ONLY, which is why this is a separate constant rather than a
+    # sentence appended to the shared one. The CitationReplacement* refusals
+    # reuse _CITATION_REPOINT_HINT unchanged: a caller who typo'd, truncated or
+    # hallucinated a survivor UUID demonstrably HAS a survivor, so their fix is
+    # "copy the correct UUID" and offering a one-flag bypass there would invite
+    # exactly the stranded-pointer incident this gate closes. The same logic
+    # bounds who should take it at all — a consolidation delete has a survivor
+    # by definition, so the escape is never right for one, and the sentence
+    # says so rather than leaving the Stage-1 agent to infer it.
+    _CITATION_REPOINT_REQUIRED_HINT = (
+        _CITATION_REPOINT_HINT
+        + ' If there is no surviving entry to repoint to — a plain drop rather '
+          'than a consolidation, which replacement_memory_id cannot express — '
+          "pass metadata={'allow_dangling_citations': True} to accept dangling "
+          'these citations deliberately; the override is recorded at WARNING '
+          'and the response names every citer it strands. A consolidation '
+          'delete has a survivor by definition, so name it instead: taking the '
+          'escape there strands exactly the live pointers this gate exists to '
+          'protect.'
+    )
+    # (task 3624) Appended to whichever refusal a caller gets when they DID send
+    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # strictness degrades silently into a dead end: the value is dropped, the
+    # ordinary refusal comes back, and its hint instructs them to pass the very
+    # flag they believe they just passed — a retry loop for an LLM caller.
+    _IGNORED_DANGLING_OVERRIDE_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED and this refusal stands. Only '
+        'a literal True counts (the same rule as allow_near_duplicate and '
+        "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
+        'irreversible delete. Resend it as JSON true if you meant to override.'
     )
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
@@ -1642,7 +1670,12 @@ def create_mcp_server(
                 'error_type': 'CitationRepointRequired',
                 'memory_id': memory_id,
                 'citing_tasks': citing_tasks,
-                'hint': _CITATION_REPOINT_HINT,
+                # The ONE refusal that advertises the escape: this caller has
+                # named no survivor and may genuinely have none. The
+                # CitationReplacement* refusals below keep the plain hint —
+                # they were reached BY naming a survivor, so the fix is to
+                # correct that value, not to bypass the gate.
+                'hint': _CITATION_REPOINT_REQUIRED_HINT,
             }, None
 
         # A forwarding pointer is only a pointer if it is a concrete id. This
@@ -3165,9 +3198,11 @@ def create_mcp_server(
         # (see below in this module): read off the RAW envelope, and only a
         # LITERAL True counts — a truthy 'yes' must not unlock an irreversible
         # delete.
-        allow_dangling_citations = (
-            isinstance(metadata, dict) and metadata.get('allow_dangling_citations') is True
+        override_supplied = (
+            isinstance(metadata, dict) and 'allow_dangling_citations' in metadata
         )
+        raw_override = metadata.get('allow_dangling_citations') if override_supplied else None
+        allow_dangling_citations = raw_override is True
         # Repoint live task-metadata citations BEFORE the irreversible delete.
         # Order is the whole point: a rejection here never reaches the service
         # call, so the dangling-pointer window is closed rather than moved.
@@ -3176,6 +3211,21 @@ def create_mcp_server(
             allow_dangling_citations=allow_dangling_citations,
         )
         if rejection:
+            # The `is True` strictness above is right, but dropping a
+            # non-conforming value in SILENCE is not: the caller would get back
+            # a refusal whose hint tells them to pass the flag they believe they
+            # just passed, and would retry into the same wall. Name the value
+            # that was ignored instead (loud-over-silent-degradation). A literal
+            # False is a deliberate "no", not a malformed yes, so it is honoured
+            # without comment — this fires only for a non-boolean value.
+            if override_supplied and not isinstance(raw_override, bool):
+                rejection = {
+                    **rejection,
+                    'ignored_override': {'allow_dangling_citations': raw_override},
+                    'hint': ' '.join(
+                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
+                    ),
+                }
             return rejection
         result = await memory_service.delete_memory(
             memory_id=resolved_id,
