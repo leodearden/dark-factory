@@ -291,19 +291,6 @@ class TestCitationGateScopingAndFailures:
         )
 
     @pytest.mark.asyncio
-    async def test_non_recon_caller_bypasses_the_gate_entirely(
-        self, mcp_server, mock_service, interceptor,
-    ):
-        """(a) An interactive caller pays no extra get_tasks read and is never
-        blocked — the gate is scoped to the consolidation path the incident
-        actually came from."""
-        result = await _call_delete(mcp_server, agent_id='claude-interactive')
-
-        assert result['status'] == 'deleted'
-        mock_service.delete_memory.assert_awaited_once()
-        interceptor.get_tasks.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_graphiti_store_bypasses_the_gate_entirely(
         self, mcp_server, mock_service, interceptor,
     ):
@@ -418,6 +405,101 @@ class TestCitationGateScopingAndFailures:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
         interceptor.get_tasks.assert_not_awaited()
+
+
+class TestGateAppliesToEveryCaller:
+    """The gate keys on the RECORD, not on who is deleting it (task 3624).
+
+    "Will this delete dangle a live pointer?" is a property of the entry and
+    the task DB, not of the caller's agent_id. The original scoping bounded the
+    gate to ``recon-stage-*`` callers, so the identical delete issued from an
+    interactive session — the way the 25-gate consolidation batch of task 3524
+    is actually driven — landed unguarded and stranded exactly the pointers the
+    guard exists to protect.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1201', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1202', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_with_live_citers_is_refused(
+        self, mcp_server, mock_service,
+    ):
+        """(a) THE LEAF SIGNAL. An interactive delete of a still-cited mem0
+        entry is refused, exactly as a recon-stage one already was."""
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        assert [c['task_id'] for c in result['citing_tasks']] == ['1201']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_with_no_live_citers_still_deletes(
+        self, mock_service,
+    ):
+        """(b) REGRESSION for the common case. Broadening the gate must not
+        turn every ordinary interactive delete into a refusal — the gate runs,
+        finds nothing live, and gets out of the way."""
+        interceptor = _make_interceptor([
+            _task('1211', 'pending', {'cited': SURVIVOR}),
+            _task('1212', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_can_repoint_with_a_replacement(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(c) The remedy is available to every caller too: supplying a valid
+        survivor gets the interactive caller the same repoint-then-delete path
+        recon already had, not merely a refusal it cannot clear."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_runs_when_agent_id_is_absent(
+        self, mcp_server, mock_service,
+    ):
+        """(d) The deliberate consequence of keying on the record: a delete
+        with no agent_id at all is gated too. Under the old predicate an
+        unidentified caller was the LEAST guarded one."""
+        result = await _call_delete(mcp_server, agent_id=None)
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
 
 
 TOMBSTONE_KEY = 'x_memory_citation_tombstones'
@@ -687,19 +769,22 @@ class TestReplacementMustResolveAndDiffer:
 
     @pytest.mark.asyncio
     async def test_inactive_gate_pays_for_no_existence_read(self, interceptor):
-        """(e) An out-of-scope caller (non-recon agent, or a graphiti store)
-        bypasses the gate entirely and reads nothing."""
-        for overrides in (
-            {'agent_id': 'claude-interactive'},
-            {'store': 'graphiti'},
-        ):
-            service = _make_service()
-            mcp_server = self._server(service, interceptor)
+        """(e) An out-of-scope RECORD (a graphiti store) bypasses the gate
+        entirely and reads nothing.
 
-            result = await _call_delete(
-                mcp_server, replacement_memory_id=HALLUCINATED, **overrides,
-            )
+        Task 3624 narrowed this: the caller-identity arm
+        (``{'agent_id': 'claude-interactive'}``) used to sit alongside the
+        graphiti one, but the gate no longer keys on WHO is deleting — only on
+        the record. That arm's inverse now lives in
+        ``TestGateAppliesToEveryCaller``.
+        """
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
 
-            assert result['status'] == 'deleted', overrides
-            service.get_memory_by_id.assert_not_awaited()
-            interceptor.get_tasks.assert_not_awaited()
+        result = await _call_delete(
+            mcp_server, replacement_memory_id=HALLUCINATED, store='graphiti',
+        )
+
+        assert result['status'] == 'deleted'
+        service.get_memory_by_id.assert_not_awaited()
+        interceptor.get_tasks.assert_not_awaited()
