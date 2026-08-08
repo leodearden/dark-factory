@@ -579,6 +579,76 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+    # ----------------------------------------------------------------- #
+    # task 3079 — genitive/possessive status form
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # the finding's verbatim stale edge fact
+            (
+                "Task 2623's status is pending as of 2026-07-14T20:31:00Z, "
+                'linked to memory f20fbf15-41b7-4781-97a6-334f4e1d066a.',
+                {2623},
+            ),
+            # curly apostrophe (U+2019) — what most prose writers/LLMs emit
+            ('Task 2623’s status is pending as of 2026-07-14.', {2623}),
+            ("Task 5's status is blocked.", {5}),
+            ("Task 5's status is in-progress.", {5}),
+        ],
+    )
+    def test_genitive_status_form_extracts_id(self, fact, expected):
+        """"Task N's status is <marker>" -> {N}. (task 3079)
+
+        REPRO. This is the canonical shape Graphiti writes for a per-task
+        status snapshot, and every pre-3079 path missed it while the gate
+        (a bare '\\bpending\\b' search) fired — the exact "matched the gate
+        yet went undetected" symptom the finding reports:
+
+        - INDIVIDUAL_SNAPSHOT_RE is TASK_REF_RE + '\\s*' + copula, and the
+          '\\s*' cannot cross the intervening "'s status ".
+        - SNAPSHOT_STATUS_PHRASE_RE wants 'in <marker> status' — marker
+          BEFORE the noun; here the order is inverted ('status is <marker>').
+        - LIST_INTRODUCER_RE wants '<marker> tasks[:\\[]'.
+
+        So the extractor returned set() for a fact that plainly asserts a
+        non-terminal status, and the edge was never even a candidate. The
+        control shape 'The status of task 2623 is pending' already worked,
+        which is what makes this a lexical gap rather than a traversal one.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # negation / past-exit — refused for free by the closed-class
+            # _ADVERB_ALT, exactly as the individual form refuses it (the
+            # asymmetry the module docstring documents: no _GAP_EXCLUDED_ALT
+            # equivalent is needed on a closed-class-connective path).
+            "Task 5's status is no longer pending.",
+            "Task 5's status is not blocked.",
+            "Task 5's status was previously pending.",
+            # terminal status — the gate short-circuits before extraction
+            "Task 5's status is done.",
+            # head-noun hazard: a status REPORT that is pending review, not a
+            # pending task. Requiring 'status' + copula ADJACENCY excludes it
+            # outright, so this path needs no trailing noun-phrase lookahead
+            # of the kind SNAPSHOT_STATUS_PHRASE_RE carries.
+            "Task 5's status report is pending review.",
+            "Task 5's status update is pending.",
+        ],
+    )
+    def test_genitive_status_form_precision_guards(self, fact):
+        """Shapes the genitive path must NOT extract. (task 3079)
+
+        These pin the new path against the over-selection direction the
+        module docstring forbids: each fact below is either permanently
+        true (a past-exit/negated assertion), already terminal, or binds
+        the marker to a following head noun rather than to the task.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
