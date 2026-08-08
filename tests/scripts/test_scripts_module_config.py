@@ -453,15 +453,25 @@ def test_scripts_diff_is_lint_gated() -> None:
     gated in production.
 
     NOTE on (2) — written in the lock_depth-AGNOSTIC form, never pinning a
-    literal such as ``derive_modules(...) == ['scripts']``. The pydantic Field
-    default for ``lock_depth`` is 2, but the EFFECTIVE value is 4: the
+    literal such as ``derive_modules(...) == ['scripts']``. Three layers stack
+    here and they do not agree: the pydantic Field default is 2, the
     package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` ships
-    ``lock_depth: 4`` and is layered over the Field default on every load. At
-    depth 4, ``derive_modules([SAMPLE_TOUCHED_FILE], 4)`` returns the full
-    path — 3 path components is below the depth-4 truncation threshold — so
-    ``normalize_lock`` leaves it whole. What matters is that each derived key
-    RESOLVES back to this config. Task 3350's sibling guard hit this exact trap
-    and documented it; pinning the literal would re-encode a falsified constant.
+    ``lock_depth: 4`` over it on every load, and THIS project's
+    ``dark-factory-orchestrator.yaml`` overrides that to 12 — so 12 is the
+    EFFECTIVE value under the autouse config binding. ``SAMPLE_TOUCHED_FILE``
+    is 3 path components, below the truncation threshold at 4 AND at 12, so
+    ``derive_modules([SAMPLE_TOUCHED_FILE], cfg.lock_depth)`` returns the full
+    path whole at either depth and the conclusion is unaffected. What matters
+    is that each derived key RESOLVES back to this config. Task 3350's sibling
+    guard hit this exact trap and documented it; pinning the literal would
+    re-encode a falsified constant.
+
+        CORRECTED IN PLACE (task 3866): this note used to assert "the
+        EFFECTIVE value is 4" and reason "at depth 4". The defaults.yaml half
+        is still true — the package really does ship 4 — but calling 4
+        EFFECTIVE stopped being true when this project moved lock_depth
+        4 -> 12. Recorded rather than silently rewritten, because the note
+        exists precisely to document a falsified constant.
     """
     discovered = _discovered()
 

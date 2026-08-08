@@ -21,10 +21,16 @@
 # first, so tests/scripts' own gating was hostage to every other suite.
 #
 # Registered at prefix `tests/scripts` (depth 2), not `tests` (depth 1):
-# depth 2 is <= the effective lock_depth of 4 (shipped by the package-bundled
-# orchestrator/src/orchestrator/defaults.yaml), so the config.py:4712-4725
+# depth 2 is <= the effective lock_depth, so the config.py:4712-4725
 # "prefix deeper than lock_depth" warning does not fire and the
-# scheduler/workflow path can reach this config. Registering at `tests` would
+# scheduler/workflow path can reach this config.
+#   CORRECTED IN PLACE (task 3866): this used to say "<= the effective
+#   lock_depth of 4 (shipped by the package-bundled
+#   orchestrator/src/orchestrator/defaults.yaml)". The package-bundled value
+#   really is still 4, but it is no longer the EFFECTIVE one here —
+#   dark-factory-orchestrator.yaml overrides lock_depth to 12. The reachability
+#   argument holds a fortiori: 2 <= 12 just as 2 <= 4, so the conclusion and the
+#   choice of depth-2 registration are unchanged. Registering at `tests` would
 # additionally capture any future tests/<other>/ subtree that this `uv run
 # --project shared` environment cannot necessarily run, silently mis-gating it.
 #

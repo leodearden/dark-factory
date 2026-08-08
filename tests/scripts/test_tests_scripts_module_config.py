@@ -62,13 +62,22 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     NOTE on assertion (3)/(4) — a falsified premise corrected against measured
     reality (the same class of defect this task exists to fix). Task 3350's
     plan asserted ``lock_depth == 2``, reading the pydantic Field default at
-    config.py:2593. The EFFECTIVE value is 4: the package-bundled
-    ``orchestrator/src/orchestrator/defaults.yaml:7`` ships ``lock_depth: 4``
-    and is layered over the Field default on every load. At depth 4,
-    ``derive_modules([SAMPLE_TOUCHED_FILE], 4)`` returns the full path
+    config.py:2593. That is not the effective value, and neither is the
+    package-bundled ``orchestrator/src/orchestrator/defaults.yaml:7``
+    ``lock_depth: 4`` layered over it on every load: THIS project's
+    ``dark-factory-orchestrator.yaml`` overrides both to 12, so 12 is what a
+    real load resolves here. ``derive_modules([SAMPLE_TOUCHED_FILE],
+    cfg.lock_depth)`` returns the full path
     ``['tests/scripts/test_spawn_claude.py']``, NOT ``['tests/scripts']`` —
-    3 path components is below the depth-4 truncation threshold, so
-    ``normalize_lock`` leaves it whole.
+    3 path components is below the truncation threshold at 4 and at 12 alike,
+    so ``normalize_lock`` leaves it whole either way.
+
+        CORRECTED IN PLACE (task 3866): this note used to say "The EFFECTIVE
+        value is 4" and reason "at depth 4". The defaults.yaml half remains
+        true; what broke is calling 4 EFFECTIVE, after lock_depth moved
+        4 -> 12. Noted rather than silently rewritten — this docstring exists
+        BECAUSE task 3350 encoded a falsified constant, and a second silent
+        substitution would defeat its purpose.
 
     That does not weaken the fix, and the plan's conclusion still holds: what
     actually matters is that the derived lock key RESOLVES to this module
@@ -107,8 +116,9 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     # (3) Reachability precondition: a prefix DEEPER than lock_depth is honoured
     # by run_full_verification (which iterates module_configs.values() directly)
     # but is unreachable via scheduler/workflow, which pass normalize_lock-
-    # truncated keys. config.py:4719 warns; it does not fail. Holds at both the
-    # Field default (2) and the shipped defaults.yaml value (4).
+    # truncated keys. config.py:4719 warns; it does not fail. Holds at every
+    # layer: the Field default (2), the shipped defaults.yaml value (4), and
+    # this project's override (12) — prefix depth 2 is <= all three.
     assert prefix_depth <= cfg.lock_depth, (
         f'module config prefix {MODULE_PREFIX!r} has depth {prefix_depth} but '
         f'lock_depth={cfg.lock_depth}; the scheduler (_limit_for) and workflow '
@@ -137,7 +147,8 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
         )
 
     # (5) The prefix itself resolves — the form scheduler/workflow pass when the
-    # touched path IS truncated to lock_depth (i.e. at any lock_depth <= 2).
+    # touched path IS truncated to lock_depth (i.e. at any lock_depth <= 2; at
+    # the effective 12 the path is passed whole, which assertion (4) covers).
     resolved_prefix = cfg.for_module(MODULE_PREFIX)
     assert resolved_prefix is not None and resolved_prefix.prefix == MODULE_PREFIX, (
         f'cfg.for_module({MODULE_PREFIX!r}) did not resolve to the discovered '
