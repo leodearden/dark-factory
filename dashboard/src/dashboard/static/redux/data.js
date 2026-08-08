@@ -44,6 +44,12 @@ window.DF_DATA = {
   AGENTS: [],
   ORCHESTRATORS: [],
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
+  // ACTIVE_TASKS row shape: {id, project, title, status, agent, started, loops,
+  //   attempts, lane, phase, lane_state, runtime_offline, deps, meta_files,
+  //   train, external_deps, prd, claimant_run_id, heartbeat_at, stranded}.
+  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
+  //   `stranded` (task 3543) is the independent liveness verdict, computed
+  //   server-side from the claim columns via shared.task_claimant.is_stranded.
   ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],

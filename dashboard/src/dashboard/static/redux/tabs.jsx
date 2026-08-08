@@ -293,7 +293,13 @@ function OrchTab({ projectFilter, search }) {
                           <tr key={t.id}>
                             <td className="mono" style={{ color: 'var(--fg-1)', whiteSpace: 'nowrap' }}>{window.DF_SHELL.taskId(t.id)}</td>
                             <td style={{ color: isDone ? 'var(--fg-2)' : 'var(--fg-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.title}>{t.title}</td>
-                            <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.agent || '—'}</td>
+                            {/* `agent` is worktree presence, not liveness. The strand
+                                verdict (task 3543) rides alongside it, gated on its own
+                                server-computed field — never on the agent value. */}
+                            <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {t.agent || '—'}
+                              {t.stranded && <span className="badge bad" style={{ marginLeft: 4 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}
+                            </td>
                             <td className="num">{rtCell(t.loops)}</td>
                             <td className="num">{rtCell(t.attempts)}</td>
                             <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : isPending ? '—' : rtAge(t.started)}</td>
