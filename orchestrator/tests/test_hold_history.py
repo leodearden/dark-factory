@@ -598,6 +598,120 @@ def test_window_size_is_configurable():
     assert history.predicted_hold(['churn/src']) == pytest.approx(90.0)
 
 
+# --- the refusal contract --------------------------------------------------
+#
+# PRD :459-461 — "An empty history must refuse, not admit — a predicate that
+# accepts the empty case certifies structure, not capability."  These are the
+# assertions that fail if the predictor ever learns to fabricate a default.
+
+
+def _assert_refuses(history: HoldHistory, modules: list[str], why: str) -> None:
+    """``predicted_hold`` must return None — not 0.0, not any other float."""
+    result = history.predicted_hold(modules)
+    assert result is None, f'{why}: expected a refusal, got {result!r}'
+    assert not isinstance(result, (int, float)), (
+        f'{why}: a fabricated number is worse than no answer — 0.0 reads as '
+        f'"instant hold" to every caller'
+    )
+
+
+def test_empty_history_refuses():
+    _assert_refuses(HoldHistory(), ['orchestrator/src'], 'empty history')
+
+
+def test_module_never_seen_refuses():
+    history = _history_of({'orchestrator/src': [10.0, 20.0, 30.0]})
+
+    _assert_refuses(history, ['never/seen'], 'unknown module')
+
+
+def test_empty_module_list_refuses():
+    history = _history_of({'orchestrator/src': [10.0, 20.0, 30.0]})
+
+    _assert_refuses(history, [], 'no modules named')
+
+
+@pytest.mark.parametrize('n_samples', [1, 2])
+def test_below_min_samples_refuses(n_samples: int):
+    """One or two holds are an anecdote, not a distribution."""
+    history = _history_of({'orchestrator/src': [10.0] * n_samples}, min_samples=3)
+
+    assert history.sample_count(['orchestrator/src']) == n_samples
+    _assert_refuses(history, ['orchestrator/src'], f'{n_samples} sample(s)')
+
+
+def test_exactly_min_samples_admits():
+    """The floor is inclusive — at exactly 3 the predictor answers.
+
+    Paired with the refusal above, this is what makes the gate a real
+    threshold rather than a blanket "never answer".
+    """
+    history = _history_of({'orchestrator/src': [10.0, 20.0, 30.0]}, min_samples=3)
+
+    assert history.sample_count(['orchestrator/src']) == 3
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(20.0)
+
+
+def test_refusal_is_driven_by_the_pooled_count_not_the_per_module_count():
+    """The gate counts what the prediction is actually made from.
+
+    Three modules with one sample each pool to 3 and admit; two pool to 2 and
+    refuse.  A per-module gate would refuse both — and a gate that ignored
+    counts entirely would admit both.
+    """
+    three = _history_of({'a/src': [10.0], 'b/src': [20.0], 'c/src': [30.0]}, min_samples=3)
+    assert three.sample_count(['a/src', 'b/src', 'c/src']) == 3
+    assert three.predicted_hold(['a/src', 'b/src', 'c/src']) == pytest.approx(20.0)
+
+    two = _history_of({'a/src': [10.0], 'b/src': [20.0]}, min_samples=3)
+    assert two.sample_count(['a/src', 'b/src']) == 2
+    _assert_refuses(two, ['a/src', 'b/src'], 'two modules, one sample each')
+
+
+def test_refusing_for_one_module_does_not_refuse_for_a_well_evidenced_one():
+    history = _history_of(
+        {'thin/src': [10.0], 'thick/src': [10.0, 20.0, 30.0, 40.0]},
+        min_samples=3,
+    )
+
+    _assert_refuses(history, ['thin/src'], 'thin module alone')
+    assert history.predicted_hold(['thick/src']) == pytest.approx(25.0)
+
+
+def test_min_samples_is_configurable_and_not_read_from_config():
+    """``min_samples`` is a constructor parameter with default 3.
+
+    Task η owns the ``backfill_min_samples`` config leaf; this module must not
+    reach for it, or ζ would not stand alone.
+    """
+    strict = _history_of({'orchestrator/src': [10.0, 20.0, 30.0]}, min_samples=4)
+    _assert_refuses(strict, ['orchestrator/src'], 'min_samples=4 with 3 samples')
+
+    lax = _history_of({'orchestrator/src': [10.0]}, min_samples=1)
+    assert lax.predicted_hold(['orchestrator/src']) == pytest.approx(10.0)
+
+
+def test_default_min_samples_is_three():
+    """The stock constructor refuses at 2 and admits at 3 — no config needed."""
+    assert HoldHistory().predicted_hold(['m/src']) is None
+
+    two = _history_of({'m/src': [10.0, 20.0]})
+    _assert_refuses(two, ['m/src'], 'default min_samples, 2 samples')
+
+    three = _history_of({'m/src': [10.0, 20.0, 30.0]})
+    assert three.predicted_hold(['m/src']) == pytest.approx(20.0)
+
+
+def test_zero_length_holds_still_count_as_samples():
+    """A 0.0 sample is an OBSERVATION; a 0.0 *prediction* from no samples is a
+    fabrication.  The gate must not conflate them — three instant holds are
+    real evidence that this module's holds are instant."""
+    history = _history_of({'fast/src': [0.0, 0.0, 0.0]}, min_samples=3)
+
+    assert history.sample_count(['fast/src']) == 3
+    assert history.predicted_hold(['fast/src']) == pytest.approx(0.0)
+
+
 def test_module_match_is_exact_not_prefix():
     """Modules are depth-coarsened path prefixes already (``_get_modules``).
 
