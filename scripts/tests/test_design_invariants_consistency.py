@@ -379,3 +379,231 @@ def test_fixtures_doc_sections_match_the_normative_family() -> None:
         f"  fixtures:  {fixtures}\n"
         f"One doc renumbered without the other."
     )
+
+
+# ---------------------------------------------------------------------------
+# marked_span / assert_family_claims — fixture-driven tests
+#
+# Live family-size claims (INV ranges, cardinal counts) are pinned ONLY inside
+# explicit HTML-comment marked spans. See the module docstring: both docs also
+# carry HISTORICAL range prose that is correct as written, so a blanket
+# file-wide rule would land RED against facts and could only be greened by
+# falsifying history.
+# ---------------------------------------------------------------------------
+
+# The two live family-size claims in the normative doc. Suffixed names rather
+# than one repeated `inv-family-claim` marker: `marked_span` is loud on a
+# DUPLICATE marker (an ambiguous span is how a second, unpinned copy hides), and
+# that loudness is worth more than the cosmetic saving of a shared name.
+_NORMATIVE_CLAIM_SPANS = ("inv-family-claim-intro", "inv-family-claim-census")
+
+# (a) Happy path, modelled on the real doc: the begin marker carries an
+# explanatory comment naming the pinning test, and that comment's own prose sits
+# OUTSIDE the returned span.
+_SPAN_HAPPY = """\
+Some prose above.
+
+<!-- inv-family-claim-intro:begin
+     Pinned by scripts/tests/test_design_invariants_consistency.py — task 3802. -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:end -->
+
+Some prose below.
+"""
+
+_SPAN_NO_BEGIN = """\
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:end -->
+"""
+
+_SPAN_NO_END = """\
+<!-- inv-family-claim-intro:begin -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+"""
+
+_SPAN_DUPLICATE_BEGIN = """\
+<!-- inv-family-claim-intro:begin -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:begin -->
+A second, unpinned copy.
+<!-- inv-family-claim-intro:end -->
+"""
+
+_SPAN_DUPLICATE_END = """\
+<!-- inv-family-claim-intro:begin -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:end -->
+More prose.
+<!-- inv-family-claim-intro:end -->
+"""
+
+_SPAN_INVERTED = """\
+<!-- inv-family-claim-intro:end -->
+Numeric aliases INV-1..INV-8 are prose convenience only.
+<!-- inv-family-claim-intro:begin -->
+"""
+
+# A synthetic family standing in for the live one, so these tests keep asserting
+# the same thing when a ninth invariant lands.
+_FIXTURE_FAMILY = [(number, f"slug-{number}") for number in range(1, 9)]
+_FIXTURE_SPAN_NAME = "a-fixture-span"
+
+
+def test_marked_span_returns_only_the_text_between_the_markers() -> None:
+    """(a) The begin comment's own prose is excluded; the wrapped claim is not."""
+    span = marked_span(_SPAN_HAPPY, "inv-family-claim-intro", source=_FIXTURE_SOURCE)
+
+    assert "Numeric aliases INV-1..INV-8 are prose convenience only." in span
+    assert "Pinned by scripts/tests" not in span, (
+        "the begin comment's explanatory prose must sit outside the span — it "
+        f"names a test path and a task number a claim regex could match: {span!r}"
+    )
+    assert "prose above" not in span and "prose below" not in span
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_phrase"),
+    [
+        pytest.param(_SPAN_NO_BEGIN, "missing begin", "begin", id="missing-begin"),
+        pytest.param(_SPAN_NO_END, "missing end", "end", id="missing-end"),
+        pytest.param(_SPAN_DUPLICATE_BEGIN, "duplicate begin", "found 2", id="duplicate-begin"),
+        pytest.param(_SPAN_DUPLICATE_END, "duplicate end", "found 2", id="duplicate-end"),
+        pytest.param(_SPAN_INVERTED, "inverted", "precedes", id="inverted-markers"),
+    ],
+)
+def test_marked_span_fails_loudly_on_a_broken_marker(
+    markdown_text: str, case: str, expected_phrase: str
+) -> None:
+    """A missing, duplicated or inverted marker RAISES — never returns ''.
+
+    Missing is the vacuity hazard: an empty span satisfies every claim check
+    below by containing no claims to check. Duplicated is the same failure one
+    level down — silently taking the first span leaves the second copy of the
+    claim unpinned and free to drift, which is precisely the defect this module
+    exists to catch.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        marked_span(markdown_text, "inv-family-claim-intro", source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
+    assert "inv-family-claim-intro" in message, f"{case}: must name the marker: {message!r}"
+    assert expected_phrase in message, f"{case}: must diagnose the defect: {message!r}"
+
+
+def test_assert_family_claims_accepts_a_current_range_and_cardinal() -> None:
+    """A span whose range and spelled-out count both name the live size passes."""
+    assert_family_claims(
+        "Numeric aliases INV-1..INV-8 are prose convenience; the eight ids above.",
+        _FIXTURE_FAMILY,
+        source=_FIXTURE_SOURCE,
+        span_name=_FIXTURE_SPAN_NAME,
+    )
+
+
+@pytest.mark.parametrize(
+    ("span_text", "case", "expected_phrase"),
+    [
+        pytest.param(
+            "Numeric aliases INV-1..INV-7 are prose convenience only.",
+            "stale range",
+            "INV-1..INV-7",
+            id="stale-range",
+        ),
+        pytest.param(
+            "The slug vocabulary is *this* doc — the seven ids above.",
+            "stale cardinal",
+            "seven ids",
+            id="stale-cardinal",
+        ),
+        pytest.param(
+            "Walk the batch against all 7 invariants.",
+            "stale numeric cardinal",
+            "7 invariants",
+            id="stale-numeric-cardinal",
+        ),
+        pytest.param(
+            "The founding subset INV-2..INV-8 is not the family.",
+            "range not starting at 1",
+            "INV-2..INV-8",
+            id="range-offset-start",
+        ),
+    ],
+)
+def test_assert_family_claims_rejects_a_stale_claim(
+    span_text: str, case: str, expected_phrase: str
+) -> None:
+    """A range or cardinal disagreeing with the live family size RAISES.
+
+    This is the drift the marked spans exist to catch: the claim reads fine in
+    isolation and only becomes false when an invariant is added, which is exactly
+    when nobody is looking at the sentence that mentions a count.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        assert_family_claims(
+            span_text, _FIXTURE_FAMILY, source=_FIXTURE_SOURCE, span_name=_FIXTURE_SPAN_NAME
+        )
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
+    assert _FIXTURE_SPAN_NAME in message, f"{case}: message must name the span: {message!r}"
+    assert expected_phrase in message, f"{case}: message must quote the claim: {message!r}"
+
+
+def test_assert_family_claims_is_loud_on_a_span_carrying_no_claim() -> None:
+    """A span with neither a range nor a cardinal RAISES by default.
+
+    The failure mode this guards is a marker drifting off the sentence it was
+    meant to wrap — a prose edit that moves the claim out of the span leaves the
+    guard green while the claim it names is no longer pinned at all.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        assert_family_claims(
+            "A gate checklist, not an essay.",
+            _FIXTURE_FAMILY,
+            source=_FIXTURE_SOURCE,
+            span_name=_FIXTURE_SPAN_NAME,
+        )
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message
+    assert _FIXTURE_SPAN_NAME in message
+
+
+def test_assert_family_claims_permits_a_claimless_span_when_explicitly_allowed() -> None:
+    """``allow_no_claim=True`` is the only way to opt a span out of the floor.
+
+    Explicit at the call site, so a span pinned for its slugs rather than its
+    counts says so in code instead of passing vacuously by accident.
+    """
+    assert_family_claims(
+        "A gate checklist, not an essay.",
+        _FIXTURE_FAMILY,
+        source=_FIXTURE_SOURCE,
+        span_name=_FIXTURE_SPAN_NAME,
+        allow_no_claim=True,
+    )
+
+
+def test_normative_doc_family_size_claims_are_current() -> None:
+    """LIVE: design-invariants.md's two marked family-size claims name the real size.
+
+    The doc states the family size twice in prose — "Numeric aliases INV-1..INV-N
+    are prose convenience only" in the intro, and "the slug vocabulary is *this*
+    doc — the <n> ids above" at the Census seam. Neither auto-extends. Both are
+    wrapped in `inv-family-claim-*` markers so this check can find them without a
+    content heuristic, and so a human editing the doc sees at the edit site that
+    the sentence is pinned.
+
+    The doc's HISTORICAL ranges are deliberately NOT wrapped and NOT checked:
+    "INV-1..INV-5 encode the agent-legibility survey's cross-cutting root causes"
+    and the INV-6..INV-7 / INV-8 provenance sentences are true as written, and a
+    blanket file-wide range rule could only be greened by falsifying them.
+    """
+    family = canonical_family()
+    text = NORMATIVE_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(NORMATIVE_DOC)
+
+    for span_name in _NORMATIVE_CLAIM_SPANS:
+        span = marked_span(text, span_name, source=source)
+        assert_family_claims(span, family, source=source, span_name=span_name)
