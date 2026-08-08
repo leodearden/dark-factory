@@ -267,6 +267,125 @@ class TestCurationMdIsGenerated:
         assert manifest['merge_sha_availability']['finding'] in text
 
 
+# ---------------------------------------------------------------------------
+# The minted pool — loadable, complete, and carrying what the runner reads
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def pool() -> list[dict]:
+    from orchestrator.cli import _load_fixture_dir
+    return _load_fixture_dir(POOL_DIR)
+
+
+class TestMintedPool:
+    def test_loads_via_the_real_fixture_loader(self, pool: list[dict]) -> None:
+        # The user-observable signal: the pool is loadable by the same code
+        # path an eval run uses, with no ClickException.
+        assert pool, 'the v2 hard pool holds no fixtures'
+
+    def test_id_set_equals_the_manifest_includes(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # No orphan fixture, no unminted include.
+        expected = set()
+        for c in manifest['candidates']:
+            if c['decision'] == 'include':
+                repo = {'reify': 'reify', 'dark_factory': 'df',
+                        'know_live': 'kl'}[c['project']]
+                expected.add(f'{repo}_task_{c["task_id"]}')
+        assert {f['id'] for f in pool} == expected
+
+    def test_every_fixture_carries_what_the_runner_reads(
+        self, pool: list[dict],
+    ) -> None:
+        for f in pool:
+            where = f.get('id')
+            assert f['id'], where
+            assert f['project_root'], where
+            # The sharp edge: run_architect_eval REQUIRES pre_task_commit to
+            # create its eval worktree — it is not optional the way reference is.
+            pre = f['pre_task_commit']
+            assert isinstance(pre, str) and len(pre) == 40, where
+            assert all(ch in '0123456789abcdef' for ch in pre), where
+            assert f['task_definition']['title'], where
+            assert f['task_definition']['description'], where
+            assert f['verify_commands'], where
+
+    def test_every_fixture_is_in_the_v2_cohort(self, pool: list[dict]) -> None:
+        for f in pool:
+            assert f['cohort'] == 'fable-trial-v2-hard', f['id']
+
+    def test_every_fixture_names_its_baseline_rung(self, pool: list[dict]) -> None:
+        for f in pool:
+            assert f['provenance']['baseline_source'] in {
+                'merge_first_parent', 'status_autocommit', 'timestamp_walk',
+            }, f['id']
+
+    def test_ceilings_are_pinned_fixture_side(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # runner.py reads both straight off the task record (task.get with
+        # 50 / 60 defaults), so pinning them is pure data — but EVERY fixture
+        # must carry them or that fixture silently runs at the wrong ceiling.
+        for f in pool:
+            assert f['max_architect_turns'] == 120, f['id']
+            assert f['timeout_minutes'] == manifest['ceilings']['timeout_minutes'], \
+                f['id']
+
+    def test_referenced_fixtures_carry_a_real_reference(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        by_id = _mint_modes(manifest)
+        for f in pool:
+            if by_id.get(f['id']) != 'referenced':
+                continue
+            post = f['reference']['post_task_commit']
+            assert isinstance(post, str) and len(post) == 40, f['id']
+            assert f['reference']['diff_stat']['files'] > 0, f['id']
+
+    def test_planrate_only_fixtures_omit_reference_and_say_why(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # An empty `reference: {}` is indistinguishable from a capture that
+        # silently failed. Omit the key and record the cause instead.
+        by_id = _mint_modes(manifest)
+        for f in pool:
+            if by_id.get(f['id']) != 'planrate_only':
+                continue
+            assert 'reference' not in f, f['id']
+            assert f['provenance']['reference_unavailable'].strip(), f['id']
+
+
+def _mint_modes(manifest: dict) -> dict[str, str]:
+    repo_of_project = {'reify': 'reify', 'dark_factory': 'df', 'know_live': 'kl'}
+    return {
+        f'{repo_of_project[c["project"]]}_task_{c["task_id"]}': c['mint_mode']
+        for c in manifest['candidates'] if c['decision'] == 'include'
+    }
+
+
+# ---------------------------------------------------------------------------
+# Isolation — the standing corpus is unreachable from here and unchanged
+# ---------------------------------------------------------------------------
+
+class TestStandingCorpusIsolation:
+    def test_standing_corpus_still_holds_its_22_fixtures(self) -> None:
+        from orchestrator.cli import _load_fixture_dir
+        standing = _load_fixture_dir(STANDING_TASKS_DIR)
+        assert len(standing) == 22
+        assert len({f['id'] for f in standing}) == 22
+
+    def test_pool_and_standing_corpus_are_disjoint(self, pool: list[dict]) -> None:
+        from orchestrator.cli import _load_fixture_dir
+        standing_ids = {f['id'] for f in _load_fixture_dir(STANDING_TASKS_DIR)}
+        assert standing_ids.isdisjoint({f['id'] for f in pool})
+
+    def test_standing_corpus_carries_no_v2_cohort_fixture(self) -> None:
+        from orchestrator.cli import _load_fixture_dir
+        for f in _load_fixture_dir(STANDING_TASKS_DIR):
+            assert f.get('cohort') != 'fable-trial-v2-hard', f['id']
+
+
 class TestMetaLayout:
     def test_meta_dir_holds_no_file_the_fixture_glob_would_reach(self) -> None:
         # _load_fixture_dir globs '*.json' NON-recursively against tasks_dir.
