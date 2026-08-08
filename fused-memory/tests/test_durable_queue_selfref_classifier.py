@@ -39,6 +39,7 @@ explicit ``@pytest.mark.asyncio``.
 from __future__ import annotations
 
 import asyncio  # noqa: F401  (used by later steps' e2e tests)
+import json
 import logging  # noqa: F401  (used by the caplog assertions in step-09)
 import uuid as uuid_mod
 from unittest.mock import AsyncMock  # noqa: F401  (used by the e2e tests)
@@ -52,7 +53,7 @@ from _fm_helpers import poll_until
 from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError
 
 import fused_memory.services.durable_queue as dq_module
-from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.durable_queue import DurableWriteQueue, QueueItem
 
 
 def _uuid() -> str:
@@ -89,6 +90,30 @@ async def _poll_until_dead(
             f'Timed out waiting for {expected_dead} dead item(s) '
             f'(group_id={group_id!r}); last counts={last_counts}'
         ) from exc
+
+
+def _item(
+    operation: str,
+    payload,
+    *,
+    item_id: int = 1,
+    group_id: str = 'proj1',
+    attempts: int = 0,
+    max_attempts: int = 5,
+) -> QueueItem:
+    """A QueueItem built straight from a row tuple — no DB needed.
+
+    The 12-tuple order is QueueItem.__slots__ (durable_queue.py:114-118):
+    id, group_id, operation, payload, callback_type, status, attempts,
+    max_attempts, next_retry_at, created_at, completed_at, error.
+    *payload* may be a dict (serialised here, as enqueue does) or a raw string,
+    so the malformed-JSON cases can be expressed directly.
+    """
+    payload_text = payload if isinstance(payload, str) else json.dumps(payload)
+    return QueueItem((
+        item_id, group_id, operation, payload_text, None, 'in_flight',
+        attempts, max_attempts, 0.0, 0.0, None, None,
+    ))
 
 
 def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
@@ -189,4 +214,93 @@ class TestParserFailsOpen:
         assert dq_module._parse_not_found_uuid(message) is None, (
             f'{message!r} must not parse as the pinned not-found format; '
             f'got {dq_module._parse_not_found_uuid(message)!r}.'
+        )
+
+
+class TestIdentityUuidResolution:
+    """``_identity_uuid`` resolves the uuid the operation exists to CREATE —
+    deliberately not "any uuid appearing in the payload".
+
+    A payload may legitimately REFERENCE other nodes' uuids, and those genuinely
+    can be transiently invisible or belong to another graph (the task's causes 3
+    and 4), so they must keep their retry budget. Only the operation's own
+    minted identity licenses the "retrying cannot possibly help" conclusion.
+    """
+
+    def test_add_episode_maps_to_the_uuid_key(self, tmp_path):
+        assert dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS['add_episode'] == 'uuid'
+
+    def test_only_add_episode_is_mapped(self, tmp_path):
+        """The other live operations carry no caller-minted identity."""
+        assert set(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS) == {'add_episode'}, (
+            'Only add_episode supplies a caller-minted identity (memory_service.py'
+            ':2516 mints it, :2534 stamps it, :2248 forwards it). '
+            'add_memory_graphiti and mem0_classify_and_add carry no uuid key at '
+            'all, and mem0_add has no live producer — mapping any of them would '
+            'claim an identity that does not exist. Got '
+            f'{sorted(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS)}.'
+        )
+
+    def test_resolves_the_add_episode_identity(self, tmp_path):
+        u = _uuid()
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', {'uuid': u, 'content': 'c', 'group_id': 'g'})
+        assert q._identity_uuid(item) == u
+
+    def test_unmapped_operation_returns_none_even_with_a_uuid_key(self, tmp_path):
+        """The MAP decides, not the key name.
+
+        add_memory_graphiti has no caller-minted identity, so a 'uuid' key
+        appearing in its payload would be a REFERENCE to some other node — a
+        node that genuinely may be in flight or in another graph.
+        """
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_memory_graphiti', {'uuid': _uuid(), 'content': 'c'})
+        assert q._identity_uuid(item) is None, (
+            'An unmapped operation must resolve to None even when its payload '
+            'happens to contain a uuid key.'
+        )
+
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            '{not json',        # unparseable
+            '[]',               # parses, but not a dict
+            '"str"',            # parses, but not a dict
+            '123',              # parses, but not a dict
+            'null',             # parses, but not a dict
+            '{}',               # dict, key missing
+            '{"content": "c"}',  # dict, key missing
+            '{"uuid": null}',
+            '{"uuid": ""}',     # empty string is not an identity
+            '{"uuid": 123}',    # non-str
+            '{"uuid": {"a": 1}}',
+            '{"uuid": ["u"]}',
+        ],
+    )
+    def test_fails_open_on_unusable_payloads(self, tmp_path, payload):
+        """Every unusable shape resolves to None, which falls back to today's
+        policy. Failing open here is the safe direction."""
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', payload)
+        assert q._identity_uuid(item) is None, (
+            f'payload {payload!r} must resolve to None; got '
+            f'{q._identity_uuid(item)!r}.'
+        )
+
+    def test_constructor_override_fully_replaces_the_default(self, tmp_path):
+        """identity_payload_keys= is the test seam and the generic-component
+        property: it REPLACES the default map rather than extending it."""
+        u = _uuid()
+        q = _queue(
+            tmp_path, AsyncMock(),
+            identity_payload_keys={'custom_op': 'node_id'},
+        )
+        custom = _item('custom_op', {'node_id': u, 'content': 'c'})
+        assert q._identity_uuid(custom) == u
+
+        episode = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        assert q._identity_uuid(episode) is None, (
+            'An explicit identity_payload_keys= must fully replace the default '
+            'map, not merge with it.'
         )
