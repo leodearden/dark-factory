@@ -32,6 +32,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -39,6 +40,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    _ENUM_PREP_PREFIX_RE,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -769,6 +771,68 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+    #: Every preposition in ``_ENUM_PREP_PREFIX_RE``, each paired with a
+    #: PLURAL head noun. Plural agreement is what refuses the far more
+    #: natural singular-copula phrasing of most of these ('Work on tasks
+    #: ... IS blocked'), so only a plural head puts the preposition guard
+    #: itself on the hook. See the test below for why that distinction
+    #: decides whether these cases test anything at all.
+    _PREPOSITION_GUARD_CASES = (
+        ('of', 'Statuses of tasks 1020 and 1030 are blocked.'),
+        ('in', 'Delays in tasks 1020 and 1030 are blocked.'),
+        ('on', 'Notes on tasks 1020 and 1030 are pending.'),
+        ('to', 'Updates to tasks 1020 and 1030 are pending.'),
+        ('re', 'Comments re tasks 1020 and 1030 are pending.'),
+        ('for', 'Reviews for tasks 1020 and 1030 are pending.'),
+        ('with', 'Problems with tasks 1020 and 1030 are blocked.'),
+        ('among', 'Conflicts among tasks 1020 and 1030 are blocked.'),
+        ('about', 'Notes about tasks 1020 and 1030 are pending.'),
+        ('across', 'Regressions across tasks 1020 and 1030 are pending.'),
+        ('against', 'Complaints against tasks 1020 and 1030 are pending.'),
+        ('between', 'Dependencies between tasks 1020 and 1030 are blocked.'),
+        ('regarding', 'Notes regarding tasks 1020 and 1030 are pending.'),
+    )
+
+    @pytest.mark.parametrize(
+        ('preposition', 'fact'),
+        _PREPOSITION_GUARD_CASES,
+        ids=[p for p, _ in _PREPOSITION_GUARD_CASES],
+    )
+    def test_every_guarded_preposition_is_exercised_against_a_plural_head(
+        self, preposition, fact
+    ):
+        """Each entry in ``_ENUM_PREP_PREFIX_RE`` is load-bearing. (task 3079)
+
+        The guard list could previously have SILENTLY LOST entries: most of
+        its prepositions appeared only in singular-copula facts ('Work on
+        tasks ... is blocked', 'The dependency between tasks ... is
+        blocked'), and those are already refused by ``_PLURAL_COPULA_ALT``
+        agreement — deleting 'on' or 'between' from the list would not have
+        failed a single test. Only a PLURAL head noun ('Notes', 'Delays',
+        'Dependencies') with a plural copula reaches the preposition check,
+        so these are the cases that actually pin it.
+
+        (amendment, reviewer_comprehensive test-coverage finding, task 3079)
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set(), (
+            f'preposition {preposition!r} is in _ENUM_PREP_PREFIX_RE but its '
+            f'complement still over-selects'
+        )
+
+    def test_preposition_guard_cases_cover_the_whole_guard_list(self):
+        """The case list above must track ``_ENUM_PREP_PREFIX_RE`` exactly.
+
+        Without this, a preposition added to the guard would ship with no
+        plural-head coverage and could later be dropped unnoticed — the very
+        gap the test above closes. Ties the fixture to the source of truth
+        rather than to a hand-maintained copy of it.
+        """
+        alternation = re.search(r'\(\?:([^)]*)\)', _ENUM_PREP_PREFIX_RE.pattern)
+        assert alternation is not None, 'could not parse _ENUM_PREP_PREFIX_RE'
+        assert set(alternation.group(1).split('|')) == {
+            p for p, _ in self._PREPOSITION_GUARD_CASES
+        }
+
     @pytest.mark.parametrize(
         ('fact', 'expected'),
         [
@@ -1048,7 +1112,6 @@ class TestPluralEnumerationPerformance:
     #: the CI-flake boundary.
     BUDGET_SECONDS = 1.0
 
-    @pytest.mark.timeout(60)
     @pytest.mark.parametrize(
         ('sep', 'count'),
         [
@@ -1072,9 +1135,13 @@ class TestPluralEnumerationPerformance:
         is exactly what forces the engine to explore every apportionment of
         every whitespace run.
 
-        ``@pytest.mark.timeout(60)`` is only a backstop: pytest-timeout's
-        default signal method cannot interrupt a C-level ``re`` match, so the
-        elapsed-time assertion below is the real regression signal.
+        The elapsed-time assertion below is the real regression signal. The
+        suite-wide ``timeout = 60`` / ``timeout_method = "thread"`` backstop
+        in pyproject.toml would eventually fire, but it ends in
+        ``os._exit(1)`` and takes the whole xdist worker with it — a 60x
+        slower, far less legible failure than the assertion. Pre-fix these
+        cases measured 4.6-16.6s, i.e. inside that backstop and invisible to
+        it, so BUDGET_SECONDS is what actually catches the regression.
         """
         ids = [str(1000 + i) for i in range(count)]
         fact = f'Pending tasks {sep.join(ids)} were reviewed by the merge worker.'
