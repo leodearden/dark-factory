@@ -22,6 +22,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
     has_live_workflow_corroboration,
+    is_pure_gate_metadata,
     is_workflow_live_for_task,
 )
 
@@ -757,6 +758,82 @@ class TestBlockedNormalOrchestratorSuppression:
             )
 
         assert live is False
+
+
+# ---------------------------------------------------------------------------
+# Pure-gate metadata classifier (task 3751)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPureGateMetadata:
+    """is_pure_gate_metadata identifies the DeterministicRunner PURE-GATE shape.
+
+    A pure gate is `always_escalates` truthy AND `before_done` absent/falsy — the
+    same two metadata fields DeterministicRunner itself branches on. Its whole
+    execution is "file one born-at-L2 escalation, stamp metadata.gate_escalated_at,
+    set status blocked": no script, no systemd, no git_ops. A truthy `before_done`
+    DISQUALIFIES the shape because that path runs a blocking deploy/predicate
+    script while the task's status is still 'pending'.
+
+    Fail-safe direction: only POSITIVE evidence of the shape returns True. Any
+    non-Mapping input (None, a string, an int, a list) returns False, so an
+    absent/unparseable metadata blob leaves the task live.
+    """
+
+    def test_always_escalates_alone_is_a_pure_gate(self):
+        """`always_escalates` truthy with `before_done` absent entirely => True.
+
+        This is dark_factory task 3845's exact metadata shape (verified by a
+        direct get_task read): no `before_done` key at all.
+        """
+        assert is_pure_gate_metadata({'always_escalates': True}) is True
+
+    def test_explicit_none_before_done_is_a_pure_gate(self):
+        """An explicit `before_done: None` is equivalent to the key being absent."""
+        assert is_pure_gate_metadata({'always_escalates': True, 'before_done': None}) is True
+
+    def test_truthy_before_done_disqualifies(self):
+        """A before_done deploy/predicate task is NOT a pure gate.
+
+        `Harness._run_deterministic_slot` never flips the task to 'in-progress',
+        so such a task stays 'pending' for the entire duration of a blocking
+        script run — recon must not treat it as provably-idle.
+        """
+        metadata = {
+            'always_escalates': True,
+            'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+        }
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'always_escalates': False},
+            {},
+            {'task_kind': 'deterministic'},
+        ],
+        ids=['always_escalates_false', 'empty', 'task_kind_only'],
+    )
+    def test_missing_or_falsy_always_escalates_is_not_a_pure_gate(self, metadata):
+        """Without truthy `always_escalates` there is no positive evidence of the shape."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    def test_non_mapping_input_is_not_a_pure_gate(self, metadata):
+        """Fail-safe toward live: anything that is not a Mapping returns False."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    def test_truthiness_not_identity(self):
+        """A truthy-but-not-`True` value still qualifies.
+
+        Task metadata round-trips through JSON, so the classifier must use
+        truthiness rather than `is True`.
+        """
+        assert is_pure_gate_metadata({'always_escalates': 'true'}) is True
 
 
 # ---------------------------------------------------------------------------
