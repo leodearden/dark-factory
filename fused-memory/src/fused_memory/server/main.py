@@ -889,6 +889,12 @@ async def run_server():
             memory_service=memory_service,
             task_interceptor=task_interceptor,
             known_projects=_known_projects_map,
+            # task 3065: repair_memory_citation needs the durable journal to
+            # reach a CLOSED run's findings — recon-report's own in-process
+            # state is TTL-evicted (300s) and GC'd at run quiescence, so it
+            # cannot serve a repair of a run that completed days ago. Safe to
+            # pass here: recon_journal was constructed and initialize()d above.
+            recon_journal=recon_journal,
         )
 
         # Task 2624: wire the code-enforced before/after live-task-write
@@ -1115,6 +1121,10 @@ async def run_server():
             # so the harness and the uvicorn server share the SAME ReconReportState
             # object. For reconciliation-disabled runs, build them now.
             if recon_report_state is None:
+                # No recon_journal here, deliberately (task 3065): this is the
+                # reconciliation-DISABLED path, where no journal was ever opened.
+                # repair_memory_citation then answers journal_unavailable, which
+                # is the honest result — there is no durable run history to repair.
                 recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
                     config,
                     memory_service=memory_service,
@@ -1796,6 +1806,8 @@ def _build_recon_report_components(
     memory_service: Any = None,
     task_interceptor: Any = None,
     known_projects: dict[str, str] | None = None,
+    *,
+    recon_journal: Any = None,
 ) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
     """Construct the recon_report state, FastMCP server, and uvicorn.Config.
 
@@ -1804,6 +1816,14 @@ def _build_recon_report_components(
 
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
+
+    Args:
+        recon_journal: the open ReconciliationJournal (task 3065), used solely by
+            ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
+            blob of an already-completed run.  Only the reconciliation-ENABLED
+            boot path has one; the disabled path passes nothing and the tool then
+            degrades to a structured ``journal_unavailable`` refusal rather than
+            half-working against a store that does not exist.
 
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
@@ -1829,6 +1849,7 @@ def _build_recon_report_components(
         memory_service=memory_service,
         task_interceptor=task_interceptor,
         store=recon_report_store,
+        journal=recon_journal,
     )
     if known_projects is not None:
         state.known_projects = known_projects
