@@ -183,6 +183,25 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     return json.dumps(payload, indent=2), dropped
 
 
+MEMORY_CONTEXT_CAVEAT = (
+    "_This context was recalled from {project_id!r}'s project memory — it is "
+    'NOT a description of this worktree. It may name tasks, repos, crates, or '
+    'file paths that do not exist here. Do not assume a recalled path is '
+    'real: verify it exists before reading it or `cd`-ing into it._'
+)
+"""Standing provenance caveat rendered right after the ``# Context`` heading.
+
+Covers the leak channel :func:`filter_foreign_project_results` cannot reach:
+every Graphiti-sourced memory result has ``metadata == {}`` today (see that
+function's docstring), so an untagged foreign fact — e.g. a path belonging
+to a different project's repo — survives the filter unclassified and
+renders verbatim. The tag filter is the permanent chokepoint for taggable
+(Mem0) results; this caveat is what actually converts "agent `cd`'s/reads
+into a recalled foreign path" into "agent verifies the path first" for the
+untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
+"""
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
@@ -1214,6 +1233,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
         """Call fused-memory search for project context."""
         sections = []
         foreign_dropped = 0
+        memory_unavailable = False
 
         try:
             # Project overview
@@ -1246,21 +1266,29 @@ Handle this escalation, then call `resolve_issue` with a summary.
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
             sections.append('## Context\n\n_Memory unavailable — proceed with codebase exploration._')
+            memory_unavailable = True
 
         if not sections:
             return '# Context\n\n_No memory context available._'
 
+        if memory_unavailable:
+            # No facts were actually recalled (the outer fetch itself failed), so
+            # the provenance caveat below — which talks about recalled facts —
+            # would not make sense here. Preserve the pre-existing rendering.
+            return '# Context\n\n' + '\n\n---\n\n'.join(sections)
+
+        caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=self.project_id)
         if foreign_dropped > 0:
             logger.info(
                 f'_get_memory_context: filtered {foreign_dropped} memory result(s) tagged to '
                 f'another project out of the context assembled for {self.project_id!r}'
             )
-            sections.append(
-                f'_{foreign_dropped} memory result(s) tagged to another project were filtered '
-                'out of this context._'
+            caveat += (
+                f'\n\n_{foreign_dropped} memory result(s) tagged to another project were '
+                'filtered out of this context._'
             )
 
-        return '# Context\n\n' + '\n\n---\n\n'.join(sections)
+        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(sections)
 
     async def _scoped_search(self, query: str) -> tuple[str | None, int]:
         """Search fused-memory and drop cross-project results from the reply.
