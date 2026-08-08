@@ -1496,5 +1496,196 @@ class TestReport:
         assert UUID_C in sections['dangling_pointers'].text
 
 
+# ---------------------------------------------------------------------------
+# The seeded live-store test — the task's user-observable signal
+#
+# On an EPHEMERAL per-worker collection, never the live corpus. Marked
+# PER-TEST (never a module pytestmark): fused-memory runs under
+# `-m 'not integration'`, so a module-level mark would deselect every pure
+# test above and the guards they carry would guard nothing.
+# ---------------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+import os  # noqa: E402
+
+from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+
+EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+"""The ONLY prefix scripts/cleanup_test_collections.py reaps.
+
+mock_config's default `fused` prefix would leak a collection forever. Asserted
+against that script's own constant below rather than restated here.
+"""
+
+SEED_PREDECESSOR = (
+    'The staleness sweep resolves each pointer target with one live '
+    'get_memory_by_id read per unique target id.'
+)
+SEED_SUCCESSOR = (
+    'The staleness sweep resolves each pointer target against the live store, '
+    'deduplicating by target id so one target costs one read.'
+)
+SEED_DANGLING_SOURCE = (
+    'Corrects an earlier note about how the staleness sweep counts pointer '
+    'targets it cannot resolve.'
+)
+NEVER_WRITTEN_UUID = 'deadbeef-0000-4000-8000-000000000001'
+
+
+@pytest.fixture
+def sweep_project_id(worker_id):
+    """Per-xdist-worker so concurrent workers cannot share a collection."""
+    return f'sweep_e4_{worker_id}'
+
+
+@pytest.fixture
+def sweep_config(mock_config, sweep_project_id):
+    """mock_config pointed at an ephemeral collection with a REAL embedder.
+
+    Clearing the fake api_key makes mem0's OpenAIEmbedding fall back to the
+    real OPENAI_API_KEY. A stub constant vector would make the surfacing
+    family meaningless — its whole question is about real retrieval order.
+    """
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    config.embedder.providers.openai.api_key = None
+    return config
+
+
+@pytest.fixture
+def clean_sweep_collection(sweep_config, sweep_project_id):
+    """Delete the seeded collection before AND after, so a swallowed teardown self-heals."""
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    collection = Scope(project_id=sweep_project_id).mem0_collection_name(
+        sweep_config.mem0.collection_prefix,
+    )
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestSeededStalenessSweep:
+    """A real supersedes pair and a real dangling pointer, both reported."""
+
+    def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
+        self, monkeypatch, sweep_config, sweep_project_id,
+    ):
+        """A leaked collection under the default prefix would live forever.
+
+        Deliberately NOT via ``clean_sweep_collection``: that fixture opens a
+        real QdrantClient, and this assertion is about a NAME. Taking it would
+        drag the one pure test in this class onto the network.
+        """
+        import importlib.util as _ilu  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        collection = Scope(project_id=sweep_project_id).mem0_collection_name(
+            sweep_config.mem0.collection_prefix,
+        )
+
+        path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
+        spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
+        assert spec is not None and spec.loader is not None
+        cleanup = _ilu.module_from_spec(spec)
+        monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
+        spec.loader.exec_module(cleanup)
+
+        # Asserted against the reaper's OWN constant, not a restated string:
+        # a prefix rename over there must not silently strand collections here.
+        assert collection.startswith(cleanup.PREFIX)
+
+    @pytest.mark.integration
+    @pytest.mark.timeout(300)
+    @pytest.mark.asyncio
+    @qdrant_skipif()
+    @pytest.mark.skipif(
+        not os.environ.get('OPENAI_API_KEY'),
+        reason='the seeded sweep needs a real embedder',
+    )
+    async def test_a_superseded_pair_and_a_dangling_pointer_are_both_reported(
+        self, sweep_config, sweep_project_id, clean_sweep_collection, tmp_path,
+    ):
+        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        m = _mod()
+        memory = MemoryService(sweep_config)
+        await memory.initialize()
+        try:
+            # mem0's SQLite history writer is process-shared and xdist-
+            # contended; it is not the question under test, and its failure
+            # would mask the one that is.
+            instance = await memory.mem0._get_instance(Scope(project_id=sweep_project_id))
+            instance.db.add_history = lambda *a, **kw: None
+
+            predecessor = await memory.add_memory(
+                SEED_PREDECESSOR, category='procedural_knowledge',
+                project_id=sweep_project_id, agent_id='e4-sweep-seed',
+            )
+            predecessor_id = predecessor.memory_ids[0]
+            successor = await memory.add_memory(
+                SEED_SUCCESSOR, category='procedural_knowledge',
+                project_id=sweep_project_id, agent_id='e4-sweep-seed',
+                metadata={'supersedes': [predecessor_id]},
+            )
+            successor_id = successor.memory_ids[0]
+            await memory.add_memory(
+                SEED_DANGLING_SOURCE, category='procedural_knowledge',
+                project_id=sweep_project_id, agent_id='e4-sweep-seed',
+                metadata={'corrects': [NEVER_WRITTEN_UUID]},
+            )
+
+            outcome = await m.run_sweep(
+                memory,
+                project_ids=(sweep_project_id,),
+                scan_limit=100,
+                out_root=tmp_path,
+                stamp=STAMP,
+            )
+        finally:
+            await memory.close()
+
+        series = load_metric_series(outcome.metrics_path)
+
+        # (1) The dangling edge is counted AND its target is named -- a bare
+        # count would not tell an operator which pointer to go and look at.
+        assert _metric(series, 'dangling-pointers').value >= 1
+        unresolved = {ref.target for ref in outcome.census.unresolved_refs}
+        assert NEVER_WRITTEN_UUID in unresolved
+        # ...and the live predecessor is NOT in it: the read really happened.
+        assert predecessor_id not in unresolved
+
+        # (2) The seeded supersedes edge produced a tripwire item that passes,
+        # keyed by content rather than by the successor's UUID (D5).
+        tripwire = _metric(series, 'successor-pointer-present')
+        seeded_key = m._tripwire_item_key(m.PointerRef(
+            source_id=successor_id, key='supersedes', target=predecessor_id,
+            source_content=SEED_SUCCESSOR,
+        ))
+        matching = [item for item in tripwire.items if item.item_key == seeded_key]
+        assert len(matching) == 1
+        assert matching[0].passed is True
+        assert successor_id not in seeded_key
+
+        # (3) The pair was searched against the real embedder and scored.
+        assert {r.successor_id for r in outcome.surfacing.records} == {successor_id}
+        assert {r.superseded_id for r in outcome.surfacing.records} == {predecessor_id}
+
+        # Both artifacts landed, under this leaf's own eval_id.
+        assert outcome.metrics_path == tmp_path / 'e4-staleness-sweep' / f'metrics-{STAMP}.json'
+        assert outcome.report_path is not None and outcome.report_path.exists()
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
