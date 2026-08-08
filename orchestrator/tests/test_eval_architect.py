@@ -2352,6 +2352,91 @@ class TestArchitectCellResolvesCostProvenance:
 
 
 @pytest.mark.asyncio
+class TestArchitectCellCostSourceIsComposed:
+    """Task 3656 step-7: the cell's ``cost_usd`` is a TWO-COMPONENT sum
+    (architect spend + plan-judge spend), so its single ``cost_source`` must
+    not silently describe two differently-sourced components.
+
+    Only the ARCHITECT component is resolved. The plan judge is always a
+    native-cloud opus call — ``judge_plan_quality`` takes neither the
+    candidate's model nor its ``env_overrides`` — so its CLI figure is
+    trustworthy by construction, and re-resolving it against the candidate's
+    price table would price opus tokens at a vLLM rate. The label therefore
+    COMPOSES (``metrics.compose_cost_source``): agreement → that source,
+    disagreement with judge dollars actually in the sum → ``'mixed'``.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    def _spending_judge(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        return PlanQualityVerdict(
+            plan_quality=0.77, per_criterion={}, reasoning='good', cost_usd=0.42,
+        )
+
+    async def test_price_table_architect_plus_cli_judge_reads_mixed(self):
+        """A price-table architect component beside a CLI judge component: the
+        figure is the RESOLVED architect cost plus the judge's CLI cost, and the
+        label says the two disagree rather than claiming either one."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.90 + 0.42)
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['cost_source'] == 'mixed'
+        assert result.metrics['cost_source'] == 'mixed'
+
+    async def test_todays_native_shape_with_a_spending_judge_stays_cli(self):
+        """REGRESSION PIN: both components are CLI-sourced, so a spending judge
+        must NOT tip today's architect cells into 'mixed'. Keeps every landed
+        result and ``TestArchitectCellRecordsJudgeSpend`` byte-identical."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert result.metrics['cost_source'] == 'cli'
+
+    async def test_judge_skipped_labels_the_architect_component_alone(self):
+        """An unscorable plan SKIPS the judge (``_create_plan_stub`` is the
+        header-only artifact ``create_plan`` writes), so no judge dollars enter
+        the sum and the label describes the architect component alone — NOT
+        'mixed', which would announce a blend that never happened."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_create_plan_stub(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        mocks['judge'].assert_not_called()
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.0)
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        assert result.metrics['cost_source'] == 'price_table'
+
+
+@pytest.mark.asyncio
 class TestArchitectRunnerJudgeCostReadIsDefensive:
     """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
     spend on a judge-skipped branch, and an unreadable verdict field must
