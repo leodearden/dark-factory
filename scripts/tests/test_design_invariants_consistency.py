@@ -371,6 +371,112 @@ def section_span(md_text: str, heading_prefix: str, *, source: str) -> str:
     return "\n".join(lines[start:end])
 
 
+# A rehearsal verdict row, anchored on its Fixture ID cell. Matched by ROW SHAPE
+# over the whole document rather than per-table: the live row set is split over a
+# base table plus two dated addendum tables, so "parse the table" would silently
+# cover a third of it.
+_VERDICT_ROW_RE = re.compile(r"^\| `INV-(\d+)-(PRD|CODE)` \|")
+
+# The legend's own cumulative-count claim — a second thing that does not
+# auto-extend when an addendum walk adds rows.
+_CUMULATIVE_ROWS_RE = re.compile(r"(\d+) rows cumulative")
+
+_BACKTICKED_SLUG_RE = re.compile(r"^`([a-z0-9][a-z0-9-]*)`$")
+
+
+def verdict_table_rows(md_text: str, *, source: str) -> list[tuple[int, str, str]]:
+    """Every rehearsal verdict row as ``(number, shape, expected_slug)``.
+
+    The Expected-slug cell is column 4. A row that is too short, or whose cell is
+    empty or not a backticked slug, RAISES rather than yielding ``None``: a
+    ``None`` would flow into the slug-equality check and surface as "expected
+    `contracts-machine-checked`, got None" — a red with a misleading diagnosis
+    pointing at the family rather than at the malformed row.
+    """
+    rows: list[tuple[int, str, str]] = []
+    for line in md_text.splitlines():
+        match = _VERDICT_ROW_RE.match(line)
+        if match is None:
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        assert len(cells) >= 6, (
+            f"{source}: verdict row {line!r} has {len(cells)} pipe-separated "
+            f"cells, too few to carry an Expected-slug column (task 3802)."
+        )
+        slug_match = _BACKTICKED_SLUG_RE.match(cells[4])
+        assert slug_match is not None, (
+            f"{source}: the Expected-slug cell of verdict row "
+            f"`INV-{match.group(1)}-{match.group(2)}` is {cells[4]!r}, not a "
+            f"backticked slug (task 3802). That column is the one this guard "
+            f"compares against the normative family, so an unreadable cell must "
+            f"fail loudly rather than compare as None."
+        )
+        rows.append((int(match.group(1)), match.group(2), slug_match.group(1)))
+
+    assert rows, (
+        f"{source}: no `| `INV-N-PRD|CODE` |` verdict rows found at all (task "
+        f"3802) — the coverage check would pass vacuously. Either the row shape "
+        f"changed or the wrong file was read."
+    )
+    return rows
+
+
+def assert_verdict_table_covers(
+    md_text: str, family: list[tuple[int, str]], *, source: str
+) -> None:
+    """Every invariant is rehearsed in both shapes, with the right expected slug.
+
+    COVERAGE only — never the Verdict/rationale column, which the doc's own
+    "Snapshot caveat" declares a point-in-time transcription rather than a live
+    pin on the G7 / Step-5.5 text.
+
+    Unknown numbers are checked FIRST so a renumbering reports "INV-9 names no
+    current invariant" rather than the per-invariant shape failure it also causes.
+    """
+    rows = verdict_table_rows(md_text, source=source)
+    canonical = dict(family)
+
+    unknown = sorted({number for number, _, _ in rows if number not in canonical})
+    assert not unknown, (
+        f"{source}: verdict row(s) for INV-{unknown} name no current invariant "
+        f"(task 3802); the family is INV-1..INV-{len(family)}. Delete the orphan "
+        f"rows, or renumber them if the fixture survived a family renumbering."
+    )
+
+    for number, slug in family:
+        shapes = sorted(shape for row_number, shape, _ in rows if row_number == number)
+        assert shapes == ["CODE", "PRD"], (
+            f"{source}: INV-{number} `{slug}` has verdict rows {shapes}, expected "
+            f"exactly one PRD row and one CODE row (task 3802). The rehearsal "
+            f"table does not auto-extend: a new invariant lands with nothing "
+            f"calibrating the G7 walk (PRD shape) or the /review Step-5.5 audit "
+            f"(CODE shape) against it."
+        )
+
+    mismatched = [
+        (number, shape, cell, canonical[number])
+        for number, shape, cell in rows
+        if cell != canonical[number]
+    ]
+    assert not mismatched, (
+        f"{source}: verdict row(s) whose Expected-slug cell disagrees with "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802) — (number, shape, cell, "
+        f"canonical): {mismatched}. The slug is what the gate must emit, so a "
+        f"stale cell rehearses the wrong acceptance."
+    )
+
+    claims = _CUMULATIVE_ROWS_RE.findall(md_text)
+    assert len(claims) == 1, (
+        f"{source}: expected exactly one `<N> rows cumulative` legend claim, "
+        f"found {len(claims)}: {claims} (task 3802)."
+    )
+    assert int(claims[0]) == len(rows), (
+        f"{source}: the legend claims {claims[0]} rows cumulative but the tables "
+        f"carry {len(rows)} (task 3802) — update the legend when an addendum "
+        f"walk adds rows."
+    )
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------
