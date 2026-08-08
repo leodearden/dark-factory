@@ -20,10 +20,9 @@ trust.
 import json
 from datetime import datetime
 
-import pytest
-
 import lms_manifest
 import lms_vram
+import pytest
 
 # Verbatim `nvidia-smi --query-gpu=memory.total,memory.used,memory.free
 # --format=csv,noheader,nounits` output captured on this host 2026-08-05.

@@ -114,7 +114,7 @@ def test_the_committed_serving_inventory_is_complete():
     grep gate green over a smaller slate."""
     present = {Path(p).name for p in _tracked(SERVING_DIR)}
 
-    assert EXPECTED_SERVING_FILES <= present, (
+    assert present >= EXPECTED_SERVING_FILES, (
         f'missing from {SERVING_DIR}: {sorted(EXPECTED_SERVING_FILES - present)}'
     )
 

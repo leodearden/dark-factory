@@ -232,7 +232,6 @@ from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser c
     parse_unit_directives,
 )
 
-
 # ---------------------------------------------------------------------------
 # Drift records and unit specs
 # ---------------------------------------------------------------------------

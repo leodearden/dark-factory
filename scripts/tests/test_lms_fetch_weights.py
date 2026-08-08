@@ -17,10 +17,9 @@ Two measured facts drive the rest:
     names, so a naive `hf download` runs ANONYMOUSLY and fails only later, only
     on gated repos -- which the Mistral and Gemma families are.
 """
-import pytest
-
 import lms_fetch_weights
 import lms_manifest
+import pytest
 
 _BACKGROUND_SHELL_TOKENS = ('nohup', 'setsid', 'disown', '&')
 
@@ -194,7 +193,9 @@ def test_redact_argv_changes_nothing_else():
     redacted = lms_fetch_weights.redact_argv(argv)
 
     assert len(redacted) == len(argv)
-    for original, shown in zip(argv, redacted):
+    # strict=True restates the length assertion above at the zip itself, so a
+    # future divergence fails here rather than silently truncating the sweep.
+    for original, shown in zip(argv, redacted, strict=True):
         if original.startswith('--setenv=HF_TOKEN='):
             continue
         assert shown == original

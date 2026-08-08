@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 from lms_manifest import ArmEntry, ArmManifestError, load_arms
-from lms_serve import HOST_HF_CACHE, REPO_ROOT, image_ref, host_gguf_dir
+from lms_serve import HOST_HF_CACHE, REPO_ROOT, host_gguf_dir, image_ref
 
 
 class WeightFetchError(Exception):
@@ -181,12 +181,14 @@ def main(argv: list[str] | None = None) -> int:
             failures += 1
             continue
         try:
-            if not args.weights_only:
-                if _submit(pull_image_argv(arm), dry_run=args.dry_run) == 0:
-                    submitted.append(pull_unit_name(arm))
-            if not args.images_only:
-                if _submit(fetch_argv(arm), dry_run=args.dry_run) == 0:
-                    submitted.append(fetch_unit_name(arm))
+            if not args.weights_only and _submit(
+                pull_image_argv(arm), dry_run=args.dry_run,
+            ) == 0:
+                submitted.append(pull_unit_name(arm))
+            if not args.images_only and _submit(
+                fetch_argv(arm), dry_run=args.dry_run,
+            ) == 0:
+                submitted.append(fetch_unit_name(arm))
         except WeightFetchError as exc:
             print(f'lms_fetch_weights: {arm.arm_id}: {exc}', file=sys.stderr)
             failures += 1

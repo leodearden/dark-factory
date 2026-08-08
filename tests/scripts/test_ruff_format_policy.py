@@ -63,7 +63,6 @@ import pathlib
 import tomllib
 
 import yaml
-
 from orchestrator.config import _discover_module_configs
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]

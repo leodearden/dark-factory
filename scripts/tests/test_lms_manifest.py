@@ -16,10 +16,9 @@ accidentally greened (or reddened) by an unrelated edit to the real manifest.
 """
 from pathlib import Path
 
+import lms_manifest
 import pytest
 import yaml
-
-import lms_manifest
 
 _COMMITTED_MANIFEST = (
     Path(__file__).resolve().parents[1] / 'local-model-serving' / 'arms.yaml'

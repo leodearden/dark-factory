@@ -31,13 +31,6 @@ import sys
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
-
-# backfill_decision_queue_stamp lives in <repo>/scripts, which
-# tests/scripts/conftest.py puts on sys.path at collection time; scripts/ is
-# also in [tool.pyright] extraPaths (task 3456), so this resolves statically
-# too. `orchestrator` resolves via the workspace's editable install.
-from orchestrator import session_registry as sr
-
 from backfill_decision_queue_stamp import (
     EXIT_BAD_ARGS,
     EXIT_NO_QUEUE,
@@ -48,6 +41,12 @@ from backfill_decision_queue_stamp import (
     resolve_queue_for_decision,
     unusable_queues,
 )
+
+# backfill_decision_queue_stamp lives in <repo>/scripts, which
+# tests/scripts/conftest.py puts on sys.path at collection time; scripts/ is
+# also in [tool.pyright] extraPaths (task 3456), so this resolves statically
+# too. `orchestrator` resolves via the workspace's editable install.
+from orchestrator import session_registry as sr
 
 SCRIPT = Path(__file__).resolve().parent.parent.parent / 'scripts' / 'backfill_decision_queue_stamp.py'
 

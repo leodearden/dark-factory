@@ -20,11 +20,10 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import lms_ctl
 import lms_manifest
 import lms_vram
+import pytest
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 LMS_DIR = SCRIPTS_DIR / 'local-model-serving'

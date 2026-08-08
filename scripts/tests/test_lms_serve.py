@@ -19,11 +19,10 @@ happen is what costs us:
     would credit it.  Encoding that structurally is the only way it survives a
     later well-meaning edit.
 """
-import pytest
-
 import lms_manifest
 import lms_serve
 import lms_vram
+import pytest
 
 MEASURED_GPU = lms_vram.GpuReading(total_mib=24576, used_mib=7362, free_mib=16761)
 
