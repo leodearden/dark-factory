@@ -58,7 +58,12 @@ class EvalMetrics:
     # Efficiency
     cost_usd: float = 0.0
     # Cost provenance (Invariant P5): one of 'price_table' | 'cli' |
-    # 'unpriced_proxy' — see :func:`resolve_cost_usd`. Defaults to 'cli' (the
+    # 'unpriced_proxy' | 'mixed'. The first three are what
+    # :func:`resolve_cost_usd` resolves for a SINGLE invocation's spend.
+    # 'mixed' is producible only by the ARCHITECT path, whose cost_usd is a
+    # TWO-COMPONENT sum (architect spend + plan-judge spend): when those two
+    # components' sources disagree, :func:`compose_cost_source` says so rather
+    # than letting one label silently describe both. Defaults to 'cli' (the
     # trustworthy native-cloud source) so a result JSON persisted before this
     # field existed reads back sanely.
     cost_source: str = 'cli'
@@ -542,6 +547,63 @@ def resolve_cost_usd(
         + output_tokens * _FALLBACK_PRICE['output_per_1m']
     ) / 1_000_000
     return cost, 'unpriced_proxy'
+
+
+def compose_cost_source(
+    primary: str,
+    *,
+    secondary_cost_usd: float,
+    secondary: str = 'cli',
+) -> str:
+    """Collapse a TWO-COMPONENT cost sum's provenance to ONE honest label.
+
+    :func:`resolve_cost_usd` answers "where did THIS figure come from?" for a
+    single invocation. ``run_architect_eval``'s ``cost_usd`` is not a single
+    invocation: it is the architect's spend PLUS the plan judge's spend. Only
+    the ARCHITECT component is resolved — the plan judge is always a
+    native-cloud opus call (``judge_plan_quality`` does not take the
+    candidate's model or ``env_overrides``), so its CLI figure is trustworthy
+    by construction and re-resolving it against the candidate's price table
+    would price opus tokens at a vLLM rate.
+
+    That is the mixed-provenance problem this helper exists to solve: the
+    moment the architect side resolves to ``'price_table'`` or
+    ``'unpriced_proxy'``, a single ``cost_source`` would silently describe two
+    differently-sourced components. Rather than let one label stand in for two
+    sources (the defect one level up, just quieter) or persist a second
+    ``judge_cost_source`` field (which every result JSON written before it
+    would read back as a default, mislabelling the existing corpus), the label
+    COMPOSES:
+
+    - *secondary_cost_usd* ``<= 0`` — no second component entered the sum, so
+      the label describes the primary alone. This is every judge-SKIPPED
+      architect branch (tainted, refused-with-a-plan, unscorable plan), plus
+      the defensive negative case: :func:`coerce_cost_usd` already floors a
+      nonsense figure to ``0.0`` upstream, and spend that did not happen must
+      never MANUFACTURE a ``'mixed'`` label.
+    - the two sources AGREE — that source. Today's architect cell is a native
+      candidate resolving ``'cli'`` beside a ``'cli'`` judge, so a spending
+      judge leaves it ``'cli'``, byte-identical to what already landed.
+    - they DISAGREE — ``'mixed'``.
+
+    ``'mixed'`` is deliberately the SAME label
+    :func:`~orchestrator.evals.report._summarize_cost_source` already emits for
+    the structurally identical situation one aggregation level up ("this figure
+    blends more than one distinct cost source, so no single source honestly
+    labels it"). Reusing the word keeps ONE vocabulary across the cell and the
+    report row, needs zero report-side change (a single distinct cell label
+    passes straight through ``_summarize_cost_source``), and means an operator
+    reading ``mixed`` need not learn which level produced it.
+
+    *secondary* defaults to ``'cli'`` — the plan judge's always-native-cloud
+    provenance — but is a parameter rather than a hardcoded assumption so a
+    future caller with a differently-sourced second component states its own.
+
+    Pure: no I/O, no config, mirroring :func:`resolve_cost_usd`.
+    """
+    if secondary_cost_usd <= 0.0:
+        return primary
+    return primary if primary == secondary else 'mixed'
 
 
 def coerce_cost_usd(value: object) -> float:
