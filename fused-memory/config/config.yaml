@@ -72,9 +72,21 @@ queue:
   # DEFAULT_TRANSIENT_ERROR_NAMES in
   # src/fused_memory/services/durable_queue.py for the evidence and for the
   # clustered/read-routed-backend condition that would justify putting it back.
-  # That list is the authority; this one must match it (enforced by
-  # test_config_schema.py::TestQueueConfigTransientErrorFields::
-  # test_config_yaml_pins_transient_retry_policy).
+  #
+  # RECORDED COST (task 3585). Spelling the list out here makes it a THIRD
+  # copy — schema.QueueConfig's default and durable_queue's frozenset are the
+  # other two — so a future membership change in code has to be made in three
+  # places, not two. That is accepted deliberately, for one reason: the policy
+  # is otherwise editable only by changing code, and an operator responding to
+  # an incident needs it visible and tunable in the DEPLOYED file. Retuning
+  # here is expected and supported; CI does not freeze this list to the code
+  # default. What it does enforce (test_config_schema.py::
+  # TestQueueConfigTransientErrorFields::
+  # test_deployed_config_transient_retry_policy) is the 3585 verdict plus the
+  # anti-drift floor: this list may ADD names, must contain every name in
+  # DEFAULT_TRANSIENT_ERROR_NAMES, and must not readmit the not-found family.
+  # Re-add one of those three only after re-deriving the argument from the
+  # durable_queue.py comment — the test will make you mean it.
   #
   # queue.* is NOT in reload.py's hot-reload allowlist, so mcp__fused-memory__
   # reload_config reports a change here under restart_required rather than
