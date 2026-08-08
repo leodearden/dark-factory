@@ -663,3 +663,199 @@ def terminal_staleness(records: list[dict], terminal_task_ids) -> StalenessObser
     return StalenessObservation(
         entries_referencing_terminal=exposed, stale=stale, records=tuple(found),
     )
+
+
+# ---------------------------------------------------------------------------
+# M1 series assembly
+#
+# Every model, validator and path helper comes from shared.memory_eval_metrics
+# (D2). Nothing about the artifact shape is re-declared here.
+# ---------------------------------------------------------------------------
+
+def pinned_metric_ids() -> tuple[str, ...]:
+    """Every metric_id a run of this leaf is expected to emit.
+
+    THE list this leaf owns, in one place, so "which family went unmeasured"
+    is answerable by comparing against it rather than by remembering what
+    :func:`build_series` can emit.
+    """
+    return (
+        METRIC_SUPERSEDED_STILL_SURFACING,
+        METRIC_DANGLING_POINTERS,
+        METRIC_SUCCESSOR_POINTER_PRESENT,
+        METRIC_TASK_TERMINAL_STALENESS,
+    )
+
+
+def _count(metric_id: str, value: int, exposure: int, *, details_path: str | None = None):
+    """A count Metric, or ``None`` when the family measured nothing.
+
+    ``None`` rather than a ``value=0 / n=0`` datapoint: a count kind has no
+    more claim to a zero-trial measurement than a proportion does, and
+    emitting one would put a fabricated "nothing wrong here" into the baseline
+    window leaf α computes limits from. Absent is the honest signal, and
+    :func:`metric_families_not_measured` puts the absence in the report — a
+    metric that vanishes without explanation reads as healthy.
+
+    Every count in this leaf is ``higher_is_worse``: more dangling pointers,
+    more superseded entries outranking their successors and more stale
+    liveness claims are each unambiguously the regression direction.
+    """
+    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+
+    if exposure <= 0:
+        return None
+    return Metric(
+        metric_id=metric_id,
+        kind='count',
+        value=float(value),
+        n=exposure,
+        direction='higher_is_worse',
+        details_path=details_path,
+    )
+
+
+def _disclosure_counts(
+    census: DanglingCensus,
+    surfacing: SurfacingObservation,
+    staleness: StalenessObservation,
+    malformed: int,
+) -> dict[str, int]:
+    """The narrowings that must ride along INSIDE the machine-readable artifact.
+
+    Reporting them only in prose would be a silent cap for every consumer that
+    reads the JSON — which is all of them. ``corpus.counts`` is free-form
+    category -> size by design (its docstring: the bucket vocabulary is not
+    that schema's to own), so it is where a per-run disclosure belongs.
+
+    The per-key rows matter because ``dangling-pointers`` aggregates three
+    keys into one number: without them a consumer cannot tell a corpus that
+    grew its ``corrects`` population from one that started breaking
+    ``supersedes`` edges, and those have different fixes. ``malformed`` splits
+    "the target is gone" from "the pointer was never writable", which the
+    aggregate also cannot express.
+    """
+    counts: dict[str, int] = {
+        'pointer_refs_malformed': malformed,
+        'pointer_targets_unique_reads': len(
+            {ref.target for ref in census.unresolved_refs if isinstance(ref.target, str)},
+        ) + census.resolved,
+        'surfacing_pairs_observed': len(surfacing.records),
+        'task_terminal_entry_task_pairs': len(staleness.records),
+    }
+    for key, row in sorted(census.by_key.items()):
+        for field_name, value in sorted(row.items()):
+            counts[f'pointers_{key}_{field_name}'] = value
+    return counts
+
+
+def build_series(
+    census: DanglingCensus,
+    tripwire_items: list,
+    surfacing: SurfacingObservation,
+    staleness: StalenessObservation,
+    corpus_counts: dict[str, int],
+    project_id: str,
+    stamp: str,
+    *,
+    eval_id: str = EVAL_ID,
+):
+    """Assemble the M1 metric series for one sweep run.
+
+    Emits at most the four metrics this leaf owns, in the pinned vocabulary.
+    β's ``superseded-above-successor`` and its topic metrics are that leaf's
+    and never appear here.
+
+    The result is validated before it is returned, so an aggregation bug
+    surfaces in this runner rather than in leaf α's evaluator — the M1
+    "rejected at emit time, not read time" guarantee applied to the producer's
+    own arithmetic.
+    """
+    from shared.memory_eval_metrics import (  # noqa: PLC0415
+        SCHEMA_VERSION,
+        Corpus,
+        Metric,
+        MetricSeries,
+        report_artifact_path,
+        validate_metric_series,
+    )
+
+    # The report FILENAME, not its absolute path: the artifact directory gets
+    # copied and served (the dashboard reads it as plain files), and an
+    # absolute path from this machine would be a dangling pointer there.
+    details_path = report_artifact_path('.', eval_id, stamp).name
+
+    metrics: list[Any] = []
+    for metric in (
+        _count(
+            METRIC_SUPERSEDED_STILL_SURFACING,
+            surfacing.still_surfacing, surfacing.pairs_comparable,
+            details_path=details_path,
+        ),
+        _count(
+            METRIC_DANGLING_POINTERS,
+            census.unresolved, census.examined,
+            details_path=details_path,
+        ),
+    ):
+        if metric is not None:
+            metrics.append(metric)
+
+    # A tripwire with no items is not a passing tripwire — the schema rejects
+    # an empty items list outright, and rightly: "no supersedes edge in this
+    # corpus" is an absence of evidence, not a clean structural check.
+    if tripwire_items:
+        metrics.append(Metric(
+            metric_id=METRIC_SUCCESSOR_POINTER_PRESENT,
+            kind='tripwire',
+            value=float(sum(1 for item in tripwire_items if not item.passed)),
+            n=len(tripwire_items),
+            items=list(tripwire_items),
+            details_path=details_path,
+        ))
+
+    terminal = _count(
+        METRIC_TASK_TERMINAL_STALENESS,
+        staleness.stale, staleness.entries_referencing_terminal,
+        details_path=details_path,
+    )
+    if terminal is not None:
+        metrics.append(terminal)
+
+    counts = dict(corpus_counts)
+    disclosures = _disclosure_counts(
+        census, surfacing, staleness, len(malformed_pointer_refs(census.unresolved_refs)),
+    )
+    for key, value in disclosures.items():
+        if key in counts:
+            raise ValueError(
+                f'corpus_counts key {key!r} collides with a run disclosure this '
+                'runner computes. Rename the caller-supplied key: silently '
+                'overwriting either one would hide a narrowing.'
+            )
+        counts[key] = value
+
+    series = MetricSeries(
+        schema_version=SCHEMA_VERSION,
+        eval_id=eval_id,
+        run_stamp=stamp,
+        corpus=Corpus(project_id=project_id, counts=counts),
+        metrics=metrics,
+    )
+    validate_metric_series(series)
+    return series
+
+
+def metric_families_not_measured(series) -> list[str]:
+    """Pinned metric ids *series* does not carry, in the pinned order.
+
+    Every family here declines to emit rather than emit a zero-exposure
+    datapoint, because a fabricated trial in leaf α's baseline window is worse
+    than a gap in it. But an absent metric is not an error to the evaluator
+    either — it joins by metric_id and simply stops trending what is missing.
+    So the absence is named HERE, in the run's own report, where the
+    alternative is a metric that silently stops existing and reads to a human
+    as one that had nothing to report.
+    """
+    present = {metric.metric_id for metric in series.metrics}
+    return [metric_id for metric_id in pinned_metric_ids() if metric_id not in present]
