@@ -10,10 +10,14 @@ colliding with sibling subprojects' helpers.
 import asyncio
 import contextlib
 import functools
+import importlib.util
 import inspect
 import json
 import os
+import pathlib
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -1272,3 +1276,48 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
+# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
+# independent copies of the same loader).
+# ---------------------------------------------------------------------------
+
+
+def load_script_module(
+    script_path: pathlib.Path, mod_name: str | None = None
+) -> types.ModuleType:
+    """Load a non-package script (e.g. under ``scripts/``) by file path.
+
+    ``scripts/`` is not a package and its modules are not on ``PYTHONPATH``,
+    so this is how a script's pure functions get imported into a test without
+    ``sys.path`` pollution. *mod_name* defaults to the file stem and is the
+    key the module is registered under in ``sys.modules``.
+
+    An already-loaded module for the SAME file is reused rather than
+    re-executed: two independent test modules loading the same script under
+    the same *mod_name* would otherwise make the second load silently
+    replace the first module object in ``sys.modules`` -- two live module
+    objects whose identity depends on collection order. Harmless while only
+    pure functions are used, but a latent hazard the moment anything holds
+    module state.
+    """
+    name = mod_name or script_path.stem
+    cached = sys.modules.get(name)
+    cached_file = getattr(cached, '__file__', None)
+    if cached is not None and cached_file is not None and (
+        pathlib.Path(cached_file).resolve() == script_path.resolve()
+    ):
+        return cached
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {script_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module

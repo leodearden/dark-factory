@@ -52,17 +52,15 @@ reproducing the very bug under test. This module needs no such literal today
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import inspect
 import json
 import re
-import sys
-import types
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -73,47 +71,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_GLOB = 'toolcall-xml-leak-sweep-*'
 
 
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path.
-
-    Reuse of test_sweep_toolcall_xml_leak.py's loader: scripts/ is not a
-    package and the script is not on PYTHONPATH, so importlib is how the
-    production detector is reached without sys.path pollution.
-
-    One deliberate difference from that copy: an already-loaded module for the
-    SAME file is reused rather than re-executed. Both test modules register the
-    key ``sweep_toolcall_xml_leak`` in ``sys.modules``, so an unconditional
-    load makes the second import execute the 965-line script a second time and
-    silently REPLACE the first module object -- two live module objects whose
-    identity depends on collection order. Harmless while only pure functions
-    are used, but a latent hazard the moment anything holds module state.
-
-    The remaining half of the reviewer's ask -- hoisting this loader into
-    ``fused-memory/tests/conftest.py`` so the loading contract has ONE
-    definition -- is not applied here: conftest.py is outside this task's
-    locked module set.
-    """
-    mod_name = 'sweep_toolcall_xml_leak'
-    cached = sys.modules.get(mod_name)
-    cached_file = getattr(cached, '__file__', None)
-    if cached is not None and cached_file is not None and (
-        Path(cached_file).resolve() == SCRIPT_PATH.resolve()
-    ):
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 classify_record = _mod.classify_record
 CLASSIFICATIONS = _mod.CLASSIFICATIONS
@@ -168,27 +126,14 @@ def _provenance_path(report_path: Path) -> Path:
 _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 
 # The four per-record outcomes the runbook (docs/mcp-toolcall-xml-leak.md §5
-# remediation table) says a HUMAN must adjudicate. Lifted verbatim as a
-# vocabulary rather than re-derived, so this module's notion of "a mutation
-# somebody has to deal with" is the runbook's, not a fresh invention.
-#
-# There is no shared constant to import: the script spells the same four
-# inline in resolve_exit_code(). That makes this tuple a HAND COPY, and a hand
-# copy of a growth-prone list is a silent-drift hazard -- add a fifth danger
-# outcome to the sweep and _unrepaired_danger_records() would return [] for a
-# record carrying it, every test below would hit its "if not outstanding"
-# early exit, and the whole class would go GREEN while a real unrepaired live
-# mutation landed untracked. TestDangerFlagsMatchTheProductionScript pins this
-# tuple against resolve_exit_code's own source so that drift is RED, not
-# silent. (Exporting the constant FROM the script, as the reviewer suggested,
-# is the cleaner fix but edits scripts/sweep_toolcall_xml_leak.py, which is
-# outside this task's locked module set.)
-DANGER_FLAGS = (
-    'record_error',
-    'content_lost_in_flight',
-    'skipped_not_mem0_routed',
-    'skipped_metadata_would_be_rejected',
-)
+# remediation table) says a HUMAN must adjudicate. Bound directly to the
+# script's own HUMAN_ADJUDICATION_FLAGS export (task 3738) rather than
+# hand-copied, so this module's notion of "a mutation somebody has to deal
+# with" cannot drift from the production predicate's -- add a fifth danger
+# outcome to the sweep and this tuple grows with it automatically, instead of
+# _unrepaired_danger_records() silently returning [] for a record carrying an
+# outcome nobody told this module about.
+DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS
 
 # The two shapes repair_content() knows how to fix. Only these carry a
 # repaired_content, so only for these can the recovery payload be checked for
@@ -437,13 +382,16 @@ def _production_danger_flags() -> tuple[set[str], str]:
 
 
 class TestDangerFlagsMatchTheProductionScript:
-    """DANGER_FLAGS is a hand copy. This is what keeps it honest.
+    """DANGER_FLAGS now binds directly to the script's own export. This backstops that.
 
-    The script spells the same four names inline in ``resolve_exit_code`` and
-    exports no shared constant, so nothing structurally prevents the two lists
-    from diverging. Divergence here fails in the WORST direction: a fifth
-    danger outcome added upstream would make ``_unrepaired_danger_records()``
-    return ``[]`` for a record carrying it, every test in
+    DANGER_FLAGS is ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738), not a hand
+    copy, so ``test_hand_copy_equals_what_the_script_acts_on`` below is
+    ordinarily a tautology -- both sides resolve to the same tuple. It stays
+    as a backstop against a regression where DANGER_FLAGS is ever rebound to
+    a fresh literal (re-introducing the hand-copy hazard this task removed):
+    divergence there fails in the WORST direction, since a fifth danger
+    outcome added upstream would make ``_unrepaired_danger_records()`` return
+    ``[]`` for a record carrying it, every test in
     ``TestUnrepairedMutationsAreTracked`` would take its ``if not outstanding``
     early exit, and the suite would report all-green while a real unrepaired
     live-corpus mutation landed with no tracking entry required — this module's

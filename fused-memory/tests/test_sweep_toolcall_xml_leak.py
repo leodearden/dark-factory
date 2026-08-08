@@ -38,38 +38,20 @@ escaped.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.models import SourceStore
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
-
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path."""
-    mod_name = 'sweep_toolcall_xml_leak'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 _BODY = 'The merge worker consumes the stash stack in project_root.'
 
@@ -285,12 +267,11 @@ class TestResolveExitCode:
         success would make a silently partial sweep look complete."""
         assert _mod.resolve_exit_code(self._report(dry_run=False, truncated=True)) != 0
 
-    @pytest.mark.parametrize('flag', [
-        'content_lost_in_flight',
-        'skipped_not_mem0_routed',
-        'skipped_metadata_would_be_rejected',
-        'record_error',
-    ])
+    # Sourced from the script's own export, not re-typed, so this parametrize
+    # set cannot silently drift from what resolve_exit_code() actually acts on
+    # (task 3738; see also test_toolcall_xml_leak_sweep_artifacts.py's
+    # TestDangerFlagsMatchTheProductionScript, which binds the same constant).
+    @pytest.mark.parametrize('flag', _mod.HUMAN_ADJUDICATION_FLAGS)
     def test_every_per_record_failure_flag_exits_non_zero(self, flag):
         """Each of these leaves a record a human still has to adjudicate, so
         none of them may be reported as a clean sweep."""

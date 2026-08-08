@@ -173,6 +173,24 @@ MANUAL_REVIEW = 'manual_review'
 
 CLASSIFICATIONS = (CLEAN, REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE, MANUAL_REVIEW)
 
+# The four per-record outcomes that leave a record needing HUMAN adjudication
+# -- see resolve_exit_code()'s docstring for what each one means and why. This
+# is a DIFFERENT vocabulary from CLASSIFICATIONS above: a classification is
+# assigned to every scanned record up front, while these flags are set later,
+# during (or in place of) an --apply repair attempt.
+#
+# Exported so nothing downstream has to hand-copy these four names: tests
+# (fused-memory/tests/test_sweep_toolcall_xml_leak.py,
+# fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py) bind to this
+# constant directly rather than re-typing it and risking silent drift (task
+# 3738).
+HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (
+    'record_error',
+    'content_lost_in_flight',
+    'skipped_not_mem0_routed',
+    'skipped_metadata_would_be_rejected',
+)
+
 
 # ---------------------------------------------------------------------------
 # Pure core
@@ -859,9 +877,9 @@ def resolve_exit_code(report: dict) -> int:
     and a zero exit would let a partial sweep read as a complete one. Pure,
     sync, no I/O.
 
-    Four per-record outcomes also force non-zero, all needing a human:
-    ``content_lost_in_flight`` (the delete landed but the re-add did not
-    persist, so the text survives only in the printed report),
+    Four per-record outcomes also force non-zero -- :data:`HUMAN_ADJUDICATION_FLAGS`,
+    all needing a human: ``content_lost_in_flight`` (the delete landed but the
+    re-add did not persist, so the text survives only in the printed report),
     ``skipped_not_mem0_routed`` (a repairable record whose category does not
     route to mem0, left entirely untouched),
     ``skipped_metadata_would_be_rejected`` (a repairable record whose carried
@@ -878,12 +896,7 @@ def resolve_exit_code(report: dict) -> int:
     if report.get('truncated'):
         return 1
     for record in report.get('records', []):
-        if (
-            record.get('content_lost_in_flight')
-            or record.get('skipped_not_mem0_routed')
-            or record.get('skipped_metadata_would_be_rejected')
-            or record.get('record_error')
-        ):
+        if any(record.get(flag) for flag in HUMAN_ADJUDICATION_FLAGS):
             return 1
     return 0
 
