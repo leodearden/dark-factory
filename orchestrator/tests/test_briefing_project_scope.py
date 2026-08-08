@@ -18,8 +18,26 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
-from orchestrator.agents.briefing import filter_foreign_project_results
+import pytest
+
+from orchestrator.agents.briefing import BriefingAssembler, filter_foreign_project_results
+from orchestrator.config import GitConfig, OrchestratorConfig
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
 
 
 def _result(id_: str, content: str, metadata: dict | None = None, source_store: str = 'graphiti') -> dict:
