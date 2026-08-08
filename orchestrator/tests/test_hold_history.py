@@ -9,16 +9,20 @@ back out of the implementation under test.
 
 from __future__ import annotations
 
-import pytest
-
 import _hold_history_fixtures as F
+import pytest
 from orchestrator.hold_history import HoldSpan, iter_hold_spans
 
 
 def _by_key(spans) -> dict[tuple[str, str], HoldSpan]:
-    """Index spans by (task_id, module) — unique for every trace used here."""
-    indexed = {(s.task_id, s.module): s for s in spans}
-    assert len(indexed) == len(list(spans)), 'trace produced duplicate (task, module) keys'
+    """Index spans by (task_id, module) — unique for every trace used here.
+
+    ``iter_hold_spans`` is a generator, so materialise before counting: a
+    second pass over an exhausted iterator would silently see zero spans.
+    """
+    materialized = list(spans)
+    indexed = {(s.task_id, s.module): s for s in materialized}
+    assert len(indexed) == len(materialized), 'trace produced duplicate (task, module) keys'
     return indexed
 
 
