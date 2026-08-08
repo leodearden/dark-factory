@@ -360,17 +360,29 @@ async def repair_memory_citation(
             }
 
     # ── Compute the new citation list (no mutation yet) ───────────────────
+    # The mutation is confined to cited_memories plus the appended provenance
+    # record — never the finding roster, stats or summary — so the run's
+    # flagged_count and every downstream stat stay exactly as originally
+    # reported, and complete()'s cached response and the judge's stat
+    # verification cannot be invalidated after the fact.
     cited = finding.get('cited_memories') or []
     kept = [entry for entry in cited if not _is_citation_of(entry, memory_id)]
     removed_count = len(cited) - len(kept)
+    deduped = False
     if replacement_memory_id is not None:
-        kept.append(
-            {
-                'memory_id': replacement_memory_id,
-                'store': store,
-                'metadata_fingerprint': _fingerprint_from_record(replacement_record),
-            }
-        )
+        if any(_is_citation_of(entry, replacement_memory_id) for entry in kept):
+            # Already cited — appending again would leave the finding claiming
+            # the same evidence twice. The repair is still real: the dangling
+            # entry is gone.
+            deduped = True
+        else:
+            kept.append(
+                {
+                    'memory_id': replacement_memory_id,
+                    'store': store,
+                    'metadata_fingerprint': _fingerprint_from_record(replacement_record),
+                }
+            )
 
     outcome = {
         'status': 'repaired' if apply else 'dry_run',
@@ -381,7 +393,7 @@ async def repair_memory_citation(
         'removed_memory_id': memory_id,
         'removed_count': removed_count,
         'replacement_memory_id': replacement_memory_id,
-        'deduped': False,
+        'deduped': deduped,
         'store': store,
         'cited_memories': kept,
     }
