@@ -21,6 +21,13 @@ module):
    record too — those are the rounds this question keeps losing, and a bare
    pytest skip line is not a record.
 
+WHICH accounts exist at all is no longer decided here: the
+``CLAUDE_OAUTH_TOKEN_*`` scan moved to ``_oauth_accounts`` (task 3700), which is
+now its single home across the four places that had each hand-rolled it.  This
+module keeps only the measurement-specific question — which PAIR of the
+available accounts to run on — and imports the fleet letter set rather than
+owning it.
+
 Imported by bare module name (``from _cross_account_evidence import ...``);
 ``conftest.py`` prepends ``shared/tests`` to ``sys.path``, same convention as
 ``_capacity_skip.py``.  The leading underscore keeps pytest from collecting it.
@@ -34,17 +41,9 @@ from pathlib import Path
 from typing import IO
 
 from _capacity_skip import result_looks_like_capacity_failure
+from _oauth_accounts import FLEET_TOKEN_LETTERS, available_tokens, token_var_names
 
 from shared.cli_invoke import AgentResult
-
-#: The account letters scanned, in order, when no override is set.
-#:
-#: WIDER than the ``BCDEF`` scan ``test_cli_invoke_integration`` shipped with:
-#: ``CLAUDE_OAUTH_TOKEN_G`` is a real account in ``.env`` that the old scan could
-#: not reach at all, which needlessly shrank the pool this measurement draws
-#: from.  ``A`` stays out deliberately — it is the interactive/primary account,
-#: not a fleet worker, and the old scan excluded it too.
-TOKEN_LETTERS: tuple[str, ...] = ('B', 'C', 'D', 'E', 'F', 'G')
 
 #: Env var naming the pair to measure, e.g. ``'F,C'`` or
 #: ``'CLAUDE_OAUTH_TOKEN_F,CLAUDE_OAUTH_TOKEN_C'``.  First entry is account A
@@ -56,18 +55,6 @@ PAIR_OVERRIDE_VAR = 'CROSS_ACCOUNT_RESUME_TOKENS'
 EVIDENCE_PATH_VAR = 'CROSS_ACCOUNT_EVIDENCE_PATH'
 
 TokenPair = tuple[tuple[str, str], tuple[str, str]]
-
-
-def available_tokens(environ: Mapping[str, str]) -> list[tuple[str, str]]:
-    """``[(var_name, token), ...]`` for every set token var, in scan order.
-
-    Pure: reads only the injected *environ*, never ``os.environ``.
-    """
-    return [
-        (var, environ[var])
-        for var in (f'CLAUDE_OAUTH_TOKEN_{ch}' for ch in TOKEN_LETTERS)
-        if environ.get(var)
-    ]
 
 
 def _normalise_entry(entry: str) -> str:
@@ -89,7 +76,7 @@ def select_token_pair(environ: Mapping[str, str]) -> TokenPair:
     account B issues the ``--resume``.  Reversing them measures a different thing.
 
     Without *PAIR_OVERRIDE_VAR*, returns the first two available tokens in
-    ``TOKEN_LETTERS`` order — byte-identical to the ``_AVAILABLE_TOKENS[0]/[1]``
+    ``FLEET_TOKEN_LETTERS`` order — byte-identical to the ``_AVAILABLE_TOKENS[0]/[1]``
     behaviour the integration module shipped with, so opting out changes nothing.
 
     Raises:
@@ -142,7 +129,7 @@ def select_token_pair(environ: Mapping[str, str]) -> TokenPair:
         raise ValueError(
             'A cross-account resume measurement needs TWO accounts; found '
             f'{len(tokens)}: {[var for var, _ in tokens]}. Scanned '
-            f'{[f"CLAUDE_OAUTH_TOKEN_{ch}" for ch in TOKEN_LETTERS]}.'
+            f'{list(token_var_names(FLEET_TOKEN_LETTERS))}.'
         )
     return (tokens[0], tokens[1])
 
