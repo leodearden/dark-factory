@@ -248,6 +248,37 @@ class TestMalformedConfigRaises:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestProjectRootAbsoluteness:
+    """``project_root`` must be an absolute path — a relative value fails
+    loudly at ``load_config`` rather than letting each consumer resolve it
+    against its own process cwd (task 3702, reviewer suggestion #1 on task
+    3269's ambient-cwd fix)."""
+
+    def test_dot_project_root_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: .
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='project_root'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_relative_dotdot_project_root_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ../foo
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='project_root'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_absolute_project_root_still_loads(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.project_root == '/home/leo/src/dark-factory'
+
+
 class TestShippedDarkFactoryConfig:
     """The committed docs/legibility/legibility.yaml — dark_factory's own
     per-project §7.4 config — loads and validates through config.load_config.

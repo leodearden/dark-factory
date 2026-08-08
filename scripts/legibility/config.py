@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
@@ -140,6 +140,30 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
+
+    @field_validator('project_root')
+    @classmethod
+    def _project_root_must_be_absolute(cls, value: str) -> str:
+        """Reject a relative ``project_root`` at config-load time.
+
+        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        digest.py, ...) resolves ``cfg.project_root`` against its OWN
+        process cwd. ``scripts/legibility-trickle@.service`` pins
+        ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``
+        instance, so a relative root in any project's legibility.yaml would
+        silently resolve into the dark-factory checkout instead of that
+        project's own tree. Failing loudly here — at ``load_config``, whose
+        documented contract is to propagate ``ValidationError`` on malformed
+        input — is cheaper than letting each consumer guess.
+        """
+        if not os.path.isabs(value):
+            raise ValueError(
+                f'project_root must be an absolute path, got {value!r}. '
+                'A relative project_root resolves against each consuming '
+                "process's own cwd (e.g. the trickle systemd unit's pinned "
+                'WorkingDirectory), not the config file location.'
+            )
+        return value
 
 
 def load_config(path: Path | str) -> LegibilityConfig:
