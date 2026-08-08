@@ -32,13 +32,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Both modules live in <repo>/scripts, which tests/scripts/conftest.py puts on
-# sys.path at collection time. As of task 3456, scripts/ and scripts/legibility/
-# are ALSO listed in [tool.pyright] extraPaths in the root pyproject.toml — a
-# precondition for the `scripts` module's own declared type gate — so these
-# imports resolve statically too and need no ignore. This comment previously
-# asserted the opposite ("deliberately absent from extraPaths"); 3456 falsified
-# it. Same correction in tests/scripts/test_migrate_metadata_modules_to_files.py.
+# All three modules live in <repo>/scripts, which tests/scripts/conftest.py puts
+# on sys.path at collection time. As of task 3456, scripts/ and
+# scripts/legibility/ are ALSO listed in [tool.pyright] extraPaths in the root
+# pyproject.toml — a precondition for the `scripts` module's own declared type
+# gate — so these imports resolve statically too and need no ignore. This comment
+# previously asserted the opposite ("deliberately absent from extraPaths"); 3456
+# falsified it. Same correction in
+# tests/scripts/test_migrate_metadata_modules_to_files.py.
+#
+# _task_db_scan is imported by the TEST only, never by
+# repair_wiped_metadata_files.py itself — see the lockstep guard at the bottom of
+# this file for why that asymmetry is deliberate.
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+)
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -1660,6 +1672,92 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
 
     assert exit_code == EXIT_WRITE_FAILED
     assert exit_code != EXIT_LIVE_READ_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Cross-copy lockstep guard with _task_db_scan.py's Tier 3.
+#
+# Task 3817 decided this script does NOT adopt _task_db_scan.run_audit_cli and
+# keeps its own EXIT_* ladder — the rationale lives in _task_db_scan.py's module
+# docstring, and is NOT restated here. What that decision leaves behind is a
+# duplicated exit-code ladder that nothing checked: the two copies agreed only by
+# luck. These tests are what convert that luck into a CI failure. They import the
+# shared constants rather than re-spelling 0/1/2/3 as literals, because a
+# hardcoded copy in the guard would drift exactly as the thing it guards against.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
+    """The four shared codes must keep the SAME integers as Tier 3's.
+
+    Task 3817 decided repair_wiped_metadata_files.py keeps its own copy of the
+    ladder that _task_db_scan.py's AUDIT_EXIT_* constants own, so this test is
+    the only thing standing between the two copies and silent drift. An operator
+    (or a wrapper script) reading an exit code must not have to know WHICH of the
+    wiped-metadata tools produced it.
+    """
+    assert EXIT_OK == AUDIT_EXIT_OK
+    assert EXIT_WRITE_FAILED == AUDIT_EXIT_FINDINGS
+    assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+    assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
+
+
+def test_exit_server_unreachable_is_this_scripts_own_extension():
+    """4 is this script's, not Tier 3's — and must stay outside its value set.
+
+    Tier 3 has no fifth code, so EXIT_SERVER_UNREACHABLE cannot be checked for
+    lockstep; what CAN be checked is that it never collides with a Tier-3 code
+    and thereby acquires a second, contradictory meaning. Anyone renumbering the
+    shared ladder upward lands on this test rather than on a silent collision.
+    """
+    assert EXIT_SERVER_UNREACHABLE == 4
+    assert EXIT_SERVER_UNREACHABLE not in {
+        AUDIT_EXIT_OK,
+        AUDIT_EXIT_FINDINGS,
+        AUDIT_EXIT_NO_ROOT,
+        AUDIT_EXIT_NOTHING_AUDITED,
+    }
+
+
+def test_repair_exit_constants_are_pairwise_distinct():
+    """Each code denotes EXACTLY ONE outcome — mirroring the shared module's own
+    test_audit_exit_constants_are_pairwise_distinct in
+    scripts/tests/test_task_db_scan.py.
+
+    Collapsing any pair is the silent fail-soft docs/legibility/
+    design-invariants.md forbids: folding 3 into 0 reports "examined nothing at
+    all" as a clean sweep, and folding 4 into 1 sends an operator hunting for a
+    rejected write that was never attempted.
+    """
+    codes = [
+        EXIT_OK,
+        EXIT_WRITE_FAILED,
+        EXIT_NO_ROOT,
+        EXIT_NOTHING_SCANNED,
+        EXIT_SERVER_UNREACHABLE,
+        EXIT_LIVE_READ_FAILED,
+    ]
+    assert len(set(codes)) == len(codes), codes
+
+
+def test_exit_2_stderr_is_the_shared_sentence_plus_this_scripts_suffix(tmp_path):
+    """The exit-2 MESSAGE is duplicated too, not just the number.
+
+    This script spells the sentence inline rather than importing
+    NO_PROJECT_ROOT_RESOLVED_MESSAGE — task 3817 kept it free of any
+    _task_db_scan import — so the wording is a third copy and can drift the same
+    way the integers can. The shared sentence must survive VERBATIM, and this
+    script's write-flavoured suffix must follow it: a repair that reported only
+    "nothing was audited" would lose the fact that nothing was WRITTEN either.
+    """
+    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
+
+    assert result.returncode == EXIT_NO_ROOT, result.stderr
+    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE in result.stderr
+    _, _, after_shared_sentence = result.stderr.partition(
+        NO_PROJECT_ROOT_RESOLVED_MESSAGE
+    )
+    assert "NOTHING was examined" in after_shared_sentence, result.stderr
 
 
 def test_make_client_is_attributable_to_this_repair_not_the_migration():
