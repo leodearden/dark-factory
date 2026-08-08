@@ -512,3 +512,84 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
             )
         finally:
             await q.close()
+
+
+class TestDeadLetterLogNamesOperationAndGroup:
+    """The dead-letter WARNING must name the operation, the group_id and the
+    classification.
+
+    These are the fields a triager needs first, and before this change they had
+    to be re-read from SQLite via get_dead_items — a step that is impossible
+    once the row has been deleted, which is precisely when the log line is all
+    that survives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_warning_names_operation_and_group(
+        self, tmp_path, caplog
+    ):
+        execute = AsyncMock(side_effect=RuntimeError('boom'))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger='fused_memory.services.durable_queue'
+            ):
+                await q.enqueue(
+                    group_id='proj-alpha', operation='add_episode',
+                    payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
+                )
+                await _poll_until_dead(
+                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
+                )
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert any(
+                'add_episode' in r.getMessage() and 'proj-alpha' in r.getMessage()
+                for r in warnings
+            ), (
+                'expected the dead-letter WARNING to name both the operation and '
+                'the group_id; got: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+            # The pre-existing fields must survive the enrichment.
+            assert any(
+                '5 attempts' in r.getMessage() and 'RuntimeError' in r.getMessage()
+                for r in warnings
+            ), (
+                'the attempt count and error text must still be present; got: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_warning_names_the_classification(
+        self, tmp_path, caplog
+    ):
+        """"Doomed from attempt 1" must be distinguishable from "exhausted its
+        budget" without a second lookup."""
+        u = _uuid()
+        execute = AsyncMock(side_effect=NodeNotFoundError(u))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger='fused_memory.services.durable_queue'
+            ):
+                await q.enqueue(
+                    group_id='proj-alpha', operation='add_episode',
+                    payload={'uuid': u, 'content': 'c', 'group_id': 'proj-alpha'},
+                )
+                await _poll_until_dead(
+                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
+                )
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert any('permanent' in r.getMessage() for r in warnings), (
+                'expected the WARNING to label the classification "permanent" so '
+                'a triager can tell a doomed write from an exhausted one; got: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+        finally:
+            await q.close()
