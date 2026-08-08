@@ -12386,12 +12386,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # existing stop() invariant -- so a concurrent in-flight
             # _finalize_inflight unwind (from cancelling verify_task here)
             # racing its own finally-block releases is safe.
-            if _fh_entry.lease is not None:
-                with contextlib.suppress(BaseException):
-                    await self._abort_remote_verify(_fh_entry.lease, _fh_req.task_id)
-            _fh_entry.verify_task.cancel()
-            with contextlib.suppress(BaseException):
-                await _fh_entry.verify_task
+            await self._teardown_verify_task(
+                _fh_entry.lease, _fh_entry.verify_task, _fh_req.task_id,
+                shutdown_defensive=True,
+            )
             if _fh_entry.merge_wt is not None:
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_fh_entry.merge_wt)
@@ -12501,18 +12499,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # short-circuits it here.
             self._retire_item(_ie_req.request_id)
             if _ie.verify_task is not None and not _ie.verify_task.done():
-                # Fire remote cancel BEFORE task.cancel() so the remote
-                # verify-merge process is signalled while _inflight_request_id
-                # is still live (mirrors task-1757 _run_inflight_verify fix).
-                # suppress(BaseException) matches the drain's shutdown-defensive
-                # pattern (cf. cancel_and_release suppress below) so a
-                # SIGTERM-driven CancelledError cannot abort the drain loop.
-                if _ie.lease is not None:
-                    with contextlib.suppress(BaseException):
-                        await self._abort_remote_verify(_ie.lease, _ie_req.task_id)
-                _ie.verify_task.cancel()
-                with contextlib.suppress(BaseException):
-                    await _ie.verify_task
+                # shutdown_defensive matches the drain's pattern (cf. the
+                # cancel_and_release suppress below) so a SIGTERM-driven
+                # CancelledError cannot abort the drain loop.
+                await self._teardown_verify_task(
+                    _ie.lease, _ie.verify_task, _ie_req.task_id,
+                    shutdown_defensive=True,
+                )
             if _ie.merge_wt is not None:
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_ie.merge_wt)
@@ -14206,19 +14199,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         _entry_status: str | None = None
                         try:
                             if _entry.verify_task is not None:
-                                # Fire remote cancel BEFORE task.cancel() so the
-                                # remote verify-merge process is signalled while
-                                # _inflight_request_id is still live (mirrors
-                                # task-1757 _run_inflight_verify fix).  Helper
-                                # swallows Exception internally; CancelledError
-                                # propagates to stop the loop (correct behaviour).
-                                if _entry.lease is not None:
-                                    await self._abort_remote_verify(
-                                        _entry.lease, _entry.item.request.task_id,
-                                    )
-                                _entry.verify_task.cancel()
-                                with contextlib.suppress(BaseException):
-                                    await _entry.verify_task
+                                # Default (non-shutdown-defensive) teardown:
+                                # `_abort_remote_verify` swallows Exception
+                                # internally, and a CancelledError deliberately
+                                # propagates to stop the loop (correct
+                                # behaviour) rather than being suppressed the
+                                # way the stop() drain paths suppress it.
+                                await self._teardown_verify_task(
+                                    _entry.lease,
+                                    _entry.verify_task,
+                                    _entry.item.request.task_id,
+                                )
                                 # Peek at the completed result to detect REQUEUED
                                 # (operator-halt): the request is already back on
                                 # _queue via the abort-poll; _remerge must be
@@ -14825,13 +14816,78 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if chain_failed:
             self._n_failed = True
 
+    async def _teardown_verify_task(
+        self,
+        lease: Any | None,
+        verify_task: asyncio.Task | None,
+        task_id: str,
+        *,
+        shutdown_defensive: bool = False,
+    ) -> None:
+        """THE verify-abort teardown: signal the REMOTE verify, then cancel and
+        reap the LOCAL verify task (task 3204).
+
+        The sole caller of :meth:`_abort_remote_verify` — enforced by
+        test_merge_queue_concurrent_verify.py's
+        ``TestVerifyTeardownChokepoint``. Its six callers are the two ``stop()``
+        drain paths (finalizing head and ``_inflight``), the head-failure
+        cascade, and the three ``_run_inflight_verify`` abort triggers
+        (sole-waiter abandon, operator halt, dead-verify no-progress).
+
+        ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
+        The remote cancel must fire while ``_inflight_request_id`` is still
+        live: the verify coroutine's finally clause clears it when the
+        coroutine is cancelled, which makes a subsequent ``cancel_verify()`` a
+        silent no-op and leaks an orphaned remote verify-merge process (see
+        :meth:`_abort_remote_verify`, and ``VerifyRunner.cancel_verify``'s
+        no-op branch). Previously this was a prose contract re-typed at six
+        sites; because this helper always cancels AFTER aborting, a caller that
+        cannot abort on its own can no longer get the order wrong.
+
+        Both steps no-op independently when their argument is ``None``, so no
+        caller has to branch: ``lease is None`` skips only the remote abort,
+        ``verify_task is None`` skips only the cancel-and-reap. The
+        ``await verify_task`` is unconditionally suppressed — a verify that
+        died with an exception must not derail the teardown.
+
+        *shutdown_defensive* (keyword-only) covers the one genuine per-site
+        difference. On the ``stop()`` drain paths a SIGTERM-driven
+        ``CancelledError`` out of the remote abort must NOT abort the drain
+        loop, so the abort is wrapped in ``contextlib.suppress(BaseException)``.
+        The default deliberately lets it PROPAGATE: at the head-failure cascade
+        a ``CancelledError`` stopping the verifier loop is correct behaviour,
+        and flattening the flag either way would be a silent behaviour change
+        on one path or the other.
+
+        Deliberately NOT owned here: each site's ``not verify_task.done()``
+        guard. Sites 1 and 2 have one and the cascade deliberately does not, so
+        a helper-internal ``done()`` check would silently stop the cascade
+        firing its remote abort for an already-completed verify task — and at
+        the ``stop()`` finalizing-head site that condition gates the whole
+        block (future resolution, retirement, worktree, lease, permit), not
+        just the teardown. The worktree / lease / permit releases that follow
+        the teardown at several sites are likewise left in place: they differ
+        in both order and content between sites.
+        """
+        if lease is not None:
+            if shutdown_defensive:
+                with contextlib.suppress(BaseException):
+                    await self._abort_remote_verify(lease, task_id)
+            else:
+                await self._abort_remote_verify(lease, task_id)
+        if verify_task is not None:
+            verify_task.cancel()
+            with contextlib.suppress(BaseException):
+                await verify_task
+
     async def _abort_remote_verify(self, lease: Any, task_id: str) -> None:
         """Fire remote cancel-verify while *_inflight_request_id* is still live.
 
-        Must be called BEFORE ``verify_task.cancel()`` in each abort branch.
-        The verify coroutine's finally clause (verify_runner.py:799) clears
-        ``_inflight_request_id`` when the coroutine is cancelled, which makes a
-        subsequent ``cancel_verify()`` a no-op (verify_runner.py:814).
+        Call only through :meth:`_teardown_verify_task`, which owns the
+        must-abort-BEFORE-``verify_task.cancel()`` ordering and the rationale
+        for it. The verify coroutine's finally clause (verify_runner.py:799)
+        clears ``_inflight_request_id`` when the coroutine is cancelled, which
+        makes a subsequent ``cancel_verify()`` a no-op (verify_runner.py:814).
 
         Guards:
         - No-op for local leases (LocalRunner has no ``cancel_verify`` method).
@@ -15295,10 +15351,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # DROP the request.  Checked first so a gave-up waiter wins
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
-                    await self._abort_remote_verify(lease, req.task_id)
-                    verify_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await verify_task
+                    await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     # task 2420 amend (reviewer finding, resource_cleanup): this
                     # request is DROPPED (sole waiter gave up) — the per-task
@@ -15338,10 +15391,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'and re-queuing merge for re-verify after un-halt',
                         req.task_id,
                     )
-                    await self._abort_remote_verify(lease, req.task_id)
-                    verify_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await verify_task
+                    await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     self._requeue_request(req)
                     # task 3003 amend (robustness): an operator-halt requeue is
@@ -15418,10 +15468,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         _dead_abort_n,
                         self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
                     )
-                    await self._abort_remote_verify(lease, req.task_id)
-                    verify_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await verify_task
+                    await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     # task 3003 amend (robustness): a dead/hung verify — abort or
                     # busy-loop cap — is not lane contention either (the verify
