@@ -1161,6 +1161,46 @@ def _build_workflow_with_escalation(
 
 
 # ---------------------------------------------------------------------------
+# Lock-module path construction (shared: the same premise is asserted by
+# test_workflow_status_on_resume.py and test_workflow_metadata_files_reconcile.py)
+# ---------------------------------------------------------------------------
+
+
+def same_module_siblings(lock_depth: int) -> tuple[str, str]:
+    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
+
+    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
+    components, so two files share a lock module iff those components agree.
+    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
+    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
+    themselves and become DIFFERENT modules, making the "same-module widen"
+    premise unsatisfiable.
+
+    That is not hypothetical — it is why these tests went red on main when
+    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
+    094d634465, deliberately making module locks file-granular). The autouse
+    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
+    at the LIVE operational config, so ``config.lock_depth`` here is the real
+    deployed value by design, not a code default.
+
+    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
+    CONSTRUCTION at any depth, so these stay tests of same-module widen
+    behaviour instead of silently becoming tests of the knob's current value.
+
+    The same-module/different-file state itself stays LIVE at every depth, so
+    this constructor is not life support for a dead branch (task 3866 answered
+    that question explicitly): the code under test is depth-GENERIC — it reads
+    ``config.lock_depth`` and ships in the orchestrator package, whose bundled
+    ``defaults.yaml`` still declares 4 over a pydantic Field default of 2, and
+    ``lock_depth: 12`` is one project's operational override — while even at 12
+    any path deeper than ``lock_depth`` still collapses onto its truncated
+    prefix.
+    """
+    package = '/'.join(f'p{i}' for i in range(lock_depth))
+    return f'{package}/e.py', f'{package}/f.py'
+
+
+# ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
 # Mirrors the if TYPE_CHECKING / SchedulerFacade conformance block near the
 # bottom of test_workflow_e2e.py.
