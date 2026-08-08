@@ -93,6 +93,7 @@ import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
