@@ -1565,6 +1565,27 @@ def create_mcp_server(
         # accept dangling the citers you just showed me", and with nothing
         # enumerated there is nothing to knowingly accept.
         if allow_dangling_citations:
+            # An override that lands SILENTLY is the same class of defect as the
+            # gate that never ran, so record what is being knowingly dangled —
+            # reusing the enumeration above so the trace and the rejection's
+            # citing_tasks name the same citers the same way. A replacement
+            # supplied alongside the flag is contradictory ("repoint them" vs
+            # "dangle them"); the override wins, and the dropped argument is
+            # named rather than discarded in silence.
+            ignored_replacement = (
+                '' if replacement_memory_id is None
+                else f'; replacement_memory_id {replacement_memory_id} was '
+                     'supplied but NOT used'
+            )
+            logger.warning(
+                'citation gate: allow_dangling_citations override by %s — deleting '
+                '%s, leaving %d live citation(s) dangling: %s%s',
+                agent_id,
+                memory_id,
+                len(citing_tasks),
+                citing_tasks,
+                ignored_replacement,
+            )
             return None, None
 
         if replacement_memory_id is None:
