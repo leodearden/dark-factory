@@ -13,8 +13,9 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
@@ -114,6 +115,44 @@ def _parse_not_found_uuid(message: str) -> str | None:
     match = _NOT_FOUND_MESSAGE_RE.match(message)
     return match.group(1) if match else None
 
+
+# operation -> the payload key holding THE UUID THAT OPERATION CREATES.
+#
+# Deliberately NOT "any uuid appearing in the payload". A payload may
+# legitimately REFERENCE other nodes' uuids, and a not-found naming one of those
+# is genuinely retryable: the node may live in a different graph (for FalkorDB
+# the group_id IS the database, and graphiti's by-uuid lookup Cypher carries no
+# group_id predicate), or a concurrent write creating it may still be in flight.
+# Those keep their full retry budget. Only the uuid this operation exists to
+# CREATE licenses the conclusion that retrying cannot possibly help.
+#
+# Verified vocabulary (the queue has exactly four operation strings, dispatched
+# by MemoryService._execute_durable_write at memory_service.py:1402-1410):
+#   add_episode           — 'uuid' is minted by the producer as its OWN fresh
+#                           identity (memory_service.py:2516), stamped onto the
+#                           payload (:2534) and forwarded to the backend
+#                           (:2248). The self-referential case.
+#   add_memory_graphiti   — no 'uuid' key at all.
+#   mem0_classify_and_add — no uuid key.
+#   mem0_add              — legacy, no live producer.
+# ('_write_op_id' / '_causation_id' are write-journal ids, not graph uuids.)
+#
+# COUPLING TO TASK 3561, which is in flight and changes exactly this key: its
+# fix stops handing graphiti a caller-minted uuid (passing None so the library
+# takes its CREATE branch rather than its LOAD branch). If it lands and the key
+# disappears, this rule simply falls open and every add_episode failure returns
+# to the ordinary policy — which is correct. This classifier is the generic
+# safety net for the NEXT operation that references its own not-yet-created
+# uuid, not a fix for that one instance.
+#
+# Not a QueueConfig field: the config surface exists for operator tuning,
+# whereas this is a fact about the payload vocabulary that an operator has no
+# basis to retune. It is overridable via the constructor only — the test seam,
+# and the property that keeps this a generic component.
+DEFAULT_IDENTITY_PAYLOAD_KEYS: Mapping[str, str] = MappingProxyType({
+    'add_episode': 'uuid',
+})
+
 # -- Schema ------------------------------------------------------------------
 
 _CREATE_TABLE = """\
@@ -198,6 +237,7 @@ class DurableWriteQueue:
         write_timeout_seconds: float = 120.0,
         transient_max_attempts: int | None = None,
         transient_error_names: Iterable[str] | None = None,
+        identity_payload_keys: Mapping[str, str] | None = None,
         on_terminal: TerminalHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
@@ -215,6 +255,12 @@ class DurableWriteQueue:
         self._transient_error_names = (
             frozenset(transient_error_names) if transient_error_names is not None
             else DEFAULT_TRANSIENT_ERROR_NAMES
+        )
+        # An explicit map REPLACES the default rather than extending it, so a
+        # caller can express "no operation has a self-identity" as {}.
+        self._identity_payload_keys: Mapping[str, str] = (
+            dict(identity_payload_keys) if identity_payload_keys is not None
+            else DEFAULT_IDENTITY_PAYLOAD_KEYS
         )
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
@@ -495,6 +541,28 @@ class DurableWriteQueue:
         budget instead of the plain ``max_attempts`` ceiling.
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
+
+    def _identity_uuid(self, item: QueueItem) -> str | None:
+        """The uuid *item*'s operation exists to CREATE, or None if it has none.
+
+        Fails open at every step — an unmapped operation, an unparseable or
+        non-dict payload, or a missing/None/non-str/empty value all yield None,
+        which returns the caller to its ordinary retry policy. None means "no
+        identity could be established", never "no identity exists".
+        """
+        key = self._identity_payload_keys.get(item.operation)
+        if key is None:
+            return None
+        try:
+            payload = item.parsed_payload()
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        return None
 
     async def _handle_failure(
         self, item: QueueItem, exc: Exception
