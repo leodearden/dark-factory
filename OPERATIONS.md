@@ -1104,10 +1104,11 @@ live migration are separate acts, and the second one is yours.
 | `--root` | Archive root (default `data/orchestrator/agent-transcripts`). |
 | Exit 0 | Every file migrated (or was already migrated). |
 | Exit 1 | **At least one file failed** — act on it. Unlike the `gc_agent_transcripts` sweep, which always exits 0 so a watchdog does not alarm, this is a one-off whose failures need a human. |
+| Exit 2 | **At least one conflict needs adjudication** (and nothing failed) — see below. Nothing is damaged; a `.gz` was retained next to a longer plain twin. Exit 1 wins when both are present. |
 
 stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
-`failed` / `failed_paths`); the LOUD lines go to stderr, so
-`... --apply | jq` works while failures stay visible.
+`conflicts` / `conflict_paths` / `failed` / `failed_paths`); the LOUD lines go
+to stderr, so `... --apply | jq` works while failures stay visible.
 
 Per file it decompresses to the sibling `.jsonl`, **reads the result back**,
 mirrors the `.gz` mtime, and only then unlinks the source. A file it cannot
@@ -1136,18 +1137,48 @@ python3 scripts/migrate_transcript_archive_gunzip.py | jq
 #    Gate: `scanned` should equal the baseline count and `failed` MUST be 0.
 #    A non-zero `failed` names the offending files in `failed_paths` —
 #    investigate those before going further.
+#    `conflicts` need NOT be 0 to proceed — the sweep leaves those files
+#    untouched — but read `conflict_paths` first and resolve them per below.
 
 # 3. Migrate.
 python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
 
 # 4. Confirm.
-find data/orchestrator/agent-transcripts -name '*.gz' | wc -l   # expect 0
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+#    expect 0 — or exactly the `conflicts` count from step 3, which are the
+#    files deliberately retained for you. Resolve those, then re-run 3 and 4.
 ```
 
 **Run this only AFTER the fleet has redeployed** past the task-3618 merge
 (§8). Until every orchestrator restarts, live units keep writing `.gz`, so a
 migration run before then leaves transition-window residue. Re-run step 3
 after the redeploy to sweep it — that is exactly what idempotency buys.
+
+### Resolving a conflict
+
+That re-run is also what produces conflicts, so expect them on the second
+pass. A session in flight ACROSS the redeploy has BOTH forms on disk: the
+pre-redeploy process archived `<sid>.jsonl.gz`, then the post-redeploy
+producer hook wrote a plain `<sid>.jsonl` for the same session — resumed, and
+therefore **longer**.
+
+A residual `.gz` with a longer plain twin beside it is exactly that shape.
+**The plain file is the authoritative copy.** The sweep refuses to gunzip over
+it (that would overwrite a live transcript with stale content and roll its
+mtime backwards, aging the task dir out early), and refuses to delete the
+`.gz` on its own judgement — being longer proves the twin is not a truncated
+stub, but never proves it *contains* the archived bytes. That last step is
+yours:
+
+```bash
+# For each path in conflict_paths — confirm the plain twin really is a superset
+# before deleting anything.
+zcat <sid>.jsonl.gz | diff - <(head -c "$(zcat <sid>.jsonl.gz | wc -c)" <sid>.jsonl) \
+  && rm <sid>.jsonl.gz
+```
+
+If the two disagree, do NOT delete: that is a genuinely divergent pair, and
+the archive copy is the only record of the pre-redeploy content.
 
 Expect roughly a 4x expansion (≈485 MB → ≈1.9 GB at the sampled 3.93x ratio),
 a one-off cost against ~2.1 TB free.

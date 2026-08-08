@@ -34,6 +34,31 @@ Letting the gunzip stamp ``now`` on every file would silently reset the entire
 90-day retention window in a single pass — nothing would age out for another
 90 days.
 
+The conflict rule (when the PLAIN file is the authoritative one)
+----------------------------------------------------------------
+The ``.gz`` is authoritative only until something longer turns up next to it.
+Re-running this sweep after a fleet redeploy — which the runbook explicitly
+instructs, to clear transition-window residue — reaches sessions that were in
+flight ACROSS that redeploy and so have BOTH forms on disk: the pre-redeploy
+process archived ``<sid>.jsonl.gz``, then the post-redeploy producer hook wrote
+a plain, RESUMED and therefore LONGER ``<sid>.jsonl``. Gunzipping over that
+would overwrite the live transcript with stale content and roll its mtime
+backwards. So a twin that does not corroborate but is LONGER than the ``.gz`` is
+a CONFLICT: both copies are retained untouched, it is counted and named, and
+the run exits :data:`EXIT_CONFLICTS`.
+
+SIZE is the signal, never mtime. Both shapes that reach that branch are NEWER
+than the archived ``.gz`` — a killed write stamped ``now`` because its
+``os.utime`` mirror had not run yet — so mtime cannot separate them. Direction
+of size can: a killed write leaves a strict PREFIX (shorter, rebuild it), an
+append-only resume leaves a strict SUPERSET (longer, keep it).
+
+The ``.gz`` is deliberately NOT unlinked on that path. A size comparison
+establishes only that the twin is longer, never that it CONTAINS the archived
+content, and deleting on that basis would be the same unverified destruction
+this module exists to prevent. One residual ``.gz`` and a line of operator
+attention is the right price.
+
 This module is STDLIB-ONLY by design, mirroring the deliberate no-repo-imports
 posture of :mod:`gc_agent_transcripts` (a sweep over this very same tree), so it
 runs standalone in any environment with no config load and no PYTHONPATH setup.
@@ -74,6 +99,11 @@ GZ_SUFFIX = '.gz'
 # non-zero failure count is an exit code, not a warning buried in a log.
 EXIT_OK = 0
 EXIT_FAILURES = 1
+# A DISTINCT code for "needs adjudication", because it is not "is damaged": a
+# conflict means a plain twin that is LONGER than its .gz was left in place and
+# both copies retained. It cannot stay 0 — a conflict leaves a .gz on disk,
+# which contradicts the runbook's `expect 0` confirmation.
+EXIT_CONFLICTS = 2
 
 # Every way reading a real gzip stream (or its decoded text) can fail.
 #
@@ -258,6 +288,62 @@ def _twin_is_trustworthy(gz_path: Path, twin: Path) -> bool:
     return True
 
 
+def _twin_supersedes_gz(gz_path: Path, twin: Path) -> bool:
+    """Does an UN-trustworthy *twin* carry MORE data than the ``.gz``?
+
+    Applied ONLY after :func:`_twin_is_trustworthy` has already returned False,
+    to separate the two very different shapes that land there:
+
+    * a **half-written** twin — a run killed mid-write left a strict PREFIX of
+      the payload. The ``.gz`` is authoritative; rebuild from it.
+    * a **resumed-session** twin — the plain file is LONGER than the archive
+      because a session resumed and appended to it. It is authoritative;
+      overwriting it from the ``.gz`` is unrecoverable data loss.
+
+    SIZE IS THE DISCRIMINATOR, NOT MTIME. Both shapes are NEWER than the
+    archived ``.gz``: the killed write stamped ``now`` because its
+    :func:`os.utime` mirror had not run yet, and a resumed session is genuinely
+    newer. Only the DIRECTION of size separates them — a killed write is
+    strictly shorter, an append-only resume strictly longer. Triggering on
+    mtime would misclassify the half-written twin and strand a truncated
+    transcript.
+
+    A ``None`` ISIZE (a sub-8-byte ``.gz``, too small to carry a trailer) makes
+    no comparison possible, so this does NOT claim a conflict: that file fails
+    decompression and lands in ``failed`` where it belongs.
+    """
+    isize = _gz_uncompressed_size(gz_path)
+    if isize is None:
+        return False
+    return twin.stat().st_size > isize
+
+
+def _warn_migrate_conflict(gz_path: Path, twin: Path) -> None:
+    """LOUD, greppable WARNING for a twin that supersedes its ``.gz``.
+
+    Modelled on :func:`_warn_migrate_failure`: lazy %-formatting and the
+    greppable prefix first. Names BOTH paths with their sizes and mtimes —
+    mtime is reported as EVIDENCE for the operator, never as the decision — and
+    states plainly that both copies were retained, so the line is actionable on
+    its own rather than pointing at a counter.
+    """
+    gz_stat = gz_path.stat()
+    twin_stat = twin.stat()
+    logger.warning(
+        '%s CONFLICT: %s (%d bytes, mtime=%s) is LONGER than the archived %s '
+        '(%d bytes compressed, mtime=%s) — a session resumed after this .gz was '
+        'written. BOTH RETAINED for adjudication; the plain file is the '
+        'authoritative copy.',
+        _LOG_PREFIX,
+        twin,
+        twin_stat.st_size,
+        twin_stat.st_mtime,
+        gz_path,
+        gz_stat.st_size,
+        gz_stat.st_mtime,
+    )
+
+
 def verify_source_readable(gz_path: Path) -> None:
     """Stream *gz_path* through decompression and discard it, raising on damage.
 
@@ -285,6 +371,10 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
     * an existing twin that corroborates -> ``skipped`` (the crash-resume path);
       its now-redundant ``.gz`` is still unlinked, so the archive converges to
       zero ``.gz`` even across a killed run;
+    * an un-trustworthy twin that is nevertheless LONGER than the ``.gz``
+      (:func:`_twin_supersedes_gz`) -> ``conflicts``. Nothing is written, no
+      mtime is touched and the ``.gz`` is NOT unlinked: both copies are left for
+      the operator to adjudicate;
     * anything else -> :func:`gunzip_one`, counted ``migrated``.
 
     ``apply=False`` is a pure projection: it classifies and counts without
@@ -304,6 +394,8 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
         'scanned': 0,
         'migrated': 0,
         'skipped': 0,
+        'conflicts': 0,
+        'conflict_paths': [],
         'failed': 0,
         'failed_paths': [],
     }
@@ -315,11 +407,23 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
         twin = plain_sibling(gz_path)
 
         try:
-            if twin.exists() and _twin_is_trustworthy(gz_path, twin):
-                if apply:
-                    gz_path.unlink()
-                summary['skipped'] += 1
-                continue
+            if twin.exists():
+                # Corroboration FIRST: a complete twin killed before its utime
+                # mirror is newer than the .gz yet exactly right, and must still
+                # resume cleanly.
+                if _twin_is_trustworthy(gz_path, twin):
+                    if apply:
+                        gz_path.unlink()
+                    summary['skipped'] += 1
+                    continue
+
+                # Classified on the dry-run path too, so a projection reports
+                # conflicts without mutating anything.
+                if _twin_supersedes_gz(gz_path, twin):
+                    _warn_migrate_conflict(gz_path, twin)
+                    summary['conflicts'] += 1
+                    summary['conflict_paths'].append(str(gz_path))
+                    continue
 
             if apply:
                 gunzip_one(gz_path)
@@ -377,7 +481,9 @@ def main(argv: list[str] | None = None) -> int:
     can be piped into ``jq`` while failures stay visible. Exits
     :data:`EXIT_FAILURES` if any file could not be migrated — every such source
     ``.gz`` is still on disk and named in ``failed_paths``, so the run is
-    re-runnable after the operator investigates.
+    re-runnable after the operator investigates — or :data:`EXIT_CONFLICTS` if
+    the only outstanding work is adjudication. ``failed`` takes precedence when
+    both are present: damage is the more urgent of the two.
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
@@ -388,12 +494,13 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info(
         '%s migration complete — root=%s scanned=%d migrated=%d skipped=%d '
-        'failed=%d apply=%s',
+        'conflicts=%d failed=%d apply=%s',
         _LOG_PREFIX,
         root,
         summary['scanned'],
         summary['migrated'],
         summary['skipped'],
+        summary['conflicts'],
         summary['failed'],
         args.apply,
     )
@@ -402,7 +509,9 @@ def main(argv: list[str] | None = None) -> int:
             '%s DRY-RUN — nothing was changed; re-run with --apply to migrate.',
             _LOG_PREFIX,
         )
-    return EXIT_FAILURES if summary['failed'] else EXIT_OK
+    if summary['failed']:
+        return EXIT_FAILURES
+    return EXIT_CONFLICTS if summary['conflicts'] else EXIT_OK
 
 
 if __name__ == '__main__':
