@@ -390,5 +390,110 @@ class TestSupersededSurfacing:
         assert obs.records == ()
 
 
+class TestTaskTerminalStaleness:
+    """Entries asserting LIVE task state for a task that has gone terminal."""
+
+    def test_a_live_status_assertion_about_a_terminal_task_is_reported(self):
+        m = _mod()
+        records = [_record('rec-1', 'Task 4802 status=in-progress, claimant_run_id=abc')]
+        obs = m.terminal_staleness(records, {'4802': 'done'})
+        assert obs.entries_referencing_terminal == 1
+        assert obs.stale == 1
+        assert obs.records[0].record_id == 'rec-1'
+        assert obs.records[0].task_id == '4802'
+        assert obs.records[0].status == 'done'
+
+    def test_the_same_assertion_about_a_non_terminal_task_is_not_reported(self):
+        m = _mod()
+        records = [_record('rec-1', 'Task 4802 status=in-progress, claimant_run_id=abc')]
+        obs = m.terminal_staleness(records, {'1234': 'done'})
+        assert obs.entries_referencing_terminal == 0
+        assert obs.stale == 0
+        assert obs.records == ()
+
+    def test_a_timestamped_point_in_time_framing_is_exempt(self):
+        """Even for a terminal task: it was true when it was checked."""
+        m = _mod()
+        records = [
+            _record('rec-1', 'Task 4802 liveness check performed at 2026-08-01: status=in-progress'),
+        ]
+        obs = m.terminal_staleness(records, {'4802': 'done'})
+        assert obs.entries_referencing_terminal == 1  # still exposed
+        assert obs.stale == 0                          # but not counted
+
+    def test_task_ids_come_from_content_and_from_metadata(self):
+        m = _mod()
+        assert m.referenced_task_ids(_record('r', 'see task 4802 and df 91 and #7')) == {
+            '4802', '91', '7',
+        }
+        assert m.referenced_task_ids(_record('r', 'no refs', task_id=4802)) == {'4802'}
+        assert m.referenced_task_ids(_record('r', 'task 12', task_id='4802')) == {'12', '4802'}
+        # A bare number is not a task reference.
+        assert m.referenced_task_ids(_record('r', 'there were 4802 records')) == set()
+
+    def test_exposure_is_entries_referencing_a_terminal_task_not_the_corpus(self):
+        m = _mod()
+        records = [
+            _record('rec-1', 'Task 4802 status=in-progress'),
+            _record('rec-2', 'Task 4802 was a good idea'),
+            _record('rec-3', 'nothing to do with tasks at all'),
+            _record('rec-4', 'Task 9999 status=in-progress'),
+        ]
+        obs = m.terminal_staleness(records, {'4802': 'cancelled'})
+        assert obs.entries_referencing_terminal == 2
+        assert obs.stale == 1
+
+    def test_one_entry_naming_two_terminal_tasks_is_exposed_once(self):
+        m = _mod()
+        records = [_record('rec-1', 'Task 4802 and task 4803 status=in-progress')]
+        obs = m.terminal_staleness(records, {'4802': 'done', '4803': 'done'})
+        assert obs.entries_referencing_terminal == 1
+        assert obs.stale == 1
+        assert sorted(r.task_id for r in obs.records) == ['4802', '4803']
+
+    def test_a_bare_set_of_terminal_ids_works_too(self):
+        m = _mod()
+        obs = m.terminal_staleness(
+            [_record('rec-1', 'Task 4802 status=in-progress')], {'4802'},
+        )
+        assert obs.stale == 1
+        assert obs.records[0].status == 'terminal'
+
+    def test_no_terminal_ids_is_zero_exposure(self):
+        m = _mod()
+        obs = m.terminal_staleness([_record('rec-1', 'Task 4802 status=in-progress')], set())
+        assert obs.entries_referencing_terminal == 0
+        assert obs.records == ()
+
+    def test_the_live_state_judgement_is_delegated_to_task_filter(self):
+        """INV-5, and the helper carries the mandatory cheap-prefilter ordering.
+
+        ``POINT_IN_TIME_CHECK_RE``'s two lookaheads under ``re.DOTALL`` are
+        quadratic in content length; the helper prefilters with the
+        lookahead-free ``LIVE_TASK_STATUS_RE``, which is what keeps a
+        corpus-scale scan tractable. Re-deriving either regex here would drop
+        that ordering silently.
+        """
+        source = _source()
+        assert 'frames_live_task_status_as_current_fact' in source
+        assert 'LIVE_TASK_STATUS_RE = ' not in source
+        assert 'POINT_IN_TIME_CHECK_RE = ' not in source
+
+    def test_the_helper_is_actually_called(self, monkeypatch):
+        m = _mod()
+        from fused_memory.reconciliation import task_filter  # noqa: PLC0415
+
+        calls: list[str] = []
+
+        def _spy(text: str) -> bool:
+            calls.append(text)
+            return True
+
+        monkeypatch.setattr(task_filter, 'frames_live_task_status_as_current_fact', _spy)
+        obs = m.terminal_staleness([_record('rec-1', 'Task 4802 whatever')], {'4802': 'done'})
+        assert calls == ['Task 4802 whatever']
+        assert obs.stale == 1
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
