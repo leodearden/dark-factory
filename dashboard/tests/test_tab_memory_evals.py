@@ -1982,6 +1982,74 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     )
 
 
+def test_a_drawn_trend_does_not_claim_it_was_withheld(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A drawn holed series must not sit next to text asserting no chart was
+    drawn.
+
+    Task 3490's whole premise is SHAPE AND DISCLOSURE: the sparkline is drawn
+    with visible breaks in it, and the gap count says how many samples are
+    missing.  Both halves are required.  Drawing without disclosing leaves the
+    operator staring at unexplained breaks; disclosing with a stale claim is
+    worse, because the footer read `N pts · M gap(s) — no chart drawn` before
+    this task, and that sentence is now FALSE the moment the chart above it is
+    drawn.  A cell that shows a sparkline and, directly beneath it, text saying
+    no chart was drawn is self-contradicting — precisely the reads-as-a-bug
+    outcome this column's five states exist to prevent.
+
+    The retired claim is pinned as a BANNED PROBE rather than by asserting the
+    new wording.  This file's rule is never to pin operator copy: a rewording
+    would fail the suite while proving nothing extra about the branch.
+    Asserting the ABSENCE of a now-false claim is a different shape — a
+    negative control that the caption was actually updated — and matches the
+    `_BANNED_ARITHMETIC` probe idiom in the sibling test_charts_null_samples.py.
+    """
+    code = tab_memory_evals_jsx_code
+
+    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (4) VACUITY GUARD first — every assertion below is about the drawn arm,
+    #     and all three would pass trivially if that arm had been deleted.
+    assert 'data-testid="memory-eval-trend-chart"' in row_body, (
+        'the drawn-chart arm is gone. The disclosure assertions in this test '
+        'are all conditional on a chart being drawn, so without it they prove '
+        'nothing.'
+    )
+
+    # (1) BANNED PROBE — the retired claim must not survive anywhere in the row.
+    assert 'no chart drawn' not in row_body, (
+        'MemoryEvalMetricRow still says "no chart drawn". Since task 3490 a '
+        'holed series IS drawn, so that clause renders directly beneath the '
+        'sparkline it denies. Counts may stay; the verdict about what was '
+        'rendered must go — the states above are what say whether a chart was '
+        'drawn.'
+    )
+
+    # (2) the gap count still reaches a CONDITIONAL disclosure, so a clean
+    #     series prints no dangling separator and no "0 missing" noise.
+    assert re.search(r'\{\s*gaps\s*\?', row_body), (
+        'the gap count no longer gates its own disclosure. Retiring the "no '
+        'chart drawn" clause must not cost the count itself: a holed series '
+        'is drawn with visible breaks in the line, and this is the only thing '
+        'that explains them.'
+    )
+
+    # (3) ...and the DRAWN arm's own hover text must account for those breaks,
+    #     where they appear. `[^<>]` confines the match to a single opening
+    #     tag, so a `gaps` mention in some neighbouring element cannot satisfy
+    #     it — the same proximity idiom the mismatch check above uses.
+    assert re.search(
+        r'\bgaps\b[^<>]{0,300}?data-testid="memory-eval-trend-chart"', row_body
+    ), (
+        'the drawn-chart element does not consume `gaps` in its own opening '
+        'tag. The sparkline is drawn with a break at every missing sample; '
+        'without the count in its `title=`, an operator hovering the broken '
+        'line gets no account of why it is broken.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-9 test: escalation links, storm aggregate banner, unmatched list
 # ---------------------------------------------------------------------------
