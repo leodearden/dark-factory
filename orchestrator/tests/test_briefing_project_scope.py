@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -302,3 +303,70 @@ class TestForeignTagKeysAndSpelling:
 
         assert 'Fact.' in text
         assert dropped == 0
+
+
+def _mcp_search_envelope(results: list[dict]) -> dict:
+    """Build the real ``tools/call`` response envelope ``_mcp_search`` reads.
+
+    Mirrors ``BriefingAssembler._mcp_search`` (briefing.py:1250-1275): FastMCP
+    returns ``{'result': {'content': [{'type': 'text', 'text': ...}]}}`` where
+    ``text`` is the JSON-serialised ``search`` tool payload. Used to patch
+    ``orchestrator.agents.briefing.mcp_call`` directly (unlike every other
+    briefing test, which patches ``_get_memory_context`` itself away to a
+    stub) so the real ``_get_memory_context`` / ``_scoped_search`` /
+    ``filter_foreign_project_results`` pipeline actually runs end-to-end.
+    """
+    return {
+        'result': {
+            'content': [
+                {'type': 'text', 'text': json.dumps({'results': results})},
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+class TestGetMemoryContextFiltersForeignFacts:
+    """``_get_memory_context`` drops foreign-tagged results end-to-end.
+
+    ``_mcp_search`` is called once per hardcoded query (project overview,
+    conventions, decisions, and — since a ``task_id`` is passed — task
+    context: four calls). The stub answers every call identically, so a
+    single foreign result per query yields a filtered count of 4 in the
+    assembled block, not 1 — the count must reflect all four queries, not
+    just one.
+    """
+
+    async def test_filters_foreign_facts_and_announces_the_drop(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        envelope = _mcp_search_envelope([
+            _result(
+                '1',
+                "A park on 'crates/reify-compiler/src' blocks acquire of "
+                "'crates/reify-compiler'.",
+                metadata={'project_id': 'reify'},
+            ),
+            _result(
+                '2',
+                'Own project fact about dark_factory.',
+                metadata={'project_id': 'dark_factory'},
+            ),
+        ])
+        foreign_per_query = 1
+        queries_fired = 4  # overview, conventions, decisions, task-context (task_id given below)
+        expected_dropped = foreign_per_query * queries_fired
+
+        with caplog.at_level(logging.INFO), patch(
+            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
+        ):
+            context = await briefing._get_memory_context('3609')
+
+        assert context.splitlines()[0] == '# Context'
+        assert 'Own project fact about dark_factory.' in context
+        assert 'crates/reify-compiler' not in context
+        assert "A park on 'crates/reify-compiler/src'" not in context
+        assert f'{expected_dropped} memory result(s) tagged to another project were filtered out' in context
+        assert 'dark_factory' in caplog.text
+        assert 'filtered' in caplog.text.lower()
+        assert any(r.levelno == logging.INFO for r in caplog.records)
