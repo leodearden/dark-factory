@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 _ACQUIRED = 'lock_acquired'
 _RELEASED = 'lock_released'
+_SERVICE_RESTART = 'service_restart'
+
+#: Event types :func:`iter_hold_spans` reads.  Everything else in the stream is
+#: skipped without touching the open-span map.
+_INTERESTING = frozenset({_ACQUIRED, _RELEASED, _SERVICE_RESTART})
 
 
 @dataclass(frozen=True)
@@ -120,19 +125,60 @@ def iter_hold_spans(
     ``if task_id in open_acquires`` guard from analyze_modules.py:145 carried
     over verbatim.
 
+    ERA BOUNDARIES close every still-open span at the boundary timestamp and
+    mark it ``truncated``.  The span is *counted*, not discarded:
+    PARKING_MODEL_REPORT.md:102 is explicit that "the lock did block others
+    until then", so the observed prefix is a real lower bound.  A ``truncated``
+    span is a hold whose end was IMPOSED; a dropped span is a hold whose end was
+    never observed at all — the second would have to be fabricated, so it isn't.
+
     *era_boundaries* accepts extra boundary timestamps (POSIX seconds) beyond
-    the ones this helper derives from the stream itself.
+    the ones this helper derives from the stream itself.  They are interleaved
+    into the stream in timestamp order (a boundary at or before a row's
+    timestamp fires first), and any left over after the last row still fire —
+    they are observed instants, exactly like a ``service_restart`` row.
     """
     open_spans: dict[tuple[str, str], float] = {}
+    pending_boundaries = sorted(float(b) for b in era_boundaries)
+    boundary_i = 0
+
+    def _close_all(at: float) -> Iterator[HoldSpan]:
+        """Close EVERY open span at *at*, truncated, and empty the map.
+
+        The one era-boundary closure (INV-5): ``service_restart`` rows, caller-
+        supplied boundaries and — from task ζ step-6 — run-id transitions all
+        funnel through here, so no boundary source can drift from another.
+        """
+        for (task_id, module), start in list(open_spans.items()):
+            yield HoldSpan(task_id, module, start, at, truncated=True)
+        open_spans.clear()
+
+    def _drain_boundaries_through(at: float) -> Iterator[HoldSpan]:
+        """Fire every caller-supplied boundary at or before *at*."""
+        nonlocal boundary_i
+        while boundary_i < len(pending_boundaries) and pending_boundaries[boundary_i] <= at:
+            yield from _close_all(pending_boundaries[boundary_i])
+            boundary_i += 1
 
     for r in rows:
         event_type = str(r.get('event_type') or '')
-        if event_type not in (_ACQUIRED, _RELEASED):
+        if event_type not in _INTERESTING:
             continue
         at = _parse_ts(r.get('timestamp'))
         if at is None:
             logger.debug('hold_history: unparseable timestamp %r — row dropped', r.get('timestamp'))
             continue
+
+        yield from _drain_boundaries_through(at)
+
+        if event_type == _SERVICE_RESTART:
+            # ERA BOUNDARY.  This row's task_id is the *trigger* task that
+            # provoked the restart (service_restart.py:747-759), NOT a lock
+            # holder — reading it as one would open a phantom span.  Only the
+            # timestamp is load-bearing here.
+            yield from _close_all(at)
+            continue
+
         raw_task_id = r.get('task_id')
         if not raw_task_id:
             continue
@@ -140,10 +186,20 @@ def iter_hold_spans(
 
         if event_type == _ACQUIRED:
             for module in _modules_of(r):
-                open_spans[(task_id, module)] = at
+                key = (task_id, module)
+                prior_start = open_spans.get(key)
+                if prior_start is not None:
+                    # DOUBLE-ACQUIRE (PARKING_MODEL_REPORT.md:101): force-close
+                    # the previous span here.  Re-opening at `at` rather than
+                    # keeping `prior_start` matters — keeping it would make the
+                    # eventual release re-count the prefix just yielded.
+                    yield HoldSpan(task_id, module, prior_start, at, truncated=True)
+                open_spans[key] = at
         else:
             for module in _modules_of(r):
                 start = open_spans.pop((task_id, module), None)
                 if start is None:
                     continue  # ORPHAN-RELEASE — span never opened.
                 yield HoldSpan(task_id, module, start, at)
+
+    yield from _drain_boundaries_through(float('inf'))
