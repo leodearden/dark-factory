@@ -188,11 +188,19 @@ class TestRunInNewSession:
         """The timeout must be a real bound even against a pipe-HOLDING child.
 
         The non-obvious half of the fix. A surviving grandchild holds the
-        inherited stdout/stderr pipe write ends, so the drain that follows the
-        kill never sees EOF; unbounded, it blocks forever and the caller's
-        ``timeout=`` becomes advisory. Reproduced against real processes during
-        planning. 15s for a 2s timeout is deliberately loose — this asserts
-        "bounded", not a specific latency, so it cannot flake under load.
+        inherited stdout/stderr pipe write ends, so a drain run against it
+        never sees EOF; unbounded, it blocks forever and the caller's
+        ``timeout=`` stops being a bound at all. Measured: a direct
+        ``communicate()`` after a plain ``kill()`` of such a child does hang.
+
+        Green today via the group kill (which closes every write end at once),
+        so this is a REGRESSION guard on the two degraded paths — a refused or
+        failed ``killpg`` falls back to killing the direct child only, and
+        there the bound is the sole thing standing between this suite and
+        pytest-timeout's 300s axe.
+
+        15s for a 2s timeout is deliberately loose: this asserts "bounded", not
+        a latency, so it cannot flake under load.
         """
         pidfile = tmp_path / 'leaked.pid'
         leaker = _leaker_script(tmp_path)

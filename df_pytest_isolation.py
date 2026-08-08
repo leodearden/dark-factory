@@ -62,6 +62,29 @@ its fused-memory clock and the fleet script it spawns land in the main checkout
 whichever worktree invoked them.  One root would have left the second protected
 path watched-but-unwritable-to, i.e. green and useless.
 
+THIRD DEFENCE — a test's spawn timeout can never leak a process group.
+
+Task 3798.  Both pytest harnesses that drive
+``scripts/restart-all-orchestrators.sh --drain`` used a plain
+``subprocess.run(..., timeout=N)``.  On POSIX that timeout path ``kill()``s the
+DIRECT CHILD ONLY, so the poll loops the drain script forks outlive it, get
+reparented to ``systemd --user``, and sit spending their grace — 86 concurrent
+orphans on 2026-08-06 and 82 more on 2026-08-07, each holding a hand-typed
+``99999``-second (27.8 HOUR) grace.  That number is the second half of the
+defect: an orphan that lives 27.8h outlives pytest's tmpdir GC, at which point
+its ``PATH`` no longer resolves ``systemctl`` to the test's fake and its
+expiry restarts REAL units and stamps a REAL fleet-deploy clock.
+
+Same structure and the same reason for living here as the two defences above —
+``run_in_new_session`` / ``wait_proof_grace_secs`` / ``leaked_drain_processes``
+as pure helpers plus a thin session-scoped autouse fixture — because the defect
+class is again "a spawner that forgets" and the next one has not been written
+yet.  Centralising the spawn matters twice over here: ``tests/scripts/`` and
+``scripts/tests/`` cannot import each other's test modules, so their two
+copies of this harness could only ever be kept in step by a cross-checking
+test (``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` exists for
+exactly that reason).  This module is the one place BOTH already import.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -76,6 +99,8 @@ together by
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -441,3 +466,156 @@ def _df_deploy_clocks_unwritten():
             )
             if reason is not None:
                 pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Session-isolated spawning (task 3798)
+# ---------------------------------------------------------------------------
+
+# How long the post-kill drain may take before we give up on collecting the
+# child's partial output. Bounded on purpose — see run_in_new_session. Generous
+# because it is a CEILING, not a latency: once the group is SIGKILLed every
+# write end of the pipe is closed and the drain returns in milliseconds.
+_POST_KILL_DRAIN_SECS = 10
+
+
+def _unsafe_pgid_reason(pgid: int) -> str | None:
+    """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
+
+    Ported (not imported — see the module docstring's stdlib-only constraint)
+    from ``shared.proc_group._unsafe_pgid_reason``, which is the canonical
+    async sibling of this function and the place to look for the full history.
+
+    This is not belt-and-braces. That module's docstring records task 845: a
+    ``killpg`` aimed via ``os.getpgid(pid)`` at a pid the kernel had already
+    RECYCLED resolved to the new owner's group, which in practice was the
+    ``systemd --user`` manager's — and killed the user's entire login session.
+    The hazard is unusually live in this module's case, because the orphans it
+    exists to reap are themselves reparented to ``systemd --user``.
+
+    Takes no ``proc_pid`` companion argument, unlike the ``shared`` version:
+    the single caller captures ``pgid = p.pid`` at the instant of spawn and
+    passes that same value here, so a ``pgid != proc.pid`` check would compare
+    a variable against itself.
+    """
+    if pgid <= 1:
+        return f'pgid <= 1 ({pgid!r})'
+    if pgid == os.getpid():
+        return f'pgid == os.getpid() ({pgid})'
+    try:
+        ppid = os.getppid()
+    except OSError:
+        ppid = None
+    if ppid is not None and pgid == ppid:
+        return f'pgid == os.getppid() ({pgid})'
+    try:
+        own_pgrp = os.getpgrp()
+    except OSError:
+        own_pgrp = None
+    if own_pgrp is not None and pgid == own_pgrp:
+        return f'pgid == os.getpgrp() ({pgid})'
+    return None
+
+
+def run_in_new_session(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run``, except a timeout kills the whole process GROUP.
+
+    A drop-in for ``subprocess.run(cmd, env=..., capture_output=True,
+    text=True, timeout=...)``: same ``CompletedProcess`` on the ordinary path,
+    same ``subprocess.TimeoutExpired`` with partial output attached on the slow
+    one. Two things differ, both of them the point.
+
+    FIRST — the child leads its own session, and the timeout signals the GROUP.
+    ``subprocess.run``'s timeout path calls ``Popen.kill()``, which signals the
+    direct child and nothing else. A script that backgrounds a poll loop
+    therefore survives its own caller's timeout: the loop is reparented to
+    ``systemd --user`` and keeps running until its grace expires. That is task
+    3798's 86-orphan pileup, and it is only reachable by signalling the group.
+
+    The pgid is CAPTURED as ``p.pid`` immediately after a ``start_new_session=
+    True`` spawn, and that frozen int is what gets signalled. Deliberately NOT
+    ``os.killpg(os.getpgid(p.pid), ...)``, the obvious spelling: once the child
+    is reaped the kernel may reuse its pid, and ``os.getpgid`` on a reused pid
+    returns the NEW owner's group — task 845, where that resolved to the user's
+    ``systemd --user`` session. POSIX guarantees the child is the leader of its
+    own group with ``pgid == pid`` at the instant of a new-session spawn, so
+    capturing it there closes the TOCTOU completely.
+    :func:`_unsafe_pgid_reason` is the residual defence, and a refusal falls
+    back to ``p.kill()`` — the direct child only, i.e. exactly today's
+    behaviour — rather than signalling a group we are unsure of.
+
+    SECOND — the post-kill drain is BOUNDED. This is the non-obvious half, and
+    it is what keeps the DEGRADED paths above safe. A surviving grandchild
+    inherits the stdout/stderr pipe WRITE ENDS, so a drain run against it never
+    sees EOF; unbounded, it blocks forever and the caller's ``timeout=`` stops
+    being a wall-clock bound at all. Measured against real processes: a direct
+    ``communicate()`` after a plain ``kill()`` of such a child does hang.
+
+    Whenever the group kill lands this is moot — the whole group dies, every
+    write end closes, and the drain returns in milliseconds. It becomes real on
+    exactly the two fallbacks: an ``_unsafe_pgid_reason`` refusal and a failed
+    ``killpg``, both of which degrade to ``p.kill()`` and so leave a
+    pipe-holding grandchild alive. Capping at ``_POST_KILL_DRAIN_SECS`` makes
+    the worst case ``timeout + drain`` on every path.
+
+    (For the record, since it is the obvious next question: stock
+    ``subprocess.run`` does NOT hang here. Its POSIX timeout branch calls
+    ``process.wait()``, not a second ``communicate()`` — verified by inspection
+    of CPython. Its defect is solely the un-reached grandchild, not a hang.)
+
+    The re-raised ``TimeoutExpired`` carries whatever was drained, because the
+    existing callers assert on the script's output from the TIMEOUT path (via
+    their ``_decode`` / ``_boundary_decode`` helpers, which normalise both
+    ``bytes`` and ``str`` and so keep working unchanged).
+    """
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=True,
+    )
+    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
+    pgid = p.pid
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(p, pgid)
+        try:
+            out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
+        except subprocess.TimeoutExpired:
+            # Something still holds the pipe open despite the group kill.
+            # Give up on the output rather than on the timeout: the caller
+            # asked for a bound and gets one.
+            p.kill()
+            out, err = ('', '') if text else (b'', b'')
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
+    """SIGKILL the captured *pgid*, degrading to the direct child if unsure.
+
+    Every failure mode degrades to ``p.kill()`` rather than propagating: the
+    caller is already on its way to raising ``TimeoutExpired``, and masking
+    that with a signalling error would replace a legible timeout with a
+    confusing one. ``ProcessLookupError`` is the ordinary case of a child that
+    exited between the timeout and the signal.
+    """
+    reason = _unsafe_pgid_reason(pgid)
+    if reason is not None:
+        p.kill()
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        p.kill()
