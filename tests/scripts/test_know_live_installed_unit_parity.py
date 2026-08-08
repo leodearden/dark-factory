@@ -57,6 +57,34 @@ Importable `from systemd_unit_invariants import ...` because
 tests/scripts/conftest.py puts this directory on sys.path — pytest's
 --import-mode=importlib (pyproject.toml addopts) deliberately does not do
 that on its own.
+
+Reuse note, updated by task 3763 (this module previously recorded lifting
+its helpers into tests/scripts/systemd_unit_invariants.py as "the better
+long-term fix", untaken because that module sat outside task 3642's lock).
+Half of that is now done, and the split is deliberate:
+
+  - MOVED — `systemctl_user_show`, formerly the module-local
+    `_systemctl_user_show`, now lives in systemd_unit_invariants.py and is
+    imported above. It gained a second consumer
+    (test_pump_web_ui_installed_unit_parity.py, task 3763), which is the
+    trigger condition that module's own docstring names: "duplicating it
+    into both is how the two copies drift until one silently stops
+    catching the defect". Its correctness rests on four non-obvious
+    MEASURED behaviours, so a divergent copy is the expensive kind of
+    drift. Its negative-case owner stays HERE (the four-case parametrized
+    test at the bottom of this file), mirroring how
+    test_dashboard_service_template.py owns assert_restart_backoff_
+    effective's guard.
+  - STAYED LOCAL — `_config_arg_from_exec_start` and
+    `_argv_from_exec_start_show`. Both still have exactly one consumer
+    (this module), so lifting them would buy no de-duplication today. The
+    separate, still-open divergence the first one documents — its
+    collapse of a dangling `--config` into the same None as "no --config
+    at all", where test_orchestrator_service_files.py's canonical parser
+    raises — is NOT closed by that lift alone: it needs
+    test_orchestrator_service_files.py to switch to the shared parser
+    too, and that module remains outside this task's lock. Tracked as
+    follow-up, not reached for here.
 """
 
 import pathlib
@@ -126,10 +154,14 @@ def _config_arg_from_exec_start(exec_start_value: str) -> str | None:
     module's generic "carries no --config argument" message rather than a
     MalformedExecStart-specific one. Lifting both parsers into a shared
     helper (e.g. tests/scripts/systemd_unit_invariants.py) would close this
-    gap for real and is the better long-term fix, but that module and
-    test_orchestrator_service_files.py both sit outside this task's locked
-    scope (scripts/setup-host.sh and this module only) — tracked as
-    follow-up rather than reached for here.
+    gap for real and is still the better long-term fix. Task 3763 lifted
+    `systemctl_user_show` into exactly that module but deliberately left
+    these two parsers here (see this module's reuse note): the lift alone
+    does NOT close this divergence, because closing it also requires
+    test_orchestrator_service_files.py — which owns the canonical parser
+    this one diverges from — to adopt the shared helper, and that module
+    sits outside this task's locked scope. Tracked as follow-up rather
+    than reached for here.
     """
     tokens = exec_start_value.split()
     for i, token in enumerate(tokens):
@@ -160,54 +192,6 @@ def _argv_from_exec_start_show(exec_start_value: str) -> str | None:
         if segment.startswith("argv[]="):
             return segment[len("argv[]=") :]
     return None
-
-
-def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
-    """Run `systemctl --user show <unit> -p <prop> ...`, parsed to a dict.
-
-    Returns None — never raises — when the query cannot be answered at all:
-    a non-zero exit, output naming a bus connection failure ("Failed to
-    connect to bus" — the shape seen from a container/CI sandbox with no
-    user D-Bus session), or the query timing out — a wedged systemd --user
-    manager or a stuck D-Bus leaving this call hung past its 30s timeout,
-    which surfaces as subprocess.TimeoutExpired. That last case is caught
-    deliberately and degrades to the same skip: subprocess.TimeoutExpired
-    is a subprocess.SubprocessError, NOT an OSError (verified MRO:
-    TimeoutExpired -> SubprocessError -> Exception), so the handler below
-    must name both classes — narrowing it back to `except OSError` alone
-    is the exact regression a prior review caught here. Callers treat None
-    as "skip", not "fail": this invariant requires a live systemd --user
-    manager to answer, and its absence is an environment fact rather than
-    a defect in the unit.
-
-    A property systemd does not implement at all (verified: `-p
-    SomeUnknownProperty` against a live unit exits 0 with EMPTY stdout, on
-    this host's systemd 255.4) is NOT surfaced as None here — it is simply
-    absent from the returned dict, distinct from a recognised-but-blank
-    value. Callers that care about that distinction (e.g. RestartSteps=,
-    unsupported before systemd 254) must check `"Prop" not in shown`
-    themselves; collapsing "unsupported" into the same falsy shape as
-    "supported and empty" is how a guard meant to skip cleanly on an old
-    systemd instead fails loudly and misleadingly on one.
-    """
-    argv = ["systemctl", "--user", "show", unit]
-    for prop in properties:
-        argv += ["-p", prop]
-    try:
-        result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    combined = f"{result.stdout}{result.stderr}"
-    if result.returncode != 0 or "failed to connect to bus" in combined.lower():
-        return None
-    parsed: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        key, sep, value = line.partition("=")
-        if sep:
-            parsed[key] = value
-    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +271,7 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
     as the reconciled state rather than asserting the pre-fix RED.
     """
     _require_installed_unit()
-    shown = _systemctl_user_show(UNIT_BASENAME, "RestartSteps")
+    shown = systemctl_user_show(UNIT_BASENAME, "RestartSteps")
     if shown is None:
         pytest.skip(
             "systemctl --user show could not be queried (no user D-Bus "
@@ -337,7 +321,7 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     requires.
     """
     _require_installed_unit()
-    shown = _systemctl_user_show(UNIT_BASENAME, "ExecStart")
+    shown = systemctl_user_show(UNIT_BASENAME, "ExecStart")
     if shown is None:
         pytest.skip(
             "systemctl --user show could not be queried (no user D-Bus "
@@ -455,7 +439,7 @@ def test_argv_from_exec_start_show_returns_none_without_argv_segment() -> None:
 def test_systemctl_user_show_returns_none_when_subprocess_raises(
     monkeypatch: pytest.MonkeyPatch, raised: BaseException
 ) -> None:
-    """_systemctl_user_show's docstring promises "Returns None — never raises".
+    """systemctl_user_show's docstring promises "Returns None — never raises".
 
     Regression pin for a swallowed-exception gap (reviewer_comprehensive,
     robustness): the only handler was `except OSError`, but
@@ -484,7 +468,7 @@ def test_systemctl_user_show_returns_none_when_subprocess_raises(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert systemctl_user_show(UNIT_BASENAME, "RestartSteps") is None, (
-        "_systemctl_user_show's docstring promises None, never raises — a "
+        "systemctl_user_show's docstring promises None, never raises — a "
         f"{type(raised).__name__} from subprocess.run must degrade to a "
         "skip via None, not propagate uncaught"
     )

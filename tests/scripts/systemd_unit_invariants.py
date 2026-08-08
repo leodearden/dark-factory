@@ -18,6 +18,7 @@ pyproject.toml addopts) deliberately does not.
 """
 import pathlib
 import re
+import subprocess
 
 # ---------------------------------------------------------------------------
 # Restart backoff
@@ -121,3 +122,72 @@ def assert_restart_backoff_effective(path: pathlib.Path) -> None:
         "starts from systemd's 100ms default and the backoff that runs is not "
         "the one the file describes."
     )
+
+
+# ---------------------------------------------------------------------------
+# systemd MANAGER view
+#
+# The file-layer helpers above read a unit FILE.  This one reads what the
+# systemd --user MANAGER has actually LOADED, which is a different question
+# with a different answer: `cp`-ing a corrected unit into place without a
+# `daemon-reload` leaves the manager on the stale unit, so a file-only check
+# blesses a host whose defect is still live.
+#
+# Written for task 3642 (as a module-local helper in
+# tests/scripts/test_know_live_installed_unit_parity.py, whose own docstring
+# named lifting it here "the better long-term fix" — declined then only
+# because this module sat outside that task's locked scope).  Lifted here
+# VERBATIM by task 3763, when tests/scripts/test_pump_web_ui_installed_unit_
+# parity.py became its second consumer: exactly the trigger condition this
+# module's own docstring describes.  Its negative-case guard stays where it
+# was written, in test_know_live_installed_unit_parity.py, mirroring how
+# test_dashboard_service_template.py owns assert_restart_backoff_effective's.
+# ---------------------------------------------------------------------------
+
+
+def systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
+    """Run `systemctl --user show <unit> -p <prop> ...`, parsed to a dict.
+
+    Returns None — never raises — when the query cannot be answered at all:
+    a non-zero exit, output naming a bus connection failure ("Failed to
+    connect to bus" — the shape seen from a container/CI sandbox with no
+    user D-Bus session), or the query timing out — a wedged systemd --user
+    manager or a stuck D-Bus leaving this call hung past its 30s timeout,
+    which surfaces as subprocess.TimeoutExpired. That last case is caught
+    deliberately and degrades to the same skip: subprocess.TimeoutExpired
+    is a subprocess.SubprocessError, NOT an OSError (verified MRO:
+    TimeoutExpired -> SubprocessError -> Exception), so the handler below
+    must name both classes — narrowing it back to `except OSError` alone
+    is the exact regression a prior review caught here. Callers treat None
+    as "skip", not "fail": this invariant requires a live systemd --user
+    manager to answer, and its absence is an environment fact rather than
+    a defect in the unit.
+
+    A property systemd does not implement at all (verified: `-p
+    SomeUnknownProperty` against a live unit exits 0 with EMPTY stdout, on
+    this host's systemd 255.4) is NOT surfaced as None here — it is simply
+    absent from the returned dict, distinct from a recognised-but-blank
+    value. Callers that care about that distinction (e.g. RestartSteps=,
+    unsupported before systemd 254) must check `"Prop" not in shown`
+    themselves; collapsing "unsupported" into the same falsy shape as
+    "supported and empty" is how a guard meant to skip cleanly on an old
+    systemd instead fails loudly and misleadingly on one.
+    """
+    argv = ["systemctl", "--user", "show", unit]
+    for prop in properties:
+        argv += ["-p", prop]
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    combined = f"{result.stdout}{result.stderr}"
+    if result.returncode != 0 or "failed to connect to bus" in combined.lower():
+        return None
+    parsed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            parsed[key] = value
+    return parsed
