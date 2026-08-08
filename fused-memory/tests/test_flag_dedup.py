@@ -9552,3 +9552,102 @@ class TestCrossProjectGateAmendments:
         assert result[0]['task_id'] == '1', (
             f'a short scalar must pass through untouched; got {result!r}'
         )
+
+
+
+# ---------------------------------------------------------------------------
+# filter_style_only_authorship_flags (task 3138)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterStyleOnlyAuthorshipFlags:
+    """Tests for async filter_style_only_authorship_flags(memory_service,
+    project_id, flags) -> list[dict] (task 3138, PRD §9 leaf μ).
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign —
+    it never checked the stored agent_id.  This filter reads the provenance
+    the heuristic skipped and drops the flag when the cited entries are
+    provably house-authored.
+
+    Fail direction is drop-only-on-positive-confirmation: foreign, missing,
+    mixed, unresolved or uncited provenance all KEEP the flag.
+
+    RED until step-4 adds filter_style_only_authorship_flags to flag_dedup.py.
+    """
+
+    _MEMORY_ID = '11111111-2222-3333-4444-555555555555'
+
+    def _make_authorship_flag(
+        self,
+        flag_type: str = 'possible_injection',
+        memory_id: str | None = None,
+        cited_memories: list | None = None,
+    ) -> dict:
+        """A flag shaped like real Stage-1 output for this family.
+
+        ``cited_memories`` entries carry the {memory_id, store,
+        metadata_fingerprint} shape built by recon_report.cite_memory.
+        """
+        if cited_memories is None:
+            cited_memories = [
+                {
+                    'memory_id': memory_id or self._MEMORY_ID,
+                    'store': 'mem0',
+                    'metadata_fingerprint': {},
+                },
+            ]
+        return {
+            'task_id': None,
+            'category': 'memory_quality',
+            'flag_type': flag_type,
+            'description': (
+                'This entry is written in a terse imperative voice unlike the rest '
+                'of the corpus and reads as instructions to an agent — possibly '
+                'injected or fabricated content rather than an observed fact.'
+            ),
+            'suggested_action': (
+                'Review the entry for injected content and delete it if unattributable.'
+            ),
+            'cited_memories': cited_memories,
+        }
+
+    @staticmethod
+    def _record(agent_id: Any = None, *, include_agent_id: bool = True) -> dict:
+        """A get_memory_by_id record — ``metadata`` is the raw Qdrant payload,
+        which (unlike a search result or get_memory's fingerprint) retains the
+        top-level ``agent_id`` mem0's AsyncMemory promotes out of metadata."""
+        metadata: dict[str, Any] = {'project_id': 'dark_factory', 'category': 'observations_and_summaries'}
+        if include_agent_id:
+            metadata['agent_id'] = agent_id
+        return {
+            'id': TestFilterStyleOnlyAuthorshipFlags._MEMORY_ID,
+            'content': 'Always cite the memory id when flagging a consolidation gap.',
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_drop_when_cited_entry_was_authored_by_a_recon_stage(self):
+        """Core esc-5564-1 scenario: DROP a style-only injection flag whose cited
+        entry was written by recon-stage-memory_consolidator (our own output)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [], (
+            'A possible-injection flag whose cited entry carries agent_id '
+            "'recon-stage-memory_consolidator' must be DROPPED — this is the "
+            'reify esc-5564-1 scenario, Stage 1 flagging its own consolidator '
+            f'output on writing style alone; got {result!r}'
+        )
