@@ -3527,6 +3527,83 @@ def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
     assert from_b == sr.UNKNOWN_QUEUE
 
 
+@pytest.mark.parametrize(
+    ('a', 'b', 'expected'),
+    [
+        # Both directions of every adjacent pair: the helper is symmetric,
+        # so argument order must never decide the answer.
+        ('', 'info', 'info'),
+        ('info', '', 'info'),
+        ('info', 'blocking', 'blocking'),
+        ('blocking', 'info', 'blocking'),
+        ('blocking', 'critical', 'critical'),
+        ('critical', 'blocking', 'critical'),
+        ('critical', 'urgent', 'urgent'),
+        ('urgent', 'critical', 'urgent'),
+        # ...and the non-adjacent pair that matters most in practice: a
+        # second watcher's 'info' must not pull a 'critical' record down.
+        ('critical', 'info', 'critical'),
+        ('info', 'critical', 'critical'),
+    ],
+)
+def test_max_decision_severity_takes_the_higher_of_the_two(a: str, b: str, expected: str) -> None:
+    """The never-downgrade primitive: '' < info < blocking < critical < urgent.
+
+    This deliberately does NOT reuse escalation/src/escalation/queue.py's
+    ``_SEVERITY_RANK``, which is ``{'info': 0, 'blocking': 1}`` only: there,
+    'critical' and 'urgent' fall to the ``.get(x, 0)`` default and rank
+    INFO-tier. Reusing it would make the never-downgrade helper itself
+    perform the exact downgrade this task exists to prevent -- a second
+    watcher's 'info' would tie-or-beat a first watcher's 'critical'.
+    (Importing it is impossible anyway: this module is stdlib-only.)
+    """
+    assert sr._max_decision_severity(a, b) == expected
+
+
+@pytest.mark.parametrize('value', ['', 'info', 'blocking', 'critical', 'urgent'])
+def test_max_decision_severity_of_an_equal_pair_is_that_value(value: str) -> None:
+    """A tie returns the value itself, so a re-file never churns the field."""
+    assert sr._max_decision_severity(value, value) == value
+
+
+@pytest.mark.parametrize(
+    ('existing', 'incoming'),
+    [
+        ('critical', 'criticl'),  # typo'd incoming must not displace
+        ('critical', 'CRITICAL'),  # case variant is NOT a known severity
+        ('urgent', 'whatever'),
+        ('info', 'nonsense'),
+    ],
+)
+def test_max_decision_severity_unknown_never_displaces_a_recognised_one(
+    existing: str,
+    incoming: str,
+) -> None:
+    """An UNRECOGNISED severity ranks unknown-lowest and never raises.
+
+    A typo'd or case-variant severity from a second watcher (escalation
+    models.KNOWN_SEVERITIES is lowercase-only and rejects case variants
+    outright) must not be able to downgrade a recognised one. It ranks
+    alongside the unset sentinel rather than blowing up, because this helper
+    sits on a watcher's filing path and must never crash the watch loop.
+    """
+    assert sr._max_decision_severity(existing, incoming) == existing
+
+
+def test_max_decision_severity_two_unknowns_returns_existing() -> None:
+    """Ambiguous both-unknown case resolves to ``existing``: never downgrade,
+    never churn the file with an equally-meaningless replacement.
+    """
+    assert sr._max_decision_severity('mystery-a', 'mystery-b') == 'mystery-a'
+
+
+def test_max_decision_severity_unknown_loses_to_a_recognised_incoming() -> None:
+    """The other direction: an unknown EXISTING value does not block a real
+    incoming severity from landing, since unknown ranks at the bottom.
+    """
+    assert sr._max_decision_severity('bogus', 'blocking') == 'blocking'
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
