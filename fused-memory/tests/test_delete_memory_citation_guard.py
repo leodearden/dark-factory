@@ -501,6 +501,24 @@ class TestGateAppliesToEveryCaller:
         assert result['error_type'] == 'CitationRepointRequired'
         mock_service.delete_memory.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_refusal_hint_names_the_allow_dangling_citations_escape(
+        self, mcp_server,
+    ):
+        """A refusal with no reachable next action is a dead end, not a guard.
+
+        ``hint`` is a field of the structured tool response, so this is
+        behaviour rather than prose. Before broadening, the only exit the hint
+        offered was "supply a surviving UUID" — which is unreachable for the
+        caller the broadening newly captures: an operator dropping a record
+        outright, with no survivor at all to repoint to. The escape is
+        undiscoverable unless the refusal names it.
+        """
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        assert 'allow_dangling_citations' in result['hint']
+
 
 class TestAllowDanglingCitationsEscape:
     """``metadata={'allow_dangling_citations': True}`` is the deliberate escape.
