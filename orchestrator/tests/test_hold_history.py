@@ -9,9 +9,12 @@ back out of the implementation under test.
 
 from __future__ import annotations
 
+import sqlite3
+
 import _hold_history_fixtures as F
 import pytest
 
+from orchestrator.event_store import EventStore
 from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans
 
 
@@ -725,3 +728,140 @@ def test_module_match_is_exact_not_prefix():
     assert history.predicted_hold(['orchestrator/src']) == pytest.approx(20.0)
     assert history.sample_count(['orchestrator/src']) == 3
     assert history.sample_count(['orchestrator']) == 0
+
+
+# ===========================================================================
+# seed_from_event_store — the durable seed off a REAL EventStore
+# ===========================================================================
+
+
+@pytest.fixture
+def seeded_store(tmp_path) -> EventStore:
+    """A real ``EventStore`` sqlite file carrying the canonical 21-row trace.
+
+    A real store, not a stub: the seed's whole job is to survive what
+    ``fetch_events_by_type_all_runs`` actually returns — three separate
+    per-type result sets, JSON-decoded ``data``, rows spanning two ``run_id``
+    values.  ``_RecordingEventStore`` implements only ``emit()`` and has no
+    fetch API at all, so it cannot exercise any of that.
+    """
+    store = EventStore(tmp_path / 'runs.db', F.RUN_A)
+    written = F.write_trace(store)
+    assert written == len(F.build_trace())
+    return store
+
+
+def test_seed_reproduces_the_hand_computed_medians(seeded_store):
+    """The PRD's headline signal, end to end: sqlite rows in, module medians out.
+
+    The expectations are the literals hand-computed in ``_hold_history_fixtures``
+    from a fixed whole-second timeline — never read back out of the code here.
+    """
+    history = HoldHistory()
+
+    recorded = history.seed_from_event_store(seeded_store)
+
+    assert recorded == F.EXPECTED_SPAN_COUNT
+    for module, expected in F.EXPECTED_MEDIANS.items():
+        assert history.predicted_hold([module]) == pytest.approx(expected), module
+    assert history.predicted_hold(list(F.EXPECTED_MEDIANS)) == pytest.approx(
+        F.EXPECTED_POOLED_MEDIAN
+    )
+
+
+def test_seed_carries_the_per_module_samples_not_just_the_medians(seeded_store):
+    history = HoldHistory()
+
+    history.seed_from_event_store(seeded_store)
+
+    for module, samples in F.EXPECTED_SAMPLES.items():
+        assert history.sample_count([module]) == len(samples), module
+
+
+def test_seed_merges_the_three_event_types_in_row_id_order(seeded_store):
+    """Each type is fetched SEPARATELY — the merge must restore one stream.
+
+    Concatenating the per-type lists would put every release after every
+    acquire, so T4's 400->580 double-acquire and the T5 service_restart
+    boundary would both resolve against the wrong neighbours.  The
+    give-away is the truncated set: it is exactly the three spans whose end
+    was imposed, and no ordering other than by row ``id`` produces it.
+    """
+    history = HoldHistory()
+
+    history.seed_from_event_store(seeded_store)
+
+    # orchestrator/src's five samples in close order — [60, 120, 180, 120, 40].
+    # Any per-type concatenation reorders or loses these.
+    assert history.sample_count(['orchestrator/src']) == 5
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(120.0)
+    # 200 is T5's service_restart-truncated hold; it only measures 200 if the
+    # restart row was interleaved between the acquire at 800 and the rows after.
+    assert history.predicted_hold(['fused-memory/src']) == pytest.approx(200.0)
+
+
+def test_seed_drops_the_orphan_and_the_end_of_stream_holder(seeded_store):
+    """The residue classes must survive the round trip through sqlite."""
+    history = HoldHistory()
+
+    history.seed_from_event_store(seeded_store)
+
+    # T3's orphan release and T10's never-released acquire contribute nothing:
+    # 11 spans, not 12 or 13.
+    assert history.sample_count(list(F.EXPECTED_SAMPLES)) == F.EXPECTED_SPAN_COUNT
+
+
+def test_seeding_twice_does_not_double_count(seeded_store):
+    """Seed-once. A second call must be a no-op, returning 0.
+
+    ``finish_startup`` is not guaranteed to run exactly once across a
+    reconfigure, and a double seed would halve every module's effective window
+    while leaving the medians looking plausible — a silent corruption.
+    """
+    history = HoldHistory()
+
+    first = history.seed_from_event_store(seeded_store)
+    second = history.seed_from_event_store(seeded_store)
+
+    assert first == F.EXPECTED_SPAN_COUNT
+    assert second == 0, 'second seed must be a no-op'
+    assert history.sample_count(list(F.EXPECTED_SAMPLES)) == F.EXPECTED_SPAN_COUNT
+    for module, expected in F.EXPECTED_MEDIANS.items():
+        assert history.predicted_hold([module]) == pytest.approx(expected), module
+
+
+def test_seed_is_fail_soft_when_the_store_raises():
+    """A broken store must not take the scheduler down with it.
+
+    The seed runs inside ``finish_startup``; propagating here would turn an
+    unreadable history — a degradation the refusal contract already handles —
+    into a failure to start at all.
+    """
+    class _ExplodingStore:
+        def fetch_events_by_type_all_runs(self, event_type, *, task_id=None):
+            raise sqlite3.OperationalError('database is locked')
+
+    history = HoldHistory()
+
+    assert history.seed_from_event_store(_ExplodingStore()) == 0
+    assert history.sample_count(['orchestrator/src']) == 0
+    assert history.predicted_hold(['orchestrator/src']) is None
+
+
+def test_seed_of_an_empty_store_records_nothing_and_still_refuses(tmp_path):
+    """A fresh deployment has no history; it must refuse, not seed a default."""
+    history = HoldHistory()
+
+    assert history.seed_from_event_store(EventStore(tmp_path / 'empty.db', 'run-x')) == 0
+    assert history.predicted_hold(['orchestrator/src']) is None
+
+
+def test_seed_respects_the_window(seeded_store):
+    """The seed feeds the same bounded windows the live path does."""
+    history = HoldHistory(window=2, min_samples=1)
+
+    history.seed_from_event_store(seeded_store)
+
+    assert history.sample_count(['orchestrator/src']) == 2
+    # last two of [60, 120, 180, 120, 40] -> [120, 40] -> median 80.0
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(80.0)
