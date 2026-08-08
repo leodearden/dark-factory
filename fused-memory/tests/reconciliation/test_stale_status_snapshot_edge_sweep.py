@@ -649,6 +649,113 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+    # ----------------------------------------------------------------- #
+    # task 3079 — plural multi-task enumeration
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, 1030 and 1031 are pending.', {1020, 1030, 1031}),
+            # Oxford comma + closed-class adverb
+            (
+                'Tasks 1020, 1030, and 1031 are still in progress.',
+                {1020, 1030, 1031},
+            ),
+            ('Tasks 1020 and 1030 are blocked.', {1020, 1030}),
+            # repeated reference token in the enumeration tail
+            ('Tasks 1020, task 1030 and task 1031 are pending.', {1020, 1030, 1031}),
+        ],
+    )
+    def test_plural_enumeration_extracts_every_id(self, fact, expected):
+        """"Tasks A, B and C are <marker>" -> {A, B, C}. (task 3079)
+
+        REPRO, and the precise answer to the finding's second question: the
+        pre-3079 extractor got NONE of these ids, not merely the first.
+        TASK_REF_RE anchors '\\btask\\b', which does not match the plural
+        'Tasks' at all; and even if it did, the enumeration tail (', 1030,
+        and 1031') carries no reference token of its own, so the trailing
+        ids were unreachable by every path.
+
+        The Oxford comma case is load-bearing: a separator alternation
+        that handles ',' or 'and' but not ', and' silently misses the
+        finding's verbatim fact shape.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # transitive-verb reading — the mandatory copula must refuse it,
+            # exactly as INDIVIDUAL_SNAPSHOT_RE's transitive arm does. This
+            # is a permanently-true historical fact, not a status snapshot.
+            'Tasks 1020, 1030, and 1031 blocked task 5.',
+            'Tasks 1020 and 1030 block the merge queue.',
+            # terminal status — gate short-circuits
+            'Tasks 1020, 1030, and 1031 are done.',
+            # negation / past-exit, refused by the closed-class _ADVERB_ALT
+            'Tasks 1020, 1030, and 1031 are no longer pending.',
+            # marker present but NOT adjacent to the enumeration+copula: the
+            # BRANCH is active, not the tasks
+            'Tasks 1020 and 1030 were merged into the active branch.',
+        ],
+    )
+    def test_plural_enumeration_precision_guards(self, fact):
+        """Shapes the plural path must NOT extract. (task 3079)
+
+        Same anchoring discipline the rest of the module enforces: the
+        marker must sit immediately after the enumeration and its copula,
+        and the copula is mandatory so a plural subject followed by a
+        transitive verb never reads as a status assertion.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_plural_enumeration_needs_two_or_more_ids(self):
+        """A plural head over a single id is not an enumeration. (task 3079)
+
+        Guards the plural path from degenerating into a second, weaker
+        individual form: 'Tasks 1020 are pending' is malformed English and
+        a single stray digit after a plural head is more likely a count
+        than an id. Requiring 2+ ids keeps the path's subject unambiguous.
+        The well-formed singular shape still routes through
+        INDIVIDUAL_SNAPSHOT_RE unchanged.
+        """
+        assert extract_snapshot_edge_task_ids('Tasks 1020 are pending.') == set()
+        assert extract_snapshot_edge_task_ids('Task 1020 is pending.') == {1020}
+
+    def test_plural_enumeration_collects_digits_only_from_its_own_span(self):
+        """An embedded count phrase never contributes a spurious id. (task 3079)
+
+        The module's standing invariant is that a bare '\\d+' may only
+        contribute an id from inside an already-detected, marker-anchored
+        segment — the property that keeps dates, commit hashes and ports in
+        ordinary prose from becoming task ids. The plural path preserves it
+        by collecting digits from its own 'ids' capture group ONLY, never
+        from the whole fact.
+
+        Here '3 tasks' sits in a second clause outside the enumeration, so
+        3 must not appear even though the fact as a whole is packed with
+        status markers.
+        """
+        ids = extract_snapshot_edge_task_ids(
+            'Tasks 1020 and 1030 are pending; 3 tasks remain in progress.'
+        )
+        assert ids == {1020, 1030}
+        assert 3 not in ids
+
+    def test_plural_enumeration_does_not_reach_across_an_intervening_count(self):
+        """A count phrase breaking the enumeration kills the match. (task 3079)
+
+        'Blocked tasks 1020 and 1030 plus 3 pending others ...' — the
+        enumeration cannot absorb 'plus 3', and the copula never follows
+        the ids, so the path yields nothing at all rather than leaking a
+        bare 3. Under-selection is the fail-safe direction this module
+        prefers throughout.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Blocked tasks 1020 and 1030 plus 3 pending others are pending.'
+        ) == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
