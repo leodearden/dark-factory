@@ -1058,6 +1058,135 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
 
 
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
+    """A contested task stays withheld even when the sink's memo is COLD.
+
+    ``TestAlreadyLandedDispatchGateStaleEvidenceConflict`` above only ever
+    exercises the WARM path: tick 1 files the conflict in the same process,
+    so tick 2 short-circuits on ``should_skip``'s in-memory memo.  That memo
+    is in-memory ONLY (``provenance_conflict.py``'s class docstring:
+    "an in-memory per-task memo ... Lost on restart"), so it is empty on any
+    process that did not itself file the conflict — after a fleet
+    redeploy / watchdog restart, or when a DIFFERENT writer site filed it
+    (``merge_queue.py``'s two ``ProvenanceConflictSink`` call sites).
+
+    With the memo cold, the task-3534 any-level veto is what sees the
+    pending ``provenance_conflict`` record — and its answer is ``return
+    False``, which means "I abstain; dispatch normally".  For a task under
+    arbitration that is precisely the outcome this gate's docstring forbids
+    ("a contested task must never dispatch while under arbitration"), so the
+    hold has to be decided from DURABLE store state, ordered above that
+    veto.  Ordering alone cannot deliver the invariant; durability can.
+    """
+
+    async def test_cold_sink_memo_still_withholds_contested_task(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A restart clears the memo but not the escalation store."""
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        result_1 = await h._already_landed_dispatch_gate('42')
+
+        assert result_1 is True, 'a contested task must not dispatch'
+        conflicts = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+        assert conflicts[0].level == 2
+        assert conflicts[0].severity == 'urgent'
+
+        # SIMULATE THE RESTART: a brand-new sink (empty memo) over the SAME
+        # durable queue — exactly what a fleet redeploy leaves behind.
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        assert h._provenance_conflict_sink.should_skip(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is False, (
+            'the fresh sink must have a COLD memo — otherwise this test '
+            'silently degrades into a re-run of the warm-memo case above'
+        )
+
+        result_2 = await h._already_landed_dispatch_gate('42')
+
+        assert result_2 is True, (
+            'a contested task must never dispatch while under arbitration — '
+            'including on a cold memo'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
+            'the durable hold must short-circuit BEFORE re-attempting the '
+            'already-rejected done-write, not merely re-derive it'
+        )
+        conflicts_after = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
+
+    async def test_conflict_filed_by_a_different_writer_site_still_withholds(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """The hold is decided from store state, with no write attempt at all.
+
+        The second half of the cold-memo finding, which a restart-only test
+        would miss: the conflict was filed by a sink instance this harness
+        has never owned (mirroring the merge-queue writer sites), so the
+        harness's own memo has never held task 42 at any point.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        # A writer site the harness does not own files the conflict.
+        foreign_sink = ProvenanceConflictSink(escalation_queue=h._escalation_queue)
+        foreign_sink.record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+
+        # The harness's own sink has never seen task 42.
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True, (
+            'a conflict filed by another writer site binds this gate too'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 0, (
+            'the hold is decided purely from durable store state — no doomed '
+            'write attempt at all'
+        )
+
+
 def _wired_absent_branch_harness(mock_orch_config) -> Harness:
     """Bare harness with resolve_branch_sha -> None (branch ref does not
     exist, e.g. a fresh task never dispatched).  is_ancestor and
