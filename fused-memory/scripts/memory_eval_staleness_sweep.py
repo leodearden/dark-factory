@@ -78,9 +78,15 @@ can never be misread as health.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
 import hashlib
 import logging
+import os
 import re
+import sys
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -1148,3 +1154,479 @@ async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
         for task_id, status in (statuses or {}).items()
         if status in TERMINAL
     })
+
+
+# ---------------------------------------------------------------------------
+# The human-readable report
+#
+# The shared module renders the metric TABLE. Everything here is what only
+# this runner knows: which families measured nothing, which scans were capped,
+# and which pointers were never writable in the first place.
+#
+# Nothing here adjudicates. No bound, no ratchet and no pass/fail verdict
+# appears in this output — all of that belongs to leaf α's evaluator (G6), and
+# a second home for it would drift from the first without anyone noticing.
+# ---------------------------------------------------------------------------
+
+_MAX_NAMED = 20
+"""Detail rows printed per section before the remainder is counted instead.
+
+The count of what was elided is always printed, so a long tail is visible as a
+number even when it is not enumerated. A section that silently stopped at
+twenty would read as a complete list of twenty.
+"""
+
+
+@dataclass(frozen=True)
+class ReportSection:
+    """One block of the report, under a STABLE machine key.
+
+    The key is never rendered — it exists so a caller (and a test) can ask
+    WHICH blocks a report carries, and in what order, without matching on the
+    English inside them. Prose is the part of this module expected to be
+    reworded; a check that keys on prose constrains wording rather than
+    behaviour, while keying on structure keeps the disclosure guarantees
+    falsifiable: a section that stops being emitted, or is emitted on the
+    wrong run, fails — and a copy edit does not. β's convention, for the same
+    reason.
+    """
+
+    key: str
+    lines: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return '\n'.join(self.lines)
+
+
+def _elided(rows: list[str], total: int) -> list[str]:
+    """*rows* plus a line naming how many more there were."""
+    if total > len(rows):
+        return [*rows, f'    ... and {total - len(rows)} more']
+    return rows
+
+
+def sweep_report_sections(
+    series,
+    *,
+    census: DanglingCensus,
+    tripwire_items: list,
+    surfacing: SurfacingObservation,
+    staleness: StalenessObservation,
+    scan_stats: dict[str, dict[str, int]],
+    terminal_join: TerminalTaskJoin,
+) -> tuple[ReportSection, ...]:
+    """The report, decomposed — one block per family, then the disclosures.
+
+    Every family gets a section whether or not it emitted a metric. That is
+    the point: a family that measured nothing omits its metric (a fabricated
+    zero-exposure datapoint in leaf α's baseline window is worse than a gap),
+    and without a section saying so the absence would read to a human as a
+    clean result.
+    """
+    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+
+    sections: list[ReportSection] = [
+        ReportSection('header', (
+            f'E4 staleness sweep — {series.eval_id} @ {series.run_stamp}',
+            f'corpus: {series.corpus.project_id}',
+            '',
+            'This report MEASURES. It evaluates no limit and reaches no',
+            'verdict; every threshold lives in the limits evaluator (leaf α).',
+        )),
+        ReportSection('metrics', ('', render_report(series).rstrip('\n'))),
+    ]
+
+    unmeasured = metric_families_not_measured(series)
+    if unmeasured:
+        sections.append(ReportSection('not_measured', (
+            '',
+            'NOT MEASURED this run (metric omitted, not zero):',
+            *(f'  {metric_id}' for metric_id in unmeasured),
+            '  An omitted metric is a gap in the trend, not a clean result.',
+        )))
+
+    sections.append(ReportSection('superseded_surfacing', (
+        '',
+        'Family 1 — superseded entries still surfacing',
+        f'  comparable pairs (both returned): {surfacing.pairs_comparable}',
+        f'  superseded above its successor:   {surfacing.still_surfacing}',
+        *_elided(
+            [
+                f'    {record.superseded_id} (rank {record.superseded_rank}) '
+                f'above {record.successor_id} (rank {record.successor_rank})'
+                for record in surfacing.inversions[:_MAX_NAMED]
+            ],
+            len(surfacing.inversions),
+        ),
+    )))
+
+    unresolved_rows = [
+        f'    {ref.key}: {ref.source_id} -> {ref.target!r}'
+        for ref in census.unresolved_refs[:_MAX_NAMED]
+    ]
+    sections.append(ReportSection('dangling_pointers', (
+        '',
+        'Family 2 — dangling pointer census',
+        f'  pointers examined: {census.examined}',
+        f'  resolved:          {census.resolved}',
+        f'  unresolved:        {census.unresolved}',
+        *(f'  {key}: {row}' for key, row in sorted(census.by_key.items())),
+        # Named, not just counted: a bare total tells an operator that
+        # something dangles but not which pointer to go and look at.
+        *_elided(unresolved_rows, len(census.unresolved_refs)),
+    )))
+
+    failing = [item for item in tripwire_items if not item.passed]
+    sections.append(ReportSection('successor_pointer_tripwire', (
+        '',
+        'Family 2b — successor pointer present (per supersedes edge)',
+        f'  edges checked: {len(tripwire_items)}',
+        f'  edges whose predecessor is gone: {len(failing)}',
+        *_elided([f'    {item.item_key}' for item in failing[:_MAX_NAMED]], len(failing)),
+    )))
+
+    sections.append(ReportSection('task_terminal_staleness', (
+        '',
+        'Family 3 — entries asserting live state for a terminal task',
+        f'  entries referencing a terminal task: {staleness.entries_referencing_terminal}',
+        f'  of those, asserting live state:      {staleness.stale}',
+        *_elided(
+            [
+                f'    {record.record_id} claims task {record.task_id} is live '
+                f'(actually {record.status})'
+                for record in staleness.records[:_MAX_NAMED]
+            ],
+            len(staleness.records),
+        ),
+    )))
+
+    if not terminal_join.available:
+        sections.append(ReportSection('task_backend_skipped', (
+            '',
+            'DISCLOSURE — the task join did not run:',
+            f'  {terminal_join.skipped_reason}',
+        )))
+
+    truncated = sorted(
+        category for category, row in scan_stats.items() if row.get('truncated')
+    )
+    if truncated:
+        sections.append(ReportSection('scan_truncation', (
+            '',
+            'DISCLOSURE — the scan hit its per-category cap:',
+            *(
+                f'  {category}: scanned {scan_stats[category]["scanned"]} '
+                '(the cap; there may be more)'
+                for category in truncated
+            ),
+            '  These families describe a CAPPED SAMPLE, not the whole corpus.',
+        )))
+
+    malformed = malformed_pointer_refs(census.unresolved_refs)
+    if malformed:
+        sections.append(ReportSection('malformed_pointers', (
+            '',
+            'DISCLOSURE — pointer members that could never name a memory:',
+            # Separated from genuinely-missing targets on purpose: "the target
+            # is gone" and "the pointer was never writable" have different
+            # fixes, and the aggregate count cannot express which this is.
+            *_elided(
+                [
+                    f'  {ref.key}: {ref.source_id} -> {ref.target!r}'
+                    for ref in malformed[:_MAX_NAMED]
+                ],
+                len(malformed),
+            ),
+        )))
+
+    return tuple(sections)
+
+
+def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
+    """Render *sections* to the text an operator reads.
+
+    Each section carries its own leading blank line, so this is a plain
+    concatenation — there is no separator policy here that could disagree with
+    what a section believes its own shape is.
+    """
+    return '\n'.join(line for section in sections for line in section.lines) + '\n'
+
+
+def write_report_text(path: str | Path, text: str) -> None:
+    """Replace the report at *path* with *text*, atomically.
+
+    A plain ``write_text`` would be a truncate-and-write over the file
+    ``write_metric_series`` had just written atomically — and that module's
+    ``_atomic_write_text`` exists precisely because the memory-eval leaves
+    share one artifact root that the dashboard reads as plain files. A crash
+    or a concurrent reader mid-write would leave a truncated report beside a
+    valid metrics artifact, the one state that atomicity was designed to
+    exclude. Widening the report must not reopen the hole.
+
+    The mechanism is copied rather than imported (β does the same):
+    ``_atomic_write_text`` is module-private in ``shared`` and this leaf holds
+    no lock on that package. ``mkstemp`` gives an OS-guaranteed exclusively
+    created sibling — not a pid-derived name, which concurrent writers under
+    the shared root could collide on.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# The read-only run band
+#
+# D8's runner pattern minus every mutation: CONFIG_PATH from --config,
+# FusedMemoryConfig(), MemoryService(), initialize(), try/finally close().
+#
+# There is no --apply band and no write call anywhere below. The guarantee is
+# asserted as BEHAVIOUR: the tests drive this band against a service double
+# whose every write method raises, so a run that completes never wrote.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SweepOutcome:
+    """Everything one run produced, for a caller that wants more than an exit code."""
+
+    series: Any
+    census: DanglingCensus
+    tripwire_items: list
+    surfacing: SurfacingObservation
+    staleness: StalenessObservation
+    scan_stats: dict[str, dict[str, int]]
+    terminal_join: TerminalTaskJoin
+    report: str
+    sections: tuple[ReportSection, ...]
+    """The report's blocks under their machine keys — ``report`` is their join.
+
+    Carried so a caller can ask what this run DISCLOSED without pattern
+    matching English out of the rendered text.
+    """
+    metrics_path: Path | None
+    report_path: Path | None
+
+
+def corpus_project_id(project_ids: tuple[str, ...]) -> str:
+    """The single ``Corpus.project_id`` for a run covering *project_ids*.
+
+    M1's Corpus carries one project id and this runner emits one artifact per
+    stamp, so a multi-project run needs a stable joined identifier. Single
+    project in, that project out — β's shape, so the two leaves' artifacts
+    stay comparable.
+    """
+    return '+'.join(project_ids)
+
+
+async def run_sweep(
+    memory: Any,
+    *,
+    project_ids: tuple[str, ...],
+    scan_limit: int,
+    out_root: str | Path,
+    stamp: str | None = None,
+    config: Any = None,
+    eval_id: str = EVAL_ID,
+    write_metrics: bool = True,
+) -> SweepOutcome:
+    """Sweep *project_ids* against *memory* and assemble the run's artifacts.
+
+    *memory* is injected rather than constructed here, which is what lets the
+    read-only guarantee be tested: the whole band runs against a double whose
+    write methods raise.
+
+    The series is built even when *write_metrics* is False, because the report
+    names which families went unmeasured and that answer comes from the
+    assembled series — a ``--no-metrics`` run must not be a less honest one.
+    """
+    from shared.memory_eval_metrics import run_stamp, write_metric_series  # noqa: PLC0415
+
+    effective_stamp = stamp or run_stamp()
+
+    records: list[dict[str, Any]] = []
+    scan_stats: dict[str, dict[str, int]] = {}
+    refs: list[PointerRef] = []
+    resolution: dict[str, bool] = {}
+    surfacings: list[SurfacingObservation] = []
+
+    for project_id in dict.fromkeys(project_ids):
+        project_records, project_stats = await fetch_pointer_records(
+            memory, project_id, scan_limit=scan_limit,
+        )
+        records.extend(project_records)
+        for category, row in project_stats.items():
+            merged = scan_stats.setdefault(category, {'scanned': 0, 'truncated': 0})
+            merged['scanned'] += row['scanned']
+            merged['truncated'] = max(merged['truncated'], row['truncated'])
+
+        project_refs = [ref for record in project_records for ref in pointer_targets(record)]
+        refs.extend(project_refs)
+        resolution.update(
+            await resolve_pointer_targets(memory, project_id, project_refs),
+        )
+        surfacings.append(await fetch_surfacing_ranks(memory, project_id, project_refs))
+
+    terminal_join = (
+        await fetch_terminal_task_ids(config) if config is not None
+        else TerminalTaskJoin(statuses={}, skipped_reason=(
+            'no config was supplied to this run, so no task statuses could be '
+            'read. The task-terminal-staleness family was NOT measured — its '
+            'absence from the metrics is a gap, not a clean result.'
+        ))
+    )
+
+    census = dangling_census(refs, resolution)
+    tripwire_items = successor_pointer_items(refs, resolution)
+    surfacing = combine_surfacing(surfacings)
+    staleness = terminal_staleness(records, terminal_join.statuses)
+
+    corpus_counts = {
+        f'scanned_{category}': row['scanned'] for category, row in sorted(scan_stats.items())
+    }
+    corpus_counts.update({
+        f'truncated_{category}': row['truncated']
+        for category, row in sorted(scan_stats.items())
+    })
+
+    series = build_series(
+        census=census,
+        tripwire_items=tripwire_items,
+        surfacing=surfacing,
+        staleness=staleness,
+        corpus_counts=corpus_counts,
+        project_id=corpus_project_id(tuple(project_ids)),
+        stamp=effective_stamp,
+        eval_id=eval_id,
+    )
+
+    sections = sweep_report_sections(
+        series,
+        census=census,
+        tripwire_items=tripwire_items,
+        surfacing=surfacing,
+        staleness=staleness,
+        scan_stats=scan_stats,
+        terminal_join=terminal_join,
+    )
+    report = join_report_sections(sections)
+
+    metrics_path: Path | None = None
+    report_path: Path | None = None
+    if write_metrics:
+        metrics_path, report_path = write_metric_series(
+            series, out_root, stamp=effective_stamp,
+        )
+        # The shared writer lays down its own metric table; replace it with
+        # this runner's fuller text, atomically, so the two artifacts under
+        # one stamp never disagree about what the run found.
+        write_report_text(report_path, report)
+
+    return SweepOutcome(
+        series=series,
+        census=census,
+        tripwire_items=tripwire_items,
+        surfacing=surfacing,
+        staleness=staleness,
+        scan_stats=scan_stats,
+        terminal_join=terminal_join,
+        report=report,
+        sections=sections,
+        metrics_path=metrics_path,
+        report_path=report_path,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface — δ's flag vocabulary, minus every mutation flag.
+
+    There is deliberately no ``--apply``, ``--fix`` or ``--prune``: this sweep
+    reports, and a reporting runner with a mutation flag is one refactor away
+    from being a repair tool nobody reviewed as one. The absence is asserted
+    by equality in the tests, so adding one is a decision, not a slip.
+    """
+    parser = argparse.ArgumentParser(description=(
+        'Read-only E4 staleness sweep: superseded surfacing, dangling-pointer '
+        'census, and task-terminal staleness. Reports; never repairs.'
+    ))
+    parser.add_argument(
+        '--project-id', dest='project_id', required=True,
+        help='Project id to sweep',
+    )
+    parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=5000,
+        help='Maximum number of memories to scan PER CATEGORY (default: 5000). '
+             'A cap that fires is disclosed in the report and in corpus.counts.',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    parser.add_argument(
+        '--metrics-root', dest='metrics_root', default=_DEFAULT_METRICS_ROOT,
+        help=f'Root for M1 metric artifacts (default: {_DEFAULT_METRICS_ROOT})',
+    )
+    parser.add_argument(
+        '--eval-id', dest='eval_id', default=EVAL_ID,
+        help=f'Artifact directory name under --metrics-root (default: {EVAL_ID})',
+    )
+    parser.add_argument(
+        '--no-metrics', dest='no_metrics', action='store_true',
+        help='Skip the metrics artifact (report to stdout only)',
+    )
+    return parser
+
+
+async def _run(args: argparse.Namespace) -> int:
+    """Build a live MemoryService, sweep, print the report."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    # Imported as MODULE ATTRIBUTES, function-locally (D8): that indirection
+    # is the seam the read-only double patches, so the guarantee is testable
+    # end to end without a test-only hook in this script.
+    import fused_memory.config.schema as _schema  # noqa: PLC0415
+    import fused_memory.services.memory_service as _service  # noqa: PLC0415
+
+    config = _schema.FusedMemoryConfig()
+    memory = _service.MemoryService(config)
+    await memory.initialize()
+    try:
+        outcome = await run_sweep(
+            memory,
+            project_ids=(args.project_id,),
+            scan_limit=args.scan_limit,
+            out_root=args.metrics_root,
+            config=config,
+            eval_id=args.eval_id,
+            write_metrics=not args.no_metrics,
+        )
+    finally:
+        await memory.close()
+
+    print(outcome.report, end='')
+    if outcome.metrics_path is not None:
+        logger.info('metrics: %s', outcome.metrics_path)
+        logger.info('report:  %s', outcome.report_path)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(_run(build_parser().parse_args(argv)))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
