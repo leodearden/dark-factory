@@ -22,9 +22,8 @@ import subprocess
 import zlib
 from pathlib import Path
 
-import pytest
-
 import migrate_transcript_archive_gunzip as mig
+import pytest
 
 LOG_PREFIX = "migrate_transcript_archive_gunzip:"
 

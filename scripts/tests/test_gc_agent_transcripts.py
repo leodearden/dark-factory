@@ -17,9 +17,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import gc_agent_transcripts as gct
+import pytest
 from gc_agent_transcripts import select_prunable
 
 LOG_PREFIX = "gc_agent_transcripts:"
@@ -404,7 +403,7 @@ def test_default_constants_match_orchestrator_config():
     """
     from orchestrator.config import RetentionConfig, TranscriptArchiveConfig
 
-    assert gct.ARCHIVE_ROOT_RELATIVE == TranscriptArchiveConfig().root
+    assert TranscriptArchiveConfig().root == gct.ARCHIVE_ROOT_RELATIVE
     assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
     assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000

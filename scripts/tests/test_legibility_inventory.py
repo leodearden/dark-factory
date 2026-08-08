@@ -27,8 +27,9 @@ from functools import lru_cache
 from pathlib import Path
 
 import pytest
+from legibility import digest
+from legibility import inventory as mod
 
-from legibility import digest, inventory as mod
 from orchestrator import session_registry
 
 # Repo root from scripts/tests/ — the same parents[2] derivation
