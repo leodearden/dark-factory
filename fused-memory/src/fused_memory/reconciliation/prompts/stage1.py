@@ -3,6 +3,8 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -37,6 +39,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
@@ -95,6 +98,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
+
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \

@@ -12,6 +12,8 @@ from fused_memory.reconciliation.predicate_contradiction import (
 from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -32,6 +34,7 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 - Memory: `mcp__fused-memory__search`, `mcp__fused-memory__get_entity`, \
 `mcp__fused-memory__get_episodes`, `mcp__fused-memory__add_memory`, \
 `mcp__fused-memory__delete_memory`, `mcp__fused-memory__update_edge`
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
 `mcp__fused-memory__set_task_status`, `mcp__fused-memory__submit_task`, \
 `mcp__fused-memory__resolve_ticket`, `mcp__fused-memory__update_task`, \
@@ -192,6 +195,8 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
 {get_recon_report_tool_guidance()}
+
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \
