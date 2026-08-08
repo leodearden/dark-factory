@@ -674,3 +674,183 @@ class TestChainBuildLane:
         git_ops = _make_git_ops(git_repo)
         await release_chain_build_lane(git_ops, None, warm=False)
         await release_chain_build_lane(git_ops, None, warm=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-09: RED — SpeculativeMergeWorker.chain_snapshot()
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestChainSnapshot:
+    """chain_snapshot() returns queued items in pick order without mutating."""
+
+    async def test_returns_merge_request_objects_not_ids(self, git_repo: Path):
+        """Contrast with unfrozen_suffix(), which returns request_id strings."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        reqs = [_make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)]
+        worker._lane_buffers['normal'].extend(reqs)
+
+        snap = worker.chain_snapshot()
+
+        assert isinstance(snap, tuple)
+        assert len(snap) == 3
+        for got, want in zip(snap, reqs, strict=True):
+            assert got is want
+
+    async def test_is_the_merge_request_typed_twin_of_unfrozen_suffix(
+        self, git_repo: Path,
+    ):
+        """The headline ordering invariant: same order as unfrozen_suffix()."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['high'].extend([
+            _make_req('201', '201', config, git_repo, lane='high'),
+            _make_req('202', '202', config, git_repo, lane='high'),
+        ])
+        worker._lane_buffers['normal'].extend([
+            _make_req('101', '101', config, git_repo),
+            _make_req('102', '102', config, git_repo),
+        ])
+
+        assert tuple(
+            r.request_id for r in worker.chain_snapshot()
+        ) == worker.unfrozen_suffix()
+
+    async def test_high_lane_precedes_normal_lane(self, git_repo: Path):
+        """Lane priority matches MERGE_LANES = ('high', 'normal')."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        hi = _make_req('201', '201', config, git_repo, lane='high')
+        lo = _make_req('101', '101', config, git_repo)
+        # Append the normal-lane item FIRST to prove lane order, not insert order.
+        worker._lane_buffers['normal'].append(lo)
+        worker._lane_buffers['high'].append(hi)
+
+        assert [r.task_id for r in worker.chain_snapshot()] == ['201', '101']
+
+    async def test_fifo_within_lane_not_aging_key_order(self, git_repo: Path):
+        """Append order wins over merge_first_enqueued_at (the requeue case).
+
+        `_note_requeue` re-appends at the deque TAIL while retaining an old
+        `merge_first_enqueued_at`, so aging order genuinely diverges from FIFO.
+        Sorting by `_aging_key` here would disagree with BOTH order authorities
+        (unfrozen_suffix iterates the deque directly; _pop_next_pickable scans
+        FIFO and degrades to buf[0] on an empty conflict graph) and would break
+        the contiguous-prefix property δ's in-order CAS walk depends on.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        first = _make_req('101', '101', config, git_repo)
+        second = _make_req('102', '102', config, git_repo)
+        # Opposite order to the append order: `second` looks OLDER by aging key.
+        first.merge_first_enqueued_at = 2000.0
+        second.merge_first_enqueued_at = 1000.0
+        worker._lane_buffers['normal'].extend([first, second])
+
+        assert [r.task_id for r in worker.chain_snapshot()] == ['101', '102']
+
+    async def test_does_not_mutate_the_lane_buffers(self, git_repo: Path):
+        """Nothing is popped — build_chain must be pure w.r.t. queue state."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+        before = [list(b) for b in worker._lane_buffers.values()]
+
+        worker.chain_snapshot()
+
+        assert [list(b) for b in worker._lane_buffers.values()] == before
+
+    async def test_fires_no_lifecycle_transition(self, git_repo: Path):
+        """Contrast with _pop_next_pickable, which fires LANE_BUFFERED→MERGING."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
+        )
+        before = dict(worker._lifecycle._states)
+
+        worker.chain_snapshot()
+
+        assert dict(worker._lifecycle._states) == before
+
+    async def test_is_idempotent(self, git_repo: Path):
+        """Two consecutive calls return equal tuples."""
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
+        )
+
+        assert worker.chain_snapshot() == worker.chain_snapshot()
+
+    async def test_empty_queue_returns_empty_tuple(self, git_repo: Path):
+        git_ops = _make_git_ops(git_repo)
+        worker = _make_worker(git_ops)
+
+        assert worker.chain_snapshot() == ()
+
+    async def test_halted_lanes_are_excluded(self, git_repo: Path):
+        """A halted lane's items are not dispatchable, so they cannot chain.
+
+        Matches _pop_next_pickable's is_lane_halted skip.  This is the one
+        deliberate divergence from unfrozen_suffix(), which reports the whole
+        buffer region regardless of halt state — chaining an item the pipeline
+        cannot land would build an unlandable tip.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['high'].append(
+            _make_req('201', '201', config, git_repo, lane='high'),
+        )
+        worker._lane_buffers['normal'].append(_make_req('101', '101', config, git_repo))
+        worker.halt_lane('high', 'test halt')
+        assert worker.is_lane_halted('high')
+
+        assert [r.task_id for r in worker.chain_snapshot()] == ['101']
+
+
+class TestChainSnapshotIsSync:
+    """chain_snapshot is pure/synchronous — callable with no running loop.
+
+    Unmarked (sync) class: a sync test_* inside an @pytest.mark.asyncio class
+    is an ERROR under this file's filterwarnings config.  Uses function
+    introspection plus an empty-buffer call rather than staging requests,
+    because _make_req needs a running loop — which would defeat the point.
+    """
+
+    def test_chain_snapshot_is_not_a_coroutine_function(self):
+        import asyncio as _asyncio
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        assert not _asyncio.iscoroutinefunction(
+            SpeculativeMergeWorker.chain_snapshot,
+        )
+
+    def test_callable_with_no_running_event_loop(self, git_repo: Path):
+        """An empty-buffer call returns () outside any event loop.
+
+        Same contract as frozen_prefix / unfrozen_suffix / frozen_prefix_tip /
+        _pop_next_pickable, so chain_snapshot stays callable from snapshot().
+        """
+        import asyncio as _asyncio
+
+        with pytest.raises(RuntimeError):
+            _asyncio.get_running_loop()
+
+        worker = _make_worker(_make_git_ops(git_repo))
+
+        assert worker.chain_snapshot() == ()
