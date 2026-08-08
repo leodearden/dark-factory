@@ -402,6 +402,79 @@ class TestResolveCostUsd:
         assert cost == pytest.approx(6.0)
 
 
+class TestComposeCostSource:
+    """Task 3656: collapse a TWO-COMPONENT cost sum's provenance to ONE label.
+
+    ``run_architect_eval``'s ``cost_usd`` is architect spend PLUS plan-judge
+    spend. Only the architect component is resolved through
+    :func:`resolve_cost_usd`; the judge is always a native-cloud opus call, so
+    its component is always CLI-sourced and re-resolving it against the
+    candidate's price table would price opus tokens at a vLLM rate. That makes
+    one ``cost_source`` label describe two differently-sourced components the
+    moment the architect side resolves to ``price_table`` / ``unpriced_proxy``
+    — so the label COMPOSES: agreement → that source, disagreement (with judge
+    dollars actually in the sum) → ``'mixed'``.
+
+    ``'mixed'`` is deliberately the SAME word ``report._summarize_cost_source``
+    already emits for the cross-trial form of the same situation, so the
+    reporting vocabulary stays one word list and no report-side change is
+    needed.
+    """
+
+    _SOURCES = ('cli', 'price_table', 'unpriced_proxy')
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_no_second_component_keeps_the_primary_verbatim(self, primary):
+        """$0 judge spend → no second component entered the sum, so the label
+        describes the primary alone (every judge-SKIPPED architect branch)."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=0.0) == primary
+
+    def test_agreeing_sources_keep_that_source(self):
+        """TODAY'S architect cell: a native candidate resolves 'cli' and the
+        judge is 'cli' too, so a spending judge must NOT make it 'mixed'."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source('cli', secondary_cost_usd=0.42) == 'cli'
+
+    def test_price_table_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'price_table', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    def test_unpriced_proxy_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'unpriced_proxy', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_negative_secondary_is_treated_as_no_second_component(self, primary):
+        """Defensive: ``coerce_cost_usd`` already floors a nonsense figure to
+        0.0 upstream, but a negative that slipped through must never MANUFACTURE
+        a 'mixed' label out of spend that did not happen."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=-1.0) == primary
+
+    def test_secondary_source_is_overridable(self):
+        """The ``secondary`` default names the plan judge's always-native-cloud
+        provenance; a caller with a differently-sourced second component states
+        it, rather than the helper hardcoding one caller's assumption."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'price_table', secondary_cost_usd=0.42, secondary='price_table',
+        ) == 'price_table'
+        assert compose_cost_source(
+            'cli', secondary_cost_usd=0.42, secondary='unpriced_proxy',
+        ) == 'mixed'
+
+
 # ---------------------------------------------------------------------------
 # Task 2477 step-03: blend_composite — the C4 efficiency-adjusted composite
 # ---------------------------------------------------------------------------
