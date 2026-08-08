@@ -207,27 +207,6 @@ def marked_span(md_text: str, name: str, *, source: str) -> str:
     return md_text[comment_close + len("-->") : end_index]
 
 
-_CARDINAL_WORDS = (
-    "one",
-    "two",
-    "three",
-    "four",
-    "five",
-    "six",
-    "seven",
-    "eight",
-    "nine",
-    "ten",
-    "eleven",
-    "twelve",
-)
-
-_CARDINAL_CLAIM_RE = re.compile(
-    r"\b(" + "|".join(_CARDINAL_WORDS) + r"|\d+)\s+(?:invariants|ids|slugs)\b",
-    re.IGNORECASE,
-)
-
-
 # A backticked token whose ENTIRE content is the canonical slug shape. Requiring
 # the closing backtick immediately after the run is what excludes every
 # backticked non-slug the docs carry beside real slugs: `INV-5` (uppercase),
@@ -278,47 +257,11 @@ def dark_factory_family_row(md_text: str) -> str:
     return rows[0]
 
 
-def section_span(md_text: str, heading_prefix: str, *, source: str) -> str:
-    """One markdown section: its ``## <heading_prefix>…`` line to the next ``## ``.
-
-    Line-anchored on the heading rather than sliced by index of a substring, so a
-    section name quoted inside a paragraph elsewhere cannot re-target the span.
-    Stops at the next ``## `` specifically — not at the next heading of any level
-    — so the section's own ``###`` sub-headings stay inside it.
-
-    Loud on an absent or duplicated heading, never a ``''`` return. This
-    extractor feeds ABSENCE assertions, where an empty span is the worst possible
-    silent failure: it satisfies "contains no restated slug" by containing
-    nothing at all.
-    """
-    lines = md_text.splitlines()
-    starts = [i for i, line in enumerate(lines) if line.startswith(f"## {heading_prefix}")]
-    assert len(starts) == 1, (
-        f"{source}: expected exactly one `## {heading_prefix}…` heading, found "
-        f"{len(starts)} (task 3802). Absent means the section was renamed or "
-        f"renumbered and this guard would pin nothing; duplicated means one of "
-        f"the two copies is unchecked. Update the heading prefix constant in "
-        f"scripts/tests/test_design_invariants_consistency.py, or de-duplicate "
-        f"the section."
-    )
-
-    start = starts[0]
-    end = next(
-        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
-        len(lines),
-    )
-    return "\n".join(lines[start:end])
-
-
 # A rehearsal verdict row, anchored on its Fixture ID cell. Matched by ROW SHAPE
 # over the whole document rather than per-table: the live row set is split over a
 # base table plus two dated addendum tables, so "parse the table" would silently
 # cover a third of it.
 _VERDICT_ROW_RE = re.compile(r"^\| `INV-(\d+)-(PRD|CODE)` \|")
-
-# The legend's own cumulative-count claim — a second thing that does not
-# auto-extend when an addendum walk adds rows.
-_CUMULATIVE_ROWS_RE = re.compile(r"(\d+) rows cumulative")
 
 _BACKTICKED_SLUG_RE = re.compile(r"^`([a-z0-9][a-z0-9-]*)`$")
 
@@ -404,17 +347,6 @@ def assert_verdict_table_covers(
         f"stale cell rehearses the wrong acceptance."
     )
 
-    claims = _CUMULATIVE_ROWS_RE.findall(md_text)
-    assert len(claims) == 1, (
-        f"{source}: expected exactly one `<N> rows cumulative` legend claim, "
-        f"found {len(claims)}: {claims} (task 3802)."
-    )
-    assert int(claims[0]) == len(rows), (
-        f"{source}: the legend claims {claims[0]} rows cumulative but the tables "
-        f"carry {len(rows)} (task 3802) — update the legend when an addendum "
-        f"walk adds rows."
-    )
-
 
 # Every site this module pins, and WHAT is pinned there. Registration means "this
 # file's relationship to the family is mechanized", not "this file enumerates" —
@@ -433,10 +365,7 @@ PINNED_SITES = {
         "two independent enumerations — the family-inventory row (ordered) and "
         "the `inv-trigger-shapes` G7 fallback span (set)"
     ),
-    "CONTRIBUTING.md": (
-        "pinned as an ABSENCE: zero restated slugs, no cardinal family count in "
-        "§6, and a live pointer at the normative doc in its place"
-    ),
+    "CONTRIBUTING.md": ("pinned as an ABSENCE: it must restate NO slug at all"),
 }
 
 # Four distinct slugs is an enumeration, not a discussion. Below it sit the docs
@@ -1051,107 +980,22 @@ def test_gates_trigger_shape_list_covers_every_invariant() -> None:
 # anti-restatement rule itself.
 # ---------------------------------------------------------------------------
 
-_CONTRIBUTING_SECTION = "6. Design invariants"
-
-_SECTION_DOC = """\
-# Contributing
-
-## 5. Git workflow
-
-Branch off main.
-
-## 6. Design invariants & PRD gates
-
-Every task in a batch is walked against the invariants.
-
-### A sub-heading inside §6
-
-Still inside section six.
-
-## 7. Commit messages
-
-Match the observed convention.
-"""
-
-_SECTION_DOC_DUPLICATED = """\
-## 6. Design invariants & PRD gates
-
-First copy.
-
-## 7. Commit messages
-
-## 6. Design invariants & PRD gates
-
-Second copy, e.g. from a bad merge.
-"""
-
-
-def test_section_span_stops_at_the_next_top_level_heading() -> None:
-    """The span covers the section's own body — sub-headings in, siblings out.
-
-    Stopping at the next ``## `` (not at the next heading of any level) is what
-    keeps §6's own sub-headings inside the span while excluding §5 and §7. A span
-    that ran to EOF would make the absence assertions below pin the whole file
-    under a section's name, which is a different — and much more brittle — claim
-    than the one this test means to make.
-    """
-    span = section_span(_SECTION_DOC, _CONTRIBUTING_SECTION, source=_FIXTURE_SOURCE)
-
-    assert "Every task in a batch is walked" in span
-    assert "Still inside section six" in span, "a `###` sub-heading must not end the span"
-    assert "Branch off main" not in span, "the span must not run backwards into §5"
-    assert "Match the observed convention" not in span, "the span must stop at the next `## `"
-
-
-@pytest.mark.parametrize(
-    ("markdown_text", "heading_prefix", "case", "expected_phrase"),
-    [
-        pytest.param(
-            _SECTION_DOC, "9. No such section", "absent", "found 0", id="section-absent"
-        ),
-        pytest.param(
-            _SECTION_DOC_DUPLICATED,
-            _CONTRIBUTING_SECTION,
-            "duplicated",
-            "found 2",
-            id="section-duplicated",
-        ),
-    ],
-)
-def test_section_span_fails_loudly(
-    markdown_text: str, heading_prefix: str, case: str, expected_phrase: str
-) -> None:
-    """A missing or duplicated heading RAISES — never returns ''.
-
-    An empty span passes every absence assertion below by containing nothing to
-    find, which is the vacuity failure in its purest form: the guard would report
-    success precisely because it had stopped looking.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        section_span(markdown_text, heading_prefix, source=_FIXTURE_SOURCE)
-
-    message = str(excinfo.value)
-    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
-    assert heading_prefix in message, f"{case}: message must name the heading: {message!r}"
-    assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
-
-
 def test_contributing_does_not_restate_the_invariant_family() -> None:
     """LIVE: CONTRIBUTING.md points at the normative doc instead of copying it.
 
-    Two assertions, one theme — this site is pinned as an ABSENCE:
+    ONE assertion — whole-file, zero canonical slugs. CONTRIBUTING.md §6 used to
+    restate all eight, twelve lines above its own rule forbidding restatement.
+    Re-syncing that list would have fixed the contradiction and left the site
+    free to drift again on the next invariant; deleting it means there is nothing
+    left to drift. This is the anti-restatement rule made machine-checkable — it
+    fails the moment anyone re-introduces a copy, which a content-equality pin
+    never would.
 
-    (a) WHOLE-FILE, zero canonical slugs. CONTRIBUTING.md §6 used to restate all
-        eight, twelve lines above its own rule forbidding restatement. Re-syncing
-        that list would have fixed today's contradiction and left the site free to
-        drift again on the next invariant; deleting it means there is nothing left
-        to drift. This assertion is the anti-restatement rule made machine-
-        checkable — it fails the moment anyone re-introduces a copy, which a
-        content-equality pin never would.
-
-    (b) §6 SPAN carries no `<cardinal> invariants` phrase and DOES carry the
-        literal path `docs/legibility/design-invariants.md`, so the bullet stays a
-        working pointer rather than becoming a dangling reference.
+    Deliberately the ONLY assertion here. Earlier revisions also pinned §6's
+    prose (no `<cardinal> invariants` phrase, must contain the normative doc's
+    literal path); both were substring pins on wording that would fire on an
+    ordinary editorial rewrite rather than on family drift, and neither is a
+    cross-artifact structural claim. Removed in the task-3802 review remediation.
     """
     text = CONTRIBUTING_DOC.read_text(encoding="utf-8")
     source = _repo_relative(CONTRIBUTING_DOC)
@@ -1167,24 +1011,6 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
         f"gone stale once and cannot be kept current by policy alone."
     )
 
-    section = section_span(text, _CONTRIBUTING_SECTION, source=source)
-
-    stale_count = _CARDINAL_CLAIM_RE.search(section)
-    assert stale_count is None, (
-        f"{source} §{_CONTRIBUTING_SECTION} states the family size in prose "
-        f"({stale_count.group(0)!r} — task 3802). Nothing here needs a count: "
-        f"de-number the sentence (\"the single normative copy\") so it cannot go "
-        f"stale when an invariant is added."
-    )
-
-    assert _repo_relative(NORMATIVE_DOC) in section, (
-        f"{source} §{_CONTRIBUTING_SECTION} no longer names "
-        f"{_repo_relative(NORMATIVE_DOC)} (task 3802). This section is pinned as "
-        f"an ABSENCE — it must not restate the invariants — which only works if "
-        f"it still POINTS at the doc that does. Without the path, deleting the "
-        f"restatement just turned the G7 bullet into a dangling reference."
-    )
-
 
 # ---------------------------------------------------------------------------
 # The fixtures doc's rehearsal verdict table — pinned for COVERAGE only
@@ -1194,9 +1020,11 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 # those source docs, and tells readers to re-walk rather than trust the quoted
 # rationale as current. So this guard asserts COVERAGE — every invariant present
 # in both PRD and CODE shape, each row's Expected-slug cell equal to the
-# canonical slug, the legend's cumulative count current — and never the prose.
-# Coverage is the property that actually fails to auto-extend when an invariant
-# is added, so it is the right thing to mechanize.
+# canonical slug — and never the prose. Coverage is the property that actually
+# fails to auto-extend when an invariant is added, so it is the right thing to
+# mechanize. The legend's "<N> rows cumulative" line is deliberately NOT pinned:
+# that is a transcribed number, and the doc's own Snapshot caveat already tells
+# readers to re-walk rather than trust one.
 # ---------------------------------------------------------------------------
 
 _SMALL_FAMILY = [(1, "a-slug"), (2, "b-slug")]
@@ -1230,8 +1058,6 @@ _VERDICT_WRONG_SLUG = _VERDICT_HAPPY.replace(
 )
 
 _VERDICT_UNKNOWN_NUMBER = _VERDICT_HAPPY.replace("| `INV-2-CODE` |", "| `INV-9-CODE` |")
-
-_VERDICT_STALE_LEGEND = _VERDICT_HAPPY.replace("4 rows cumulative", "5 rows cumulative")
 
 _VERDICT_TOO_FEW_COLUMNS = "| `INV-1-PRD` | PRD |\n"
 
@@ -1280,7 +1106,6 @@ def test_assert_verdict_table_covers_accepts_a_complete_table() -> None:
         pytest.param(_VERDICT_MISSING_CODE, "missing CODE row", "CODE", id="missing-code-row"),
         pytest.param(_VERDICT_WRONG_SLUG, "wrong expected slug", "a-slug", id="wrong-slug"),
         pytest.param(_VERDICT_UNKNOWN_NUMBER, "unknown invariant", "9", id="unknown-number"),
-        pytest.param(_VERDICT_STALE_LEGEND, "stale legend", "5", id="stale-legend-count"),
     ],
 )
 def test_assert_verdict_table_covers_rejects_drift(
