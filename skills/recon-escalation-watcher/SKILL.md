@@ -515,19 +515,25 @@ the primary return-triage surface across both watchers:
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>] \
-  [--escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations]
+  --escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
+  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (e.g. `esc-recon-abc-1`) is the natural choice. Re-filing the same id overwrites
   the prior record rather than duplicating it.
-  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so the
-  orchestrator's `escalation-watcher` may already have filed a decision under this id for the same
-  underlying human gate. Before filing, check whether a decision for that id already exists and is
-  still `open`; if it is, do **not** overwrite it — a second watcher observing the same gate must
-  enrich or no-op, never clobber richer context or downgrade an existing record's severity. Park
-  your recon record and append the id to your handled set instead.
+  **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
+  the orchestrator's `escalation-watcher` may already have filed a decision under this id for the
+  same underlying human gate. The verb now handles that for you: if an `open` record already exists
+  at this id and was filed from a **different** `--escalations-dir`, your filing **enriches** it
+  instead of overwriting — non-empty fields survive, fields the first filer left empty are filled
+  from yours, `severity` takes the **max** of the two and is never downgraded, and
+  `filed_at`/`state`/`manual_boost` stay with the first filer (so you cannot reset an operator's
+  cockpit boost or re-open a closed row). Just file; you do not need to look first.
+  Two deliberate limits: a re-file from the **same** queue is still a plain idempotent whole-file
+  overwrite — that is the restart promise above, and you are the sole authority on your own
+  escalation — and only an `open` record is protected, since a filing against an `answered` one is
+  a new ask rather than an enrichment of a live question.
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
@@ -535,17 +541,24 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
-- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
+- **`--escalations-dir`** (**mandatory**): the escalation **queue** your `--escalation-id` belongs
+  to — for this
   watcher, `$DARK_FACTORY_ROOT/data/reconciliation/escalations`. It must name the SAME queue you
   later pass to `reap-decisions` (below). Decision records are fleet-global while an escalation id
   is unique only *within* one queue, and this project runs two of them over the same
   `esc-<taskid>-<n>` namespace, so this is what lets the reaper join a decision back to the right
   per-queue id namespace instead of matching an unrelated same-named orchestrator escalation.
-  Stored normalized, so any spelling of the same directory works. Omitting it files a queue-less
-  record — see the hazard note below.
+  Stored normalized, so any spelling of the same directory works. **You can no longer file without
+  it** (task 3559): omit the flag and the verb exits 2 with nothing filed, and pass it empty and it
+  refuses with a loud error and prints no id — so if the id doesn't come back on stdout, your
+  filing did not land. It is the same directory you already pass to `reap-decisions`.
   There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
-  "this record's owning queue was investigated and could not be determined". You never write it;
-  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  "this record's owning queue was investigated and could not be determined". You never write it —
+  and that is now enforced, not just asked: `write-decision` **rejects**
+  `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*
+  reaper and could only ever be closed by hand. It stays valid on the back-fill path
+  (`set_decision_escalations_dir`), which is where task 3640 wrote it, for legacy records whose
+  escalation id resolved in several queues at
   once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
   falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
   the reaper refuses to close it at all.
@@ -581,19 +594,20 @@ decision vanishes from the cockpit queue while its own escalation is still pendi
 Passing `--escalations-dir` on `write-decision` is what makes the reaper skip cross-queue records:
 it stamps the owning queue on the decision, and a reaper scanning a *different* queue leaves that
 decision alone. Keep the two dirs straight regardless — a queue-less legacy record (filed before
-that flag existed) falls back to project-only scoping and has no such protection. Task 3640
-**back-filled** that pre-existing open population, so the unprotected set is now drained rather
-than merely shrinking — but only for records that existed at back-fill time. A decision you file
-today without the flag lands straight back in it.
+that flag existed, i.e. the **pre-existing** population only) falls back to project-only scoping and
+has no such protection. Task 3640 **back-filled** that population, and task 3559 made the flag
+mandatory at the verb, so no new queue-less record can be created through `write-decision`. That is
+what makes the back-fill terminal rather than a recurring chore: the unprotected set can now only
+shrink.
 
 **This queue is FLEET-WIDE, and that widens the collision surface.**
 `data/reconciliation/escalations` holds reconciliation escalations for reify, autopilot_video,
 solar_challenge, know_live and pump_web_ui as well as dark_factory. So an `esc-<taskid>-<n>` filed
 here routinely collides with an id in one of *those* projects' own orchestrator queues — e.g.
 `esc-5773-1` exists in both this queue and `reify/data/escalations`. Such collisions are
-**expected, not anomalous**, and they are the reason passing `--escalations-dir` on every
-`write-decision` matters for non-dark_factory projects too: without it, a record filed here is
-false-closable by a reaper running in a project you have never touched.
+**expected, not anomalous**, and they are why `--escalations-dir` is now **mandatory** on every
+`write-decision` rather than merely advisable — the stakes reach beyond dark_factory: without it, a
+record filed here is false-closable by a reaper running in a project you have never touched.
 
 A decision stamped `<unknown>` is **refused**, not closed: no reaper may close it, and it stays a
 visible cockpit row until a human closes it. The reaper never defaults to closing on doubt — an
@@ -610,8 +624,12 @@ Two collision modes exist and must not be conflated:
   human gate. These must collapse to **ONE** cockpit decision — a human asked the same question
   twice is its own regression. That is why the queue is recorded as a *field* on the record rather
   than namespaced into the decision id (`recon:esc-…` / `orch:esc-…` would double-file the same
-  question), and why a second watcher must never downgrade an existing record's severity (see the
-  interim rule under `--id` above).
+  question). A second watcher must never downgrade an existing record's severity — and since task
+  3559 the verb **enforces** that rather than asking you to remember it: a filing from a different
+  queue against an `open` record enriches it, never clobbering or downgrading (see `--id` above).
+  The queue stamp is scalar, so the collapsed record keeps the **first** filer's queue and is
+  therefore reapable only by that queue's reaper; the verb logs a warning naming both queues when
+  it discards the other.
 
 This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
 escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
