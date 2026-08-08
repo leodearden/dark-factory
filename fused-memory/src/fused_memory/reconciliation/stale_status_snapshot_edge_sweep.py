@@ -161,6 +161,49 @@ Design decisions (captured in plan.json):
   'status', so "Task N's state is pending" is still not extracted — the
   same deliberate fail-safe under-selection direction as the task-3042
   residual above.
+- The plural enumeration is required to be the copula's SUBJECT, via TWO
+  remedies that are BOTH necessary: plural agreement on the copula
+  (``_PLURAL_COPULA_ALT``) and negative lookbehinds for a preceding
+  preposition (``_ENUM_NO_PREP_LB``). Adjacency of the marker to the
+  copula does NOT establish subjecthood — that was the defect: in "The
+  merge of tasks A and B is blocked" the plural NP is a preposition's
+  complement and the MERGE is what is blocked, yet the fact would be
+  retired the instant either id went terminal. Neither remedy suffices
+  alone: agreement kills the singular-outer-head shapes but not a plural
+  outer head ("Dependencies for tasks A and B are blocked" — the copula
+  agrees with 'Dependencies'), while the lookbehind is a closed word list.
+  Deliberate residual, fail-safe direction: an unlisted preposition, or a
+  multi-space/newline gap before 'tasks', still slips through. Note
+  ``_COPULA_ALT`` is untouched and still shared by the other paths; only
+  this one narrows. (amendment, reviewer_comprehensive
+  correctness-precision finding, task 3079)
+- ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
+  quantifiers. Greedily written, the separator's trailing '\\s*' overlaps
+  its own leading '\\s*,\\s*'/'\\s+', so a whitespace run between two ids
+  can be apportioned (w+1) ways and the '+' repetition has (w+1)**n
+  parses — all explored whenever the overall match FAILS, which is the
+  common case since most enumerations in prose are not followed by a
+  copula and a marker. The sharper finding is that the base scales with
+  whitespace-run WIDTH, not id count alone: ', ' is ~2**n, ',  ' ~3**n and
+  ',\\n    ' ~6**n, so a newline-indented list of only NINE ids already
+  cost 8.5s (measured 6.1s at n=20 for ', ' on this branch). That is a far
+  lower real-world trigger threshold than a flat 2**n reading suggests,
+  and is why the regression test sizes each whitespace shape separately.
+  Possessive-ness is language-preserving here because every possessive
+  element is followed by something that can never match whitespace, so no
+  quantifier can hold a character a later element needs; post-fix all
+  shapes parse in ~0.1ms and n=200 in 0.6ms. The 2+-ids requirement is
+  still carried by the separator's mandatory leading comma-or-whitespace,
+  now spelled possessively. Requires Python >= 3.11, exactly this
+  package's floor. (amendment, reviewer_comprehensive performance-redos
+  finding, task 3079)
+- Why a regex in this module gets a performance test at all:
+  ``sweep_stale_status_snapshot_edges`` calls
+  ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
+  dict comprehension with no per-edge timeout, over the whole group's edge
+  set (~5868 edges in the task-3042 record). Extractor cost is therefore a
+  whole-cycle LIVENESS property — one pathological fact stalls the entire
+  reconciliation cycle — not a micro-optimisation. (amendment, task 3079)
 """
 
 from __future__ import annotations
@@ -549,7 +592,7 @@ _ENUM_NO_PREP_LB = (
 # '\btask\b' and so does not match the plural head 'Tasks'; and even if it
 # did, the enumeration tail carries no reference token of its own.
 #
-# Three anchoring properties, mirroring the adjacency discipline every other
+# Four anchoring properties, mirroring the adjacency discipline every other
 # path in this module already follows:
 #
 # (a) The copula is MANDATORY — no optional-copula arm. This is the same
@@ -558,16 +601,31 @@ _ENUM_NO_PREP_LB = (
 #     blocked task 5' (a permanently-true historical fact). Because the
 #     copula is mandatory, using _STATUS_MARKER_ALT whole — including the
 #     transitive-capable markers — is safe here.
-# (b) The marker must sit immediately after the enumeration and its copula,
+# (b) The enumeration must be the copula's SUBJECT, established jointly by
+#     plural agreement (_PLURAL_COPULA_ALT) and the absence of a preceding
+#     preposition (_ENUM_NO_PREP_LB). CORRECTION (amendment,
+#     reviewer_comprehensive correctness-precision finding, task 3079):
+#     this property used to be stated as "the marker sits immediately after
+#     the enumeration and its copula", as though adjacency established the
+#     reading. It does not, and that was exactly the defect — in 'The merge
+#     of tasks 1020 and 1030 is blocked' the marker IS adjacent to the
+#     copula, but the copula's subject is the outer head noun and the MERGE
+#     is what is blocked. Adjacency is the separate, weaker property (c).
+#     Both remedies are needed: agreement alone still admits a plural outer
+#     head ('Dependencies for tasks A and B are blocked'), and the
+#     lookbehind alone is a closed word list. See _PLURAL_COPULA_ALT and
+#     _ENUM_NO_PREP_LB for the full argument and the residual.
+# (c) The marker must sit immediately after the enumeration and its copula,
 #     with only closed-class function words (adverb, 'all', article) in
 #     between, so 'Tasks 1020 and 1030 were merged into the active branch'
-#     does not match — the BRANCH is active, not the tasks.
-# (c) Bare digits are collected from the 'ids' capture group ONLY, never
+#     does not match — the BRANCH is active, not the tasks. This is a
+#     necessary but NOT sufficient condition for the (b) reading.
+# (d) Bare digits are collected from the 'ids' capture group ONLY, never
 #     from the whole fact, preserving the module invariant that a '\d+'
 #     contributes an id only from inside an already-detected,
 #     marker-anchored span (see _BARE_DIGIT_RE).
 #
-# On (c): the aggregate path additionally strips COUNT_QUANTITY_RE spans
+# On (d): the aggregate path additionally strips COUNT_QUANTITY_RE spans
 # from its segment before collecting digits, because a colon/bracket segment
 # is free text that really can contain '...and 3 pending others'. This path
 # needs no such strip and deliberately omits it: _ENUM_IDS_ALT's alphabet
