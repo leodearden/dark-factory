@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from shared.locking import (
-    CODE_EXTENSIONS,
+    FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
     is_file_path,
@@ -16,9 +16,9 @@ from shared.locking import (
 )
 
 # ---------------------------------------------------------------------------
-# Drift guard — pins shared.locking.CODE_EXTENSIONS to the canonical vector.
+# Drift guard — pins shared.locking.FILE_EXTENSIONS to the canonical vector.
 #
-# Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the allowlist
+# Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the allowlist
 # changes.  Also update the verbatim copy in
 # fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
 # corresponding _CANONICAL_EXTENSIONS in
@@ -43,7 +43,7 @@ _CANONICAL_EXTENSIONS = [
 # ---------------------------------------------------------------------------
 # Classification corpora — deliberate verbatim duplicates of the corpora in
 # fused-memory/tests/test_lock_charter_guard.py, for the same reason the two
-# CODE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
+# FILE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
 # are NOT linked by a re-export, so each must be pinned INDEPENDENTLY — and
 # this is the copy the orchestrator scheduler (the α enforcement point) actually
 # imports.  Keeping the two lists byte-identical is what lets a reader diff them.
@@ -279,16 +279,16 @@ class TestIsFilePath:
         assert not is_file_path('src/server/')
 
     def test_uppercase_extension_is_not_file_case_sensitive(self):
-        # Case-sensitive allowlist: 'MD' not in CODE_EXTENSIONS
+        # Case-sensitive allowlist: 'MD' not in FILE_EXTENSIONS
         assert not is_file_path('README.MD')
 
-    def test_code_extensions_is_frozenset(self):
-        assert isinstance(CODE_EXTENSIONS, frozenset)
+    def test_file_extensions_is_frozenset(self):
+        assert isinstance(FILE_EXTENSIONS, frozenset)
         # Spot-check canonical members
-        assert 'py' in CODE_EXTENSIONS
-        assert 'rs' in CODE_EXTENSIONS
-        assert 'ts' in CODE_EXTENSIONS
-        assert 'md' in CODE_EXTENSIONS
+        assert 'py' in FILE_EXTENSIONS
+        assert 'rs' in FILE_EXTENSIONS
+        assert 'ts' in FILE_EXTENSIONS
+        assert 'md' in FILE_EXTENSIONS
 
     @pytest.mark.parametrize('path', _ACCEPT_PATHS)
     def test_accept_corpus_paths_are_files(self, path: str):
@@ -297,7 +297,7 @@ class TestIsFilePath:
         One representative path per canonical extension (all 59, not just the 22
         added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
-        but four spot-checks in ``test_code_extensions_is_frozenset`` — leaving
+        but four spot-checks in ``test_file_extensions_is_frozenset`` — leaving
         the copy the orchestrator scheduler actually imports pinned strictly
         weaker than the fused-memory copy, which defeats the point of
         independently pinning two deliberately-duplicated definitions.
@@ -325,7 +325,7 @@ class TestIsFilePath:
         """_ACCEPT_PATHS must exercise every entry in _CANONICAL_EXTENSIONS.
 
         Turns the corpus comment's "one path per canonical extension" claim into
-        an enforced invariant, so an extension cannot be added to CODE_EXTENSIONS
+        an enforced invariant, so an extension cannot be added to FILE_EXTENSIONS
         and pinned in the drift guard while never being run through an actual
         classification assertion.  Mirrors the assertion of the same name in
         fused-memory/tests/test_lock_charter_guard.py, which also carries the
@@ -443,8 +443,8 @@ class TestStripDirectoryLocks:
         assert strip_directory_locks(files) == ['src/foo.py']
 
 
-class TestCodeExtensionsDriftGuard:
-    """Pin shared.locking.CODE_EXTENSIONS to the canonical extension vector.
+class TestFileExtensionsDriftGuard:
+    """Pin shared.locking.FILE_EXTENSIONS to the canonical extension vector.
 
     This is the α-copy drift guard for the shared.locking canonical source.
     The corresponding γ-copy guard lives in
@@ -454,16 +454,16 @@ class TestCodeExtensionsDriftGuard:
     """
 
     def test_extension_drift_guard(self):
-        """sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+        """sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
-        Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the
+        Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the
         allowlist changes.  Also update the verbatim copy in
         lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
         """
-        assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
-            f'shared.locking.CODE_EXTENSIONS has drifted from the canonical vector.\n'
+        assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.FILE_EXTENSIONS has drifted from the canonical vector.\n'
             f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
-            f'  actual    : {sorted(CODE_EXTENSIONS)!r}\n'
-            f'Update CODE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
             f'lock_charter_guard.py.'
         )

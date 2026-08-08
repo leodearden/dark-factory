@@ -149,7 +149,7 @@ class TestModuleLevelAll:
             'normalize_lock',
             'files_to_modules',
             'modules_conflict',
-            'CODE_EXTENSIONS',
+            'FILE_EXTENSIONS',
             'is_file_path',
             'directory_locks',
             'strip_directory_locks',
