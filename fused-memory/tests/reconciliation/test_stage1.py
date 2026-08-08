@@ -4783,3 +4783,180 @@ class TestStage1PhantomCitationRecurrenceRegression:
         assert durable[0]['citation_failures'] == [
             {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
         ]
+
+
+# ---------------------------------------------------------------------------
+# filter_style_only_authorship_flags wiring (task 3138)
+# ---------------------------------------------------------------------------
+
+
+class TestStyleOnlyAuthorshipFlagWiring:
+    """MemoryConsolidator.run() must apply filter_style_only_authorship_flags to
+    items_flagged (task 3138), dropping an injection/fabrication flag whose
+    cited entry is provably house-authored, and surfacing
+    report.stats['style_only_authorship_flags_dropped'].
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign —
+    it never checked the stored agent_id.
+
+    RED until step-10 wires filter_style_only_authorship_flags into run() and
+    sets the stat.
+    """
+
+    _HOUSE_MEMORY_ID = '11111111-2222-3333-4444-555555555555'
+    _FOREIGN_MEMORY_ID = '99999999-8888-7777-6666-555555555555'
+
+    def _make_authorship_flag(self, memory_id: str) -> dict:
+        return {
+            'task_id': None,
+            'category': 'memory_quality',
+            'flag_type': 'possible_injection',
+            'description': (
+                f'Entry {memory_id} is written in a terse imperative voice unlike '
+                'the rest of the corpus — possibly injected or fabricated content.'
+            ),
+            'suggested_action': 'Review the entry and delete it if unattributable.',
+            'cited_memories': [
+                {'memory_id': memory_id, 'store': 'mem0', 'metadata_fingerprint': {}},
+            ],
+        }
+
+    @staticmethod
+    def _record(memory_id: str, agent_id: str) -> dict:
+        """A get_memory_by_id record — ``metadata`` is the raw Qdrant payload,
+        which still carries the top-level agent_id mem0 promotes out of
+        metadata on the search/get paths."""
+        return {
+            'id': memory_id,
+            'content': 'Always cite the memory id when flagging a consolidation gap.',
+            'metadata': {'project_id': 'test_project', 'agent_id': agent_id},
+        }
+
+    @pytest.mark.asyncio
+    async def test_house_authored_flag_dropped_and_foreign_survives_annotated(self):
+        """esc-5564-1 end-to-end: the self-flagged finding is dropped, the
+        genuinely-foreign one survives carrying its provenance annotation, and
+        the filter runs BEFORE dedup_flags."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        records = {
+            self._HOUSE_MEMORY_ID: self._record(
+                self._HOUSE_MEMORY_ID, 'recon-stage-memory_consolidator',
+            ),
+            self._FOREIGN_MEMORY_ID: self._record(
+                self._FOREIGN_MEMORY_ID, 'attacker-xyz',
+            ),
+        }
+        stage.memory.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: records[memory_id],
+        )
+
+        house_flag = self._make_authorship_flag(self._HOUSE_MEMORY_ID)
+        foreign_flag = self._make_authorship_flag(self._FOREIGN_MEMORY_ID)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[house_flag, foreign_flag],
+            stats={},
+        )
+        # dedup_flags passes everything through unchanged, and records what it
+        # was handed so the ordering assertion below can inspect it.
+        seen_by_dedup: list[list[dict]] = []
+
+        async def _dedup(**kw):
+            seen_by_dedup.append(list(kw['flags']))
+            return kw['flags']
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_dedup),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3138-step9',
+            )
+
+        assert house_flag not in report.items_flagged, (
+            'A possible_injection flag whose cited entry was authored by '
+            "'recon-stage-memory_consolidator' must be DROPPED — Stage 1 "
+            f'flagging its own output on style alone; got {report.items_flagged!r}. '
+            'RED: filter_style_only_authorship_flags is not yet wired into run().'
+        )
+        assert foreign_flag in report.items_flagged, (
+            'The genuinely-foreign-authored flag must SURVIVE; got '
+            f'{report.items_flagged!r}'
+        )
+        assert foreign_flag['authorship_provenance'] == {
+            'checked': [
+                {
+                    'memory_id': self._FOREIGN_MEMORY_ID,
+                    'agent_id': 'attacker-xyz',
+                    'classification': 'foreign',
+                },
+            ],
+            'decision': 'kept_foreign_author',
+        }, (
+            'The surviving flag must carry the agent_id the gate actually checked '
+            f'as a field (INV-2); got {foreign_flag.get("authorship_provenance")!r}'
+        )
+        assert report.stats.get('style_only_authorship_flags_dropped') == 1, (
+            "run() must set report.stats['style_only_authorship_flags_dropped'] = 1 "
+            f'when one house-authored flag is dropped; got stats={report.stats!r}. '
+            'RED: stat not yet surfaced.'
+        )
+
+        # Ordering: the filter must run BEFORE dedup_flags, so a dropped flag is
+        # picked up by the marker-reclaim tail and its Stage-2 marker
+        # acknowledged. If it ran after, dedup_flags would still see the flag.
+        assert seen_by_dedup, 'dedup_flags was never called'
+        assert house_flag not in seen_by_dedup[0], (
+            'filter_style_only_authorship_flags must run BEFORE dedup_flags — '
+            'landing it after would drop the flag outside the _pre_filter_flags '
+            'snapshot window and strand its Stage-2 disposition marker; got '
+            f'dedup_flags input={seen_by_dedup[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_when_nothing_is_dropped(self):
+        """The stat is always surfaced, so a 0 is legibly 'ran, dropped nothing'
+        rather than 'never ran'."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.get_memory_by_id = AsyncMock(
+            return_value=self._record(self._FOREIGN_MEMORY_ID, 'attacker-xyz'),
+        )
+        foreign_flag = self._make_authorship_flag(self._FOREIGN_MEMORY_ID)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[foreign_flag],
+            stats={},
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3138-step9b',
+            )
+
+        assert report.items_flagged == [foreign_flag]
+        assert report.stats.get('style_only_authorship_flags_dropped') == 0, (
+            f'expected the stat present and 0; got stats={report.stats!r}'
+        )
