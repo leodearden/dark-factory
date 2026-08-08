@@ -10,6 +10,7 @@ back out of the implementation under test.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
 import _hold_history_fixtures as F
 import pytest
@@ -865,3 +866,210 @@ def test_seed_respects_the_window(seeded_store):
     assert history.sample_count(['orchestrator/src']) == 2
     # last two of [60, 120, 180, 120, 40] -> [120, 40] -> median 80.0
     assert history.predicted_hold(['orchestrator/src']) == pytest.approx(80.0)
+
+
+# ===========================================================================
+# The in-process feed — observe_acquired / observe_released
+# ===========================================================================
+
+
+#
+# The scheduler feeds holds as they happen; the seed feeds the ones that
+# already happened.  Both must mean the same thing by "a hold", so the
+# equivalence test below replays one trace through both paths (INV-5).
+
+
+def _at(offset_secs: float) -> float:
+    """POSIX seconds ``offset_secs`` after the fixture's ``BASE_TS``."""
+    return F.BASE_TS.timestamp() + offset_secs
+
+
+def _replay_live(history: HoldHistory, rows: list[dict]) -> None:
+    """Feed *rows* through the LIVE ``observe_*`` path, as the scheduler would."""
+    for r in rows:
+        at = datetime.fromisoformat(r['timestamp']).timestamp()
+        modules = list(r['data'].get('modules') or [])
+        if r['event_type'] == 'lock_acquired':
+            history.observe_acquired(r['task_id'], modules, at=at)
+        elif r['event_type'] == 'lock_released':
+            history.observe_released(r['task_id'], modules, at=at)
+
+
+def test_observe_pair_records_one_sample_per_module():
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T1', ['orchestrator/src', 'shared/src'], at=_at(0))
+    history.observe_released('T1', ['orchestrator/src', 'shared/src'], at=_at(90))
+
+    assert history.sample_count(['orchestrator/src']) == 1
+    assert history.sample_count(['shared/src']) == 1
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(90.0)
+
+
+def test_observe_released_for_a_module_never_acquired_records_nothing():
+    """ORPHAN-RELEASE, live.  Same rule as the seed path."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_released('T3', ['orchestrator/src'], at=_at(350))
+
+    assert history.sample_count(['orchestrator/src']) == 0
+    assert history.predicted_hold(['orchestrator/src']) is None
+
+
+def test_observe_partial_release_leaves_the_unnamed_modules_open():
+    """``release_subset`` names only the narrowed-away modules."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T2', ['orchestrator/src', 'shared/src'], at=_at(100))
+    history.observe_released('T2', ['orchestrator/src'], at=_at(220))
+    history.observe_released('T2', ['shared/src'], at=_at(300))
+
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(120.0)
+    assert history.predicted_hold(['shared/src']) == pytest.approx(200.0)
+
+
+def test_double_observe_acquired_force_closes_and_records():
+    """DOUBLE-ACQUIRE, live: the first hold really did block others."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T4', ['orchestrator/src'], at=_at(400))
+    history.observe_acquired('T4', ['orchestrator/src'], at=_at(580))
+    history.observe_released('T4', ['orchestrator/src'], at=_at(700))
+
+    # [180, 120] — the force-closed prefix AND the re-opened span, and the
+    # second measures 700-580, not 700-400 (which would re-count the prefix).
+    assert history.sample_count(['orchestrator/src']) == 2
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(150.0)
+
+
+def test_live_feed_and_seed_path_agree_on_the_same_trace():
+    """INV-5: one set of pairing rules, two feeds.
+
+    Rows 1-9 of the canonical trace are a single run with no era boundary, so
+    the live path has nothing to derive that the seed path does not — any
+    divergence here is the two implementations drifting apart.
+    """
+    rows = F.build_trace()[:9]
+
+    live = HoldHistory(min_samples=1)
+    _replay_live(live, rows)
+
+    seeded = HoldHistory(min_samples=1)
+    for span in iter_hold_spans(rows):
+        seeded.record_span(span)
+
+    for module in ('orchestrator/src', 'shared/src'):
+        assert live.sample_count([module]) == seeded.sample_count([module]), module
+        assert live.predicted_hold([module]) == pytest.approx(
+            seeded.predicted_hold([module])
+        ), module
+
+
+def test_live_observation_extends_a_seeded_history(seeded_store):
+    """The feed CONTINUES from the seed — it does not start over.
+
+    A fresh window after every restart is the amnesia the durable seed exists
+    to prevent; a seed the live feed then ignores is the same bug wearing a
+    different hat.
+    """
+    history = HoldHistory()
+    history.seed_from_event_store(seeded_store)
+    before = history.sample_count(['shared/src'])
+
+    history.observe_acquired('T99', ['shared/src'], at=_at(9000))
+    history.observe_released('T99', ['shared/src'], at=_at(9080))
+
+    assert history.sample_count(['shared/src']) == before + 1
+    # [200, 100, 60, 80] -> sorted [60, 80, 100, 200] -> (80+100)/2 = 90.0
+    assert history.predicted_hold(['shared/src']) == pytest.approx(90.0)
+
+
+# --- predicted_remaining ---------------------------------------------------
+
+
+def _holding(module: str, samples: list[float], *, task_id: str = 'T1', since: float = 0.0):
+    """A history with *samples* on *module* and *task_id* currently holding it."""
+    history = _history_of({module: samples}, min_samples=3)
+    history.observe_acquired(task_id, [module], at=_at(since))
+    return history
+
+
+def test_predicted_remaining_is_the_prediction_minus_the_elapsed_hold():
+    history = _holding('orchestrator/src', [100.0, 200.0, 300.0], since=0.0)
+
+    # predicted_hold = 200.0; elapsed = 50 -> 150 remaining.
+    assert history.predicted_remaining('T1', now=_at(50)) == pytest.approx(150.0)
+
+
+def test_predicted_remaining_floors_at_zero_for_an_overdue_holder():
+    """Exactly 0.0 — a float, not None, and never negative.
+
+    None means "no prediction"; 0.0 means "predicted to finish already, and
+    hasn't".  Collapsing an overdue holder into None would erase the one case a
+    caller most needs to distinguish, and a negative number would read as time
+    credit that does not exist.
+    """
+    history = _holding('orchestrator/src', [100.0, 200.0, 300.0], since=0.0)
+
+    remaining = history.predicted_remaining('T1', now=_at(5000))
+
+    assert remaining == pytest.approx(0.0)
+    assert remaining is not None
+    assert remaining >= 0.0
+
+
+def test_predicted_remaining_refuses_when_the_task_holds_nothing():
+    history = _history_of({'orchestrator/src': [100.0, 200.0, 300.0]}, min_samples=3)
+
+    assert history.predicted_remaining('T1', now=_at(50)) is None
+
+
+def test_predicted_remaining_refuses_after_the_hold_is_released():
+    history = _holding('orchestrator/src', [100.0, 200.0, 300.0], since=0.0)
+
+    history.observe_released('T1', ['orchestrator/src'], at=_at(10))
+
+    assert history.predicted_remaining('T1', now=_at(50)) is None
+
+
+def test_predicted_remaining_refuses_when_the_modules_cannot_be_predicted():
+    """The refusal composes: no prediction for the modules, none for the remainder."""
+    history = HoldHistory(min_samples=3)
+    history.record('thin/src', 100.0)  # one sample — below the floor
+    history.observe_acquired('T1', ['thin/src'], at=_at(0))
+
+    assert history.predicted_hold(['thin/src']) is None
+    assert history.predicted_remaining('T1', now=_at(10)) is None
+
+
+def test_predicted_remaining_measures_from_the_earliest_open_hold():
+    """A task holding several modules has been blocking since its FIRST acquire.
+
+    Measuring from the latest would under-count the elapsed hold and over-state
+    how much time is left — the optimistic direction, which is the one that
+    hurts: it keeps a waiting task waiting.
+    """
+    history = _history_of({'a/src': [200.0] * 3, 'b/src': [200.0] * 3}, min_samples=3)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+    history.observe_acquired('T1', ['b/src'], at=_at(100))
+
+    # predicted_hold(['a/src','b/src']) = 200.0; elapsed from 0, not from 100.
+    assert history.predicted_remaining('T1', now=_at(150)) == pytest.approx(50.0)
+
+
+def test_predicted_remaining_pools_only_the_modules_actually_held():
+    history = _history_of(
+        {'held/src': [100.0, 100.0, 100.0], 'idle/src': [9000.0] * 3},
+        min_samples=3,
+    )
+    history.observe_acquired('T1', ['held/src'], at=_at(0))
+
+    assert history.predicted_remaining('T1', now=_at(40)) == pytest.approx(60.0)
+
+
+def test_predicted_remaining_is_scoped_to_the_asking_task():
+    history = _history_of({'orchestrator/src': [100.0, 200.0, 300.0]}, min_samples=3)
+    history.observe_acquired('T1', ['orchestrator/src'], at=_at(0))
+
+    assert history.predicted_remaining('T1', now=_at(50)) == pytest.approx(150.0)
+    assert history.predicted_remaining('T2', now=_at(50)) is None
