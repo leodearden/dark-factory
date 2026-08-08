@@ -8005,6 +8005,58 @@ async def confirm_isolated_rerun_verdict(
     default is "merge stays red". That is a different judgement from the
     named-``unconfirmable`` paths, which are cases we UNDERSTAND well enough
     to say we could not tell — an unhandled exception is not.
+
+    PURE (INV-5). It OBSERVES; it does not act. Deliberately absent, and
+    fenced by ``TestConfirmIsolatedRerunVerdictIsPure``: no event emit, no
+    ledger write, no escalation, no task filing, no suppression-streak bump,
+    and no worktree churn. Those side-effects belong to the RECORDER (task ε),
+    and keeping them out is what lets this run wherever the worktree is —
+    local or remote — with the dispatcher doing the recording afterwards from
+    the returned ``FlakeSuppression``. This is why the module imports only the
+    three vocabulary types from ``flake_ledger`` and never its writers: the
+    import surface makes the purity structural rather than a reviewing burden.
+    ``read_psi_sample`` is the one read added, and it is wrapped so it can
+    never raise — a telemetry read must never change a gate's verdict.
+
+    SAME-TREE (INV-3): every re-run targets the GIVEN *worktree*. No
+    ``git worktree add``/``remove``, no cleanup ``finally``.
+
+    SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
+    re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
+    _scope_to_keyword(...)), policy.timeout_secs)`` with ``lint_command`` and
+    ``type_check_command`` nulled, so only the named tests run, serially,
+    without pyproject ``addopts`` or its 60s per-test default.
+
+    Node-id -> subproject mapping DELEGATES to
+    ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
+    module_configs}`` — the same shared helper ``confirm_main_tip_failure_is_real``
+    and the sweep pre-filter use. The list -> dict conversion is
+    order-preserving on a prefix-deduped list, so candidate iteration and
+    first-wins ambiguity resolution are unchanged. The mapping runs over the
+    GIVEN *module_configs* + *worktree*, never re-discovered: empty
+    *module_configs* or files-not-on-disk naturally map nothing, which is an
+    honest ``unconfirmable`` rather than a guess.
+
+    ``test_ids`` carries the RAW extracted node-ids, never the
+    prefix-qualified group ids — the qualified id is a re-run implementation
+    detail (which subproject to invoke pytest from), whereas the raw node-id is
+    the test's IDENTITY and is what α's ``flake_debt.test_id`` primary key and
+    §8.3's idempotency key are built on. Recording a prefix-qualified variant
+    would split one test's debt across two rows.
+
+    Args:
+        worktree: The tree to re-run in. Judged as given (INV-3).
+        config: Orchestrator config, passed through to ``run_verification``.
+        module_configs: Subprojects to map node-ids against, as given by the
+            caller.
+        failing_result: The failing result whose named tests are re-examined.
+        call_site: Which gate is asking. Selects the ``_CALL_SITE_POLICY``
+            entry; a valid member with no entry answers ``unconfirmable``.
+        runner: WHERE the re-run ran. ``'local'`` is correct for both of this
+            task's in-process call sites; it exists so the dispatcher can
+            supply the true origin at the remote boundary (task ε).
+        now: Observation timestamp, for deterministic tests. Defaults to
+            ``datetime.now(UTC)``.
     """
     # Bound BEFORE the try so the except handler can never hit an unbound
     # local and re-raise a NameError out of a public entry point (α's
