@@ -3604,6 +3604,172 @@ def test_max_decision_severity_unknown_loses_to_a_recognised_incoming() -> None:
     assert sr._max_decision_severity('bogus', 'blocking') == 'blocking'
 
 
+@pytest.mark.parametrize(
+    ('name', 'kept', 'offered'),
+    [
+        ('text', 'Adopt the reify plan?', 'reify?'),
+        ('task_id', '5914', '9999'),
+        ('escalation_id', 'esc-5914-1', 'esc-other-7'),
+        ('session_id', 'watcher-df-1', 'watcher-recon-2'),
+        ('options', ['yes', 'no'], ['maybe']),
+    ],
+)
+def test_merge_decision_enrichment_never_clobbers_a_non_empty_field(
+    name: str,
+    kept: object,
+    offered: object,
+) -> None:
+    """MODE-2 rule: a second watcher ENRICHES, it never overwrites.
+
+    Two watchers can surface the SAME underlying human gate through two
+    different queues (the observed esc-5914-1 shape, task 3528 requirement
+    (b)). The second one to file must not replace what the first wrote --
+    the cockpit row would otherwise flip to whichever watcher happened to
+    write last.
+    """
+    existing = _make_decision(**{name: kept})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == kept
+
+
+@pytest.mark.parametrize(
+    ('name', 'empty', 'offered'),
+    [
+        ('text', '', 'reify?'),
+        ('task_id', None, '5914'),
+        ('escalation_id', None, 'esc-5914-1'),
+        ('session_id', None, 'watcher-recon-2'),
+        ('options', None, ['yes', 'no']),
+    ],
+)
+def test_merge_decision_enrichment_fills_an_empty_field(
+    name: str,
+    empty: object,
+    offered: object,
+) -> None:
+    """The other half of the rule -- and what makes this ENRICHMENT rather
+    than a no-op: a field the first filer left empty/None IS filled from the
+    second filer, so the collapsed row is strictly better informed than
+    either watcher's view alone.
+    """
+    existing = _make_decision(**{name: empty})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == offered
+
+
+@pytest.mark.parametrize(
+    ('name', 'kept', 'offered'),
+    [
+        ('filed_at', '2026-07-07T00:00:00+00:00', '2026-08-08T00:00:00+00:00'),
+        ('state', 'open', 'answered'),
+        ('manual_boost', 5, 0),
+    ],
+)
+def test_merge_decision_enrichment_keeps_custody_fields_with_the_first_filer(
+    name: str,
+    kept: object,
+    offered: object,
+) -> None:
+    """CUSTODY fields always stay with the EXISTING record.
+
+    A second watcher must be able to neither reset an operator's cockpit
+    boost (manual_boost is the C5 human's, not a watcher's), nor re-open or
+    close the record (state transitions are update_decision_state's job),
+    nor restamp when the gate was first surfaced (filed_at drives queue
+    age). These are the fields where "last writer wins" would silently
+    destroy work done by someone else.
+    """
+    existing = _make_decision(**{name: kept})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == kept
+
+
+@pytest.mark.parametrize(
+    ('existing_sev', 'incoming_sev', 'expected'),
+    [
+        ('info', 'urgent', 'urgent'),  # upgrade lands
+        ('critical', 'info', 'critical'),  # downgrade refused
+        ('', 'blocking', 'blocking'),  # unset is enriched
+        ('blocking', 'blocking', 'blocking'),  # tie is stable
+    ],
+)
+def test_merge_decision_enrichment_never_downgrades_severity(
+    existing_sev: str,
+    incoming_sev: str,
+    expected: str,
+) -> None:
+    """severity is _max_decision_severity(existing, incoming), both ways.
+
+    The record must end up carrying the MOST urgent view any watcher has of
+    the gate: an incoming 'urgent' upgrades an existing 'info', and an
+    incoming 'info' leaves an existing 'critical' alone.
+    """
+    existing = _make_decision(severity=existing_sev)
+    incoming = _make_decision(severity=incoming_sev)
+
+    assert sr.merge_decision_enrichment(existing, incoming).severity == expected
+
+
+def test_merge_decision_enrichment_keeps_id_and_project_from_existing() -> None:
+    """``id`` is the JOIN KEY -- the whole reason these two records are being
+    merged at all -- so it, and the project it is scoped to, come from the
+    existing record and are never taken from the incoming one.
+    """
+    existing = _make_decision(id='esc-5914-1', project='df')
+    incoming = _make_decision(id='esc-5914-1', project='other-project')
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_decision_enrichment_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    The helper is deliberately side-effect-free so it stays trivially
+    testable in isolation from the CLI verb, and so a caller holding the
+    pre-merge record (e.g. for a log line naming what changed) still sees
+    what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', severity='info')
+    incoming = _make_decision(id='esc-5914-1', text='second?', severity='urgent')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
+    """Whole-record comparison, following the
+    test_set_decision_escalations_dir_preserves_every_other_field idiom: a
+    merge that differs from `existing` ONLY in severity must be expressible
+    as a single dataclasses.replace, so a field silently drifting in is a
+    hard failure rather than an unasserted gap.
+    """
+    existing = _make_decision(id='esc-5914-1', severity='info')
+    # Same in every field EXCEPT severity, which outranks.
+    incoming = dataclasses.replace(existing, severity='urgent')
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged == dataclasses.replace(existing, severity='urgent')
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
