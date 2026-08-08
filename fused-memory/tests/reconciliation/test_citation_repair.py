@@ -661,3 +661,153 @@ class TestRepairLiveRunRefusalAndDryRun:
             }
         finally:
             await journal.close()
+
+
+class TestRepairDropOnlyAndIdempotency:
+    """Drop-only, dedupe, repeat-call and multi-occurrence behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_drop_only_when_no_replacement_given(self, tmp_path):
+        """Omitting the replacement DROPS the dangling citation.
+
+        The same shape ``verify_cited_memories`` applies to the current run's
+        report — a claim that lost its backing loses the citation and gains a
+        provenance record, rather than keeping a phantom id.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING), _citation(SUCCESSOR)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=None,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['replacement_memory_id'] is None
+            assert outcome['removed_count'] == 1
+            # No replacement to resolve, so only the victim was looked up.
+            assert [mid for _project, mid in memory.calls] == [DANGLING]
+
+            repaired = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            # The finding's OTHER citation is untouched.
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            record = repaired['citation_repairs'][0]
+            assert record['memory_id'] == DANGLING
+            assert record['replacement_memory_id'] is None
+            assert record['reason'] == 'memory_not_found'
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_replacement_already_cited_is_deduped(self, tmp_path):
+        """A replacement the finding already cites is not appended twice."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING), _citation(SUCCESSOR)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['deduped'] is True
+
+            repaired = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            cited_ids = [c['memory_id'] for c in repaired['cited_memories']]
+            assert cited_ids == [SUCCESSOR]
+            assert cited_ids.count(SUCCESSOR) == 1
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_repeat_repair_is_idempotent(self, tmp_path):
+        """A retried repair adds no second provenance record.
+
+        The same no-self-amplification property ``citation_verifier``'s
+        tombstone path documents for retried sweeps: a repair that appended a
+        further record on every pass would inflate provenance unbounded.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            call = dict(
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            first = await citation_repair.repair_memory_citation(journal, memory, **call)
+            assert first['status'] == 'repaired'
+            after_first = _dump(await journal.get_run(RUN_ID))
+
+            second = await citation_repair.repair_memory_citation(journal, memory, **call)
+
+            assert second['error'] == 'citation_not_present'
+            assert _dump(await journal.get_run(RUN_ID)) == after_first
+            repaired = after_first['memory_consolidator']['items_flagged'][0]
+            assert len(repaired['citation_repairs']) == 1
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_dangling_citations_all_removed(self, tmp_path):
+        """One call removes EVERY occurrence and reports how many."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING), _citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['removed_count'] == 2
+            repaired = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+        finally:
+            await journal.close()
