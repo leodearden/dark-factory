@@ -679,3 +679,112 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         p.kill()
+
+
+# ---------------------------------------------------------------------------
+# The in-suite leak guard (task 3798)
+# ---------------------------------------------------------------------------
+
+# Stamped into os.environ for the session, so EVERY spawner that builds its
+# child env from `dict(os.environ)` — both of today's, plus any future one —
+# tags its descendants with no per-spawner change. Same mechanism and same
+# "the defect class is a spawner that forgets" reasoning as 3797's clock
+# redirect.
+LEAK_TOKEN_ENV = 'DF_PYTEST_LEAK_TOKEN'
+
+# The one script whose survivors are worth failing a run over.
+DRAIN_SCRIPT_CMDLINE_MARKER = 'restart-all-orchestrators.sh'
+
+
+def leaked_drain_processes(
+    token: str | None, *, proc_root: str | os.PathLike[str] = Path('/proc'),
+) -> list[tuple[int, str]]:
+    """Every live drain-script process belonging to THIS pytest session.
+
+    Returns ``(pid, cmdline)`` for each process whose ``/proc/<pid>/cmdline``
+    contains :data:`DRAIN_SCRIPT_CMDLINE_MARKER` AND whose
+    ``/proc/<pid>/environ`` carries ``LEAK_TOKEN_ENV=<token>``.
+
+    WHY BOTH, RATHER THAN THE OBVIOUS ``pgrep -f restart-all-orchestrators.sh``:
+
+    * The token is what makes the guard ATTRIBUTABLE. ``merge_verify_breadth:
+      "full"`` means many worktrees run this same suite concurrently, and the
+      main checkout is machine-operated (CLAUDE.md) — the deployed watchdog and
+      the merge coordinator both run ``--drain`` for real. Asserted literally,
+      the bare pgrep is a false-positive generator that fails runs for other
+      people's processes and for genuine production activity. Requiring this
+      session's own token means a match provably belongs to US.
+    * The marker is what keeps the guard QUIET. These two test directories hold
+      ~90 files that spawn subprocesses; scanning for "any surviving descendant"
+      would flake constantly on all of them.
+
+    Fails CLOSED on a falsy token — an empty token must never be read as "match
+    everything", which would turn the guard into a suite-wide false-positive
+    generator the first time the fixture failed to stamp it.
+
+    Every per-pid read is individually guarded: scanning /proc races process
+    exit by construction, and a pid that vanishes mid-scan is the ordinary case,
+    not an error. Mirrors the same invariant in ``shared.proc_group``, the
+    canonical async sibling of this module's process handling.
+    """
+    if not token:
+        return []
+
+    # The exact NUL-delimited assignment, so a token that merely PREFIXES
+    # another session's cannot cross-match. /proc separates entries with NUL
+    # and the first entry has no leading one, hence the two accepted forms.
+    assignment = LEAK_TOKEN_ENV.encode() + b'=' + token.encode() + b'\x00'
+    marker = DRAIN_SCRIPT_CMDLINE_MARKER.encode()
+
+    leaks: list[tuple[int, str]] = []
+    try:
+        entries = sorted(Path(proc_root).iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / 'cmdline').read_bytes()
+            if marker not in cmdline:
+                continue
+            environ = (entry / 'environ').read_bytes()
+        except OSError:
+            continue
+        if not (environ.startswith(assignment) or b'\x00' + assignment in environ):
+            continue
+        # errors='replace' only for the human-readable rendering: environ and
+        # cmdline are raw bytes and need not be valid UTF-8.
+        leaks.append((
+            int(entry.name),
+            cmdline.replace(b'\x00', b' ').decode('utf-8', errors='replace').strip(),
+        ))
+    return leaks
+
+
+def leaked_drain_process_reason(leaks: list[tuple[int, str]]) -> str | None:
+    """Explain which drain processes this run leaked, or ``None`` if it did not.
+
+    Names every pid and its cmdline, the mechanism, and the remedy SYMBOL —
+    mirroring :func:`deploy_clock_violation_reason`'s convention that a guard's
+    message has to be actionable without a second investigation.
+    """
+    if not leaks:
+        return None
+    listed = '\n'.join(f'  pid {pid}: {cmdline}' for pid, cmdline in leaks)
+    return (
+        f'this test run LEAKED {len(leaks)} drain-script process(es) (task 3798):\n'
+        f'{listed}\n'
+        'Each carries this session\'s own DF_PYTEST_LEAK_TOKEN, so they are '
+        'provably ours — not a concurrent worktree\'s run and not a genuine '
+        'machine-operated --drain.\n'
+        'Mechanism: a spawn whose timeout kill did not reach the process group. '
+        "subprocess.run's timeout path kill()s the DIRECT CHILD only, so a poll "
+        'loop the script forked survives, is reparented to systemd --user, and '
+        'spends its grace unattended — then issues a REAL systemctl restart if '
+        'it outlives the tmpdir holding the fake one.\n'
+        'Fix: spawn via df_pytest_isolation.run_in_new_session, which starts a '
+        'new session and SIGKILLs the whole group on timeout.\n'
+        'These processes have been reaped, so the box is clean; this failure is '
+        'the signal, not the damage.'
+    )
