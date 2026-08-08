@@ -1438,6 +1438,7 @@ class TestMergeGateWrapperDelegates:
 
         spy.assert_awaited_once()
         call = spy.await_args
+        assert call is not None, 'await_args unset despite assert_awaited_once'
         assert call.args[0] is tmp_path, call.args
         assert call.args[1] is config, call.args
         assert call.args[2] is module_configs, call.args
@@ -1569,6 +1570,7 @@ class TestMainProbeWrapperDelegates:
 
         spy.assert_awaited_once()
         call = spy.await_args
+        assert call is not None, 'await_args unset despite assert_awaited_once'
         assert call.args[0] is tmp_path, call.args
         assert call.args[1] is config, call.args
         assert call.args[2] is module_configs, call.args
