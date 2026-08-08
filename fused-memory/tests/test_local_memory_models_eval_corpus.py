@@ -641,6 +641,35 @@ class _FalkorDouble:
         )
 
 
+class _UnreachableDouble:
+    """A graph handle whose ``ro_query`` raises, standing in for a down FalkorDB.
+
+    A real class, never MagicMock, for the same reason as ``_FalkorDouble``
+    above. It carries no rows at all: the point is the store never answers.
+    """
+
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+        self.ro_queries: list[str] = []
+
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.ro_queries.append(cypher)
+        raise self.exc
+
+
+def _redis_connection_error(message: str) -> BaseException:
+    """The exception a down FalkorDB actually surfaces, imported at call time.
+
+    Local rather than a top-level import so this module keeps build_corpus.py's
+    own property — importing it drags in no client — and so collection never
+    depends on what is only a transitive dependency
+    (graphiti-core[falkordb] -> falkordb -> redis).
+    """
+    from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
+
+    return RedisConnectionError(message)
+
+
 def _row(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts') -> list[object]:
     """One result_set row, in PROJECTED_FIELDS order."""
     return [
@@ -1802,7 +1831,7 @@ class _StubReaderFactory:
     could pass while the real one writes.
     """
 
-    def __init__(self, double: _FalkorDouble):
+    def __init__(self, double: _FalkorDouble | _UnreachableDouble):
         self.double = double
         self.calls: list[dict] = []
 
@@ -1820,14 +1849,20 @@ def _cli_rows(population=None) -> list[list[object]]:
     ]
 
 
-def _run_cli(monkeypatch, *argv, rows=None) -> tuple[int, _StubReaderFactory]:
+def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubReaderFactory]:
     """Drive ``main()`` in-process against the offline double.
 
     Precedent: ``_run_cli`` in test_memory_eval_transcript_corpus.py. Returns
     the exit code plus the factory, so a test can assert on what the CLI asked
     the reader for as well as what it produced.
+
+    *rows* is the ordinary path: a store that answers. *double* substitutes the
+    graph handle outright, for a store that does not — see
+    ``_UnreachableDouble``.
     """
-    factory = _StubReaderFactory(_FalkorDouble(rows if rows is not None else _cli_rows()))
+    if double is None:
+        double = _FalkorDouble(rows if rows is not None else _cli_rows())
+    factory = _StubReaderFactory(double)
     monkeypatch.setattr(_mod, 'EpisodeReader', factory)
     return _mod.main(list(argv)), factory
 
@@ -2117,6 +2152,127 @@ class TestCliVerifyMode:
             monkeypatch, '--verify', '--out', str(out), '--n', '30', '--seed', 'other'
         )
         assert code == 0
+
+
+class TestAnUnreachableStoreIsATypedErrorNotATraceback:
+    """Exit 1 is DOCUMENTED to mean "the store was unreachable" — make it true.
+
+    The module docstring's exit table and scripts/local_memory_models_eval/
+    README.md both promise that exit 1 covers a run that could not complete
+    because the store could not be read. Today an unreachable FalkorDB satisfies
+    that promise only by accident: the exception escapes ``main`` as a raw
+    traceback that Python happens to exit 1 on. An operator reading the
+    documented contract expects a message; a caller distinguishing "the corpus
+    is wrong" from "the check never ran" gets the right answer for the wrong
+    reason, and any change to how tracebacks exit would silently break it.
+
+    The controls matter as much as the assertions here: widening the handler to
+    a bare ``except Exception`` would satisfy every positive test below while
+    swallowing genuine builder bugs behind a tidy ``error:`` line, converting a
+    loud crash into a silent fail-soft.
+    """
+
+    def test_the_redis_connection_error_is_not_an_oserror(self):
+        """Why ``OSError`` alone would NOT be enough.
+
+        Measured on redis 7.4.0: the MRO is ConnectionError -> RedisError ->
+        Exception, with OSError nowhere in it. A handler widened to OSError
+        only — the obvious reading — would still let exactly the unreachable
+        FalkorDB case escape as a traceback. Pinned as a premise so the reason
+        for the second exception type cannot be lost to a later tidy-up.
+        """
+        from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
+
+        assert not issubclass(RedisConnectionError, OSError)
+
+    @pytest.mark.parametrize(
+        'make_exc',
+        [_redis_connection_error, OSError],
+        ids=['redis-connection-error', 'oserror'],
+    )
+    def test_an_unreachable_store_exits_run_failed_under_verify(
+        self, monkeypatch, tmp_path, make_exc
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        code, _ = _run_cli(
+            monkeypatch,
+            '--verify',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(make_exc('falkordb is down')),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+
+    @pytest.mark.parametrize(
+        'make_exc',
+        [_redis_connection_error, OSError],
+        ids=['redis-connection-error', 'oserror'],
+    )
+    def test_an_unreachable_store_exits_run_failed_under_build(
+        self, monkeypatch, tmp_path, make_exc
+    ):
+        """And writes nothing: a run that never read the store has no corpus."""
+        out = tmp_path / 'corpus_manifest.json'
+        code, _ = _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(make_exc('falkordb is down')),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+
+    def test_the_operator_sees_the_promised_error_line_not_a_stack_trace(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The contract is a message on stderr, in the shape the CLI already uses."""
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+        )
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert 'falkordb is down' in err
+
+    def test_an_unrelated_exception_still_surfaces_as_a_traceback(
+        self, monkeypatch, tmp_path
+    ):
+        """CONTROL: the handler must stay narrow.
+
+        A RuntimeError out of the store path is a bug in this builder, not an
+        unreachable store. Catching it would hide a defect behind the exit code
+        that means "the environment was at fault" — the loud-crash-becomes-
+        silent-fail-soft failure this project's norms forbid.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        with pytest.raises(RuntimeError):
+            _run_cli(
+                monkeypatch,
+                '--n',
+                '20',
+                '--seed',
+                's',
+                '--out',
+                str(out),
+                double=_UnreachableDouble(RuntimeError('a builder bug')),
+            )
+
+    def test_the_run_failed_code_is_still_disjoint_from_every_verdict(self):
+        """CONTROL, re-asserted at the CLI layer: no new status may claim 1."""
+        assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
