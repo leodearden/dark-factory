@@ -282,6 +282,10 @@ class TestDerivedRegistriesByteIdentity:
           * disk_full (task 3683) — same terminus, reached through the
             identical category-agnostic retry windows (see
             TestDiskFullArchivesForHumanTriage).
+          * pytest_internalerror (task 3683) — likewise; the sweep retry that
+            justified its exclusion is the one fail-OPEN arm and does not
+            cover the three that escalate (see
+            TestPytestInternalerrorArchivesForHumanTriage).
 
         Every other member is still the legacy value; this stays a
         byte-for-byte pin so an UNINTENDED archive-policy change still reds
@@ -289,7 +293,7 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'pytest_internalerror', 'env_transient',
+            'env_transient',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
@@ -317,6 +321,12 @@ class TestShouldArchive:
     reproduces the legacy _should_archive_category decision for every
     category — proving the endswith('_error') heuristic can be deleted
     without changing behavior for any of the 12 known categories.
+
+    pytest_internalerror has since been ADJUDICATED away from the legacy
+    value rather than drifting from it (task 3683): it is infra-transient and
+    terminates in a blocking human escalation, so the archived log is that
+    human's only triage artifact — see
+    TestPytestInternalerrorArchivesForHumanTriage.
     """
 
     @pytest.mark.parametrize(
@@ -329,7 +339,7 @@ class TestShouldArchive:
             ('tree_sitter_generate_error', True),
             ('flock_error', True),
             ('npm_error', True),
-            ('pytest_internalerror', False),
+            ('pytest_internalerror', True),
             ('env_transient', False),
             ('test_failure', False),
             ('unknown_test_failure', True),

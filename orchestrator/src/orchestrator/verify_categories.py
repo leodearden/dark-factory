@@ -241,6 +241,22 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
+    # archive=True (task 3683): the standing rationale for archive=False was
+    # "the sweep already retries this category, so archiving it would create
+    # spurious human-triage artifacts". That describes exactly one arm — the
+    # FIRST-PASS main-tip sweep (verify.py:7062/:7141), which returns a None
+    # sentinel, retries next tick indefinitely and never escalates. It is an
+    # ADDITIONAL path, not an exemption from the three bounded windows that
+    # terminate in front of a human: workflow.py:9020 (default 5 attempts,
+    # then escalate_to_human=True → blocking L1 at :14791),
+    # merge_queue.py:2761/:3134, and the isolated-confirm gate at
+    # verify.py:7255 (an infra-transient hit CONSUMES one of
+    # _SWEEP_CONFIRM_MAX_ATTEMPTS; two convert the result into a red-main L1
+    # at harness.py:11325). All three test flat INFRA_TRANSIENT_CATEGORIES
+    # membership with no per-category branch, so this row cannot be
+    # structurally exempt from any of them. Enforced by
+    # ``_assert_infra_transient_rows_archive``.
+    #
     # verdict_indeterminate=False DESPITE is_infra_transient=True: retrying an
     # INTERNALERROR is usually worthwhile (predicate 1 holds — collection died
     # before any test ran), but predicate (2) FAILS.  `_PYTEST_INTERNALERROR_RE`
@@ -251,7 +267,7 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # branch-caused break: exactly the false-GREEN class tasks 2822/1700
     # hardened against.  Fail CLOSED; only the retry loop treats it as infra.
     FailureCategory.PYTEST_INTERNALERROR: CategoryPolicy(
-        severity_rank=9, archive=False, preexisting_probe=False,
+        severity_rank=9, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
