@@ -11760,6 +11760,161 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         )
 
 
+class TestRenderLiveWorkflowSectionPendingPureGate:
+    """_render_live_workflow_section drops the bare project-wide orchestrator
+    signal for a PENDING deterministic PURE GATE (task 3751 step-9/10).
+
+    The observed Stage-2 symptom: dark_factory task 3845 — a pending
+    ``always_escalates`` deterministic gate with NO ``before_done`` — was listed
+    under Live-Workflow Signals with ONLY the bare ``orchestrator`` signal for 3+
+    consecutive reconciliation cycles (runs 0e98f0ac, f112de8), which blocked its
+    disposition. Such a task never acquires a worktree or branch, and its entire
+    DeterministicRunner run is "file escalation, stamp gate_escalated_at, set
+    blocked" — no script, no systemd, no git_ops — so the project-wide lock is
+    never task-specific evidence for it.
+
+    Direct-call harness copied from TestRenderLiveWorkflowSectionCorroborationGate;
+    only the git side_effect (no worktree / no commit) and the task metadata differ.
+    The corroboration gate (task 2963) is inert here because it is in-progress-only.
+
+    RED until step-10 computes and passes ``pure_gate`` — only case (a) fails
+    today; (b)-(d) are the narrowing controls and pin the keep-listed behavior.
+    """
+
+    _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+    _TASK_ID = 3845
+    _BRANCH = 'task/3845'
+
+    # dark_factory task 3845's real metadata, verified first-hand. The
+    # `operational_mode`/`execution_class` labels are incidental — the
+    # classification keys on (always_escalates, before_done), the pair
+    # DeterministicRunner itself branches on.
+    _PURE_GATE_METADATA = {
+        'task_kind': 'deterministic',
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'always_escalates': True,
+    }
+
+    def _git_side_effect(self, *, worktree_for_branch: str | None = None):
+        """Drive worktree_registered=False, recent_commit=False, and an UNKNOWN
+        (not zero) own-commit count.
+
+        A failing ``rev-list`` yields an unknown count, so ``branch_bare`` is
+        False and task 2767's rule 4 cannot mask the result — the ONLY signal
+        left is the project-wide orchestrator lock, which is exactly what rule 5
+        must drop. Pass *worktree_for_branch* to additionally register a live
+        worktree for that branch.
+        """
+        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                stdout = 'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                if worktree_for_branch is not None:
+                    stdout += (
+                        f'worktree /project-{self._TASK_ID}\nHEAD def5678\n'
+                        f'branch refs/heads/{worktree_for_branch}\n\n'
+                    )
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stdout, stderr='',
+                )
+            # rev-list AND git log both fail: unknown commit count (=> not
+            # bare) and no tip timestamp (=> recent_commit False).
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='fatal: bad revision',
+            )
+
+        return side_effect
+
+    def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        with patch(
+            'subprocess.run',
+            side_effect=self._git_side_effect(worktree_for_branch=worktree_for_branch),
+        ):
+            return _render_live_workflow_section(
+                [task], ProjectRoot(str(tmp_path)), now=self._NOW
+            )
+
+    # ----- cases -----
+
+    def test_pending_pure_gate_is_dropped(self, tmp_path, monkeypatch):
+        """(a) THE SYMPTOM — task 3845's exact shape is dropped entirely."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH not in result, (
+            f"Expected {self._BRANCH} DROPPED (pending deterministic pure gate, "
+            f"orchestrator-only signal); got:\n{result!r}"
+        )
+        assert result == '', (
+            f"Expected an EMPTY section (the only task was dropped); got:\n{result!r}"
+        )
+
+    def test_pending_before_done_deterministic_is_still_listed(self, tmp_path, monkeypatch):
+        """(b) NARROWING — a pending deterministic task WITH before_done may be
+        mid-deploy inside DeterministicRunner, so its signal is kept."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {
+                **self._PURE_GATE_METADATA,
+                'before_done': {'kind': 'predicate'},
+            },
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+            f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
+        )
+
+    def test_pending_normal_task_is_still_listed(self, tmp_path, monkeypatch):
+        """(c) Ordinary pending tasks are completely unaffected."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {'task_kind': 'normal'},
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
+            f"deterministic-only; got:\n{result!r}"
+        )
+
+    def test_pure_gate_with_registered_worktree_is_still_listed(self, tmp_path, monkeypatch):
+        """(d) Per-task evidence wins — only the bare project-wide orchestrator
+        signal is suppressed, never a real worktree."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(
+            tmp_path, task, monkeypatch, worktree_for_branch=self._BRANCH
+        )
+
+        assert f'- {self._BRANCH}: worktree' in result, (
+            f"Expected {self._BRANCH} listed via its REGISTERED WORKTREE (and "
+            f"WITHOUT the suppressed orchestrator signal); got:\n{result!r}"
+        )
+
+
 class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
     """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
     taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
