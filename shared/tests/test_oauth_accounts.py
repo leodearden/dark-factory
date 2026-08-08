@@ -300,3 +300,52 @@ class TestUsageGateResolvesThroughSingleHome:
         module = reload_module_under_env('test_usage_gate')
         assert module._AVAILABLE_TOKENS == []
         assert module._need_one_account.args[0] is True
+
+
+class TestFleetConsumersResolveThroughSingleHome:
+    """The fleet-set consumers must hold the single home's own function object.
+
+    Object IDENTITY is the assertion that actually forbids a re-inlined copy.
+    Behavioural assertions alone cannot catch the failure this task is about: a
+    fresh ``for c in 'BCDEFG'`` copy would pass every scan-behaviour assertion
+    on the day it is written and only diverge later, which is exactly how the
+    present three-way drift arose.
+
+    The repo already sanctions this class of guard — ``_capacity_skip`` carries
+    a bidirectional drift guard against production's ``classify_invocation`` —
+    and it is a runtime-wiring fact, not a documentation meta-test. Each guard
+    is paired below with behavioural pins so a green suite still proves the scan
+    WORKS, not merely that it is wired.
+    """
+
+    def test_cross_account_evidence_uses_the_single_home(self):
+        import _cross_account_evidence
+
+        assert _cross_account_evidence.available_tokens is available_tokens
+
+    def test_cli_invoke_integration_uses_the_single_home(self):
+        import test_cli_invoke_integration
+
+        assert test_cli_invoke_integration.available_tokens is available_tokens
+
+    def test_integration_module_sees_f_and_g_in_scan_order(
+        self, reload_module_under_env
+    ):
+        module = reload_module_under_env(
+            'test_cli_invoke_integration',
+            CLAUDE_OAUTH_TOKEN_G='tok-g',
+            CLAUDE_OAUTH_TOKEN_F='tok-f',
+        )
+        assert module._AVAILABLE_TOKENS == [
+            ('CLAUDE_OAUTH_TOKEN_F', 'tok-f'),
+            ('CLAUDE_OAUTH_TOKEN_G', 'tok-g'),
+        ]
+
+    def test_integration_module_does_not_see_the_interactive_primary_account(
+        self, reload_module_under_env
+    ):
+        """The cross-account measurement spends fleet capacity; A stays out."""
+        module = reload_module_under_env(
+            'test_cli_invoke_integration', CLAUDE_OAUTH_TOKEN_A='tok-a'
+        )
+        assert module._AVAILABLE_TOKENS == []
