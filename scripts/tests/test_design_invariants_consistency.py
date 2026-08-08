@@ -1173,3 +1173,129 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
         f"it still POINTS at the doc that does. Without the path, deleting the "
         f"restatement just turned the G7 bullet into a dangling reference."
     )
+
+
+# ---------------------------------------------------------------------------
+# The fixtures doc's rehearsal verdict table — pinned for COVERAGE only
+#
+# The doc carries an explicit "Snapshot caveat" declaring the Verdict column a
+# point-in-time transcription of the G7 / Step-5.5 wording, NOT a live pin on
+# those source docs, and tells readers to re-walk rather than trust the quoted
+# rationale as current. So this guard asserts COVERAGE — every invariant present
+# in both PRD and CODE shape, each row's Expected-slug cell equal to the
+# canonical slug, the legend's cumulative count current — and never the prose.
+# Coverage is the property that actually fails to auto-extend when an invariant
+# is added, so it is the right thing to mechanize.
+# ---------------------------------------------------------------------------
+
+_SMALL_FAMILY = [(1, "a-slug"), (2, "b-slug")]
+
+# Rows are split over THREE tables in the live doc (a base table plus two dated
+# addenda), so the extractor must collect across all of them rather than parse
+# "the" table. Modelled on that shape.
+_VERDICT_HAPPY = """\
+Acceptance: every fixture flags with the correct slug — 4 rows cumulative, all `Y`.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | G7's list fires | Y |
+| `INV-1-CODE` | CODE | INV-1 a-slug | `a-slug` | Step 5.5 fires | Y |
+
+### Addendum — later walk
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-2-PRD` | PRD | INV-2 b-slug | `b-slug` | G7's list fires | Y |
+| `INV-2-CODE` | CODE | INV-2 b-slug | `b-slug` | Step 5.5 fires | Y |
+"""
+
+_VERDICT_MISSING_CODE = _VERDICT_HAPPY.replace(
+    "| `INV-2-CODE` | CODE | INV-2 b-slug | `b-slug` | Step 5.5 fires | Y |\n", ""
+).replace("4 rows cumulative", "3 rows cumulative")
+
+_VERDICT_WRONG_SLUG = _VERDICT_HAPPY.replace(
+    "| `INV-2-PRD` | PRD | INV-2 b-slug | `b-slug` |",
+    "| `INV-2-PRD` | PRD | INV-2 b-slug | `a-slug` |",
+)
+
+_VERDICT_UNKNOWN_NUMBER = _VERDICT_HAPPY.replace("| `INV-2-CODE` |", "| `INV-9-CODE` |")
+
+_VERDICT_STALE_LEGEND = _VERDICT_HAPPY.replace("4 rows cumulative", "5 rows cumulative")
+
+_VERDICT_TOO_FEW_COLUMNS = "| `INV-1-PRD` | PRD |\n"
+
+_VERDICT_EMPTY_SLUG_CELL = "| `INV-1-PRD` | PRD | INV-1 a-slug |  | fires | Y |\n"
+
+
+def test_verdict_table_rows_collects_rows_across_every_table() -> None:
+    """Rows are collected by ROW SHAPE, not per-table — the live set is split in three."""
+    assert verdict_table_rows(_VERDICT_HAPPY, source=_FIXTURE_SOURCE) == [
+        (1, "PRD", "a-slug"),
+        (1, "CODE", "a-slug"),
+        (2, "PRD", "b-slug"),
+        (2, "CODE", "b-slug"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case"),
+    [
+        pytest.param(_VERDICT_TOO_FEW_COLUMNS, "too few columns", id="short-row"),
+        pytest.param(_VERDICT_EMPTY_SLUG_CELL, "empty expected-slug cell", id="empty-slug-cell"),
+        pytest.param("no table here at all\n", "no rows", id="no-rows"),
+    ],
+)
+def test_verdict_table_rows_fails_loudly(markdown_text: str, case: str) -> None:
+    """A malformed or absent row RAISES rather than yielding ``None`` or ``[]``.
+
+    Yielding ``None`` for an unreadable Expected-slug cell would make the
+    slug-equality check below compare ``None`` against a real slug — a red with a
+    misleading diagnosis — and an empty row list would make coverage pass
+    vacuously.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        verdict_table_rows(markdown_text, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value), case
+
+
+def test_assert_verdict_table_covers_accepts_a_complete_table() -> None:
+    assert_verdict_table_covers(_VERDICT_HAPPY, _SMALL_FAMILY, source=_FIXTURE_SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_phrase"),
+    [
+        pytest.param(_VERDICT_MISSING_CODE, "missing CODE row", "CODE", id="missing-code-row"),
+        pytest.param(_VERDICT_WRONG_SLUG, "wrong expected slug", "a-slug", id="wrong-slug"),
+        pytest.param(_VERDICT_UNKNOWN_NUMBER, "unknown invariant", "9", id="unknown-number"),
+        pytest.param(_VERDICT_STALE_LEGEND, "stale legend", "5", id="stale-legend-count"),
+    ],
+)
+def test_assert_verdict_table_covers_rejects_drift(
+    markdown_text: str, case: str, expected_phrase: str
+) -> None:
+    """Each drift shape the table can develop when the family changes fires."""
+    with pytest.raises(AssertionError) as excinfo:
+        assert_verdict_table_covers(markdown_text, _SMALL_FAMILY, source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: {message!r}"
+    assert expected_phrase in message, f"{case}: message must quote the defect: {message!r}"
+
+
+def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
+    """LIVE: the rehearsal table walks every invariant in both fixture shapes.
+
+    Coverage only. The Verdict/rationale column is deliberately NOT pinned: the
+    doc's own "Snapshot caveat" declares it a point-in-time transcription of the
+    G7 and Step-5.5 text as it read on 2026-07-14, and instructs readers to
+    re-walk the fixtures against the current wording rather than trust the quoted
+    rationale. Pinning that prose would contradict the doc's stated contract and
+    would go red on any unrelated gate-wording edit.
+    """
+    assert_verdict_table_covers(
+        FIXTURES_DOC.read_text(encoding="utf-8"),
+        canonical_family(),
+        source=_repo_relative(FIXTURES_DOC),
+    )
