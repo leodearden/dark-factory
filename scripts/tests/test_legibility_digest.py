@@ -1082,6 +1082,18 @@ def _briefing_text(body_filler='Project overview and recent decisions go here.')
     )
 
 
+_CENSUS_MEMORY_CONTEXT_TURN = (
+    '# Context\n\n'
+    '## Project Context\n\n'
+    '{ "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", '
+    '"content": "Task 1470 wired /audit into /review Phase-2 Architectural '
+    'Coherence." } ] }\n'
+)
+"""The 07-31 census cluster 1.1(b) sighting verbatim
+(plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing injection
+that the all-three-headings rule admitted into the gold section."""
+
+
 _TRICKLE_CODER_PREAMBLE = (
     'You are the trickle coder for the dark-factory agent-confusion '
     'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
@@ -1113,6 +1125,60 @@ class TestHarnessInjectedTurnFilter:
 
         assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
         assert [t['index'] for t in turns] == [1]
+
+    def test_census_sighted_memory_context_turn_is_excluded(self):
+        # The 07-31 census cluster 1.1(b) sighting, verbatim
+        # (plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing
+        # injection -- '# Context' + '## Project Context' + the memory-search
+        # JSON dump. It carries NEITHER '## Agent Identity' NOR '# Task', so
+        # the old all-three rule let it through into the gold section.
+        text = _CENSUS_MEMORY_CONTEXT_TURN
+
+        assert mod.is_harness_injected_turn(text) is True
+        assert mod.iter_user_turns([_user_text(text)]) == []
+
+    def test_context_plus_conventions_subheading_is_excluded(self):
+        # briefing.py:1096 emits '## Conventions' under the same '# Context'.
+        records = [_user_text(
+            '# Context\n\n## Conventions\n\n{"results": []}\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_memory_unavailable_context_variant_is_excluded(self):
+        # briefing.py:1113's exception path emits a '## Context' sub-block;
+        # '## Context' is therefore an ANCHOR too, not just '# Context'.
+        records = [_user_text(
+            '## Context\n\n_Memory unavailable._\n\n## Project Context\n\nx\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_task_plus_action_is_excluded(self):
+        # The role prompt templates emit '# Task' and '# Action'
+        # (briefing.py:193/496/1038) as the two headings of one preamble.
+        records = [_user_text('# Task\n\ndo the thing\n\n# Action\n\ngo\n')]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_lone_context_anchor_with_prose_is_retained(self):
+        # The relaxation's boundary: ONE anchor and NO corroborating
+        # briefing heading is not enough to classify as injected.
+        records = [_user_text('# Context\n\nsome prose about the problem')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == '# Context\n\nsome prose about the problem'
+
+    def test_lone_subheading_without_an_anchor_is_retained(self):
+        # A corroborator alone never classifies -- at least one ANCHOR is
+        # required, so a human turn headed '## Conventions' stays gold.
+        records = [_user_text('## Conventions\n\nwe always use tabs, fix this')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
 
     def test_single_heading_alone_is_not_excluded(self):
         # Only ONE of the three co-occurring headings -- must not alone
