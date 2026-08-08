@@ -53,7 +53,6 @@ where the wording being "still correct" is not.
 from __future__ import annotations
 
 import importlib.resources as pkg_resources
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -67,7 +66,7 @@ from orchestrator.agents.roles import (
     WAIT_PATTERN_GUIDANCE,
     WAIT_PATTERN_REMINDER,
 )
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 
 # A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
 # tool — i.e. it can launch a build, a full test suite, or a long verification
@@ -391,22 +390,6 @@ def test_combined_guidance_is_stated_up_front() -> None:
     )
 
 
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O),
-    mirroring the fixture in test_roles_background_warning.py."""
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
-
-
 def test_amender_reminder_cannot_dangle() -> None:
     """Half the pointer's precondition: IMPLEMENTER carries the full block.
 
@@ -454,9 +437,21 @@ async def test_amender_prompt_reinforces_the_wait_rules(
     single prompt. The no-duplication half is asserted explicitly so a future
     edit cannot quietly reintroduce it.
 
+    Task 3747 folded in ``test_roles_background_warning.py``'s near-duplicate
+    ``test_amender_prompt_reinforces_warning_at_failure_site`` (task 2761),
+    which exercised the same ``build_amender_prompt`` call over the same stub
+    ``briefing`` fixture (now shared via ``conftest.py``) and additionally
+    asserted the task-2761 ``BACKGROUND_TASK_WARNING`` precondition below —
+    that assertion is preserved here rather than dropped.
+
     ``_get_memory_context`` is patched to a stub so no real fused-memory HTTP
     call fires (mirrors the resume golden test).
     """
+    assert BACKGROUND_TASK_WARNING in ROLES['implementer'].system_prompt, (
+        'The amender runs under IMPLEMENTER; its system prompt must carry the '
+        "2761 warning, since the turn prompt now only points back at it."
+    )
+
     with patch.object(
         BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
     ):
