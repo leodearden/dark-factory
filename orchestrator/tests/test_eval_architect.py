@@ -3845,3 +3845,97 @@ class TestCliArchitectDispatch:
         _, run_eval, run_arch = _dispatch_single_eval(self._impl_cfg(), capsys)
         run_eval.assert_called_once()
         run_arch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# UsageGate construction in run_architect_eval (eval-revival φ, task 3630)
+#
+# The architect eval was the ONE eval entry point invoking an agent with no
+# account failover: run_eval (runner.py:401-407) and run_end_to_end
+# (:1039-1045) both build a gate, run_architect_eval did not. A capped account
+# therefore refused the architect outright, and the cell was recorded
+# cap_tainted → EXCLUDED from the reported mean (the 2026-07-28 wave lost ~40%
+# of cells, 37 blocked). Exclusion is not neutral: the costlier candidate runs
+# longer and is more cap-exposed, so it loses more cells and the comparison is
+# biased invisibly.
+#
+# These pin the gate CONSTRUCTION half — same enabled-guard, same
+# warn-and-degrade fallback as the two sibling entry points.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectEvalUsageGate:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_gate_is_constructed_from_usage_cap_when_enabled(self):
+        from shared.config_models import UsageCapConfig
+
+        gate = MagicMock()
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+
+        # Built exactly ONCE, from the orch config's usage_cap BLOCK — not the
+        # whole config, and not a fresh default. Same call shape as
+        # run_eval:405 / run_end_to_end:1043.
+        mocks['UsageGate'].assert_called_once()
+        passed = mocks['UsageGate'].call_args.args[0]
+        assert isinstance(passed, UsageCapConfig)
+        assert passed.enabled is True
+
+        # …and the cell is otherwise untouched: still one architect invoke,
+        # still judged, still a non-sentinel score.
+        assert mocks['invoke'].call_count == 1
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['cap_tainted'] is False
+        assert result.outcome == 'done'
+
+    async def test_gate_is_not_constructed_when_usage_cap_disabled(self):
+        """usage_cap.enabled=False is a real production configuration.
+
+        The gate must stay ABSENT there — the enabled guard is what keeps a
+        deployment that opted out of the account pool from paying for probe
+        dirs and account state it never asked for.
+        """
+        gate_factory = MagicMock()
+        with patch('orchestrator.evals.runner.UsageGate', gate_factory):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(), produced_plan=_well_formed_plan(),
+            )
+
+        assert not gate_factory.called
+        # Byte-equivalent to the pre-φ cell.
+        assert mocks['invoke'].call_count == 1
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['cap_tainted'] is False
+        assert result.outcome == 'done'
+
+    async def test_gate_construction_failure_degrades_to_no_failover(self, caplog):
+        """A gate that cannot be built must not take the eval cell down with it.
+
+        Same warn-and-degrade contract as run_eval:406-407: log WHY, then run
+        ungated. Losing failover costs cells; raising here would cost the whole
+        campaign — and would do it for a REASON that has nothing to do with the
+        candidate under test.
+        """
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate_error=RuntimeError('boom'),
+        )
+
+        assert 'without failover' in caplog.text
+        assert 'boom' in caplog.text
+
+        # Fully scored cell, not a crash and not an exclusion.
+        assert isinstance(result.metrics['plan_quality'], float)
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.outcome == 'done'
+        assert result.metrics['cap_tainted'] is False
+        assert mocks['invoke'].call_count == 1
