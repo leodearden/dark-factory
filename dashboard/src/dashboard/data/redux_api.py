@@ -841,7 +841,31 @@ def shape_performance(
 # ---------------------------------------------------------------------------
 
 
-_BURNDOWN_KEYS = ('done', 'in_progress', 'blocked', 'pending')
+# ``concurrency_cap`` is deliberately NOT here: it is a per-project scalar
+# series, not an additive count.  Summing caps across projects invents a
+# denominator no single orchestrator ever enforced — the parity alarm is
+# aggregated by OR-ing per-project verdicts instead (see below).
+_BURNDOWN_KEYS = (
+    'done', 'in_progress', 'in_progress_live', 'in_progress_stranded', 'blocked', 'pending',
+)
+
+
+def _with_split(series: Mapping[str, Any]) -> dict[str, Any]:
+    """Return *series* with the live/stranded split guaranteed present.
+
+    A series predating the split (an un-migrated burndown.db) carries neither
+    key.  ``get_burndown_series`` already degrades that case to all-live, and
+    this seam degrades it identically: contributing 0 to both bands while the
+    ``in_progress`` band they split stays fully populated would break the
+    conservation invariant (``live + stranded == in_progress``) that makes the
+    stacked chart and the parity alarm auditable.
+    """
+    live = list(series.get('in_progress_live') or [])
+    stranded = list(series.get('in_progress_stranded') or [])
+    if not live and not stranded:
+        in_progress = list(series.get('in_progress') or [])
+        live, stranded = in_progress, [0] * len(in_progress)
+    return {**series, 'in_progress_live': live, 'in_progress_stranded': stranded}
 
 
 def shape_burndown(
@@ -851,7 +875,9 @@ def shape_burndown(
 
     ``BURNDOWN`` is the sum across projects, aligned by label.
     ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks
-    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history).
+    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history),
+    the ``in_progress_live`` / ``in_progress_stranded`` split, and a parity
+    block from :func:`dashboard.data.burndown.compute_parity_alarm`.
 
     Consumer contract — the two label rows are NOT interchangeable:
 
@@ -877,43 +903,93 @@ def shape_burndown(
     would first require every downstream consumer (``deriveVelocitySeries``,
     the summary-table last-value reads, ``compute_window_completion``) to be
     made hole-aware.
+
+    The aggregate parity block is an **OR over per-project alarms**, never a
+    comparison of summed in-progress against summed caps.  Summing hides a
+    real breach behind an idle project's headroom (33-against-24 beside
+    3-against-100 reads as 35-against-124) and invents a fake one when a
+    capless project inflates the numerator against a partial denominator.
+    ``parity_peak`` / ``parity_cap`` travel as a matched pair from the
+    worst-margin breaching project — a peak from one project beside a cap from
+    another explains nothing — and are ``None`` when nothing breaches.
+    ``parity_projects`` names the breaching projects so an operator reading the
+    aggregate banner is not left hunting for which one.
     """
     # Local import avoids circular import: burndown.py imports stats and
     # this module imports config/no-burndown.
     from dashboard.data.burndown import (
         aggregate_window_completion,
         compute_forecast_confidence,
+        compute_parity_alarm,
         compute_window_completion,
     )
 
     by_project: dict[str, dict] = {}
+    filled_by_project: list[dict[str, Any]] = []
     label_set: set[str] = set()
     for pid, series in series_by_project.items():
+        filled = _with_split(series)
+        filled_by_project.append(filled)
         labels = list(series.get('labels') or [])
         label_set.update(labels)
         forecast = compute_forecast_confidence(series)
         completion = compute_window_completion(series)
+        parity = compute_parity_alarm(series)
         by_project[_project_label(pid)] = {
             'labels': labels,
-            **{k: list(series.get(k) or []) for k in _BURNDOWN_KEYS},
+            **{k: list(filled.get(k) or []) for k in _BURNDOWN_KEYS},
             **forecast,
             **completion,
+            **parity,
         }
 
     sorted_labels = sorted(label_set)
     aggregate: dict[str, Any] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
-    for series in series_by_project.values():
-        labels = list(series.get('labels') or [])
-        index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
+    index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
+    for filled in filled_by_project:
+        labels = list(filled.get('labels') or [])
         for k in _BURNDOWN_KEYS:
-            for lbl, val in zip(labels, series.get(k) or [], strict=False):
+            for lbl, val in zip(labels, filled.get(k) or [], strict=False):
                 if lbl in index_map:
                     aggregate[k][index_map[lbl]] += int(val or 0)
 
     aggregate.update(compute_forecast_confidence(aggregate))
     aggregate.update(aggregate_window_completion(by_project, sorted_labels))
+    aggregate.update(_aggregate_parity(by_project))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
+
+
+def _aggregate_parity(by_project: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Fold per-project parity verdicts into one aggregate block.
+
+    See :func:`shape_burndown` for why this is an OR rather than a comparison
+    of summed counts against summed caps.
+    """
+    breaching = sorted(
+        (label for label, block in by_project.items() if block.get('parity_alarm')),
+    )
+    breach_count = sum(int(b.get('parity_breach_count') or 0) for b in by_project.values())
+
+    worst_peak: int | None = None
+    worst_cap: int | None = None
+    worst_margin: int | None = None
+    for label in breaching:
+        block = by_project[label]
+        peak, cap = block.get('parity_peak'), block.get('parity_cap')
+        if not isinstance(peak, int) or not isinstance(cap, int):
+            continue  # an alarm always carries both; belt-and-braces
+        margin = peak - cap
+        if worst_margin is None or margin > worst_margin:
+            worst_margin, worst_peak, worst_cap = margin, peak, cap
+
+    return {
+        'parity_alarm': bool(breaching),
+        'parity_cap': worst_cap,
+        'parity_peak': worst_peak,
+        'parity_breach_count': breach_count,
+        'parity_projects': breaching,
+    }
 
 
 # ---------------------------------------------------------------------------
