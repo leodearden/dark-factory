@@ -517,6 +517,49 @@ class TestAlreadyLandedDispatchGateAnyLevelVeto:
         assert result is True
         cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
 
+    async def test_escalation_store_read_failure_vetoes_flip(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """A FAILED read is the third state, not "no open escalations".
+
+        The caller-side half of ``classify_pins``'s STORE-CORRECTNESS
+        CONTRACT (obligation 2: "Pass ``records=None`` when that read could
+        not be performed or failed. Never substitute ``[]``") — substituting
+        ``[]`` here would be the exact esc-3163 collapse the contract exists
+        to forbid.  So an unreadable store must veto, must not raise, and
+        must say so.
+
+        Letting the exception propagate instead would make the disposition
+        invisible: the scheduler's generic ``_consult_already_landed``
+        catch-all logs a traceback and fails open for the WHOLE gate, so
+        "never phantom-done on an unreadable store" would be incidental
+        rather than local and testable.
+
+        Note this is distinct from ``_escalation_queue is None``, which keeps
+        failing OPEN — a deliberately-absent queue (escalations disabled) is
+        not the same thing as a failed read.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            '42' in m and ('store' in m.lower() or 'read' in m.lower())
+            for m in messages
+        ), messages
+
 
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
