@@ -127,8 +127,10 @@ class TestTopicSlug:
 class TestNormalizeSupersedes:
     """PRD D2 — `supersedes` is a list; the helper accepts scalar/list/None.
 
-    Readers: ``reconciliation/targeted.py:1464`` and leaf 3112's closure
-    predicate. The scalar writer is ``reconciliation/harness.py:1167``.
+    The writer/reader map is stated once, in ``normalize_supersedes``'s own
+    docstring — in short: the harness writer emitted a scalar until task 3196
+    migrated it to the canonical list shape, and scalar tolerance remains on
+    read for the 81 un-migrated corpus records.
     """
 
     def test_none_becomes_empty_list(self):
@@ -175,7 +177,8 @@ class TestKindRegistry:
 
     #: The five names the PRD's §6 row claimed were live but that leaf α
     #: measured at ZERO live records.  Three have verified live in-repo
-    #: Mem0 writers (scope_freshness.py:97/:251/:495, harness.py:1166,
+    #: Mem0 writers (scope_freshness.py:97/:251/:495,
+    #: ReconciliationHarness._reconcile_status_correction,
     #: cleanup_count_snapshots.py:210); two do not (see the registry's
     #: block 2 comments).  All five are retained regardless:
     #: grandfathering means "what is written", not only "what survives"
@@ -764,9 +767,15 @@ class TestValidateMemoryMetadata:
     def test_scalar_supersedes_is_normalized_not_rejected(self):
         """The beta-before-gamma hazard fix.
 
-        harness.py:1167 writes a scalar today (81 live records). Beta lands
-        BEFORE gamma migrates it, so rejecting the scalar form here would
-        break the recon harness's own writes for the whole window between.
+        The recon harness wrote a scalar (81 live records) until task 3196
+        (gamma) migrated it to the canonical list shape. Beta landed BEFORE
+        gamma, so rejecting the scalar form here would have broken the recon
+        harness's own writes for the whole window between.
+
+        Post-3196 this guards the LEGACY CORPUS rather than a live in-repo
+        writer: gamma shipped no corpus rewrite, so the 81 pre-migration
+        records still carry scalars (PRD D2 defers retro normalization to leaf
+        theta's stamping sweep), and out-of-repo writers are unbound by it.
         """
         meta = {'supersedes': _UUID}
         assert self._validate(meta) == []

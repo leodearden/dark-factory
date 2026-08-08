@@ -1164,7 +1164,35 @@ class ReconciliationHarness:
             live = diff['live']
             corrected_metadata = {
                 'kind': 'project_status_correction',
-                'supersedes': latest['id'],
+                # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs.  The
+                # shape contract, the read tolerance for the legacy scalar, and
+                # the writer/reader map all live in ONE place —
+                # `memory_metadata.normalize_supersedes`'s docstring — rather
+                # than being restated here.  Written list-shaped at the source
+                # rather than leaning on the service-seam coercion in
+                # validate_memory_metadata().  Exactly one predecessor is
+                # recorded: `latest` is the single max()-by-created_at memory
+                # being superseded.  Do NOT widen to every deleted duplicate —
+                # the queried set is deleted for pool-capping (task 1938
+                # amendment), a different relation from supersession.
+                #
+                # EXPECTED-DANGLING POINTER (deliberate; pre-dates the list
+                # migration and is unchanged by it).  `latest` is a member of
+                # the `memories` set deleted below, so this id does NOT resolve
+                # via `get_memory_by_id` once this branch returns.  That is
+                # intended: the pool cap requires the corrected predecessor to
+                # go away, and `supersedes` is kept as an audit trace of WHICH
+                # record was corrected, not as a live pointer.  Consequence for
+                # the eval program's E4 dangling-pointer census
+                # (docs/prds/memory-eval-program.md §γ, which resolves
+                # `supersedes` targets via `get_memory_by_id`): 100% of this
+                # writer's edges are dangling BY DESIGN, so E4 must allowlist
+                # `kind=project_status_correction` rather than report a census
+                # spike.  Making the target resolvable would mean keeping
+                # `latest` alive, which reopens the unbounded-pool bug — i.e.
+                # not a documentation-only change, which is why this leaf
+                # records the invariant instead of "fixing" it.
+                'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
                 'active_tasks': live['active_tasks'],
@@ -1177,7 +1205,7 @@ class ReconciliationHarness:
                 f"active={len(live['active_tasks'])}."
             )
             # Add-then-delete: guarantees at least one correct memory always exists
-            # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+            # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
             # is still the most-recent, so next cycle's max()-by-created_at selection
             # ignores any stale leftover and self-heals.  Once add_memory lands, the
             # supersede has effectively happened regardless of delete outcomes below

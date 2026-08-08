@@ -12620,7 +12620,17 @@ class TestHarnessReconcileStatusCorrection:
         assert add_kwargs['category'] == 'observations_and_summaries'
         assert add_kwargs['project_id'] == 'test-project'
         assert add_kwargs['metadata']['kind'] == 'project_status_correction'
-        assert add_kwargs['metadata']['supersedes'] == 'af698512-stale-memory'
+        # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs, written
+        # list-shaped at the source. Asserted on the PRE-service metadata dict
+        # so a migrated writer is distinguishable from one relying on the
+        # scalar->list coercion in validate_memory_metadata(). Exact list
+        # equality is the contract: exactly one superseded predecessor
+        # (`latest['id']`) is recorded per correction — not membership.
+        supersedes = add_kwargs['metadata']['supersedes']
+        assert isinstance(supersedes, list), (
+            f'PRD D2: supersedes is a list of full UUIDs, got {type(supersedes).__name__}'
+        )
+        assert supersedes == ['af698512-stale-memory']
         assert add_kwargs['metadata']['task_count_done'] == 114
         assert add_kwargs['metadata']['task_count_total'] == 124
         assert sorted(add_kwargs['metadata']['active_tasks']) == live_active
