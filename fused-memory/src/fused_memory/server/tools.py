@@ -1457,6 +1457,7 @@ def create_mcp_server(
         project_id: str,
         agent_id: str | None,
         replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
 
@@ -1552,6 +1553,19 @@ def create_mcp_server(
             {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
             for c in live_citers
         ]
+
+        # The deliberate escape, placed HERE rather than as an early-out at the
+        # top of the gate on purpose: it must be able to name what it dangles.
+        # An early return before the scan would be cheaper but structurally
+        # unable to enumerate anything, which is the silent-override defect
+        # this whole gate argues against. The placement also preserves the
+        # fail-CLOSED posture for free — the scan-error return above precedes
+        # it, so an override plus an unreadable task DB is still
+        # CitationScanFailed. That is the right semantics: the flag means "I
+        # accept dangling the citers you just showed me", and with nothing
+        # enumerated there is nothing to knowingly accept.
+        if allow_dangling_citations:
+            return None, None
 
         if replacement_memory_id is None:
             return {
@@ -3071,11 +3085,19 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
+        # Same write-time override idiom as add_memory's allow_near_duplicate
+        # (see below in this module): read off the RAW envelope, and only a
+        # LITERAL True counts — a truthy 'yes' must not unlock an irreversible
+        # delete.
+        allow_dangling_citations = (
+            isinstance(metadata, dict) and metadata.get('allow_dangling_citations') is True
+        )
         # Repoint live task-metadata citations BEFORE the irreversible delete.
         # Order is the whole point: a rejection here never reaches the service
         # call, so the dangling-pointer window is closed rather than moved.
         rejection, repoint_stats = await _citation_repoint_gate(
             resolved_id, store, project_id, agent_id, replacement_memory_id,
+            allow_dangling_citations=allow_dangling_citations,
         )
         if rejection:
             return rejection
