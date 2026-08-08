@@ -279,6 +279,72 @@ class TestResolveReifyRoot:
         start = start_dir / 'test_x.py'
         assert _resolve_reify_root(start) == (higher / 'reify').resolve()
 
+    # -- REIFY_ROOT override precedence (task 3843 step 3/4) ----------------
+
+    def test_env_override_wins_over_discovery(self, tmp_path, monkeypatch):
+        src = tmp_path / 'src'
+        start = _plant(src, 'dark-factory/fused-memory/tests')
+        other = tmp_path / 'other' / 'reify-elsewhere'
+        other.mkdir(parents=True)
+        monkeypatch.setenv('REIFY_ROOT', str(other))
+
+        result = _resolve_reify_root(start)
+
+        assert result == other.resolve()
+        assert result != (src / 'reify').resolve(), (
+            'REIFY_ROOT must win over a discoverable ancestor, not be shadowed by it'
+        )
+
+    def test_env_override_is_honored_verbatim_when_absent_on_disk(self, tmp_path, monkeypatch):
+        src = tmp_path
+        start = _plant(src, 'dark-factory/fused-memory/tests')
+        missing = tmp_path / 'does-not-exist' / 'reify-typo'
+        monkeypatch.setenv('REIFY_ROOT', str(missing))
+
+        result = _resolve_reify_root(start)
+
+        assert result == missing.resolve(), (
+            'a REIFY_ROOT typo must surface downstream as a skip naming the bad '
+            'path, not silently fall back to a discovered checkout that answers '
+            'for a different repo than the operator named'
+        )
+        assert not result.exists()
+
+    def test_env_override_returns_a_path_object(self, tmp_path, monkeypatch):
+        # start has nothing discoverable in its ancestry, so pre-step-4 (env
+        # ignored) this falls through discovery to None, not a Path — a
+        # genuine RED distinct from test_env_override_wins_over_discovery.
+        monkeypatch.setenv('REIFY_ROOT', 'relative/reify-path')
+        start = tmp_path / 'a' / 'b' / 'test_x.py'
+        result = _resolve_reify_root(start)
+        assert isinstance(result, Path)
+        assert result.is_absolute(), 'callers append _REIFY_GUARD_RELPATH unconditionally'
+
+    def test_empty_env_var_falls_back_to_discovery(self, tmp_path, monkeypatch):
+        # An exported-but-empty REIFY_ROOT ('export REIFY_ROOT=') is a shell
+        # accident, not an intent, and must not resolve to the process CWD.
+        monkeypatch.setenv('REIFY_ROOT', '')
+        src = tmp_path
+        start = _plant(src, 'dark-factory/fused-memory/tests')
+        assert _resolve_reify_root(start) == (src / 'reify').resolve()
+
+    def test_unset_env_var_falls_back_to_discovery(self, tmp_path, monkeypatch):
+        # Regression pin: honoring REIFY_ROOT must not break plain discovery.
+        monkeypatch.delenv('REIFY_ROOT', raising=False)
+        src = tmp_path
+        start = _plant(src, 'dark-factory/fused-memory/tests')
+        assert _resolve_reify_root(start) == (src / 'reify').resolve()
+
+    def test_module_constants_track_the_resolver(self):
+        """Single-source-of-truth pin — GREEN as soon as step 2 lands.
+
+        Not this step's RED signal (see plan step 3); included here because it
+        is cheap and guards against the two call sites re-diverging later.
+        """
+        assert _REIFY_REPO_ROOT == _resolve_reify_root()
+        if _REIFY_REPO_ROOT is not None:
+            assert _REIFY_GUARD_SCRIPT == _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH
+
 
 # ---------------------------------------------------------------------------
 # REJECT corpus (α/γ shared vector — all must return False)
