@@ -3348,6 +3348,14 @@ class MemoryService:
 
     # ------------------------------------------------------------------
     # Read: search
+    #
+    # Cross-store merge is Reciprocal Rank Fusion with RRF_K (task 3658, PRD
+    # D4). The router's primary_store is a TIEBREAK, not precedence: it used to
+    # order results wholesale, which let one store fill `limit` and made the
+    # other structurally unreachable no matter how well it matched. Graphiti
+    # emits no synthesized scores any more — it has none of its own to report,
+    # which is why fusion is by rank rather than by calibrated score. See
+    # `_rrf_score` and the `search` docstring for the full consumer contract.
     # ------------------------------------------------------------------
 
     async def search(
