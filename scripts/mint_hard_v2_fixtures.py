@@ -83,6 +83,71 @@ SELECT MIN(timestamp) FROM events
 WHERE task_id = ? AND role='architect'\
 """
 
+# ---------------------------------------------------------------------------
+# The curation judgements
+# ---------------------------------------------------------------------------
+#
+# The criterion is the PRD's, recorded verbatim: EXCLUDE a candidate when its
+# brief FAILS TO STATE AN IMPLEMENTABLE GOAL. It is never a length threshold —
+# `brief_chars` is recorded on every row as evidence for the judgement, not as
+# the rule. reify 3024's 94-character brief is INCLUDED for exactly this
+# reason: terse, but it names the annotation to parse and the fallback to
+# derive, so it is implementable-but-thin, which is the hard signal the pool
+# exists to measure.
+#
+# Every candidate not listed here is an include; each entry below is one
+# individually adjudicated exclusion, keyed ``(project, task_id)``.
+EXCLUSIONS: dict[tuple[str, str], str] = {
+    ('reify', '3378'): (
+        'EXCLUDE. Cancelled, and abandonment was NOT benign: the architect '
+        'reported the task unactionable 6 separate times (esc-3378-91/92/125/'
+        '126/129/130), each naming the same cause — the required signature '
+        '`fn solve_elastic_static(body, material, loads, supports, options)` '
+        'references stdlib types (Body, Load, Support) and fn-param-default '
+        'syntax that do not exist on main, with no sibling task creating '
+        'them. The task is ill-posed AT ITS OWN BASELINE, so an exhaustion '
+        'here measures the spec, not the model — precisely the confound this '
+        'curation removes.'
+    ),
+    ('reify', '5208'): (
+        'EXCLUDE. Status `pending`: never landed, so there is no reference '
+        'diff and no ground truth that the task is completable at all. The '
+        'brief is a SYMPTOM REPORT — "curated 3-arg fillet fails through the '
+        'production .ri pipeline (CLI errors loudly, GUI fails silently) ... '
+        'classic phantom-capability" — which states an observed failure, not '
+        'an implementable goal: the deliverable is a root-cause diagnosis '
+        'that did not exist at filing time. Architect exhaustion on an '
+        'open-ended investigation is not the plan-quality signal the pool '
+        'measures.'
+    ),
+}
+
+# Candidates whose status is not `done` but which ARE included, with the
+# benign-abandonment finding that justifies keeping them. Recorded separately
+# so the judgement is explicit rather than implied by absence from EXCLUSIONS.
+NON_DONE_INCLUDES: dict[tuple[str, str], str] = {
+    ('reify', '3586'): (
+        'INCLUDE. Cancelled, but abandonment WAS benign with respect to '
+        'well-posedness: the only escalations on this task are '
+        'esc-3586-38/40, both "Planning failed: agent failed: '
+        "subtype='error_max_budget_usd'\" — budget exhaustion during "
+        'planning, with no unactionability claim anywhere in its history. '
+        'The 2489-char brief names concrete file:line deliverables '
+        '(BRepKind::Vertex at geometry.rs:54-71, OcctKernel::extract_vertices '
+        'mirroring handle.rs:293-318, per-op populators in two named '
+        'crates). It was abandoned for COST, not for being ill-posed, which '
+        'is exactly the hard-task signal the pool measures.'
+    ),
+}
+
+# A `done` task that ALSO drew unactionable escalations is a genuinely hard
+# task that was eventually resolved, not an ill-posed one — the discriminator
+# is the terminal status. reify 2573, 3095 and 4370 are in that group and are
+# included; only the CANCELLED-and-unactionable 3378 is excluded.
+DONE_DESPITE_UNACTIONABLE: tuple[tuple[str, str], ...] = (
+    ('reify', '2573'), ('reify', '3095'), ('reify', '4370'),
+)
+
 
 class BaselineUnresolved(RuntimeError):
     """No rung of the baseline ladder produced a commit.
@@ -400,17 +465,162 @@ def run_census(strict: bool = True) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --author — (re)generate _meta/curation.json from the live dbs + judgements
+# ---------------------------------------------------------------------------
+
+POOL_DIR = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'evals' / 'tasks_hard_v2'
+CURATION_JSON = POOL_DIR / '_meta' / 'curation.json'
+
+
+def _candidate_row(cand: Candidate) -> dict:
+    """Render one adjudicated candidate row for the manifest."""
+    key = (cand.project, cand.task_id)
+    excluded = key in EXCLUSIONS
+    if excluded:
+        reason = EXCLUSIONS[key]
+    elif key in NON_DONE_INCLUDES:
+        reason = NON_DONE_INCLUDES[key]
+    elif key in DONE_DESPITE_UNACTIONABLE:
+        reason = (
+            'INCLUDE. The brief states an implementable goal, and although '
+            'the architect raised unactionable escalation(s) on this task it '
+            'reached status `done` — the unactionability was resolved, so '
+            'this is a genuinely hard task that landed, not an ill-posed '
+            'one. Terminal status is the discriminator (cf. reify 3378, '
+            'cancelled AND unactionable, which is excluded).'
+        )
+    else:
+        reason = (
+            'INCLUDE. The brief states an implementable goal: it names the '
+            'deliverable and enough of its surface for an architect to locate '
+            'the work at the baseline commit.'
+        )
+
+    row: dict = {
+        'task_id': cand.task_id,
+        'project': cand.project,
+        'project_root': cand.project_root,
+        'title': cand.title,
+        'status': cand.status,
+        'brief_chars': cand.brief_chars,
+        'decision': 'exclude' if excluded else 'include',
+        'reason': reason,
+        'merge_sha': cand.merge_sha,
+        'baseline_sha': cand.baseline_sha,
+        'baseline_source': cand.baseline_source,
+    }
+    if not excluded:
+        row['mint_mode'] = 'referenced' if cand.merge_sha else 'planrate_only'
+    return row
+
+
+def author_manifest(census_date: str) -> dict:
+    """Build the curation manifest from the live dbs + the judgement tables.
+
+    *census_date* is passed in at the CLI boundary rather than read from the
+    clock, so the manifest — and therefore the CURATION.md rendered from it —
+    stays a pure function of its inputs.
+    """
+    per_project: dict[str, list[Candidate]] = {}
+    for project, root_str in SOURCE_CHECKOUTS.items():
+        per_project[project] = collect_candidates(project, Path(root_str))
+
+    counts = {p: len(c) for p, c in per_project.items()}
+    if counts != EXPECTED_CENSUS_COUNTS:
+        raise RuntimeError(
+            f'author_manifest: census drift — got {counts}, expected '
+            f'{EXPECTED_CENSUS_COUNTS}. Refusing to author a manifest whose '
+            f'pool silently differs from the recorded one.'
+        )
+
+    rows = [_candidate_row(c) for cands in per_project.values() for c in cands]
+    referenced = sum(1 for r in rows if r.get('mint_mode') == 'referenced')
+    planrate = sum(1 for r in rows if r.get('mint_mode') == 'planrate_only')
+
+    return {
+        'schema_version': 1,
+        'task': '3631 — fable-trial-v2 β1: mint the curated v2 hard fixture pool',
+        'prd': 'plans/fable-architect-trial-v2-prd.md',
+        'cohort': 'fable-trial-v2-hard',
+        'census': {
+            'source': '<project_root>/data/orchestrator/runs.db (events table)',
+            'census_date': census_date,
+            'filter_sql': CENSUS_SQL,
+            'filter_note': (
+                'The turns-at-exhaustion 121 clause binds the max_turns arm '
+                'ONLY. Budget exhaustion terminates at an arbitrary turn '
+                'count (know-live 543 exhausted its budget at 113 turns), so '
+                'applying 121 globally yields 23 candidates instead of the '
+                'recorded 41. 121 is know-live production '
+                'max_turns.architect=120 plus one.'
+            ),
+            'counts': counts,
+            'task_ids': {p: [c.task_id for c in cands]
+                         for p, cands in per_project.items()},
+        },
+        'curation_criterion': (
+            "Exclude a candidate when its brief fails to state an "
+            "implementable goal. Never a length threshold: brief_chars is "
+            "recorded per row as evidence for the judgement, not as the rule."
+        ),
+        'adversarial_scan': (
+            'No candidate in the census is an adversarial/red-team fixture — '
+            'all 41 are real product tasks from the three checkouts\' task '
+            'trees. The PRD\'s skip-adversarial rule therefore excludes '
+            'nothing here; the scan is recorded so its emptiness is a finding '
+            'rather than an omission.'
+        ),
+        'merge_sha_availability': {
+            'referenced': referenced,
+            'planrate_only': planrate,
+            'finding': (
+                f'SPLIT / direct-landed candidates are a MAJORITY '
+                f'({planrate}/{len(rows)}), not the minority the trial '
+                f'manifest assumed. Only {referenced} of {len(rows)} have a '
+                f'single clean "Merge task/<id> into main" commit, so only '
+                f'those can carry a reference block. This caps the '
+                f'downstream plan_quality population and is a material fact '
+                f'for γ1, though it does not block β1 — D9\'s planRate-only '
+                f'mechanism handles it.'
+            ),
+        },
+        'candidates': rows,
+    }
+
+
+def run_author(census_date: str) -> int:
+    manifest = author_manifest(census_date)
+    CURATION_JSON.parent.mkdir(parents=True, exist_ok=True)
+    CURATION_JSON.write_text(json.dumps(manifest, indent=2) + '\n')
+    included = sum(1 for r in manifest['candidates'] if r['decision'] == 'include')
+    print(f'wrote {CURATION_JSON} — {len(manifest["candidates"])} candidate(s), '
+          f'{included} included, '
+          f'{len(manifest["candidates"]) - included} excluded')
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--census', action='store_true',
                       help='Re-run the architect-exhaustion census and print it')
+    mode.add_argument('--author', action='store_true',
+                      help='(Re)generate _meta/curation.json from the live dbs')
+    parser.add_argument('--census-date', default=None,
+                        help='ISO date stamped into the manifest (required with '
+                             '--author; passed in rather than read from the '
+                             'clock so the manifest stays reproducible)')
     parser.add_argument('--no-strict', action='store_true',
                         help='Report census drift without a non-zero exit')
     args = parser.parse_args(argv)
 
     if args.census:
         return run_census(strict=not args.no_strict)
+    if args.author:
+        if not args.census_date:
+            parser.error('--author requires --census-date')
+        return run_author(args.census_date)
     return 2
 
 
