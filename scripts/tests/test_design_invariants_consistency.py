@@ -982,3 +982,162 @@ def test_gates_trigger_shape_list_covers_every_invariant() -> None:
         f"design-invariants.md screen against, so a gap here is a gate that "
         f"silently stops covering a known failure mode."
     )
+
+
+# ---------------------------------------------------------------------------
+# CONTRIBUTING.md — pinned as an ABSENCE
+#
+# §6 restated all eight slugs twelve lines above its own rule saying not to
+# ("it's the single normative copy ...; don't restate them elsewhere"), and
+# design-invariants.md says the same at its head ("no restatement, per INV-5").
+# The fix DELETES the duplicate rather than re-syncing it, so this site cannot
+# go stale again; the assertion below is the machine-checkable form of the
+# anti-restatement rule itself.
+# ---------------------------------------------------------------------------
+
+_CONTRIBUTING_SECTION = "6. Design invariants"
+
+_SECTION_DOC = """\
+# Contributing
+
+## 5. Git workflow
+
+Branch off main.
+
+## 6. Design invariants & PRD gates
+
+Every task in a batch is walked against the invariants.
+
+### A sub-heading inside §6
+
+Still inside section six.
+
+## 7. Commit messages
+
+Match the observed convention.
+"""
+
+_SECTION_DOC_DUPLICATED = """\
+## 6. Design invariants & PRD gates
+
+First copy.
+
+## 7. Commit messages
+
+## 6. Design invariants & PRD gates
+
+Second copy, e.g. from a bad merge.
+"""
+
+
+def test_section_span_stops_at_the_next_top_level_heading() -> None:
+    """The span covers the section's own body — sub-headings in, siblings out.
+
+    Stopping at the next ``## `` (not at the next heading of any level) is what
+    keeps §6's own sub-headings inside the span while excluding §5 and §7. A span
+    that ran to EOF would make the absence assertions below pin the whole file
+    under a section's name, which is a different — and much more brittle — claim
+    than the one this test means to make.
+    """
+    span = section_span(_SECTION_DOC, _CONTRIBUTING_SECTION, source=_FIXTURE_SOURCE)
+
+    assert "Every task in a batch is walked" in span
+    assert "Still inside section six" in span, "a `###` sub-heading must not end the span"
+    assert "Branch off main" not in span, "the span must not run backwards into §5"
+    assert "Match the observed convention" not in span, "the span must stop at the next `## `"
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "heading_prefix", "case", "expected_phrase"),
+    [
+        pytest.param(
+            _SECTION_DOC, "9. No such section", "absent", "found 0", id="section-absent"
+        ),
+        pytest.param(
+            _SECTION_DOC_DUPLICATED,
+            _CONTRIBUTING_SECTION,
+            "duplicated",
+            "found 2",
+            id="section-duplicated",
+        ),
+    ],
+)
+def test_section_span_fails_loudly(
+    markdown_text: str, heading_prefix: str, case: str, expected_phrase: str
+) -> None:
+    """A missing or duplicated heading RAISES — never returns ''.
+
+    An empty span passes every absence assertion below by containing nothing to
+    find, which is the vacuity failure in its purest form: the guard would report
+    success precisely because it had stopped looking.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        section_span(markdown_text, heading_prefix, source=_FIXTURE_SOURCE)
+
+    message = str(excinfo.value)
+    assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
+    assert heading_prefix in message, f"{case}: message must name the heading: {message!r}"
+    assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
+
+
+def test_contributing_does_not_restate_the_invariant_family() -> None:
+    """LIVE: CONTRIBUTING.md points at the normative doc instead of copying it.
+
+    Three assertions, one theme — this site is pinned as an ABSENCE:
+
+    (a) WHOLE-FILE, zero canonical slugs. CONTRIBUTING.md §6 used to restate all
+        eight, twelve lines above its own rule forbidding restatement. Re-syncing
+        that list would have fixed today's contradiction and left the site free to
+        drift again on the next invariant; deleting it means there is nothing left
+        to drift. This assertion is the anti-restatement rule made machine-
+        checkable — it fails the moment anyone re-introduces a copy, which a
+        content-equality pin never would.
+
+    (b) WHOLE-FILE, every `INV-<a>..<b>` range names the live family. This
+        deliberately KEEPS the repo-layout bullet's "design-invariants.md
+        (INV-1..INV-N, gates ...)" orienting hint alive rather than deleting it:
+        unlike a slug list it is cheap to keep current, and now it is pinned.
+        ``assert_family_claims`` also covers cardinal-count phrases file-wide,
+        which is strictly stricter and cannot fire on anything but a genuinely
+        stale count — the exact drift this task exists to stop.
+
+    (c) §6 SPAN carries no `<cardinal> invariants` phrase (it said "the single
+        normative copy of the eight invariants") and DOES carry the literal path
+        `docs/legibility/design-invariants.md`, so the bullet stays a working
+        pointer rather than becoming a dangling reference. A pointer that no
+        longer names its target is how a deletion turns into an orphan.
+    """
+    family = canonical_family()
+    text = CONTRIBUTING_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(CONTRIBUTING_DOC)
+
+    restated = [slug for slug in canonical_slugs() if slug in text]
+    assert not restated, (
+        f"{source} restates {len(restated)} invariant slug(s) {restated} (task "
+        f"3802). That doc's own §6 says of design-invariants.md: \"it's the "
+        f"single normative copy; don't restate them elsewhere\", and the "
+        f"normative doc says the same at its head (\"no restatement, per "
+        f"INV-5\"). Replace the copy with a pointer to "
+        f"{_repo_relative(NORMATIVE_DOC)} — a restated list here has already "
+        f"gone stale once and cannot be kept current by policy alone."
+    )
+
+    assert_family_claims(text, family, source=source, span_name="the whole file")
+
+    section = section_span(text, _CONTRIBUTING_SECTION, source=source)
+
+    stale_count = _CARDINAL_CLAIM_RE.search(section)
+    assert stale_count is None, (
+        f"{source} §{_CONTRIBUTING_SECTION} states the family size in prose "
+        f"({stale_count.group(0)!r} — task 3802). Nothing here needs a count: "
+        f"de-number the sentence (\"the single normative copy\") so it cannot go "
+        f"stale when an invariant is added."
+    )
+
+    assert _repo_relative(NORMATIVE_DOC) in section, (
+        f"{source} §{_CONTRIBUTING_SECTION} no longer names "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802). This section is pinned as "
+        f"an ABSENCE — it must not restate the invariants — which only works if "
+        f"it still POINTS at the doc that does. Without the path, deleting the "
+        f"restatement just turned the G7 bullet into a dangling reference."
+    )
