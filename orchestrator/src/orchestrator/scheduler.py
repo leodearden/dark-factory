@@ -7179,6 +7179,49 @@ class Scheduler:
         """
         return self._started
 
+    # --- Hold-duration prediction (task 3822 / PRD task ζ, consumed by η) ---
+
+    def predicted_hold(self, task: dict) -> float | None:
+        """Predicted lock-hold duration (seconds) for *task*, or None.
+
+        Takes the TASK, not a module list, on purpose: ``_get_modules`` applies
+        the ``lock_depth`` coarsening, the deterministic-task short-circuit and
+        the ``task-<id>`` fallback, so it is the only thing that produces the
+        keys the lock layer — and therefore the history — actually uses.  A
+        caller splitting paths its own way would key the history on strings
+        that never appear in a lock event.
+
+        **None means NO PREDICTION** — too few observed holds on this task's
+        modules to say anything.  A caller (task η deciding whether a backfill
+        is worth the wait) MUST refuse on None rather than substitute a
+        default: 0.0, a global mean or a configured "typical" hold would all
+        read as a confident answer the evidence does not support.  The measured
+        basis for that caution is
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
+        — every static-attribute predictor scored WORSE than the test-set mean
+        (R² -0.22 to -0.82); only module hold history scored positive.
+        """
+        return self._hold_history.predicted_hold(self._get_modules(task))
+
+    def predicted_remaining(self, holder: str) -> float | None:
+        """Predicted seconds *holder* will keep its locks, or None.
+
+        Reads the Scheduler's own wall clock (``_wall_now``) rather than taking
+        a ``now`` argument: hold starts are wall-clock POSIX seconds, comparable
+        with the ISO timestamps in the event log, and a caller passing a
+        monotonic reading would get a remainder computed across two unrelated
+        epochs.
+
+        **None means NO PREDICTION** — *holder* holds nothing, or its modules
+        are below ``min_samples``.  It is NOT the same answer as 0.0, which
+        means "predicted to have finished already, and hasn't": that is a live
+        fact about an overdue holder and the one signal a waiting caller most
+        needs.  η must keep them apart.
+        """
+        return self._hold_history.predicted_remaining(
+            holder, now=self._wall_now().timestamp()
+        )
+
     def _emit_lock_event(
         self,
         event_type: EventType,
