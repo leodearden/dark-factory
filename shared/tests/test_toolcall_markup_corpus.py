@@ -446,6 +446,42 @@ class TestTruncationRule:
         assert truncated is False
         assert stored == unrepairable
 
+    def test_refuses_to_truncate_away_the_reason_it_was_collected(self):
+        """Truncation must never strip the substring the predicate matched on.
+
+        Both predicate alternatives ``search`` the whole value, so a specimen
+        can be collected on a mis-close-then-opener sequence sitting MID-value
+        while ``repair`` accepts a later mis-close. Truncating to lead-in plus
+        the accepted tail drops the middle, and the stored value is then one the
+        corpus's own collection predicate would never have picked up — which
+        would force the replay test's non-circular re-derivation to carry an
+        exemption. Store it verbatim instead. Observed once in the 473-specimen
+        2026-08-08 snapshot, so this is a real archive shape, not a hypothetical.
+        """
+        value = (
+            'w' * 5000
+            # collected on THIS: a mis-close then a canonical opener (alt 2) —
+            # but the name is not in the schema, so repair refuses here...
+            + _closer('rationale') + '\n'
+            + _canonical_opener('nonesuch') + 'x' + _closer('parameter') + '\n'
+            + 'w' * 500
+            # ...and accepts HERE instead, where the tail is whitespace only.
+            + _closer('rationale') + '\n'
+        )
+        assert extract.matches_collection_predicate(value)
+        assert repair(value, 'decision', ('decision', 'how', 'rationale'), ('decision',)) is not None
+
+        stored, truncated = extract.apply_truncation(
+            value,
+            param='decision',
+            schema_params=('decision', 'how', 'rationale'),
+            supplied=('decision',),
+        )
+
+        assert truncated is False
+        assert stored == value
+        assert extract.matches_collection_predicate(stored)
+
 
 class TestCorpusWriter:
     """Every '<' is written as its \\u003c JSON escape."""

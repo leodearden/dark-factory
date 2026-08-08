@@ -261,6 +261,16 @@ def apply_truncation(
     from the full value's — same recovered names, and a ``clean_value`` equal to
     the stored lead-in. Without that check the corpus would pin a fiction: an
     outcome the real value never produced.
+
+    It refuses on a second, independent ground: a truncated value that no longer
+    satisfies the collection predicate. Both predicate alternatives ``search``
+    the WHOLE value, so a real specimen can be collected on a mis-close-then-
+    opener sequence sitting mid-value while ``repair`` accepts a LATER mis-close
+    — truncation then drops the middle and leaves a stored value the corpus's
+    own definition would never have collected. Measured on the 2026-08-08
+    snapshot: 1 specimen of 473. Storing it verbatim keeps the replay test's
+    predicate re-derivation an honest non-circular check rather than something
+    the extractor has to be exempted from.
     """
     result = repair(value, param, schema_params, supplied)
     if result is None:
@@ -277,6 +287,8 @@ def apply_truncation(
     if replayed.clean_value != lead_in:
         return (value, False)
     if sorted(replayed.recovered) != sorted(result.recovered):
+        return (value, False)
+    if not matches_collection_predicate(stored):
         return (value, False)
     return (stored, True)
 
