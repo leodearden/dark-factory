@@ -740,3 +740,195 @@ def test_normative_doc_family_size_claims_are_current() -> None:
     for span_name in _NORMATIVE_CLAIM_SPANS:
         span = marked_span(text, span_name, source=source)
         assert_family_claims(span, family, source=source, span_name=span_name)
+
+
+# ---------------------------------------------------------------------------
+# gates.md — TWO independent enumerations, pinned differently on purpose
+#
+# Task 3811 (commit f29da1855b) deliberately preserved the two-site shape:
+# gates.md:181 records that collapsing them was considered and REJECTED. The
+# family-inventory row is read generically off each project's own normative doc
+# by projects that HAVE adopted one; the trigger-shape list exists precisely for
+# projects that have NOT, and is a hand-distilled illustrative set. So both are
+# pinned, but not in the same way — see the two live tests below.
+# ---------------------------------------------------------------------------
+
+_GATES_TRIGGER_SPAN = "inv-trigger-shapes"
+
+_SLUGS_HAPPY = "adds a fallback (`storm-escape-required`)? a contract in prose (`a-slug`)?"
+
+# Every backticked non-slug shape the real docs carry near an enumeration:
+# a numeric alias, a dotted metadata key, an angle-bracket placeholder, a
+# CamelCase symbol, a path, and a call expression.
+_SLUGS_DECOYS = (
+    "See `INV-5`, `metadata.g7_waivers`, `G7 waiver: <slug>`, `FailureCategory`, "
+    "`docs/legibility/design-invariants.md`, `_run()` and `Y` — none is a slug, "
+    "but `real-slug` is."
+)
+
+# The measured shape of the live trigger-shape paragraph: `contracts-machine-checked`
+# appears TWICE, once for "a tool without a declared filter/envelope convention"
+# and once for "a contract in prose". Duplicates must survive extraction so the
+# caller — not the extractor — decides whether order and multiplicity matter.
+_SLUGS_DUPLICATED = (
+    "a tool without a declared envelope (`contracts-machine-checked`)? "
+    "a contract in prose (`contracts-machine-checked`)? "
+    "a log-scrape (`structured-facts-at-failure`)?"
+)
+
+# A fixture table carrying BOTH project rows. The reify row's INV-SF slugs are
+# the same lexical shape as dark-factory's, so an extractor keyed on "a table row
+# with backticked slugs" would silently merge two projects' families — and the
+# merged set would then never equal either one.
+_FAMILY_ROW_TABLE = """\
+| Project | Family |
+|---|---|
+| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` (the doc is normative) |
+| reify | INV-SF-1..2 (silent-failure) — `undef-has-provenance`, `diagnostics-carry-codes` |
+"""
+
+_FAMILY_ROW_ABSENT = """\
+| Project | Family |
+|---|---|
+| reify | INV-SF-1..2 (silent-failure) — `undef-has-provenance`, `diagnostics-carry-codes` |
+"""
+
+_FAMILY_ROW_DUPLICATED = """\
+| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` |
+| reify | INV-SF-1..2 — `undef-has-provenance` |
+| dark-factory | INV-1..2 — `a-slug`, `b-slug` |
+"""
+
+
+def test_slugs_in_span_returns_backticked_slugs_in_document_order() -> None:
+    assert slugs_in_span(_SLUGS_HAPPY) == ["storm-escape-required", "a-slug"]
+
+
+def test_slugs_in_span_ignores_backticked_non_slug_tokens() -> None:
+    """Numeric aliases, dotted keys, placeholders, CamelCase and paths are not slugs.
+
+    All six shapes are measured in gates.md and design-invariants.md near an
+    enumeration. An extractor keyed on "anything backticked" would fold them into
+    the family and make the set comparison fail with a nonsense diff.
+    """
+    assert slugs_in_span(_SLUGS_DECOYS) == ["real-slug"]
+
+
+def test_slugs_in_span_preserves_duplicates_in_order() -> None:
+    """Duplicates survive extraction; the CALLER decides whether they matter.
+
+    The live trigger-shape paragraph names `contracts-machine-checked` twice
+    because two distinct trigger shapes map to that one invariant. Silently
+    de-duplicating inside the extractor would hide that from the ordered
+    family-row check, which legitimately must not tolerate a repeat.
+    """
+    assert slugs_in_span(_SLUGS_DUPLICATED) == [
+        "contracts-machine-checked",
+        "contracts-machine-checked",
+        "structured-facts-at-failure",
+    ]
+
+
+def test_dark_factory_family_row_ignores_the_reify_row() -> None:
+    """DECOY IMMUNITY: the sibling project's row has the same lexical shape.
+
+    Merging the two families is the failure that would not announce itself — the
+    combined set simply never equals dark-factory's, and the diff would blame the
+    wrong rows.
+    """
+    row = dark_factory_family_row(_FAMILY_ROW_TABLE)
+
+    assert slugs_in_span(row) == ["a-slug", "b-slug", "c-slug"]
+    assert "undef-has-provenance" not in row
+
+
+@pytest.mark.parametrize(
+    ("markdown_text", "case", "expected_phrase"),
+    [
+        pytest.param(_FAMILY_ROW_ABSENT, "absent", "found 0", id="row-absent"),
+        pytest.param(_FAMILY_ROW_DUPLICATED, "duplicated", "found 2", id="row-duplicated"),
+    ],
+)
+def test_dark_factory_family_row_fails_loudly(
+    markdown_text: str, case: str, expected_phrase: str
+) -> None:
+    """A missing or duplicated row RAISES — never returns ''.
+
+    Absent is the vacuity hazard (an empty row yields an empty slug list, and
+    empty-vs-a-real-family at least fails loudly — but empty-vs-empty would not,
+    if the family ever failed to parse too). Duplicated means one of the two rows
+    is unpinned and free to drift.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        dark_factory_family_row(markdown_text)
+
+    message = str(excinfo.value)
+    assert "gates.md" in message, f"{case}: message must name the doc: {message!r}"
+    assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
+
+
+def test_gates_family_row_lists_the_whole_family_in_order() -> None:
+    """LIVE: gates.md's family-inventory row transcribes the family, in order.
+
+    Pinned as an ORDERED list, unlike the trigger-shape span below: this row is a
+    straight canonical-order transcription today, so ordering is free signal —
+    a mis-ordered row means someone edited it by hand against a stale copy.
+    ``assert_family_claims`` additionally pins the row's own `INV-1..N` range
+    token, which is a second thing that does not auto-extend.
+    """
+    family = canonical_family()
+    text = GATES_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(GATES_DOC)
+    row = dark_factory_family_row(text)
+
+    assert slugs_in_span(row) == canonical_slugs(), (
+        f"{source}: the `| dark-factory |` family-inventory row has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  row:       {slugs_in_span(row)}\n"
+        f"  normative: {canonical_slugs()}\n"
+        f"Update the row to list every slug in canonical INV-1..N order. It is "
+        f"illustrative — the doc is normative — but an illustration naming the "
+        f"wrong family is worse than none."
+    )
+    assert_family_claims(
+        row, family, source=source, span_name="the `| dark-factory |` family-inventory row"
+    )
+
+
+def test_gates_trigger_shape_list_covers_every_invariant() -> None:
+    """LIVE: the G7 fallback trigger-shape list names every invariant at least once.
+
+    A SET comparison, deliberately, and not an ordered or exact-multiset one. The
+    paragraph is in NON-canonical order and legitimately names
+    `contracts-machine-checked` TWICE — once for "a tool without a declared
+    filter/envelope convention", once for "a contract in prose" — because two
+    distinct trigger shapes map to that invariant. An ordered assertion would be
+    RED-and-unfixable without rewriting normative gate prose this task is not
+    scoped to author.
+
+    A set still catches the defect this site has actually exhibited twice: an
+    invariant added to the normative doc with no trigger shape appended here, so
+    projects with no invariants file of their own screen against an incomplete
+    list and never see the new failure mode.
+    """
+    text = GATES_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(GATES_DOC)
+    span = marked_span(text, _GATES_TRIGGER_SPAN, source=source)
+
+    listed = set(slugs_in_span(span))
+    canonical = set(canonical_slugs())
+    missing = sorted(canonical - listed)
+    unknown = sorted(listed - canonical)
+
+    assert not missing and not unknown, (
+        f"{source}: the G7 trigger-shape fallback list inside the "
+        f"`{_GATES_TRIGGER_SPAN}` marker has drifted from "
+        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
+        f"  MISSING (invariant exists, no trigger shape screens for it): {missing}\n"
+        f"  UNKNOWN (trigger shape names no current invariant): {unknown}\n"
+        f"Append the new invariant's trigger shape to the G7 fallback list in "
+        f"gates.md — the same instruction that paragraph's own follow-up already "
+        f"carries. This list is what projects WITHOUT their own "
+        f"design-invariants.md screen against, so a gap here is a gate that "
+        f"silently stops covering a known failure mode."
+    )
