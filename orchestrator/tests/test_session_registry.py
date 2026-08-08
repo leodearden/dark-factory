@@ -3040,6 +3040,8 @@ def test_main_write_decision_files_open_record(
             'esc-1',
             '--session-id',
             'watcher-df-99',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
         ]
     )
 
@@ -3077,6 +3079,8 @@ def test_main_write_decision_stamps_severity(
             'q',
             '--severity',
             'critical',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
         ]
     )
 
@@ -3095,7 +3099,19 @@ def test_main_write_decision_severity_defaults_empty(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-nosev', '--project', 'df', '--text', 'q'])
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-nosev',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
 
     assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
@@ -3171,7 +3187,19 @@ def test_main_write_decision_prints_filed_id(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-park-2', '--project', 'df', '--text', 'q'])
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-2',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
 
     assert rc == 0
     assert 'dec-park-2' in capsys.readouterr().out
@@ -3193,7 +3221,23 @@ def test_main_write_decision_fail_soft_when_fleet_root_under_a_file(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
 
     with caplog.at_level(logging.ERROR):
-        rc = sr.main(['write-decision', '--id', 'dec-park-3', '--project', 'df', '--text', 'q'])
+        # The queue dir deliberately lives under tmp_path, NOT under the
+        # broken fleet root: normalize_escalations_dir is non-strict and
+        # resolves a non-existent path fine, so supplying the (now
+        # mandatory) stamp does not itself need the unwritable root.
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-park-3',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
 
     assert rc == 0
     assert 'dec-park-3' not in capsys.readouterr().out
@@ -3211,8 +3255,33 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc1 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'first?'])
-    rc2 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'second?'])
+    queue = str(tmp_path / 'escalations')
+    rc1 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-4',
+            '--project',
+            'df',
+            '--text',
+            'first?',
+            '--escalations-dir',
+            queue,
+        ]
+    )
+    rc2 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-4',
+            '--project',
+            'df',
+            '--text',
+            'second?',
+            '--escalations-dir',
+            queue,
+        ]
+    )
 
     assert rc1 == 0
     assert rc2 == 0
