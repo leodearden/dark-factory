@@ -944,10 +944,15 @@ class TaskInterceptor:
             # malformed blob, or an absent key all degrade to
             # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
             # the forwarding enables at gate 2 is live_workflow_detector's
-            # task_kind-scoped rules, none of which were reachable there while
-            # only `status` was passed: rule 2 (blocked + deterministic, task
+            # task_kind-scoped rules: rule 2 (blocked + deterministic, task
             # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
-            # (pending + deterministic + pure gate, task 3751).
+            # (pending + deterministic + pure gate, task 3751). Only rule 5
+            # actually changes gate 2's verdict — rule 3 already fired there
+            # on the previous implicit task_kind=None, and rule 2's extra
+            # coverage is masked because gate 2 reads is_live, which ORs in
+            # the per-task worktree/commit evidence. See check()'s Gate 2
+            # docstring for the full no-widening argument and the tests
+            # pinning it.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here

@@ -316,21 +316,43 @@ def check(
     inputs are derived from it:
 
     * ``task_kind`` — forwarding this makes ``live_workflow_detector``'s
-      PRE-EXISTING rule 2 (blocked + deterministic, task 2067) and rule 3
-      (blocked + normal + bare, task 2409) reachable from this gate FOR THE
-      FIRST TIME. Gate 2 previously forwarded only ``status``, so no
-      task_kind-scoped rule had ever fired here. That is an intended,
-      in-direction consequence of the plumbing — both rules exist precisely
-      to stop the bare project-wide lock being read as per-task evidence,
-      and Gate 2 is the one place where that misreading actually blocks a
-      write — not an accident. It is pinned by an explicit test rather than
-      left as a silent behavior change.
+      PRE-EXISTING rule 2 (blocked + deterministic, task 2067) reachable
+      from this gate for the first time, but is BEHAVIOR-PRESERVING here.
+      It widens nothing, for two reasons:
+
+      1. Rule 3 (blocked + normal/absent + no git evidence, task 2409) was
+         already reachable. Its task_kind clause is ``task_kind in (None,
+         NORMAL_TASK_KIND)``, and the previously-omitted kwarg defaulted to
+         ``None`` — so a blocked task with no worktree and no recent commit
+         was already exempt from the bare orchestrator lock at this gate,
+         before any metadata was plumbed through.
+      2. Rule 2's only delta over rule 3 is being unconditional on the git
+         signals, i.e. it also fires when a worktree or recent commit
+         exists. This gate consumes only
+         :func:`~fused_memory.services.live_workflow_detector.is_workflow_live_for_task`
+         — ``is_live = worktree_registered or recent_commit or
+         orchestrator_live`` — so in exactly that case ``is_live`` stays
+         True on the per-task evidence and the write is still rejected.
+         Rule 2 zeroes ``orchestrator_live``, which this gate never reads
+         on its own.
+
+      The one narrowing is that a blocked task carrying some THIRD
+      ``task_kind`` value (neither ``'normal'`` nor ``'deterministic'``)
+      no longer matches rule 3's clause, so it keeps the lock — the
+      fail-safe-toward-live direction. All of the above is pinned by
+      ``TestGate2TaskKindForwardingIsBehaviorPreserving`` in
+      tests/test_recon_write_policy.py, including the differential
+      worktree case, so the argument fails loudly if a detector rule
+      changes underneath it.
     * ``pure_gate`` — :func:`is_pure_gate_metadata`, carrying task 3751's
-      rule 5 (pending + deterministic + pure gate). A pure gate
+      rule 5 (pending + deterministic + pure gate). This is the ONLY
+      behavior change task 3751 makes at this gate. A pure gate
       (``always_escalates`` truthy, no ``before_done``) never acquires a
       worktree or branch, so the bare lock is never evidence for it; a
       pending deterministic task WITH ``before_done`` keeps the signal
-      because it may be mid-deploy inside ``DeterministicRunner``.
+      because it may be mid-deploy inside ``DeterministicRunner``. See
+      :func:`is_pure_gate_metadata` for the residual escalate-then-block
+      write window this accepts.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
