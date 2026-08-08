@@ -35,12 +35,12 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
+from shared.task_claimant import is_stranded
 
 from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
-from shared.task_claimant import is_stranded
 
 # ---------------------------------------------------------------------------
 # Per-project_root TTL cache for fetch_tasks

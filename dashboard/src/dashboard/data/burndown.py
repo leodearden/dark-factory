@@ -444,7 +444,13 @@ async def aggregate_burndown_series(
     Returns the empty-series default ``{labels: [], done: [], ...}`` when no
     rows are found across any DB.
     """
-    _keys = ('done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending')
+    _keys = (
+        'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
+        # The split partitions in_progress; concurrency_cap is a per-snapshot
+        # scalar (nullable).  Both merge last-writer-wins with the zones — a
+        # snapshot is one consistent observation, so its columns travel together.
+        'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+    )
     empty: dict = {'labels': [], **{k: [] for k in _keys}}
 
     if not dbs:
@@ -582,6 +588,71 @@ def distinct_iso_days(labels: list[Any]) -> int:
     return max(1, len(seen))
 
 
+def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``{parity_alarm, parity_cap, parity_peak, parity_breach_count}``.
+
+    Answers one question about a burndown series: did in-progress work ever
+    exceed the orchestrator's own concurrency cap?  That is the E12 defect —
+    the cap was breached and every surface reported ordinary throughput.
+
+    **Each snapshot is judged against the cap stored on THAT snapshot**, never
+    against one "current" cap applied across history.  ``max_concurrent_tasks``
+    is green-tier hot-reloadable: re-deriving a single cap would forgive a real
+    past breach after a cap raise, and invent a fictional one after a cap cut.
+
+    Semantics:
+
+    * ``parity_breach_count`` — snapshots where ``in_progress > cap``.  The cap
+      is INCLUSIVE, so running exactly at capacity is healthy, not an alarm.
+    * ``parity_alarm`` — ``breach_count > 0``.
+    * ``parity_cap`` — the most recent KNOWN cap in the series, for display
+      next to the peak.  ``None`` when no snapshot carries one.
+    * ``parity_peak`` — the highest ``in_progress`` among snapshots that carry
+      a cap.  Capless snapshots are excluded: a peak means nothing without the
+      cap it is measured against, and mixing them in would show a number the
+      displayed cap cannot explain.
+
+    A series with no cap anywhere is UNKNOWN, not "not breaching": the alarm
+    stays False but ``parity_cap``/``parity_peak`` are ``None`` so a caller can
+    tell the two apart, and the collapse is logged rather than left silent.
+
+    Pure: no clock, no I/O, no mutation of *series*.  Ragged or non-numeric
+    input degrades to the quiet result rather than raising inside a route.
+    """
+    in_progress = list(series.get('in_progress') or [])
+    caps = list(series.get('concurrency_cap') or [])
+
+    peak: int | None = None
+    latest_cap: int | None = None
+    breaches = 0
+    comparable = 0
+    for count, cap in zip(in_progress, caps, strict=False):
+        if not isinstance(count, int) or isinstance(count, bool):
+            continue
+        if not isinstance(cap, int) or isinstance(cap, bool):
+            continue
+        comparable += 1
+        latest_cap = cap
+        if peak is None or count > peak:
+            peak = count
+        if count > cap:
+            breaches += 1
+
+    if not comparable:
+        logger.debug(
+            'compute_parity_alarm: no snapshot carries a concurrency cap over '
+            '%d label(s); reporting unknown rather than "not breaching"',
+            len(in_progress),
+        )
+
+    return {
+        'parity_alarm': breaches > 0,
+        'parity_cap': latest_cap,
+        'parity_peak': peak,
+        'parity_breach_count': breaches,
+    }
+
+
 def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     """Return ``{completed, velocity, window_days}`` from a burndown series.
 
@@ -662,13 +733,31 @@ async def get_burndown_series(
         'deferred': [],
         'in_progress': [],
         'pending': [],
+        'in_progress_live': [],
+        'in_progress_stranded': [],
+        'concurrency_cap': [],
     }
     if db is None:
         return empty
     since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
+        # Which of the post-3543 columns this DB actually has.  ``_burndown_dbs``
+        # opens OTHER projects' burndown.db files read-only and nothing migrates
+        # those, so a hardcoded widened SELECT would raise 'no such column'
+        # there, hit the guard below, and silently blank that project's entire
+        # chart — losing the six zones it DOES have to report three it does not.
+        async with db.execute('PRAGMA table_info(snapshots)') as cur:
+            available = {row[1] for row in await cur.fetchall()}
+        has_split = {'in_progress_live', 'in_progress_stranded'} <= available
+        has_cap = 'concurrency_cap' in available
+
+        columns = ['ts', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending']
+        if has_split:
+            columns += ['in_progress_live', 'in_progress_stranded']
+        if has_cap:
+            columns.append('concurrency_cap')
         async with db.execute(
-            'SELECT ts, done, cancelled, blocked, deferred, in_progress, pending '
+            f'SELECT {", ".join(columns)} '
             'FROM snapshots WHERE project_id = ? AND ts >= ? ORDER BY ts',
             (project_id, since),
         ) as cur:
@@ -677,28 +766,26 @@ async def get_burndown_series(
         logger.warning('Error fetching burndown series', exc_info=True)
         return empty
 
-    labels = []
-    done = []
-    cancelled = []
-    blocked = []
-    deferred = []
-    in_progress = []
-    pending = []
+    result: dict = {key: [] for key in empty}
     for row in rows:
-        labels.append(row[0])
-        done.append(row[1])
-        cancelled.append(row[2])
-        blocked.append(row[3])
-        deferred.append(row[4])
-        in_progress.append(row[5])
-        pending.append(row[6])
+        result['labels'].append(row[0])
+        result['done'].append(row[1])
+        result['cancelled'].append(row[2])
+        result['blocked'].append(row[3])
+        result['deferred'].append(row[4])
+        result['in_progress'].append(row[5])
+        result['pending'].append(row[6])
+        if has_split:
+            result['in_progress_live'].append(row[7])
+            result['in_progress_stranded'].append(row[8])
+        else:
+            # Un-migrated DB: the split is unknown.  All-live keeps the
+            # conservation invariant (live + stranded == in_progress) true and
+            # errs toward under-reporting strands, never over-reporting.
+            result['in_progress_live'].append(row[5])
+            result['in_progress_stranded'].append(0)
+        # A missing cap column is UNKNOWN, i.e. NULL — never 0, which would
+        # read as a cap of zero and alarm on every row.
+        result['concurrency_cap'].append(row[-1] if has_cap else None)
 
-    return {
-        'labels': labels,
-        'done': done,
-        'cancelled': cancelled,
-        'blocked': blocked,
-        'deferred': deferred,
-        'in_progress': in_progress,
-        'pending': pending,
-    }
+    return result

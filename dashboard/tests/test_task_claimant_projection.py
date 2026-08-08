@@ -111,7 +111,7 @@ class TestShapeTaskCarriesClaimantFields:
 class TestTaskIsStrandedTruthTable:
     def test_ttl_is_a_timedelta(self):
         assert isinstance(STRANDED_HEARTBEAT_TTL, timedelta)
-        assert STRANDED_HEARTBEAT_TTL > timedelta(0)
+        assert timedelta(0) < STRANDED_HEARTBEAT_TTL
 
     def test_in_progress_with_null_claimant_is_stranded(self):
         task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}

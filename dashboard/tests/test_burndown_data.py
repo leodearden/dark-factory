@@ -1772,8 +1772,12 @@ class TestGetBurndownSeries:
         assert len(result['labels']) == 3
         assert len(result['done']) == 3
         assert len(result['pending']) == 3
+        # Exact inventory, so a key can neither vanish nor appear unnoticed.
+        # The last three are task 3543's split + cap; see
+        # tests/test_burndown_parity_alarm.py for their semantics.
         assert set(result.keys()) == {
             'labels', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
+            'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
         }
 
     @pytest.mark.asyncio
