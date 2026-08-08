@@ -1417,6 +1417,23 @@ class TestConcurrentLoop:
 
         attempted: list[str] = []
 
+        # Load-bearing happens-before (task 3805): released only once the
+        # main loop has processed df_task_11's (the failure's) summary. In
+        # the production loop, log_one_summary(summary) runs immediately
+        # before the --stop-on-first-failure drain (`remaining = []`) in the
+        # same `for fut in done` iteration (scripts/run_vllm_eval.py:
+        # 1591-1603), and the window can only refill at the top of the NEXT
+        # `while` iteration (:1570). So a sibling that blocks on this Event
+        # cannot complete — and therefore cannot trigger a refill — until
+        # AFTER the drain has already run, deterministically, regardless of
+        # CPU scheduling. The 10s timeout below is only a deadlock backstop,
+        # not the ordering mechanism: the guarantee comes from the Event,
+        # not from timing, so it cannot be "tuned" like a sleep margin. See
+        # _release_on_summary's docstring. Do NOT replace this Event with a
+        # sleep: two prior fixes (b94ae82154, ca05d20ffa) tuned a duration
+        # margin against unbounded thread-start latency and both re-flaked.
+        released = _release_on_summary(monkeypatch, "df_task_11")
+
         def fake_run(cmd, *args, **kwargs):
             if (
                 isinstance(cmd, list)
@@ -1443,7 +1460,9 @@ class TestConcurrentLoop:
                         metrics={"cost_usd": 5.0},
                     )
                     return SimpleNamespace(returncode=1)
-                _REAL_SLEEP(0.1)
+                assert released.wait(timeout=10.0), (
+                    "drain never observed df_task_11's failure"
+                )
                 results.mkdir(parents=True, exist_ok=True)
                 _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
                 return SimpleNamespace(returncode=0)
