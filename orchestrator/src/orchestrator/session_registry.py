@@ -995,6 +995,44 @@ path always begins with ``'/'``, so this sentinel can never collide with a
 real queue no matter what a project is named or where it is checked out."""
 
 
+_DECISION_SEVERITY_RANK: dict[str, int] = {'': 0, 'info': 1, 'blocking': 2, 'critical': 3, 'urgent': 4}
+"""Total order over DecisionRecord.severity, for the never-downgrade rule (task 3559).
+
+Mirrors escalation.models.KNOWN_SEVERITIES (``frozenset({'info','blocking'})
+| BORN_AT_L2_SEVERITIES``) and the cockpit's ordering comment in
+cockpit/src/cockpit/priorities.default.yaml ("ordered
+urgent>=critical>blocking>info") BY CONVENTION, not by import -- the same
+hand-sync idiom ESCALATION_ARCHIVE_SUBDIR documents above. This module is
+deliberately stdlib-only with no intra-orchestrator imports (see the module
+docstring) so spawn-claude.sh can invoke it by absolute path with no
+venv/PYTHONPATH. ``''`` (severity unset) is the floor.
+
+Deliberately NOT escalation.queue._SEVERITY_RANK, even though that map
+exists and looks reusable: it is ``{'info': 0, 'blocking': 1}`` only, so
+'critical' and 'urgent' fall to its ``.get(x, 0)`` default and rank
+INFO-tier. Copying it here would make _max_decision_severity perform the
+exact downgrade it exists to prevent."""
+
+
+def _max_decision_severity(existing: str, incoming: str) -> str:
+    """Return whichever of two severities ranks higher; never downgrade.
+
+    Used when a second watcher enriches an open DecisionRecord it did not
+    file (see merge_decision_enrichment): the record must end up carrying
+    the MOST urgent view any watcher has of the underlying human gate.
+
+    An unrecognised value (a typo, or a case variant -- KNOWN_SEVERITIES is
+    lowercase-only) resolves via ``.get(value, 0)`` to the same rank as the
+    unset sentinel, so it can never displace a recognised severity, and this
+    never raises: it sits on a watcher's filing path and must not crash the
+    watch loop. Ties -- and the ambiguous both-unrecognised case -- return
+    ``existing``, so an equal re-file never churns the stored value.
+    """
+    if _DECISION_SEVERITY_RANK.get(incoming, 0) > _DECISION_SEVERITY_RANK.get(existing, 0):
+        return incoming
+    return existing
+
+
 def normalize_escalations_dir(value: str | Path) -> str:
     """The ONE canonical spelling of an escalation-queue path (task 3528).
 
