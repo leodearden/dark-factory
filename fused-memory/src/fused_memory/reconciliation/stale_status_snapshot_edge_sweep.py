@@ -468,8 +468,31 @@ SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
 # between two adjacent digits of a SINGLE number, so '1020' parsed as
 # '102' + '0' and 'Tasks 1020 are pending' wrongly satisfied a rule meant
 # to need two ids.
-_ENUM_SEP_ALT = r'(?:\s*,\s*|\s+)(?:(?:and|&|/)\s+)?(?:task\s*)?#?\s*'
-_ENUM_IDS_ALT = r'\d+(?:' + _ENUM_SEP_ALT + r'\d+)+'
+#
+# Every quantifier here is POSSESSIVE (task 3079, reviewer_comprehensive
+# performance-redos finding). Written greedily, the separator's TRAILING
+# '\s*' overlaps its own LEADING '\s*,\s*' / '\s+', so a whitespace run
+# between two ids can be apportioned between those elements in
+# (len(run) + 1) distinct ways. Under _ENUM_IDS_ALT's '+' repetition that
+# is (w + 1) ** n parses, and ALL of them get explored whenever the overall
+# match ultimately FAILS — the common case, since most enumerations in
+# prose are not followed by a copula and a status marker. Measured pre-fix
+# on a non-matching fact: 6.1s for 20 ids at ', ', and 16.6s for only NINE
+# ids at ',\n    ' (the base scales with whitespace-run WIDTH, so a
+# newline-indented list wedges the sweep at a much lower id count than a
+# flat 2**n reading suggests). Post-fix all shapes parse in ~0.1ms.
+#
+# Possessive-ness is safe here — it changes only HOW a span is parsed,
+# never WHETHER it matches — because every possessive element is followed
+# by something that can never match whitespace: each '\s*+'/'\s++' is
+# followed by ',', a letter, '#' or '\d++', and '\d++' is followed by
+# whitespace or ','. So no quantifier can ever be holding a character a
+# later element needs, and the accepted enumeration alphabet (including
+# '1020, # 1030' with an internal space after the reference token) is
+# unchanged. Possessive quantifiers require Python >= 3.11, which is
+# exactly this package's floor (pyproject.toml).
+_ENUM_SEP_ALT = r'(?:\s*+,\s*+|\s++)(?:(?:and|&|/)\s++)?(?:task\s*+)?#?\s*+'
+_ENUM_IDS_ALT = r'\d++(?:' + _ENUM_SEP_ALT + r'\d++)+'
 
 # Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
 # 3079). Before this, such an edge yielded NO ids at all — not merely the
