@@ -98,10 +98,12 @@ together by
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import signal
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -788,3 +790,67 @@ def leaked_drain_process_reason(leaks: list[tuple[int, str]]) -> str | None:
         'These processes have been reaped, so the box is clean; this failure is '
         'the signal, not the damage.'
     )
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_no_leaked_drain_processes():
+    """Reap, then fail, if this run leaked a drain-script process.
+
+    Stamps a fresh per-session token into ``os.environ`` and, at teardown, scans
+    ``/proc`` for live processes carrying BOTH that token and the drain script's
+    name.  The token lives in the ENVIRONMENT rather than being threaded through
+    any spawner because every spawner here builds its child env from
+    ``dict(os.environ)``: descendants are tagged for free, including the ones
+    nobody has written yet.  Same "the defect class is a spawner that forgets"
+    reasoning as 3797's clock redirect — a per-call-site tag would be opted out
+    of by exactly the spawner this guard exists to catch.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp`` and
+    ``_df_deploy_clocks_unwritten`` document — cost (a function-scoped autouse
+    fixture runs once per test across ~90 spawning files, times every xdist
+    worker, and each run here is a full /proc sweep) and coverage (a leak from a
+    module- or session-scoped fixture must be caught too, and that is where
+    expensive subprocess setup tends to live).
+
+    ONE DELIBERATE DIVERGENCE from :func:`_df_deploy_clocks_unwritten`, which is
+    DETECT-ONLY: this guard REAPS what it reports.  That guard must not touch
+    what it finds, because the main checkout is machine-operated and rolling a
+    clock back could silently undo a GENUINE fleet-deploy stamp.  Here the token
+    removes that ambiguity entirely — a match provably belongs to THIS session,
+    so it can be neither a concurrent worktree's run nor a real
+    machine-operated ``--drain``.  And leaving a confirmed orphan alive is not
+    neutral: it goes on to spend its grace and then issue a REAL ``systemctl
+    restart``, which is the second-order hazard this task exists to close.  Reap
+    first, then fail — the message is the signal, the kill is the containment.
+
+    A failure raised in teardown surfaces as a run-level ERROR with a non-zero
+    exit code even when every test passed.  That is the intended loudness: the
+    damage is to the box, not to any one test's result.
+    """
+    token = uuid.uuid4().hex
+    prior = os.environ.get(LEAK_TOKEN_ENV)
+    os.environ[LEAK_TOKEN_ENV] = token
+    try:
+        yield
+    finally:
+        # Restore BEFORE scanning: nested sessions (this module's own end-to-end
+        # test runs one) must not inherit a token that has stopped being current.
+        if prior is None:
+            os.environ.pop(LEAK_TOKEN_ENV, None)
+        else:
+            os.environ[LEAK_TOKEN_ENV] = prior
+        leaks = leaked_drain_processes(token)
+        reason = leaked_drain_process_reason(leaks)
+        if reason is not None:
+            for pid, _cmdline in leaks:
+                # The pid, never os.killpg(pid, ...): a leaked process is by
+                # definition one whose spawner did NOT put it in a session of
+                # its own, so its pid is not necessarily a pgid and signalling
+                # that number as a group could reach an unrelated one — task
+                # 845's failure, recorded in shared/src/shared/proc_group.py.
+                # Killing the drain script itself stops the poll loop, which is
+                # the whole hazard; its `sleep`/`systemctl` children carry no
+                # grace of their own.
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            pytest.fail(reason, pytrace=False)
