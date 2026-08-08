@@ -1067,11 +1067,16 @@ Review the above data and perform memory consolidation:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
+        # Live-Workflow Signals — parity with assemble_payload / _format_assembled_payload
+        # (task 3839, gate 3833). The harness DOES set filtered_task_tree on remediation
+        # passes (_configure_consolidator, harness.py:3949-3953), so this renders for real;
+        # it is not a no-op. Returns '' when nothing is live, keeping the payload tight.
+        live_workflow_section = self._build_live_workflow_section()
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}
+{_format_findings(findings)}{live_workflow_section}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:
