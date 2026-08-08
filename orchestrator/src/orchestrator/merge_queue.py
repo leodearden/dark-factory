@@ -5911,6 +5911,91 @@ async def classify_and_merge(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Deep merge-ahead chain builder (task 3184, PRD β —
+# ``plans/deep-merge-ahead-prd.md``)
+#
+# TWO INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
+#
+# 1. PURITY.  ``build_chain`` is pure w.r.t. queue state: it never calls
+#    ``_pop_next_pickable``, ``_note_transition``, ``_emit_merge_attempt``,
+#    ``classify_and_merge``, ``_note_conflict_detected``, or any ``set_result``
+#    chokepoint (``_resolve_and_release``, ``_resolve_or_drop_abandoned``,
+#    ``_oob_deliver``, ``_resolve_merging_requests``).  PRD decision #4: a
+#    chain conflict at position j MUST NOT fire item j's conflict path — j may
+#    conflict only with an *unlanded* predecessor, and takes its normal
+#    sequential path later.
+#
+# 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation;
+#    the merge loop reuses that lane via ``GitOps.merge_branch_into_worktree``.
+#    (``merge_to_main`` would provision a fresh worktree per item.)
+# ---------------------------------------------------------------------------
+
+
+async def build_chain(
+    git_ops: GitOps,
+    queue_snapshot: Sequence[MergeRequest],
+    head_merge_commit: str,
+    *,
+    cap: int,
+    target_depth: int,
+) -> ChainResult:
+    """Speculatively merge a prefix of the queue onto the frozen head's tip.
+
+    Merges up to ``min(len(queue_snapshot), cap, target_depth)`` items, in
+    submission order, sequentially into ONE scratch worktree, truncating at
+    the first item that does not merge cleanly.  Mirrors the free-function
+    convention of :func:`classify_and_merge` (collaborators injected rather
+    than reached for).
+
+    Nothing calls this yet — γ (task 3185, deep-tip dispatch) is the first
+    caller — so this commit cannot change any production behaviour.  With
+    α's shipped ``chain_cap`` default of 0, ``depth <= 0`` short-circuits
+    before any lane or subprocess is touched, which is what makes the kill
+    switch structurally free.
+
+    See the module section comment above for the two invariants (purity and
+    one-worktree) this function exists to uphold.
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        queue_snapshot: The unfrozen suffix in pick order, from
+            :meth:`SpeculativeMergeWorker.chain_snapshot`.
+        head_merge_commit: The base to stack on — the frozen prefix tip, from
+            :meth:`SpeculativeMergeWorker.frozen_prefix_tip` (which returns
+            ``main_sha`` when nothing is verifying).
+        cap: Hard ceiling from ``MergeDeepConfig.chain_cap``.  ``0`` is the
+            kill switch.  Keyword-only, so a call site can never transpose it
+            with *target_depth*.
+        target_depth: How deep this round actually wants to go.
+
+    Returns:
+        A :class:`~orchestrator.merge_types.ChainResult`.  A non-empty result
+        HOLDS its lane and the caller MUST release it via
+        :func:`~orchestrator.merge_liveness.release_chain_build_lane`; an
+        empty result never holds one.
+    """
+    depth = min(len(queue_snapshot), cap, target_depth)
+    if depth <= 0:
+        # Kill switch / nothing to do: return BEFORE touching git — no lane
+        # acquisition, no subprocess.
+        return ChainResult(links=[], tip=head_merge_commit)
+
+    # Exactly one lane for the whole chain (invariant 2 above).  `config` is
+    # read off the snapshot rather than taken as a parameter: every
+    # MergeRequest carries one, and that is the established idiom (see
+    # merge_liveness._acquire_warm_verify_worktree).
+    lane, warm = await acquire_chain_build_lane(
+        git_ops, queue_snapshot[0].config, head_merge_commit,
+    )
+    if lane is None:
+        return ChainResult(links=[], tip=head_merge_commit)
+
+    # The sequential merge loop lands in step-14.
+    await release_chain_build_lane(git_ops, lane, warm=warm)
+    return ChainResult(links=[], tip=head_merge_commit)
+
+
 async def _journal_landed_then_advance(
     outbox: LandedOutbox | None,
     git_ops: Any,
