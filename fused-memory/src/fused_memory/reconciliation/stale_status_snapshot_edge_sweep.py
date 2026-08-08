@@ -248,6 +248,44 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Genitive/possessive form: "Task N's status is <marker>" (task 3079). This
+# is the canonical shape Graphiti writes for a per-task status snapshot, and
+# before task 3079 EVERY path missed it while the whole-fact gate fired —
+# the "matched the gate yet went undetected" symptom the finding reports:
+# INDIVIDUAL_SNAPSHOT_RE's '\s*' cannot cross the intervening "'s status ";
+# SNAPSHOT_STATUS_PHRASE_RE requires 'in <marker> status' (marker BEFORE the
+# noun) whereas here the order is inverted ('status is <marker>'); and
+# LIST_INTRODUCER_RE requires '<marker> tasks[:\[]'. So the miss rate was
+# structural, not incidental.
+#
+# Both apostrophes are admitted: ASCII U+0027 and the typographic U+2019
+# that most prose writers (and LLM writers) actually emit.
+#
+# Two properties worth stating because they are what keep this path cheap:
+#
+# - No trailing noun-phrase lookahead is needed, unlike
+#   SNAPSHOT_STATUS_PHRASE_RE. Requiring the literal noun 'status' to be
+#   IMMEDIATELY followed by the copula already excludes the modifier-head
+#   hazard that lookahead exists for: in "Task 5's status report is pending
+#   review", 'report' sits between 'status' and 'is', so nothing matches.
+# - No _GAP_EXCLUDED_ALT equivalent is needed either. Reusing the
+#   closed-class _ADVERB_ALT means negation and past-exit qualifiers ('is no
+#   longer', 'is not', 'was previously') are refused for free, because those
+#   tokens simply are not in the alternation — the same asymmetry the module
+#   docstring already documents for the individual form. Only the open-class
+#   gap of the phrase form has to buy that protection back explicitly.
+#
+# The copula is MANDATORY here, so _STATUS_MARKER_ALT (which includes the
+# transitive-capable 'blocked') is safe to use whole: there is no bare-verb
+# reading of "Task 5's status is blocked".
+GENITIVE_STATUS_RE: re.Pattern[str] = re.compile(
+    TASK_REF_RE.pattern
+    + r"(?:'|’)s\s+status\s+"
+    + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?'
+    + _STATUS_MARKER_ALT + r'\b',
+    re.IGNORECASE,
+)
+
 # The permissive path: an open-class gap of up to 3 words between the task
 # reference and the preposition 'in' (e.g. 'is deliberately parked in ...'),
 # admitted ONLY when the marker is immediately followed by the literal noun
@@ -417,13 +455,19 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
          and/or article may sit in between — deliberately NOT the
          preposition 'in') — so an incidental status word elsewhere in
          the fact is never wrongly attributed to the reference.
-      3. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
+      3. Genitive form: extract ids via GENITIVE_STATUS_RE, which reaches
+         the possessive shape "Task N's status is <marker>" (task 3079).
+         The literal noun 'status' must be immediately followed by a
+         copula, which is what keeps a following head noun ("Task N's
+         status REPORT is pending review") out without needing the
+         trailing lookahead SNAPSHOT_STATUS_PHRASE_RE carries.
+      4. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
          which additionally admits a bounded open-class gap (e.g. 'is
          deliberately parked in ...') between the reference and the
          marker, but only when the marker is immediately followed by the
          literal noun 'status' — the token that makes the span an
          explicit status assertion rather than an incidental mention.
-      4. Aggregate form: for each detected list segment ('<marker> tasks
+      5. Aggregate form: for each detected list segment ('<marker> tasks
          are [...]' / '<marker> tasks: ...'), strip COUNT_QUANTITY_RE
          spans from that segment only (so an embedded count phrase doesn't
          contribute a spurious id) and collect its bare digit tokens. The
@@ -439,6 +483,7 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
         return set()
 
     ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
+    ids |= {int(m.group(1)) for m in GENITIVE_STATUS_RE.finditer(fact)}
     ids |= {int(m.group(1)) for m in SNAPSHOT_STATUS_PHRASE_RE.finditer(fact)}
 
     for intro in LIST_INTRODUCER_RE.finditer(fact):
