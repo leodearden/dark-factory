@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -432,6 +433,16 @@ Conventions:
   rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
   is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
   rationale live in fused_memory/server/markup_tripwire.py.
+- A store='mem0' delete_memory is REFUSED (error_type=CitationRepointRequired) while a live
+  (non-terminal) task still cites the entry in its metadata — dispatch follows those pointers,
+  and the delete is irreversible. This is a property of the RECORD, not of who is deleting, so
+  it applies to every caller. The refusal names each citing task and path. Retry with
+  replacement_memory_id=<the surviving entry's full 36-char UUID> and the citers are repointed
+  before the delete runs; that is the answer for a consolidation, which has a survivor by
+  definition. Only for a plain drop with NO survivor to repoint to, pass
+  metadata={'allow_dangling_citations': True} — literal boolean True only, same as above. The
+  override is recorded at WARNING and the response names every citation it strands. An
+  unreadable task DB fails CLOSED (CitationScanFailed), override or not.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -1846,7 +1857,21 @@ def create_mcp_server(
         ``repoint_task_citations`` MUST agree on this definition: they read the
         same snapshot, and a disagreement surfaces as a gate demanding a repoint
         that the sweep then reports zero work for.
+
+        COST, and why the snapshot is deliberately NOT cached (task 3624).
+        Broadening the gate to every caller means every mem0 delete pays one
+        full ``get_tasks`` read plus an O(tasks x metadata-nodes) walk, so a
+        25-delete consolidation batch pays it 25 times with no reuse. A
+        per-batch or short-TTL snapshot cache would collapse that and is
+        refused on purpose: this is the LAST read before an irreversible
+        delete, and a task that begins citing the doomed id after the snapshot
+        was taken would be invisible to it — trading the gate's fail-closed
+        guarantee for a race, on precisely the operation whose harm motivated
+        the gate. The cost is made OBSERVABLE instead: each scan reports its
+        task count and duration at DEBUG, so a project large enough for this to
+        matter surfaces as a measurement rather than as a hunch.
         """
+        started = time.perf_counter()
         tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
         tasks = (tasks_data or {}).get('tasks') or []
         found: list[dict[str, Any]] = []
@@ -1865,6 +1890,17 @@ def create_mcp_server(
                 'paths': paths,
                 'terminal': status in INACTIVE_TASK_STATUSES,
             })
+        # DEBUG, not INFO: this now runs on EVERY mem0 delete, so it is the
+        # common path and must not be chatty by default. It is the only place
+        # the broadened gate's per-delete cost is measurable.
+        logger.debug(
+            'citation gate: scanned %d task(s) for citations of %s in %.1f ms '
+            '(%d citer(s) found)',
+            len(tasks),
+            memory_id,
+            (time.perf_counter() - started) * 1000,
+            len(found),
+        )
         return found
 
     @mcp.tool()
@@ -3201,7 +3237,9 @@ def create_mcp_server(
         override_supplied = (
             isinstance(metadata, dict) and 'allow_dangling_citations' in metadata
         )
-        raw_override = metadata.get('allow_dangling_citations') if override_supplied else None
+        raw_override = (
+            metadata.get('allow_dangling_citations') if isinstance(metadata, dict) else None
+        )
         allow_dangling_citations = raw_override is True
         # Repoint live task-metadata citations BEFORE the irreversible delete.
         # Order is the whole point: a rejection here never reaches the service

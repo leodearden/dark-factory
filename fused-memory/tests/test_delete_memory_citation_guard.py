@@ -785,6 +785,32 @@ class TestAllowDanglingCitationsEscape:
         assert result['ignored_replacement_memory_id'] == SURVIVOR
 
     @pytest.mark.asyncio
+    async def test_scan_cost_is_reported_at_debug(
+        self, mcp_server, mock_service, caplog,
+    ):
+        """Broadening the gate put a full task-tree read on EVERY mem0 delete,
+        so a 25-delete batch pays it 25 times. The snapshot is deliberately not
+        cached (a stale one would hide a citer that appeared after it was taken,
+        which is a race on an irreversible delete), so the cost is made
+        measurable instead. DEBUG, not INFO: this is now the common path."""
+        with caplog.at_level('DEBUG'):
+            await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                metadata={'allow_dangling_citations': True},
+            )
+
+        scan_lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'DEBUG' and 'citation gate: scanned' in r.getMessage()
+        ]
+        assert len(scan_lines) == 1
+        # The two numbers an operator needs: how much tree was walked, and how
+        # long it took.
+        assert 'scanned 2 task(s)' in scan_lines[0]
+        assert ' ms' in scan_lines[0]
+
+    @pytest.mark.asyncio
     async def test_no_warning_when_the_flag_is_absent(
         self, mcp_server, mock_service, caplog,
     ):

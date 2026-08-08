@@ -32,15 +32,30 @@ entry to repoint to — a plain drop rather than a consolidation, which
 `replacement_memory_id` cannot express — pass
 `metadata={'allow_dangling_citations': True}`. Only a literal boolean `True`
 counts, matching the `allow_mcp_markup` convention below; a truthy `'yes'` or `1`
-does not unlock an irreversible delete. The refusal's `hint` names the escape, so
-it is discoverable from the rejection itself.
+does not unlock an irreversible delete — and does not vanish either: a supplied
+value that is not a literal boolean comes back as `ignored_override` on the
+rejection, with a `hint` sentence saying why, rather than leaving the caller to
+retry the flag they believe they already passed. (A literal `False` is a
+deliberate "no" and is honoured without comment.)
+
+The `hint` names the escape, so it is discoverable from the rejection itself —
+but only on `CitationRepointRequired`. The `CitationReplacement*` refusals
+deliberately do **not** advertise it: those are reached by *naming* a survivor,
+so the caller demonstrably has one and their fix is to correct the UUID. A
+consolidation delete has a survivor by definition, which is exactly the case the
+escape is wrong for.
 
 Two deliberate differences from `allow_mcp_markup`. First, the override is not
 silent: it is recorded at `WARNING` naming the deleted id, the `agent_id` that
 asked, and every live citer it strands — an override that lands silently is the
-same class of defect as the gate that never ran. Supplying a
-`replacement_memory_id` *alongside* the flag is contradictory; the override wins
-and the ignored value is named in that same line rather than dropped in silence.
+same class of defect as the gate that never ran. The same enumeration is
+returned to the caller (`dangled_citations`, `dangled_citation_count`), because
+an MCP caller never sees the server's log stream and a bare
+`{'status': 'deleted'}` would be silent from the only vantage point that matters
+to them. Supplying a `replacement_memory_id` *alongside* the flag is
+contradictory; the override wins, and the ignored value is named both in that
+log line and as `ignored_replacement_memory_id` on the response rather than
+dropped in silence.
 Second, `allow_mcp_markup` is "stripped before persistence" whereas this flag
 needs no strip at all: `delete_memory` discards `_extract_causation`'s cleaned
 dict and `memory_service.delete_memory(...)` takes no `metadata` parameter, so
@@ -52,6 +67,16 @@ exactly the scoping this task removed. It deliberately does **not** unlock the
 fail-closed path: an override plus an unreadable task DB is still
 `CitationScanFailed`, because the flag means "I accept dangling the citers you
 just showed me" and with nothing enumerated there is nothing to knowingly accept.
+
+**Cost.** Every `store='mem0'` delete now pays one `task_interceptor.get_tasks`
+read plus a whole-tree metadata walk, so a 25-delete batch pays it 25 times. The
+snapshot is deliberately *not* cached across calls: it is the last read before an
+irreversible delete, and a task that starts citing the doomed id after a cached
+snapshot was taken would be invisible to the gate — trading its fail-closed
+guarantee for a race, on the exact operation the gate exists to protect. The cost
+is made observable instead: each scan logs its task count and duration at `DEBUG`
+(`citation gate: scanned N task(s) ... in X ms`), so a project large enough for
+this to matter shows up as a measurement.
 
 #### Leaked tool-call XML: root cause, and the tooling to sweep the corpus (task 3083)
 
