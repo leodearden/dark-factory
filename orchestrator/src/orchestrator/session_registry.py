@@ -2601,6 +2601,18 @@ def _run_write_decision(
     construction (it is the same dir it passes to reap-decisions), so there
     is no legitimate write-path caller.
 
+    UPSERT, NOT A BLIND OVERWRITE (task 3559). If an OPEN record already
+    exists at this id and its stored queue stamp DIFFERS from *stamp*, this
+    is a second watcher observing the same human gate through a different
+    queue (the observed esc-5914-1 MODE-2 shape), so the incoming filing is
+    folded in via merge_decision_enrichment -- never clobbering or
+    downgrading what the first watcher wrote. Everything else keeps today's
+    full overwrite: no existing record (the normal first-filing case), an
+    unreadable/corrupt one, a NON-open one (a question the human already
+    dealt with -- a new filing there starts a new ask), or a MATCHING queue
+    stamp (the same watcher re-filing across a restart, which both SKILL.md
+    files promise is idempotent).
+
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
     cross-link it into its in-session note or afk-digest line. write_decision
@@ -2646,7 +2658,7 @@ def _run_write_decision(
         )
         return
 
-    record = DecisionRecord(
+    incoming = DecisionRecord(
         id=decision_id,
         project=project,
         text=text,
@@ -2657,6 +2669,39 @@ def _run_write_decision(
         severity=severity,
         escalations_dir=stamp,
     )
+
+    # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
+    # read-modify-write shape: _mutate_decision is a STRICT read-modify-write
+    # -- it does DecisionRecord.from_json(path.read_text()) and fail-softs to
+    # None when the file is absent. Here, absent is the NORMAL case (the first
+    # filing of a new decision), so delegating would make CREATING a record
+    # impossible. This verb is an UPSERT: read-or-construct, merge, write.
+    # What genuinely must not diverge are the invariants that helper's
+    # docstring identifies as load-bearing, so they are mirrored verbatim:
+    # its exact (OSError, json.JSONDecodeError, KeyError, TypeError,
+    # ValueError) read/parse/write fault set, and (step-14) the lock sitting
+    # INSIDE the try/except so an acquisition fault is absorbed rather than
+    # raised at a watcher.
+    record = incoming
+    try:
+        existing = DecisionRecord.from_json(decision_path_for_id(decision_id).read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        # Absent (the common first-filing case), unreadable, or corrupt: all
+        # fall through to writing fresh. A watcher's filing must never raise.
+        existing = None
+    if (
+        existing is not None
+        and existing.state == DecisionState.OPEN
+        and normalize_escalations_dir(existing.escalations_dir) != stamp
+    ):
+        # A DIFFERENT queue filing against a live record: this is the MODE-2
+        # cross-queue collapse, so enrich rather than overwrite. A matching
+        # stamp is the SAME watcher re-filing across a restart, which both
+        # SKILL.md files promise is a plain idempotent overwrite; a non-open
+        # record is a question the human already dealt with, so a new filing
+        # against it starts a new ask rather than editing a closed row.
+        record = merge_decision_enrichment(existing, incoming)
+
     if write_decision(record):
         print(record.id)
 

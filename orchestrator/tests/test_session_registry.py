@@ -4336,10 +4336,13 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
     """Pins the acknowledged MODE-2 tradeoff (task 3528, raised in review).
 
     A MODE-2 same-subject duplicate (esc-5914-1) collapses to ONE record by
-    design -- but ``escalations_dir`` is single-valued and write_decision
-    rewrites the whole file, so the survivor carries only the LAST filer's
-    queue (pinned by ..._same_id_from_two_queues_stays_one_decision). The
-    axis-2 guard then makes the OTHER queue's reaper skip it outright.
+    design -- but ``escalations_dir`` is single-valued, so the survivor can
+    carry only ONE of the two queues: the FIRST filer's, since task 3559
+    made a cross-queue re-file enrich rather than overwrite (pinned by
+    ..._same_id_from_two_queues_stays_one_decision). The axis-2 guard then
+    makes the OTHER queue's reaper skip it outright. Task 3559 changed only
+    WHICH queue survives -- deterministically the first filer's, rather than
+    racily whichever watcher wrote last -- not the gap's existence.
 
     So if the escalation that actually reaches a terminal status is the one
     in the NON-stamped queue -- entirely possible for two independently-filed
@@ -4360,7 +4363,12 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
         json.dumps({'status': 'resolved'})
     )
     (recon / 'esc-5914-1.json').write_text(json.dumps({'status': 'pending'}))
-    for queue in (orch, recon):  # two watchers, one collapsed record; recon files last
+    # Two watchers, one collapsed record. RECON FILES FIRST, so under task
+    # 3559's first-writer-wins its queue is the one stamped -- which keeps
+    # this case non-vacuous: the reaper below scans `orch`, the NON-stamped
+    # queue, and `orch` is precisely where the RESOLVED copy lives, so an
+    # absent axis-2 guard really would close this decision.
+    for queue in (recon, orch):
         assert (
             sr.main(
                 [
@@ -4448,8 +4456,11 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     listed = sr.list_decisions(root=tmp_path)
     assert [d.id for d in listed] == ['esc-5914-1']
     # The discriminator is a FIELD holding a normalized queue path, never a
-    # namespace prefix baked into the id.
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    # namespace prefix baked into the id. The field is scalar, so only ONE of
+    # the two queues can survive: the FIRST filer's (task 3559 -- the second
+    # filing enriches rather than overwrites), which makes the outcome
+    # deterministic instead of "whichever watcher happened to write last".
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
     assert listed[0].id == 'esc-5914-1'
 
 
