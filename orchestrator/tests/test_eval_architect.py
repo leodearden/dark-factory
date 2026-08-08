@@ -3939,3 +3939,106 @@ class TestArchitectEvalUsageGate:
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
         assert mocks['invoke'].call_count == 1
+
+
+def _healthy_agent_result():
+    """A clean architect answer — the result the SECOND account returns.
+
+    A real AgentResult, not a MagicMock: it has to survive
+    ``classify_invocation`` inside ``invoke_with_cap_retry`` (which must see a
+    success, not another cap) AND ``detect_invocation_error`` in the runner
+    (which must leave the cell unmarked). A MagicMock cannot express either,
+    since every attribute access on it returns a truthy Mock.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=True,
+        output='wrote the plan',
+        cost_usd=1.23,
+        duration_ms=4567,
+        turns=11,
+    )
+
+
+def _two_account_gate():
+    """A REAL two-account UsageGate with tokens pre-injected.
+
+    Deliberately not a mock: the point of the failover test is that the genuine
+    ``invoke_slot`` / ``detect_cap_hit`` / token-rotation path runs end to end,
+    so a mock's scripted answers cannot make it pass. Canonical construction —
+    test_usage_gate.py:30-43.
+    """
+    from _orch_helpers import build_usage_gate
+    from shared.config_models import AccountConfig
+
+    return build_usage_gate(
+        [
+            AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A'),
+            AccountConfig(name='max-b', oauth_token_env='CLAUDE_OAUTH_B'),
+        ],
+        ['tok-a', 'tok-b'],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cap FAILOVER through run_architect_eval (eval-revival φ, task 3630)
+#
+# The user-observable signal of the whole task: a cap on the first account must
+# cost the campaign a retry, not a cell. Before φ the 429 was classified by
+# detect_invocation_error and the cell was persisted cap_tainted with
+# plan_quality=None — a measurement the campaign then had to EXCLUDE.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectEvalCapFailover:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_cap_hit_fails_over_to_a_second_account_and_completes_the_cell(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=[_cap_agent_result(), _healthy_agent_result()],
+        )
+
+        # (a) The cap cost a RETRY, not the cell.
+        assert mocks['invoke'].await_count == 2
+
+        # (b) …and the retry actually ROTATED the account, rather than
+        # re-dispatching onto the same capped token.
+        first, second = mocks['invoke'].call_args_list
+        assert first.kwargs['oauth_token'] == 'tok-a'
+        assert second.kwargs['oauth_token'] == 'tok-b'
+
+        # (c) The cell is HEALTHY — measured, judged, and INCLUDED in the mean.
+        # This is the whole point: pre-φ this cell was an exclusion.
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['invocation_error'] is None
+        assert result.outcome == 'done'
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['plan_steps'] == 4
+
+        # (d) The architect is still invoked with EXACTLY today's kwargs — the
+        # new seam is a transport change, not a re-specification of the
+        # candidate under test. A silent drop here (e.g. backend or
+        # env_overrides not reaching invoke_agent) would change WHAT is being
+        # measured while every other assertion above stayed green.
+        kw = second.kwargs
+        assert kw['model'] == 'sonnet'
+        assert kw['backend'] == 'claude'
+        assert kw['effort'] == 'high'
+        assert kw['prompt'] == 'ARCH PROMPT'
+        assert kw['cwd'] == Path('/fake/wt')
+        assert kw['max_turns'] == 50
+        assert kw['system_prompt']
+        assert 'max_budget_usd' in kw
+        assert 'allowed_tools' in kw
+        assert 'disallowed_tools' in kw
+        assert 'env_overrides' in kw
+        assert kw['mcp_config'] is not None
