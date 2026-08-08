@@ -932,14 +932,21 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
 
 
 # ---------------------------------------------------------------------------
-# step-3 test: EscalationStatStrip computes all four metrics from the
-# payload's existing daily series (no duplicated computation)
+# step-3 test: EscalationStatStrip computes its metrics from the payload's
+# existing daily series (no duplicated computation).  Widened to five tiles
+# by task 3543, which added the pinning count.
 # ---------------------------------------------------------------------------
 
 
-def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> None:
-    """EscalationStatStrip must compute all four metrics from series the
-    backend aggregator already emits, and render four labeled tiles.
+def test_tab_escalations_strip_metric_inventory(tab_escalations_jsx_body: str) -> None:
+    """EscalationStatStrip must compute every metric from series the
+    backend aggregator already emits, and render one labeled tile each.
+
+    The tile count is asserted EXACTLY, not as a floor.  A `>= N` bound (what
+    this test used before task 3543 added the fifth tile) silently accepts a
+    sixth tile appearing with no test naming what it shows — the inventory
+    stops being pinned the moment it stops being exact.  Adding a tile is
+    meant to cost one line here.
 
     Asserts, scoped to the EscalationStatStrip body:
     (a) benign-rate — references flow_daily, the 'benign'/'actionable' class
@@ -947,7 +954,8 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     (b) 6h-breach — references open_items and breach_6h.
     (c) esc-per-done — references esc_per_done_daily.
     (d) churn — references churn_daily.
-    (e) at least four <C.StatTile tiles are rendered.
+    (e) pinning — references pins_recovery over the same open_items.
+    (f) exactly five <C.StatTile tiles are rendered.
     """
     strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
     assert strip_fn, (
@@ -996,11 +1004,21 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
         'churn-24h tile must be computed from it.'
     )
 
-    # (e) at least four StatTile occurrences
+    # (e) pinning substrate — task 3543 / spec S8.  Same open_items the breach
+    # tile already reduces, so the count costs no extra payload.
+    assert 'pins_recovery' in strip_fn, (
+        'EscalationStatStrip does not reference pins_recovery — add the pinning '
+        'tile, counting open_items whose pins_recovery annotation is truthy. '
+        'Seven tripwire L0s that all pin recovery are seven strands sharing one '
+        'cause, and the strip is where that reads as one number.'
+    )
+
+    # (f) exactly five StatTile occurrences
     tile_count = len(re.findall(r'<C\.StatTile', strip_fn))
-    assert tile_count >= 4, (
-        f'EscalationStatStrip renders {tile_count} <C.StatTile tiles, expected >= 4 '
-        '(benign rate, 6h breaches, esc/done, churn).'
+    assert tile_count == 5, (
+        f'EscalationStatStrip renders {tile_count} <C.StatTile tiles, expected exactly 5 '
+        '(benign rate, 6h breaches, esc/done, churn, pinning). Adding or removing a '
+        'tile must update this inventory and the substrate assertions above.'
     )
 
 
@@ -1329,4 +1347,66 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
         f'{seed_capture.group(0)!r}. A first poll that resolves before this '
         'module is evaluated freezes a real payload as the "seed", and paused '
         'polling or endpoint backoff makes that wedge permanent.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3543 step-27: the pinning tile
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_strip_pinning_tile(tab_escalations_jsx_body: str) -> None:
+    """The fifth tile counts open items that PIN a task's recovery.
+
+    Reduced from the SAME `lifespan.open_items` array the 6h-breach tile
+    already walks (the inline reduce beside `breachCount` is the established
+    precedent for a one-line open_items derivation living in the JSX), so the
+    count costs no extra payload and cannot disagree with the badges rendered
+    on the analytics tab.
+
+    Two properties the counting must have, both because the backend OMITS
+    `pins_recovery` when the annotation is unknown:
+
+    * truthiness, never `=== false` or `!= null` — an unannotated item must
+      fall out of the count rather than being counted as "does not pin";
+    * a denominator hint naming the shared cause, so seven tripwire L0s that
+      all pin recovery read as seven strands with ONE cause rather than seven
+      unrelated items.
+    """
+    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    assert strip_fn, (
+        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
+    )
+
+    assert re.search(r'pins_recovery', strip_fn), (
+        'EscalationStatStrip does not reference pins_recovery.'
+    )
+    # Counted off open_items, the array the breach tile already built.
+    assert re.search(
+        r'openItems\s*\.\s*filter\s*\([^)]*pins_recovery', strip_fn,
+    ), (
+        'EscalationStatStrip does not count pins_recovery off the same openItems '
+        'array as breachCount — deriving it from a second source would let the '
+        'strip and the analytics badges disagree about one payload.'
+    )
+    assert not re.search(r'pins_recovery\s*===\s*false', strip_fn), (
+        'EscalationStatStrip compares pins_recovery === false — the key is ABSENT '
+        'when unknown, so an equality test mislabels unannotated items. Count on '
+        'truthiness.'
+    )
+    assert re.search(r'label="pinning"', strip_fn, re.IGNORECASE), (
+        'EscalationStatStrip does not render a tile labelled "pinning" — the fifth '
+        'tile must say what it counts.'
+    )
+    # The hint must give the count a denominator (as "6h breaches" does with
+    # `of N pending`), otherwise "3" is unreadable.
+    pinning_tile = re.search(
+        r'<C\.StatTile\b(?:(?!/>)[\s\S])*?pinning(?:(?!/>)[\s\S])*?/>',
+        strip_fn, re.IGNORECASE,
+    )
+    assert pinning_tile, 'Could not locate the pinning <C.StatTile element.'
+    assert 'hint=' in pinning_tile.group(0), (
+        'The pinning tile carries no hint= — give the count a denominator naming '
+        'the shared cause (e.g. "of N pending" / "N tasks"), as the 6h-breach tile '
+        'does; a bare number is unreadable.'
     )

@@ -1330,3 +1330,58 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
             'RegimeMarkers overlay (see that file) and must be updated to match, '
             'or charts.jsx should export the constant instead.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3543 step-27: PINNING badge on open items
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_panel_renders_pinning_badge(tab_analytics_jsx_body: str) -> None:
+    """LifespanPanel badges an open item that PINS a task's recovery.
+
+    The badge sits beside the existing `6h+` breach badge in the open-items
+    row: two independent signals about one record, "nobody has answered this
+    in 6h" and "this record is what stops that task from being recovered".
+
+    The gate must be TRUTHINESS on `item.pins_recovery`, because the backend
+    OMITS that key whenever the annotation is unknown (the project's
+    escalation MCP was unreadable, or the record carried no annotation — see
+    dashboard/data/escalation_analytics.py). Truthiness renders nothing for
+    both `false` and `undefined`, which is exactly right. What must NOT
+    appear is a negated arm (`!item.pins_recovery && <badge/>`): that would
+    render a confident "does not pin" over a record nobody ever classified.
+    """
+    body = tab_analytics_jsx_body
+    lifespan_body = _extract_function_body(body, 'LifespanPanel')
+    assert lifespan_body, 'Could not locate the LifespanPanel( function body.'
+
+    assert 'pins_recovery' in lifespan_body, (
+        'LifespanPanel does not reference `pins_recovery` — the open-items row '
+        'must badge a record that pins a task recovery.'
+    )
+    assert re.search(r'item\.pins_recovery\s*&&', lifespan_body), (
+        'LifespanPanel does not gate its PINNING badge on `item.pins_recovery &&` — '
+        'the key is ABSENT when the annotation is unknown, so the render must be a '
+        'plain truthiness gate that draws nothing for both false and undefined.'
+    )
+    assert not re.search(r'!\s*item\.pins_recovery', lifespan_body), (
+        'LifespanPanel renders a NEGATED pins_recovery arm — an unannotated item '
+        '(key omitted) would be labelled "does not pin", asserting a classification '
+        'nobody produced. Render nothing when the key is absent.'
+    )
+    assert re.search(r'PINNING', lifespan_body, re.IGNORECASE), (
+        'LifespanPanel does not render a PINNING label — the badge must name what '
+        'it means, next to the existing 6h+ badge.'
+    )
+    assert 'pins_recovery_task_ids' in lifespan_body, (
+        'LifespanPanel does not reference `pins_recovery_task_ids` — the badge '
+        'tooltip must name WHICH tasks this record is pinning, otherwise an '
+        'operator has to guess which strand to go look at.'
+    )
+    # The badge must live in the same row-render as the breach badge, so the
+    # two read as one line of evidence rather than two panels to correlate.
+    assert 'breach_6h' in lifespan_body, (
+        'LifespanPanel no longer references breach_6h — the PINNING badge is '
+        'specified as sitting beside it in the open-items row.'
+    )
