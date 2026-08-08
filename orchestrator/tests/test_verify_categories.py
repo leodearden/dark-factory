@@ -829,6 +829,97 @@ class TestEnvTransientArchivesForHumanTriage:
         assert verify._should_archive_category('env_transient') is True
 
 
+class TestAssertInfraTransientRowsArchive:
+    """task 3683: ``is_infra_transient`` ⇒ ``archive``, enforced at import
+    time as a reusable, unit-testable guard.
+
+    The three classes above adjudicate three specific rows. This is the
+    durable part: the rule holds UNCONDITIONALLY, so it needs no
+    ``human_reachable`` field and no per-category branch. Every consumer that
+    retries an infra-transient result does so on flat ``in
+    INFRA_TRANSIENT_CATEGORIES`` set membership (workflow.py:9020,
+    merge_queue.py:2761, verify.py:7255), so no member can be structurally
+    exempt from any of them, and each of those windows is BOUNDED and
+    terminates in a blocking level-1 ``infra_issue`` escalation on exhaustion.
+    An infra-transient row that does not archive therefore discards the only
+    triage artifact its human gets beyond a truncated ``failure_report()``.
+
+    Modelled on ``_validate_exhaustive`` and ``_assert_sentinels_disjoint``:
+    the guard takes ``policy`` as a PARAMETER, so a synthetic table exercises
+    it directly instead of requiring a real import crash.
+
+    RED today: ``_assert_infra_transient_rows_archive`` does not exist yet.
+    """
+
+    def _row(self, *, archive: bool, is_infra_transient: bool):
+        """Build a row from the REAL CategoryPolicy dataclass.
+
+        All six fields are required (the dataclass has no defaults on
+        purpose), so a synthetic row cannot drift from the real row shape.
+        """
+        from orchestrator.verify_categories import CategoryPolicy, RetryKind
+        return CategoryPolicy(
+            severity_rank=0,
+            archive=archive,
+            preexisting_probe=False,
+            is_infra_transient=is_infra_transient,
+            verdict_indeterminate=False,
+            retry_kind=RetryKind.NONE,
+        )
+
+    def test_infra_transient_row_without_archive_raises_and_names_it(self):
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_infra_transient_rows_archive
+
+        class _Synth(StrEnum):
+            BAD = 'synthetic_bad_row'
+            GOOD = 'synthetic_good_row'
+
+        policy = {
+            _Synth.BAD: self._row(archive=False, is_infra_transient=True),
+            _Synth.GOOD: self._row(archive=True, is_infra_transient=True),
+        }
+        # Naming the offender matters: a future author hitting this at import
+        # time must learn WHICH row to fix, not just that something is wrong.
+        with pytest.raises(AssertionError, match='synthetic_bad_row'):
+            _assert_infra_transient_rows_archive(policy)
+
+    def test_ordinary_archive_false_rows_do_not_trip_the_guard(self):
+        """The guard must not over-fire on non-infra archive=False rows —
+        compile_error/test_failure/passed are legitimately not archived."""
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_infra_transient_rows_archive
+
+        class _Synth(StrEnum):
+            INFRA = 'synthetic_infra_row'
+            CODE_FAULT = 'synthetic_code_fault_row'
+
+        policy = {
+            _Synth.INFRA: self._row(archive=True, is_infra_transient=True),
+            _Synth.CODE_FAULT: self._row(archive=False, is_infra_transient=False),
+        }
+        _assert_infra_transient_rows_archive(policy)
+
+    def test_real_module_import_satisfies_its_own_guard(self):
+        # Importing the real module must succeed — its shipped table already
+        # satisfies the guard (this is it firing at import time).
+        import orchestrator.verify_categories as vc
+
+        vc._assert_infra_transient_rows_archive(vc.CATEGORY_POLICY)
+
+    def test_no_infra_transient_category_is_archive_denied(self):
+        """The human-legible form of the same invariant, asserted against the
+        DERIVED registries rather than the rows — after task 3683 the two sets
+        are disjoint, and the guard is what keeps them that way."""
+        from orchestrator.verify_categories import (
+            ARCHIVE_DENY_LIST,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+        assert INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST == frozenset()
+
+
 class TestEnvironmentalCategoriesOutrankCodeFaults:
     """_worst_category must pick the infra root cause over a co-occurring
     downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
