@@ -2344,6 +2344,124 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
         assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
 
 
+class TestAWriteFailureIsNotBlamedOnTheStore:
+    """A bad ``--out`` is an ordinary operator typo — do not name the store for it.
+
+    ``--out`` is operator-supplied, so a path into a directory that does not
+    exist (or is not a directory) is a routine mistake, not an infrastructure
+    incident. Reporting it as "the store could not be read" sends the operator
+    off to restart FalkorDB when the fix is a path — the exact mis-attribution
+    ``_window_population`` was extracted to eliminate on the verify side.
+
+    The cause is placement, not the exception tuple: a handler wrapped around
+    the WHOLE run sees every ``OSError`` the run can raise, and
+    ``write_manifest``'s ``mkdir``/``write_text`` raise the same type as an
+    unreachable socket. So the catch belongs at the seam that actually talks to
+    the store, where the attribution is true by construction rather than by the
+    hope that nothing else in the run raises ``OSError``.
+    """
+
+    @staticmethod
+    def _unwritable_out(tmp_path):
+        """An ``--out`` whose parent exists but is a FILE, so ``mkdir`` raises.
+
+        ``write_manifest`` calls ``target.parent.mkdir(parents=True,
+        exist_ok=True)``, and ``exist_ok=True`` still re-raises
+        ``FileExistsError`` (an ``OSError``) when the existing path is not a
+        directory. Chosen over ``chmod 0o500`` deliberately: chmod is a silent
+        no-op for uid 0, so on a CI runner that happens to be root a
+        permissions-based fixture would make every test below pass vacuously.
+        This trick is uid-independent.
+        """
+        bad_parent = tmp_path / 'afile'
+        bad_parent.write_text('not a directory', encoding='utf-8')
+        return bad_parent / 'corpus_manifest.json'
+
+    def test_an_unwritable_out_path_is_not_reported_as_an_unreachable_store(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The whole point, stated in the negative — and shape-agnostic.
+
+        It asserts only that the store is NOT named, so it holds whichever way
+        the write failure is eventually surfaced. That keeps it a pin on the
+        mis-attribution alone, rather than a second copy of the next test's
+        message assertions that would have to move with them.
+        """
+        out = self._unwritable_out(tmp_path)
+        capsys.readouterr()
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert 'the store could not be read' not in capsys.readouterr().err
+
+    def test_an_unwritable_out_path_is_attributed_to_the_path(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """And in the positive: a typed exit-1 naming the path the operator gave.
+
+        Mirrors ``_run_verify``'s existing ``cannot read {path}: {exc}`` idiom,
+        so the two halves of the CLI report a filesystem failure the same way.
+        """
+        out = self._unwritable_out(tmp_path)
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        err = capsys.readouterr().err
+        assert code == _mod.EXIT_RUN_FAILED
+        assert err.startswith('error: ')
+        assert 'cannot write' in err
+        assert str(out) in err
+
+    def test_the_store_answered_before_the_write_failed(self, monkeypatch, tmp_path):
+        """What makes the two tests above evidence rather than coincidence.
+
+        The store is demonstrably innocent — it was queried and it answered —
+        rather than merely never having been reached, which a run that failed
+        earlier would also satisfy while telling us nothing about attribution.
+        """
+        out = self._unwritable_out(tmp_path)
+        double = _FalkorDouble(_cli_rows())
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), double=double)
+        assert double.ro_queries
+        assert not double.violations
+
+    def test_an_unreachable_store_is_still_reported_as_a_store_failure(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: the narrowing must not cost the true positive.
+
+        Same build mode, same exit code, same message — only the culprit
+        differs. Without this, "stop blaming the store" could be satisfied by
+        never blaming the store at all.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+        )
+        err = capsys.readouterr().err
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'the store could not be read' in err
+        assert 'falkordb is down' in err
+
+    def test_a_verify_run_with_an_unreadable_manifest_is_still_a_bad_manifest(
+        self, monkeypatch, tmp_path
+    ):
+        """CONTROL: the OTHER filesystem OSError in the CLI keeps its verdict.
+
+        ``_run_verify`` already catches ``OSError`` from ``path.read_text()``
+        and reports ``bad_manifest``, and that clause sits BEFORE the store is
+        touched. Moving the store handler must not reach past it and convert a
+        settled verdict into a verdict-free exit 1.
+        """
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(tmp_path / 'nope.json'))
+        assert code == _mod.EXIT_CODES['bad_manifest']
+
+
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
     """The delivered_check greps fused-memory/scripts/ on the COMMITTED tree."""
 
