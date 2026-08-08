@@ -48,6 +48,19 @@ SUCCESSOR_RECORD: dict[str, Any] = {
 }
 
 
+# A raw, non-StageReport ``stage_reports`` entry, shaped like the ones
+# ``harness`` actually writes. Note it carries ``failed_stage``, NOT ``stage``:
+# ``journal.get_run`` discriminates on ``'stage' in v`` to decide whether to
+# parse an entry as a StageReport, so a fixture using ``stage`` here would not
+# be a raw entry at all — it would fail model validation on read-back.
+RAW_ERROR_ENTRY: dict[str, Any] = {
+    'error_type': 'CancelledError',
+    'error_message': 'Run cancelled (timeout or external cancellation)',
+    'failed_stage': 'integrity_check',
+    'traceback': '',
+}
+
+
 def _finding(finding_id: str, cited: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
     return {
         'finding_id': finding_id,
@@ -91,7 +104,7 @@ class TestRepairHappyPath:
                 _finding('f-1', [_citation(DANGLING)]),
                 _finding('f-2', [_citation(SUCCESSOR)]),
             ],
-            extra_stage_reports={'_error': {'stage': 'integrity_check', 'msg': 'boom'}},
+            extra_stage_reports={'_error': RAW_ERROR_ENTRY},
         )
         try:
             before = _dump(await journal.get_run(RUN_ID))
