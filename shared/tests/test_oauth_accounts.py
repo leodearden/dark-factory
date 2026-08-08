@@ -4,14 +4,13 @@ An ORDINARY (unmarked) test module: it runs in CI and in the verify lane, makes
 no real CLI calls, and costs nothing.  Same shape as ``test_capacity_skip.py``,
 which pins the other shared test-kit module extracted for the same reason.
 
-What these tests are for (task 3700).  The "which ``CLAUDE_OAUTH_TOKEN_*`` vars
-exist?" scan was hand-rolled in four places over THREE different letter sets —
-``BCDEF`` in ``test_usage_gate``, ``BCDEFG`` in ``_cross_account_evidence``, and
-``ABCDEFG`` in both startup-probe sites.  ``CLAUDE_OAUTH_TOKEN_G`` is a real
-fleet account in ``.env``, so the ``BCDEF`` copy skipped a live test that could
-have run.  ``_oauth_accounts`` is now the single source; these tests pin its
-contract, and the identity guards further down pin that each consumer actually
-RESOLVES through it rather than holding a re-inlined copy.
+What these tests are for (task 3700): they pin ``_oauth_accounts``' contract,
+and the identity guards further down pin that each of the four consumers
+actually RESOLVES through it rather than holding a re-inlined copy.  The scan's
+history — four hand-rolled copies over three letter sets, and which live gate
+that cost — is told once, in ``_oauth_accounts``' own module docstring; it is
+not restated here, because a story with five copies is the failure this task
+exists to end, reintroduced one layer up.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import importlib
 from types import ModuleType
 
 import pytest
+from _cross_account_evidence import PAIR_OVERRIDE_VAR
 from _oauth_accounts import (
     ALL_TOKEN_LETTERS,
     FLEET_TOKEN_LETTERS,
@@ -43,12 +43,16 @@ def reload_module_under_env(monkeypatch):
     Yields ``reload(module_name, **tokens)`` -> the reloaded module.  Every
     ``CLAUDE_OAUTH_TOKEN_*`` letter and the pair-override var are cleared first,
     so the machine's real ``.env`` (which has A..G all set) cannot leak in and
-    make these assertions environment-dependent.
+    make these assertions environment-dependent.  Neither the letter set nor the
+    override var name is restated here: both are imported from the module that
+    owns them, so this fixture cannot become the next drifting copy.
 
     Generalised from ``test_cross_account_evidence.py``'s
     ``reload_integration_module``, which is pinned to the pair-selection concern;
     one fixture here serves ``test_usage_gate``, ``test_cli_invoke_integration``
-    and ``test_startup_completion_fixtures``.
+    and ``test_startup_completion_fixtures``.  That original still exists, and
+    only because collapsing the two means hoisting this one into ``conftest.py``
+    — outside task 3700's lock set, so filed as follow-up rather than done here.
 
     Reloading mutates the module object other collected items may hold, so on
     teardown the real environment is restored (``monkeypatch.undo()`` FIRST,
@@ -64,7 +68,7 @@ def reload_module_under_env(monkeypatch):
             reloaded.append(module)
         for ch in ALL_TOKEN_LETTERS:
             monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
-        monkeypatch.delenv('CROSS_ACCOUNT_RESUME_TOKENS', raising=False)
+        monkeypatch.delenv(PAIR_OVERRIDE_VAR, raising=False)
         for name, value in tokens.items():
             monkeypatch.setenv(name, value)
         return importlib.reload(module)
@@ -243,18 +247,27 @@ class TestFirstAvailableToken:
 class TestUsageGateResolvesThroughSingleHome:
     """``test_usage_gate``'s live gate must see every fleet account — G included.
 
-    THE headline defect of task 3700.  That module shipped its own ``BCDEF``
-    scan, so ``CLAUDE_OAUTH_TOKEN_G`` — a real fleet account in ``.env`` — was
-    invisible to it and ``_need_one_account`` skipped a live test that had a
-    perfectly healthy account to run on.  Under the capacity scarcity task 3484
-    measured on 2026-08-05 (5 of 6 accounts capped) that is the difference
-    between a live probe running and a question going another round with no
-    observations.
+    THE headline defect of task 3700: this module held the ``BCDEF`` copy, so
+    ``CLAUDE_OAUTH_TOKEN_G`` was invisible to it and ``_need_one_account``
+    skipped a live test that had a healthy account to run on.  (Full history in
+    ``_oauth_accounts``' module docstring.)
 
     Runtime-behaviour tests of module-level resolution, not structure or
     docstring tests — the same class of assertion as
     ``test_cross_account_evidence.py``'s ``TestIntegrationModuleUsesSelectTokenPair``.
     """
+
+    def test_module_resolves_the_scan_through_the_single_home(self):
+        """Object identity — the only assertion that forbids a re-inlined copy.
+
+        Every behavioural assertion in this class passes unchanged against a
+        fresh ``for c in 'BCDEFG'`` copy pasted back into ``test_usage_gate``,
+        which is precisely the regression this task exists to prevent, and this
+        is the module it actually happened to.
+        """
+        import test_usage_gate
+
+        assert test_usage_gate.available_tokens is available_tokens
 
     def test_g_only_machine_selects_the_live_test(self, reload_module_under_env):
         """With ONLY G set the gate must SELECT, not skip.
@@ -360,17 +373,25 @@ class TestAnyAccountConsumersResolveThroughSingleHome:
     so they legitimately scan ``A``..``G``.  That difference is why the single
     home owns two named sets instead of collapsing everything onto one.
 
-    The identity guard is the part that goes red: today each site loops its own
-    hand-rolled ``for c in 'ABCDEFG'`` and holds no reference to
-    ``_oauth_accounts`` at all.  The behavioural assertions already pass — they
-    are carried as regression pins that the rewire must not disturb, and in
-    particular that this half must NOT be narrowed to the fleet set.
+    Both sites now resolve through ``_oauth_accounts.ALL_TOKEN_LETTERS``; each
+    previously looped its own hand-rolled ``for c in 'ABCDEFG'``.  The identity
+    guards below pin that wiring — they are what a re-inlined copy would break,
+    since the behavioural assertions beside them would pass against one.  The
+    behavioural assertions pin the direction the rewire must never take: this
+    half must NOT be narrowed to the fleet set.
     """
 
     def test_probe_delegates_to_the_single_home(self):
         import startup_completion_probe
 
         assert startup_completion_probe.first_available_token is first_available_token
+
+    def test_fixture_gate_resolves_the_scan_through_the_single_home(self):
+        """Identity guard for the fixture-gate half, matching the probe's above."""
+        import test_startup_completion_fixtures
+
+        assert test_startup_completion_fixtures.available_tokens is available_tokens
+        assert test_startup_completion_fixtures.ALL_TOKEN_LETTERS is ALL_TOKEN_LETTERS
 
     def test_probe_reaches_the_interactive_primary_account(self, monkeypatch):
         """The direction that must NOT regress to the fleet set.

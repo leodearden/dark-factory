@@ -477,15 +477,12 @@ def _cli_version() -> str:
 def _oauth_token() -> tuple[str, str] | None:
     """Return ``(env_var_name, token)`` for the first available OAuth account.
 
-    Scans ``_oauth_accounts.ALL_TOKEN_LETTERS`` — the ANY-account set, which is
-    WIDER than the fleet set that module defaults to.  This probe does not spend
-    fleet capacity to answer a measurement question; it only needs SOME account
-    so a machine with none degrades to a legible skip.  The interactive/primary
-    account ``A`` is acceptable for that, and excluding it would make a
-    single-account machine report a failure it cannot act on.
+    ``ALL_TOKEN_LETTERS``, not ``_oauth_accounts``' fleet default: this probe
+    spends no fleet capacity and only needs SOME account so a machine with none
+    degrades to a legible skip, so the interactive/primary account ``A`` counts.
 
-    ``_oauth_accounts`` is the single home for this scan (task 3700); the letter
-    set is not restated here.
+    ``_oauth_accounts`` is the single home for this scan (task 3700) — see its
+    module docstring; the letter set is not restated here.
     """
     return first_available_token(os.environ, ALL_TOKEN_LETTERS)
 

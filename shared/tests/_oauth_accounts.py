@@ -35,9 +35,16 @@ bootstrap so it also resolves when run standalone.  The leading underscore keeps
 pytest from collecting this module as a test file; its contract tests live in
 ``test_oauth_accounts.py``.
 
-Deliberately import-light — no ``shared.cli_invoke``, no ``_capacity_skip`` — so
-the standalone ``startup_completion_probe.py`` script can import it without
-dragging in the package.
+Deliberately a LEAF of the test-kit import graph: stdlib only, no
+``shared.*``, no sibling kit module.  Not to spare a consumer the package —
+``startup_completion_probe.py`` imports ``shared.cli_invoke`` and
+``shared.config_dir`` a few lines below its ``_oauth_accounts`` import, so the
+package is loaded regardless.  The reason is that this module has to be
+importable at ANY point in a consumer's own bootstrap, before or after its
+``src/`` path insert, and that the two sibling kit modules already depend on
+``shared.*`` and on each other (``_cross_account_evidence`` imports both
+``_capacity_skip`` and this module) — so an import from here into either would
+close a cycle.  Keep it a leaf.
 """
 
 from __future__ import annotations
@@ -82,9 +89,13 @@ def token_var_names(letters: Iterable[str]) -> tuple[str, ...]:
 
 def available_tokens(
     environ: Mapping[str, str],
-    letters: tuple[str, ...] = FLEET_TOKEN_LETTERS,
+    letters: Iterable[str] = FLEET_TOKEN_LETTERS,
 ) -> list[tuple[str, str]]:
     """``[(var_name, token), ...]`` for every set token var, in scan order.
+
+    *letters* is annotated ``Iterable[str]`` to agree with ``token_var_names``,
+    which is the only thing this does with it; it is consumed exactly once, so a
+    one-shot iterator is safe.
 
     Order is fixed by *letters* and is NOT the environ's own iteration order:
     callers index this list positionally (``_AVAILABLE_TOKENS[0]``,
@@ -112,7 +123,7 @@ def available_tokens(
 
 def first_available_token(
     environ: Mapping[str, str],
-    letters: tuple[str, ...] = FLEET_TOKEN_LETTERS,
+    letters: Iterable[str] = FLEET_TOKEN_LETTERS,
 ) -> tuple[str, str] | None:
     """``(var_name, token)`` for the first set token var, or ``None`` if none is.
 

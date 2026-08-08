@@ -27,17 +27,11 @@ from _oauth_accounts import ALL_TOKEN_LETTERS, available_tokens
 
 from shared import cli_invoke
 
-# Live re-probe gate — the account scan is IMPORTED from _oauth_accounts, the
-# single home for it (task 3700), so a machine with no accounts records a
-# legible skip instead of a spurious failure.  This comment used to name
-# test_cli_invoke_integration.py's _AVAILABLE_TOKENS as what it mirrored; that
-# module no longer defines the scan, it imports it, and the "mirror" here was a
-# hand-rolled `for c in 'ABCDEFG'` that could have drifted from it silently —
-# which is exactly what had happened to the third copy, in test_usage_gate.
-#
-# ALL_TOKEN_LETTERS, not the fleet set _oauth_accounts defaults to: this gate
-# asks only "is there ANY account at all?", it spends no fleet capacity, and the
-# interactive/primary account A is a legitimate answer.  Narrowing it to the
+# Live re-probe gate — account scan single-homed in _oauth_accounts (task 3700);
+# see its module docstring for the history and for the two letter sets.
+# ALL_TOKEN_LETTERS, not that module's fleet default: this gate spends no fleet
+# capacity and asks only "is there ANY account at all?", so the
+# interactive/primary account A is a legitimate answer and narrowing to the
 # fleet set would make a single-account machine report a failure it cannot act
 # on.  startup_completion_probe._oauth_token uses the same set for the same
 # reason.
