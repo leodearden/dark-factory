@@ -557,9 +557,25 @@ async def test_worker_created_path_emits_journal_event(
             description='Checking event emission',
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
 
-        # Let the worker drain
-        await asyncio.sleep(0.2)
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flaked under load (task 3854: observed failing
+        # in a 388s-wall full-suite run, passing in isolation and in a
+        # 226s-wall run). Waiting on the ticket leaving 'pending' rather
+        # than on journal_calls directly keeps a genuine regression loud: a
+        # ticket that resolves without emitting the event trips the
+        # assertions below immediately instead of burning the whole
+        # timeout first.
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the ticket',
+        )
 
     # Exactly one task_created event must have been journalled
     task_created_events = [
