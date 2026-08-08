@@ -4052,6 +4052,42 @@ AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _classify_authorship(agent_id: Any) -> str:
+    """Classify one citation's stored ``agent_id``.
+
+    ``'internal'`` — a recognised house writer (the only value that can clear
+    a flag).  ``'missing'`` — no usable provenance at all (absent key, None,
+    empty, or a non-string).  ``'foreign'`` — a real agent_id that matches no
+    house writer family.  The two non-internal values are kept distinct
+    because they read very differently to an operator: a foreign id is a
+    positive signal, a missing one is a gap.
+    """
+    if is_internal_writer(agent_id):
+        return 'internal'
+    if not isinstance(agent_id, str) or not agent_id:
+        return 'missing'
+    return 'foreign'
+
+
+def _authorship_keep_decision(checked: list[dict[str, Any]]) -> str:
+    """Summarise WHY a candidate flag survived, from its checked citations.
+
+    Precedence runs most- to least-specific: a mix of house and non-house
+    citations is the most informative outcome, then a positively-foreign
+    author, then no usable provenance.  ``kept_missing_agent_id`` is the
+    catch-all for "no usable agent_id was obtained for any citation" —
+    whether it was absent from the payload or the lookup could not resolve it.
+    """
+    if not checked:
+        return 'kept_no_resolvable_citations'
+    classifications = {c['classification'] for c in checked}
+    if 'internal' in classifications:
+        return 'kept_mixed_authors'
+    if 'foreign' in classifications:
+        return 'kept_foreign_author'
+    return 'kept_missing_agent_id'
+
+
 async def filter_style_only_authorship_flags(
     memory_service: Any,
     project_id: str,
@@ -4084,7 +4120,16 @@ async def filter_style_only_authorship_flags(
     costs one noisy finding the next cycle clears, while wrongly dropping one
     silently disables the detection.
 
-    Non-candidate flags pass through untouched and are never looked up.
+    Every SURVIVING candidate is annotated with ``authorship_provenance``::
+
+        {'checked': [{'memory_id', 'agent_id', 'classification'}, ...],
+         'decision': 'kept_foreign_author' | 'kept_missing_agent_id'
+                     | 'kept_mixed_authors' | 'kept_no_resolvable_citations'}
+
+    — the structured fact at the decision point (INV-2), so Stage 2 and any
+    operator read the agent_ids this gate actually checked as a field instead
+    of re-deriving them from the description prose.  Non-candidate flags pass
+    through untouched: never looked up, never annotated.
 
     Args:
         memory_service: Object with an async ``get_memory_by_id(project_id,
@@ -4094,8 +4139,9 @@ async def filter_style_only_authorship_flags(
         flags: List of flag dicts from Stage 1 ``items_flagged``.
 
     Returns:
-        Filtered list with confirmed-house-authored authorship flags removed.
-        A new list; the input list and its dicts are never mutated here.
+        A new list, in input order, with confirmed-house-authored authorship
+        flags removed.  The input LIST is never mutated; surviving candidate
+        dicts gain the ``authorship_provenance`` key described above.
     """
     candidate_positions: list[int] = [
         i for i, flag in enumerate(flags)
@@ -4114,7 +4160,7 @@ async def filter_style_only_authorship_flags(
             checked.append({
                 'memory_id': memory_id,
                 'agent_id': agent_id,
-                'classification': 'internal' if is_internal_writer(agent_id) else 'foreign',
+                'classification': _classify_authorship(agent_id),
             })
         return checked
 
@@ -4130,6 +4176,7 @@ async def filter_style_only_authorship_flags(
     for i, flag in enumerate(flags):
         checked = checked_by_pos.get(i)
         if checked is None:
+            # Not a candidate — never looked up, never annotated, byte-identical.
             kept.append(flag)
             continue
         if checked and all(c['classification'] == 'internal' for c in checked):
@@ -4141,6 +4188,15 @@ async def filter_style_only_authorship_flags(
                 [c['memory_id'] for c in checked],
             )
             continue  # drop: every cited entry is provably house-authored
+        # Survives. Record the provenance actually read at the decision point
+        # (INV-2), so Stage 2 and any operator read the checked agent_ids as a
+        # field rather than re-deriving them from the description prose.
+        # ``setdefault`` mirrors citation_verifier's ``citation_failures``
+        # idiom: annotate the finding, never rewrite it.
+        flag.setdefault(
+            'authorship_provenance',
+            {'checked': checked, 'decision': _authorship_keep_decision(checked)},
+        )
         kept.append(flag)
 
     return kept
