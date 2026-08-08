@@ -1335,6 +1335,38 @@ class TestOpenDebt:
         # Same opened_at for all three (canonicalised), so the test_id tiebreak sorts.
         assert [r.test_id for r in rows] == ['a::t', 'b::t', 'c::t']
 
+    async def test_a_naive_now_logs_a_loud_warning(self, tmp_path: Path, caplog) -> None:
+        """Unlike :func:`_normalize_observed_at`'s wire-supplied ``observed_at``, a
+        naive ``now`` here is an IN-REPO caller bug, not untrusted input — coerced
+        rather than rejected (the never-raises invariant still holds), but never
+        silently: a future ζ/ε call site passing ``datetime.now()`` instead of
+        ``datetime.now(UTC)`` must be visible in the logs."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, now=datetime(2026, 8, 6, 12, 0)
+            )
+
+        assert row is not None  # coerced, not rejected
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert 'open_debt' in warnings[0].getMessage()
+        assert 'naive' in warnings[0].getMessage()
+
+    async def test_an_aware_now_logs_nothing(self, tmp_path: Path, caplog) -> None:
+        """The warning is naive-specific — an ordinary aware-UTC caller, the documented
+        contract, must stay silent or the log line stops signalling anything."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert row is not None
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
+
     async def test_reopen_while_still_open_is_not_a_re_entry(self, tmp_path: Path) -> None:
         """The debt never closed, so this is the SAME cycle: ``open_count`` and
         ``opened_at`` hold, and only ``last_occurrence_at`` advances.  Counting it as a
@@ -1502,6 +1534,43 @@ class TestResolveDebt:
 
         (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
         assert raw['resolved_at'] == self.LATER.isoformat()
+
+    async def test_a_naive_now_logs_a_loud_warning(self, tmp_path: Path, caplog) -> None:
+        """Mirrors ``TestOpenDebt``'s coverage of the same loud-on-naive treatment."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert (
+                await resolve_debt(
+                    db_path,
+                    'dark_factory',
+                    self.TEST_ID,
+                    resolving_commit='deadbee',
+                    now=datetime(2026, 8, 6, 13, 0),
+                )
+                is None  # coerced, not rejected — resolve_debt always returns None
+            )
+
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert 'resolve_debt' in warnings[0].getMessage()
+        assert 'naive' in warnings[0].getMessage()
+
+    async def test_an_aware_now_logs_nothing(self, tmp_path: Path, caplog) -> None:
+        """The warning is naive-specific — an ordinary aware-UTC caller, the documented
+        contract, must stay silent or the log line stops signalling anything."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await resolve_debt(
+                db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+            )
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
 
     async def test_the_resolved_row_is_retained(self, tmp_path: Path) -> None:
         """§5.2: resolved rows are kept DELIBERATELY because η's recurrence trigger
