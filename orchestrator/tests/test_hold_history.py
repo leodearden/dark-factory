@@ -12,7 +12,7 @@ from __future__ import annotations
 import _hold_history_fixtures as F
 import pytest
 
-from orchestrator.hold_history import HoldSpan, iter_hold_spans
+from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans
 
 
 def _offset(posix_seconds: float) -> float:
@@ -429,3 +429,185 @@ def test_canonical_trace_omits_the_orphan_and_the_end_of_stream_holder():
     assert 'T3' not in holders, 'orphan release must not produce a span'
     assert 'T10' not in holders, 'span open at end of stream must be dropped'
     assert F.SERVICE_RESTART_TRIGGER_TASK not in holders
+
+
+# ===========================================================================
+# HoldHistory — the rolling per-module window and its pooled median
+# ===========================================================================
+#
+# Every history built below carries at least three pooled samples, so these
+# assertions stay green once the ``min_samples`` refusal gate lands (step-10).
+# The refusal contract itself is asserted separately, not here.
+
+
+def _history_of(durations: dict[str, list[float]], **kwargs) -> HoldHistory:
+    """A :class:`HoldHistory` fed *durations* per module, in the order given."""
+    history = HoldHistory(**kwargs)
+    for module, values in durations.items():
+        for value in values:
+            history.record(module, value)
+    return history
+
+
+# --- record_span -----------------------------------------------------------
+
+
+def test_record_span_files_the_span_under_its_own_module():
+    history = HoldHistory(window=10, min_samples=3)
+
+    for start, end in ((0.0, 60.0), (100.0, 220.0), (400.0, 580.0)):
+        history.record_span(HoldSpan('T1', 'orchestrator/src', start, end))
+
+    # [60, 120, 180] -> median 120.0
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(120.0)
+    assert history.sample_count(['orchestrator/src']) == 3
+
+
+def test_record_span_counts_a_truncated_span():
+    """PARKING_MODEL_REPORT.md:102 — "the lock did block others until then".
+
+    A truncated span's end was IMPOSED, not fabricated, so its duration is a
+    real lower bound on a real hold.  Dropping it would bias the window toward
+    the short, tidy holds — exactly the ones least worth predicting.
+    """
+    history = HoldHistory(window=10, min_samples=3)
+
+    history.record_span(HoldSpan('T1', 'shared/src', 0.0, 10.0))
+    history.record_span(HoldSpan('T2', 'shared/src', 0.0, 20.0))
+    history.record_span(HoldSpan('T3', 'shared/src', 0.0, 900.0, truncated=True))
+
+    assert history.sample_count(['shared/src']) == 3
+    # [10, 20, 900] -> median 20.0.  Were the truncated span dropped, only two
+    # samples would remain and this would not be 20.0 at all.
+    assert history.predicted_hold(['shared/src']) == pytest.approx(20.0)
+
+
+def test_record_span_ignores_the_holding_task_identity():
+    """The window is per-MODULE: who held it is not part of the key."""
+    history = HoldHistory(window=10, min_samples=3)
+
+    history.record_span(HoldSpan('T1', 'shared/src', 0.0, 10.0))
+    history.record_span(HoldSpan('T2', 'shared/src', 0.0, 30.0))
+    history.record_span(HoldSpan('T3', 'shared/src', 0.0, 50.0))
+
+    assert history.sample_count(['shared/src']) == 3
+    assert history.predicted_hold(['shared/src']) == pytest.approx(30.0)
+
+
+# --- pooling across the modules named --------------------------------------
+
+
+def test_predicted_hold_pools_every_sample_from_every_module_named():
+    """Pooled median — NOT a median of per-module medians, nor the first module's.
+
+    The sample counts are deliberately lopsided (5 vs 3) so the three candidate
+    answers separate: pooled median 10.0, median-of-medians 55.0, first-module
+    median 10.0 but second-module median 100.0.  Only pooling gives 10.0 while
+    ALSO giving 100.0 for ['slow/src'] alone.
+    """
+    history = _history_of(
+        {'fast/src': [10.0] * 5, 'slow/src': [100.0] * 3},
+        window=10,
+        min_samples=3,
+    )
+
+    assert history.predicted_hold(['fast/src']) == pytest.approx(10.0)
+    assert history.predicted_hold(['slow/src']) == pytest.approx(100.0)
+
+    # pooled n=8: [10,10,10,10,10,100,100,100] -> (10+10)/2 = 10.0
+    pooled = history.predicted_hold(['fast/src', 'slow/src'])
+    assert pooled == pytest.approx(10.0)
+    assert pooled != pytest.approx(55.0), 'median-of-medians, not a pooled median'
+    assert history.sample_count(['fast/src', 'slow/src']) == 8
+
+
+def test_predicted_hold_is_order_independent_across_the_modules_named():
+    history = _history_of({'fast/src': [10.0] * 5, 'slow/src': [100.0] * 3})
+
+    assert history.predicted_hold(['slow/src', 'fast/src']) == pytest.approx(
+        history.predicted_hold(['fast/src', 'slow/src'])
+    )
+
+
+def test_predicted_hold_matches_the_canonical_traces_hand_computed_medians():
+    """End-to-end against the fixture oracle: spans in, hand-computed medians out."""
+    history = HoldHistory(window=10, min_samples=3)
+    for span in iter_hold_spans(F.build_trace()):
+        history.record_span(span)
+
+    for module, expected in F.EXPECTED_MEDIANS.items():
+        assert history.predicted_hold([module]) == pytest.approx(expected), module
+
+    assert history.predicted_hold(list(F.EXPECTED_MEDIANS)) == pytest.approx(
+        F.EXPECTED_POOLED_MEDIAN
+    )
+    assert history.sample_count(list(F.EXPECTED_MEDIANS)) == F.EXPECTED_SPAN_COUNT
+
+
+# --- the rolling window is real --------------------------------------------
+
+
+#: 15 durations: five long ones, then ten short ones.
+#: - last 10 -> [10..100], median (50+60)/2 = 55.0
+#: - all 15  -> median is the 8th of the sorted 15 = 80.0
+_FIFTEEN = [1000.0] * 5 + [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+
+
+def test_window_keeps_only_the_last_ten_samples():
+    """N=10 must be a real eviction, not a slice taken at read time.
+
+    55.0 (last ten) and 80.0 (all fifteen) are far apart precisely so this
+    cannot pass by accident.
+    """
+    history = _history_of({'churn/src': _FIFTEEN}, window=10, min_samples=3)
+
+    assert history.sample_count(['churn/src']) == 10
+    assert history.predicted_hold(['churn/src']) == pytest.approx(55.0)
+    assert history.predicted_hold(['churn/src']) != pytest.approx(80.0), 'window not enforced'
+
+
+def test_default_window_is_also_ten():
+    """The stock constructor must be bounded too — an unbounded default would
+    make the predictor answer from holds that stopped being representative
+    months ago (PARKING_MODEL_REPORT.md:116-126 measures the last-10 median)."""
+    history = _history_of({'churn/src': _FIFTEEN})
+
+    assert history.sample_count(['churn/src']) == 10
+    assert history.predicted_hold(['churn/src']) == pytest.approx(55.0)
+
+
+def test_each_module_gets_its_own_window():
+    """Overflow on one module must not evict another's samples."""
+    history = _history_of(
+        {'churn/src': _FIFTEEN, 'quiet/src': [7.0, 8.0, 9.0]},
+        window=10,
+        min_samples=3,
+    )
+
+    assert history.sample_count(['churn/src']) == 10
+    assert history.sample_count(['quiet/src']) == 3
+    assert history.sample_count(['churn/src', 'quiet/src']) == 13
+    assert history.predicted_hold(['quiet/src']) == pytest.approx(8.0)
+
+
+def test_window_size_is_configurable():
+    history = _history_of({'churn/src': _FIFTEEN}, window=3, min_samples=3)
+
+    assert history.sample_count(['churn/src']) == 3
+    # last three: [80, 90, 100] -> 90.0
+    assert history.predicted_hold(['churn/src']) == pytest.approx(90.0)
+
+
+def test_module_match_is_exact_not_prefix():
+    """Modules are depth-coarsened path prefixes already (``_get_modules``).
+
+    Matching 'orchestrator/src' against 'orchestrator/src/orchestrator' here
+    would pool holds from a key the lock layer treats as different.
+    """
+    history = _history_of(
+        {'orchestrator/src': [10.0, 20.0, 30.0], 'orchestrator/tests': [900.0] * 3},
+    )
+
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(20.0)
+    assert history.sample_count(['orchestrator/src']) == 3
+    assert history.sample_count(['orchestrator']) == 0
