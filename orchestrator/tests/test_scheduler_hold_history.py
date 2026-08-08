@@ -194,3 +194,123 @@ def test_the_guard_can_actually_find_emit_sites():
         tmp.unlink()
 
     assert [(line, fn) for _f, line, fn in found] == [(3, 'f')]
+
+
+# ===========================================================================
+# The two η-facing surfaces
+# ===========================================================================
+#
+# Task η consumes these to decide whether a backfill is worth the wait.  Both
+# must be able to say "no prediction" — η is required to refuse a backfill on
+# None rather than substitute a default, which it can only do if None is
+# reachable and distinguishable from a real 0.0.
+
+
+def _task(task_id: str, files: list[str]) -> dict:
+    return {
+        'id': task_id,
+        'title': f'Task {task_id}',
+        'status': 'pending',
+        'dependencies': [],
+        'metadata': {'files': files},
+    }
+
+
+def test_scheduler_predicted_hold_takes_a_TASK_and_resolves_its_modules():
+    """The argument is a task dict, not a module list.
+
+    Callers must not re-derive modules themselves: ``_get_modules`` applies the
+    lock_depth coarsening, the deterministic-task short-circuit and the
+    ``task-<id>`` fallback, and a caller that split paths its own way would key
+    the history on strings the lock layer never uses.
+    """
+    scheduler = _make_scheduler()
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    modules = scheduler._get_modules(task)
+    for duration in (100.0, 200.0, 300.0):
+        for module in modules:
+            scheduler._hold_history.record(module, duration)
+
+    assert scheduler.predicted_hold(task) == pytest.approx(200.0)
+
+
+def test_scheduler_predicted_hold_refuses_for_a_task_with_no_history():
+    scheduler = _make_scheduler()
+
+    assert scheduler.predicted_hold(_task('1', ['orchestrator/src'])) is None
+
+
+def test_scheduler_predicted_hold_refuses_below_min_samples():
+    """The refusal contract survives the delegation — it is not swallowed here."""
+    scheduler = _make_scheduler()
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    for module in scheduler._get_modules(task):
+        scheduler._hold_history.record(module, 100.0)
+
+    assert scheduler.predicted_hold(task) is None
+
+
+def test_scheduler_predicted_remaining_refuses_for_a_task_holding_nothing():
+    scheduler = _make_scheduler()
+
+    assert scheduler.predicted_remaining('1') is None
+
+
+def test_scheduler_predicted_remaining_uses_the_schedulers_own_wall_clock():
+    """No ``now`` argument: the surface reads the injectable wall clock.
+
+    A caller passing its own clock could pass a monotonic reading, which shares
+    no epoch with the acquire timestamps and would produce a nonsense remainder.
+    """
+    scheduler = _make_scheduler()
+    module = 'orchestrator/src'
+    for duration in (100.0, 200.0, 300.0):
+        scheduler._hold_history.record(module, duration)
+    # Acquired 50s before the scheduler's fixed wall clock.
+    scheduler._hold_history.observe_acquired(
+        '1', [module], at=FIXED_DT.timestamp() - 50.0
+    )
+
+    assert scheduler.predicted_remaining('1') == pytest.approx(150.0)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_then_release_lands_a_real_sample_in_the_history():
+    """The round trip, through the real dispatch path — the feed is LIVE.
+
+    Everything else here injects samples directly.  This is the only assertion
+    that the wiring actually fires on a real acquire and a real release, rather
+    than the history merely being seedable and hand-feedable.
+    """
+    from unittest.mock import AsyncMock
+
+    wall = [FIXED_DT]
+    config = OrchestratorConfig(max_per_module=1)
+    scheduler = Scheduler(config, wall_time_source=lambda: wall[0])
+    scheduler.finish_startup()
+
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    scheduler.get_tasks = AsyncMock(return_value=[task])
+    modules = scheduler._get_modules(task)
+    assert modules, 'the task must resolve to at least one module'
+
+    assigned = await scheduler.acquire_next()
+    assert assigned is not None and assigned.task_id == '1'
+    assert scheduler._hold_history.open_modules('1') == modules
+
+    wall[0] = datetime.fromtimestamp(FIXED_DT.timestamp() + 120.0, tz=UTC)
+    scheduler.release('1')
+
+    assert scheduler._hold_history.open_modules('1') == []
+    for module in modules:
+        assert scheduler._hold_history.sample_count([module]) == 1
+
+    # Read the landed sample's VALUE back exactly.  One real sample is below
+    # min_samples, so pad each module with one sample far below and one far
+    # above: that sandwiches the observed hold as the median, making the
+    # assertion an exact readout of it rather than of the padding.
+    for module in modules:
+        scheduler._hold_history.record(module, 0.0)
+        scheduler._hold_history.record(module, 10_000.0)
+
+    assert scheduler._hold_history.predicted_hold(modules) == pytest.approx(120.0)
