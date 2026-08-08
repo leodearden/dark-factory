@@ -100,15 +100,28 @@ correctly resolves it — in this order:
 `invalid_at` set on the stale edge. This is the house pattern and is already in live use. \
 `search` returns EDGES, not raw episode prose — a superseding edge is the annotation that \
 is actually RETRIEVABLE; an annotation buried in episode text is not.
-(b) **Episode text wrong ON ITS FACE** (a premature past-tense completion claim, a \
-corrupted or leaked fragment): use `mcp__fused-memory__redact_episode_content` ONLY for \
-this case. First call `get_episodes` and copy the episode's CURRENT content verbatim — \
-`new_content` REPLACES the stored text in full and the original is not recoverable; if \
-you cannot retrieve the full current text, do not redact. Annotate in place — e.g. \
-prefix a dated `[SUPERSEDED: ...]` marker — do not rewrite the surrounding narrative.
+(b) **Episode text wrong ON ITS FACE**: use `mcp__fused-memory__redact_episode_content` \
+ONLY for this case. In BOTH sub-cases below, first call `get_episodes` and copy the \
+episode's CURRENT content verbatim — `new_content` REPLACES the stored text in full and \
+the original is not recoverable; if you cannot retrieve the full current text, do not \
+redact. Leave the surrounding narrative untouched. The two sub-cases need DIFFERENT \
+edits, and confusing them gets your call refused:
+  - **Wrong claim** (a premature past-tense completion claim, a superseded assertion): \
+keep the text as-is and prefix a dated `[SUPERSEDED: ...]` marker. The wrong prose stays \
+readable as a record of what was believed at the time.
+  - **Corrupted or leaked fragment** (e.g. leaked serialized tool-call XML): you must \
+REPLACE the corrupted span ITSELF with a redaction marker such as \
+`[REDACTED: leaked tool-call fragment]`, not merely prefix a marker to the front. The \
+server re-runs its leak detector over your `new_content` and RAISES on a call that still \
+carries the fragment ("a redaction that re-introduces the leak is not a redaction"), so a \
+verbatim copy with a prefix added is rejected every time. A refusal here does NOT mean \
+you should fall through to (c) — it means your replacement text is not yet leak-free; \
+excise the fragment and retry.
 (c) **Last resort**: `mcp__fused-memory__delete_episode` — see the tool listing above \
 for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve the \
-problem.
+problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
+exists precisely to avoid the cascade, so a rejected redaction means fix the \
+`new_content` and retry (b), never escalate to (c).
 (d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
 `mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
 delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
