@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from escalation.queue import EscalationQueue
 
@@ -347,6 +348,12 @@ class TestArbitrationPendingReopenAtArm:
         """
         sink, rows = self._sink_with_conflict(tmp_path)
 
+        # ``Escalation.detail`` is declared ``str``, so ``None`` is deliberately
+        # OFF-CONTRACT here: it pins the sink's ``getattr(record, 'detail', None)
+        # or '{}'`` defensive arm, which exists for records rehydrated from a
+        # store that serialized ``detail`` as JSON ``null``.  Annotated ``Any``
+        # so the type checker permits the off-contract assignment.
+        bad_detail: Any
         for bad_detail in ('not json', None):
             rows[0].detail = bad_detail
             assert sink.arbitration_pending(
