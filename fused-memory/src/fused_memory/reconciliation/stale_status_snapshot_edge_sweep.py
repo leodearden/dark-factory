@@ -3,8 +3,9 @@
 Stage 1 (``MemoryConsolidator``) has no deterministic sweep that keeps VALID
 (``invalid_at IS NULL``) task-status-snapshot Graphiti edges in sync with the
 tasks they describe. A status-snapshot edge asserts that some task_id is
-currently active/pending/in-progress; once that task reaches a terminal
-status (done/cancelled), the edge is stale but nothing retires it. The prior
+currently active/pending/blocked/stalled/in-progress; once that task reaches
+a terminal status (done/cancelled), the edge is stale but nothing retires
+it. The prior
 approach — a manual LLM `search` sweep — was unreliable (run b1408864 found
 only 17 of an estimated 23+ stale edges). This module replaces it with a
 deterministic direct-lookup sweep, mirroring the deterministic-lookup-over-
@@ -101,6 +102,65 @@ Design decisions (captured in plan.json):
   the deliberate fail-safe direction — under-selection self-heals or is
   caught by Stage 2, whereas over-selection would wrongly retire true
   facts.
+- The genitive/possessive form "Task N's status is <marker>"
+  (GENITIVE_STATUS_RE) is now extracted. It is the canonical shape
+  Graphiti writes for a per-task status snapshot, yet every prior path
+  missed it structurally while the gate fired — the "matched the gate yet
+  went undetected" symptom. It needs neither the trailing noun-phrase
+  lookahead SNAPSHOT_STATUS_PHRASE_RE carries (requiring 'status' to be
+  IMMEDIATELY followed by the copula already excludes the "status report
+  is pending review" modifier-head reading) nor a _GAP_EXCLUDED_ALT
+  equivalent (its connective is closed-class, so negation and past-exit
+  qualifiers are refused for free — the same asymmetry recorded for the
+  individual form). (amendment, task 3079)
+- The plural enumeration form "Tasks A, B and C are <marker>"
+  (PLURAL_ENUM_SNAPSHOT_RE) is now extracted. Previously it yielded NONE
+  of the ids — not merely the first: TASK_REF_RE anchors '\\btask\\b' and
+  so does not match the plural head, and the enumeration tail carries no
+  reference token of its own. Its copula is mandatory (refusing the
+  transitive-verb reading), its enumeration requires 2+ ids (a plural
+  head over a lone digit is more likely a count than an id), and its
+  separator must absorb the Oxford comma — a single-token separator
+  alternation silently misses the real-world fact shape. Unlike the
+  aggregate path it applies no COUNT_QUANTITY_RE strip: its enumeration
+  alphabet admits no count noun, so the strip could never fire usefully,
+  while it WOULD misfire on the reference-token separator and drop a
+  legitimate leading id (see PLURAL_ENUM_SNAPSHOT_RE). (amendment, task
+  3079)
+- 'stalled' is now a recognized non-terminal marker, and — like
+  'blocked' — goes in ``_TRANSITIVE_MARKER_ALT`` rather than
+  ``_ADJECTIVE_MARKER_ALT``, because it is also a common transitive verb
+  ('Task 5 stalled the merge queue' is a permanently-true historical
+  fact). Discharging the standing marker-addition rule above found the
+  non-obvious consumer: ``COUNT_QUANTITY_RE`` is the only one of the four
+  that is NOT safe by default, since a marker missing from its count-noun
+  alternation turns '3 stalled others' into a spurious task id. The other
+  three are safe by construction (gate-only widening; 'in stalled status'
+  and 'Stalled tasks:' are both genuine status assertions).
+  ``INACTIVE_TASK_STATUSES`` stays ``{done, cancelled}``. (amendment,
+  task 3079)
+- ``_COMPOUND_PREFIX`` admits ONE optional hyphenated modifier before the
+  marker in the adjacency-anchored arms, so 'pairwise-stalled' anchors to
+  its copula. Bounded to a single token on purpose: '\\w+' cannot cross
+  whitespace, so it never becomes an open-class gap that would re-admit
+  the readings the mandatory-copula arms exist to exclude. (amendment,
+  task 3079)
+- Two hypotheses were investigated and RULED OUT; do not re-open them.
+  (1) Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs
+  ``MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL`` with
+  no entity-type, label, or episode filter, so the sweep demonstrably
+  SCANNED the missed edges and dropped them at extraction — reproduced
+  end-to-end against the branch base, which reported scanned=3 with
+  candidate_edges=0. Every gap here was lexical. (2) A shared blind spot
+  with ``task_count_verification``: that is not an edge sweep at all, but
+  the ``cross_verify_task_counts(tree, statuses)`` census-vs-tree
+  consistency dict (``task_filter``), whose remit is aggregate counts and
+  never per-task status edges — its 'healthy' report was correct, not
+  blind. (amendment, task 3079)
+- Known residual (task 3079): the genitive path requires the literal noun
+  'status', so "Task N's state is pending" is still not extracted — the
+  same deliberate fail-safe under-selection direction as the task-3042
+  residual above.
 """
 
 from __future__ import annotations
@@ -529,10 +589,10 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
 
 
 def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
-    """Return the task ids *fact* asserts as active/pending/blocked/in-progress.
+    """Return the task ids *fact* asserts as active/pending/blocked/stalled/in-progress.
 
     Returns the empty set (never a candidate for invalidation) when:
-    - *fact* contains no active/pending/blocked/in-progress status marker at
+    - *fact* contains no active/pending/blocked/stalled/in-progress status marker at
       all (e.g. 'Task 5 is done', 'Task 7 landed as merge commit'); or
     - *fact* is a pure count-only snapshot with no specific task-id
       reference (e.g. 'There are 8 tasks in progress', '1505 done / 148
@@ -703,7 +763,7 @@ async def sweep_stale_status_snapshot_edges(
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
     ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
-    each edge asserts as active/pending/blocked/in-progress, cross-references those
+    each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
     lookup, not semantic search), and invalidates
     (``memory_service.update_edge(..., invalid_at=...)``) every edge whose
