@@ -25,6 +25,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    same_module_siblings,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -1386,4 +1387,48 @@ class TestStartupGraceSecsReachesWatchdog:
             f'Expected startup_grace_secs=77.0 forwarded to invoke_with_cap_retry; '
             f'got {call_kwargs.get("startup_grace_secs")!r}. '
             'workflow._invoke must thread config.timeouts.startup_grace_secs end-to-end.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Contract: the same-module-sibling constructor is depth-invariant (task 3866)
+# ---------------------------------------------------------------------------
+
+
+class TestSameModuleSiblings:
+    """Pin `same_module_siblings`'s contract across every plausible lock_depth.
+
+    The premise "two DISTINCT files that share one lock module" is asserted as
+    a precondition by several tests in this repo.  Encoded as a fixed literal
+    (`a/b/c/d/{e,f}.py`) it silently dies once `lock_depth` exceeds the
+    literal's own depth — which is exactly how these tests went red when
+    `dark-factory-orchestrator.yaml` moved `lock_depth` 4 -> 12.  The
+    constructor derives the shared package prefix FROM the depth, so the
+    premise holds BY CONSTRUCTION; this test is what keeps that true.
+
+    Depths cover the operational value (12), the package-bundled default
+    (`defaults.yaml:7` = 4), the pydantic Field default (2), the degenerate
+    minimum (1), and a deeper future setting (20).
+    """
+
+    @pytest.mark.parametrize('lock_depth', [1, 2, 3, 4, 12, 20])
+    def test_siblings_are_distinct_files_in_one_module_at_any_depth(self, lock_depth: int):
+        f1, f2 = same_module_siblings(lock_depth)
+
+        assert f1 != f2, (
+            f'same_module_siblings({lock_depth}) returned identical paths {f1!r}; '
+            '"same module, DIFFERENT file" is unconstructible if the two paths '
+            'are the same string.'
+        )
+
+        modules = files_to_modules([f1, f2], lock_depth)
+        assert len(modules) == 1, (
+            f'Expected {f1!r} and {f2!r} to collapse to ONE module at '
+            f'lock_depth={lock_depth}; got {sorted(modules)!r}.'
+        )
+
+        assert files_to_modules([f1], lock_depth) == modules, (
+            f'Adding sibling {f2!r} must not widen the module set of {f1!r} at '
+            f'lock_depth={lock_depth} — that equality is the exact precondition '
+            'the same-module-widen tests assert.'
         )
