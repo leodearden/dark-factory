@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
@@ -530,5 +531,133 @@ class TestRepairResolutionErrors:
             assert after['_resume'] == {'resumed_at': '2026-07-26T04:00:00Z'}
             repaired = after['integrity_check']['items_flagged'][0]
             assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+        finally:
+            await journal.close()
+
+
+class TestRepairLiveRunRefusalAndDryRun:
+    """Closed runs only, and a dry-run that shares the applied path's answer."""
+
+    @pytest.mark.asyncio
+    async def test_running_status_is_refused(self, tmp_path):
+        """A run still in flight is refused before any lookup.
+
+        ``update_run_stage_reports`` rewrites the WHOLE blob, and the harness
+        calls it again at each stage boundary from its in-memory assembled
+        report — so a journal-side repair on a live run would be silently
+        clobbered at the next stage transition. A fix that appears to succeed
+        and then evaporates is worse than a clean refusal.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status='running',
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_completed_run_still_in_process_is_refused(self, tmp_path):
+        """A run the recon-report state still holds is live for this purpose.
+
+        The journal row can read 'completed' while the in-process entry is
+        still being written through, so ``live_run_ids`` (the caller's
+        ``ReconReportState._state`` view) is the second half of the guard.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                live_run_ids=frozenset({RUN_ID}),
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
+            # The live case is not a gap: within a live run _resolve_finding is
+            # already cross-stage, so the ordinary tools reach the finding.
+            assert 'cite_memory' in outcome['hint']
+            assert 'delete_finding' in outcome['hint']
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_matches_applied_outcome_without_writing(self, tmp_path):
+        """``apply=False`` answers exactly what ``apply=True`` would, and writes nothing."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            spy = AsyncMock(wraps=journal.update_run_stage_reports)
+            journal.update_run_stage_reports = spy
+
+            call = dict(
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+            dry = await citation_repair.repair_memory_citation(
+                journal, memory, apply=False, **call
+            )
+
+            assert dry['status'] == 'dry_run'
+            assert spy.await_count == 0
+            assert _dump(await journal.get_run(RUN_ID)) == before
+            # Both corroboration reads still happened — a dry-run that skipped
+            # them would tell the operator nothing about whether the gates hold.
+            assert [mid for _project, mid in memory.calls] == [DANGLING, SUCCESSOR]
+
+            applied = await citation_repair.repair_memory_citation(
+                journal, memory, apply=True, **call
+            )
+
+            assert applied['status'] == 'repaired'
+            assert spy.await_count == 1
+            # One code path: everything but the status verdict is identical.
+            assert {k: v for k, v in dry.items() if k != 'status'} == {
+                k: v for k, v in applied.items() if k != 'status'
+            }
         finally:
             await journal.close()
