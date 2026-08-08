@@ -950,3 +950,252 @@ class TestConfirmIsolatedRerunVerdictNeverRaises:
         assert s is not None
         assert isinstance(s, FlakeSuppression), s
         assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+
+
+# ---------------------------------------------------------------------------
+# S9: the `main_probe` policy — the SAME discriminator, different knobs.
+# ---------------------------------------------------------------------------
+
+#: A node-id owned by a SECOND subproject, so a two-group run can be built.
+OTHER_ID = 'fused-memory/tests/test_q.py::test_q'
+TWO_GROUP_TEST_OUTPUT = f'FAILED {FAILED_ID}\nFAILED {OTHER_ID}\n'
+
+
+class TestConfirmIsolatedRerunVerdictMainProbe:
+    """Same body, main_probe calibration: the BOUNDED 2-attempt engine, its own
+    timeout constant, its own log label, and the other-leg precondition."""
+
+    def _run(self, verify_module, config, module_configs, failing, worktree, **kw):
+        return asyncio.run(
+            verify_module.confirm_isolated_rerun_verdict(
+                worktree, config, module_configs, failing,
+                call_site='main_probe', **kw,
+            )
+        )
+
+    def test_clean_isolated_rerun_passes_in_isolation(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.call_site == FlakeCallSite.main_probe, s.call_site
+
+    def test_uses_the_bounded_two_attempt_engine(self, tmp_path: Path) -> None:
+        """The main probe retries; the merge gate does not. Asserted against
+        the CONSTANT so retuning the bound never silently passes here."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(False))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+        assert rv.await_count == verify_module._SWEEP_CONFIRM_MAX_ATTEMPTS, (
+            f'The main probe uses the BOUNDED multi-attempt engine, not the '
+            f'merge gate single shot; got {rv.await_count} awaits'
+        )
+
+    def test_isolated_command_uses_the_main_probe_timeout_constant(
+        self, tmp_path: Path,
+    ) -> None:
+        """A constant SEPARATE from the merge gate's BY DESIGN — asserted
+        against the constant, not the literal 300, so retuning one can never
+        silently retune the other."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        called_mc = rv.call_args.args[2]
+        assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+        assert '-o addopts=' in called_mc.test_command, called_mc.test_command
+        assert (
+            f'--timeout {verify_module._MAIN_PROBE_CONFIRM_TIMEOUT_SECS}'
+            in called_mc.test_command
+        ), called_mc.test_command
+        assert called_mc.lint_command is None, called_mc.lint_command
+        assert called_mc.type_check_command is None, called_mc.type_check_command
+
+    def test_run_verification_called_with_exactly_three_positionals(
+        self, tmp_path: Path,
+    ) -> None:
+        """No role / is_merge_verify kwargs — the main probe runs at
+        run_verification's own defaults. The sync side_effect would TypeError
+        on a fourth positional; this mirrors the existing suite's fake and is
+        the load-bearing shape pin."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        seen: list[dict] = []
+
+        def _fake_run_verification(worktree, config, module_config, **kwargs):
+            seen.append(kwargs)
+            return _result(True)
+
+        rv = AsyncMock(side_effect=_fake_run_verification)
+        with patch.object(verify_module, 'run_verification', rv):
+            self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert len(rv.call_args.args) == 3, rv.call_args.args
+        assert rv.call_args.args[0] is tmp_path, rv.call_args.args[0]
+        assert seen == [{'max_retries': 0}], seen
+
+    def test_non_empty_lint_output_bails_as_other_leg_failed(
+        self, tmp_path: Path,
+    ) -> None:
+        """_summarize_checks/_worst_category picks ONE category across up to
+        three legs, so a matched signature does not prove the lint leg was
+        clean. Bails BEFORE any work."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(lint_output='E501 line too long\n'), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == 'other_leg_failed', s.unconfirmable_reason
+        assert s.test_ids == (), s.test_ids
+        rv.assert_not_awaited()
+
+    def test_non_empty_type_output_bails_as_other_leg_failed(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(type_output='error: incompatible type\n'), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == 'other_leg_failed', s.unconfirmable_reason
+        rv.assert_not_awaited()
+
+    def test_the_precondition_is_policy_scoped_not_global(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE asymmetry test: the SAME failing result with non-empty
+        lint_output bails under main_probe and does NOT under merge_gate. The
+        merge gate has no such bail today, PRD §3 does not ask for one, and
+        adding it would newly refuse to suppress merges carrying any lint
+        output."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        failing = _failing_result(lint_output='E501 line too long\n')
+
+        with patch.object(
+            verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+        ):
+            probe = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                failing, tmp_path,
+            )
+            merge = asyncio.run(
+                verify_module.confirm_isolated_rerun_verdict(
+                    tmp_path, config, [_module_config('orchestrator')], failing,
+                    call_site='merge_gate',
+                )
+            )
+
+        assert probe.verdict is FlakeVerdict.unconfirmable, probe.verdict
+        assert probe.unconfirmable_reason == 'other_leg_failed', probe
+        assert merge.verdict is FlakeVerdict.passes_in_isolation, merge.verdict
+
+    def test_grouping_helper_receives_the_main_probe_log_label(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        spy = MagicMock(return_value={'orchestrator': [FAILED_ID]})
+
+        with (
+            patch.object(
+                verify_module, 'run_verification', AsyncMock(return_value=_result(True)),
+            ),
+            patch.object(verify_module, '_group_node_ids_by_subproject', spy),
+        ):
+            self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert spy.call_count == 1, spy.call_args_list
+        assert spy.call_args.kwargs['log_label'] == (
+            'verify_failure_is_preexisting_on_main confirm gate'
+        ), spy.call_args.kwargs
+
+    def test_second_group_still_failing_yields_fails_in_isolation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two subprojects: the first confirms, the second does not — ALL
+        groups must confirm green, and both node-ids are re-run."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(
+            tmp_path,
+            'orchestrator/tests/test_x.py',
+            'fused-memory/tests/test_q.py',
+        )
+        config = _make_config(tmp_path)
+        rv = AsyncMock(side_effect=[_result(True), _result(False), _result(False)])
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config,
+                [_module_config('orchestrator'), _module_config('fused-memory')],
+                _failing_result(TWO_GROUP_TEST_OUTPUT), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+        commands = [c.args[2].test_command for c in rv.await_args_list]
+        assert any(FAILED_ID in cmd for cmd in commands), commands
+        assert any(OTHER_ID in cmd for cmd in commands), commands
