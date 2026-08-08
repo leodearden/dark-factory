@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from dashboard.data.burndown import (
     collect_snapshot,
     compute_window_completion,
     downsample,
+    ensure_snapshot_columns,
     get_burndown_projects,
     get_burndown_series,
 )
@@ -396,6 +398,161 @@ class TestCountZones:
         legacy = _count_statuses({t['id']: t['status'] for t in tasks})
 
         assert {k: zones[k] for k in legacy} == legacy
+
+
+# ---------------------------------------------------------------------------
+# Schema + additive migration for the split / cap columns (task 3543)
+# ---------------------------------------------------------------------------
+
+# The pre-3543 DDL, verbatim. Every already-deployed burndown.db is on this
+# shape, and BURNDOWN_SCHEMA is applied with CREATE TABLE IF NOT EXISTS, so
+# editing the DDL string alone would never reach them.
+_LEGACY_BURNDOWN_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT    NOT NULL,
+    ts          TEXT    NOT NULL,
+    pending     INTEGER NOT NULL DEFAULT 0,
+    in_progress INTEGER NOT NULL DEFAULT 0,
+    blocked     INTEGER NOT NULL DEFAULT 0,
+    deferred    INTEGER NOT NULL DEFAULT 0,
+    cancelled   INTEGER NOT NULL DEFAULT 0,
+    done        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
+"""
+
+_NEW_SNAPSHOT_COLUMNS = ('in_progress_live', 'in_progress_stranded', 'concurrency_cap')
+
+
+def _legacy_burndown_db(path: Path) -> None:
+    """Create a pre-3543 burndown DB carrying one legacy snapshot row."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_LEGACY_BURNDOWN_SCHEMA)
+    conn.execute(
+        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, '
+        'deferred, cancelled, done) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ('legacy', '2026-01-01T00:00:00+00:00', 5, 3, 1, 0, 0, 20),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _columns(path: Path) -> set[str]:
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[1] for r in conn.execute('PRAGMA table_info(snapshots)')}
+    finally:
+        conn.close()
+
+
+class TestSnapshotSchemaColumns:
+    def test_schema_declares_the_split_columns_not_null_default_zero(self):
+        for col in ('in_progress_live', 'in_progress_stranded'):
+            assert re.search(
+                rf'{col}\s+INTEGER\s+NOT NULL\s+DEFAULT 0', BURNDOWN_SCHEMA
+            ), f'{col} missing or not NOT NULL DEFAULT 0 in BURNDOWN_SCHEMA'
+
+    def test_schema_declares_concurrency_cap_nullable(self):
+        """NULL is the honest "cap unknown" value — never 0, which would read as
+        a cap of zero and alarm on every snapshot."""
+        match = re.search(r'concurrency_cap\s+INTEGER([^,\n]*)', BURNDOWN_SCHEMA)
+        assert match is not None, 'concurrency_cap missing from BURNDOWN_SCHEMA'
+        assert 'NOT NULL' not in match.group(1).upper()
+
+    def test_fresh_db_is_already_at_the_new_shape(self, tmp_path):
+        db = tmp_path / 'fresh.db'
+        _create_burndown_db(db)
+
+        assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+
+_NEW_SNAPSHOT_COLUMNS_SET = set(_NEW_SNAPSHOT_COLUMNS)
+
+
+class TestEnsureSnapshotColumns:
+    """``ensure_snapshot_columns(conn)`` — the additive ALTER TABLE migration.
+
+    Mandatory, not cosmetic: BURNDOWN_SCHEMA is applied with CREATE TABLE IF
+    NOT EXISTS, so a live burndown.db never gains the new columns from the DDL
+    edit alone and the widened INSERT would fail on the first collection cycle
+    after deploy — on exactly the machines holding the history this task exists
+    to make legible.
+    """
+
+    async def test_adds_the_three_columns_to_a_legacy_db(self, tmp_path):
+        db = tmp_path / 'legacy.db'
+        _legacy_burndown_db(db)
+        assert not (_NEW_SNAPSHOT_COLUMNS_SET & _columns(db))
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_legacy_rows_survive_with_zero_zero_null(self, tmp_path):
+        db = tmp_path / 'legacy.db'
+        _legacy_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            cur = await conn.execute(
+                'SELECT done, in_progress, in_progress_live, in_progress_stranded, '
+                'concurrency_cap FROM snapshots WHERE project_id = ?',
+                ('legacy',),
+            )
+            row = await cur.fetchone()
+
+        assert row is not None
+        assert row[0] == 20  # pre-existing data untouched
+        assert row[1] == 3
+        assert row[2] == 0
+        assert row[3] == 0
+        assert row[4] is None  # cap genuinely unknown for a historical row
+
+    async def test_is_idempotent(self, tmp_path):
+        db = tmp_path / 'legacy.db'
+        _legacy_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+            await ensure_snapshot_columns(conn)  # must not raise
+            await conn.commit()
+
+        assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_is_a_noop_on_a_fresh_db(self, tmp_path):
+        db = tmp_path / 'fresh.db'
+        _create_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.commit()
+
+        assert _columns(db) >= _NEW_SNAPSHOT_COLUMNS_SET
+
+    async def test_widened_insert_succeeds_after_migration(self, tmp_path):
+        db = tmp_path / 'legacy.db'
+        _legacy_burndown_db(db)
+
+        async with aiosqlite.connect(str(db)) as conn:
+            await ensure_snapshot_columns(conn)
+            await conn.execute(
+                _INSERT_SNAPSHOT_SQL,
+                ('p', '2026-08-08T12:00:00+00:00', 1, 4, 2, 0, 0, 9, 3, 1, 24),
+            )
+            await conn.commit()
+            cur = await conn.execute(
+                'SELECT in_progress, in_progress_live, in_progress_stranded, '
+                'concurrency_cap FROM snapshots WHERE project_id = ?',
+                ('p',),
+            )
+            row = await cur.fetchone()
+
+        assert row == (4, 3, 1, 24)
 
 
 # ---------------------------------------------------------------------------
