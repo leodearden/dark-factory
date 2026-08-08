@@ -171,7 +171,7 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 | Project | Family |
 |---|---|
-| dark-factory | INV-1..8 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication`, `status-matches-liveness`, `holds-owned-and-bounded`, `loop-thread-occupancy-bounded` (the doc is normative — walk whatever it contains, this row is illustrative) |
+| dark-factory | `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication`, `status-matches-liveness`, `holds-owned-and-bounded`, `loop-thread-occupancy-bounded` (the doc is normative — walk whatever it contains, this row is illustrative) |
 | reify | INV-SF-1..6 (silent-failure) — `undef-has-provenance`, `error-severity-exits-nonzero`, `declared-intent-consumed-or-diagnosed`, `indeterminate-attributable-transient`, `placeholders-owned-and-loud`, `diagnostics-carry-codes` |
 
 **If the project has no such file** — most targets don't — G7 is **advisory, not blocking**: screen the batch against the dark-factory trigger shapes below, record any hit in the decomposition record, and do not block on a list the project never adopted. Note the fallback explicitly rather than skipping G7 silently.
