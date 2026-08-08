@@ -699,6 +699,62 @@ class TestDiskFullArchivesForHumanTriage:
         assert verify._should_archive_category('disk_full') is True
 
 
+class TestPytestInternalerrorArchivesForHumanTriage:
+    """task 3683: PYTEST_INTERNALERROR must archive its verify log.
+
+    This class exists to REBUT the rationale previously pinned in
+    ``test_verify.py::TestShouldArchiveCategory`` — "The sweep already retries
+    on this category (returns None sentinel); archiving it would create
+    spurious human-triage artifacts for transient crashes." That is true of
+    exactly ONE arm: the FIRST-PASS main-tip sweep (verify.py:7062/:7141),
+    which returns a ``None`` sentinel, retries next tick indefinitely and never
+    escalates. It is the only fail-OPEN consumer, and it is an ADDITIONAL path,
+    not an exemption from the three that terminate in front of a human:
+
+      * workflow.py:9020 — retries any infra-transient VerifyResult for
+        ``config.verify_infra_retry_max_attempts`` (default 5) attempts, then
+        stamps ``escalate_to_human=True`` / ``category='infra_issue'``
+        (:9060-9067), which short-circuits the steward L0 at :14436 and files
+        ``Escalation(severity='blocking', level=1)`` at :14791.
+      * merge_queue.py:2761/:3134 — post-merge verify, bounded retry budget,
+        then a TRANSIENT_INFRA_REASON_PREFIX blocked outcome →
+        workflow.py:10305 → the same blocking L1.
+      * verify.py:7255 — the isolated-confirm gate, where an infra-transient
+        hit CONSUMES one of ``_SWEEP_CONFIRM_MAX_ATTEMPTS = 2``; two of them
+        convert the result into a blocking red-main L1 at harness.py:11325.
+
+    Each of those tests flat ``in INFRA_TRANSIENT_CATEGORIES`` membership with
+    no per-category branch, so PYTEST_INTERNALERROR cannot be structurally
+    exempt from any of them. "Spurious artifacts for transient crashes" is the
+    cost; a human holding a blocking infra_issue with nothing but a truncated
+    ``failure_report()`` is what archive=False bought instead. Archive growth
+    is bounded independently by ``_prune_archive``'s retention.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:237), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.PYTEST_INTERNALERROR].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.PYTEST_INTERNALERROR not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('pytest_internalerror') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('pytest_internalerror') is True
+
+
 class TestEnvironmentalCategoriesOutrankCodeFaults:
     """_worst_category must pick the infra root cause over a co-occurring
     downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
