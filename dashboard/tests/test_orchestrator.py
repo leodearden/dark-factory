@@ -816,3 +816,285 @@ class TestDiscoverOrchestratorsOfflineMarker:
         # Summary should be all-zero (no tasks)
         s = entry.get('summary', {})
         assert s.get('total', -1) == 0
+
+
+class TestReadMaxConcurrentTasks:
+    """Tests for ``read_max_concurrent_tasks`` — the parity alarm's denominator.
+
+    ``max_concurrent_tasks`` is a top-level key of the orchestrator config and
+    is green-tier hot-reloadable (CLAUDE.md), i.e. TIME-VARYING.  The burndown
+    collector therefore reads it once per snapshot so each historical row is
+    paired with the cap that was in force at THAT instant; comparing a past
+    in-progress census against today's cap would mislabel both directions.
+
+    The contract mirrors this module's ``_read_project_root_from_config``
+    sibling: ``yaml.safe_load``, never raise, return ``None`` for anything
+    unexpected.  ``None`` means "unknown", which the read side must never
+    conflate with "not breaching".
+    """
+
+    LOGGER = 'dashboard.data.orchestrator'
+
+    @staticmethod
+    def _write(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    # ---- happy paths -------------------------------------------------
+
+    def test_canonical_config_yields_cap(self, tmp_path):
+        """The canonical CLAUDE.md filename is what discovery keys on first."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 24\n')
+
+        assert read_max_concurrent_tasks(tmp_path) == 24
+
+    def test_accepts_str_project_root(self, tmp_path):
+        """Callers hold roots as Path, but a str must not blow up."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 8\n')
+
+        assert read_max_concurrent_tasks(str(tmp_path)) == 8
+
+    def test_ignores_unrelated_top_level_keys(self, tmp_path):
+        """A real config carries many keys; only max_concurrent_tasks is read."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(
+            tmp_path / 'dark-factory-orchestrator.yaml',
+            'project_root: /home/leo/src/dark-factory\n'
+            'max_concurrent_tasks: 24\n'
+            'escalation:\n'
+            '  port: 9101\n',
+        )
+
+        assert read_max_concurrent_tasks(tmp_path) == 24
+
+    def test_zero_cap_is_a_real_value_not_unknown(self, tmp_path):
+        """A cap of 0 ("dispatch nothing") is a legal config and is preserved.
+
+        Deliberate boundary: 0 is NOT coerced to None.  With tasks still
+        in-progress against a 0 cap the parity alarm SHOULD fire, and
+        returning None would report that genuine breach as "unknown".
+        Only *negative* caps are nonsense and rejected (see below).
+        """
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 0\n')
+
+        assert read_max_concurrent_tasks(tmp_path) == 0
+
+    # ---- legacy-spelling precedence ----------------------------------
+
+    @pytest.mark.parametrize(
+        'legacy_name',
+        ['orchestrator.yaml', 'orchestrator-config.yaml', 'orchestrator/config.yaml'],
+    )
+    def test_legacy_spellings_honoured_as_fallback(self, tmp_path, legacy_name):
+        """Each legacy spelling from config._LEGACY_CONFIG_NAMES still resolves."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / legacy_name, 'max_concurrent_tasks: 12\n')
+
+        assert read_max_concurrent_tasks(tmp_path) == 12
+
+    def test_legacy_precedence_order_is_first_match_wins(self, tmp_path):
+        """The documented order is orchestrator.yaml, then -config, then subdir."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 11\n')
+        self._write(tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 22\n')
+        self._write(tmp_path / 'orchestrator/config.yaml', 'max_concurrent_tasks: 33\n')
+
+        assert read_max_concurrent_tasks(tmp_path) == 11
+
+    def test_canonical_beats_legacy(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 24\n')
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n')
+
+        assert read_max_concurrent_tasks(tmp_path) == 24
+
+    def test_present_canonical_is_authoritative_even_without_the_key(self, tmp_path):
+        """A present-but-capless canonical config must NOT be masked by a legacy file.
+
+        Same rule config._discover_root_escalation_url documents: once the
+        canonical file exists on disk it is authoritative, so a stale legacy
+        spelling can never silently supply a cap the live config dropped.
+        """
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'project_root: /somewhere\n')
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 99\n')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    # ---- ${VAR:default} expansion ------------------------------------
+
+    def test_env_var_default_expanded_before_int_coercion(self, tmp_path, monkeypatch):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        monkeypatch.delenv('DF_TEST_MAX_TASKS', raising=False)
+        self._write(
+            tmp_path / 'dark-factory-orchestrator.yaml',
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n',
+        )
+
+        assert read_max_concurrent_tasks(tmp_path) == 24
+
+    def test_env_var_value_overrides_default(self, tmp_path, monkeypatch):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        monkeypatch.setenv('DF_TEST_MAX_TASKS', '6')
+        self._write(
+            tmp_path / 'dark-factory-orchestrator.yaml',
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS:24}"\n',
+        )
+
+        assert read_max_concurrent_tasks(tmp_path) == 6
+
+    def test_unset_env_var_with_no_default_is_unknown(self, tmp_path, monkeypatch, caplog):
+        """``${VAR}`` with VAR unset expands to '' — unknown, not 0."""
+        import logging
+
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        monkeypatch.delenv('DF_TEST_MAX_TASKS', raising=False)
+        self._write(
+            tmp_path / 'dark-factory-orchestrator.yaml',
+            'max_concurrent_tasks: "${DF_TEST_MAX_TASKS}"\n',
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            assert read_max_concurrent_tasks(tmp_path) is None
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            'an unusable cap value must be logged, not dropped silently'
+        )
+
+    # ---- unknown / unusable -> None ----------------------------------
+
+    def test_missing_config_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    def test_missing_project_root_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        assert read_max_concurrent_tasks(tmp_path / 'no-such-root') is None
+
+    def test_unparseable_yaml_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: [unclosed\n')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    def test_non_dict_top_level_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', '- a\n- b\n')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    def test_empty_file_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', '')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    def test_key_absent_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'project_root: /somewhere\n')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    def test_null_value_is_none(self, tmp_path):
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks:\n')
+
+        assert read_max_concurrent_tasks(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        ('label', 'yaml_value'),
+        [
+            ('non-numeric string', 'lots'),
+            ('float', '2.5'),
+            ('list', '[1, 2]'),
+            ('mapping', '{a: 1}'),
+            ('negative', '-1'),
+            ('bool true', 'true'),
+            ('bool false', 'false'),
+        ],
+    )
+    def test_unusable_value_is_none_with_warning(self, tmp_path, caplog, label, yaml_value):
+        """A malformed cap is 'unknown' + a WARNING — never a silent 0 or True.
+
+        ``bool`` matters specifically: it is an ``int`` subclass, so a bare
+        ``isinstance(value, int)`` check would let ``true`` through as a
+        cap of 1 and alarm on every snapshot.
+        """
+        import logging
+
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(
+            tmp_path / 'dark-factory-orchestrator.yaml',
+            f'max_concurrent_tasks: {yaml_value}\n',
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = read_max_concurrent_tasks(tmp_path)
+
+        assert result is None, f'{label} must not be accepted as a cap (got {result!r})'
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, f'{label} must emit a WARNING naming the bad value'
+
+    def test_numeric_string_is_accepted(self, tmp_path):
+        """A quoted YAML scalar is how ``${VAR:default}`` configs spell an int."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        self._write(tmp_path / 'dark-factory-orchestrator.yaml', "max_concurrent_tasks: '24'\n")
+
+        assert read_max_concurrent_tasks(tmp_path) == 24
+
+    # ---- never raises ------------------------------------------------
+
+    def test_never_raises_for_any_hostile_input(self, tmp_path):
+        """Sweep: the reader is called from the collector loop and must not raise.
+
+        A raise here would take down a burndown collection cycle for every
+        project, which is strictly worse than an unknown cap.
+        """
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        cases = [
+            'max_concurrent_tasks: [unclosed\n',
+            '\t\tbad indent\n',
+            '- not\n- a mapping\n',
+            'max_concurrent_tasks: !!python/object:os.system {}\n',
+            'max_concurrent_tasks: 999999999999999999999999\n',
+            '\x00\x01binary garbage\n',
+        ]
+        for text in cases:
+            root = tmp_path / f'case{cases.index(text)}'
+            self._write(root / 'dark-factory-orchestrator.yaml', text)
+            result = read_max_concurrent_tasks(root)
+            assert result is None or isinstance(result, int)
+
+    def test_config_path_is_a_directory_does_not_raise(self, tmp_path):
+        """``dark-factory-orchestrator.yaml`` existing as a DIRECTORY is not a crash."""
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        (tmp_path / 'dark-factory-orchestrator.yaml').mkdir()
+        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 7\n')
+
+        # The canonical name is not a readable FILE, so resolution falls through
+        # to the legacy spelling rather than exploding on IsADirectoryError.
+        assert read_max_concurrent_tasks(tmp_path) == 7
