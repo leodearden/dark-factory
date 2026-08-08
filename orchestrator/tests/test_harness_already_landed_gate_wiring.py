@@ -22,12 +22,14 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from escalation.models import Escalation
 from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.harness import Harness
@@ -122,19 +124,6 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
     trips exactly one guard — the gate must return False and must NOT
     call _mark_in_progress_done.
     """
-
-    async def test_open_l1_vetoes_flip(self, mock_orch_config) -> None:
-        """An open L1 escalation is a deliberate human handoff — never
-        second-guessed, even though is_ancestor is True.
-        """
-        h = _wired_ancestry_harness(mock_orch_config)
-        h._escalation_queue = MagicMock()
-        h._escalation_queue.has_open_l1 = MagicMock(return_value=True)
-
-        result = await h._already_landed_dispatch_gate('42')
-
-        assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
     async def test_degenerate_branch_vetoes_flip(self, mock_orch_config) -> None:
         """A degenerate branch (tip == branch_base_sha) carries zero task
@@ -364,6 +353,171 @@ class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
+def _open_escalation(
+    esc_id: str, *, level: int, severity: str = 'blocking',
+) -> Escalation:
+    """A pending escalation row as ``get_by_task(tid, status='pending')`` yields.
+
+    ``filing_claimant_run_id`` is left at its default ``None`` (the shape every
+    legacy row and most current producers carry) — irrelevant for L1/L2, and
+    for L0 the gate passes ``live_claimant=False``, which classifies
+    ``dead_l0`` identity-independently.
+    """
+    return Escalation(
+        id=esc_id,
+        task_id='42',
+        agent_role='implementer',
+        severity=severity,
+        category='design_concern',
+        summary='an open handoff on task 42',
+        level=level,
+    )
+
+
+def _queue_with_open(*records: Escalation) -> MagicMock:
+    """An escalation queue whose ANY-LEVEL pending read yields *records*.
+
+    ``has_open_l1`` is pinned False on purpose: after task 3534 the gate's veto
+    no longer consults the L1-only read at all, so a sub-case that vetoes here
+    proves it went through ``get_by_task(..., status='pending')``.  The stub
+    stays because ``landing_evidence._file_unattributed_landing_escalation``
+    still consumes ``has_open_l1`` for escalation dedup.
+    """
+    queue = MagicMock()
+    queue.has_open_l1 = MagicMock(return_value=False)
+    queue.get_by_task = MagicMock(return_value=list(records))
+    queue.make_id = MagicMock(return_value='esc-42-1')
+    return queue
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateAnyLevelVeto:
+    """The escalation veto is ANY-LEVEL, not L1-only (task 3534 / PRD eta-0).
+
+    Spec ``docs/task-escalation-state-spec.md`` E8: the gate's veto read was
+    ``has_open_l1(task_id)``, which silently missed an L2-only (or L0-only)
+    open escalation while its own docstring claimed parity with
+    ``_reconcile_one_stranded``, which went any-level in W10.  The veto now
+    asks the shared ``escalation.pins.classify_pins(...).vetoes_done_flip``
+    predicate over the same ``get_by_task(tid, status='pending')`` rows the
+    resolver's row (f) reads.
+
+    Every sub-case starts from an otherwise-flipping ancestry setup and
+    overrides only ``_escalation_queue``.
+    """
+
+    async def test_open_l2_only_vetoes_flip(self, mock_orch_config) -> None:
+        """PRD boundary row #10: an L2-ONLY open escalation must veto the
+        auto-done flip.  This is the exact record the old L1-only read missed.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_with(
+            '42', status='pending',
+        )
+
+    async def test_open_l0_only_vetoes_flip(self, mock_orch_config) -> None:
+        """An L0-ONLY open escalation also vetoes the flip.
+
+        Under ``live_claimant=False`` it classifies ``dead_l0`` — which does
+        NOT pin recovery (spec S4) but DOES veto a done-flip (PRD D3: "any
+        non-info open record still vetoes MARK_DONE").  Pins the liveness-
+        independence this call site relies on: both ``dead_l0`` and
+        ``queue_handoff`` set ``vetoes_done_flip``, so the gate never has to
+        resolve the task's live claimant.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-3', level=0),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_open_l1_still_vetoes_flip(self, mock_orch_config) -> None:
+        """An open L1 escalation is a deliberate handoff — never second-guessed,
+        even though is_ancestor is True.  Migrated off the ``has_open_l1``
+        stub (dead wiring once the gate stops reading it) onto the any-level
+        pending read, so "existing L1 behaviour unchanged" stays verified.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-7', level=1),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_veto_logs_the_pinning_escalation_ids(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """The veto is LOUD: it names the task and the pinning escalation ids.
+
+        The "not silently" half of boundary row #10 — a task that stops
+        auto-flipping must say which record pinned it.  (Task beta/3535
+        replaces this log line with the structured ``recovery_vetoed``
+        emission plus streak dedup.)
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness'
+        ]
+        assert any('esc-42-9' in m and '42' in m for m in messages), messages
+
+    async def test_info_severity_only_does_not_veto(
+        self, mock_orch_config,
+    ) -> None:
+        """PRD D3 / boundary row #8: an ``info``-severity record NEVER pins.
+
+        Guards the choice of predicate rather than the change itself: green
+        both before and after, but RED against a naive ``bool(pending_rows)``
+        veto — under which a genuinely-landed task carrying one
+        ``escalate_info`` annotation would never auto-flip and would
+        re-dispatch every tick forever.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-5', level=0, severity='info'),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+    async def test_no_open_records_flips_as_today(self, mock_orch_config) -> None:
+        """A read that succeeded and found nothing is not a veto — the flip
+        happens exactly as it does today.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open()
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
 ) -> Harness:
@@ -379,6 +533,11 @@ def _wired_marker_harness(
     landing) and ``_escalation_queue`` is a wired MagicMock with
     ``has_open_l1`` defaulting False — callers flip either to exercise the
     CANDIDATE-mode reject-and-escalate path (task 2678).
+
+    ``get_by_task`` returns ``[]`` EXPLICITLY (task 3534): the gate's veto now
+    reads the any-level pending rows, and leaving that to
+    ``MagicMock.__iter__``'s empty default would make "no open escalations"
+    an accident of the mock rather than a stated precondition.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -406,6 +565,7 @@ def _wired_marker_harness(
     h._mark_in_progress_done = AsyncMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
@@ -487,9 +647,11 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
-        # has_open_l1 is also consulted by the gate's pre-existing top-of-
-        # method open-L1 veto (unrelated to this dedup check) — assert the
-        # dedup call happened (most recent call), not an exact call count.
+        # Since task 3534 the gate's own veto reads get_by_task(..., pending)
+        # instead of has_open_l1, so the escalation helper's dedup check is
+        # the ONLY has_open_l1 caller left — but assert on the most recent
+        # call rather than an exact count, so a future dedup site added
+        # elsewhere in the path doesn't turn this into a brittle failure.
         cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
         cast(MagicMock, h._escalation_queue).submit.assert_called_once()
         esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
@@ -573,6 +735,7 @@ def _wired_content_harness(
     h._mark_in_progress_done = AsyncMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
