@@ -40,6 +40,11 @@ from typing import Any
 
 from fused_memory.models.reconciliation import StageReport
 
+# Imported, not re-declared: ``recon_report._UUID_RE`` and
+# ``citation_verifier._CANONICAL_UUID_RE`` already exist, and a third copy of the
+# same gate is exactly the lockstep duplication INV-5 forbids.
+from fused_memory.reconciliation.citation_verifier import is_concrete_memory_id
+
 logger = logging.getLogger(__name__)
 
 __all__ = ['build_citation_repair_record', 'repair_memory_citation']
@@ -235,10 +240,62 @@ async def repair_memory_citation(
     the MCP tool traverse one code path (INV-5) and a dry-run tells the operator
     whether the gates pass before anything is written.
     """
+    # ── Shape gates (no I/O; cheapest refusals first) ─────────────────────
+    for role, candidate in (
+        ('memory_id', memory_id),
+        ('replacement_memory_id', replacement_memory_id),
+    ):
+        if candidate is None:
+            continue  # drop-only repair: no replacement to shape-check
+        if not is_concrete_memory_id(candidate):
+            return _ERR_INVALID_UUID_SHAPE | {
+                'field': role,
+                'value': candidate,
+                'hint': (
+                    'must be a canonical 36-char UUID; a truncated prefix is '
+                    'not an id, and looking one up would return not-found and '
+                    'read as a confirmed-absent citation.'
+                ),
+            }
+
+    if store != SUPPORTED_STORE:
+        return _ERR_UNSUPPORTED_STORE | {
+            'store': store,
+            'hint': (
+                f'only store={SUPPORTED_STORE!r} can be repaired: corroboration '
+                'goes through get_memory_by_id, a Mem0/Qdrant point read, which '
+                'returns not-found for every graphiti id and would therefore '
+                'classify valid graph provenance as dangling. Verifying a graph '
+                'citation needs a different primitive (get_edge / '
+                'get_entity_by_uuid).'
+            ),
+        }
+
+    # ── Resolution gates ──────────────────────────────────────────────────
     run = await journal.get_run(target_run_id)
+    if run is None:
+        return _ERR_TARGET_RUN_NOT_FOUND | {'target_run_id': target_run_id}
 
     located = _find_finding(run, finding_id)
+    if located is None:
+        return _ERR_FINDING_UNKNOWN | {
+            'target_run_id': target_run_id,
+            'finding_id': finding_id,
+        }
     stage_name, _report, finding = located
+
+    if not any(
+        _is_citation_of(entry, memory_id)
+        for entry in finding.get('cited_memories') or []
+    ):
+        # Also the idempotency verdict: a second identical repair lands here
+        # rather than appending a further provenance record.
+        return _ERR_CITATION_NOT_PRESENT | {
+            'target_run_id': target_run_id,
+            'stage': stage_name,
+            'finding_id': finding_id,
+            'memory_id': memory_id,
+        }
 
     # ── Corroboration (INV-3: corroborate before acting) ──────────────────
     # Ordered so NO journal write can happen unless every gate passes. Both
