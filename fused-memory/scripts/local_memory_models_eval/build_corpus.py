@@ -1178,6 +1178,40 @@ def _rule_drift(criteria: dict) -> str:
     )
 
 
+def _window_population(
+    population: list[EpisodeRecord], cutoff: datetime
+) -> list[EpisodeRecord]:
+    """Return the records at or before *cutoff*, naming any row that will not parse.
+
+    Its own function, and deliberately called from OUTSIDE
+    :func:`verify_manifest`'s manifest-attributable ``try``, because the two
+    failures it sits between have different culprits. The window *bound* is a
+    manifest value; a record's ``created_at`` is a STORE value. Filtering
+    inside that ``try`` — which is what this code used to do — reported a
+    corrupted store row as ``bad_manifest``, sending the reader off to
+    re-derive an artifact that was never wrong while the row that actually
+    needs fixing went unnamed.
+
+    So a record-level parse failure is re-raised, not returned: it propagates
+    to :func:`main` and exits 1, "the run never reached a verdict", which is
+    the truth. The uuid is named because an operator cannot go and fix a row
+    the message does not identify — the same shape ``fetch_population`` uses
+    for its own row-level rejections.
+    """
+    windowed: list[EpisodeRecord] = []
+    for record in population:
+        try:
+            created_at = parse_timestamp(record.created_at)
+        except CorpusBuildError as exc:
+            raise CorpusBuildError(
+                f'episode {record.uuid!r} has an unparseable created_at: {exc} — '
+                f'this is a store condition, not a defect in the manifest'
+            ) from exc
+        if created_at <= cutoff:
+            windowed.append(record)
+    return windowed
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1217,6 +1251,16 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     meaningful. Hashes cannot be compared against episodes that are not there,
     and drift in a selection that is already wrong is not the reader's problem
     yet.
+
+    **Manifest defects are returned; store defects are raised.** Those are two
+    different findings with two different remedies, so they get two different
+    mechanisms: anything wrong with the artifact comes back as a
+    :class:`VerifyReport` status and a documented exit code, while anything
+    wrong with the population propagates as a :class:`CorpusBuildError` and
+    exits 1, "no verdict was reached". Collapsing the second into
+    ``bad_manifest`` would be worse than unhelpful — it names a culprit that is
+    innocent, and the reader would re-derive a perfectly good corpus while the
+    real problem stayed in the store. See :func:`_window_population`.
     """
     try:
         criteria, episodes = _read_criteria(manifest)
@@ -1239,12 +1283,27 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         )
 
     try:
+        # Already parsed for effect in _read_criteria, so this cannot raise
+        # today. Kept here anyway, and inside this clause rather than beside
+        # the windowing: the bound is a MANIFEST value, so a reader tracing
+        # attribution at the point of use should find it in the clause that
+        # reports bad_manifest.
         cutoff = parse_timestamp(
             criteria['window']['max_created_at'], field='criteria.window.max_created_at'
         )
-        windowed = [
-            record for record in population if parse_timestamp(record.created_at) <= cutoff
-        ]
+    except CorpusBuildError as exc:
+        return VerifyReport(
+            status='bad_manifest',
+            detail=f'cannot re-derive from the recorded criteria: {exc}',
+            checked=len(recorded_ids),
+        )
+
+    # OUTSIDE the clause above, deliberately: a record that will not parse is a
+    # corrupted store row, and blaming the artifact for it points the reader at
+    # the wrong culprit. See _window_population.
+    windowed = _window_population(population, cutoff)
+
+    try:
         rederived = [
             record.uuid
             for record in select(windowed, criteria['n'], seed=criteria['seed']).selected
