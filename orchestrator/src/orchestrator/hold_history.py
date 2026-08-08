@@ -333,12 +333,29 @@ class HoldHistory:
         """Median hold (seconds) across the pooled windows of *modules*.
 
         POOLED, not a median-of-medians: a module with 10 samples should weigh
-        more than one with 3, because it is the better-evidenced key.
+        more than one with 3, because it is the better-evidenced key.  The gate
+        below counts the pooled samples for the same reason — it counts what the
+        answer would actually be made from, so three modules with one sample
+        each admit while two refuse.
 
-        Returns None when there is nothing to answer from — see step-10, which
-        raises that floor from "any sample at all" to ``min_samples``.
+        **None means NO PREDICTION, and callers must refuse in turn — never
+        substitute a default.**  Returning 0.0 (or a global mean, or a
+        configured "typical" hold) would read to every caller as a confident
+        "this hold is instant", which is strictly worse than an admitted
+        absence: a wrong number propagates silently, a None cannot.  PRD
+        :459-461: "An empty history must refuse, not admit — a predicate that
+        accepts the empty case certifies structure, not capability."
+
+        Note the asymmetry this protects: a 0.0 *sample* is an observation (a
+        module whose holds really are instant), while a 0.0 *prediction* from no
+        samples is a fabrication.  The gate is on the sample COUNT, never on the
+        value, so the two can never be confused.
+
+        ``min_samples`` is a constructor parameter, deliberately NOT read from
+        config here — task η owns the ``backfill_min_samples`` leaf and this
+        module must stand alone without it.
         """
         pooled = self._pooled(modules)
-        if not pooled:
+        if len(pooled) < self._min_samples:
             return None
         return float(statistics.median(pooled))
