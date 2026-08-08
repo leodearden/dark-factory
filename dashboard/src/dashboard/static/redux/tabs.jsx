@@ -1197,6 +1197,23 @@ function BurnTab({ projectFilter, displayWindow }) {
   const [openMap, toggle, setAll] = useOpenSet(projIds, true, 'df.open.burn');
   const allOpen = projIds.every(p => openMap[p]);
 
+  // Concurrency-parity banner (E12). The verdict is computed server-side, where
+  // each snapshot is judged against the cap stored ON that snapshot — the cap is
+  // hot-reloadable, so re-deriving it here from the rendered series would forgive
+  // a real past breach after a raise and invent one after a cut. This renders the
+  // verdict and nothing else.
+  const parityBanner = (block, projects) => {
+    if (!block || !block.parity_alarm) return null;
+    const n = block.parity_breach_count ?? 0;
+    const who = projects && projects.length ? ` · ${projects.join(', ')}` : '';
+    return (
+      <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
+        ⚠ Over concurrency cap · peaked at {block.parity_peak} in flight, cap {block.parity_cap}
+        {` · ${n} snapshot${n !== 1 ? 's' : ''} over${who}`}
+      </div>
+    );
+  };
+
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
@@ -1257,16 +1274,21 @@ function BurnTab({ projectFilter, displayWindow }) {
             <span className="meta">aggregate · all projects</span>
           </div>
           <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {b.parity_alarm && parityBanner(b, b.parity_projects)}
             <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-              {[['done',CP.ok],['in-progress',CP.accent],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+              {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
+            {/* in_progress is banded as live + stranded, never alongside them:
+                stacking the whole beside its parts would draw a total no
+                census ever produced. The server guarantees they sum. */}
             <SA labels={b.labels} stacks={[
-              { key: 'done',        color: CP.ok,     values: b.done },
-              { key: 'in_progress', color: CP.accent, values: b.in_progress },
-              { key: 'blocked',     color: CP.bad,    values: b.blocked },
-              { key: 'pending',     color: CP.warn,   values: b.pending },
+              { key: 'done',                 color: CP.ok,       values: b.done },
+              { key: 'in_progress_live',     color: CP.accent,   values: b.in_progress_live },
+              { key: 'in_progress_stranded', color: CP.stranded, values: b.in_progress_stranded },
+              { key: 'blocked',              color: CP.bad,      values: b.blocked },
+              { key: 'pending',              color: CP.warn,     values: b.pending },
             ]} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
@@ -1327,8 +1349,9 @@ function BurnTab({ projectFilter, displayWindow }) {
                     <span className="title">Status mix · 30d</span>
                   </div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {pb.parity_alarm && parityBanner(pb, null)}
                     <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-                      {[['done',CP.ok],['in-progress',CP.accent],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+                      {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
@@ -1336,10 +1359,11 @@ function BurnTab({ projectFilter, displayWindow }) {
                         the sorted union across all projects (redux_api.py shape_burndown), so
                         pairing it with pb.* both overruns and index-shifts them. */}
                     <SA labels={pb.labels} stacks={[
-                      { key: 'done',        color: CP.ok,     values: pb.done },
-                      { key: 'in_progress', color: CP.accent, values: pb.in_progress },
-                      { key: 'blocked',     color: CP.bad,    values: pb.blocked },
-                      { key: 'pending',     color: CP.warn,   values: pb.pending },
+                      { key: 'done',                 color: CP.ok,       values: pb.done },
+                      { key: 'in_progress_live',     color: CP.accent,   values: pb.in_progress_live },
+                      { key: 'in_progress_stranded', color: CP.stranded, values: pb.in_progress_stranded },
+                      { key: 'blocked',              color: CP.bad,      values: pb.blocked },
+                      { key: 'pending',              color: CP.warn,     values: pb.pending },
                     ]} height={220} formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
