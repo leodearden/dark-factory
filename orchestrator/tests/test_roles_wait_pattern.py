@@ -437,21 +437,14 @@ async def test_amender_prompt_reinforces_the_wait_rules(
     single prompt. The no-duplication half is asserted explicitly so a future
     edit cannot quietly reintroduce it.
 
-    Task 3747 folded in ``test_roles_background_warning.py``'s near-duplicate
-    ``test_amender_prompt_reinforces_warning_at_failure_site`` (task 2761),
-    which exercised the same ``build_amender_prompt`` call over the same stub
-    ``briefing`` fixture (now shared via ``conftest.py``) and additionally
-    asserted the task-2761 ``BACKGROUND_TASK_WARNING`` precondition below —
-    that assertion is preserved here rather than dropped.
-
     ``_get_memory_context`` is patched to a stub so no real fused-memory HTTP
     call fires (mirrors the resume golden test).
     """
-    assert BACKGROUND_TASK_WARNING in ROLES['implementer'].system_prompt, (
-        'The amender runs under IMPLEMENTER; its system prompt must carry the '
-        "2761 warning, since the turn prompt now only points back at it."
-    )
-
+    # The IMPLEMENTER-carries-BACKGROUND_TASK_WARNING precondition this relies
+    # on is covered by test_roles_background_warning.py::
+    # test_implementer_system_prompt_carries_warning, and transitively by
+    # test_amender_reminder_cannot_dangle + test_combined_guidance_composes_both_rules
+    # above — not re-asserted here (task 3747 review).
     with patch.object(
         BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
     ):
