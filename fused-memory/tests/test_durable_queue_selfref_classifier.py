@@ -395,3 +395,120 @@ class TestClassifyFailure:
             'An operator re-adding a not-found name must not be able to '
             'resurrect a retry budget for a provably self-referential failure.'
         )
+
+
+class TestSelfReferentialNotFoundDeadLettersImmediately:
+    """The acceptance signal, end-to-end through a real queue and real SQLite.
+
+    Everything above tests the policy functions in isolation; this class asserts
+    what an operator actually observes: the attempt count on the dead row, and
+    how many times the backend was hit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_referential_not_found_dies_on_attempt_one(self, tmp_path):
+        """ACCEPTANCE: one backend round-trip, then dead. Not five."""
+        u = _uuid()
+        execute = AsyncMock(side_effect=NodeNotFoundError(u))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 1, (
+                'A not-found naming the episode\'s OWN uuid is unsatisfiable by '
+                f'construction and must dead-letter on attempt 1; got '
+                f'{dead[0]["attempts"]} — it is still burning the retry budget.'
+            )
+            stats = await q.get_stats(group_id='proj1')
+            assert stats['counts'].get('dead', 0) == 1
+            assert execute.await_count == 1, (
+                'The backend must be hit exactly once — sparing the four futile '
+                f'round-trips is the point; got {execute.await_count}.'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_referenced_uuid_not_found_keeps_the_full_budget(self, tmp_path):
+        """CONTROL: a not-found naming a merely-REFERENCED uuid retries fully.
+
+        Causes 3 (the node lives in another graph) and 4 (a concurrent write
+        creating it is still in flight) are genuinely retryable, and this is the
+        assertion that fails if the rule is ever widened to "any uuid in the
+        payload".
+        """
+        identity, referenced = _uuid(), _uuid()
+        execute = AsyncMock(side_effect=NodeNotFoundError(referenced))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={
+                    'uuid': identity, 'referenced_uuid': referenced,
+                    'name': 'ep', 'content': 'c', 'group_id': 'proj1',
+                },
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert dead[0]['attempts'] == 5, (
+                'A not-found naming a REFERENCED uuid must keep the plain '
+                f'max_attempts budget (5); got {dead[0]["attempts"]}.'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_message_falls_open_end_to_end(self, tmp_path):
+        """FAIL-OPEN: fused-memory's own not-found text, naming the identity
+        uuid, still gets the full budget — an unrecognised message degrades to
+        today's behaviour, never to permanent failure."""
+        u = _uuid()
+        execute = AsyncMock(side_effect=Exception(f'Entity node not found: {u}'))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert dead[0]['attempts'] == 5, (
+                'An unrecognised message shape must fall open to the ordinary '
+                f'budget (5); got {dead[0]["attempts"]}.'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_unmapped_operation_keeps_the_full_budget(self, tmp_path):
+        """An operation with no declared identity keeps its retries even when a
+        'uuid' key happens to sit in its payload."""
+        u = _uuid()
+        execute = AsyncMock(side_effect=NodeNotFoundError(u))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_memory_graphiti',
+                payload={'uuid': u, 'content': 'c', 'group_id': 'proj1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert dead[0]['attempts'] == 5, (
+                'An unmapped operation must keep the plain budget (5); got '
+                f'{dead[0]["attempts"]}.'
+            )
+        finally:
+            await q.close()
