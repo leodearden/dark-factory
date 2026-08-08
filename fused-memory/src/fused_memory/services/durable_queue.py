@@ -67,14 +67,18 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # above argues the stronger claim. Dropping these names only returns them to
 # the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
 # still spends five backend round-trips plus exponential backoff proving what
-# attempt 1 already showed. Making it terminal on the first attempt is task
-# 3586 (payload-aware classifier: _handle_failure already holds the whole
-# QueueItem and passes none of it to _is_transient, and the 'dead' outcome
-# plus the on_terminal hook below are the machinery it would reuse). If
-# 3586's payload discrimination proves too fine-grained, a blunter terminal
-# counterpart to this set — matched the same way, checked first — is the
-# cheaper fallback. Either shape is 3586's call; 3585 deliberately changed
-# only WHICH errors get the extended budget.
+# attempt 1 already showed. 3585 deliberately changed only WHICH errors get
+# the extended budget.
+#
+# MAKING IT TERMINAL ON ATTEMPT 1 LANDED SEPARATELY, as task 3586: see
+# _classify_failure below, which took the payload-aware route rather than the
+# blunter "terminal error names" counterpart 3585 offered as a fallback. It
+# does NOT act on this set or on any name list — it fires only when the
+# not-found names the very uuid the operation exists to create, a proof derived
+# from the item's own payload. So the two mechanisms stay independent: editing
+# the names here cannot switch the permanent rule on or off, and 3586's rule is
+# checked FIRST precisely so re-adding a name here cannot hand a
+# provably-doomed write the extended budget back.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
