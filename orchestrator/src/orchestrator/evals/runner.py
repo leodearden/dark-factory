@@ -45,6 +45,7 @@ from .metrics import (
     EvalMetrics,
     coerce_cost_usd,
     collect_metrics,
+    compose_cost_source,
     detect_invocation_error,
     resolve_cost_usd,
 )
@@ -599,6 +600,25 @@ async def run_architect_eval(
     judge-skipped branch (tainted, refused-with-a-plan, unscorable plan)
     spends nothing on the judge, so ``cost_usd`` there is architect spend
     alone.
+
+    Cost PROVENANCE (task 3656): the ARCHITECT component of that total is
+    RESOLVED per Invariant P5, through the same
+    :func:`~orchestrator.evals.metrics.resolve_cost_usd` seam
+    ``collect_metrics`` uses on the implementer path — so a PROXIED architect
+    candidate no longer keeps the raw CLI figure P5 calls untrustworthy for a
+    proxy, and ``cost_source`` is DERIVED rather than left at an unverified
+    dataclass default. The PLAN-JUDGE component deliberately keeps its CLI
+    figure: the judge is always a native-cloud opus call
+    (:func:`~orchestrator.evals.judge.judge_plan_quality` takes neither the
+    candidate's model nor its ``env_overrides``), so re-resolving it against
+    the candidate's price table would price opus tokens at a vLLM rate. The
+    cell's single ``cost_source`` therefore reads ``'mixed'``
+    (:func:`~orchestrator.evals.metrics.compose_cost_source`) whenever those
+    two components disagree AND the judge actually spent — the
+    operator-visible answer to the mixed-provenance question, rather than one
+    label quietly standing in for two sources. A NATIVE candidate resolves
+    ``'cli'`` beside a ``'cli'`` judge, so today's cells keep both figure and
+    label byte-identical.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -999,7 +1019,13 @@ async def run_architect_eval(
         # plan judge is always a native-cloud opus call. judge_cost_usd is still
         # the judge's SHARE of this total, not a separately-resolved addend.
         cost_usd=resolved_arch_cost + judge_cost_usd,
-        cost_source=arch_cost_source,
+        # ONE label for a TWO-component sum: the default secondary='cli' is the
+        # plan judge's always-native-cloud-opus provenance, so this reads
+        # 'mixed' exactly when the judge actually spent AND the two components'
+        # sources disagree — never letting one label quietly stand in for two.
+        cost_source=compose_cost_source(
+            arch_cost_source, secondary_cost_usd=judge_cost_usd,
+        ),
         # The architect invocation's token usage + its proxy signal — the three
         # inputs Invariant P5 resolves cost provenance from (resolve_cost_usd).
         # Stamped on the cell so the persisted JSON carries the evidence behind
