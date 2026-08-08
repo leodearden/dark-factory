@@ -1930,8 +1930,9 @@ def create_mcp_server(
         Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately. :mod:`fused_memory.server.markup_tripwire` holds the
-        authoritative pattern list and the rationale — it is deliberately the
-        only place in the package that enumerates the literals.
+        write-time pattern list and the rationale; the literals themselves are
+        enumerated once, in :mod:`shared.toolcall_markup`, and nothing in this
+        package spells them.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -2120,9 +2121,10 @@ def create_mcp_server(
         each one that lands is a permanent corpus specimen. Strip the fragment
         and resubmit. If you are quoting such markup DELIBERATELY (documenting
         the leak itself), set metadata={'allow_mcp_markup': True}.
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -5587,9 +5589,10 @@ def create_mcp_server(
         stored as medium). Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately (e.g. filing a task ABOUT the leak).
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             project_root: Absolute path to project root

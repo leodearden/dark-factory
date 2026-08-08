@@ -85,15 +85,21 @@ that same call. ``\\x3c`` is byte-identical at runtime (both in the regex
 engine and in Python string literals) and never appears verbatim in the file
 text, so it is immune. Leave it escaped.
 
-This module is pure and stdlib-only. It deliberately imports nothing else
-from ``fused_memory`` so that every layer — backends, services, middleware,
-the MCP tools layer, and standalone scripts — can depend on it without a
-cycle.
+This module is pure and dependency-light: the stdlib plus
+``shared.toolcall_markup``, which OWNS the envelope-literal enumeration
+(INV-5) and is itself stdlib-only and pure. It deliberately imports nothing
+else from ``fused_memory`` so that every layer — backends, services,
+middleware, the MCP tools layer, and standalone scripts — can depend on it
+without a cycle. A standalone script must therefore put ``shared/src`` on
+``sys.path`` alongside ``fused-memory/src``; ``scripts/scan_task_toolcall_leaks.py``
+carries that bootstrap and is the pattern to copy.
 """
 from __future__ import annotations
 
 import re
 from typing import NamedTuple
+
+from shared.toolcall_markup import PARAMETER_CLOSER_NAMES, PREFILTER_NEEDLES
 
 __all__ = [
     'LEAK_TAIL',
@@ -104,20 +110,20 @@ __all__ = [
     'has_toolcall_xml_leak',
 ]
 
+# PREFILTER_NEEDLES — imported above, NOT spelled here. The enumeration is
+# owned by shared.toolcall_markup (INV-5); its VALUE and ORDER are unchanged by
+# the move, and tests/test_mem0_client.py zips this tuple against the Qdrant
+# filter clauses with strict=True, so the order stays load-bearing.
+#
 # Literal substrings a store-side PREFILTER can search for cheaply. Every leak
 # necessarily contains one of these — they are the closing-tag alternation of
-# LEAK_TAIL — so OR-ing them is a strict SUPERSET of the real match set and can
-# never miss a leak the detector would find.
+# LEAK_TAIL, now literally so, since both are built from the same name tuple —
+# so OR-ing them is a strict SUPERSET of the real match set and can never miss
+# a leak the detector would find.
 #
 # They are a speed optimisation ONLY. The authoritative verdict is always
 # find_toolcall_xml_leak() re-run over each returned record, because a bare
 # closing tag is common in ordinary prose and matches nothing on its own.
-PREFILTER_NEEDLES = (
-    '\x3c/description>',
-    '\x3c/parameter>',
-    '\x3c/details>',
-    '\x3c/content>',
-)
 
 # Promoted verbatim from scripts/scan_task_toolcall_leaks.py (task 2939), with
 # exactly two generalizations for the Mem0 specimens (task 3083):
@@ -129,7 +135,7 @@ PREFILTER_NEEDLES = (
 # The \s+ real-whitespace requirement between the two halves is UNCHANGED and
 # must stay that way; see the module docstring for the 2938/2939 rationale.
 LEAK_TAIL = re.compile(
-    r'\x3c/(?:description|parameter|details|content)>'
+    r'\x3c/(?:' + '|'.join(PARAMETER_CLOSER_NAMES) + r')>'
     r'\s+'
     r'(\x3c(?:parameter\s+name="[^"]*">|/invoke>).*)$',
     re.DOTALL,
