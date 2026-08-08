@@ -106,7 +106,6 @@ import pathlib
 import shutil
 
 import pytest
-
 from systemd_unit_invariants import (
     assert_restart_backoff_effective,
     systemctl_user_show,
