@@ -599,3 +599,167 @@ def test_dry_run_over_a_healthy_archive_projects_zero_failures(tmp_path):
     assert summary["scanned"] == 2
     assert summary["migrated"] == 2
     assert summary["failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-19: the RESUMED-SESSION conflict — never overwrite a twin that carries
+# MORE data than the .gz
+#
+# Reachable on the DOCUMENTED operator path. OPERATIONS.md §13 instructs
+# "Re-run step 3 after the redeploy to sweep" the transition-window residue,
+# and any task in flight ACROSS that redeploy has BOTH forms on disk: the
+# pre-redeploy process archived `<sid>.jsonl.gz`, then the post-redeploy
+# producer hook wrote a plain `<sid>.jsonl` for the resumed, longer session.
+#
+# The twin fails `_twin_is_trustworthy` (its size does not match the .gz ISIZE)
+# and so falls through to `gunzip_one`, which would overwrite the NEWER, LONGER
+# transcript with stale .gz content, roll its mtime backwards (corrupting the
+# retention age `gc_agent_transcripts.scan_task_dirs` derives from the newest
+# descendant mtime), unlink the .gz, and report `migrated: 1` — silently.
+#
+# SIZE, NOT MTIME, IS THE DISCRIMINATOR. Both shapes that reach this point are
+# NEWER than the archived .gz: a killed write stamped `now` because its
+# `os.utime` mirror had not run yet, and a resumed session is genuinely newer.
+# What separates them is the DIRECTION of size — a killed write leaves a strict
+# PREFIX (shorter), a resumed append-only transcript leaves a strict SUPERSET
+# (longer). Tests (b) and (c) below pin that distinction so a mtime-triggered
+# rule cannot pass.
+# ---------------------------------------------------------------------------
+
+def _write_resumed_session_conflict(root: Path) -> tuple[Path, Path, bytes]:
+    """Build the shape a session resumed across a fleet redeploy leaves behind.
+
+    A SHORT archived `.gz` stamped `ARCHIVED_MTIME`, next to a plain twin whose
+    bytes are a strict SUPERSET of it (the same records plus more — what an
+    append-only resumed transcript looks like) stamped a NEWER mtime.
+
+    Returns ``(gz, twin, twin_bytes)``.
+    """
+    archived = _payload(5)
+    resumed = _payload(20)
+    assert resumed.startswith(archived), "fixture must be a strict byte superset"
+
+    gz = _write_gz(root / "3618" / "enc" / "sess.jsonl.gz", archived)
+    twin = root / "3618" / "enc" / "sess.jsonl"
+    twin.write_bytes(resumed)
+    os.utime(twin, (ARCHIVED_MTIME + DAY, ARCHIVED_MTIME + DAY))
+    return gz, twin, resumed
+
+
+def test_resumed_session_twin_is_never_overwritten_by_the_stale_gz(tmp_path, caplog):
+    """(a) THE REGRESSION. A twin carrying MORE data than the `.gz` is the
+    authoritative copy; overwriting it from the archive is unrecoverable data
+    loss. Both files are left exactly as they are and the operator is TOLD."""
+    caplog.set_level(logging.WARNING, logger="migrate_transcript_archive_gunzip")
+    gz, twin, resumed = _write_resumed_session_conflict(tmp_path)
+    before_mtime_ns = twin.stat().st_mtime_ns
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert twin.read_bytes() == resumed, "the resumed transcript was overwritten"
+    # No mtime rollback: gc_agent_transcripts derives the retention age from the
+    # newest descendant mtime, so stamping the .gz's older mtime here would age
+    # a live task dir out early.
+    assert twin.stat().st_mtime_ns == before_mtime_ns
+    # BOTH copies retained: a size comparison proves the twin is longer, never
+    # that it CONTAINS the .gz content, so the .gz is kept for adjudication.
+    assert gz.exists(), "the .gz must be retained for the operator to adjudicate"
+    assert summary["migrated"] == 0
+    assert summary["skipped"] == 0
+    assert summary["failed"] == 0
+    assert summary["conflicts"] == 1
+    assert str(gz) in summary["conflict_paths"]
+    # LOUD: told, not left to be noticed.
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        LOG_PREFIX in m and str(gz) in m for m in warn_msgs
+    ), f"missing LOUD WARNING for the conflicting twin; got {warn_msgs}"
+
+
+def test_half_written_twin_is_still_rebuilt_even_though_it_is_newer(tmp_path):
+    """(b) NON-REGRESSION, and the reason SIZE is the discriminator. The
+    half-written twin at the committed contract above is ALSO newer than the
+    `.gz` (its killed write stamped `now`; the mtime mirror never ran), so a
+    "newer => conflict" rule would misclassify it and strand a truncated
+    transcript. It is SHORTER, so it is still rebuilt from the authoritative
+    source."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-b.jsonl.gz", payload)
+    twin = tmp_path / "3618" / "enc" / "sess-b.jsonl"
+    twin.write_bytes(payload[: len(payload) // 2] + b"\xff")
+
+    # The premise this test exists to pin: newer, but strictly SHORTER.
+    assert twin.stat().st_mtime > gz.stat().st_mtime
+    assert twin.stat().st_size < len(payload)
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["migrated"] == 1
+    assert summary["conflicts"] == 0
+    assert summary["conflict_paths"] == []
+    assert twin.read_bytes() == payload, "the bad twin was not rebuilt from the .gz"
+    assert int(twin.stat().st_mtime) == int(ARCHIVED_MTIME)
+    assert not gz.exists()
+
+
+def test_complete_but_unstamped_twin_is_still_skipped(tmp_path):
+    """(c) NON-REGRESSION, the crash-resume window. A twin written completely
+    but killed BEFORE its `os.utime` mirror has an mtime of `now` — newer than
+    the `.gz`, yet exactly right. Corroboration is checked FIRST, so a newer
+    mtime alone never blocks the resume path."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-c.jsonl.gz", payload)
+    twin = tmp_path / "3618" / "enc" / "sess-c.jsonl"
+    twin.write_bytes(payload)  # no os.utime — mtime is `now`
+
+    assert twin.stat().st_mtime > gz.stat().st_mtime
+    assert twin.stat().st_size == len(payload)
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["skipped"] == 1
+    assert summary["conflicts"] == 0
+    assert summary["migrated"] == 0
+    assert twin.read_bytes() == payload
+    assert not gz.exists(), "a corroborated twin still converges the archive to zero .gz"
+
+
+def test_dry_run_projects_the_conflict_without_touching_anything(tmp_path):
+    """(d) The adjudication list is visible BEFORE `--apply`. Classification
+    happens on the projection path too, so the operator sees the conflicts in
+    the dry run rather than discovering them mid-sweep."""
+    gz, twin, resumed = _write_resumed_session_conflict(tmp_path)
+    before = _mtimes(tmp_path)
+
+    summary = mig.migrate_archive(tmp_path, apply=False)
+
+    assert summary["scanned"] == 1
+    assert summary["conflicts"] == 1
+    assert str(gz) in summary["conflict_paths"]
+    assert summary["migrated"] == 0
+    # A pure projection: not one byte, and not one mtime, changed.
+    assert twin.read_bytes() == resumed
+    assert gz.exists()
+    assert _mtimes(tmp_path) == before
+
+
+def test_cli_exits_non_zero_and_reports_conflicts(tmp_path):
+    """(e) A conflict leaves a `.gz` on disk, which contradicts the runbook's
+    `expect 0` confirmation — so it must carry an EXIT CODE, not just a counter
+    the operator might not read. Distinct from the failure code: "needs
+    adjudication" is not "is damaged"."""
+    gz, twin, resumed = _write_resumed_session_conflict(tmp_path)
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    assert result.returncode != 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    summary = json.loads(result.stdout)
+    assert summary["conflicts"] == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert str(gz) in summary["conflict_paths"], (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert summary["failed"] == 0
+    assert gz.exists()
+    assert twin.read_bytes() == resumed
