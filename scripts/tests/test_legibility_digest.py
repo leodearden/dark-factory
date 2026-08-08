@@ -434,6 +434,86 @@ class TestIterErrorNeighborhoods:
 
 
 # ---------------------------------------------------------------------------
+# _extract_exit_code / classify_designed_outcome — the 07-31 census cluster
+# 1.3 finding (plans/confusion-census-2026-07-31.md:97): watcher-rearm.sh's
+# bounded-wait CEILING is a DESIGNED loop-continuation outcome that the
+# extractor counted as a tool_error, inflating session a189558e's error
+# signal 4x and burying the one genuine failure among false positives.
+# Recognition is two-tier: the machine-readable self-declaration first
+# (scripts/watcher-rearm.sh:228-237), the bare exit code second.
+# ---------------------------------------------------------------------------
+
+_CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+"""The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
+
+
+class TestDesignedOutcomeRecognition:
+    def test_extracts_exit_equals_form(self):
+        assert mod._extract_exit_code(_CEILING_DECLARATION) == 124
+
+    def test_extracts_exit_code_prose_form(self):
+        assert mod._extract_exit_code('command failed with exit code 2') == 2
+
+    def test_extracts_exit_status_prose_form(self):
+        assert mod._extract_exit_code('exit status 137') == 137
+
+    def test_extraction_is_case_insensitive(self):
+        assert mod._extract_exit_code('Exit Code 2') == 2
+
+    def test_returns_none_when_no_code_present(self):
+        assert mod._extract_exit_code('something went wrong') is None
+
+    def test_first_match_wins_when_several_appear(self):
+        text = 'exit=124\nlater the retry gave exit code 2\n'
+
+        assert mod._extract_exit_code(text) == 124
+
+    def test_declared_ceiling_is_designed(self):
+        assert mod.classify_designed_outcome(_CEILING_DECLARATION, 124) is not None
+
+    def test_declared_fired_is_designed(self):
+        label = mod.classify_designed_outcome(
+            'WATCHER_REARM_OUTCOME: FIRED exit=0', 0,
+        )
+
+        assert label is not None
+
+    def test_declared_killed_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
+        # REAL failure the census should still see, not a designed outcome.
+        assert mod.classify_designed_outcome(
+            'WATCHER_REARM_OUTCOME: KILLED exit=137', 137,
+        ) is None
+
+    def test_declared_error_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
+        assert mod.classify_designed_outcome(
+            'WATCHER_REARM_OUTCOME: ERROR exit=2', 2,
+        ) is None
+
+    def test_bare_exit_124_is_a_designed_bounded_wait(self):
+        assert mod.classify_designed_outcome(
+            'command timed out after 600s', 124,
+        ) is not None
+
+    def test_ordinary_failure_is_not_designed(self):
+        assert mod.classify_designed_outcome('boom, exit code 2', 2) is None
+
+    def test_empty_content_with_no_exit_code_is_not_designed(self):
+        assert mod.classify_designed_outcome('', None) is None
+
+    def test_declaration_and_bare_124_labels_are_distinct(self):
+        # Which rule fired must stay legible to a digest reader.
+        declared = mod.classify_designed_outcome(_CEILING_DECLARATION, 124)
+        bare = mod.classify_designed_outcome('timed out', 124)
+
+        assert declared != bare
+
+    def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
+        assert mod.BOUNDED_WAIT_EXIT_CODE == 124
+
+
+# ---------------------------------------------------------------------------
 # iter_self_corrections — curated markers in assistant TEXT blocks only.
 # Native-carrier scoping: the same phrase inside a tool_result or inside a
 # Write/Edit tool_use input (an agent authoring test data) is not a signal.
