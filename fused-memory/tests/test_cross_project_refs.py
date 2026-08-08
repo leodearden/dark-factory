@@ -200,6 +200,83 @@ class TestNoFalsePositives:
         assert scan.ambiguous == []
 
 
+class TestTaskVocabularyQualifiersAreNotProjectIds:
+    """'Task: 2500' must never be read as project 'task', task 2500.
+
+    This is the ONE qualifier class every other narrowing provably misses, and
+    the only one the consumer's decisive guard cannot make for us:
+
+    1. The self-qualifier drop does not fire — 'task' is not the group id.
+    2. The ambiguity guard does not fire — _BARE_TASK_MENTION_PATTERN requires
+       'tasks?\\s+\\d+' (whitespace, not a colon), so the number never lands in
+       bare_mentions.
+    3. The allowlist is permissive by default, since no caller wires a registry.
+    4. Decisively, the module docstring delegates final precision to the
+       consumer, which "splits only when the episode actually touched a node
+       literally named ``Task N``". For the literal string 'Task: 2500' that
+       node is PRECISELY what graphiti-core's extraction produces, so the guard
+       is guaranteed to CO-OCCUR rather than to filter.
+
+    Net effect if unrejected: destructive edge surgery moves a genuinely LOCAL
+    task's facts onto a bogus 'task:2500' entity — the same misattribution bug
+    this module exists to fix, running in the opposite direction. So these
+    spellings must be rejected HERE; no downstream narrowing can catch them.
+    """
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Task: 2500 is now done',
+            'task: 2500',
+            'task : 2500',
+            'TASK:2500',
+            'tasks: 2500 and 2501',
+            'Tasks : 2500',
+            'subtask: 2500',
+            'subtasks: 2500',
+            'sub-task: 2500',
+        ],
+    )
+    def test_task_vocabulary_qualifier_yields_nothing(self, content):
+        # Deliberately the project named in the incident, so a reader sees the
+        # self-qualifier drop genuinely cannot save this.
+        scan = find_cross_project_task_refs(content, group_id='dark_factory')
+        assert scan.refs == []
+        assert scan.ambiguous == []
+
+
+class TestTaskColonMentionsCreateAmbiguity:
+    """A colon-spelled LOCAL task mention must make a same-numbered foreign ref
+    ambiguous, exactly as the whitespace-spelled 'task 2500' already does.
+
+    Rejecting the qualifier (above) stops 'task' becoming a project; this stops
+    a genuinely FOREIGN ref being split when the same number is ALSO named as a
+    local task in colon form. Neither defence subsumes the other."""
+
+    def test_colon_spelled_bare_mention_makes_the_foreign_ref_ambiguous(self):
+        """Mirrors TestAmbiguousRefs::test_same_number_qualified_and_bare_is_ambiguous,
+        which pins the whitespace form of the same content."""
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 and Task: 2500', group_id='reify'
+        )
+        assert scan.refs == []
+        assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
+
+    def test_word_glued_colon_lookalikes_are_not_bare_mentions(self):
+        """'subtask: 2500' is NOT a bare mention of task 2500, mirroring
+        TestAmbiguousRefs::test_word_glued_task_lookalikes_are_not_bare_mentions
+        and _TASK_NODE_NAME_PATTERN's documented refusal to match 'subtask 5'.
+
+        This is the regression guard for the new colon pattern's lookbehind:
+        without it, 'tasks?\\s*:\\s*\\d+' would match the 'task: 2500' substring
+        INSIDE 'subtask: 2500' and wrongly suppress a real foreign ref."""
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 and subtask: 2500', group_id='reify'
+        )
+        assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == []
+
+
 class TestShapeValidProseMatchesRelyOnDownstreamGuards:
     """Prose that happens to have the '<word>: <number>' shape DOES match — the
     scanner is deliberately whitespace-tolerant, because that is how humans
