@@ -10,6 +10,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### `delete_memory`'s citation gate now applies to EVERY caller (task 3624)
+
+**Behaviour change, operator-visible.** A `store='mem0'` `delete_memory` call
+that succeeded yesterday can now be REFUSED with
+`error_type='CitationRepointRequired'`. The pre-delete citation-repoint gate
+(task 3108) was scoped to `recon-stage-*` callers; it now keys on the RECORD —
+`store == 'mem0'` and a scannable registered project — because "will this delete
+dangle a live task pointer?" is a property of the entry and the task DB, not of
+who issued the delete. Under the old predicate the identical delete issued from
+an interactive session landed unguarded, and a caller with no `agent_id` at all
+was the *least* guarded one. This is what gates the 25-gate memory-consolidation
+batch tracked by task 3524 / esc-3524-1, which is driven from an interactive
+session rather than a recon-stage agent. An uncited entry is unaffected: the scan
+finds nothing live and the delete proceeds as before.
+
+**Migration note:** the remedy is unchanged — retry with
+`replacement_memory_id=<the surviving entry's full 36-char UUID>` and the live
+citers are repointed before the delete runs. For a delete with *no* surviving
+entry to repoint to — a plain drop rather than a consolidation, which
+`replacement_memory_id` cannot express — pass
+`metadata={'allow_dangling_citations': True}`. Only a literal boolean `True`
+counts, matching the `allow_mcp_markup` convention below; a truthy `'yes'` or `1`
+does not unlock an irreversible delete. The refusal's `hint` names the escape, so
+it is discoverable from the rejection itself.
+
+Two deliberate differences from `allow_mcp_markup`. First, the override is not
+silent: it is recorded at `WARNING` naming the deleted id, the `agent_id` that
+asked, and every live citer it strands — an override that lands silently is the
+same class of defect as the gate that never ran. Supplying a
+`replacement_memory_id` *alongside* the flag is contradictory; the override wins
+and the ignored value is named in that same line rather than dropped in silence.
+Second, `allow_mcp_markup` is "stripped before persistence" whereas this flag
+needs no strip at all: `delete_memory` discards `_extract_causation`'s cleaned
+dict and `memory_service.delete_memory(...)` takes no `metadata` parameter, so
+the flag structurally cannot reach the store.
+
+The escape is a property of stated intent, not of identity — it is available to
+recon-stage callers too, since a second caller-identity check would reintroduce
+exactly the scoping this task removed. It deliberately does **not** unlock the
+fail-closed path: an override plus an unreadable task DB is still
+`CitationScanFailed`, because the flag means "I accept dangling the citers you
+just showed me" and with nothing enumerated there is nothing to knowingly accept.
+
 #### Leaked tool-call XML: root cause, and the tooling to sweep the corpus (task 3083)
 
 **This task ships no write-time guard.** Live rejection at the MCP write
