@@ -10175,12 +10175,53 @@ class Harness:
         it.
 
         Ancestry-path guards mirror ``_reconcile_one_stranded``'s own guard
-        sequence so this gate can never flip a false positive: an open L1
-        escalation is a deliberate human handoff (never second-guessed); a
-        degenerate branch (tip == branch_base_sha) carries zero task work,
-        so ``is_ancestor`` returning True is a trivial false "already on
-        main" signal; and a missing citation rejects the zero-commit-branch
-        shape where no commit on main actually cites this task.
+        sequence so this gate can never flip a false positive: an open
+        escalation at ANY level is a deliberate handoff (never
+        second-guessed); a degenerate branch (tip == branch_base_sha)
+        carries zero task work, so ``is_ancestor`` returning True is a
+        trivial false "already on main" signal; and a missing citation
+        rejects the zero-commit-branch shape where no commit on main
+        actually cites this task.
+
+        **Any-level escalation veto** (task 3534, PRD
+        ``plans/task-escalation-state-graph-prd.md`` eta-0 / spec
+        ``docs/task-escalation-state-spec.md`` E8).  That first guard used
+        to read ``has_open_l1(task_id)``, which silently missed an L2-only
+        (or L0-only) open escalation while this docstring already claimed
+        parity with ``_reconcile_one_stranded`` — whose own veto went
+        any-level in W10 (see :meth:`_reconcile_one_stranded`, "an open
+        escalation at ANY level ... the resolver's row (f) folds every
+        level") over exactly the rows
+        ``TaskGroundTruth._resolve_open_escalations`` reads.  The veto now
+        asks the SHARED pin predicate
+        :func:`escalation.pins.classify_pins` for
+        :attr:`~escalation.pins.PinReport.vetoes_done_flip` over the same
+        ``get_by_task(task_id, status='pending')`` read, so this gate and
+        the resolver agree by construction rather than by copied intent
+        (INV-5).  ``info``-severity records are deliberately carved out
+        (PRD D3 / boundary row #8): an annotation is not a handoff, and a
+        naive ``bool(pending_rows)`` veto would wedge a genuinely-landed
+        task carrying one ``escalate_info`` record into re-dispatching
+        every tick forever.  The veto is LOGGED with the pinning escalation
+        ids so a task that stops auto-flipping says why; task beta (3535)
+        replaces that log line with the structured ``recovery_vetoed``
+        emission plus its N-consecutive-vetoes dedup escalation.
+
+        That veto sits immediately BELOW the task-2677 ``should_skip`` memo
+        (and above all git subprocess work), which is load-bearing rather
+        than incidental.  The two guards return OPPOSITE values: the
+        arbitration memo returns ``True`` — an affirmative "withhold
+        dispatch, this task is contested" — whereas the escalation veto
+        returns ``False``, this gate's ABSTAIN ("I will not flip it; make
+        the dispatch decision normally").  The stronger claim has to win,
+        and it is not hypothetical: a ``done_evidence_stale`` rejection
+        files its own pending L2 ``provenance_conflict`` (severity
+        ``urgent``) via :class:`~orchestrator.provenance_conflict.ProvenanceConflictSink`,
+        so ordering the any-level veto first would let EVERY contested task
+        dispatch from the tick after its conflict was filed.  The old
+        L1-only read missed that record only by accident (``urgent`` is
+        born at L2) — going any-level removes the accident, so the ordering
+        now has to carry the invariant explicitly.
 
         The branch-deleted merge-marker path (also mirroring
         ``_reconcile_one_stranded``) catches the case where the branch ref
@@ -10245,17 +10286,12 @@ class Harness:
         wait-and-retry degradation would wedge the task permanently, whereas
         an extra dispatch of an already-landed task always terminates.
 
-        The guard sits DOWNSTREAM of every existing veto (open L1, the
-        task-2677 ``should_skip`` memo, the degenerate-branch check, and each
-        arm's ``validate_landing_evidence`` verdict), so a landing that is
-        being refused anyway never pays for check work.
+        The guard sits DOWNSTREAM of every existing veto (the any-level
+        escalation pin, the task-2677 ``should_skip`` memo, the
+        degenerate-branch check, and each arm's
+        ``validate_landing_evidence`` verdict), so a landing that is being
+        refused anyway never pays for check work.
         """
-        if (
-            self._escalation_queue is not None
-            and self._escalation_queue.has_open_l1(task_id)
-        ):
-            return False
-
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
@@ -10272,6 +10308,34 @@ class Harness:
             task_id, reopen_at=metadata.get('reopen_at'),
         ):
             return True
+
+        if self._escalation_queue is not None:
+            # An open escalation at ANY level (not just L1 — the resolver's
+            # row (f) folds every level) is the deliberate
+            # human/automation-handoff signal, and a handoff is never
+            # second-guessed by an automatic done-flip.  `live_claimant=False`
+            # is deliberate and free: `vetoes_done_flip` is True for BOTH the
+            # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
+            # cannot change this site's answer — and this hot per-dispatch-tick
+            # path skips claimant resolution entirely for an identical result.
+            from escalation.pins import classify_pins  # noqa: PLC0415
+
+            pinned = classify_pins(
+                task_id,
+                self._escalation_queue.get_by_task(task_id, status='pending'),
+                live_claimant=False,
+            )
+            if pinned.vetoes_done_flip:
+                logger.info(
+                    'already-landed dispatch gate: task %s is NOT eligible for '
+                    'auto-done — pinned by open escalation(s) %s (any-level '
+                    'veto, PRD task-escalation-state-graph D4/E8); '
+                    'dispatching normally',
+                    task_id,
+                    ', '.join((*pinned.queue_handoff, *pinned.dead_l0))
+                    or '<store unavailable>',
+                )
+                return False
 
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None

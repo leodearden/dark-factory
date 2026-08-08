@@ -28,8 +28,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from escalation.models import Escalation
+
 from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.harness import Harness
