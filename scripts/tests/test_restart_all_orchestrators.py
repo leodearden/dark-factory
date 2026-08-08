@@ -31,6 +31,7 @@ from df_pytest_isolation import (
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     run_in_new_session,
+    wait_proof_grace_secs,
 )
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
@@ -399,15 +400,23 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     )
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
 
+    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift:
+    # the grace must outlast the timeout (or the script force-fires mid-test and
+    # the assertion below fails), and must stay small enough that a poller which
+    # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
+    spawn_timeout = 3
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            timeout=3,
+            timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)
@@ -608,15 +617,22 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     )
     # No heartbeat file written for UNIT_R at all.
 
+    # ONE binding feeding BOTH the grace and the timeout -- see
+    # test_defer_withholds_restart_while_busy above. This is the test named in
+    # every sampled orphan's PYTEST_CURRENT_TEST (task 3798).
+    spawn_timeout = 3
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "99999",
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            timeout=3,
+            timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)

@@ -30,7 +30,10 @@ WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
 if str(REPO_ROOT.resolve()) not in sys.path:
     sys.path.append(str(REPO_ROOT.resolve()))
 
-from df_pytest_isolation import run_in_new_session  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    run_in_new_session,
+    wait_proof_grace_secs,
+)
 
 
 def _load_watchdog() -> types.ModuleType:
@@ -3670,31 +3673,40 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
 
     clock_file = tmp_path / "clock.json"
 
+    # 20s (not 8s): under full tests/scripts/ suite load (32-way xdist), the
+    # handful of bash+python3 subprocess spawns needed to reach the assertion
+    # point below (SELF_UNIT/list-units, the idle unit's
+    # drain-check+baseline+restart, R's drain-check) can collectively take long
+    # enough under CPU contention that an 8s wall-clock cap kills the child
+    # before R's "deferring restart of ...: mid-merge" line (a plain,
+    # unbuffered bash `echo`) is even reached -- not a buffering issue, just
+    # insufficient scheduling margin. 20s matches _boundary_run_drain_script's
+    # own default timeout, which every other caller in this file already relies
+    # on safely.
+    #
+    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift.
+    # The grace is DERIVED rather than typed (task 3798): wait_proof_grace_secs
+    # gives 80s here, a 4x margin over this 20s timeout -- wide enough that
+    # widening the timeout cannot accidentally let R's own restart land first,
+    # and small enough that a poller which escapes the timeout's kill
+    # self-terminates in 80s. It was hardcoded 99999s (27.8 HOURS), which is
+    # what let 86 leaked pollers accumulate on 2026-08-06 and 82 more the next
+    # day, each eventually reaching expiry after its fake systemctl had been
+    # GC'd out of pytest's tmpdir. See wait_proof_grace_secs for both sides of
+    # that invariant.
+    spawn_timeout = 20
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _boundary_run_drain_script(
             bin_dir, state_path, fleet_dir, clock_file,
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            # Wide margin over the couple of bash+python3 subprocess spawns
-            # needed to reach the assertion point below (SELF_UNIT/list-units,
-            # the idle unit's drain-check+baseline+restart, R's drain-check)
-            # so a loaded CI host can't push the idle unit's restart past the
-            # cutoff and flake the ordering assertion; FORCE_FIRE_AFTER_SECS
-            # is 99999s, so widening this can't accidentally let R's own
-            # restart land before the timeout fires.
-            #
-            # 20s (not 8s): under full tests/scripts/ suite load (32-way
-            # xdist), the handful of subprocess spawns above can collectively
-            # take long enough under CPU contention that an 8s wall-clock cap
-            # kills the child before R's "deferring restart of ...: mid-merge"
-            # line (a plain, unbuffered bash `echo`) is even reached -- not a
-            # buffering issue, just insufficient scheduling margin. 20s
-            # matches _boundary_run_drain_script's own default timeout, which
-            # every other caller in this file already relies on safely.
-            timeout=20,
+            timeout=spawn_timeout,
         )
 
     stdout = _boundary_decode(exc_info.value.stdout)
