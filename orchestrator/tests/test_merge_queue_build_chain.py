@@ -559,6 +559,7 @@ class TestChainBuildLane:
         lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
 
         assert warm is True
+        assert lane is not None
         assert lane == git_ops.worktree_base / '_spec-0'
         assert await git_ops._is_registered_worktree(lane)
         assert await _rev_parse(lane) == head_sha
