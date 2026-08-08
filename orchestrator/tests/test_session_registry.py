@@ -4898,6 +4898,16 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
     which pins the no-duplicate half; this pins that even a DOWNGRADE lands
     when it comes from the same queue.
+
+    ...with the CUSTODY fields excepted, which is the other half of this
+    test. ``filed_at`` and ``manual_boost`` are NOT the watcher's to revise:
+    a restart is not news about when the gate was first surfaced (filed_at
+    drives cockpit ordering), and the boost belongs to the OPERATOR via
+    set_manual_boost. merge_decision_enrichment already holds both back on
+    the cross-queue path; custody cannot depend on which queue re-filed, or
+    an operator who boosts a row to the top of the queue silently loses it
+    on the watcher's next restart -- the very "second write downgrades an
+    open record" shape task 3559 removes.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, _recon = _two_queues(tmp_path)
@@ -4910,6 +4920,10 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
         task_id='5914',
         escalations_dir=str(orch),
     )
+    # An operator triages the cockpit between the two filings: boosts the row
+    # to the top of the queue. The watcher then restarts and re-files.
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
     _file_decision(
         id='esc-5914-1',
         project='df',
@@ -4923,6 +4937,82 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     assert listed[0].text == 'reify? (rephrased)'
     assert listed[0].severity == 'info'
     assert listed[0].task_id is None
+    assert listed[0].manual_boost == 9  # the operator's boost survives
+    assert listed[0].filed_at == filed_at  # queue age not restamped
+
+
+def test_main_write_decision_same_id_different_project_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cross-PROJECT id collision is not a MODE-2 collapse, and must not merge.
+
+    DecisionRecords are fleet-global, both watcher SKILLs tell a watcher to
+    use the escalation id as the decision id, and ``esc-<taskid>-<n>`` task
+    numbering RESTARTS per project -- so 'esc-42-1' in dark_factory and
+    'esc-42-1' in reify are two unrelated human gates that collide. Two
+    projects also always run different queue dirs, so such a collision lands
+    on exactly the queue-differs axis the enrichment branch keys on: without
+    a project check it would be folded into the other project's record,
+    producing ONE cockpit row that claims to be A's ask (A's project, text
+    and filed_at kept, severity maxed up by B) while B's gate is invisible
+    and unreapable by B's reaper.
+
+    Refused rather than overwritten: overwriting would delete a live row
+    instead, which is the clobber this task exists to stop. Same
+    first-writer-wins policy as a conflicting queue stamp, and loud, so the
+    collision is a log line rather than a silent misfiling.
+
+    Deliberately arranged so the merge is DETECTABLE rather than a no-op:
+    the incumbent is the POORER record (info, no task/session id) and the
+    colliding filing is richer, so enrichment would visibly leak B's
+    severity and ids onto A's row. Asserting only `project`/`text` would be
+    vacuous -- enrichment keeps those from *existing* too.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-42-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='info',
+        escalation_id='esc-42-1',
+        escalations_dir=str(orch),
+    )
+    with caplog.at_level(logging.ERROR):
+        rc2 = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            task_id='42',
+            session_id='watcher-reify-1',
+            escalation_id='esc-42-1',
+            escalations_dir=str(recon),
+        )
+
+    assert rc1 == 0
+    assert rc2 == 0  # loud, but fail-soft: never changes spawn-claude.sh's rc
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-42-1']
+    survivor = listed[0]
+    # Untouched in EVERY field -- not merged, not overwritten, not enriched.
+    assert survivor.project == 'df'
+    assert survivor.text == 'Adopt the reify plan?'
+    assert survivor.severity == 'info'  # NOT maxed up by the other project
+    assert survivor.task_id is None  # no empty field filled from reify
+    assert survivor.session_id is None
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
+    refusals = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
+    ]
+    assert refusals, 'the refusal must be logged, not silent'
+    assert 'reify' in refusals[0].getMessage()  # names the refused project
+    assert 'df' in refusals[0].getMessage()  # ...and the incumbent
 
 
 def test_main_write_decision_non_open_record_is_still_overwritten(

@@ -2703,17 +2703,30 @@ def _run_write_decision(
     construction (it is the same dir it passes to reap-decisions), so there
     is no legitimate write-path caller.
 
-    UPSERT, NOT A BLIND OVERWRITE (task 3559). If an OPEN record already
-    exists at this id and its stored queue stamp DIFFERS from *stamp*, this
-    is a second watcher observing the same human gate through a different
-    queue (the observed esc-5914-1 MODE-2 shape), so the incoming filing is
-    folded in via merge_decision_enrichment -- never clobbering or
-    downgrading what the first watcher wrote. Everything else keeps today's
-    full overwrite: no existing record (the normal first-filing case), an
-    unreadable/corrupt one, a NON-open one (a question the human already
-    dealt with -- a new filing there starts a new ask), or a MATCHING queue
-    stamp (the same watcher re-filing across a restart, which both SKILL.md
-    files promise is idempotent).
+    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an OPEN record at the
+    same id, three cases are told apart:
+
+    - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
+      DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
+      numbering restarts per project. REFUSED (loud, fail-soft, nothing
+      written): merging would hide this ask inside the other project's row
+      and overwriting would delete that row.
+    - DIFFERENT queue stamp -- the second watcher observing the same human
+      gate through another queue (the observed esc-5914-1 MODE-2 shape), so
+      the filing is folded in via merge_decision_enrichment rather than
+      clobbering or downgrading what the first watcher wrote.
+    - MATCHING queue stamp -- the SAME watcher re-filing across a restart,
+      which both SKILL.md files promise is idempotent, so its whole view
+      lands (including fields going down or empty). Only ``filed_at`` and
+      ``manual_boost`` are held back, as CUSTODY: a restart is not news
+      about queue age and says nothing about the operator's C5 boost, which
+      belongs to set_manual_boost. Same rule merge_decision_enrichment
+      applies cross-queue -- custody does not depend on which queue re-filed.
+
+    Everything else keeps today's full overwrite: no existing record (the
+    normal first-filing case), an unreadable/corrupt one, or a NON-open one
+    (a question the human already dealt with -- a new filing there starts a
+    new ask, boost and age included).
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -2808,19 +2821,75 @@ def _run_write_decision(
                 # Absent (the common first-filing case), unreadable, or
                 # corrupt: all fall through to writing fresh.
                 existing = None
-            if (
-                existing is not None
-                and existing.state == DecisionState.OPEN
-                and normalize_escalations_dir(existing.escalations_dir) != stamp
-            ):
-                # A DIFFERENT queue filing against a live record: this is the
-                # MODE-2 cross-queue collapse, so enrich rather than
-                # overwrite. A matching stamp is the SAME watcher re-filing
-                # across a restart, which both SKILL.md files promise is a
-                # plain idempotent overwrite; a non-open record is a question
-                # the human already dealt with, so a new filing against it
-                # starts a new ask rather than editing a closed row.
-                record = merge_decision_enrichment(existing, incoming)
+            if existing is not None and existing.state == DecisionState.OPEN:
+                if existing.project != project:
+                    # SAME id, DIFFERENT project: an id COLLISION, not a
+                    # MODE-2 collapse. Both SKILL.md files tell a watcher to
+                    # use the escalation id as the decision id, and
+                    # esc-<taskid>-<n> task numbering RESTARTS per project,
+                    # so 'esc-42-1' in dark_factory and 'esc-42-1' in reify
+                    # are two unrelated gates. Two projects also always have
+                    # different queue dirs, so without this guard every such
+                    # collision lands in the enrichment branch below and gets
+                    # folded into the OTHER project's row -- one cockpit row
+                    # claiming to be project A's ask while B's human gate is
+                    # invisible and unreapable by B's reaper.
+                    #
+                    # Refuse rather than overwrite: overwriting would DELETE a
+                    # live row (with any operator boost and state on it),
+                    # which is the clobber this whole task exists to stop, and
+                    # leaves exactly one of the two gates visible either way.
+                    # Refusing is the non-destructive, deterministic choice --
+                    # the same first-writer-wins policy _merge_queue_and_
+                    # escalation_id applies to a conflicting queue stamp.
+                    # Scoped to an OPEN record for the same reason the rest of
+                    # this branch is: a non-open row is a question already
+                    # dealt with, and a new filing there starts a new ask.
+                    logger.error(
+                        'write-decision refusing to file %s for project %s: an OPEN '
+                        'decision already exists at that id for a DIFFERENT project '
+                        '(%s). DecisionRecords are fleet-global while esc-<taskid>-<n> '
+                        'ids restart per project, so this is an id COLLISION, not a '
+                        'MODE-2 cross-queue collapse of one human gate -- merging '
+                        'would hide this ask inside the other project\'s cockpit row '
+                        'and overwriting would delete that row, so neither is safe. '
+                        'The existing row is left intact and THIS ask did not reach '
+                        'the cockpit; it is still carried by the in-session note / '
+                        'afk-digest line this filing accompanies. Re-file it under an '
+                        'id that is unique fleet-wide.',
+                        decision_id,
+                        project,
+                        existing.project,
+                    )
+                    return
+                if normalize_escalations_dir(existing.escalations_dir) != stamp:
+                    # A DIFFERENT queue filing against a live record: this is
+                    # the MODE-2 cross-queue collapse, so enrich rather than
+                    # overwrite.
+                    record = merge_decision_enrichment(existing, incoming)
+                else:
+                    # A MATCHING stamp is the SAME watcher re-filing across a
+                    # restart, which both SKILL.md files promise is a plain
+                    # idempotent overwrite -- text, severity and task_id are
+                    # its own to revise, including downwards.
+                    #
+                    # But filed_at and manual_boost are CUSTODY fields, and
+                    # custody does not depend on which queue the re-file came
+                    # from: merge_decision_enrichment already keeps both on
+                    # the cross-queue path, and the same reasoning binds here.
+                    # A watcher restart is not new information about queue AGE
+                    # (filed_at drives the cockpit's ordering), and it is not
+                    # information about the OPERATOR's C5 boost at all -- that
+                    # is set_manual_boost's field, written by a different
+                    # subsystem. Without this, an operator who boosts a row to
+                    # the top of the queue silently loses it on the next
+                    # watcher restart, which is precisely the "second writer
+                    # downgrades an open record" shape this task removes.
+                    record = dataclasses.replace(
+                        incoming,
+                        filed_at=existing.filed_at,
+                        manual_boost=existing.manual_boost,
+                    )
 
             if write_decision(record):
                 print(record.id)
