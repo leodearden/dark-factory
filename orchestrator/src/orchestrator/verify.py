@@ -7941,9 +7941,12 @@ async def confirm_isolated_rerun_verdict(
 
     node_ids = _extract_failing_test_ids(failing_result.test_output)
     if not node_ids:
+        # We examined NOTHING — an opaque/lint/type-only failure names no test.
+        # test_ids is empty, which §8 permits only on an `unconfirmable` row.
         return _observe(
-            FlakeVerdict.fails_in_isolation, (),
-            call_site=call_site, runner=runner, now=now,
+            FlakeVerdict.unconfirmable, (),
+            call_site=call_site, runner=runner,
+            reason='no_recoverable_node_ids', now=now,
         )
 
     # Map each node-id to its owning subproject over the given module_configs
@@ -7954,10 +7957,35 @@ async def confirm_isolated_rerun_verdict(
     groups = _group_node_ids_by_subproject(
         worktree, mc_by_prefix, node_ids, log_label=policy.log_label,
     )
+    # `not groups`, NOT `is None`: BOTH sentinels must fail closed. Falling
+    # into the groups.items() loop with an empty dict would exit having run
+    # ZERO isolated re-runs and then report `passes_in_isolation` — a full
+    # suppression verdict on zero evidence, letting a genuinely red merge land.
     if not groups:
+        # Name the offending node-ids HERE so this ONE line answers both
+        # "which tests failed to map?" and "what did the gate decide?" without
+        # correlating a second line: the shared helper's own INFO names the
+        # first unmappable node-id but only knows the neutral 'unconfirmable',
+        # while the verdict vocabulary is the CALLER's alone (hence
+        # policy.unmapped_log_tail). Rendering `groups` also separates the
+        # reachable None case from the defensive-only {}. The preview is
+        # bounded — a mass failure can extract hundreds of node-ids, and a log
+        # line is not a report.
+        shown = node_ids[:10]
+        extra = len(node_ids) - len(shown)
+        logger.info(
+            '%s: node-id -> subproject mapping yielded nothing usable (%r) '
+            'for %s%s in %s — unconfirmable, %s',
+            policy.log_label, groups, shown,
+            f' (+{extra} more)' if extra else '', worktree,
+            policy.unmapped_log_tail,
+        )
+        # We DID examine these specific tests, so they are named (PRD B6) —
+        # unlike the "nothing to examine" branch above.
         return _observe(
-            FlakeVerdict.fails_in_isolation, node_ids,
-            call_site=call_site, runner=runner, now=now,
+            FlakeVerdict.unconfirmable, node_ids,
+            call_site=call_site, runner=runner,
+            reason='node_ids_unmapped_to_subproject', now=now,
         )
 
     # Each subproject group gets its own scoped + forced-serial +
@@ -7976,9 +8004,23 @@ async def confirm_isolated_rerun_verdict(
             mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
         )
         observation = await policy.engine(worktree, config, scoped_mc)
+        # Groups are evaluated IN ORDER and the FIRST non-pass short-circuits,
+        # preserving today's early `return None` — a later group's verdict
+        # cannot rescue an earlier one, so there is nothing to gain by
+        # continuing and a full re-run's cost to lose.
         if observation.outcome is not _RerunOutcome.passed:
             if policy.log_group_not_confirmed is not None:
                 policy.log_group_not_confirmed(prefix, observation)
+            if observation.outcome is _RerunOutcome.unconfirmable:
+                # We could not RE-RUN, which is not evidence the test is red.
+                # Reporting this as `fails_in_isolation` would launder an
+                # infrastructure failure into a verdict about the code.
+                return _observe(
+                    FlakeVerdict.unconfirmable, node_ids,
+                    call_site=call_site, runner=runner,
+                    reason=f'infra_transient_rerun:{observation.category or "unknown"}',
+                    now=now,
+                )
             return _observe(
                 FlakeVerdict.fails_in_isolation, node_ids,
                 call_site=call_site, runner=runner, now=now,
