@@ -935,6 +935,19 @@ class TaskInterceptor:
             # meanwhile — the same pattern curator_escalator.py's
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
+            #
+            # task_metadata (task 3751) comes off the SAME `before` snapshot
+            # as old_status, so the metadata and live_status the gate sees can
+            # never disagree, and no second get_task is issued. The RAW value
+            # is forwarded deliberately: check() owns the coercion (via
+            # _coerce_metadata_dict), so a dict, a JSON-object string, a
+            # malformed blob, or an absent key all degrade to
+            # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
+            # the forwarding enables at gate 2 is live_workflow_detector's
+            # task_kind-scoped rules, none of which were reachable there while
+            # only `status` was passed: rule 2 (blocked + deterministic, task
+            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
+            # (pending + deterministic + pure gate, task 3751).
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -951,6 +964,7 @@ class TaskInterceptor:
                     target_status=status,
                     live_status=old_status,
                     snapshot_token=None,
+                    task_metadata=before.get('metadata') if isinstance(before, dict) else None,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
