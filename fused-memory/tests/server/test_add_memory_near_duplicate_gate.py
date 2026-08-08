@@ -57,18 +57,33 @@ def _topic_cluster(
     )
 
 
+# The real post-RRF relevance_score for a rank-1 mem0 hit on the guard's
+# single-store search path — 1/(RRF_K + 1). Task 3658 made relevance_score an
+# ordinal fusion value and moved the cosine to metadata['store_score'].
+_RRF_RANK1 = 1.0 / 61
+
+
 def _near_duplicate_result(
     id_: str = 'm1',
     score: float = 0.97,
     content: str = 'canonical .task gitignore gotcha (existing entry)',
     category: MemoryCategory = MemoryCategory.procedural_knowledge,
+    store_rank: int = 1,
 ) -> MemoryResult:
+    """Build the POST-RRF result shape the tool really receives from search().
+
+    *score* is the Mem0 COSINE and lands in ``metadata['store_score']``;
+    ``relevance_score`` carries the ordinal RRF value, deliberately unrelated
+    to it.  Every gate test in this module therefore exercises the real
+    post-task-3658 shape, with its threshold expectations unchanged.
+    """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=SourceStore.mem0,
-        relevance_score=score,
+        relevance_score=1.0 / (60 + store_rank),
+        metadata={'store_rank': store_rank, 'store_score': score},
     )
 
 
@@ -140,6 +155,17 @@ class TestAddMemoryNearDuplicateGate:
         )
         assert isinstance(result.get('similarity'), int | float), (
             f'Expected a numeric similarity, got: {result!r}'
+        )
+        # The reported similarity must be the COSINE, directly comparable to
+        # the 'threshold' emitted alongside it (0.97 vs 0.92). Quoting the
+        # ordinal RRF value (~0.0164) against a 0.92 threshold would read to
+        # the blocked agent as a guard malfunction (task 3658).
+        assert result.get('similarity') == pytest.approx(0.97), (
+            f"Expected the Mem0 cosine as 'similarity', not the fused RRF "
+            f'ordinal, got: {result!r}'
+        )
+        assert result['similarity'] > result['threshold'], (
+            f"'similarity' must be comparable to 'threshold', got: {result!r}"
         )
         assert result.get('matched_excerpt') == matched.content[:200], (
             f'Expected matched_excerpt=matched content[:200], got: {result!r}'
@@ -448,6 +474,60 @@ class TestAddMemoryNearDuplicateGate:
         assert kwargs.get('project_id') == _PROJECT_ID
         assert kwargs.get('categories') == ['procedural_knowledge']
         assert kwargs.get('limit') == 5
+
+    @pytest.mark.asyncio
+    async def test_blocks_on_results_built_by_the_real_search_path(self):
+        """End-to-end seam regression for esc-3658-1.
+
+        Every other test here hand-builds the result shape, so all of them
+        would have stayed green while the guard went dark in production.  This
+        one drives ``memory_service.search`` with results produced by the real
+        ``MemoryService._search_mem0`` — the actual RRF stamping, not a fixture
+        approximating it — and asserts the write is still soft-blocked.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        # Real _search_mem0, real stamping, stubbed only at the backend seam.
+        svc = MemoryService.__new__(MemoryService)
+        svc.mem0 = MagicMock()
+        svc.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-real-1',
+                    'memory': 'canonical .task gitignore gotcha (existing entry)',
+                    'score': 0.97,
+                    'metadata': {'category': 'procedural_knowledge'},
+                },
+            ]
+        })
+        real_results = await svc._search_mem0(
+            _CONTENT, types.SimpleNamespace(), limit=5, categories=['procedural_knowledge']
+        )
+
+        # Sanity-check the premise: this is genuinely the post-RRF shape.
+        assert real_results[0].relevance_score < 0.02
+        assert real_results[0].metadata['store_score'] == pytest.approx(0.97)
+
+        mock_service = AsyncMock()
+        mock_service.search.return_value = real_results
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', (
+            f'Real post-RRF search results must still soft-block, got: {result!r}'
+        )
+        assert result.get('matched_memory_id') == 'm-real-1'
+        assert result.get('similarity') == pytest.approx(0.97)
+        mock_service.add_memory.assert_not_called()
 
 
 class TestAddMemoryNearDuplicateGateConfig:
