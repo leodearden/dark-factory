@@ -27,7 +27,11 @@ import pytest
 # Importable because conftest.py appends REPO_ROOT to sys.path for this
 # directory. Functions only -- importing one of that module's FIXTURES into a
 # test module would bind a module-scoped copy that shadows the conftest's.
-from df_pytest_isolation import deploy_clock_snapshot, deploy_clock_violation_reason
+from df_pytest_isolation import (
+    deploy_clock_snapshot,
+    deploy_clock_violation_reason,
+    run_in_new_session,
+)
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
 UNIT_R = "orchestrator-reify.service"
@@ -200,6 +204,12 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     autouse `_df_fleet_deploy_clock_redirect` already points it at a tmp file
     for every spawner in this directory (task 3797). A per-test override still
     wins via `env=`, which is applied after the os.environ copy below.
+
+    The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
+    plain subprocess.run: subprocess.run's timeout kill()s the direct child
+    only, and this script forks poll loops that outlived it by up to 27.8h,
+    reparented to systemd --user. `_decode` below still applies -- the re-raised
+    TimeoutExpired carries the partial output the timeout tests assert on.
     """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
@@ -207,11 +217,9 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
     if env:
         full_env.update(env)
-    return subprocess.run(
+    return run_in_new_session(
         ["bash", str(SCRIPT), *extra_args],
         env=full_env,
-        capture_output=True,
-        text=True,
         timeout=timeout,
     )
 
