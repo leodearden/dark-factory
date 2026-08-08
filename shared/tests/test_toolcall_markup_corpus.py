@@ -25,7 +25,14 @@ from pathlib import Path
 import pytest
 import toolcall_markup_corpus_extract as extract
 
-from shared.toolcall_markup import INVOKE_CLOSER
+# The D5 assertion helper is imported, NOT re-derived: it is the one check in
+# the replay that is non-circular with respect to the machine-generated
+# expectation column, so it must be the SAME code the hand-authored specimen
+# tests run. Bare import works via conftest's tests/ sys.path insert (the
+# capability_manifest_corpus.py precedent).
+from test_toolcall_markup import assert_repair_invariants
+
+from shared.toolcall_markup import INVOKE_CLOSER, repair
 
 # ---------------------------------------------------------------------------
 # Synthetic-transcript builders.
@@ -533,3 +540,129 @@ class TestExtractorRobustness:
         records = extract.extract(root)
 
         assert [r['tool_use_id'] for r in records] == ['toolu_01']
+
+
+# ---------------------------------------------------------------------------
+# The committed-corpus replay contract (step 9/10, boundary row B13).
+# ---------------------------------------------------------------------------
+
+CORPUS_PATH = Path(__file__).resolve().parent / 'fixtures' / 'toolcall_markup_corpus.jsonl'
+
+
+@pytest.fixture(scope='module')
+def corpus() -> list[dict]:
+    assert CORPUS_PATH.is_file(), f'committed corpus missing at {CORPUS_PATH}'
+    return extract.load_corpus(CORPUS_PATH)
+
+
+class TestCommittedCorpus:
+    """Replay the committed specimens (PRD boundary row B13).
+
+    NO COUNT ASSERTIONS ANYWHERE IN THIS CLASS. PRD G6 is explicit that pinning
+    the reference figures would make a BETTER repairer look like a regression,
+    and the mirror-image trap is just as real: a floor on unrepairable records
+    would punish an implementation that repairs all of them. The only
+    quantitative assertion is non-emptiness. Aggregate figures live in the
+    fixture README as provenance, flagged as such.
+
+    What this class actually buys, honestly stated: (b) and (c) are REGRESSION
+    pins over a machine-generated expectation column, so they detect a CHANGE in
+    behaviour, not an error in it. (d) and (e) are non-circular by construction
+    and are the ones that could catch the repairer being wrong.
+    """
+
+    def test_corpus_exists_and_is_non_empty(self, corpus):
+        assert len(corpus) > 0
+
+    def test_every_record_carries_the_full_schema(self, corpus):
+        for record in corpus:
+            assert set(record) == set(extract.RECORD_KEYS), record.get('tool_use_id')
+            assert isinstance(record['value'], str)
+            assert isinstance(record['supplied'], list)
+            assert isinstance(record['schema_params'], list)
+            assert isinstance(record['truncated'], bool)
+            assert isinstance(record['original_length'], int)
+            assert record['expected_outcome'] in (
+                extract.OUTCOME_REPAIRED,
+                extract.OUTCOME_UNREPAIRABLE,
+            )
+
+    def test_tool_use_ids_are_unique(self, corpus):
+        ids = [record['tool_use_id'] for record in corpus]
+        assert len(ids) == len(set(ids))
+
+    def test_expectations_agree_with_replay(self, corpus):
+        """(b) Each record's stored expectation is what repair() produces now."""
+        disagreements = []
+        for record in corpus:
+            result = repair(
+                record['value'],
+                record['param'],
+                record['schema_params'],
+                record['supplied'],
+            )
+            outcome = (
+                extract.OUTCOME_UNREPAIRABLE if result is None else extract.OUTCOME_REPAIRED
+            )
+            recovered = [] if result is None else sorted(result.recovered)
+            if outcome != record['expected_outcome'] or recovered != record['expected_recovered']:
+                disagreements.append(
+                    (record['tool_use_id'], record['expected_outcome'], outcome)
+                )
+        assert not disagreements, (
+            f'{len(disagreements)} record(s) disagree with the committed expectation. '
+            'If the repairer legitimately improved, regenerate the corpus in the SAME '
+            'commit (PRD G6 anticipates exactly this). First few: '
+            f'{disagreements[:5]}'
+        )
+
+    def test_replay_is_deterministic(self, corpus):
+        """(c) Two full replays serialize identically (boundary row B13)."""
+
+        def replay() -> str:
+            rows = []
+            for record in corpus:
+                result = repair(
+                    record['value'],
+                    record['param'],
+                    record['schema_params'],
+                    record['supplied'],
+                )
+                rows.append(
+                    {
+                        'id': record['tool_use_id'],
+                        'outcome': None if result is None else 'repaired',
+                        'clean': None if result is None else result.clean_value,
+                        'recovered': None if result is None else sorted(result.recovered.items()),
+                        'pattern': None if result is None else result.pattern,
+                        'misclose': None if result is None else result.misclose,
+                    }
+                )
+            return json.dumps(rows, sort_keys=True)
+
+        assert replay() == replay()
+
+    def test_d5_holds_for_every_repaired_record(self, corpus):
+        """(d) NON-CIRCULAR: the same helper the hand-authored specimens use."""
+        for record in corpus:
+            result = repair(
+                record['value'],
+                record['param'],
+                record['schema_params'],
+                record['supplied'],
+            )
+            assert_repair_invariants(record['value'], result)
+
+    def test_every_stored_value_still_satisfies_the_collection_predicate(self, corpus):
+        """(e) NON-CIRCULAR re-derivation: no record drifted in via some other route.
+
+        Truncation rewrites the stored value, so this also proves the truncation
+        rule never produces something the corpus predicate would not have
+        collected in the first place.
+        """
+        for record in corpus:
+            assert extract.matches_collection_predicate(record['value']), record['tool_use_id']
+
+    def test_committed_file_carries_no_literal_opening_angle_bracket(self):
+        """(f) A future agent must be able to hand-edit a row safely (PRD G6)."""
+        assert '\x3c' not in CORPUS_PATH.read_text(encoding='utf-8')
