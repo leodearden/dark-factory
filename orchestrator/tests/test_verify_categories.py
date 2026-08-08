@@ -636,10 +636,14 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
 
     Also pins the invariant that should survive a future policy edit: a
     category that is infra-transient but can still surface to a human must
-    not be in ``ARCHIVE_DENY_LIST``. Asserted for SEMAPHORE_TIMEOUT
-    specifically and deliberately NOT broadened to every infra-transient
-    category — DISK_FULL, PYTEST_INTERNALERROR and ENV_TRANSIENT keep their
-    current rows, which this task does not adjudicate.
+    not be in ``ARCHIVE_DENY_LIST``. Task 3679 asserted that for
+    SEMAPHORE_TIMEOUT specifically and deliberately did NOT broaden it,
+    leaving DISK_FULL, PYTEST_INTERNALERROR and ENV_TRANSIENT unadjudicated.
+    That scope caveat is SUPERSEDED: task 3683 audited all three, found every
+    one of them reaches a human by the same category-agnostic paths, flipped
+    them, and turned the invariant into the unconditional import-time rule
+    ``is_infra_transient`` ⇒ ``archive`` — see
+    TestAssertInfraTransientRowsArchive.
 
     RED today: the row is ``archive=False``, so all four assertions fail.
     """
@@ -917,7 +921,7 @@ class TestAssertInfraTransientRowsArchive:
             ARCHIVE_DENY_LIST,
             INFRA_TRANSIENT_CATEGORIES,
         )
-        assert INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST == frozenset()
+        assert frozenset() == INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST
 
 
 class TestEnvironmentalCategoriesOutrankCodeFaults:

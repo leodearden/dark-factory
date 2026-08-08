@@ -134,15 +134,18 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # verdict was produced", so a kill must dominate any co-occurring
     # output-derived category in ``_worst_category``.
     #
-    # ``archive=True`` deliberately DIVERGES from every other infra category
-    # (INFRA_TIMEOUT / DISK_FULL / SEMAPHORE_TIMEOUT / PYTEST_INTERNALERROR /
-    # ENV_TRANSIENT are all archive=False). A kill is the one infra cause that
-    # is genuinely off-box and un-reproducible after the fact, so the durable
-    # per-attempt record is its ONLY forensic handle — the incident that
-    # motivated this row (merge_sha b1ac2c7f) was diagnosable solely because
-    # the killed leg happened to land in archive=True UNKNOWN_TEST_FAILURE.
-    # Flipping to the usual infra archive=False would delete the evidence
-    # trail and make the whole class invisible again.
+    # ``archive=True`` no longer DIVERGES from its infra-transient siblings —
+    # this row was the FIRST to hold the rule that tasks 3679 and 3683 then
+    # generalised to all of them and that
+    # ``_assert_infra_transient_rows_archive`` now enforces at import time. Its
+    # own grounding is narrower and still stands on its own: a kill is the one
+    # infra cause that is genuinely off-box and un-reproducible after the fact,
+    # so the durable per-attempt record is its ONLY forensic handle — the
+    # incident that motivated this row (merge_sha b1ac2c7f) was diagnosable
+    # solely because the killed leg happened to land in archive=True
+    # UNKNOWN_TEST_FAILURE. (INFRA_TIMEOUT is deliberately outside that rule:
+    # it is ``is_infra_transient=False``, so it is legitimately still
+    # archive=False and the guard does not cover it.)
     #
     # verdict_indeterminate=True, and the SOLE row that holds it: this is the
     # only category whose evidence is a waitpid status rather than a text
@@ -343,7 +346,54 @@ def _validate_exhaustive(enum_cls, policy) -> None:
         )
 
 
+def _assert_infra_transient_rows_archive(policy) -> None:
+    """Raise if any ``is_infra_transient`` row in *policy* has ``archive=False``.
+
+    The rule ``is_infra_transient`` ⇒ ``archive`` holds UNCONDITIONALLY, which
+    is why this needs no ``human_reachable`` field and no per-category branch
+    (task 3683's audit). Every consumer that retries an infra-transient result
+    tests flat ``in INFRA_TRANSIENT_CATEGORIES`` set membership with no
+    per-category branch — workflow.py:9020's in-process window,
+    merge_queue.py:2761's post-merge verify, verify.py:7255's isolated-confirm
+    gate — so no member can be structurally exempt from any of them. Each of
+    those windows is BOUNDED, and exhausting one files a BLOCKING level-1
+    ``infra_issue`` escalation: workflow.py:9060-9067 stamps
+    ``escalate_to_human=True``, which short-circuits the steward L0 at :14436
+    and reaches :14791; merge_queue.py:3134 routes through workflow.py:10305 to
+    the same place; harness.py:11325 files the red-main equivalent.
+
+    At that point the archived per-attempt log is the ONLY triage artifact the
+    human gets beyond a truncated ``failure_report()`` — and archival is
+    decided PER ATTEMPT from the category alone (``_archive_attempt_log`` →
+    ``_should_archive_category``, verify.py:1902), inside the retry loop, with
+    no knowledge of whether this is the exhausting attempt. So an
+    infra-transient row with ``archive=False`` discards the evidence on the
+    attempt that hands the incident to a human too. That is the reify
+    esc-5848-2 / esc-5893-3 failure, and this guard is what stops a future
+    infra-transient category shipping with it again.
+
+    Takes ``policy`` as a PARAMETER rather than closing over the module global
+    — the established pattern of its siblings ``_validate_exhaustive`` and
+    ``_assert_sentinels_disjoint`` — so a synthetic table is directly testable
+    without needing a real import crash to observe the failure.
+    """
+    offenders = sorted(
+        str(category)
+        for category, row in policy.items()
+        if row.is_infra_transient and not row.archive
+    )
+    if offenders:
+        raise AssertionError(
+            'infra-transient categories must archive their verify log '
+            '(their retry windows are bounded and terminate in a blocking '
+            f'level-1 infra_issue escalation), but archive=False on: {offenders}'
+        )
+
+
 _validate_exhaustive(FailureCategory, CATEGORY_POLICY)
+# Runs BEFORE ARCHIVE_DENY_LIST is derived below, so a bad table never
+# produces a derived registry at all.
+_assert_infra_transient_rows_archive(CATEGORY_POLICY)
 
 
 # Ordered from highest to lowest severity; used by ``_worst_category``. Derived
