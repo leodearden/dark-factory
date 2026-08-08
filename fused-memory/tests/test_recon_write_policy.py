@@ -304,6 +304,133 @@ class TestCheckGate2LiveWorkflow:
 
         assert captured['kwargs'].get('status') == 'deferred'
 
+    # -- task_metadata forwarding (task 3751) --------------------------------
+    #
+    # Gate 2 forwarded ONLY `status`, never `task_kind`, so no task_kind-scoped
+    # detector rule was ever reachable here — including task 2067's rule 2. The
+    # new `task_metadata` kwarg lets check() derive both `task_kind` and
+    # `pure_gate` (via is_pure_gate_metadata) and forward them, which is what
+    # makes rule 5 — and hence the fix for task 3845's 3-cycle stall — reachable
+    # at the one gate where the bare orchestrator lock actually blocks a write.
+
+    @staticmethod
+    def _capture_detector_kwargs(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            return False
+
+        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
+        return captured
+
+    def test_gate_2_forwards_pure_gate_shape_from_task_metadata(self, monkeypatch):
+        """THE FIX — a pending deterministic PURE GATE's metadata yields
+        task_kind='deterministic' and pure_gate=True at the detector.
+
+        This is dark_factory task 3845's real metadata (verified first-hand):
+        `always_escalates=True` with NO `before_done`. The incidental
+        `operational_mode`/`execution_class` labels are deliberately NOT what the
+        classification keys on — see is_pure_gate_metadata.
+        """
+        captured = self._capture_detector_kwargs(monkeypatch)
+        _check(
+            'set_task_status',
+            task_id='3845',
+            live_status='pending',
+            task_metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'operational_mode': 'gate',
+                'execution_class': 'operational',
+            },
+        )
+
+        assert captured['kwargs'].get('status') == 'pending'
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is True
+
+    def test_gate_2_before_done_metadata_is_not_a_pure_gate(self, monkeypatch):
+        """NARROWING — a deterministic task WITH `before_done` forwards
+        pure_gate=False, so rule 5 stays inert and the orchestrator lock keeps
+        protecting it from a recon race while it may be mid-deploy."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate'},
+            },
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is False
+
+    def test_gate_2_forwards_normal_task_kind(self, monkeypatch):
+        """An ordinary task forwards its task_kind with pure_gate=False."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata={'task_kind': 'normal'},
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'normal'
+        assert captured['kwargs'].get('pure_gate') is False
+
+    def test_gate_2_without_task_metadata_forwards_none_and_false(self, monkeypatch):
+        """BACKWARD COMPATIBILITY — omitting task_metadata reproduces today's
+        behavior exactly: task_kind=None, pure_gate=False. Every caller that
+        does not pass the new kwarg is unaffected."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        _check('set_task_status', task_id='7', live_status='pending')
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+
+    def test_gate_2_coerces_json_string_task_metadata(self, monkeypatch):
+        """A JSON-object-string metadata blob is coerced via
+        _coerce_metadata_dict, the module's existing shared idiom."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        _check(
+            'set_task_status',
+            task_id='3845',
+            live_status='pending',
+            task_metadata='{"task_kind": "deterministic", "always_escalates": true}',
+        )
+
+        assert captured['kwargs'].get('task_kind') == 'deterministic'
+        assert captured['kwargs'].get('pure_gate') is True
+
+    @pytest.mark.parametrize(
+        'task_metadata',
+        ['not json', 42, '[]', None, ['a'], ''],
+        ids=['invalid-json', 'int', 'json-list', 'none', 'list', 'empty-str'],
+    )
+    def test_gate_2_malformed_task_metadata_fails_safe_toward_live(
+        self, monkeypatch, task_metadata
+    ):
+        """FAIL-SAFE — anything that is not a dict / JSON-object string degrades
+        to task_kind=None, pure_gate=False without raising, so an unparseable
+        metadata blob leaves the task live rather than suppressing its signal."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        verdict = _check(
+            'set_task_status',
+            task_id='7',
+            live_status='pending',
+            task_metadata=task_metadata,
+        )
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+        assert verdict.is_rejection is False
+
 
 # ---------------------------------------------------------------------------
 # check() gate 3 — stale snapshot (op-agnostic) + precedence
