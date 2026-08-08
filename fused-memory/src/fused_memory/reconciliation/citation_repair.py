@@ -168,6 +168,30 @@ def _find_finding(
     return None
 
 
+def _verification_error(memory_id: str, role: str, exc: BaseException) -> dict[str, Any]:
+    """The verdict for a RAISED lookup: unknown, never 'absent'.
+
+    Mirrors ``verify_cited_memories``'s third branch. A raised read leaves the
+    id's existence undetermined, and acting on 'undetermined' is precisely the
+    silent-fail this path forbids — so it is reported with the raised type as a
+    structured fact and the caller decides, rather than propagating (which would
+    crash a stage) or collapsing into a repair.
+    """
+    logger.warning(
+        'citation_repair: %s lookup for %s raised %s — refusing to act on an '
+        'undetermined citation',
+        role,
+        memory_id,
+        type(exc).__name__,
+    )
+    return _ERR_VERIFICATION_ERROR | {
+        'memory_id': memory_id,
+        'role': role,
+        'exception_type': type(exc).__name__,
+        'exception_message': str(exc),
+    }
+
+
 def _is_citation_of(entry: Any, memory_id: str) -> bool:
     """True when ``entry`` is a mem0 citation of ``memory_id``.
 
@@ -216,9 +240,51 @@ async def repair_memory_citation(
     located = _find_finding(run, finding_id)
     stage_name, _report, finding = located
 
-    replacement_record = await memory_service.get_memory_by_id(
-        run.project_id, replacement_memory_id
-    )
+    # ── Corroboration (INV-3: corroborate before acting) ──────────────────
+    # Ordered so NO journal write can happen unless every gate passes. Both
+    # reads run even for apply=False, so a dry-run tells the operator whether
+    # the gates hold before anything is written.
+    try:
+        victim_record = await memory_service.get_memory_by_id(run.project_id, memory_id)
+    except Exception as exc:
+        return _verification_error(memory_id, 'victim', exc)
+    if victim_record:
+        # Still alive — this is a valid claim, not a dangling one. Refusing here
+        # is what makes the path structurally incapable of retargeting live
+        # provenance; the worst it can ever do is re-point a claim that already
+        # had no backing.
+        return _ERR_CITATION_NOT_DANGLING | {
+            'target_run_id': target_run_id,
+            'finding_id': finding_id,
+            'memory_id': memory_id,
+            'hint': (
+                f'{memory_id} still resolves in mem0 for project '
+                f'{run.project_id!r}; only a CONFIRMED-absent citation may be '
+                'repaired.'
+            ),
+        }
+
+    replacement_record = None
+    if replacement_memory_id is not None:
+        try:
+            replacement_record = await memory_service.get_memory_by_id(
+                run.project_id, replacement_memory_id
+            )
+        except Exception as exc:
+            return _verification_error(replacement_memory_id, 'replacement', exc)
+        if not replacement_record:
+            # A repair that installed an unresolvable id would make this tool a
+            # generator of the defect it exists to fix.
+            return _ERR_REPLACEMENT_NOT_FOUND | {
+                'target_run_id': target_run_id,
+                'finding_id': finding_id,
+                'replacement_memory_id': replacement_memory_id,
+                'hint': (
+                    f'{replacement_memory_id} does not resolve in mem0 for '
+                    f'project {run.project_id!r}; omit it to DROP the dangling '
+                    'citation instead of re-pointing it.'
+                ),
+            }
 
     cited = finding.get('cited_memories') or []
     kept = [
@@ -227,13 +293,14 @@ async def repair_memory_citation(
         if not _is_citation_of(entry, memory_id)
     ]
     removed_count = len(cited) - len(kept)
-    kept.append(
-        {
-            'memory_id': replacement_memory_id,
-            'store': store,
-            'metadata_fingerprint': _fingerprint_from_record(replacement_record),
-        }
-    )
+    if replacement_memory_id is not None:
+        kept.append(
+            {
+                'memory_id': replacement_memory_id,
+                'store': store,
+                'metadata_fingerprint': _fingerprint_from_record(replacement_record),
+            }
+        )
     finding['cited_memories'] = kept
     finding.setdefault(CITATION_REPAIRS_KEY, []).append(
         build_citation_repair_record(
