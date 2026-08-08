@@ -78,6 +78,7 @@ can never be misread as health.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -147,6 +148,24 @@ start — invisible to the limits evaluator, which scans one root.
 """
 
 _WHITESPACE_RE = re.compile(r'\s+')
+
+
+def content_key(text: str) -> str:
+    """A stable 16-hex-char identity for a memory's *text*.
+
+    ``sha256(...).hexdigest()[:16]`` — the ``shared/task_metadata.py``
+    convention, matching leaf β's ``content_key`` so the two runners describe
+    the same entry the same way.
+
+    Whitespace is normalised (surrounding stripped, internal runs collapsed to
+    one space) BEFORE hashing so that re-indentation, a wrapped line or a
+    trailing newline picked up in transit does not read as a different entry.
+    Nothing else is normalised: case and punctuation are content, and folding
+    them would make two genuinely different claims collide.
+    """
+    normalized = _WHITESPACE_RE.sub(' ', text).strip()
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
+
 
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -329,3 +348,68 @@ def dangling_census(
         by_key=by_key,
         unresolved_refs=unresolved_refs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Family (2c) — the successor-pointer tripwire (supersedes edges ONLY)
+#
+# The same population the count above covers, sliced to the one key with a
+# stable per-item identity. alpha's rule (a) grandfathers by item_key and
+# ratchets: a newly-broken edge alarms, a repaired one is released silently.
+# That is expressible only per edge, which is why this metric exists ALONGSIDE
+# the aggregate count rather than instead of it.
+# ---------------------------------------------------------------------------
+
+def _tripwire_item_key(ref: PointerRef) -> str:
+    """``s-<source content hash>-<target discriminator>``.
+
+    Content-derived, never the raw source UUID (D5, "content-hash item keys
+    (UUID rot)"). Leaf α persists this key in its grandfather set, so a source
+    id that rotated under re-consolidation would present a previously-known
+    failure as a brand-new one and fire a false alarm; the content survives
+    that rotation.
+
+    The target discriminator is what keeps two edges out of ONE source
+    distinct. It is a hash rather than the target id itself for the same
+    reason the source half is: an item_key is a stored contract, and burying a
+    raw UUID in it would make the key rot with the target too.
+    """
+    target_digest = hashlib.sha256(repr(ref.target).encode('utf-8')).hexdigest()[:8]
+    return f'{TRIPWIRE_ITEM_PREFIX}{content_key(ref.source_content)}-{target_digest}'
+
+
+def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool]) -> list:
+    """One :class:`shared.memory_eval_metrics.TripwireItem` per ``supersedes`` edge.
+
+    ``parent_id``/``corrects`` refs are deliberately excluded: they are
+    measured by the ``dangling-pointers`` COUNT, whose Poisson trend needs no
+    per-item identity. A tripwire over them could not be grandfathered, since
+    those targets have no stable item key to ratchet on.
+
+    Returns the shared model directly so the tripwire's ``n == len(items)``
+    and ``value == failing count`` invariants are satisfied by construction
+    when :func:`build_series` assembles the metric.
+
+    Sorted by item_key and de-duplicated. A duplicate key means two edges with
+    identical source CONTENT pointing at the same target — the same claim
+    written twice, which is one corpus fact, not two — and the schema rejects
+    a tripwire whose ``n`` disagrees with its item count, so the collapse has
+    to happen here rather than being discovered at emit time.
+    """
+    from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
+
+    by_key: dict[str, bool] = {}
+    for ref in refs:
+        if ref.key != 'supersedes':
+            continue
+        target = ref.target if isinstance(ref.target, str) else None
+        passed = bool(target is not None and resolution.get(target, False))
+        item_key = _tripwire_item_key(ref)
+        # A repeated key is the same edge; AND rather than overwrite, so a
+        # collision can only ever make the item stricter, never quietly
+        # upgrade a broken edge to passing.
+        by_key[item_key] = by_key.get(item_key, True) and passed
+    return [
+        TripwireItem(item_key=key, passed=passed)
+        for key, passed in sorted(by_key.items())
+    ]
