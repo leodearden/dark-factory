@@ -63,25 +63,35 @@ would only duplicate it):
 
 Drop ``--apply`` from either to dry-run it first. Dry-run is the default.
 
-Status of that repair as of task 3065's implementation: BOTH invocations were
-dry-run against the live journal and BOTH passed every gate — invocation 1
-reports ``status: dry_run``, ``removed_memory_id: beacf7fc-…``, and the
-successor resolving with its real fingerprint (``category:
-procedural_knowledge``, ``agent_id: recon-stage-memory_consolidator``);
-invocation 2 reports ``status: dry_run``, ``removed_memory_id: 17085708-…``,
-``replacement_memory_id: null``. The ``--apply`` runs could NOT be performed
-from the task worktree: ``/home/leo/src/dark-factory/`` — the machine-operated
-checkout, including ``data/`` — is mounted read-only for a task agent, so the
-write raised ``sqlite3.OperationalError: attempt to write a readonly database``.
-The row was verified byte-identical afterwards (the failed write left nothing
-behind), so the two ``--apply`` runs above remain to be executed by a process
-with write access to that checkout. Run 1 before 2: after 1 the successor is
-already cited, which is why 2 is drop-only rather than a second re-point.
-That handoff is tracked as escalation ``esc-3065-5`` (scope_violation), which
-carries the measured pre-repair blob digest to verify against:
-``sha256 ea653dc8cccf8a51a61f555adb6126056d0544f38165afac13eb0fbbe882f61c``
-(11063 bytes). Both dry-runs and the read-only re-read were re-measured at
-commit ``a08e759b`` and the row was still unrepaired at that point.
+Status of that repair: DONE — APPLIED 2026-08-08 by the task-3065 steward. Do
+NOT re-run the two invocations above; they are retained only as the worked
+example of the flag shapes. Both were blocked from the task worktree
+(``/home/leo/src/dark-factory/``, including ``data/``, is not writable by a
+task agent — the write raised ``sqlite3.OperationalError: attempt to write a
+readonly database``, and the row was verified byte-identical afterwards), and
+were re-run to completion from the steward session, which does have write
+access to that checkout. Sequence, all measured against the live journal:
+
+  * pre-repair ``runs.stage_reports`` for the run re-read read-only and
+    confirmed byte-identical to the blocked implementer's snapshot —
+    ``sha256 ea653dc8cccf8a51a61f555adb6126056d0544f38165afac13eb0fbbe882f61c``,
+    11063 bytes, no ``citation_repairs`` key.
+  * both invocations re-dry-run (gates still green), then re-run with
+    ``--apply``; each returned ``status: repaired``, ``removed_count: 1``.
+  * post-repair blob ``sha256 2b8279a7be49d5bb…``, 11444 bytes. The finding's
+    ``cited_memories`` is now exactly one entry — the successor
+    ``746b4ab9-…`` with its real fingerprint (``category:
+    procedural_knowledge``, ``agent_id: recon-stage-memory_consolidator``).
+    Both retired ids survive only inside the new ``citation_repairs`` audit
+    list (``reason: memory_not_found``, ``repaired_by:
+    script:repair_recon_citation``), which is why a raw substring grep for
+    them still hits — check ``cited_memories``, not the raw blob.
+
+Rollback artifact (the pre-repair blob) is at
+``/tmp/3065-rollback/pre_stage_reports.json``; note ``/tmp`` is not durable
+across a reboot. Run 1 before 2 was and remains the required order: after 1
+the successor is already cited, which is why 2 is drop-only rather than a
+second re-point.
 """
 
 from __future__ import annotations
