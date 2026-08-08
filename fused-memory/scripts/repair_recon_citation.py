@@ -46,6 +46,7 @@ would only duplicate it):
 
     # 1. re-point the id the incident named
     python scripts/repair_recon_citation.py \\
+        --data-dir /home/leo/src/dark-factory/data/reconciliation \\
         --target-run-id 06a4466d-cdc0-49ac-8e99-e6723be39392 \\
         --finding-id 5e85117e-51fc-4a7f-8ca7-e26078dbd3f2 \\
         --memory-id beacf7fc-b76a-4c0b-876d-f4cf6d906d42 \\
@@ -54,12 +55,28 @@ would only duplicate it):
 
     # 2. drop the sibling that is also dangling (no --replacement-memory-id)
     python scripts/repair_recon_citation.py \\
+        --data-dir /home/leo/src/dark-factory/data/reconciliation \\
         --target-run-id 06a4466d-cdc0-49ac-8e99-e6723be39392 \\
         --finding-id 5e85117e-51fc-4a7f-8ca7-e26078dbd3f2 \\
         --memory-id 17085708-b888-472f-bbf3-0a06634fd4db \\
         --apply
 
 Drop ``--apply`` from either to dry-run it first. Dry-run is the default.
+
+Status of that repair as of task 3065's implementation: BOTH invocations were
+dry-run against the live journal and BOTH passed every gate — invocation 1
+reports ``status: dry_run``, ``removed_memory_id: beacf7fc-…``, and the
+successor resolving with its real fingerprint (``category:
+procedural_knowledge``, ``agent_id: recon-stage-memory_consolidator``);
+invocation 2 reports ``status: dry_run``, ``removed_memory_id: 17085708-…``,
+``replacement_memory_id: null``. The ``--apply`` runs could NOT be performed
+from the task worktree: ``/home/leo/src/dark-factory/`` — the machine-operated
+checkout, including ``data/`` — is mounted read-only for a task agent, so the
+write raised ``sqlite3.OperationalError: attempt to write a readonly database``.
+The row was verified byte-identical afterwards (the failed write left nothing
+behind), so the two ``--apply`` runs above remain to be executed by a process
+with write access to that checkout. Run 1 before 2: after 1 the successor is
+already cited, which is why 2 is drop-only rather than a second re-point.
 """
 
 from __future__ import annotations
