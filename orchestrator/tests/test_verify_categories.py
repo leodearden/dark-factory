@@ -636,6 +636,59 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
         assert verify._should_archive_category('semaphore_timeout') is True
 
 
+class TestDiskFullArchivesForHumanTriage:
+    """task 3683: DISK_FULL must archive its verify log.
+
+    Same grounding as its SEMAPHORE_TIMEOUT sibling above, reached through the
+    identical code path. DISK_FULL is ``retry_kind=NONE`` — no in-verify serial
+    re-run is attempted — and every consumer that retries it does so on FLAT
+    ``in INFRA_TRANSIENT_CATEGORIES`` set membership with no per-category
+    branch, so it cannot be structurally exempt from any of them:
+
+      * workflow.py:9020 retries any infra-transient VerifyResult for
+        ``config.verify_infra_retry_max_attempts`` (default 5) attempts. On
+        exhaustion workflow.py:9060-9067 stamps ``escalate_to_human=True`` /
+        ``category='infra_issue'``, which short-circuits the steward L0 at
+        workflow.py:14436 and files ``Escalation(severity='blocking', level=1,
+        suggested_action='manual_intervention')`` (:14791).
+      * merge_queue.py:3134 terminates post-merge verify with a
+        TRANSIENT_INFRA_REASON_PREFIX blocked outcome → workflow.py:10305 →
+        the same blocking L1.
+      * verify.py:7255's isolated-confirm gate consumes one of
+        ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` per infra-transient hit → a red-main
+        blocking L1 at harness.py:11325.
+
+    Archival is decided PER ATTEMPT from the category alone
+    (verify.py:1902), inside the retry loop, with no knowledge of whether this
+    is the exhausting attempt — so ``archive=False`` discards the log on the
+    attempt that hands the incident to a human too, leaving that human with
+    only a truncated ``failure_report()``.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:174), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.DISK_FULL].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.DISK_FULL not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('disk_full') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('disk_full') is True
+
+
 class TestEnvironmentalCategoriesOutrankCodeFaults:
     """_worst_category must pick the infra root cause over a co-occurring
     downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
