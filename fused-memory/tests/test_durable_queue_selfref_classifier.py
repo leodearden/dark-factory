@@ -304,3 +304,94 @@ class TestIdentityUuidResolution:
             'An explicit identity_payload_keys= must fully replace the default '
             'map, not merge with it.'
         )
+
+
+class TestClassifyFailure:
+    """``_classify_failure(item, exc) -> (classification, attempts_limit)``.
+
+    Permanent maps to a limit of 1 rather than a separate boolean, so the call
+    site keeps ``died = new_attempts >= limit`` as one uniform expression — and
+    correctly re-kills an item arriving with ``attempts > 0``, which is what
+    ``replay_dead`` produces: it resets status but re-executes the identical
+    poison payload.
+    """
+
+    def test_self_referential_not_found_is_permanent_at_attempt_one(self, tmp_path):
+        """The proof: the node reported missing IS the node this write exists to
+        create, so no number of retries can make it appear."""
+        u = _uuid()
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', {'uuid': u, 'content': 'c', 'group_id': 'proj1'})
+        assert q._classify_failure(item, NodeNotFoundError(u)) == ('permanent', 1)
+
+    def test_referenced_uuid_not_found_keeps_the_full_budget(self, tmp_path):
+        """CONTROL — the rule keys off the IDENTITY field, not off "a uuid
+        appearing somewhere in the payload".
+
+        Here the missing uuid is one the payload merely references. That node
+        may be in another graph or still in flight (the task's causes 3 and 4),
+        both of which retrying can genuinely resolve.
+        """
+        identity, referenced = _uuid(), _uuid()
+        q = _queue(tmp_path, AsyncMock())
+        item = _item(
+            'add_episode',
+            {'uuid': identity, 'referenced_uuid': referenced, 'content': 'c'},
+        )
+        assert q._classify_failure(item, NodeNotFoundError(referenced)) == (
+            'normal', item.max_attempts
+        ), (
+            'A not-found naming a uuid the payload merely REFERENCES must keep '
+            'its retry budget — only the identity uuid is provably doomed.'
+        )
+
+    def test_transient_error_keeps_the_extended_budget(self, tmp_path):
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        assert q._classify_failure(item, ConnectionResetError('reset')) == (
+            'transient', 12
+        )
+
+    def test_unrelated_error_is_normal(self, tmp_path):
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        assert q._classify_failure(item, RuntimeError('boom')) == ('normal', 5)
+
+    def test_unrecognised_message_falls_open_at_the_policy_layer(self, tmp_path):
+        """Fail-open is enforced at the POLICY layer, not just in the parser.
+
+        This is fused-memory's own not-found text (graphiti_client.py:1983),
+        naming the very identity uuid — yet it must still get the plain budget,
+        because the message is not the pinned format we can reason about.
+        """
+        u = _uuid()
+        q = _queue(tmp_path, AsyncMock())
+        item = _item('add_episode', {'uuid': u, 'content': 'c'})
+        assert q._classify_failure(item, Exception(f'Entity node not found: {u}')) == (
+            'normal', 5
+        )
+
+    def test_permanent_wins_over_an_operator_readded_transient_name(self, tmp_path):
+        """PRECEDENCE: permanent is decided BEFORE transient.
+
+        transient_error_names is operator-tunable and test_config_schema.py
+        deliberately permits ADDING names back (it asserts a superset, not
+        equality). If transient were checked first, re-adding NodeNotFoundError
+        would hand a provably-doomed write the extended 12-attempt budget,
+        resurrecting exactly the loop this task exists to kill. The
+        payload-derived proof must outrank the name-based guess.
+        """
+        u = _uuid()
+        q = _queue(
+            tmp_path, AsyncMock(),
+            transient_error_names={'NodeNotFoundError'},
+        )
+        item = _item('add_episode', {'uuid': u, 'content': 'c'})
+        assert q._is_transient(NodeNotFoundError(u)), (
+            'precondition: the operator override really did make this name '
+            'transient'
+        )
+        assert q._classify_failure(item, NodeNotFoundError(u)) == ('permanent', 1), (
+            'An operator re-adding a not-found name must not be able to '
+            'resurrect a retry budget for a provably self-referential failure.'
+        )
