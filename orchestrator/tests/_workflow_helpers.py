@@ -1209,6 +1209,17 @@ def same_module_siblings(lock_depth: int) -> tuple[str, str]:
     constraint, so a caller forwarding ``config.lock_depth`` really can reach
     this; failing loudly beats handing back a pair whose preconditions are
     satisfied by emptiness.
+
+    CONTRACT TEST — ``TestSameModuleSiblings`` in
+    ``test_workflow_status_on_resume.py`` pins every guarantee above across
+    depths [1, 2, 3, 4, 12, 20] plus the sub-1 boundary.  It lives in a
+    CONSUMER suite rather than next door in ``test_workflow_helpers.py``
+    (where the rest of this module's coverage sits) for a scope reason, not a
+    design one: task 3866 held no lock on that file.  Relocating it is filed
+    as follow-up work.  Until that lands, this pointer is the only thing that
+    keeps the guard discoverable from the helper it guards — so if you move
+    the test, update this paragraph, and if you change the contract, that
+    class is what will tell you.
     """
     if lock_depth < 1:
         raise ValueError(
