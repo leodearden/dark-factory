@@ -1006,6 +1006,36 @@ def _patch_subprocess_concurrency_probe(
     return state
 
 
+def _release_on_summary(monkeypatch, task_id: str) -> threading.Event:
+    """Return an Event set once the main loop has processed ``task_id``'s
+    summary — a genuine happens-before, not a timing margin.
+
+    ``launcher.log_one_summary`` is called at scripts/run_vllm_eval.py:1591,
+    immediately before the --stop-on-first-failure drain (``remaining = []``)
+    at :1603, in the same ``for fut in done`` iteration. The window can only
+    refill at the top of the NEXT ``while`` iteration (:1570), which cannot
+    run until this iteration — including the drain — has finished on the
+    main thread. So a worker thread that blocks on the returned Event, and
+    only proceeds once it fires, can never be scheduled ahead of the drain,
+    no matter how CPU scheduling delays thread start.
+
+    Do NOT replace this with a sleep: two prior fixes (b94ae82154,
+    ca05d20ffa) tuned a duration margin against unbounded thread-start
+    latency, and both re-flaked, because completion order here is governed
+    by when a thread starts, not how long its body runs.
+    """
+    event = threading.Event()
+    real = launcher.log_one_summary
+
+    def spy(s):
+        if s.task_id == task_id:
+            event.set()
+        return real(s)
+
+    monkeypatch.setattr(launcher, "log_one_summary", spy)
+    return event
+
+
 def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
     fake_tasks.mkdir(parents=True, exist_ok=True)
     for tid in task_ids:
