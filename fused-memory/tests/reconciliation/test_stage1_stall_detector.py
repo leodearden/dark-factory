@@ -16,6 +16,7 @@ Gate-backlog age check (task 3017):
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -781,7 +782,17 @@ class TestMaybeEscalateStalledGateBacklog:
         assert '645' in combined
         assert 'run-xyz' in combined
         assert stamp in combined  # the gate_escalated_at value
-        assert '49' in combined  # age indicator (~49h)
+
+        # The summary must state a live-truthful anchor (the gate_escalated_at
+        # stamp), not a filing-time-computed elapsed-hours figure that goes
+        # stale while the escalation sits open (task 3520).
+        assert 'has awaited a human decision since' in submitted.summary
+        assert stamp in submitted.summary
+        # Scoped to `summary`, not `combined`: the detail block legitimately
+        # retains a filing-time hours value (age_hours_at_filing), and the
+        # fallback summary legitimately names the 48h threshold, so this
+        # negative must not be applied to either of those.
+        assert re.search(r'\d+(?:\.\d+)?h\b', submitted.summary) is None
 
     @pytest.mark.asyncio
     async def test_skips_when_open_gate_backlog_l1_exists(self):
