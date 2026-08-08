@@ -908,6 +908,104 @@ def set_decision_escalations_dir(
     )
 
 
+def _merge_queue_and_escalation_id(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> tuple[str, str | None]:
+    """Pick ONE ``(escalations_dir, escalation_id)`` PAIR for the merged record.
+
+    THE INVARIANT, and the only reason this is a helper rather than two
+    lines inside merge_decision_enrichment: the returned pair is ALWAYS one
+    an INPUT record could vouch for. Never one filer's queue joined to the
+    other filer's id.
+
+    Merging the two fields by independent rules is what makes that possible
+    to get wrong -- adopt the incoming queue while keeping the existing id
+    and the survivor carries a pair that existed on neither record.
+    ``_run_reap_decisions._status`` is a JOIN on exactly that pair: axis 2
+    compares the stamp, then ``read_escalation_status(escalations_dir,
+    escalation_id)`` resolves the id INSIDE that queue. Since
+    ``esc-<taskid>-<n>`` ids are unique only WITHIN a queue (task 3528), a
+    synthesized pair resolves against an UNRELATED escalation that merely
+    shares the id -- and if that one has resolved, the decision closes.
+
+    That is the fail-CLOSED direction, which _run_reap_decisions' own
+    docstring rules out: "an over-held decision is a human-triageable row,
+    while a falsely closed one is invisible". It is also not hypothetical --
+    it is the incident that docstring records, a RESOLVED orchestrator
+    escalation closing a still-PENDING recon blocking gate that then sat
+    invisible in the cockpit for ~7 days. Holding a record we cannot place
+    is always the cheaper mistake.
+
+    BOTH sides are normalized before comparison, never raw-string-compared:
+    that is the fail-open mistake normalize_escalations_dir's own docstring
+    exists to prevent, and the reaper's axis-2 guard normalizes both sides
+    for exactly this reason.
+    """
+    existing_queue = normalize_escalations_dir(existing.escalations_dir)
+    incoming_queue = normalize_escalations_dir(incoming.escalations_dir)
+
+    # (1) SAME queue -- including both-'' and both-UNKNOWN_QUEUE. One shared
+    # id namespace, so the two ids are comparable and no pair can be forged:
+    # the ordinary fill-if-empty enrichment applies.
+    if existing_queue == incoming_queue:
+        return existing_queue, existing.escalation_id or incoming.escalation_id
+
+    # (2) Queues DIFFER and the first filer's is usable -- FIRST-WRITER-WINS,
+    # as a PAIR. Note the deliberate consequence: an empty
+    # existing.escalation_id is NOT filled from incoming here, because
+    # incoming's id belongs to INCOMING's namespace. Filling it would take a
+    # record reap_answered_decisions safely skips outright (`if not
+    # escalation_id: continue`) and make it resolvable against the wrong
+    # queue -- manufacturing the fail-CLOSED join out of nothing.
+    if existing_queue and existing_queue != UNKNOWN_QUEUE:
+        if incoming_queue and incoming_queue != UNKNOWN_QUEUE:
+            logger.warning(
+                'decision %s was filed from TWO different escalation queues: keeping the '
+                'first filer\'s stamp %s and DISCARDING %s. escalations_dir is a scalar '
+                '(task 3640), so a cross-queue collapse can record only one queue -- this '
+                'record is reapable only by the first one.',
+                existing.id,
+                existing_queue,
+                incoming_queue,
+            )
+        return existing_queue, existing.escalation_id
+
+    # (3) The first filer's queue is undetermined ('' or UNKNOWN_QUEUE) but it
+    # already holds a DIFFERENT escalation id -- so we cannot tell whose
+    # namespace that id lives in, and adopting the incoming queue would pair
+    # it with an id from an undetermined one. REFUSE the upgrade, loudly.
+    if existing.escalation_id and existing.escalation_id != incoming.escalation_id:
+        logger.warning(
+            'decision %s already holds escalation id %s under an undetermined queue (%r), '
+            'so it will NOT adopt the incoming queue %s: pairing that stamp with an id '
+            'from an unknown namespace could close this decision against an unrelated '
+            'escalation. The record deliberately stays fail-OPEN (unreapable, a visible '
+            'cockpit row); the remedy is the back-fill path '
+            '(scripts/backfill_decision_queue_stamp.py / set_decision_escalations_dir, '
+            'task 3640), which actually investigates provenance.',
+            existing.id,
+            existing.escalation_id,
+            existing_queue,
+            incoming_queue,
+        )
+        return existing_queue, existing.escalation_id
+
+    # (4) Genuine enrichment -- the post-3640 case this whole merge exists
+    # for: a legacy ``escalations_dir=''`` record becoming queue-scoped. The
+    # first filer holds no id of its own, or both filers claim the SAME one,
+    # so adopting the incoming record's own SELF-CONSISTENT pair clobbers
+    # nothing. (The `or existing.escalation_id` fallback is reachable only
+    # when BOTH ids are unset -- guard (3) above already returned for every
+    # case where existing holds an id incoming does not share.)
+    if incoming_queue:
+        return incoming_queue, incoming.escalation_id or existing.escalation_id
+    # Incoming offers no queue at all, so there is nothing to adopt and no
+    # id to take with it: keep our own pair rather than trading a stamp for
+    # nothing.
+    return existing_queue, existing.escalation_id
+
+
 def merge_decision_enrichment(
     existing: DecisionRecord,
     incoming: DecisionRecord,
@@ -930,21 +1028,23 @@ def merge_decision_enrichment(
       (CUSTODY). A second watcher must not restamp queue age, re-open or
       close the record (that is update_decision_state's job), or reset an
       operator's C5 cockpit boost.
-    - ``text`` / ``task_id`` / ``escalation_id`` / ``session_id`` /
-      ``options`` -- keep *existing* where it is non-empty; take *incoming*
-      ONLY to fill a field the first filer left empty/None. That fill is
-      what makes this enrichment rather than a no-op.
+    - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
+      *existing* where it is non-empty; take *incoming* ONLY to fill a field
+      the first filer left empty/None. That fill is what makes this
+      enrichment rather than a no-op.
     - ``severity``           -- ``_max_decision_severity``: never downgrade.
-    - ``escalations_dir``    -- BOTH sides are put through
-      normalize_escalations_dir before being compared (never a raw string
-      compare -- that is the fail-open mistake that normalizer's own
-      docstring exists to prevent, and the reaper's axis-2 guard already
-      normalizes both sides for exactly this reason). Then: existing empty
-      -> take incoming; existing ``UNKNOWN_QUEUE`` and incoming real -> take
-      incoming (the record becomes reapable, a genuine enrichment); incoming
-      ``UNKNOWN_QUEUE`` and existing real -> keep existing (never make a
-      reapable record unreapable); both real and DIFFERENT -> keep existing
-      (FIRST-writer-wins) and log a WARNING naming the id and both queues.
+    - ``escalations_dir`` + ``escalation_id`` -- NOT independent fields, and
+      ``escalation_id`` is deliberately NOT a plain fill-if-empty one: the
+      two move together as a PAIR via _merge_queue_and_escalation_id, whose
+      docstring carries the reasoning. In outline: same queue -> one id
+      namespace, so ordinary fill-if-empty; different queues with the first
+      filer's usable -> keep BOTH of the first filer's (FIRST-writer-wins),
+      with a WARNING naming the id and both queues when the discarded one is
+      real; first filer's queue undetermined ('' / ``UNKNOWN_QUEUE``) but
+      already carrying a different id -> refuse the upgrade, loudly; and
+      otherwise adopt the incoming record's own self-consistent pair, which
+      is the genuine post-3640 enrichment (a legacy unstamped record
+      becoming queue-scoped, or an ``UNKNOWN_QUEUE`` one becoming reapable).
 
     WHY THIS FIELD STAYS A SCALAR rather than becoming a list of queues,
     despite the cross-queue case obviously wanting one: (1) it would break
@@ -965,35 +1065,18 @@ def merge_decision_enrichment(
     DETERMINISTIC (the first filer's queue) instead of racy (whichever
     watcher wrote last). The WARNING is what surfaces it.
 
-    PURE and side-effect-free apart from the conflicting-stamp warning: it
-    returns a NEW record via dataclasses.replace and mutates neither
-    argument, so it stays trivially testable in isolation from the CLI verb
-    and a caller holding the pre-merge record still sees what it read.
+    PURE and side-effect-free apart from the two queue warnings: it returns
+    a NEW record via dataclasses.replace and mutates neither argument, so it
+    stays trivially testable in isolation from the CLI verb and a caller
+    holding the pre-merge record still sees what it read.
     """
-    existing_queue = normalize_escalations_dir(existing.escalations_dir)
-    incoming_queue = normalize_escalations_dir(incoming.escalations_dir)
-    merged_queue = existing_queue
-    if not existing_queue or (existing_queue == UNKNOWN_QUEUE and incoming_queue != UNKNOWN_QUEUE):
-        # Enrichment: '' or <unknown> -> anything the incoming filer knows.
-        # An incoming '' or <unknown> is no worse than what we hold, and the
-        # `or existing_queue` keeps us from trading a stamp for nothing.
-        merged_queue = incoming_queue or existing_queue
-    elif incoming_queue and incoming_queue != UNKNOWN_QUEUE and incoming_queue != existing_queue:
-        logger.warning(
-            'decision %s was filed from TWO different escalation queues: keeping the '
-            'first filer\'s stamp %s and DISCARDING %s. escalations_dir is a scalar '
-            '(task 3640), so a cross-queue collapse can record only one queue -- this '
-            'record is reapable only by the first one.',
-            existing.id,
-            existing_queue,
-            incoming_queue,
-        )
+    merged_queue, merged_escalation_id = _merge_queue_and_escalation_id(existing, incoming)
 
     return dataclasses.replace(
         existing,
         text=existing.text or incoming.text,
         task_id=existing.task_id or incoming.task_id,
-        escalation_id=existing.escalation_id or incoming.escalation_id,
+        escalation_id=merged_escalation_id,
         session_id=existing.session_id or incoming.session_id,
         options=existing.options or incoming.options,
         severity=_max_decision_severity(existing.severity, incoming.severity),
