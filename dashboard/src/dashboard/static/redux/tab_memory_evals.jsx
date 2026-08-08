@@ -243,7 +243,18 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
             the signal. */}
         {plottable
           ? (
-            <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
+            /* The title accounts for the BREAKS in the drawn line, where they
+               appear. `span` (the labels-derived first→last range) is what it
+               says on its own; a holed series adds how many of those runs
+               produced no sample, so the discontinuities are explained on
+               hover rather than left to read as a rendering fault. Both counts
+               come from the same two locals every other disclosure here
+               reads. */
+            <div
+              style={{ height: 26 }}
+              title={gaps ? `${span} · ${gaps} of ${points} runs produced no sample` : span}
+              data-testid="memory-eval-trend-chart"
+            >
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
@@ -299,10 +310,16 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
                   : null}
         {/* Footer count reads `points`, the SAME local the states above are
             derived from — never the labels array's own length, which would
-            contradict the no-runs state whenever the two arrays disagree. */}
+            contradict the no-runs state whenever the two arrays disagree.
+
+            The footer states COUNTS, not verdicts about the chart. The states
+            above are what say whether anything was drawn, so no clause here
+            may claim a chart was withheld: it would render directly beneath a
+            sparkline that had in fact been drawn. Still conditional, so a
+            clean series prints no dangling separator. */}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
           {points} pts
-          {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
+          {gaps ? ` · ${gaps} missing` : ''}
         </div>
       </td>
     </tr>
