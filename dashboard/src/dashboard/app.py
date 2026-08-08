@@ -64,7 +64,7 @@ from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
 )
-from dashboard.data.escalations import build_escalation_queues
+from dashboard.data.escalations import build_escalation_queues, fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     PreformattedFanoutError,
@@ -1774,11 +1774,33 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     cache forever in front of the very walk it protects.
     """
     config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
     project_dirs = _analytics_project_dirs(config)
     key = str(project_dirs)
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_escalation_analytics, project_dirs)
+        # The pins_recovery fan-out is async and MUST stay on this side of the
+        # to_thread boundary: build_escalation_analytics is the pure-sync
+        # archive walker, and an MCP round-trip inside it would block a worker
+        # thread on the network. It runs inside _refresh (not per request) so
+        # it is paid only on a cache miss, giving the annotation the same ~60s
+        # freshness as the payload it rides in — a fresher annotation could not
+        # be shown anyway, since the cache serves the whole dict.
+        #
+        # fetch_pins_recovery already isolates per-project failures (an
+        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
+        # its siblings). This guard covers only the unexpected: whatever the
+        # cause, the analytics tab must still render, one annotation short.
+        try:
+            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
+        except Exception as exc:  # noqa: BLE001 — the tab must survive this
+            logger.warning(
+                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
+            )
+            pins = None
+        return await asyncio.to_thread(
+            build_escalation_analytics, project_dirs, pins_by_project=pins,
+        )
 
     result = await _analytics_cache.get_or_refresh(
         key, _refresh, cache_ok=archive_scan_succeeded,
