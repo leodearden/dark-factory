@@ -1285,6 +1285,123 @@ class TestConcurrentLoop:
         assert fake_client.terminate_calls == ["pod-fake-1"]
         assert set(attempted) == set(task_ids)
 
+    def test_concurrent_stop_on_first_failure_drains_after_sibling_completion(
+        self, monkeypatch, tmp_path
+    ):
+        """Permanent, deterministic reproduction of the 2026-08-06 /
+        2026-08-07 field failures, which no test previously covered: a
+        non-failing sibling's summary is processed by the main loop before
+        the failing task even starts, so the loop refills EXACTLY once
+        before it observes the failure and drains.
+
+        Contrast with test_concurrent_no_stop_flag_attempts_all_tasks_under_adverse_order
+        above is the point: identical fixture and forced ordering, only the
+        --stop-on-first-failure flag and the attempted set differ. No
+        bound-style assertion (<=3, <=4, "the tail is never attempted")
+        could distinguish this outcome from a regression that deleted the
+        drain entirely — see the baseline above, which shows the undrained
+        trace under the identical ordering is the full {10..14}. This test
+        is green on arrival: it characterizes already-correct production
+        code (scripts/run_vllm_eval.py's refill-at-top / drain-in-body
+        loop), it does not fix a bug.
+        """
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        # Two chained gates, not one. df_task_11 waits for df_task_10's
+        # summary (forces the one-sibling-first order). That alone is NOT
+        # enough to pin the refill count: once df_task_12 is submitted, if
+        # ITS completion were left unguarded it could race ahead of
+        # df_task_11's failure and trigger a SECOND cascading refill
+        # (df_task_13) — this was caught empirically (an earlier version of
+        # this test flaked exactly that way under xdist scheduling delay).
+        # So df_task_12 additionally waits for df_task_11's summary before
+        # it is allowed to *complete* (it can still be *submitted* earlier —
+        # only its completion is gated), which pins the drain to have
+        # already run before df_task_12 finishes, closing that window.
+        released_10 = _release_on_summary(monkeypatch, "df_task_10")
+        released_11 = _release_on_summary(monkeypatch, "df_task_11")
+
+        attempted: list[str] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                attempted.append(task_id)
+                if task_id == "df_task_11":
+                    assert released_10.wait(timeout=10.0), (
+                        "df_task_10 summary never observed by the main loop"
+                    )
+                    results.mkdir(parents=True, exist_ok=True)
+                    _write_result(
+                        results,
+                        task_id,
+                        config_name,
+                        "fail00001",
+                        outcome="blocked",
+                        metrics={"cost_usd": 5.0},
+                    )
+                    return SimpleNamespace(returncode=1)
+                if task_id != "df_task_10":
+                    assert released_11.wait(timeout=10.0), (
+                        "df_task_11 summary never observed by the main loop"
+                    )
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        captured: dict = {}
+        real_print = launcher.print_summary_table
+
+        def capture_print(summaries):
+            captured["summaries"] = summaries
+            return real_print(summaries)
+
+        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+                "--stop-on-first-failure",
+            ]
+        )
+
+        assert rc == 1
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # One initial wave of 2 (df_task_10, df_task_11) plus exactly one
+        # refill (df_task_12) — derived from the loop's refill-at-top /
+        # drain-in-body structure at scripts/run_vllm_eval.py:1567-1602, not
+        # fitted to observed output. This is the set a bound-style assertion
+        # cannot tell apart from a no-drain regression.
+        assert set(attempted) == {"df_task_10", "df_task_11", "df_task_12"}
+        summary_ids = {s.task_id for s in captured["summaries"]}
+        assert summary_ids == set(attempted)
+        blocked = [s for s in captured["summaries"] if s.task_id == "df_task_11"]
+        assert blocked and blocked[0].status == "blocked"
+
     def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
         """Failing task stops the queue but in-flight tasks finish."""
         results = tmp_path / "results"
