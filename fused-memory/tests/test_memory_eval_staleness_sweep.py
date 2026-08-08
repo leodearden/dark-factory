@@ -663,5 +663,348 @@ class TestBuildSeries:
         assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
 
 
+# ---------------------------------------------------------------------------
+# The async I/O band
+#
+# Thin by design: fetch, normalise, hand off to the pure functions above. What
+# is asserted here is the CALL SHAPE (which primitive, how many times, with
+# what filter) and the disclosure of anything the fetch narrowed — not any
+# metric arithmetic, which is already covered above without a store.
+# ---------------------------------------------------------------------------
+
+def _raw_point(point_id: str, payload: dict) -> dict:
+    """One record as ``scroll_by_metadata`` returns it."""
+    return {'id': point_id, 'created_at': '2026-08-01T00:00:00+00:00', 'metadata': payload}
+
+
+def _mock_memory(*, scroll_return=None, by_id=None):
+    """A MagicMock MemoryService whose two read primitives are AsyncMocks."""
+    from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+    memory = MagicMock()
+    memory.mem0 = MagicMock()
+    memory.mem0.scroll_by_metadata = AsyncMock(return_value=scroll_return or [])
+    memory.get_memory_by_id = AsyncMock(side_effect=lambda _p, mid: (by_id or {}).get(mid))
+    return memory
+
+
+@pytest.mark.asyncio
+class TestFetchPointerRecords:
+    """One capped scroll per Mem0 category, with the cap disclosed."""
+
+    async def test_one_scroll_per_category_with_the_category_filter(self):
+        m = _mod()
+        memory = _mock_memory()
+
+        _records, stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge', 'preferences_and_norms'),
+            scan_limit=1234,
+        )
+
+        # There is no single "scan everything" call to make: the primitive
+        # builds an AND-equality filter and REJECTS an empty filter dict, so
+        # the per-category loop is the enumeration, not a missed optimisation.
+        assert memory.mem0.scroll_by_metadata.await_count == 2
+        filters = [call.args[1] for call in memory.mem0.scroll_by_metadata.await_args_list]
+        assert filters == [
+            {'category': 'procedural_knowledge'},
+            {'category': 'preferences_and_norms'},
+        ]
+        for call in memory.mem0.scroll_by_metadata.await_args_list:
+            assert call.args[0].project_id == 'dark_factory'
+            assert call.kwargs.get('limit') == 1234
+        assert set(stats) == {'procedural_knowledge', 'preferences_and_norms'}
+
+    async def test_records_are_normalised_to_the_pure_bands_shape(self):
+        m = _mod()
+        raw = [_raw_point('m1', {
+            'data': 'the successor text',
+            'category': 'procedural_knowledge',
+            'supersedes': UUID_B,
+        })]
+        memory = _mock_memory(scroll_return=raw)
+
+        records, _stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=10,
+        )
+
+        assert len(records) == 1
+        # The exact {'id','content','metadata'} shape _record() builds, so the
+        # pure functions above are the SAME code path a live run drives.
+        assert records[0]['id'] == 'm1'
+        assert records[0]['content'] == 'the successor text'
+        assert records[0]['metadata']['supersedes'] == UUID_B
+        assert m.pointer_targets(records[0]) == [
+            m.PointerRef(
+                source_id='m1', key='supersedes', target=UUID_B,
+                source_content='the successor text',
+            ),
+        ]
+
+    async def test_a_firing_cap_is_disclosed_per_category(self):
+        m = _mod()
+        raw = [_raw_point(f'm{i}', {'data': f'text {i}'}) for i in range(3)]
+        memory = _mock_memory(scroll_return=raw)
+
+        _records, stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=3,
+        )
+
+        # scanned == scan_limit means the scroll may have stopped short. A cap
+        # firing on one category must never be readable as a clean sweep of
+        # the whole corpus, so it is counted per category and reported.
+        assert stats['procedural_knowledge'] == {'scanned': 3, 'truncated': 1}
+
+    async def test_an_unfilled_scan_is_disclosed_as_untruncated(self):
+        m = _mod()
+        memory = _mock_memory(scroll_return=[_raw_point('m1', {'data': 'x'})])
+
+        _records, stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=50,
+        )
+
+        assert stats['procedural_knowledge'] == {'scanned': 1, 'truncated': 0}
+
+    async def test_a_repeated_category_is_scrolled_once(self):
+        m = _mod()
+        memory = _mock_memory(scroll_return=[_raw_point('m1', {'data': 'x'})])
+
+        records, stats = await m.fetch_pointer_records(
+            memory, 'dark_factory',
+            categories=('procedural_knowledge', 'procedural_knowledge'),
+            scan_limit=10,
+        )
+
+        # Re-scrolling appends a second copy of every record under the SAME
+        # id, which would double every pointer edge in the census.
+        assert memory.mem0.scroll_by_metadata.await_count == 1
+        assert [r['id'] for r in records] == ['m1']
+        assert stats['procedural_knowledge']['scanned'] == 1
+
+    async def test_a_scan_timeout_propagates(self):
+        m = _mod()
+        memory = _mock_memory()
+        memory.mem0.scroll_by_metadata.side_effect = TimeoutError('qdrant read timed out')
+
+        with pytest.raises(TimeoutError):
+            await m.fetch_pointer_records(
+                memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=10,
+            )
+
+
+@pytest.mark.asyncio
+class TestResolvePointerTargets:
+    """Every target is corroborated against the live store (INV-3)."""
+
+    async def test_one_live_read_per_unique_target(self):
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'one', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-2', 'two', corrects=UUID_B)),
+            *m.pointer_targets(_record('rec-3', 'three', supersedes=UUID_C)),
+        ]
+        memory = _mock_memory(by_id={UUID_B: {'id': UUID_B, 'content': 'x', 'metadata': {}}})
+
+        resolution = await m.resolve_pointer_targets(memory, 'dark_factory', refs)
+
+        # A target cited by several sources costs ONE read, but the read is
+        # never skipped: resolving against the already-scrolled snapshot would
+        # make the census self-confirming, since the scroll is capped and
+        # category-scoped and a target outside it exists but is not in hand.
+        assert memory.get_memory_by_id.await_count == 2
+        assert [call.args[1] for call in memory.get_memory_by_id.await_args_list] == [
+            UUID_B, UUID_C,
+        ]
+        assert all(call.args[0] == 'dark_factory'
+                   for call in memory.get_memory_by_id.await_args_list)
+        assert resolution == {UUID_B: True, UUID_C: False}
+
+    async def test_a_none_return_maps_to_unresolved(self):
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'one', supersedes=UUID_A))
+        memory = _mock_memory(by_id={})
+
+        assert await m.resolve_pointer_targets(memory, 'dark_factory', refs) == {UUID_A: False}
+
+    async def test_a_resolve_timeout_is_never_reported_as_a_dangling_pointer(self):
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'one', supersedes=UUID_A))
+        memory = _mock_memory()
+        memory.get_memory_by_id.side_effect = TimeoutError('qdrant read timed out')
+
+        # get_memory_by_id propagates TimeoutError precisely so "absent" and
+        # "backend blipped" stay distinguishable. Folding it into the
+        # unresolved count would fabricate a defect and fire an alpha alarm on
+        # an infrastructure blip.
+        with pytest.raises(TimeoutError):
+            await m.resolve_pointer_targets(memory, 'dark_factory', refs)
+
+    async def test_a_malformed_target_costs_no_read_and_is_not_resolved(self):
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'one', supersedes=['not-a-uuid', 7]))
+        memory = _mock_memory()
+
+        resolution = await m.resolve_pointer_targets(memory, 'dark_factory', refs)
+
+        # A non-id-shaped value cannot be handed to a point-id read at all --
+        # but it is not thereby forgiven: dangling_census still counts it
+        # unresolved off its absence from this map.
+        assert memory.get_memory_by_id.await_count == 0
+        assert resolution == {}
+        census = m.dangling_census(refs, resolution)
+        assert census.unresolved == 2
+
+    async def test_an_empty_ref_set_issues_no_reads(self):
+        m = _mod()
+        memory = _mock_memory()
+        assert await m.resolve_pointer_targets(memory, 'dark_factory', []) == {}
+        assert memory.get_memory_by_id.await_count == 0
+
+
+class _BackendDouble:
+    """A SqliteTaskBackend stand-in recording its lifecycle calls."""
+
+    def __init__(self, taskmaster_config, *, statuses=None, fail=None):
+        self.config = taskmaster_config
+        self._statuses = statuses or {}
+        self._fail = fail
+        self.calls: list[str] = []
+
+    async def start(self) -> None:
+        self.calls.append('start')
+
+    async def get_statuses(self, project_root: str) -> dict[str, str]:
+        self.calls.append(f'get_statuses:{project_root}')
+        if self._fail is not None:
+            raise self._fail
+        return self._statuses
+
+    async def close(self) -> None:
+        self.calls.append('close')
+
+
+def _taskmaster_config(project_root: str = '/repo'):
+    return types.SimpleNamespace(
+        taskmaster=types.SimpleNamespace(project_root=project_root),
+    )
+
+
+def _install_backend_double(monkeypatch, double_holder, **kwargs):
+    """Patch the module attribute the sweep's function-local import resolves."""
+    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
+
+    def _factory(taskmaster_config):
+        double = _BackendDouble(taskmaster_config, **kwargs)
+        double_holder.append(double)
+        return double
+
+    monkeypatch.setattr(sqlite_task_backend, 'SqliteTaskBackend', _factory)
+
+
+@pytest.mark.asyncio
+class TestFetchTerminalTaskIds:
+    """The task join: terminal means {done, cancelled}, and a skip says so."""
+
+    async def test_it_starts_reads_and_closes_the_backend(self, monkeypatch):
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles, statuses={'1': 'done'})
+
+        await m.fetch_terminal_task_ids(_taskmaster_config('/repo'))
+
+        assert doubles[0].calls == ['start', 'get_statuses:/repo', 'close']
+
+    async def test_only_the_shared_terminal_statuses_are_selected(self, monkeypatch):
+        from shared.task_statuses import TERMINAL  # noqa: PLC0415
+
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles, statuses={
+            '4802': 'done',
+            '4803': 'cancelled',
+            '4804': 'in-progress',
+            '4805': 'deferred',
+            '4806': 'pending',
+        })
+
+        join = await m.fetch_terminal_task_ids(_taskmaster_config())
+
+        # deferred is NOT terminal: a deferred task can still be worked, so a
+        # live-state assertion about one is not stale.
+        # The STATUS rides along, not just the id -- it is what lets the
+        # report say which terminal state the entry is contradicting.
+        assert join.statuses == {'4802': 'done', '4803': 'cancelled'}
+        assert 'deferred' not in TERMINAL
+        assert join.skipped_reason is None
+
+    async def test_ids_are_normalised_to_strings(self, monkeypatch):
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles, statuses={4802: 'done'})
+
+        join = await m.fetch_terminal_task_ids(_taskmaster_config())
+
+        # referenced_task_ids() yields strings off TASK_REF_RE, so an int key
+        # here would silently never match and the family would read as clean.
+        assert join.statuses == {'4802': 'done'}
+
+    async def test_the_backend_is_closed_even_when_the_read_raises(self, monkeypatch):
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles, fail=RuntimeError('db locked'))
+
+        join = await m.fetch_terminal_task_ids(_taskmaster_config())
+
+        assert 'close' in doubles[0].calls
+        assert join.statuses == {}
+        assert join.skipped_reason is not None
+        assert 'db locked' in join.skipped_reason
+
+    async def test_an_unconfigured_taskmaster_is_a_named_skip_not_an_empty_set(
+        self, monkeypatch,
+    ):
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles)
+
+        join = await m.fetch_terminal_task_ids(types.SimpleNamespace(taskmaster=None))
+
+        # No backend is even constructed, and -- the load-bearing part -- the
+        # skip is DISTINGUISHABLE from a genuine "no terminal tasks". Both
+        # omit the metric (zero exposure), but only one of them means the
+        # family was measured and found clean.
+        assert doubles == []
+        assert join.statuses == {}
+        assert join.skipped_reason is not None
+        assert join.available is False
+
+    async def test_a_genuine_empty_result_is_available_not_skipped(self, monkeypatch):
+        m = _mod()
+        doubles: list[_BackendDouble] = []
+        _install_backend_double(monkeypatch, doubles, statuses={'1': 'pending'})
+
+        join = await m.fetch_terminal_task_ids(_taskmaster_config())
+
+        assert join.statuses == {}
+        assert join.available is True
+        assert join.skipped_reason is None
+
+    async def test_a_skipped_join_omits_the_family_rather_than_emitting_a_zero(
+        self, monkeypatch,
+    ):
+        m = _mod()
+        _install_backend_double(monkeypatch, [])
+
+        join = await m.fetch_terminal_task_ids(types.SimpleNamespace(taskmaster=None))
+        inputs = _full_inputs()
+        inputs['staleness'] = m.terminal_staleness(
+            [_record('rec-3', 'Task 4802 status=in-progress')], join.statuses,
+        )
+        series = m.build_series(**inputs)
+
+        assert 'task-terminal-staleness' not in _ids(series)
+        assert 'task-terminal-staleness' in m.metric_families_not_measured(series)
+
+
 if __name__ == '__main__':  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
