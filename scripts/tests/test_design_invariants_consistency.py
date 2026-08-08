@@ -1405,3 +1405,152 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
         canonical_family(),
         source=_repo_relative(FIXTURES_DOC),
     )
+
+
+# ---------------------------------------------------------------------------
+# Registry completeness — the SITE LIST is itself mechanized
+#
+# A drift guard whose site list is hand-maintained reproduces the exact defect it
+# exists to prevent: it reads green while a newly created enumeration site sits
+# unpinned. So `PINNED_SITES` is not trusted — it is checked against a scan. Any
+# markdown under the repo root, docs/legibility/ or skills/ carrying at least
+# `_ENUMERATION_THRESHOLD` DISTINCT canonical slugs must be registered.
+#
+# Registration means "this file's relationship to the family is pinned", NOT
+# "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs,
+# because what is pinned there is the ABSENCE of a restatement.
+#
+# plans/ and docs/prds/ are excluded BY DESIGN, not by oversight. Their PRDs and
+# capability manifests transcribe slugs as point-in-time G7 walk records (a scan
+# measured fourteen such files at 5-7 slugs each); those records must NOT be
+# updated when the family changes, so pinning them would force rewriting history.
+# ---------------------------------------------------------------------------
+
+
+def _write_fixture_site(directory: Path, name: str, slugs: list[str]) -> Path:
+    """A throwaway markdown file enumerating `slugs`, for the scan's unit tests.
+
+    Written under ``tmp_path`` rather than into the repo: the scan's own fixtures
+    must not be discoverable BY the scan, or the live assertion would go red on
+    this module's test data.
+    """
+    body = "\n".join(f"- `{slug}` — a restated entry" for slug in slugs)
+    path = directory / name
+    path.write_text(f"# fixture site\n\n{body}\n", encoding="utf-8")
+    return path
+
+
+_FIXTURE_SLUGS = [slug for _, slug in _FIXTURE_FAMILY]
+
+
+def test_unregistered_enumeration_sites_is_empty_when_every_site_is_pinned(
+    tmp_path: Path,
+) -> None:
+    """The green case: over-threshold files are all registered, so nothing is returned.
+
+    Includes the two shapes that must NOT be reported — a registered file carrying
+    zero slugs (CONTRIBUTING.md's post-fix state, pinned as an absence) and an
+    unregistered file that mentions slugs but stays under the threshold.
+    """
+    enumerating = _write_fixture_site(tmp_path, "enumerating.md", _FIXTURE_SLUGS[:4])
+    absence = _write_fixture_site(tmp_path, "absence.md", [])
+    under = _write_fixture_site(tmp_path, "under-threshold.md", _FIXTURE_SLUGS[:3])
+
+    registry = {str(enumerating): "enumerates the family", str(absence): "pinned as an absence"}
+
+    assert (
+        unregistered_enumeration_sites(
+            [enumerating, absence, under], registry, _FIXTURE_FAMILY, threshold=4
+        )
+        == []
+    )
+
+
+def test_unregistered_enumeration_sites_reports_a_new_unpinned_site(tmp_path: Path) -> None:
+    """A NEW enumeration site that nobody pinned is exactly what this scan is for."""
+    registered = _write_fixture_site(tmp_path, "registered.md", _FIXTURE_SLUGS[:5])
+    newcomer = _write_fixture_site(tmp_path, "newcomer.md", _FIXTURE_SLUGS[:4])
+
+    registry = {str(registered): "enumerates the family"}
+
+    assert unregistered_enumeration_sites(
+        [registered, newcomer], registry, _FIXTURE_FAMILY, threshold=4
+    ) == [str(newcomer)]
+
+
+def test_unregistered_enumeration_sites_counts_distinct_slugs_only(tmp_path: Path) -> None:
+    """Threshold is DISTINCT slugs: a doc quoting one slug six times is not an enumeration.
+
+    Counting occurrences instead would flag every doc that discusses a single
+    invariant in depth — noise that would train readers to add files to the
+    registry to silence it, which is how a guard stops meaning anything.
+    """
+    repeated = _write_fixture_site(tmp_path, "repeated.md", [_FIXTURE_SLUGS[0]] * 6)
+
+    assert unregistered_enumeration_sites([repeated], {}, _FIXTURE_FAMILY, threshold=4) == []
+
+
+def test_unregistered_enumeration_sites_fails_loudly_on_an_empty_scan(tmp_path: Path) -> None:
+    """An empty file list RAISES rather than returning ``[]``.
+
+    ``[]`` from an empty scan is indistinguishable from "every site is pinned" —
+    a broken glob would report the guard's strongest possible result while
+    checking nothing at all.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        unregistered_enumeration_sites([], {}, _FIXTURE_FAMILY, threshold=4)
+
+    assert "no files" in str(excinfo.value).lower()
+    assert tmp_path.exists()  # the fixture dir is unused here by design
+
+
+def test_every_enumeration_site_is_pinned() -> None:
+    """LIVE: no markdown file enumerates the family without being registered.
+
+    This is the assertion that keeps `PINNED_SITES` honest. Without it the
+    registry would be one more hand-maintained enumeration — the very shape this
+    module exists to mechanize — and a newly written site could enumerate the
+    family, drift on the next invariant, and never turn anything red.
+
+    The scan is asserted NON-VACUOUS in two independent ways before its result is
+    trusted: every registered site must actually be reachable by the globs (a
+    typo'd root or a moved doc is otherwise silently unpinned), and the normative
+    doc itself must clear the threshold (it defines every slug, so if IT does not
+    register as an enumeration the reader, the slug family, or the threshold is
+    broken).
+    """
+    family = canonical_family()
+    scanned = _enumeration_scan_files()
+
+    missing = sorted(site for site in PINNED_SITES if REPO_ROOT / site not in scanned)
+    assert not missing, (
+        f"registered site(s) {missing} are not reachable by the enumeration scan "
+        f"(task 3802). Either the file moved — update PINNED_SITES — or the scan "
+        f"roots {sorted(_SCAN_ROOTS)} no longer cover it, in which case a whole "
+        f"tree of sites is unpinned and this guard is reading green over nothing."
+    )
+
+    assert NORMATIVE_DOC in scanned and (
+        len({slug for _, slug in family if slug in NORMATIVE_DOC.read_text(encoding="utf-8")})
+        >= _ENUMERATION_THRESHOLD
+    ), (
+        f"{_repo_relative(NORMATIVE_DOC)} defines every slug in the family yet "
+        f"does not clear the {_ENUMERATION_THRESHOLD}-slug enumeration threshold "
+        f"(task 3802) — the scan cannot detect an enumeration site at all, so its "
+        f"empty result below would be vacuous."
+    )
+
+    unregistered = unregistered_enumeration_sites(
+        scanned, PINNED_SITES, family, threshold=_ENUMERATION_THRESHOLD
+    )
+    assert not unregistered, (
+        f"markdown file(s) {unregistered} restate {_ENUMERATION_THRESHOLD}+ "
+        f"invariant slugs but are not in PINNED_SITES (task 3802). Every such "
+        f"copy has to be updated by hand when an invariant is added, and every "
+        f"one this repo has had drifted. Either pin the site here (add it to "
+        f"PINNED_SITES with an assertion covering what it enumerates) or stop "
+        f"enumerating there and point at {_repo_relative(NORMATIVE_DOC)} instead. "
+        f"Note that plans/ and docs/prds/ are excluded on purpose — they record "
+        f"point-in-time G7 walks that must not be retro-edited — so a new PRD "
+        f"transcribing slugs will never appear here."
+    )
