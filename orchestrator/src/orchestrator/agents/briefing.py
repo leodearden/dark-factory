@@ -1213,28 +1213,33 @@ Handle this escalation, then call `resolve_issue` with a summary.
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
         sections = []
+        foreign_dropped = 0
 
         try:
             # Project overview
-            overview = await self._mcp_search('project overview architecture goals')
+            overview, dropped = await self._scoped_search('project overview architecture goals')
+            foreign_dropped += dropped
             if overview:
                 sections.append(f'## Project Context\n\n{overview}')
 
             # Conventions
-            conventions = await self._mcp_search('coding conventions and project norms')
+            conventions, dropped = await self._scoped_search('coding conventions and project norms')
+            foreign_dropped += dropped
             if conventions:
                 sections.append(f'## Conventions\n\n{conventions}')
 
             # Recent decisions
-            decisions = await self._mcp_search('recent decisions and rationale')
+            decisions, dropped = await self._scoped_search('recent decisions and rationale')
+            foreign_dropped += dropped
             if decisions:
                 sections.append(f'## Recent Decisions\n\n{decisions}')
 
             # Task-specific context
             if task_id:
-                task_ctx = await self._mcp_search(
+                task_ctx, dropped = await self._scoped_search(
                     f'task {task_id} context and related decisions'
                 )
+                foreign_dropped += dropped
                 if task_ctx:
                     sections.append(f'## Task Context\n\n{task_ctx}')
 
@@ -1245,7 +1250,32 @@ Handle this escalation, then call `resolve_issue` with a summary.
         if not sections:
             return '# Context\n\n_No memory context available._'
 
+        if foreign_dropped > 0:
+            logger.info(
+                f'_get_memory_context: filtered {foreign_dropped} memory result(s) tagged to '
+                f'another project out of the context assembled for {self.project_id!r}'
+            )
+            sections.append(
+                f'_{foreign_dropped} memory result(s) tagged to another project were filtered '
+                'out of this context._'
+            )
+
         return '# Context\n\n' + '\n\n---\n\n'.join(sections)
+
+    async def _scoped_search(self, query: str) -> tuple[str | None, int]:
+        """Search fused-memory and drop cross-project results from the reply.
+
+        Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
+        which queries fire or their ``limit`` (task 3253 owns that
+        adjudication) — that applies :func:`filter_foreign_project_results`
+        to the raw text before it reaches :meth:`_get_memory_context`.
+        Returns ``(None, 0)`` when the underlying search itself returned
+        nothing (nothing to filter).
+        """
+        raw = await self._mcp_search(query)
+        if not raw:
+            return None, 0
+        return filter_foreign_project_results(raw, self.project_id)
 
     async def _mcp_search(self, query: str) -> str | None:
         """Search fused-memory via its MCP HTTP endpoint."""
