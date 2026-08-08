@@ -1448,19 +1448,22 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
 
     orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH is the single
     authoritative relative path (task 2396). Neither the stdlib watchdog
-    (FLEET_DEPLOY_CLOCK_PATH) nor restart-all-orchestrators.sh (CLOCK_FILE)
-    can import it, so each hardcodes its own mirror. If those mirrors ever
-    drifted from the authoritative constant, the watchdog would read a
-    different file than the script writes — permanently un-gating the
-    staleness backstop and silently reintroducing the I2 hole this task
-    closes, with every other test still green. This pins all three copies
-    together, mirroring test_orch_restart_min_interval_secs_matches_config_default
-    above.
+    (FLEET_DEPLOY_CLOCK_PATH), restart-all-orchestrators.sh (CLOCK_FILE), nor
+    df_pytest_isolation (PROTECTED_DEPLOY_CLOCK_RELPATHS — stdlib+pytest only,
+    since every subproject conftest imports it) can import it, so each
+    hardcodes its own mirror. If those mirrors ever drifted from the
+    authoritative constant, the watchdog would read a different file than the
+    script writes — permanently un-gating the staleness backstop and silently
+    reintroducing the I2 hole this task closes, with every other test still
+    green; and the test-suite guard (task 3797) would watch a file nobody
+    writes, i.e. green and useless. This pins all FOUR copies together,
+    mirroring test_orch_restart_min_interval_secs_matches_config_default above.
     """
     from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
 
     # --- watchdog mirror (FLEET_DEPLOY_CLOCK_PATH) ---
     monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
     expected_watchdog_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
     assert expected_watchdog_path == wdog.FLEET_DEPLOY_CLOCK_PATH
@@ -1476,6 +1479,28 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
         "did its literal shape change? Update this regex to match."
     )
     assert match.group(1) == FLEET_DEPLOY_CLOCK_RELPATH
+
+    # --- pytest-guard mirror (df_pytest_isolation, task 3797) ---
+    # The suite-wide guard that fails a run which stamped a REAL deploy clock
+    # can only protect the file it names. A drifted mirror there is the worst
+    # kind of failure: silently green, watching a path nobody writes.
+    import df_pytest_isolation
+
+    assert FLEET_DEPLOY_CLOCK_RELPATH in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off "
+        f"FLEET_DEPLOY_CLOCK_RELPATH ({FLEET_DEPLOY_CLOCK_RELPATH!r}); the "
+        "test-suite deploy-clock guard would watch a file nobody writes."
+    )
+
+    fm_relpath = str(
+        pathlib.Path(wdog.FM_DEPLOY_CLOCK_PATH).relative_to(pathlib.Path(wdog.REPO_DIR))
+    )
+    assert fm_relpath in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off the "
+        f"watchdog's FM_DEPLOY_CLOCK_PATH default ({fm_relpath!r}); fused-memory's "
+        "deploy clock has the identical min-interval semantics and needs the "
+        "same guard."
+    )
 
 
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
