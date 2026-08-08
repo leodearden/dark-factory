@@ -699,6 +699,31 @@ class TestExtractSnapshotEdgeTaskIds:
             # marker present but NOT adjacent to the enumeration+copula: the
             # BRANCH is active, not the tasks
             'Tasks 1020 and 1030 were merged into the active branch.',
+            # ---------------------------------------------------------- #
+            # Prepositional-complement over-selection (amendment,
+            # reviewer_comprehensive correctness-precision finding, task
+            # 3079). In each of these the plural NP is the COMPLEMENT OF A
+            # PREPOSITION, so the copula's real subject is an outer head
+            # noun and the marker describes THAT, not the tasks. Every one
+            # is a permanently-true historical/meta fact, so the sweep
+            # would retire it the instant any referenced id went terminal —
+            # the over-selection direction the module docstring forbids,
+            # and the same class task 3042 closed for LIST_INTRODUCER_RE.
+            # ---------------------------------------------------------- #
+            # singular outer head — 'is' cannot agree with a plural subject,
+            # so plural-agreement on the copula alone already refuses these
+            'The merge of tasks 1020 and 1030 is blocked.',
+            'Review of tasks 1020 and 1030 is pending.',
+            'Documentation for tasks 1020 and 1030 is still pending.',
+            'Verification of tasks 1020, 1030, and 1031 is pending.',
+            # PLURAL outer head — the plural copula agrees with the OUTER
+            # head here, so these survive a plural-agreement-only fix and
+            # are what force the second remedy (preposition lookbehinds)
+            'Dependencies for tasks 1020 and 1030 are blocked.',
+            'The merges of tasks 1020 and 1030 are blocked.',
+            'Reviews of tasks 1020, 1030, and 1031 are pending.',
+            'Work on tasks 1020 and 1030 is blocked.',
+            'The dependency between tasks 1020 and 1030 is blocked.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
@@ -706,10 +731,40 @@ class TestExtractSnapshotEdgeTaskIds:
 
         Same anchoring discipline the rest of the module enforces: the
         marker must sit immediately after the enumeration and its copula,
-        and the copula is mandatory so a plural subject followed by a
-        transitive verb never reads as a status assertion.
+        the copula is mandatory so a plural subject followed by a transitive
+        verb never reads as a status assertion, and the enumeration must be
+        the copula's SUBJECT rather than a preposition's complement.
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # These two are the load-bearing pair: both end in the letters
+            # 'on'/'ion' immediately before ' tasks', so they prove the
+            # preposition guard is \b-anchored and does not fire on a word
+            # that merely ENDS in a preposition.
+            ('Migration tasks 1020 and 1030 are pending.', {1020, 1030}),
+            ('Verification tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # a marker-qualified plural head is still a subject
+            ('Blocked tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # a determiner before the plural head is not a preposition
+            ('The tasks 1020 and 1030 are blocked.', {1020, 1030}),
+            # 'remain' must survive the copula narrowing to plural agreement
+            ('Tasks 1020 and 1030 remain pending.', {1020, 1030}),
+        ],
+    )
+    def test_plural_enumeration_subject_positives_survive_precision_guards(
+        self, fact, expected
+    ):
+        """Subject-position enumerations still extract. (task 3079)
+
+        These pass before the prepositional-complement fix and must keep
+        passing after it — they are what stops the guard from over-reaching
+        into a blanket disabling of the plural path. Together with the
+        precision guards above they pin the fix from both directions.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
 
     def test_plural_enumeration_needs_two_or_more_ids(self):
         """A plural head over a single id is not an enumeration. (task 3079)
