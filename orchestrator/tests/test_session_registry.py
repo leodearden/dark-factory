@@ -982,13 +982,17 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state, set_manual_boost and set_decision_escalations_dir
-    must EACH acquire decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost, set_decision_escalations_dir and
+    the write-decision verb must EACH acquire decision_id_lock for the
+    correct decision id.
 
-    One case per public helper, deliberately, even though all three now share
-    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
-    that grows its own body (or a wrapper that mutates before delegating)
-    would slip past a single shared-implementation test. TestDecisionIdLock
+    One case per public caller, deliberately, even though the three setters
+    now share _mutate_decision: the lock is a per-caller CONTRACT, and a
+    setter that grows its own body (or a wrapper that mutates before
+    delegating) would slip past a single shared-implementation test. The
+    write-decision verb is precisely such a caller -- it does NOT go through
+    _mutate_decision at all (it is an upsert, not a strict RMW), so nothing
+    but this spy would notice its lock disappearing. TestDecisionIdLock
     covers the lock primitive itself; these cover its ADOPTION.
     """
 
@@ -1064,6 +1068,76 @@ class TestDecisionHelpersAdoptLock:
 
         assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
+    def test_main_write_decision_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The write-decision verb is the FOURTH writer on a decision id --
+        and the only one that may CREATE the record rather than only mutate
+        an existing one.
+
+        Asserted on the CREATE path deliberately: two watchers can file the
+        same id concurrently with nothing on disk yet, so the span needs the
+        lock even when there is no existing record to merge with. It is also
+        the path a reader is most likely to assume needs no locking.
+        """
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-spy-4',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+        assert rc == 0
+        assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
+
+    def test_main_write_decision_refusal_takes_no_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A REFUSED invocation must not take the lock.
+
+        decision_id_lock's own docstring flags ORPHAN SIDECARS: the
+        ``<id>.json.lock`` file is created on acquisition and never cleaned
+        up, so locking before the stamp guards would litter the decisions
+        dir with sidecars for ids that are never written -- one per
+        mis-invocation, forever. The guards therefore run FIRST.
+        """
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        rc = sr.main(
+            ['write-decision', '--id', 'dec-spy-5', '--project', 'df', '--text', 'q',
+             '--escalations-dir', '']
+        )
+
+        assert rc == 0
+        assert acquired == []
+
 
 @pytest.mark.timeout(30)
 def test_concurrent_state_and_boost_updates_do_not_lose_a_field(
@@ -1113,6 +1187,84 @@ def test_concurrent_state_and_boost_updates_do_not_lose_a_field(
     [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'dec-race']
     assert reread.state == sr.DecisionState.ANSWERED
     assert reread.manual_boost == 7
+
+
+@pytest.mark.timeout(30)
+def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write-decision verb's read->merge->write span must serialize too.
+
+    Task 3559 turned _run_write_decision from a blind single write into a
+    read-then-write, which is exactly the hazard decision_id_lock exists for
+    and which update_decision_state / set_manual_boost /
+    set_decision_escalations_dir already name in their Concurrency NOTEs. It
+    is a REAL race, not a theoretical one: the whole point of the enrichment
+    branch is that two watchers on two queues file the same id, and nothing
+    stops them doing so at the same moment.
+
+    Same deterministic in-process idiom as
+    test_concurrent_state_and_boost_updates_do_not_lose_a_field: a fixed
+    delay is injected into the module-level write_decision seam -- AFTER
+    each call's read, BEFORE its write -- so both threads read the same
+    pre-merge snapshot before either writes.
+
+    Without the lock, the later os.replace() clobbers the earlier call's
+    enrichment: each thread's merged record carries only ITS OWN
+    contribution (task_id or session_id, never both), so whichever writes
+    last silently drops the other watcher's information -- the very
+    lost-update this task exists to stop, reintroduced one level up. With
+    the lock, the second span re-reads the first's persisted record and
+    merges on top, so both contributions survive and the severity is the max
+    across all three filings rather than whichever landed last.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    third = tmp_path / 'third'
+    third.mkdir()
+    sr.write_decision(
+        _make_decision(
+            id='esc-race-1',
+            project='df',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            severity='info',
+            task_id=None,
+            session_id=None,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    real_write_decision = sr.write_decision
+
+    def delayed_write_decision(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        time.sleep(0.3)
+        return real_write_decision(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', delayed_write_decision)
+
+    def file_from(queue: Path, **extra: str) -> None:
+        _file_decision(id='esc-race-1', project='df', text='reify?', escalations_dir=str(queue), **extra)
+
+    t1 = threading.Thread(target=file_from, args=(recon,), kwargs={'task_id': '5914', 'severity': 'critical'})
+    t2 = threading.Thread(target=file_from, args=(third,), kwargs={'session_id': 'watcher-3', 'severity': 'urgent'})
+
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive(), 'recon-queue write-decision thread did not finish in time'
+    assert not t2.is_alive(), 'third-queue write-decision thread did not finish in time'
+
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'esc-race-1']
+    # Neither filer's contribution was dropped...
+    assert reread.task_id == '5914'
+    assert reread.session_id == 'watcher-3'
+    assert reread.severity == 'urgent'
+    # ...and the first filer's fields are still intact.
+    assert reread.text == 'Adopt the reify plan?'
+    assert reread.escalations_dir == sr.normalize_escalations_dir(orch)
 
 
 # ---------------------------------------------------------------------------
