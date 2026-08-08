@@ -524,7 +524,7 @@ async def maybe_escalate_stalled_gate_backlog(
             f'run_id: {run_id}',
             f'task_id: {task_id}',
             f'gate_escalated_at: {gate_escalated_at}',
-            f'age_hours: {age_hours if age_hours is not None else "unknown"}',
+            f'age_hours_at_filing: {age_hours if age_hours is not None else "unknown"}',
         ]
         title = task.get('title') if isinstance(task, dict) else None
         if title:
