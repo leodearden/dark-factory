@@ -97,6 +97,44 @@ logger = logging.getLogger(__name__)
 # must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
 
+# Reciprocal Rank Fusion constant for the cross-store merge in
+# MemoryService.search (task 3658, PRD D4 — deliberately a module constant, not
+# config: it is part of the documented read contract, not an operator knob).
+#
+# The consequence worth internalizing: because K dominates the ranks in play
+# (limit is typically <= 20), the fused value is an ORDINAL, never a similarity.
+# Every possible score lives in the narrow band 1/(K+1) .. 1/(K+limit) — for
+# K=60, roughly 0.0164 down to 0.0125. Do not read a fused score as "how
+# similar"; per-store truth lives in metadata['store_score'].
+RRF_K = 60
+
+
+def _rrf_score(rank: int) -> float:
+    """Reciprocal Rank Fusion score for a 1-based per-store rank (task 3658).
+
+    The value is ORDINAL, never a similarity: rank-1 scores 1/(RRF_K + 1) =
+    1/61 ~ 0.0164 and rank-2 scores 1/62 ~ 0.0161, regardless of how good
+    either result actually is.  Consumers must not compare it across API
+    versions or treat it as a distance; the honest per-store signal is
+    ``metadata['store_score']`` (the Mem0 cosine; ``None`` for Graphiti, which
+    exposes no scores at all — the very reason RRF was chosen over score
+    calibration).
+
+    The PRD writes fusion as ``Σ over stores of 1/(K + rank_store(r))``, but
+    that sum degenerates to this single term for every result here: Graphiti
+    results are keyed by edge uuid and Mem0 results by memory id, and there is
+    no cross-store dedup anywhere in the pipeline, so no result is ever
+    contributed by more than one store.  A real multi-term accumulator would be
+    dead code no input can exercise.
+
+    That degeneracy is exactly what fixes the Mem0 shut-out: with one term per
+    result, the merged order becomes a rank INTERLEAVE (graphiti-1, mem0-1,
+    graphiti-2, mem0-2, ...) rather than one store's results wholesale
+    preceding the other's.
+    """
+    return 1.0 / (RRF_K + rank)
+
+
 # Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
 # Used by _restore_superseded_dependency_edges to identify edges that should
 # never be superseded by LLM edge-resolution.
@@ -3458,6 +3496,19 @@ class MemoryService:
         When include_planned=False (default), edges whose entire provenance is
         composed of planned-only episodes are excluded.  When include_planned=True,
         those edges are returned and marked with metadata['planned'] = True.
+
+        Results are ranked by Graphiti's own backend ordering and carry, in
+        metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING edges
+            (an edge dropped for ``invalid_at`` or planned-only provenance does
+            not consume a rank).
+          - ``store_score``: always ``None`` — Graphiti's public ``search()``
+            exposes no scores, and synthesizing one would be a lie the
+            cross-store merge would then act on.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
+        similarity.
         """
         edges = await self.graphiti.search(
             query=query,
@@ -3473,7 +3524,7 @@ class MemoryService:
             )
 
         results = []
-        for i, edge in enumerate(edges):
+        for edge in edges:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
@@ -3508,19 +3559,22 @@ class MemoryService:
                 # Skip planning-only edges in normal search results.
                 continue
 
-            # Score: rank-based (no explicit score from Graphiti search)
-            score = max(0.0, 1.0 - (i * 0.05))
+            # Rank over SURVIVORS only (task 3658): the raw enumerate index
+            # counted edges skipped above, and since RRF maps rank directly to
+            # score, a gap would silently penalize Graphiti for facts the
+            # caller never sees.
+            rank = len(results) + 1
 
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
             if is_planned_edge:
                 metadata['planned'] = True
 
             results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(i)),
+                id=getattr(edge, 'uuid', str(rank)),
                 content=fact,
                 category=None,
                 source_store=SourceStore.graphiti,
-                relevance_score=score,
+                relevance_score=_rrf_score(rank),
                 provenance=provenance,
                 temporal=temporal,
                 entities=entities,
