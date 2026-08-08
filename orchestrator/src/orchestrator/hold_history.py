@@ -132,6 +132,23 @@ def iter_hold_spans(
     span is a hold whose end was IMPOSED; a dropped span is a hold whose end was
     never observed at all — the second would have to be fabricated, so it isn't.
 
+    TWO boundary sources, ONE code path (INV-5):
+
+    1. a ``service_restart`` row, closing at its own timestamp;
+    2. a **run_id transition** between consecutive rows, closing at the
+       PREVIOUS row's timestamp — the last instant the stream shows the lock
+       still held.
+
+    (2) is not redundant with (1).  ``service_restart`` has a single emit site
+    scoped to a *backing service* (service_restart.py:747-759), so an
+    orchestrator crash or systemd restart emits no such row at all — while
+    ``fetch_events_by_type_all_runs`` spans runs by construction.  Without the
+    run-id boundary, a span stranded at the end of one run stays open until some
+    ``service_restart`` days later and reports a multi-day hold that never
+    happened: the infinite-hold failure D11 exists to prevent.
+
+    Spans still open when the stream ENDS are dropped, not closed at "now".
+
     *era_boundaries* accepts extra boundary timestamps (POSIX seconds) beyond
     the ones this helper derives from the stream itself.  They are interleaved
     into the stream in timestamp order (a boundary at or before a row's
@@ -160,6 +177,9 @@ def iter_hold_spans(
             yield from _close_all(pending_boundaries[boundary_i])
             boundary_i += 1
 
+    prev_run_id = ''
+    prev_at = 0.0
+
     for r in rows:
         event_type = str(r.get('event_type') or '')
         if event_type not in _INTERESTING:
@@ -168,6 +188,20 @@ def iter_hold_spans(
         if at is None:
             logger.debug('hold_history: unparseable timestamp %r — row dropped', r.get('timestamp'))
             continue
+
+        run_id = str(r.get('run_id') or '')
+        if run_id and prev_run_id and run_id != prev_run_id:
+            # ERA BOUNDARY (run transition).  Close at the PREVIOUS row's
+            # timestamp, not this one: the prior run ended somewhere in the gap
+            # and `prev_at` is the last instant we have evidence the lock was
+            # still held.  Closing at `at` would charge the whole inter-run gap
+            # — however many days of it — to a hold nobody observed.
+            yield from _close_all(prev_at)
+        # A row with no run_id carries the current era forward rather than
+        # opening an "unknown" one: firing a boundary on missing data would
+        # truncate real spans.
+        prev_run_id = run_id or prev_run_id
+        prev_at = at
 
         yield from _drain_boundaries_through(at)
 
@@ -203,3 +237,12 @@ def iter_hold_spans(
                 yield HoldSpan(task_id, module, start, at)
 
     yield from _drain_boundaries_through(float('inf'))
+
+    if open_spans:
+        # END OF STREAM.  Unlike an era boundary, nothing here observed an end
+        # — closing these at "now" would invent a duration for a hold whose
+        # termination was never recorded, so they are dropped outright.
+        logger.debug(
+            'hold_history: %d span(s) still open at end of stream — dropped (no observed end)',
+            len(open_spans),
+        )

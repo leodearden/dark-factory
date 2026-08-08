@@ -15,6 +15,18 @@ import pytest
 from orchestrator.hold_history import HoldSpan, iter_hold_spans
 
 
+def _offset(posix_seconds: float) -> float:
+    """Seconds since ``BASE_TS`` — the scale every timestamp assertion uses.
+
+    ``pytest.approx`` is RELATIVE by default (rel=1e-6), so comparing raw POSIX
+    epoch values (~1.79e9) carries a ~1800s tolerance — wide enough to swallow
+    every offset in this fixture, making such an assertion unable to fail for
+    the difference it claims to detect.  Comparing offsets keeps the tolerance
+    at the sub-millisecond scale where it belongs.
+    """
+    return posix_seconds - F.BASE_TS.timestamp()
+
+
 def _by_key(spans) -> dict[tuple[str, str], HoldSpan]:
     """Index spans by (task_id, module) — unique for every trace used here.
 
@@ -69,8 +81,8 @@ def test_span_start_and_end_are_the_row_timestamps_in_posix_seconds():
 
     span = list(iter_hold_spans(rows))[0]
 
-    assert span.start == pytest.approx(F.BASE_TS.timestamp())
-    assert span.end == pytest.approx(F.BASE_TS.timestamp() + 60.0)
+    assert _offset(span.start) == pytest.approx(0.0, abs=1e-6)
+    assert _offset(span.end) == pytest.approx(60.0)
 
 
 # --- partial (plan_refinement) release ------------------------------------
@@ -170,8 +182,9 @@ def test_double_acquire_reopens_at_the_new_acquire_not_the_original():
 
     second = list(iter_hold_spans(rows))[1]
 
-    assert second.start == pytest.approx(F.BASE_TS.timestamp() + 580.0)
-    assert second.end == pytest.approx(F.BASE_TS.timestamp() + 700.0)
+    assert _offset(second.start) == pytest.approx(580.0)
+    assert _offset(second.start) != pytest.approx(400.0)  # NOT the original acquire
+    assert _offset(second.end) == pytest.approx(700.0)
 
 
 def test_double_acquire_closes_only_the_re_acquired_module():
@@ -305,12 +318,18 @@ def test_run_id_transition_closes_at_the_prior_run_not_at_the_new_row():
 
     1400 is the last instant the trace shows the lock still held; 1500 is the
     first instant of a different era.  Only the former is observed.
+
+    Asserted on the OFFSET from ``BASE_TS``, never on the raw epoch value:
+    ``pytest.approx`` is relative by default, so at epoch scale (~1.79e9) its
+    tolerance is ~1800s and a 100s discrepancy would pass unnoticed.
     """
     rows = F.build_trace()[13:17]
 
     stranded = {(s.task_id, s.module): s for s in iter_hold_spans(rows)}[('T7', 'shared/src')]
+    end_offset = stranded.end - F.BASE_TS.timestamp()
 
-    assert stranded.end != pytest.approx(F.BASE_TS.timestamp() + 1500.0)
+    assert end_offset == pytest.approx(1400.0)  # last row of run-a
+    assert end_offset != pytest.approx(1500.0)  # NOT run-b's first row
     assert stranded.duration == pytest.approx(100.0)
 
 
