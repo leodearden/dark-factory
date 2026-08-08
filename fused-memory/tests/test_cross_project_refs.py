@@ -15,8 +15,11 @@ Mirrors tests/test_task_naming.py, whose leaf-module shape this module copies.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from fused_memory.utils import cross_project_refs
 from fused_memory.utils.cross_project_refs import (
     CrossProjectRef,
     CrossProjectRefScan,
@@ -407,3 +410,68 @@ class TestCrossProjectRefIsFrozen:
         scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
         with pytest.raises(Exception):  # noqa: B017
             scan.refs = []  # type: ignore[misc]
+
+
+class TestHashSpelledBareMentionsCreateAmbiguity:
+    """A '#'-spelled LOCAL task mention must make a same-numbered foreign ref
+    ambiguous, exactly as the whitespace- and colon-spelled forms already do.
+
+    This is the ONE deliberate behaviour change of task 3667's extraction.
+    Before it, the mention scanner was '_BARE_TASK_MENTION_PATTERN' plus
+    '_BARE_TASK_COLON_PATTERN' — whitespace and colon separators only — so
+    'task #2500' was invisible and this content produced a CONFIDENT split.
+    The unified pattern in canonical_labels sees it, so the content is now
+    correctly refused as ambiguous: strictly a precision gain on a path that
+    performs destructive edge surgery.
+
+    Mirrors TestTaskColonMentionsCreateAmbiguity's framing.
+    """
+
+    def test_hash_spelled_bare_mention_makes_the_foreign_ref_ambiguous(self):
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 relates to task #2500', group_id='reify'
+        )
+        assert scan.refs == []
+        assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
+
+    def test_word_glued_hash_lookalikes_are_not_bare_mentions(self):
+        """The word-glue lookbehind still applies to the '#' form, so
+        'subtask #2500' must not suppress a real foreign ref — the same
+        regression guard the whitespace and colon forms each carry."""
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 and subtask #2500', group_id='reify'
+        )
+        assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == []
+
+
+class TestNoSecondCopyOfTheLabelPattern:
+    """INV-5 (no lockstep duplication), the invariant task 3667 exists to
+    enforce: the task-label vocabulary lives ONLY in utils/canonical_labels.py,
+    and this module is a thin adapter over it.
+
+    Asserted structurally over the imported module's attributes — not as a
+    source grep and not as a docstring pin — so re-introducing a compiled copy
+    fails the suite rather than merely contradicting a comment. The drift this
+    task fixes ('task #1153' being a label to one module's pattern and not the
+    other's) was invisible for exactly as long as it lived only in prose.
+    """
+
+    def test_module_exposes_no_compiled_pattern(self):
+        compiled = [
+            name for name, value in vars(cross_project_refs).items()
+            if isinstance(value, re.Pattern)
+        ]
+        assert compiled == []
+
+    @pytest.mark.parametrize(
+        'attribute',
+        [
+            '_QUALIFIED_REF_PATTERN',
+            '_BARE_TASK_MENTION_PATTERN',
+            '_BARE_TASK_COLON_PATTERN',
+            '_TASK_VOCABULARY_QUALIFIER',
+        ],
+    )
+    def test_the_old_private_patterns_are_gone(self, attribute):
+        assert not hasattr(cross_project_refs, attribute)
