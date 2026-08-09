@@ -879,3 +879,65 @@ def test_failed_migration_leaves_no_temp_debris(tmp_path, build_corrupt):
     assert survivors == ["sess.jsonl", "sess.jsonl.gz"], (
         f"unexpected debris left in the archive dir: {survivors}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: a source too small to carry an ISIZE trailer is never CORROBORATED
+# BY OMISSION.
+#
+# `_gz_uncompressed_size` returns None below 8 bytes, and `_corroborate` skips
+# the size check when it is given None — degrading the twin check to "is valid
+# UTF-8", which nearly any plain file satisfies. That would declare the twin
+# trustworthy and unlink the source without it ever having been decompressed or
+# compared, a hole in the module's headline contract (docstring: "A file that
+# cannot be corroborated is NEVER destroyed"). Nothing recoverable is lost — a
+# file that small cannot hold even a complete gzip header — but the invariant
+# has to hold by construction, not by luck.
+# ---------------------------------------------------------------------------
+
+
+def test_a_sub_isize_source_is_failed_not_skipped(tmp_path):
+    """A `.gz` too short to carry a trailer, beside a perfectly healthy twin,
+    must be counted `failed` with its source RETAINED — not `skipped` with the
+    source unlinked on the strength of a check that never ran."""
+    enc = tmp_path / "3618" / "enc"
+    enc.mkdir(parents=True)
+    gz = enc / "sess.jsonl.gz"
+    gz.write_bytes(b"\x1f\x8b\x08\x00")  # gzip magic, truncated mid-header
+    os.utime(gz, (ARCHIVED_MTIME, ARCHIVED_MTIME))
+    assert mig._gz_uncompressed_size(gz) is None, "fixture must have no ISIZE"
+
+    twin = enc / "sess.jsonl"
+    live = _payload(137)
+    twin.write_bytes(live)
+    os.utime(twin, (ARCHIVED_MTIME + DAY, ARCHIVED_MTIME + DAY))
+    before_mtime_ns = twin.stat().st_mtime_ns
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["failed"] == 1
+    assert summary["skipped"] == 0
+    assert summary["migrated"] == 0
+    assert str(gz) in summary["failed_paths"]
+    # The undecompressable source survives, so an operator can still look at it.
+    assert gz.exists()
+    # And the twin is untouched: unreadable source, nothing written.
+    assert twin.read_bytes() == live
+    assert twin.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_a_sub_isize_source_is_not_trusted_by_omission(tmp_path):
+    """The unit-level statement of the same rule, so the intent survives a
+    refactor of `migrate_archive`'s branch order: no ISIZE means no
+    corroboration is possible, which means False — never a pass by default."""
+    enc = tmp_path / "3618" / "enc"
+    enc.mkdir(parents=True)
+    gz = enc / "sess.jsonl.gz"
+    gz.write_bytes(b"\x1f\x8b\x08\x00")
+    twin = enc / "sess.jsonl"
+    twin.write_bytes(_payload(137))  # readable, decodable — and irrelevant
+
+    assert mig._twin_is_trustworthy(gz, twin) is False
+    # Nor does it read as a conflict: a comparison that cannot be made must not
+    # be reported as one (the two guards agree on the None case).
+    assert mig._twin_supersedes_gz(gz, twin) is False

@@ -329,9 +329,25 @@ def _twin_is_trustworthy(gz_path: Path, twin: Path) -> bool:
     leaves a half-written file that looks exactly like a finished one from the
     outside; trusting it would silently truncate a transcript while deleting
     the only authoritative copy.
+
+    An ISIZE this cannot read (a sub-8-byte ``.gz``, too small to carry a
+    trailer) is answered False OUTRIGHT rather than passed to
+    :func:`_corroborate` as ``None``. With ``None`` the size check is skipped
+    and the corroboration degrades to "the twin is valid UTF-8" — which nearly
+    any plain file satisfies — so the twin would be declared trustworthy and
+    the source unlinked WITHOUT ever having been decompressed or compared.
+    Nothing recoverable is lost in practice (a file that small cannot hold even
+    a complete 10-byte gzip header), but the module's headline contract is that
+    a file which cannot be corroborated is never destroyed, and that has to
+    hold by construction. Answering False routes it to :func:`gunzip_one`,
+    where it fails decompression and lands in ``failed`` with its source
+    retained — exactly what :func:`_twin_supersedes_gz` already documents.
     """
+    isize = _gz_uncompressed_size(gz_path)
+    if isize is None:
+        return False
     try:
-        _corroborate(twin, expected_size=_gz_uncompressed_size(gz_path))
+        _corroborate(twin, expected_size=isize)
     except (OSError, UnicodeDecodeError):
         return False
     return True
