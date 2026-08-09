@@ -51,6 +51,27 @@ def _make_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
 
 
+def _cold_session_responses(
+    inner: dict, url: str = 'http://localhost:8000',
+) -> list[httpx.Response]:
+    """The three responses a COLD McpSession consumes, in post order.
+
+    ``mcp_tool_call`` against a cold session issues ``initialize``, then
+    ``notifications/initialized``, then ``tools/call`` — three HTTP posts.
+    An AsyncMock client bypasses MockTransport, which is what normally
+    attaches ``.request``, so each response needs it set by hand or
+    ``raise_for_status()`` raises RuntimeError even on a 200.
+    """
+    responses = [
+        _make_init_response(),
+        _make_notify_response(),
+        _make_mcp_response(inner),
+    ]
+    for resp in responses:
+        resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
+    return responses
+
+
 class _SessionAwareHandler:
     """Mock handler that responds to initialize, notify, and tools/call."""
 
@@ -314,6 +335,58 @@ class TestDashboardClientOpIdInjection:
         posted = mock_client.post.call_args.kwargs['json']
         assert 'client_op_id' not in posted['params']['arguments'], (
             'read tools must not get a client_op_id injected'
+        )
+
+
+# ── per-call timeout budget threading ──────────────────────────
+
+
+class TestMcpToolCallTimeoutBudget:
+    """A caller's per-call budget must reach EVERY post of the flow.
+
+    ``timeout=`` on ``client.post`` bounds connect/read/write *and pool
+    acquisition*. Without threading, a caller working to a 2.0s budget still
+    waited up to httpx's 10s default for a pool slot on each of the three
+    posts a cold session performs — the incoherence this closes. The
+    ``notifications/initialized`` post is the subtlest of the three: it
+    hardcoded 10 with no parameter at all.
+    """
+
+    async def test_budget_reaches_every_post_of_a_cold_session(self):
+        from dashboard.data.memory import mcp_tool_call
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+
+        result = await mcp_tool_call(
+            mock_client, 'http://localhost:8000', 'get_status', {}, timeout=2.0,
+        )
+
+        assert result == {'ok': True}
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 3, (
+            f'cold session should post initialize + notify + tools/call, '
+            f'got {len(posts)} posts'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [2.0, 2.0, 2.0], (
+            f'the caller budget must reach every post (including the notify, '
+            f'which hardcoded 10), got {timeouts}'
+        )
+
+    async def test_default_timeout_is_unchanged_at_ten(self):
+        """Guard: the default must stay 10 — nothing is silently raised."""
+        from dashboard.data.memory import mcp_tool_call
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+
+        await mcp_tool_call(mock_client, 'http://localhost:8000', 'get_status', {})
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], (
+            f'omitting timeout must keep the pre-existing 10s default on every '
+            f'post, got {timeouts}'
         )
 
 
