@@ -39,19 +39,27 @@ import subprocess
 
 SETUP_HOST_PATH = pathlib.Path(__file__).parents[2] / "scripts" / "setup-host.sh"
 
-# The preamble every slice needs: setup-host.sh's own `set` flags and the four
-# logging shims, reduced to PLAIN TEXT so assertions can match on prefixes
-# without ANSI escapes. Prefixes mirror the reference harness.
-_PREAMBLE = (
-    "set -euo pipefail\n"
-    'REPO_ROOT="{repo_root}"\n'
-    'UNIT_DIR="{unit_dir}"\n'
-    'mkdir -p "$UNIT_DIR"\n'
+# The four logging shims, reduced to PLAIN TEXT so assertions can match on
+# prefixes without ANSI escapes. Prefixes mirror the reference harness.
+#
+# Deliberately NOT a str.format() template: these bodies are bash brace groups,
+# and every `{ printf ... }` in them would be read as a replacement field.
+_SHIMS = (
     "info()  { printf '==> %s\\n' \"$*\"; }\n"
     "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
     "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
     "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
 )
+
+
+def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
+    """setup-host.sh's own `set` flags and variables, plus the plain-text shims."""
+    return (
+        "set -euo pipefail\n"
+        f'REPO_ROOT="{repo_root}"\n'
+        f'UNIT_DIR="{unit_dir}"\n'
+        'mkdir -p "$UNIT_DIR"\n'
+    ) + _SHIMS
 
 
 def setup_host_text() -> str:
@@ -126,7 +134,7 @@ def run_section(
 
     script = tmp_path / "section.sh"
     script.write_text(
-        _PREAMBLE.format(repo_root=repo_root, unit_dir=unit_dir) + section_text,
+        _preamble(repo_root, unit_dir) + section_text,
         encoding="utf-8",
     )
 
