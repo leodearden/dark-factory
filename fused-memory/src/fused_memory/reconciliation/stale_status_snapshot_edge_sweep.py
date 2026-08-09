@@ -146,8 +146,9 @@ Design decisions (captured in plan.json):
   'previously-', 'in-' are each one '\\w+-' token, so the unguarded prefix
   re-admitted the negation / past-exit readings ('Task 5 is un-blocked'
   -> {5}) that ``_ADVERB_ALT``'s closed-class discipline refuses for free
-  on the bare marker. What refuses them is a negative lookahead subtracting a closed
-  class of inverting prefixes, kept as a SUBTRACTION from an open-class
+  on the bare marker. What refuses them is a negative lookahead
+  subtracting a closed class of inverting prefixes, kept as a
+  SUBTRACTION from an open-class
   prefix because the innocent modifier vocabulary ('pairwise-', 'merge-',
   'self-', 'auto-') is not closed. The privative 'in-' needs a second,
   narrower lookahead, since 'in[-\\s]?progress' is itself a marker.
@@ -200,14 +201,17 @@ Design decisions (captured in plan.json):
   Only SENTENCE-FINAL punctuation ends that clause — a colon, comma,
   bracket, quote or line wrap does not end prepositional government, and
   admitting any of them as a break re-opens the over-selection outright
-  (see ``_CLAUSE_BREAK_CHARS``).
-  Two residuals in OPPOSITE directions, and the first is the forbidden
+  (see ``_CLAUSE_BREAK_CHARS``). Two residuals in OPPOSITE
+  directions, and the first is the forbidden
   one: an unlisted preposition slips through and OVER-selects (the
   vocabulary was widened once already, for exactly this reason — see
   ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
-  sharing a clause with a listed word is missed, which is the fail-safe
-  direction. Note ``_COPULA_ALT`` is untouched and still shared by the
-  other paths; only this one narrows. (amendment, reviewer_comprehensive
+  sharing a clause with a listed word is missed — chiefly behind a
+  sentence-initial adverbial preamble ("As of <date>, tasks A and B are
+  pending"), and pinned by a test so the recall cost stays visible —
+  which is the fail-safe direction. Note ``_COPULA_ALT`` is untouched and
+  still shared by the other paths; only this one narrows.
+  (amendment, reviewer_comprehensive
   correctness-precision finding, task 3079)
 - ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
   quantifiers. Greedily written, the separator's trailing '\\s*' overlaps
