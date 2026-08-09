@@ -417,6 +417,51 @@ class TestForegroundBgLogReadIsAReap:
         assert detect_ended_awaiting_background(records) is False
 
 
+class TestTaskToolReaps:
+    """``TaskOutput`` and ``TaskStop`` are reaps (task 3639) — the Task-tool
+    analogues of ``BashOutput``/``KillShell``: one collects a backgrounded
+    Task/subagent's result, the other terminates it.  Both are equally
+    conclusive evidence the session engaged with its pending work."""
+
+    def test_task_output_after_launch_is_false(self) -> None:
+        """TaskOutput collects a backgrounded task's result → reap → False."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_stop_after_launch_is_false(self) -> None:
+        """TaskStop terminates a backgrounded task → reap → False."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': 't1'}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_output_before_second_launch_is_true(self) -> None:
+        """The reap sits BEFORE a second, unreaped launch → still True (mirrors
+        test_second_launch_with_reap_before_it_is_true)."""
+        records = [
+            _assistant([_bash_launch(command='job-a')]),
+            _assistant([{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}]),
+            _assistant([_bash_launch(command='job-b')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_task_output_in_flat_record_shape_is_false(self) -> None:
+        """The reap authored in the flat (nested=False) record shape is still
+        recognised (mirrors test_reap_after_launch_across_nesting_styles_is_false)."""
+        records = [
+            _assistant([_bash_launch()], nested=True),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'TaskOutput', 'input': {'task_id': 't1'}}],
+                nested=False,
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
     read_transcript_records, then the pure detector, mapping None (unresolvable
