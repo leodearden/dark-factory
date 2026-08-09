@@ -679,6 +679,7 @@ class TestNoSilentPartialRepair:
             supplied={'description'},
         )
 
+        assert result is not None
         assert result == Repair(
             clean_value='A' + _closer('priority') + 'junk B',
             recovered={'task_id': '7'},

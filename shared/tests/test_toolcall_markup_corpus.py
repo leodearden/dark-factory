@@ -446,7 +446,7 @@ class TestTruncationRule:
         assert truncated is False
         assert stored == unrepairable
 
-    def test_refuses_to_truncate_away_the_reason_it_was_collected(self):
+    def test_a_stored_value_always_still_satisfies_the_predicate(self):
         """Truncation must never strip the substring the predicate matched on.
 
         Both predicate alternatives ``search`` the whole value, so a specimen
@@ -457,6 +457,17 @@ class TestTruncationRule:
         would force the replay test's non-circular re-derivation to carry an
         exemption. Store it verbatim instead. Observed once in the 473-specimen
         2026-08-08 snapshot, so this is a real archive shape, not a hypothetical.
+
+        Pinned as an INVARIANT OVER THE OUTPUT rather than as a branch of
+        :func:`apply_truncation`, because WHICH refusal fires moved under review
+        fix 2 and could move again. It used to be the predicate guard: ``repair``
+        accepted the trailing mis-close, and truncation would have dropped the
+        middle. It is now the earlier ``result is None`` branch — the prefix
+        ``repair`` would have had to hand back still carries the canonical
+        opener, so the prefix-clean post-condition declines the whole shape
+        rather than return a partial repair. Either way the specimen is stored
+        verbatim and the stored value is still collectable, which is the only
+        thing the corpus actually depends on.
         """
         value = (
             'w' * 5000
@@ -465,11 +476,12 @@ class TestTruncationRule:
             + _closer('rationale') + '\n'
             + _canonical_opener('nonesuch') + 'x' + _closer('parameter') + '\n'
             + 'w' * 500
-            # ...and accepts HERE instead, where the tail is whitespace only.
+            # ...and USED TO accept HERE, where the tail is whitespace only.
+            # The clean_value that would have produced is not envelope-free.
             + _closer('rationale') + '\n'
         )
         assert extract.matches_collection_predicate(value)
-        assert repair(value, 'decision', ('decision', 'how', 'rationale'), ('decision',)) is not None
+        assert repair(value, 'decision', ('decision', 'how', 'rationale'), ('decision',)) is None
 
         stored, truncated = extract.apply_truncation(
             value,

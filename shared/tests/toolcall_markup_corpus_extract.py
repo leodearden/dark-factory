@@ -264,13 +264,25 @@ def apply_truncation(
 
     It refuses on a second, independent ground: a truncated value that no longer
     satisfies the collection predicate. Both predicate alternatives ``search``
-    the WHOLE value, so a real specimen can be collected on a mis-close-then-
-    opener sequence sitting mid-value while ``repair`` accepts a LATER mis-close
-    — truncation then drops the middle and leaves a stored value the corpus's
-    own definition would never have collected. Measured on the 2026-08-08
-    snapshot: 1 specimen of 473. Storing it verbatim keeps the replay test's
-    predicate re-derivation an honest non-circular check rather than something
-    the extractor has to be exempted from.
+    the WHOLE value, so a specimen collected on a mis-close-then-opener sequence
+    sitting mid-value, while ``repair`` accepts a LATER mis-close, would be
+    truncated to a stored value the corpus's own definition would never have
+    collected. Storing it verbatim keeps the replay test's predicate
+    re-derivation an honest non-circular check rather than something the
+    extractor has to be exempted from.
+
+    RETAINED THOUGH BELIEVED UNREACHABLE, and deliberately so. That second
+    ground was measured live once — 1 specimen of the 473 in the 2026-08-08
+    snapshot — but ``repair``'s prefix-clean post-condition (added under review
+    fix 2) now refuses that whole shape outright, at the ``result is None``
+    branch above, and no record in the regenerated corpus reaches this check.
+    The reason is that BOTH predicate alternatives are built from envelope
+    literals, so a predicate match strictly before an accepted mis-close would
+    poison the prefix and ``repair`` would decline. The guard stays because it
+    does NOT depend on that argument: it is the extractor's own check that what
+    it emits satisfies the corpus's definition, and a future task widening the
+    collection predicate with a non-envelope alternative would make it live
+    again without anyone re-deriving the coupling.
     """
     result = repair(value, param, schema_params, supplied)
     if result is None:

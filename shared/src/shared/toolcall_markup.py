@@ -274,8 +274,13 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     runs to end-of-string (the parser consumed that closer as its terminator),
     with one trailing invoke closer stripped and whitespace allowed between
     items. ``None`` means the tail did not parse with ZERO leftover, which
-    rejects the candidate and advances the scan — it never yields a partial
-    repair.
+    rejects the candidate and advances the scan — this function never yields a
+    partial parse of one tail.
+
+    That is a per-tail guarantee only, and on its own it is NOT enough to rule
+    out a partial REPAIR: advancing the scan leaves the rejected closer inside
+    the next candidate's prefix. The prefix-clean accept-time condition in
+    :func:`repair` is what closes that gap.
 
     Every returned value is a SLICE of *tail*; nothing is rebuilt or decoded.
     """
@@ -338,8 +343,20 @@ def repair(
     param``, ``X`` is in *schema_params*, or ``X`` is the canonical
     ``parameter`` closer. For each candidate the remaining tail is parsed by
     :func:`_parse_tail`; the EARLIEST candidate is accepted for which the tail
-    parses with zero leftover, every recovered name is in *schema_params*, and
-    no recovered name is in *supplied*. Otherwise ``None`` — never a guess.
+    parses with zero leftover, every recovered name is in *schema_params*, no
+    recovered name is in *supplied*, and the resulting ``clean_value`` is
+    itself envelope-free. Otherwise ``None`` — never a guess, and never a
+    PARTIAL repair.
+
+    NO SILENT PARTIAL REPAIR. The returned ``clean_value`` is guaranteed to
+    satisfy ``detect(clean_value) is None``. This is a contract, not an
+    accident of the scan: contract C2's middleware forwards ``clean_value`` as
+    the repaired argument, so a value that still tripped :func:`detect` would
+    re-trip the write-time tripwire downstream AND would have silently dropped
+    whatever caller arguments were hiding in the residue — the exact failure
+    this module exists to end, reintroduced by its own repairer. When the only
+    candidates that parse would leave a poisoned prefix, the honest answer is
+    ``None``.
 
     The canonical closer is always a candidate even though C1's literal wording
     does not list it. PRD section 2.1's fourth specimen mis-closes ``content``
@@ -386,19 +403,34 @@ def repair(
             continue
         if not recovered.keys().isdisjoint(already_supplied):
             continue
+        clean_value = value[: candidate.start()]
+        # PREFIX-CLEAN, the third accept-time condition. The scan steps over a
+        # candidate whose tail does not parse, which leaves that closer sitting
+        # inside every LATER candidate's prefix — and if it is itself an
+        # envelope literal, accepting would hand back a clean_value that still
+        # trips detect() while permanently dropping whatever arguments hide in
+        # the residue. `continue` rather than `return None` keeps all three
+        # refusals one shape; the outcome is identical either way because
+        # candidate start positions increase monotonically, so a poisoned
+        # prefix stays poisoned — but `continue` needs no such argument to be
+        # correct.
+        if detect(clean_value) is not None:
+            continue
 
         misclose = candidate.group(0)
-        # The union scan runs ONLY here, on the accept path. `detected` is read
-        # nowhere else, and repair() refuses far more often than it accepts —
-        # every value with no qualifying candidate at all, plus every ordinary
-        # argument that merely happens to contain a closing tag. Hoisting it
-        # above the loop would pay one full-string pass per ENVELOPE_LITERALS
-        # member (six) on that overwhelmingly common no-op path, at a
-        # per-tool-call middleware boundary (PRD contract C2) over values the
-        # corpus shows reaching tens of KB.
+        # Both union scans run on the ACCEPT PATH ONLY — the prefix scan just
+        # above fires only after a tail has already parsed and passed B8/B9,
+        # and this one only after the prefix came back clean. repair() refuses
+        # far more often than it reaches either: every value with no qualifying
+        # candidate at all, plus every ordinary argument that merely happens to
+        # contain a closing tag. Hoisting a detect() above the loop would
+        # instead pay one full-string pass per ENVELOPE_LITERALS member (six)
+        # on that overwhelmingly common no-op path, at a per-tool-call
+        # middleware boundary (PRD contract C2) over values the corpus shows
+        # reaching tens of KB.
         detected = detect(value)
         return Repair(
-            clean_value=value[: candidate.start()],
+            clean_value=clean_value,
             recovered=recovered,
             pattern=detected if detected is not None else misclose,
             misclose=misclose,
