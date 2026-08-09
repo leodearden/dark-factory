@@ -692,6 +692,15 @@ def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_roo
     failure the guard exists to prevent.  Measured zero collisions across
     both repos on 2026-08-09; this pins that property permanently rather
     than leaving it as a one-time observation.
+
+    SCOPE, stated plainly so the guard is not over-read: it bounds the risk for
+    these TWO checkouts only, while the predicate governs lock charters for
+    every project the orchestrator targets.  Several members are generic
+    basenames (`cargo`, `Dockerfile`, `LICENSE`, `pre-commit`), so a third
+    project with a real `tools/cargo/` DIRECTORY would have it classified as a
+    file and retained as a subtree-wide prefix lock, unswept by this test.  That
+    is why admitting a generic basename is a cross-project commitment — see the
+    CROSS-PROJECT SCOPE note on the EXTENSIONLESS_FILENAMES vector.
     """
     if not repo_root.is_dir():
         pytest.skip(f'{repo} checkout not present at {repo_root}')
@@ -913,11 +922,28 @@ class TestLockCharterError:
     def test_hint_names_the_extensionless_allowlist(self):
         """The hint must be followable for an unrecognised extension-less name.
 
-        Today it says "Replace each directory with the specific file paths it
-        contains", which is UNFOLLOWABLE for `hooks/project-checks`: that IS the
-        specific file, and it contains nothing.  The remedy is to add the name
-        to EXTENSIONLESS_FILENAMES, so the hint has to say so.
+        The generic advice — "Replace each directory with the specific file
+        paths it contains" — is UNFOLLOWABLE for `hooks/project-checks`: that IS
+        the specific file, and it contains nothing.  The remedy is to add the
+        name to EXTENSIONLESS_FILENAMES, so the hint has to say so.
+
+        The two classification assertions below are load-bearing, not scene
+        setting.  `lock_charter_error`'s hint is a CONSTANT string that does not
+        vary with its argument, so the substring check alone proved nothing
+        about extension-less classification — `lock_charter_error(['crates/'])`,
+        an ordinary directory, satisfied it identically.  Pinning the
+        precondition makes the test depend on the behaviour actually under
+        review: an UNRECOGNISED extension-less name still reaches this error
+        path, while a RECOGNISED one no longer does — which is precisely what
+        makes "add the name to EXTENSIONLESS_FILENAMES" the real remedy rather
+        than one more string in a fixed message.
         """
+        # Unrecognised extension-less name → still classified a directory, so it
+        # genuinely reaches lock_charter_error and needs a followable hint.
+        assert directory_locks(['hooks/some-new-hook']) == ['hooks/some-new-hook']
+        # Recognised one → not a directory, so it never reaches the error at all.
+        assert directory_locks(['hooks/pre-commit']) == []
+
         result = lock_charter_error(['hooks/some-new-hook'])
         assert 'EXTENSIONLESS_FILENAMES' in result['hint']
 

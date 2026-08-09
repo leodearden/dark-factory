@@ -189,6 +189,22 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # executable is a file" cannot be evaluated as pure string (C-P3) and would
 # re-admit directories.
 #
+# CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
+# the reason the admission rule above is stricter than it looks.  Members are
+# matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
+# `LICENSE`, `pre-commit`.  The collision guard that bounds this risk
+# (test_no_canonical_extensionless_name_is_also_a_directory) sweeps only the
+# dark-factory and reify checkouts — but this predicate governs lock charters
+# for EVERY project the orchestrator targets.  In a third project containing
+# `tools/cargo/` or `docker/Dockerfile/` as a real DIRECTORY, that directory now
+# classifies as a FILE: directory_locks stops rejecting it and derive_modules
+# RETAINS it, yielding a prefix lock over the entire subtree (modules_conflict
+# is prefix-based) — the reify-3468 over-wide-charter failure the strip exists
+# to prevent, and now with NO INFO diagnostic, because nothing was stripped.
+# Admitting a generic basename is therefore a CROSS-PROJECT COMMITMENT, not a
+# local one: weigh a candidate against every targeted repo, not only the two
+# that are actually swept.
+#
 # Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
 # Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted

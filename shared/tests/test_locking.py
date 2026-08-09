@@ -656,6 +656,15 @@ class TestExtensionlessFilenames:
         failure the guard exists to prevent.  Measured zero collisions across
         both repos on 2026-08-09; this pins that property permanently rather
         than leaving it as a one-time observation.
+
+        SCOPE, stated plainly so the guard is not over-read: it bounds the risk
+        for these TWO checkouts only, while the predicate governs lock charters
+        for every project the orchestrator targets.  Several members are generic
+        basenames (`cargo`, `Dockerfile`, `LICENSE`, `pre-commit`), so a third
+        project with a real `tools/cargo/` DIRECTORY would have it classified as
+        a file and retained as a subtree-wide prefix lock, unswept by this test.
+        That is why admitting a generic basename is a cross-project commitment —
+        see the CROSS-PROJECT SCOPE note on the EXTENSIONLESS_FILENAMES vector.
         """
         if not repo_root.is_dir():
             pytest.skip(f'{repo} checkout not present at {repo_root}')
