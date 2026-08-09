@@ -1010,12 +1010,14 @@ Review this run and provide your verdict as JSON.
         3. **No post-unhalt grace, no active cooldown**: operator intervention
            gets breathing room before the detector re-fires.
 
-        Before any of the above, phantom verdicts (task 3070) — fabricated by
-        ``_parse_verdict`` as a stand-in when judge output could not be parsed,
-        see ``is_phantom_verdict`` — are removed from the verdict list. A
-        phantom carries no evidence that a review ever happened, so it must
-        not be able to feed the count gate or complete the consecutive-streak
-        gate.
+        Before either of the last two gates, phantom verdicts (task 3070) —
+        fabricated by ``_parse_verdict`` as a stand-in when judge output
+        could not be parsed, see ``is_phantom_verdict`` — are removed from
+        the verdict list, restricted to the verdicts the time window already
+        selected (so the discarded-evidence log below describes only
+        evidence the gates could actually have used). A phantom carries no
+        evidence that a review ever happened, so it must not be able to feed
+        the count gate or complete the consecutive-streak gate.
         """
         if not self.config.halt_on_judge_serious:
             return
@@ -1037,12 +1039,26 @@ Review this run and provide your verdict as JSON.
             )
             return
 
+        # Restrict to the trend window FIRST, before phantom-exclusion runs,
+        # so the discarded-evidence accounting below describes only verdicts
+        # the gates could actually have used. A phantom that fell outside
+        # the window was never going to influence a gate regardless of its
+        # phantom-ness, so it must not be reported as "trend evidence was
+        # discounted" — that would misrepresent a window-irrelevant detail
+        # as a phantom-caused near miss. Windowing is a pure subset filter
+        # (it does not reorder), so restricting first and phantom-filtering
+        # second yields the same final evidence set the gates see as the
+        # reverse order would; only the diagnostics below change.
+        window_hours = float(self.config.halt_trend_window_hours)
+        window_start = now - timedelta(hours=window_hours)
+        in_window = [v for v in verdicts if v.reviewed_at >= window_start]
+
         # Phantom non-ok verdicts (task 3070) are fabricated placeholders for a
         # review that never happened — _parse_verdict stamps them when the
         # judge output could not be parsed (see is_phantom_verdict). They
         # carry no evidence either way, so they are removed from the evidence
-        # set BEFORE any of the three gates below run, not merely uncounted
-        # afterward: a phantom must not be able to complete the
+        # set BEFORE either of the remaining two gates below run, not merely
+        # uncounted afterward: a phantom must not be able to complete the
         # consecutive-most-recent streak any more than it should inflate the
         # count. The exclusion is deliberately restricted to non-ok
         # severities: a phantom is only ever severity=serious (see
@@ -1051,7 +1067,7 @@ Review this run and provide your verdict as JSON.
         # change, outside this task's ask).
         evidence: list[JudgeVerdict] = []
         excluded_run_ids: list[str] = []
-        for v in verdicts:
+        for v in in_window:
             if v.severity in _NON_OK_SEVERITIES and is_phantom_verdict(v):
                 excluded_run_ids.append(v.run_id)
             else:
@@ -1062,7 +1078,10 @@ Review this run and provide your verdict as JSON.
         # record, an operator watching a project that did NOT halt cannot
         # tell "no trend" apart from "trend evidence was discounted as
         # phantom" (loud-over-silent-degradation). Silent when nothing was
-        # dropped, so this never adds noise to the common case.
+        # dropped, so this never adds noise to the common case. Scoped to
+        # in-window verdicts only (see above), so this can never fire for a
+        # phantom that was already outside the window and so was never
+        # discountable in the first place.
         if excluded_run_ids:
             logger.warning(
                 'reconciliation.judge_trend_phantom_excluded',
@@ -1078,13 +1097,7 @@ Review this run and provide your verdict as JSON.
                 },
             )
 
-        window_hours = float(self.config.halt_trend_window_hours)
-        window_start = now - timedelta(hours=window_hours)
-        windowed = sorted(
-            (v for v in evidence if v.reviewed_at >= window_start),
-            key=lambda v: v.reviewed_at,
-            reverse=True,
-        )
+        windowed = sorted(evidence, key=lambda v: v.reviewed_at, reverse=True)
 
         consecutive_required = max(1, self.config.halt_trend_consecutive_required)
         if len(windowed) < consecutive_required:
