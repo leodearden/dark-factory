@@ -496,15 +496,3 @@ class TestNoSecondCopyOfTheLabelPattern:
             if isinstance(value, re.Pattern)
         ]
         assert compiled == []
-
-    @pytest.mark.parametrize(
-        'attribute',
-        [
-            '_QUALIFIED_REF_PATTERN',
-            '_BARE_TASK_MENTION_PATTERN',
-            '_BARE_TASK_COLON_PATTERN',
-            '_TASK_VOCABULARY_QUALIFIER',
-        ],
-    )
-    def test_the_old_private_patterns_are_gone(self, attribute):
-        assert not hasattr(cross_project_refs, attribute)

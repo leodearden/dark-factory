@@ -132,6 +132,3 @@ class TestNoSecondCopyOfTheLabelPattern:
             name for name, value in vars(task_naming).items() if isinstance(value, re.Pattern)
         ]
         assert compiled == []
-
-    def test_the_old_private_pattern_is_gone(self):
-        assert not hasattr(task_naming, '_TASK_NODE_NAME_PATTERN')
