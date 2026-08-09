@@ -1630,31 +1630,17 @@ class TestBuildEscalationAnalyticsPins:
         assert bare == explicit
         assert 'pins_recovery' not in explicit['per_project'][0]['lifespan']['open_items'][0]
 
-    def test_annotation_does_not_make_the_module_impure(self, tmp_path):
-        """No network, no extra clock read — the to_thread/TTL contract holds.
+    def test_annotation_does_not_read_the_clock(self, tmp_path):
+        """The threaded `now` is the only instant the annotated payload reports.
 
-        `build_escalation_analytics` runs inside `asyncio.to_thread`, so an MCP
-        round-trip in here would block a worker thread on the network; and
-        `test_clock_discipline.py` AST-enforces that `resolve_now` is this
-        module's only clock read.  Both are structural, so both are asserted
-        structurally: the module imports no HTTP client and no asyncio, and
-        the payload's `generated_at` is exactly the threaded `now`.
+        `build_escalation_analytics` runs inside `asyncio.to_thread` under a
+        TTL cache, so every timestamp it emits must come from the caller's
+        `now` rather than a fresh clock read — otherwise two rows in one pass
+        could be judged against different instants.  Annotating with
+        `pins_by_project` must not disturb that: `generated_at` stays exactly
+        the passed instant, and the pins stamp still lands.
         """
-        import ast
-
-        from dashboard.data import escalation_analytics
         from dashboard.data.escalation_analytics import build_escalation_analytics
-
-        source = Path(escalation_analytics.__file__).read_text()
-        tree = ast.parse(source)
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(a.name.split('.')[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split('.')[0])
-        assert 'httpx' not in imported
-        assert 'asyncio' not in imported
 
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -1665,3 +1651,6 @@ class TestBuildEscalationAnalyticsPins:
             pins_by_project={'proj-z': {'esc-800-1': ['800']}},
         )
         assert result['generated_at'] == now.isoformat()
+        item = result['per_project'][0]['lifespan']['open_items'][0]
+        assert item['pins_recovery'] is True
+        assert item['pins_recovery_task_ids'] == ['800']

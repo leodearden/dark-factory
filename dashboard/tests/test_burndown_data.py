@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -463,19 +462,40 @@ def _columns(path: Path) -> set[str]:
         conn.close()
 
 
-class TestSnapshotSchemaColumns:
-    def test_schema_declares_the_split_columns_not_null_default_zero(self):
-        for col in ('in_progress_live', 'in_progress_stranded'):
-            assert re.search(
-                rf'{col}\s+INTEGER\s+NOT NULL\s+DEFAULT 0', BURNDOWN_SCHEMA
-            ), f'{col} missing or not NOT NULL DEFAULT 0 in BURNDOWN_SCHEMA'
+def _column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
+    """``{column: (notnull, dflt_value)}`` from ``PRAGMA table_info(snapshots)``.
 
-    def test_schema_declares_concurrency_cap_nullable(self):
-        """NULL is the honest "cap unknown" value — never 0, which would read as
-        a cap of zero and alarm on every snapshot."""
-        match = re.search(r'concurrency_cap\s+INTEGER([^,\n]*)', BURNDOWN_SCHEMA)
-        assert match is not None, 'concurrency_cap missing from BURNDOWN_SCHEMA'
-        assert 'NOT NULL' not in match.group(1).upper()
+    Asserts against the table the collector actually writes to, rather than
+    against the DDL text — the shape is what matters, and it survives any
+    reformatting of BURNDOWN_SCHEMA.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[1]: (r[3], r[4]) for r in conn.execute('PRAGMA table_info(snapshots)')}
+    finally:
+        conn.close()
+
+
+class TestSnapshotSchemaColumns:
+    def test_created_table_declares_the_new_column_constraints(self, tmp_path):
+        """The split columns are NOT NULL DEFAULT 0; ``concurrency_cap`` is nullable.
+
+        NULL is the honest "cap unknown" value for the cap — never 0, which
+        would read as a cap of zero and alarm on every snapshot.  The split
+        counts, by contrast, are always known, so they default to 0.
+        """
+        db = tmp_path / 'shape.db'
+        _create_burndown_db(db)
+        specs = _column_specs(db)
+
+        for col in ('in_progress_live', 'in_progress_stranded'):
+            assert col in specs, f'{col} missing from the created snapshots table'
+            notnull, default = specs[col]
+            assert notnull == 1, f'{col} should be NOT NULL'
+            assert default == '0', f'{col} should DEFAULT 0, got {default!r}'
+
+        assert 'concurrency_cap' in specs, 'concurrency_cap missing from snapshots'
+        assert specs['concurrency_cap'][0] == 0, 'concurrency_cap must stay nullable'
 
     def test_fresh_db_is_already_at_the_new_shape(self, tmp_path):
         db = tmp_path / 'fresh.db'
