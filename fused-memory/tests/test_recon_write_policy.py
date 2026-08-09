@@ -18,6 +18,7 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
@@ -1785,6 +1786,255 @@ class TestInterceptorSetTaskStatusForwardsTaskMetadata:
         assert detector_kwargs['kwargs'].get('task_kind') is None
         assert detector_kwargs['kwargs'].get('pure_gate') is False
         taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# set_task_status forwards the `before` snapshot into check() (task 2964)
+# ---------------------------------------------------------------------------
+
+
+class TestGate2CorroborationInterceptorPlumbing:
+    """The interceptor forwards its `before` snapshot as check()'s `task_snapshot`.
+
+    End-to-end counterpart of TestGate2CorroborationForwarding: the plumbing
+    plus the task 599/600 regression itself, driven against the REAL detector
+    and REAL on-disk `orchestrator.lock` / `scheduler_state.json` fixtures —
+    the same fixtures test_stages.py's TestRenderLiveWorkflowSectionCorroboration
+    Gate uses for the renderer, so the two consumers' verdicts are directly
+    comparable. That comparability IS the invariant under test.
+
+    The repro shape: an in-progress task killed by a fleet redeploy. Its git
+    worktree registration lingers (worktree_registered=True) and the restarted
+    orchestrator re-acquired the project-wide lock (orchestrator_live=True),
+    but the branch tip is 48h old (recent_commit=False) and the claimant's
+    heartbeat is 30 minutes stale. Stage 2 guard-rejected task 599's re-pend
+    write for 5 consecutive cycles that way (run
+    dbfa3df8-0d7d-40e6-bc4a-bc30cce38228, 2026-08-06) while the post-2963
+    renderer had already stopped listing it as live.
+    """
+
+    _TASK_ID = '599'
+    _BRANCH = 'task/599'
+
+    # ----- on-disk fixtures (mirrors test_stages.py's corroboration gate) -----
+
+    @staticmethod
+    def _write_lock(tmp_path, started) -> None:
+        """`PID <N> started <ISO>` — the orchestrator restart boundary.
+
+        orchestrator_started_at only parses the `started` token, so the PID
+        need not be alive; is_orchestrator_live_for is monkeypatched separately.
+        """
+        lock_dir = tmp_path / 'data' / 'orchestrator'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'orchestrator.lock').write_text(
+            f'PID 12345 started {started.isoformat()}\n', encoding='utf-8',
+        )
+
+    @staticmethod
+    def _write_scheduler_state(tmp_path, *, parks=None, current_holders=None) -> None:
+        state_dir = tmp_path / 'data' / 'orchestrator'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / 'scheduler_state.json').write_text(
+            json.dumps({'parks': parks or {}, 'current_holders': current_holders or {}}),
+            encoding='utf-8',
+        )
+
+    @classmethod
+    def _git_side_effect(cls, *, commit_age: timedelta):
+        """worktree_registered=True, non-bare branch, tip aged *commit_age*.
+
+        rev-list returns 3 so rule 4 (bare branch) can never interfere; the
+        `git log` tip timestamp decides recent_commit against the detector's
+        6h recency window.
+        """
+        tip_ts = (datetime.now(UTC) - commit_age).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=(
+                        'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                        f'worktree /project-599\nHEAD def5678\n'
+                        f'branch refs/heads/{cls._BRANCH}\n\n'
+                    ),
+                    stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=tip_ts, stderr='',
+            )
+
+        return side_effect
+
+    @classmethod
+    def _task(cls, heartbeat: timedelta, **overrides) -> dict:
+        """The killed-workflow task dict: durable claimant, aged heartbeat."""
+        task = {
+            'id': cls._TASK_ID,
+            'status': 'in-progress',
+            'title': 'Stranded in-progress task',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': _heartbeat(-heartbeat),
+            'metadata': {'task_kind': 'normal'},
+        }
+        task.update(overrides)
+        return task
+
+    @staticmethod
+    def _spy_check(monkeypatch) -> dict:
+        """Wrap the REAL check() with a kwarg-capturing spy (same idiom as
+        TestInterceptorSetTaskStatusForwardsTaskMetadata)."""
+        captured: dict = {}
+        real_check = recon_write_policy.check
+
+        def _spy(op, **kwargs):
+            captured['op'] = op
+            captured.update(kwargs)
+            return real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _spy)
+        return captured
+
+    @staticmethod
+    def _spy_detector(monkeypatch) -> dict:
+        """Install a kwarg-capturing is_workflow_live_for_task spy returning False."""
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            return False
+
+        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
+        return captured
+
+    @staticmethod
+    def _force_orchestrator_live(monkeypatch) -> None:
+        from fused_memory.services import live_workflow_detector
+
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_before_snapshot_reaches_check_and_yields_corroborated_false(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """THE PLUMBING — `task_snapshot` IS the `before` dict, and the stale
+        heartbeat on it makes check() derive corroborated=False."""
+        task = self._task(timedelta(minutes=30))
+        taskmaster.get_task = AsyncMock(return_value=task)
+        check_kwargs = self._spy_check(monkeypatch)
+        detector_kwargs = self._spy_detector(monkeypatch)
+
+        await interceptor.set_task_status(
+            self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+        )
+
+        assert check_kwargs.get('task_snapshot') is task
+        assert detector_kwargs['kwargs'].get('corroborated') is False
+        # NON-REGRESSION — task 3751's task_metadata forwarding is untouched.
+        assert check_kwargs.get('task_metadata') == task['metadata']
+
+    @pytest.mark.asyncio
+    async def test_stranded_in_progress_repend_is_no_longer_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """THE REGRESSION (task 599/600) — the re-pend write now lands.
+
+        REAL is_workflow_live_for_task / detect_live_workflow; only the
+        project-wide lock is forced live. Worktree registered + orchestrator
+        lock + no recent commit + no corroborating per-task signal is exactly
+        what the renderer downgrades to indeterminate, so Gate 2 must now agree
+        and let the write through.
+        """
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch('subprocess.run', side_effect=self._git_side_effect(
+            commit_age=timedelta(hours=48),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — a genuinely live pipeline is never raced. The ONLY
+        difference from the case above is heartbeat freshness."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(seconds=5)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch('subprocess.run', side_effect=self._git_side_effect(
+            commit_age=timedelta(hours=48),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_holder_corroborates_and_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — the scheduler-holder signal corroborates on its own,
+        even with a stale heartbeat. `current_holders` is reset by an
+        orchestrator restart, so a surviving entry is fresh evidence."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(
+            tmp_path, current_holders={'implementer': self._TASK_ID},
+        )
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch('subprocess.run', side_effect=self._git_side_effect(
+            commit_age=timedelta(hours=48),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recent_commit_exempts_the_task_and_is_still_rejected(
+        self, interceptor, taskmaster, monkeypatch, tmp_path,
+    ):
+        """DIFFERENTIAL — `recent_commit` is genuine per-task work evidence and
+        is EXEMPT from the corroboration gate, so a stale heartbeat cannot
+        downgrade a task that is visibly committing. Pins the detector's
+        exemption through this path."""
+        self._write_lock(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+        self._write_scheduler_state(tmp_path)
+        taskmaster.get_task = AsyncMock(return_value=self._task(timedelta(minutes=30)))
+        self._force_orchestrator_live(monkeypatch)
+
+        with patch('subprocess.run', side_effect=self._git_side_effect(
+            commit_age=timedelta(minutes=5),
+        )):
+            result = await interceptor.set_task_status(
+                self._TASK_ID, 'pending', str(tmp_path), agent_id=AGENT_ID,
+            )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
