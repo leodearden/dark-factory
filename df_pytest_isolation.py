@@ -85,13 +85,37 @@ copies of this harness could only ever be kept in step by a cross-checking
 test (``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` exists for
 exactly that reason).  This module is the one place BOTH already import.
 
+FOURTH DEFENCE — a test run can never reach the LIVE fleet directory.
+
+Task 3799.  ``ORCH_FLEET_DIR`` was unset for the whole suite, so
+``scripts/restart-all-orchestrators.sh:109`` and ``scripts/drain_check.py:32``
+both fell through to their machine-global default,
+``/home/leo/src/dark-factory/data/fleet``.  That is a CROSS-PROJECT rendezvous
+directory — measured 2026-08-07 and re-measured 2026-08-09 holding live
+heartbeats for SEVEN different projects' orchestrators — so a test-spawned drain
+gate read five other projects' live PRODUCTION heartbeats and decided the real
+fleet's drain state from them.  ``_df_fleet_dir_redirect`` closes that, and
+``_df_no_synthetic_heartbeats_in_live_fleet`` is the regression guard behind it.
+
+The guard is keyed on the SYNTHETIC unit-name prefix rather than on "the fleet
+dir is untouched", and that is the load-bearing detail: the live directory is
+rewritten by the running orchestrators roughly every 30s (six of seven files
+moved between two readings five minutes apart), so an untouched-content guard
+would fail on essentially every run and be indistinguishable from a real leak.
+Keying it on a name no production process can produce is only POSSIBLE because
+the same task renamed every PATH-exposed fixture unit to ``orchestrator-fake*``
+(:data:`SYNTHETIC_UNIT_PREFIX`, enforced at each fake-``systemctl`` seam by
+:func:`assert_synthetic_units`) — which is why the rename and the guard are one
+defence, not two.
+
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
 deliberately not.  Nine conftests import from this module; the git ceiling and
 the deploy-clock guard are in all nine, while ``_df_no_leaked_drain_processes``
-and task 3799's ``_df_fleet_dir_redirect`` are wired only into the ROOT conftest
-(covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are exactly the
-two rootdirs that spawn the drain script — and they are the two the incident
-came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
+and task 3799's ``_df_fleet_dir_redirect`` /
+``_df_no_synthetic_heartbeats_in_live_fleet`` are wired only into the ROOT
+conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
+exactly the two rootdirs that spawn the drain script — and they are the two the
+incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
 ``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
 as their own pytest sessions from their own venvs, so the root conftest does not
 reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
@@ -1221,3 +1245,119 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop(_FLEET_DIR_ENV, None)
         else:
             os.environ[_FLEET_DIR_ENV] = saved
+
+
+def synthetic_heartbeats_in(fleet_dir: str | os.PathLike[str]) -> list[str]:
+    """Names of the SYNTHETIC-unit heartbeat files sitting in *fleet_dir*.
+
+    Only ``<SYNTHETIC_UNIT_PREFIX>*.json`` — a real unit's heartbeat is IGNORED.
+    That is the property that makes the guard immune to genuine production
+    churn: the live fleet dir is rewritten by the running orchestrators roughly
+    every ~30s, so anything keyed on "did it change" fires constantly, while
+    nothing in production can produce an ``orchestrator-fake*`` name.
+
+    NEVER RAISES.  A missing directory, an unreadable one, a path that is not a
+    directory at all — every one of them is an empty result.  This runs in
+    SESSION TEARDOWN, where an exception would mask whatever the run was
+    actually reporting.
+
+    SORTED, so the failure message is stable across filesystems (readdir order
+    is not guaranteed) and diffable between runs.
+    """
+    try:
+        entries = list(Path(fleet_dir).iterdir())
+    except OSError:
+        return []
+    return sorted(
+        entry.name
+        for entry in entries
+        if entry.name.startswith(SYNTHETIC_UNIT_PREFIX) and entry.name.endswith('.json')
+    )
+
+
+def leaked_fleet_heartbeat_reason(names: list[str]) -> str | None:
+    """Explain which synthetic heartbeats leaked into the live fleet dir.
+
+    ``None`` when *names* is empty.  Otherwise names every offending file, the
+    absolute directory, the mechanism and the remedy SYMBOL — the actionable
+    message convention :func:`deploy_clock_violation_reason` and
+    :func:`leaked_drain_process_reason` established, so triage is not a second
+    investigation.
+    """
+    if not names:
+        return None
+    listed = '\n'.join(f'  {name}' for name in names)
+    return (
+        f'this test run LEAKED {len(names)} synthetic heartbeat(s) into the LIVE '
+        f'fleet directory {LIVE_FLEET_DIR} (task 3799):\n'
+        f'{listed}\n'
+        f'Those names start with {SYNTHETIC_UNIT_PREFIX!r}, so they are provably '
+        'test fixtures — no production orchestrator can produce one.\n'
+        'Mechanism: a spawner let ORCH_FLEET_DIR fall through to the '
+        'machine-global default at restart-all-orchestrators.sh:109 / '
+        'drain_check.py:32, so its heartbeat write (or the drain gate it drove) '
+        'landed in the CROSS-PROJECT rendezvous directory that seven projects\' '
+        'orchestrators use to decide the real fleet\'s drain state.\n'
+        'Fix: let df_pytest_isolation._df_fleet_dir_redirect cover the spawner '
+        '(bind it in that rootdir\'s conftest), or set ORCH_FLEET_DIR explicitly '
+        'in the call\'s own env=, which is applied after the os.environ copy.\n'
+        'DETECT-ONLY: these files have NOT been deleted. Remove them by hand '
+        'once you have attributed them — and check the other direction too, '
+        'since a leaked heartbeat can also make a REAL drain gate read a '
+        'fixture\'s idea of merge state.'
+    )
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_no_synthetic_heartbeats_in_live_fleet():
+    """Fail the run if a synthetic heartbeat appeared in the LIVE fleet dir.
+
+    WHY THIS SHAPE AND NOT "the real data/fleet is untouched (content+mtime)",
+    which is what the task literally proposed.  MEASURED 2026-08-09, two
+    independent readings ~5 minutes apart (mtimes 19:43:46-19:44:05, then
+    19:48:16-19:48:23): SIX of the seven live unit heartbeat files moved between
+    them, because the running orchestrators rewrite their heartbeat roughly every
+    30s (``orchestrator/src/orchestrator/harness.py:9804``).  An untouched-content
+    guard would therefore fail on essentially every run in every checkout, and
+    its failures would be indistinguishable from a real leak — a false-positive
+    generator, strictly worse than no guard, and the same "green and useless"
+    failure mode this defence family exists to avoid.  Keyed on the SYNTHETIC
+    name it is deterministic instead, cannot fire on genuine production churn,
+    and is strictly more specific about the defect.  It is also only POSSIBLE
+    because task 3799's rename made fixture unit names self-identifying: that is
+    the substantive reason those two halves are one task.
+
+    Snapshots before the session and re-reads at teardown, failing only on a NEW
+    name — a synthetic file that was ALREADY there is someone else's leak (or an
+    earlier run's, not yet cleaned up), and reporting it here would send this
+    run's reader after evidence that predates them.
+
+    DETECT-ONLY — it names the file and does NOT delete it, diverging from its
+    sibling :func:`_df_no_leaked_drain_processes`, which reaps what it reports.
+    That guard can safely reap because its per-session ``DF_PYTEST_LEAK_TOKEN``
+    proves a match belongs to THIS session.  A FILENAME carries no such token.
+    ``data/fleet/`` is machine-global and cross-project, and
+    ``merge_verify_breadth: "full"`` means several worktrees run this suite
+    concurrently, so a deleting guard could remove a CONCURRENT session's
+    evidence — destroying exactly the artifact an operator needs to attribute the
+    leak.  Same stance, and the same reasoning about acting on machine-operated
+    state, as :func:`_df_deploy_clocks_unwritten`.
+
+    Pure-helpers-plus-thin-fixture split and SESSION scope for the same
+    cost/coverage reasons as its three siblings.  A failure raised in teardown
+    surfaces as a run-level ERROR with a non-zero exit even when every test
+    passed.  That is the intended loudness: the damage is to machine-global
+    production state, not to any one test's result.
+    """
+    before = set(synthetic_heartbeats_in(LIVE_FLEET_DIR))
+    try:
+        yield
+    finally:
+        new = [
+            name
+            for name in synthetic_heartbeats_in(LIVE_FLEET_DIR)
+            if name not in before
+        ]
+        reason = leaked_fleet_heartbeat_reason(new)
+        if reason is not None:
+            pytest.fail(reason, pytrace=False)
