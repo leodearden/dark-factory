@@ -5,6 +5,7 @@ import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from qdrant_client import QdrantClient
@@ -1333,13 +1334,13 @@ class TestIsMissingCollectionError:
             404,
             'Not Found',
             b"Collection `fused_solar_challenge` doesn't exist!",
-            {},
+            httpx.Headers(),
         )
         assert is_missing_collection_error(exc) is True
 
     def test_non_404_unexpected_response_is_false(self):
         """A 500 is a real backend failure, not an empty collection."""
-        exc = UnexpectedResponse(500, 'Internal Server Error', b'boom', {})
+        exc = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
         assert is_missing_collection_error(exc) is False
 
     def test_generic_exception_is_false(self):

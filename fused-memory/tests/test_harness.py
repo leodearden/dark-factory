@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -15649,7 +15650,7 @@ class TestHarnessReconcileStatusCorrection:
                 404,
                 'Not Found',
                 b"Collection `fused_solar_challenge` doesn't exist!",
-                {},
+                httpx.Headers(),
             )
         )
 
@@ -15658,6 +15659,7 @@ class TestHarnessReconcileStatusCorrection:
                 'solar_challenge', {'1': 'done'}
             )
 
+        assert result is not None
         assert result == {
             'available': True,
             'found': False,
@@ -15667,8 +15669,8 @@ class TestHarnessReconcileStatusCorrection:
         }
         assert 'error' not in result
         # Structurally the same no-op as "no cached memory": nothing written.
-        harness.memory.add_memory.assert_not_called()
-        harness.memory.delete_memory.assert_not_called()
+        harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             'a missing collection is an empty result, not a failure — it must '
             'not emit the per-cycle WARNING the generic handler logs'
@@ -15686,7 +15688,9 @@ class TestHarnessReconcileStatusCorrection:
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         harness.memory.get_memories_by_metadata = AsyncMock(
-            side_effect=UnexpectedResponse(500, 'Internal Server Error', b'boom', {})
+            side_effect=UnexpectedResponse(
+                500, 'Internal Server Error', b'boom', httpx.Headers()
+            )
         )
 
         with caplog.at_level(logging.WARNING):
@@ -15694,6 +15698,7 @@ class TestHarnessReconcileStatusCorrection:
                 'solar_challenge', {'1': 'done'}
             )
 
+        assert result is not None
         assert 'error' in result
         assert result['superseded'] is False
         assert 'collection_missing' not in result
