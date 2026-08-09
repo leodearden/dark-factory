@@ -86,15 +86,19 @@ def _canonical_project(value: str) -> str:
     return value.strip().lower().replace('-', '_')
 
 
-def _result_project(entry: dict) -> str | None:
+def _result_project(entry: dict) -> tuple[str, str] | None:
     """Read a result's owning-project tag from its metadata, if any.
 
     Walks :data:`FOREIGN_PROJECT_TAG_KEYS` in precedence order and returns
-    the first present, non-empty **string** value found in
-    ``entry['metadata']``. A non-string value (e.g. an int) is treated as
-    absent rather than crashing the comparison. Returns ``None`` — i.e.
-    untagged — when ``entry['metadata']`` is missing, not a dict, or carries
-    none of the recognised keys.
+    the ``(key, value)`` pair of the first present, non-empty **string**
+    value found in ``entry['metadata']``. A non-string value (e.g. an int)
+    is treated as absent rather than crashing the comparison. Returns
+    ``None`` — i.e. untagged — when ``entry['metadata']`` is missing, not a
+    dict, or carries none of the recognised keys.
+
+    The matched key is returned alongside the value (not just the value) so
+    a drop can be logged with enough context — which key fired, and what it
+    said — to diagnose a false-positive filter from the logs alone.
     """
     metadata = entry.get('metadata')
     if not isinstance(metadata, dict):
@@ -102,7 +106,7 @@ def _result_project(entry: dict) -> str | None:
     for key in FOREIGN_PROJECT_TAG_KEYS:
         tag = metadata.get(key)
         if isinstance(tag, str) and tag.strip():
-            return tag
+            return key, tag
     return None
 
 
@@ -131,6 +135,14 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     when nothing survives, so the existing ``if section:`` guards in
     ``_get_memory_context`` skip an all-foreign section the same way they
     skip an empty one.
+
+    When nothing is dropped (the common case — see above), ``payload_text``
+    is returned unchanged rather than re-serialised: this preserves the
+    upstream formatting byte-for-byte and avoids the cost of a needless
+    round-trip. When something IS dropped, the re-serialisation uses
+    ``ensure_ascii=False`` so non-ASCII content (dark-factory memory text is
+    dense with em dashes and accented characters) is not escaped into
+    ``\\uXXXX`` sequences in the rendered ``# Context`` block.
 
     Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
     object, or a missing/non-list ``results`` — returning ``(payload_text,
@@ -169,25 +181,38 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
-        tag = _result_project(entry)
-        if tag is not None and _canonical_project(tag) != target:
-            dropped += 1
-            continue
+        match = _result_project(entry)
+        if match is not None:
+            key, tag = match
+            if _canonical_project(tag) != target:
+                dropped += 1
+                logger.debug(
+                    f'filter_foreign_project_results: dropped {entry.get("id")!r} '
+                    f'({key}={tag!r})'
+                )
+                continue
         kept.append(entry)
 
     if not kept:
         return '', dropped
 
+    if dropped == 0:
+        # No-op: nothing was filtered, so avoid re-serialising a payload
+        # that is byte-for-byte unchanged — this is the overwhelmingly
+        # common case, since every Graphiti-sourced result is untagged
+        # today and the filter never fires on it.
+        return payload_text, 0
+
     payload = dict(payload)
     payload['results'] = kept
-    return json.dumps(payload, indent=2), dropped
+    return json.dumps(payload, indent=2, ensure_ascii=False), dropped
 
 
 MEMORY_CONTEXT_CAVEAT = (
-    "_This context was recalled from {project_id!r}'s project memory — it is "
-    'NOT a description of this worktree. It may name tasks, repos, crates, or '
-    'file paths that do not exist here. Do not assume a recalled path is '
-    'real: verify it exists before reading it or `cd`-ing into it._'
+    "_This context was recalled from the `{project_id}` project's memory — "
+    'it is NOT a description of this worktree. It may name tasks, repos, '
+    'crates, or file paths that do not exist here. Do not assume a recalled '
+    'path is real: verify it exists before reading it or `cd`-ing into it._'
 )
 """Standing provenance caveat rendered right after the ``# Context`` heading.
 
@@ -1231,28 +1256,32 @@ Handle this escalation, then call `resolve_issue` with a summary.
 
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
-        sections = []
+        recalled_sections: list[str] = []
         foreign_dropped = 0
+        queries_fired = 0
         memory_unavailable = False
 
         try:
             # Project overview
             overview, dropped = await self._scoped_search('project overview architecture goals')
             foreign_dropped += dropped
+            queries_fired += 1
             if overview:
-                sections.append(f'## Project Context\n\n{overview}')
+                recalled_sections.append(f'## Project Context\n\n{overview}')
 
             # Conventions
             conventions, dropped = await self._scoped_search('coding conventions and project norms')
             foreign_dropped += dropped
+            queries_fired += 1
             if conventions:
-                sections.append(f'## Conventions\n\n{conventions}')
+                recalled_sections.append(f'## Conventions\n\n{conventions}')
 
             # Recent decisions
             decisions, dropped = await self._scoped_search('recent decisions and rationale')
             foreign_dropped += dropped
+            queries_fired += 1
             if decisions:
-                sections.append(f'## Recent Decisions\n\n{decisions}')
+                recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
 
             # Task-specific context
             if task_id:
@@ -1260,35 +1289,65 @@ Handle this escalation, then call `resolve_issue` with a summary.
                     f'task {task_id} context and related decisions'
                 )
                 foreign_dropped += dropped
+                queries_fired += 1
                 if task_ctx:
-                    sections.append(f'## Task Context\n\n{task_ctx}')
+                    recalled_sections.append(f'## Task Context\n\n{task_ctx}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
-            sections.append('## Context\n\n_Memory unavailable — proceed with codebase exploration._')
             memory_unavailable = True
 
-        if not sections:
+        # Compute (and log) the filtered-result summary BEFORE any early
+        # return below: an all-foreign result set and a partial failure are
+        # both "no facts survived" outcomes, and the fact that a leak was
+        # caught and blocked must never be discarded along with them — see
+        # filter_foreign_project_results' loud-over-silent fail-open stance.
+        # foreign_dropped sums per-query drops over the SAME corpus (four
+        # queries can all match one distinct foreign memory), so the note
+        # names both numbers rather than implying `foreign_dropped` distinct
+        # facts were found.
+        drop_note = ''
+        if foreign_dropped > 0:
+            query_word = 'query' if queries_fired == 1 else 'queries'
+            drop_note = (
+                f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+                f'{query_word} were tagged to another project and filtered out'
+            )
+            logger.info(
+                f'_get_memory_context: {drop_note} of the context assembled for '
+                f'{self.project_id!r}'
+            )
+
+        if not recalled_sections:
+            if memory_unavailable:
+                if drop_note:
+                    return (
+                        '# Context\n\n_Memory unavailable — proceed with codebase '
+                        f'exploration. Note: {drop_note} before the failure._'
+                    )
+                return '# Context\n\n_Memory unavailable — proceed with codebase exploration._'
+            if drop_note:
+                return f'# Context\n\n_No memory context available ({drop_note})._'
             return '# Context\n\n_No memory context available._'
 
-        if memory_unavailable:
-            # No facts were actually recalled (the outer fetch itself failed), so
-            # the provenance caveat below — which talks about recalled facts —
-            # would not make sense here. Preserve the pre-existing rendering.
-            return '# Context\n\n' + '\n\n---\n\n'.join(sections)
-
+        # recalled_sections is non-empty: gate the provenance caveat on that
+        # fact alone, NOT on memory_unavailable — a later query failing must
+        # not suppress the caveat (the untagged-leak mitigation) for
+        # sections that were already genuinely recalled. The failure, if
+        # any, is appended afterwards as its own section rather than
+        # silently dropped.
         caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=self.project_id)
-        if foreign_dropped > 0:
-            logger.info(
-                f'_get_memory_context: filtered {foreign_dropped} memory result(s) tagged to '
-                f'another project out of the context assembled for {self.project_id!r}'
-            )
-            caveat += (
-                f'\n\n_{foreign_dropped} memory result(s) tagged to another project were '
-                'filtered out of this context._'
+        if drop_note:
+            caveat += f'\n\n_In total, {drop_note}._'
+
+        rendered_sections = list(recalled_sections)
+        if memory_unavailable:
+            rendered_sections.append(
+                '_Memory unavailable for the remaining queries — proceed with '
+                'codebase exploration for anything not covered above._'
             )
 
-        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(sections)
+        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
 
     async def _scoped_search(self, query: str) -> tuple[str | None, int]:
         """Search fused-memory and drop cross-project results from the reply.
@@ -1299,6 +1358,15 @@ Handle this escalation, then call `resolve_issue` with a summary.
         to the raw text before it reaches :meth:`_get_memory_context`.
         Returns ``(None, 0)`` when the underlying search itself returned
         nothing (nothing to filter).
+
+        Assumes :meth:`_mcp_search` answers with a single JSON document: it
+        joins every MCP response text block with ``'\\n'`` before returning
+        (unchanged by this task, to keep its silent-fallthrough allowlist
+        entry valid). If the search tool ever replies with more than one
+        text block, the joined text is not valid JSON and the filter fails
+        open (unfiltered, WARNING logged) for that query — see
+        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
+        pinned limitation.
         """
         raw = await self._mcp_search(query)
         if not raw:
