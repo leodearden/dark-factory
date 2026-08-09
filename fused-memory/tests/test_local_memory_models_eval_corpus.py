@@ -544,6 +544,71 @@ class TestSelect:
             _mod.select([], 10, seed='s')
 
 
+class TestSelectGroupsThePopulationOnce:
+    """The stratification is derived once per ``select``, not once per cell.
+
+    ``_group_by_cell`` derives a ``stratum_key`` for every record, and each key
+    costs an ISO-8601 parse plus a regex substitution. Calling it once per cell
+    makes the work O(cells x population) instead of O(population) — at the
+    committed shape (~2,775 episodes, 20 cells) the reviewer measured roughly
+    half a second of pure redundancy inside ``select``.
+
+    That is already fixed: ``select`` groups once and calls
+    ``_permutation_from_cells``. But nothing stopped it from being un-fixed,
+    because the optimisation is invisible in the RESULT — a revert to
+    ``cell_permutation(population, cell, ...)`` inside the loop would leave
+    every other test in this file green. Hence a pin on the call count.
+    """
+
+    def _counting_group_by_cell(self, monkeypatch) -> list[int]:
+        """Wrap the real ``_group_by_cell`` in a counter, returning the tally."""
+        calls: list[int] = []
+        real = _mod._group_by_cell
+
+        def counted(population):
+            calls.append(len(population))
+            return real(population)
+
+        monkeypatch.setattr(_mod, '_group_by_cell', counted)
+        return calls
+
+    def test_select_derives_the_stratification_exactly_once(self, monkeypatch):
+        calls = self._counting_group_by_cell(monkeypatch)
+        _mod.select(_population(SYNTHETIC_CELLS), 20, seed='s')
+        assert len(calls) == 1, f'grouped {len(calls)} times for {len(SYNTHETIC_CELLS)} cells'
+
+    def test_the_public_wrapper_still_takes_a_raw_population(self):
+        """The reviewer-facing seam survives the optimisation.
+
+        ``cell_permutation`` takes the shape a reviewer has in hand — an
+        ungrouped population — which is what makes the prefix property directly
+        checkable (see test_selection_is_a_prefix_of_each_cells_permutation).
+        Collapsing it into the grouped-only helper would optimise the seam away
+        along with the redundant work.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        for cell in SYNTHETIC_CELLS:
+            assert _mod.cell_permutation(pop, cell, seed='s') == (
+                _mod._permutation_from_cells(_mod._group_by_cell(pop), cell, seed='s')
+            )
+
+    def test_grouping_once_does_not_change_the_draw(self):
+        """CONTROL: the optimisation is result-preserving, not merely faster.
+
+        Asserted against the raw-population wrapper rather than against a
+        recorded constant, so this stays true under a future re-tune of N.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        baseline = _uuids(_mod.select(pop, 20, seed='s').selected)
+        shuffled = list(pop)
+        random.Random(7).shuffle(shuffled)
+        assert _uuids(_mod.select(shuffled, 20, seed='s').selected) == baseline
+        result = _mod.select(pop, 20, seed='s')
+        for cell in SYNTHETIC_CELLS:
+            taken = [r.uuid for r in result.selected if _mod.stratum_key(r) == cell]
+            assert taken == _mod.cell_permutation(pop, cell, seed='s')[: len(taken)], cell
+
+
 class TestSelectionIsNotConditionedOnOutcome:
     """The binding hazard, at the sampler: an outcome-failed episode stays eligible."""
 
@@ -639,6 +704,39 @@ class _FalkorDouble:
             'reader triggered index construction — this is the evidence-destroying '
             'hazard owned by docs/prds/falkordb-index-provisioning.md'
         )
+
+
+class _UnreachableDouble(_FalkorDouble):
+    """A graph handle whose ``ro_query`` raises, standing in for a down FalkorDB.
+
+    A real class, never MagicMock, for the same reason as ``_FalkorDouble``.
+    It SUBCLASSES that double rather than standing alone so it inherits every
+    write-path tripwire: an unreachable store is no excuse for the builder to
+    reach for a write-capable path on the way out, and a bare stand-in would
+    have quietly stopped checking. It carries no rows — the point is that the
+    store never answers at all.
+    """
+
+    def __init__(self, exc: BaseException):
+        super().__init__([])
+        self.exc = exc
+
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.ro_queries.append(cypher)
+        raise self.exc
+
+
+def _redis_connection_error(message: str) -> BaseException:
+    """The exception a down FalkorDB actually surfaces, imported at call time.
+
+    Local rather than a top-level import so this module keeps build_corpus.py's
+    own property — importing it drags in no client — and so collection never
+    depends on what is only a transitive dependency
+    (graphiti-core[falkordb] -> falkordb -> redis).
+    """
+    from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
+
+    return RedisConnectionError(message)
 
 
 def _row(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts') -> list[object]:
@@ -1544,6 +1642,122 @@ class TestVerifyDistinguishesASamplerChangeFromTampering:
         assert _mod.verify_manifest(bumped, population).status == 'ok'
 
 
+class TestVerifyAttributesARecordParseFailureToTheStore:
+    """A corrupted STORE row is not a broken ARTIFACT.
+
+    ``verify_manifest`` answers two different questions with two different
+    mechanisms: a defect in the manifest is a VERDICT (``bad_manifest``, a
+    documented exit code), and a defect in the store is a FAILURE (a raised
+    ``CorpusBuildError``, no verdict at all). Reporting an unparseable
+    ``created_at`` on a live episode as ``bad_manifest`` sends the reader after
+    the wrong culprit entirely: they re-derive an artifact that was never
+    wrong, while the row that actually needs fixing goes unnamed.
+
+    ``parse_timestamp`` already carries a *field* argument so "a bad manifest
+    criterion and a bad store row are distinguishable in the message" — these
+    tests make the CALLER honour the distinction it was given.
+
+    The two controls pin the other half: narrowing the attribution must not
+    drag the genuinely manifest-attributable failures out with it.
+    """
+
+    def _corrupted(self, created_at: str = 'not-a-timestamp'):
+        """A good manifest plus a population with ONE unparseable created_at.
+
+        The uuid is preserved so the ``missing_episodes`` check does not
+        short-circuit ahead of the windowing this class is about.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        corrupted = [
+            _mod.EpisodeRecord(**{**dataclasses.asdict(r), 'created_at': created_at})
+            if r.uuid == target
+            else r
+            for r in population
+        ]
+        return manifest, corrupted, target
+
+    def test_a_corrupt_store_row_is_not_reported_as_a_bad_manifest(self):
+        """The failure propagates; it is not laundered into a verdict.
+
+        Both halves are asserted in one test because pytest's bare "DID NOT
+        RAISE" would not say WHICH verdict came back, and "it came back as
+        bad_manifest" is the exact regression this class exists to prevent.
+        """
+        manifest, corrupted, _ = self._corrupted()
+        with pytest.raises(_mod.CorpusBuildError):
+            report = _mod.verify_manifest(manifest, corrupted)
+            raise AssertionError(
+                f'a corrupt store row came back as a {report.status!r} verdict '
+                f'instead of raising'
+            )
+
+    def test_the_error_names_the_offending_episode(self):
+        """An operator cannot go and fix a row the message never identifies."""
+        manifest, corrupted, target = self._corrupted()
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, corrupted)
+        assert target in str(excinfo.value)
+
+    def test_an_unparseable_window_bound_is_still_a_bad_manifest(self):
+        """CONTROL: the window BOUND is a manifest value, so it stays a verdict.
+
+        The bound is written by the builder into the artifact; a store row is
+        not. Narrowing the attribution must not sweep this out with it.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        broken = {
+            **manifest,
+            'criteria': {
+                **manifest['criteria'],
+                'window': {'max_created_at': 'not-a-timestamp'},
+            },
+        }
+        report = _mod.verify_manifest(broken, population)
+        assert report.status == 'bad_manifest'
+        assert report.detail
+
+    def test_an_unsatisfiable_recorded_n_is_still_a_bad_manifest(self):
+        """CONTROL: ``select`` stays INSIDE the manifest-attributable clause.
+
+        A recorded ``n`` the sampling frame cannot fill genuinely IS "cannot
+        re-derive from the recorded criteria" — the artifact records something
+        its own criteria do not produce. Pinned so a later implementer cannot
+        over-narrow and turn a real artifact defect into an exit-1 crash.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        unsatisfiable = {
+            **manifest,
+            'criteria': {**manifest['criteria'], 'n': len(population) + 1},
+        }
+        report = _mod.verify_manifest(unsatisfiable, population)
+        assert report.status == 'bad_manifest'
+        assert 're-derive' in report.detail
+
+    def test_the_cli_path_reports_a_corrupt_row_as_a_run_failure_not_a_verdict(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The two code spaces stay disjoint all the way out to the process.
+
+        ``fetch_population`` already pre-validates every row, so the CLI reaches
+        exit 1 before ``verify_manifest`` is ever called — this pins that the
+        operator-visible outcome is "the check never ran", never a bad_manifest
+        verdict about an artifact that is fine.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        rows = [list(row) for row in _cli_rows()]
+        rows[0][4] = 'not-a-timestamp'
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), rows=rows)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert code != _mod.EXIT_CODES['bad_manifest']
+        assert capsys.readouterr().err.strip()
+
+
 class TestVerifyCatchesContentDrift:
     """Hash drift is a DIFFERENT failure from an id mismatch."""
 
@@ -1704,14 +1918,20 @@ def _cli_rows(population=None) -> list[list[object]]:
     ]
 
 
-def _run_cli(monkeypatch, *argv, rows=None) -> tuple[int, _StubReaderFactory]:
+def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubReaderFactory]:
     """Drive ``main()`` in-process against the offline double.
 
     Precedent: ``_run_cli`` in test_memory_eval_transcript_corpus.py. Returns
     the exit code plus the factory, so a test can assert on what the CLI asked
     the reader for as well as what it produced.
+
+    *rows* is the ordinary path: a store that answers. *double* substitutes the
+    graph handle outright, for a store that does not — see
+    ``_UnreachableDouble``.
     """
-    factory = _StubReaderFactory(_FalkorDouble(rows if rows is not None else _cli_rows()))
+    if double is None:
+        double = _FalkorDouble(rows if rows is not None else _cli_rows())
+    factory = _StubReaderFactory(double)
     monkeypatch.setattr(_mod, 'EpisodeReader', factory)
     return _mod.main(list(argv)), factory
 
@@ -2001,6 +2221,245 @@ class TestCliVerifyMode:
             monkeypatch, '--verify', '--out', str(out), '--n', '30', '--seed', 'other'
         )
         assert code == 0
+
+
+class TestAnUnreachableStoreIsATypedErrorNotATraceback:
+    """Exit 1 is DOCUMENTED to mean "the store was unreachable" — make it true.
+
+    The module docstring's exit table and scripts/local_memory_models_eval/
+    README.md both promise that exit 1 covers a run that could not complete
+    because the store could not be read. Today an unreachable FalkorDB satisfies
+    that promise only by accident: the exception escapes ``main`` as a raw
+    traceback that Python happens to exit 1 on. An operator reading the
+    documented contract expects a message; a caller distinguishing "the corpus
+    is wrong" from "the check never ran" gets the right answer for the wrong
+    reason, and any change to how tracebacks exit would silently break it.
+
+    The controls matter as much as the assertions here: widening the handler to
+    a bare ``except Exception`` would satisfy every positive test below while
+    swallowing genuine builder bugs behind a tidy ``error:`` line, converting a
+    loud crash into a silent fail-soft.
+    """
+
+    def test_the_redis_connection_error_is_not_an_oserror(self):
+        """Why ``OSError`` alone would NOT be enough.
+
+        Measured on redis 7.4.0: the MRO is ConnectionError -> RedisError ->
+        Exception, with OSError nowhere in it. A handler widened to OSError
+        only — the obvious reading — would still let exactly the unreachable
+        FalkorDB case escape as a traceback. Pinned as a premise so the reason
+        for the second exception type cannot be lost to a later tidy-up.
+        """
+        from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
+
+        assert not issubclass(RedisConnectionError, OSError)
+
+    @pytest.mark.parametrize(
+        'make_exc',
+        [_redis_connection_error, OSError],
+        ids=['redis-connection-error', 'oserror'],
+    )
+    def test_an_unreachable_store_exits_run_failed_under_verify(
+        self, monkeypatch, tmp_path, make_exc
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        code, _ = _run_cli(
+            monkeypatch,
+            '--verify',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(make_exc('falkordb is down')),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+
+    @pytest.mark.parametrize(
+        'make_exc',
+        [_redis_connection_error, OSError],
+        ids=['redis-connection-error', 'oserror'],
+    )
+    def test_an_unreachable_store_exits_run_failed_under_build(
+        self, monkeypatch, tmp_path, make_exc
+    ):
+        """And writes nothing: a run that never read the store has no corpus."""
+        out = tmp_path / 'corpus_manifest.json'
+        code, _ = _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(make_exc('falkordb is down')),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+
+    def test_the_operator_sees_the_promised_error_line_not_a_stack_trace(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The contract is a message on stderr, in the shape the CLI already uses."""
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+        )
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert 'falkordb is down' in err
+
+    def test_an_unrelated_exception_still_surfaces_as_a_traceback(
+        self, monkeypatch, tmp_path
+    ):
+        """CONTROL: the handler must stay narrow.
+
+        A RuntimeError out of the store path is a bug in this builder, not an
+        unreachable store. Catching it would hide a defect behind the exit code
+        that means "the environment was at fault" — the loud-crash-becomes-
+        silent-fail-soft failure this project's norms forbid.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        with pytest.raises(RuntimeError):
+            _run_cli(
+                monkeypatch,
+                '--n',
+                '20',
+                '--seed',
+                's',
+                '--out',
+                str(out),
+                double=_UnreachableDouble(RuntimeError('a builder bug')),
+            )
+
+    def test_the_run_failed_code_is_still_disjoint_from_every_verdict(self):
+        """CONTROL, re-asserted at the CLI layer: no new status may claim 1."""
+        assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
+
+
+class TestAWriteFailureIsNotBlamedOnTheStore:
+    """A bad ``--out`` is an ordinary operator typo — do not name the store for it.
+
+    ``--out`` is operator-supplied, so a path into a directory that does not
+    exist (or is not a directory) is a routine mistake, not an infrastructure
+    incident. Reporting it as "the store could not be read" sends the operator
+    off to restart FalkorDB when the fix is a path — the exact mis-attribution
+    ``_window_population`` was extracted to eliminate on the verify side.
+
+    The cause is placement, not the exception tuple: a handler wrapped around
+    the WHOLE run sees every ``OSError`` the run can raise, and
+    ``write_manifest``'s ``mkdir``/``write_text`` raise the same type as an
+    unreachable socket. So the catch belongs at the seam that actually talks to
+    the store, where the attribution is true by construction rather than by the
+    hope that nothing else in the run raises ``OSError``.
+    """
+
+    @staticmethod
+    def _unwritable_out(tmp_path):
+        """An ``--out`` whose parent exists but is a FILE, so ``mkdir`` raises.
+
+        ``write_manifest`` calls ``target.parent.mkdir(parents=True,
+        exist_ok=True)``, and ``exist_ok=True`` still re-raises
+        ``FileExistsError`` (an ``OSError``) when the existing path is not a
+        directory. Chosen over ``chmod 0o500`` deliberately: chmod is a silent
+        no-op for uid 0, so on a CI runner that happens to be root a
+        permissions-based fixture would make every test below pass vacuously.
+        This trick is uid-independent.
+        """
+        bad_parent = tmp_path / 'afile'
+        bad_parent.write_text('not a directory', encoding='utf-8')
+        return bad_parent / 'corpus_manifest.json'
+
+    def test_an_unwritable_out_path_is_not_reported_as_an_unreachable_store(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The whole point, stated in the negative — and shape-agnostic.
+
+        It asserts only that the store is NOT named, so it holds whichever way
+        the write failure is eventually surfaced. That keeps it a pin on the
+        mis-attribution alone, rather than a second copy of the next test's
+        message assertions that would have to move with them.
+        """
+        out = self._unwritable_out(tmp_path)
+        capsys.readouterr()
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert 'the store could not be read' not in capsys.readouterr().err
+
+    def test_an_unwritable_out_path_is_attributed_to_the_path(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """And in the positive: a typed exit-1 naming the path the operator gave.
+
+        Mirrors ``_run_verify``'s existing ``cannot read {path}: {exc}`` idiom,
+        so the two halves of the CLI report a filesystem failure the same way.
+        """
+        out = self._unwritable_out(tmp_path)
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        err = capsys.readouterr().err
+        assert code == _mod.EXIT_RUN_FAILED
+        assert err.startswith('error: ')
+        assert 'cannot write' in err
+        assert str(out) in err
+
+    def test_the_store_answered_before_the_write_failed(self, monkeypatch, tmp_path):
+        """What makes the two tests above evidence rather than coincidence.
+
+        The store is demonstrably innocent — it was queried and it answered —
+        rather than merely never having been reached, which a run that failed
+        earlier would also satisfy while telling us nothing about attribution.
+        """
+        out = self._unwritable_out(tmp_path)
+        double = _FalkorDouble(_cli_rows())
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), double=double)
+        assert double.ro_queries
+        assert not double.violations
+
+    def test_an_unreachable_store_is_still_reported_as_a_store_failure(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: the narrowing must not cost the true positive.
+
+        Same build mode, same exit code, same message — only the culprit
+        differs. Without this, "stop blaming the store" could be satisfied by
+        never blaming the store at all.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+        )
+        err = capsys.readouterr().err
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'the store could not be read' in err
+        assert 'falkordb is down' in err
+
+    def test_a_verify_run_with_an_unreadable_manifest_is_still_a_bad_manifest(
+        self, monkeypatch, tmp_path
+    ):
+        """CONTROL: the OTHER filesystem OSError in the CLI keeps its verdict.
+
+        ``_run_verify`` already catches ``OSError`` from ``path.read_text()``
+        and reports ``bad_manifest``, and that clause sits BEFORE the store is
+        touched. Moving the store handler must not reach past it and convert a
+        settled verdict into a verdict-free exit 1.
+        """
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(tmp_path / 'nope.json'))
+        assert code == _mod.EXIT_CODES['bad_manifest']
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:

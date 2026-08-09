@@ -1178,6 +1178,40 @@ def _rule_drift(criteria: dict) -> str:
     )
 
 
+def _window_population(
+    population: list[EpisodeRecord], cutoff: datetime
+) -> list[EpisodeRecord]:
+    """Return the records at or before *cutoff*, naming any row that will not parse.
+
+    Its own function, and deliberately called from OUTSIDE
+    :func:`verify_manifest`'s manifest-attributable ``try``, because the two
+    failures it sits between have different culprits. The window *bound* is a
+    manifest value; a record's ``created_at`` is a STORE value. Filtering
+    inside that ``try`` — which is what this code used to do — reported a
+    corrupted store row as ``bad_manifest``, sending the reader off to
+    re-derive an artifact that was never wrong while the row that actually
+    needs fixing went unnamed.
+
+    So a record-level parse failure is re-raised, not returned: it propagates
+    to :func:`main` and exits 1, "the run never reached a verdict", which is
+    the truth. The uuid is named because an operator cannot go and fix a row
+    the message does not identify — the same shape ``fetch_population`` uses
+    for its own row-level rejections.
+    """
+    windowed: list[EpisodeRecord] = []
+    for record in population:
+        try:
+            created_at = parse_timestamp(record.created_at)
+        except CorpusBuildError as exc:
+            raise CorpusBuildError(
+                f'episode {record.uuid!r} has an unparseable created_at: {exc} — '
+                f'this is a store condition, not a defect in the manifest'
+            ) from exc
+        if created_at <= cutoff:
+            windowed.append(record)
+    return windowed
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1217,6 +1251,16 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     meaningful. Hashes cannot be compared against episodes that are not there,
     and drift in a selection that is already wrong is not the reader's problem
     yet.
+
+    **Manifest defects are returned; store defects are raised.** Those are two
+    different findings with two different remedies, so they get two different
+    mechanisms: anything wrong with the artifact comes back as a
+    :class:`VerifyReport` status and a documented exit code, while anything
+    wrong with the population propagates as a :class:`CorpusBuildError` and
+    exits 1, "no verdict was reached". Collapsing the second into
+    ``bad_manifest`` would be worse than unhelpful — it names a culprit that is
+    innocent, and the reader would re-derive a perfectly good corpus while the
+    real problem stayed in the store. See :func:`_window_population`.
     """
     try:
         criteria, episodes = _read_criteria(manifest)
@@ -1239,12 +1283,27 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         )
 
     try:
+        # Already parsed for effect in _read_criteria, so this cannot raise
+        # today. Kept here anyway, and inside this clause rather than beside
+        # the windowing: the bound is a MANIFEST value, so a reader tracing
+        # attribution at the point of use should find it in the clause that
+        # reports bad_manifest.
         cutoff = parse_timestamp(
             criteria['window']['max_created_at'], field='criteria.window.max_created_at'
         )
-        windowed = [
-            record for record in population if parse_timestamp(record.created_at) <= cutoff
-        ]
+    except CorpusBuildError as exc:
+        return VerifyReport(
+            status='bad_manifest',
+            detail=f'cannot re-derive from the recorded criteria: {exc}',
+            checked=len(recorded_ids),
+        )
+
+    # OUTSIDE the clause above, deliberately: a record that will not parse is a
+    # corrupted store row, and blaming the artifact for it points the reader at
+    # the wrong culprit. See _window_population.
+    windowed = _window_population(population, cutoff)
+
+    try:
         rederived = [
             record.uuid
             for record in select(windowed, criteria['n'], seed=criteria['seed']).selected
@@ -1457,8 +1516,27 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
 
     ``EpisodeReader`` is looked up on the module at call time rather than
     captured, so a test can substitute an offline double for the whole CLI.
+
+    This is the ONLY place in the CLI path that talks to the store, which is
+    why the store-error catch lives here rather than around the whole run in
+    :func:`main`. Everything else inside that run raises the same types:
+    ``write_manifest``'s ``mkdir``/``write_text``, and every ``print`` into a
+    closed pipe, are all ``OSError``. A handler wrapped around the run
+    therefore names the store for failures it had no part in — an operator
+    told "the store could not be read" after a typo'd ``--out`` goes off to
+    restart FalkorDB when the fix is a path. Attribution has to be true by
+    construction, not by the hope that nothing else in the run raises.
+
+    Both the constructor and the ``asyncio.run`` are inside the ``try``:
+    :meth:`EpisodeReader._resolve_graph` imports and connects the client, so a
+    failure from there is genuinely a store-connectivity condition too.
     """
-    return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+    try:
+        return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+    except _store_error_types() as exc:
+        raise CorpusBuildError(
+            f'the store could not be read ({type(exc).__name__}): {exc}'
+        ) from exc
 
 
 def _run_build(args: argparse.Namespace) -> int:
@@ -1472,7 +1550,16 @@ def _run_build(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f'dry-run: nothing written (would have written {args.out})')
         return 0
-    print(f'manifest: {write_manifest(manifest, args.out)}')
+    # Named the same way _run_verify names an unreadable manifest, so both
+    # halves of the CLI report a filesystem failure against the path the
+    # operator actually supplied. The print stays OUTSIDE: a BrokenPipeError
+    # from it, reported as `cannot write <manifest path>`, would reintroduce
+    # the same mis-attribution one layer down.
+    try:
+        written = write_manifest(manifest, args.out)
+    except OSError as exc:
+        raise CorpusBuildError(f'cannot write {args.out}: {exc}') from exc
+    print(f'manifest: {written}')
     return 0
 
 
@@ -1532,6 +1619,38 @@ def _emit_verdict(report: VerifyReport) -> int:
     return report.exit_code
 
 
+def _store_error_types() -> tuple[type[BaseException], ...]:
+    """The exception types that mean "the store could not be read".
+
+    Two measured facts shape this, both re-confirmed on redis 7.4.0 rather than
+    assumed:
+
+    1. ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — the MRO
+       of ``redis.exceptions.ConnectionError`` is ``ConnectionError ->
+       RedisError -> Exception``. So catching ``OSError`` alone, the obvious
+       reading, would still let an unreachable FalkorDB escape as a traceback:
+       exactly the case exit ``1`` is documented to cover.
+    2. The import is function-local, matching :meth:`EpisodeReader._resolve_graph`,
+       so merely importing this module — which the tests do, with a double in
+       hand — never drags in the client. It tolerates ``ImportError`` because
+       ``redis`` is only a transitive dependency
+       (``graphiti-core[falkordb]`` -> ``falkordb`` -> ``redis``); without the
+       client installed there is no FalkorDB to be unreachable, and ``OSError``
+       alone is then the whole story.
+
+    ``RedisError`` rather than ``ConnectionError`` so a server-side
+    ``ResponseError`` also exits with a message instead of a traceback. The
+    sole caller, :func:`_fetch_population`, names ``type(exc).__name__``, which
+    keeps "unreachable" and "query rejected" distinguishable in the text
+    without needing two clauses.
+    """
+    try:
+        from redis.exceptions import RedisError  # noqa: PLC0415
+    except ImportError:
+        return (OSError,)
+    return (OSError, RedisError)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     args = _build_parser().parse_args(argv)
@@ -1541,6 +1660,15 @@ def main(argv: list[str] | None = None) -> int:
         # A typed build/read failure, reported as a message plus a documented
         # code rather than a traceback plus exit 1-by-accident. Distinct from
         # every EXIT_CODES verification status: nothing was verified.
+        #
+        # ONE exit-1 path, not one per culprit: an unreachable store and an
+        # unwritable --out are both raised as CorpusBuildError at the seam
+        # that knows which is which (_fetch_population, _run_build), so the
+        # message is attributed where the evidence is rather than guessed at
+        # from up here. Deliberately NOT a bare `except Exception` — that
+        # would satisfy the documented exit-1 promise while swallowing genuine
+        # builder bugs behind a tidy message, turning a loud crash into a
+        # silent fail-soft.
         print(f'error: {exc}', file=sys.stderr)
         return EXIT_RUN_FAILED
 
