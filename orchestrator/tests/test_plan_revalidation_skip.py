@@ -438,3 +438,34 @@ async def test_replan_fallthrough_includes_prior_proposals(tmp_path: Path):
     f.build_architect_prompt.assert_awaited_once()
     _, kwargs = f.build_architect_prompt.call_args
     assert kwargs.get('include_prior_proposals') is True
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
+    """Task 3579: on the revalidation-skip path the optimistic_path stamp must
+    not write back the stale dispatch-time metadata blob — at shallow-merge
+    mode its ``files`` key overwrites the narrowed set
+    ``_reconcile_scope_locks`` just persisted."""
+    backend = FakeMetadataBackend()
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=['mod_a/src/foo.py'],
+        modules=['mod_a/src', 'mod_b/src'],
+        task_metadata={'files': ['mod_a/src/foo.py', 'mod_b/src/bar.py']},
+        changed_files=['unrelated/other.py'],
+        metadata_backend=backend,
+    )
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []  # architect never invoked
+    # The reconcile ran and persisted the narrowed set.
+    assert backend.blast_radius_calls
+    assert backend.blast_radius_calls[-1][2] == ['mod_a/src/foo.py']
+    # ...and the stamp did NOT revert it.
+    assert backend.blob['files'] == ['mod_a/src/foo.py']
+    # The stamp itself still landed — a failure above is the clobber, not a
+    # missing stamp.
+    assert backend.blob['optimistic_path'] == 'revalidation_skip'
+    assert f.wf.task['metadata']['optimistic_path'] == 'revalidation_skip'

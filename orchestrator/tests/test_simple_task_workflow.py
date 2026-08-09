@@ -434,3 +434,63 @@ async def test_should_run_simple_task_false_when_saturated(tmp_path: Path):
     f.wf.initial_plan = None
 
     assert f.wf._should_run_simple_task() is False
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
+    """Task 3579: the optimistic_path stamp must not write back the stale
+    dispatch-time metadata blob — at shallow-merge mode its ``files`` key
+    overwrites the NARROWED set ``_reconcile_scope_locks`` just persisted."""
+    plan = _good_plan()
+    plan['files'] = ['mod_a/src/foo.py']
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': ['mod_a/src/foo.py', 'mod_b/src/bar.py']},
+        modules=['mod_a/src', 'mod_b/src'],
+        metadata_backend=backend,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    # The reconcile ran and persisted the narrowed set.
+    assert backend.blast_radius_calls
+    assert backend.blast_radius_calls[-1][2] == ['mod_a/src/foo.py']
+    # ...and the stamp did NOT revert it.
+    assert backend.blob['files'] == ['mod_a/src/foo.py']
+    # The stamp itself still landed, in the backend and in memory — so a
+    # failure above is the clobber, not a missing stamp.
+    assert backend.blob['optimistic_path'] == 'simple_task'
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_preserves_widened_files(tmp_path: Path):
+    """Task 3579, the other direction: the stale dispatch-time blob written
+    back at shallow-merge mode also re-NARROWS a scope the reconcile just
+    widened."""
+    plan = _good_plan()
+    plan['files'] = ['mod_a/src/foo.py', 'mod_b/src/bar.py']
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': ['mod_a/src/foo.py']},
+        modules=['mod_a/src'],
+        metadata_backend=backend,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert backend.blast_radius_calls
+    assert backend.blast_radius_calls[-1][2] == [
+        'mod_a/src/foo.py', 'mod_b/src/bar.py',
+    ]
+    assert backend.blob['files'] == ['mod_a/src/foo.py', 'mod_b/src/bar.py']
+    assert backend.blob['optimistic_path'] == 'simple_task'
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
