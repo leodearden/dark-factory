@@ -868,15 +868,21 @@ STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
 # Age-based GC for the legacy Mem0 stage1_flag_marker pool (task 2853).
-# Task 2406 retired the Mem0 stage1_flag_marker mirror write — markers now
-# persist only to the recon_ledger SQLite table (see _gc_recon_markers /
+# Task 2406 retired the CANONICAL Mem0 stage1_flag_marker mirror write
+# (flag_dedup._persist_marker) — markers from that path now persist only
+# to the recon_ledger SQLite table (see _gc_recon_markers /
 # ReconLedgerStore.gc above, which reaps ledger rows only). Task 2228 W5-κ
 # deleted the prior in-cycle Mem0 sweeps for this source (_sweep_stale_flag_
 # markers, _sweep_terminal_task_flag_markers) on the assumption that the
 # ledger gc() pass fully replaced them; it does not reach Mem0, so the
 # pre-2406 Mem0 pool was left with no in-cycle collector for any project.
-# Since the write path is fully retired, every remaining Mem0
-# stage1_flag_marker record is dead weight; 14 days reuses the
+# The canonical write path is retired, but it is not the ONLY one (task
+# 3915): an LLM recon agent via the add_memory MCP tool can still write a
+# stage1_flag_marker record directly to Mem0, tagged with metadata.kind
+# rather than metadata.source (measured live counts: know_live 0 records
+# under {'source': 'stage1_flag_marker'} vs 1 under
+# {'kind': 'stage1_flag_marker'} — marker a5732b3b). See
+# _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days reuses the
 # STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention as a
 # conservative, consistent aging cutoff rather than deleting immediately.
 _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
@@ -1625,16 +1631,22 @@ async def _sweep_stale_mem0_flag_markers(
 
     Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
     shared enumerate -> age-filter -> gather_collect-delete -> count
-    skeleton, with a distinct source filter, delete ``_source`` tag, and
-    max-age constant from :func:`_sweep_stale_persistence_markers` — see
-    that function's docstring for the fail-safe posture and for its
+    skeleton, with the multi-variant
+    :data:`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS` filter — NOT a
+    single ``{'source': ...}`` filter (task 3915: this pool cannot be
+    identified that way; measured live counts are know_live 0 records under
+    ``{'source': 'stage1_flag_marker'}`` vs 1 under
+    ``{'kind': 'stage1_flag_marker'}``) — plus a distinct delete ``_source``
+    tag and max-age constant from :func:`_sweep_stale_persistence_markers` —
+    see that function's docstring for the fail-safe posture and for its
     protected-mirror invariant (task 3041): a ``kind='cycle_summary'`` /
     ``record_type='ledger_stamp'`` record is never deleted by this sweep,
-    whatever this pool's filter matches.
+    whatever this pool's filter(s) match.
 
     Passes ``count_short_circuit=True`` (task 2853 review, efficiency
-    finding): this pool's write path is fully retired, so once the legacy
-    records age past the cutoff and are drained, every subsequent cycle
+    finding): this pool's canonical write path is fully retired (task 3915:
+    not the ONLY write path — see above), so once the legacy records age
+    past the cutoff and are drained, every subsequent cycle
     would otherwise re-scroll an already-empty pool forever. Cheap
     ``count_memories_by_metadata`` probes short-circuit that steady state —
     one probe per :data:`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`
@@ -3350,15 +3362,22 @@ class TaskKnowledgeSync(BaseStage):
         )
 
         # Legacy Mem0 stage1_flag_marker pool (task 2853): task 2406 retired
-        # its mirror write (markers now persist only to the recon_ledger,
-        # reaped above by _gc_recon_markers), and task 2228 W5-κ deleted the
-        # prior in-cycle Mem0 sweep for this source on the assumption that
-        # the ledger gc() pass replaced it — it does not reach Mem0, so the
-        # pre-2406 pool was left uncollected for every project (the
-        # operational sweep_orphan_flag_markers.py systemd timer only
-        # targets dark_factory by default). Runs unconditionally every cycle,
-        # per-project, so each project self-heals its own legacy pool;
-        # explicit zero for the same reason as the two GC stats above.
+        # the CANONICAL mirror write (markers from that path now persist
+        # only to the recon_ledger, reaped above by _gc_recon_markers), and
+        # task 2228 W5-κ deleted the prior in-cycle Mem0 sweep for this
+        # source on the assumption that the ledger gc() pass replaced it —
+        # it does not reach Mem0, so the pre-2406 pool was left uncollected
+        # for every project (the operational sweep_orphan_flag_markers.py
+        # systemd timer only targets dark_factory by default). The canonical
+        # write path is retired, but an LLM recon add_memory write can still
+        # land a stage1_flag_marker record in Mem0 tagged only with
+        # metadata.kind, not metadata.source (measured: know_live 0 under
+        # {'source': 'stage1_flag_marker'} vs 1 under
+        # {'kind': 'stage1_flag_marker'}) — this sweep enumerates the union
+        # of both spellings for exactly that reason (task 3915). Runs
+        # unconditionally every cycle, per-project, so each project
+        # self-heals its own legacy pool; explicit zero for the same reason
+        # as the two GC stats above.
         report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
             self.memory, self.project_id, run_id,
         )
