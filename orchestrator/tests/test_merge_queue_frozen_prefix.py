@@ -769,6 +769,161 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         assert worker.frozen_prefix_tip('main0') == pre_tip
 
 
+# ── task 3206 step-1 RED: §5.3 re-merge carve-out at the DISPATCH guard ──────
+
+
+def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
+    """Stamp the §5.3 re-merge recovery marker (task 3206) on *item*.
+
+    Deliberately uses ``dataclasses.replace`` rather than a new
+    ``_make_fake_item`` keyword so this is RED (TypeError: unexpected keyword
+    argument) ONLY inside the tests that opt in, leaving every other suite in
+    this module green until step-2 adds the field.
+
+    Mirrors what ``_remerge`` does in production: it is the single producer of
+    recovery items for all five consumer paths (merge_queue.py:14373, 16010,
+    16331, 16974, 17107), so the marker is set once at the producer rather
+    than threaded through each consumer.
+    """
+    return dataclasses.replace(item, remerge_recovery=True)
+
+
+@pytest.mark.asyncio
+class TestRemergeCarveOutAtDispatchGuard:
+    """§5.3 carves out `_remerge` recovery items from the dispatch-time guard.
+
+    ADJUDICATION (task 3206, PRD §5.3): items produced by ``_remerge`` are
+    RECOVERY re-merges that legitimately target real main rather than
+    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this is the
+    measured class-(b) shape:
+
+      2026-08-07 02:36:52  task 6063 (mr-14c8fe17)  base 4485bf77
+      2026-08-07 12:11:29  task 6067 (mr-eda61713)  base e2aeeb7e
+
+    both preceded seconds earlier by "dead-base straggler at dispatch —
+    re-merging".  Under hard enforcement both deliberate recoveries would have
+    been REFUSED — and the tip they'd have been forced onto can itself be the
+    dead commit they exist to escape.
+
+    The carve-out must be NARROW: it suppresses recovery items only, never a
+    genuine class-(d) violation.
+
+    RED until step-2 GREEN adds ``remerge_recovery`` and honours it here.
+    """
+
+    async def test_remerge_recovery_item_suppresses_warning(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CARVE-OUT: a recovery item with base != frozen tip logs NO warning."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # A frozen predecessor exists, so frozen_prefix_tip('main0') == 'sha-Dc'
+        # — i.e. the guard would otherwise fire on the candidate below.
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Recovery re-merge: _remerge always sets base_sha=actual_main (here
+        # 'main0'), which is NOT the frozen tip 'sha-Dc'.  That is correct by
+        # construction, not a violation.
+        _, item_r = _make_fake_item(
+            't-recovery', base_sha='main0', merge_commit='sha-Rc',
+            config=config, git_repo=git_repo,
+        )
+        item_r = _mark_recovery(item_r)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_r, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 0, (
+            f'§5.3 re-merge carve-out (task 3206): a recovery item must not warn, '
+            f'got: {[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_non_recovery_item_still_warns(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CONTROL: the carve-out is narrow — an ordinary item still warns once.
+
+        Same base/tip mismatch as the carve-out test above, minus the marker.
+        Guards against the carve-out swallowing genuine class-(d) violations.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        _, item_e = _make_fake_item(
+            't-e', base_sha='main0', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, (
+            f'expected exactly 1 WARNING for a non-recovery mismatch, got '
+            f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_healthy_base_never_warns_regardless_of_marker(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CONTROL: base == frozen tip → no warning, marker or not (unchanged path)."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        for marked in (False, True):
+            caplog.clear()
+            _, item_e = _make_fake_item(
+                f't-e-{marked}', base_sha='sha-Dc', merge_commit='sha-Ec',
+                config=config, git_repo=git_repo,
+            )
+            if marked:
+                item_e = _mark_recovery(item_e)
+
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                assert worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0') is None
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 0, (
+                f'healthy base (marked={marked}) must never warn, got: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+
+
 # ── Amendment: _finalizing_head branch coverage (review suggestion) ───────────
 
 
