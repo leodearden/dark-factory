@@ -7514,6 +7514,109 @@ class TestSweepStaleMem0FlagMarkers:
         assert len(victims) == 1
         assert victims[0]['id'] == 'canonical-both-keys'
 
+    @pytest.mark.asyncio
+    async def test_short_circuit_only_when_all_variants_count_zero(self):
+        """dark_factory steady state: once BOTH key spellings are confirmed
+        empty, the sweep must short-circuit cheaply — one count probe per
+        variant, no scroll at all — so a fully-drained pool doesn't
+        re-scroll forever every cycle."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(memory_service, 'dark_factory', run_id='r1')
+
+        assert result == 0
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
+
+    @pytest.mark.asyncio
+    async def test_no_short_circuit_when_any_variant_counts_nonzero(self):
+        """The exact know_live state that leaked marker a5732b3b: the
+        'source' probe confirms zero but the 'kind' probe reports 1 — the
+        short circuit must NOT fire, and the scroll must run for BOTH
+        variants so the kind-only marker is found and deleted."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        kind_only_member = {
+            'id': 'kind-only-stale',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't1'},
+        }
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return [kind_only_member] if filters == {'kind': 'stage1_flag_marker'} else []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'kind-only-stale'
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_fails_open_when_a_variant_probe_raises(self):
+        """A probe exception on ONE variant must fall through to the full
+        scroll for BOTH variants, never be misread as a confirmed-empty
+        pool — the short circuit may only ever skip work the scroll would
+        itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                raise RuntimeError('qdrant down')
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+
 
 class TestSweepStaleMem0FlagForStage2Markers:
     """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
