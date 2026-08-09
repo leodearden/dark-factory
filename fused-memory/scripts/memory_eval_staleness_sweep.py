@@ -1579,6 +1579,17 @@ async def run_sweep(
     The series is built even when *write_metrics* is False, because the report
     names which families went unmeasured and that answer comes from the
     assembled series — a ``--no-metrics`` run must not be a less honest one.
+
+    ONE project id per run. The CLI enforces this (``--project-id`` is
+    single-valued) and *project_ids* is a tuple only so the loop below reads
+    the same as the rest of the band. Passing several is NOT supported and
+    would under-report: ``get_memory_by_id`` is project-scoped, but the
+    resolution map is keyed by target id alone, so a target present in project
+    A would mark project B's ref RESOLVED — silently, and in the loud
+    direction :func:`dangling_census` argues against. Keying resolution by
+    ``(project_id, target)`` means putting the project on
+    :class:`PointerRef`, which is a wider change than this leaf; until that
+    lands, do not call this with more than one id.
     """
     from shared.memory_eval_metrics import run_stamp, write_metric_series  # noqa: PLC0415
 
