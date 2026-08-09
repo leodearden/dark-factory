@@ -3,9 +3,13 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from shared.locking import (
+    EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
@@ -161,6 +165,102 @@ _DOTTED_DIRECTORY_PATHS = [
     '.cargo',
     '.taskmaster',
 ]
+
+# ---------------------------------------------------------------------------
+# Extension-less tracked FILES (dark_factory #3248).
+#
+# The second half of the classifier: real tracked files whose final segment
+# carries NO extension at all, so the FILE_EXTENSIONS lookup can never reach
+# them.  Before #3248 every one of these classified as a DIRECTORY, which made
+# `hooks/project-checks` undeclarable in metadata.files (γ rejected it with a
+# LockCharterViolation) and — worse, because it was silent — made a task
+# declaring ONLY such paths strip to an empty charter and fall through to the
+# per-task `task-<id>` synthetic lock, holding no lock on the file it edits.
+#
+# Update _CANONICAL_EXTENSIONLESS AND EXTENSIONLESS_FILENAMES together when the
+# vector changes.  Also update the verbatim copies in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND
+# fused-memory/tests/test_lock_charter_guard.py.
+#
+# EVIDENCE — `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (and
+# identical to the 2026-07-31 measurement): every tracked path whose final
+# segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
+# pre-commit pre-merge-commit project-checks; reify adds cargo
+# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+#
+# GITLINK EXCLUSION (load-bearing, not a measurement artefact): entries with
+# mode 160000 are submodule mount points — `graphiti` and `mem0` in
+# dark-factory — and are deliberately NOT admitted.  They are extension-less
+# and would otherwise qualify, but admitting them would let a task declare an
+# entire vendored submodule as its lock charter, which is strictly worse than
+# the bug being fixed.  They stay DIRECTORIES by design.  The sweep below
+# asserts this filter is doing real work rather than passing vacuously.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONLESS = [
+    'Dockerfile',
+    'LICENSE',
+    'cargo',
+    'cargo-audit-orphans',
+    'pre-commit',
+    'pre-merge-commit',
+    'project-checks',
+    'reference-transaction',
+]
+
+# One REAL tracked path per canonical extension-less name — dark-factory unless
+# the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
+# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# by TestExtensionlessFilenames::test_accept_corpus_covers_every_canonical_name.
+_EXTENSIONLESS_ACCEPT_PATHS = [
+    'LICENSE',
+    'fused-memory/docker/Dockerfile',
+    'hooks/pre-commit',
+    'hooks/pre-merge-commit',
+    'hooks/project-checks',
+    # reify
+    'hooks/reference-transaction',
+    # reify
+    'scripts/agent-bin/cargo',
+    # reify
+    'scripts/cargo-audit-orphans',
+]
+
+# Repo roots for the tracked-corpus self-audit sweep.  dark-factory is resolved
+# from this file (works in a worktree too: <root>/shared/tests/ -> parents[2]);
+# reify is a sibling under the same src/ directory.  Same resolution the γ suite
+# uses for _DF_REPO_ROOT / _REIFY_REPO_ROOT.
+_DF_REPO_ROOT = Path(__file__).parents[2]
+_REIFY_REPO_ROOT = Path(__file__).parents[5] / 'reify'
+
+
+def _tracked_file_paths(repo_root: Path) -> list[str] | None:
+    """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout.
+
+    Uses ``git ls-files -s`` (not plain ``ls-files``) specifically so the mode
+    column is available: entries with mode ``160000`` are submodule gitlinks and
+    are dropped.  See the GITLINK EXCLUSION note above for why that filter is
+    load-bearing rather than cosmetic.
+    """
+    result = subprocess.run(
+        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    paths: list[str] = []
+    for entry in result.stdout.split('\0'):
+        if not entry:
+            continue
+        # Format: "<mode> <sha> <stage>\t<path>"
+        meta, _, path = entry.partition('\t')
+        if not path:
+            continue
+        if meta.split(' ', 1)[0] == '160000':
+            continue
+        paths.append(path)
+    return paths
 
 
 class TestNormalizeLock:
@@ -387,6 +487,182 @@ class TestIsFilePath:
         assert not is_file_path(path), (
             f'{path!r} is a real directory and must NOT classify as a file; a '
             f'blanket leading-dot=>file rule was rejected for exactly this reason'
+        )
+
+
+class TestExtensionlessFilenamesDriftGuard:
+    """Pins shared.locking.EXTENSIONLESS_FILENAMES to the canonical vector."""
+
+    def test_matches_canonical_vector(self):
+        assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+
+    def test_is_frozenset(self):
+        assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
+
+    def test_members_are_bare_final_segments(self):
+        """Every member must be a non-empty, dot-free, slash-free name.
+
+        Structural invariant, not style policing.  A member is compared against
+        a path's FINAL SEGMENT, so:
+          - a name containing '.' is in the wrong allowlist — its post-dot token
+            belongs in FILE_EXTENSIONS, and putting it here would shadow that
+            lookup with an exact-name match that almost never fires;
+          - a name containing '/' could never equal a final segment, so it would
+            be permanently dead weight that reads as coverage.
+        """
+        for name in sorted(EXTENSIONLESS_FILENAMES):
+            assert isinstance(name, str) and name, f'{name!r} must be a non-empty str'
+            assert '.' not in name, (
+                f'{name!r} contains a dot — a dotted name is an EXTENSION and '
+                f'belongs in FILE_EXTENSIONS, not EXTENSIONLESS_FILENAMES'
+            )
+            assert '/' not in name, (
+                f'{name!r} contains a slash — members are matched against a '
+                f"path's final segment, which can never contain '/'"
+            )
+
+
+class TestExtensionlessFilenames:
+    """Extension-less tracked FILES classify as files (dark_factory #3248).
+
+    The hazard these pin, stated concretely: two tasks editing
+    ``hooks/project-checks`` concurrently could both hold NO lock on it, because
+    a charter that strips to empty degrades to a per-task ``task-<id>`` synthetic
+    lock that conflicts with nothing.
+    """
+
+    @pytest.mark.parametrize('path', _EXTENSIONLESS_ACCEPT_PATHS)
+    def test_extensionless_accept_corpus_paths_are_files(self, path: str):
+        assert is_file_path(path) is True, (
+            f'{path!r} is a real tracked FILE whose final segment carries no '
+            f'extension; it must classify as a file via EXTENSIONLESS_FILENAMES'
+        )
+
+    def test_accept_corpus_covers_every_canonical_name(self):
+        """_EXTENSIONLESS_ACCEPT_PATHS must exercise every canonical name.
+
+        The GAMMA-4 trap guard, mirroring
+        test_accept_corpus_covers_every_canonical_extension.  Adding a name to
+        the allowlist without a matching real accept path would otherwise swap
+        one red test for a different red test rather than closing the gap.
+
+        Coverage is derived from ``is_file_path`` itself rather than a
+        re-implementation of its segment parsing: a path counts for ``name``
+        only if the predicate ACCEPTS it and its final segment IS ``name``.
+        """
+        accepted = [p for p in _EXTENSIONLESS_ACCEPT_PATHS if is_file_path(p)]
+        uncovered = sorted(
+            name
+            for name in _CANONICAL_EXTENSIONLESS
+            if not any(p.rsplit('/', 1)[-1] == name for p in accepted)
+        )
+        assert not uncovered, (
+            f'{len(uncovered)} allowlisted name(s) are pinned in '
+            f'_CANONICAL_EXTENSIONLESS but never classified by any '
+            f'_EXTENSIONLESS_ACCEPT_PATHS entry: {uncovered!r}\n'
+            f'Add one real tracked representative path per name.'
+        )
+
+    @pytest.mark.parametrize(
+        ('repo', 'repo_root'),
+        [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
+    )
+    def test_no_canonical_name_is_also_a_directory(self, repo: str, repo_root: Path):
+        """No member may appear as a NON-FINAL component of any tracked path.
+
+        This is what bounds the risk of matching on a bare basename.  A member
+        that were ALSO a directory name somewhere in the tree would make that
+        directory declarable as a lock charter — the exact over-wide-charter
+        failure the guard exists to prevent.  Measured zero collisions across
+        both repos on 2026-08-09; this pins that property permanently rather
+        than leaving it as a one-time observation.
+        """
+        if not repo_root.is_dir():
+            pytest.skip(f'{repo} checkout not present at {repo_root}')
+        paths = _tracked_file_paths(repo_root)
+        if paths is None:
+            pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+
+        collisions: dict[str, str] = {}
+        for path in paths:
+            for component in path.split('/')[:-1]:
+                if component in EXTENSIONLESS_FILENAMES:
+                    collisions.setdefault(component, path)
+
+        assert not collisions, (
+            f'{len(collisions)} EXTENSIONLESS_FILENAMES member(s) are also '
+            f'DIRECTORY names in {repo}, so declaring that directory would now '
+            f'be accepted as a file-level lock charter:\n'
+            + '\n'.join(f'  {name} — e.g. {path}' for name, path in sorted(collisions.items()))
+            + '\nRemove the name from the allowlist, or rename the directory.'
+        )
+
+    @pytest.mark.parametrize(
+        ('repo', 'repo_root'),
+        [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
+    )
+    def test_every_tracked_extensionless_file_is_allowlisted(
+        self, repo: str, repo_root: Path
+    ):
+        """Corpus->allowlist self-audit: the 9th extensionless file must go RED.
+
+        Turns "add 8 names" into a self-auditing invariant.  When someone adds a
+        new extension-less tracked file to either repo, this test names it here
+        rather than letting it surface later as a LockCharterViolation at
+        submit time — or, worse, as a silent under-lock.
+
+        This sweep IS duplicated in the γ suite, unlike the extension-corpus
+        sweep which is deliberately α-free (see
+        test_accept_corpus_covers_every_canonical_extension for that rationale).
+        The difference is the failure mode: the extension vector is fully pinned
+        by the two drift guards, whereas this one gates a REPO-level property —
+        a newly-added tracked file changes the correct answer without any test
+        vector changing, so whichever suite runs must be able to see it.
+
+        Gitlink mount points (``graphiti``, ``mem0``) are excluded by
+        _tracked_file_paths and must NOT be admitted; that exclusion is asserted
+        below so this cannot pass vacuously.
+        """
+        if not repo_root.is_dir():
+            pytest.skip(f'{repo} checkout not present at {repo_root}')
+        paths = _tracked_file_paths(repo_root)
+        if paths is None:
+            pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+
+        # The gitlink filter must be doing real work, not passing vacuously.
+        for gitlink in ('graphiti', 'mem0'):
+            assert gitlink not in paths, (
+                f'{gitlink!r} is a submodule mount point (mode 160000) and must '
+                f'be filtered out by _tracked_file_paths; admitting it would let '
+                f'a task declare an entire vendored submodule as its lock charter'
+            )
+            assert not is_file_path(gitlink), (
+                f'{gitlink!r} is a submodule mount point and must stay a '
+                f'DIRECTORY — see the GITLINK EXCLUSION note on the corpus'
+            )
+
+        unknown: dict[str, str] = {}
+        for path in paths:
+            seg = path.rsplit('/', 1)[-1]
+            if '.' in seg:
+                continue
+            if not is_file_path(path):
+                unknown.setdefault(seg, path)
+
+        assert not unknown, (
+            f'{len(unknown)} extension-less tracked {repo} file(s) classify as '
+            f'DIRECTORIES, so any task declaring one in metadata.files is either '
+            f'rejected with a LockCharterViolation or — silently — stripped to an '
+            f'empty charter and given a task-<id> synthetic lock that conflicts '
+            f'with nothing:\n'
+            + '\n'.join(f'  {name} — e.g. {path}' for name, path in sorted(unknown.items()))
+            + '\nAdd each name to EXTENSIONLESS_FILENAMES in '
+            'shared/src/shared/locking.py AND '
+            'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+            'plus _CANONICAL_EXTENSIONLESS and _EXTENSIONLESS_ACCEPT_PATHS in '
+            'both test copies.'
         )
 
 

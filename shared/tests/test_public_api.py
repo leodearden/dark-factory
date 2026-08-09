@@ -150,6 +150,7 @@ class TestModuleLevelAll:
             'files_to_modules',
             'modules_conflict',
             'FILE_EXTENSIONS',
+            'EXTENSIONLESS_FILENAMES',
             'is_file_path',
             'directory_locks',
             'strip_directory_locks',
