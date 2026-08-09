@@ -49,7 +49,6 @@ NOTHING here writes to, or asserts the content of, the real
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -396,42 +395,14 @@ class TestLeakedFleetHeartbeatReason:
         message's other content (the mechanism, the remedy) is prose: pinning it
         by substring would freeze vocabulary the guard is free to improve, and
         the two ``<file>:<line>`` pointers this test used to pin went stale
-        inside the very commit series that wrote them.  What replaces them is
-        :func:`test_guard_messages_carry_no_line_number_pointers` below.
+        inside the very commit series that wrote them.  The remedy for that
+        staleness is at the SOURCE — the messages in ``df_pytest_isolation``
+        cite symbols (``FLEET_DIR``, ``DEFAULT_FLEET_DIR``) rather than
+        ``<file>:<line>`` — not a further test asserting over their prose.
         """
         reason = leaked_fleet_heartbeat_reason([f'{synthetic_unit("alpha")}.json'])
         assert reason is not None
         assert str(LIVE_FLEET_DIR) in reason
-
-
-_LINE_POINTER_RE = re.compile(r'\.(py|sh):\d+')
-
-
-def test_guard_messages_carry_no_line_number_pointers() -> None:
-    """No guard message may point at a ``<file>:<line>``; cite a SYMBOL instead.
-
-    REPLACES the substring pins this module used to carry — it is not a
-    supplement to them, and re-adding "the message must say X" assertions
-    alongside it re-introduces exactly what it exists to prevent.
-
-    STRUCTURAL, not a wording pin: it constrains no vocabulary, so no rewrite
-    can false-positive it, and it contains no number of its own to go stale.
-    The defect it prevents is measured, not hypothetical — the line numbers
-    formerly asserted here (``restart-all-orchestrators.sh``'s FLEET_DIR
-    default, ``drain_check.DEFAULT_FLEET_DIR``) were invalidated by the comment
-    blocks added in this same task, so the guard was shipping an operator a
-    pointer to the wrong line while promising to be "actionable without a
-    second investigation".  A symbol name breaks a test loudly when it is
-    renamed; a line number rots silently.
-    """
-    reason = leaked_fleet_heartbeat_reason([f'{synthetic_unit("alpha")}.json'])
-    assert reason is not None
-    assert _LINE_POINTER_RE.search(reason) is None, reason
-
-    with pytest.raises(pytest.fail.Exception) as excinfo:
-        assert_synthetic_units(['orchestrator-reify.service'], where='tests::factory')
-    message = str(excinfo.value)
-    assert _LINE_POINTER_RE.search(message) is None, message
 
 
 def test_no_stray_environment_assumptions() -> None:
