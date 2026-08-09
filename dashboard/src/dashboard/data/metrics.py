@@ -541,10 +541,18 @@ async def collect_metrics_snapshot(
         with contextlib.suppress(Exception):
             await conn.rollback()
 
-    # Memory (HTTP via fused-memory MCP — wrap in wait_for as belt-and-braces).
+    # Memory (HTTP via fused-memory MCP). Bounded at BOTH layers, and the
+    # outer wait_for is not redundant with the inner budget: the budget below
+    # is PER HTTP REQUEST (it also bounds pool acquisition), whereas
+    # get_memory_status fans out SEQUENTIALLY over N fused_memory_urls until
+    # one succeeds — and each cold URL costs a three-post handshake. So the
+    # budget bounds each URL and wait_for bounds the aggregate; without the
+    # outer bound a total outage would cost roughly N x 3 x the budget.
     try:
         status = await asyncio.wait_for(
-            get_memory_status(http_client, config),
+            get_memory_status(
+                http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            ),
             timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
         )
         pairs, _queue_inline = _split_status(status)
@@ -561,9 +569,15 @@ async def collect_metrics_snapshot(
             await conn.rollback()
 
     # Write queue (HTTP, separate call; tolerate either source failing).
+    # Same two-layer bound as the memory sampler above, and here the outer
+    # wait_for matters even more: get_queue_stats visits ALL N
+    # fused_memory_urls (it sums across them rather than short-circuiting),
+    # so the per-call budget alone would scale with N.
     try:
         qstats = await asyncio.wait_for(
-            get_queue_stats(http_client, config),
+            get_queue_stats(
+                http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            ),
             timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
         )
         pending, retry, dead = _split_queue_stats(qstats)

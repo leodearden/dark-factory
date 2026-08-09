@@ -242,6 +242,7 @@ async def _first_success(
     tool_name: str,
     args: dict,
     log_label: str,
+    timeout: float = 10,
 ) -> dict:
     """Call an MCP tool on each configured URL; return the first success.
 
@@ -249,29 +250,51 @@ async def _first_success(
     This is correct for singleton-per-instance tools (e.g. ``get_status``,
     ``get_curator_state``); aggregating helpers (``get_queue_stats``,
     ``get_wal_status``) handle their own per-URL loops.
+
+    *timeout* is the per-HTTP-request budget forwarded to each URL's
+    ``mcp_tool_call``. ``first_success`` itself stays timeout-agnostic (it
+    also serves tasks.py and metrics.py, which carry their own budgets) —
+    the budget rides along on the ``call`` closure below.
     """
     return await first_success(
         config.fused_memory_urls,
-        lambda url: mcp_tool_call(client, url, tool_name, args),
+        lambda url: mcp_tool_call(client, url, tool_name, args, timeout=timeout),
         log_label=log_label,
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
 
-async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_memory_status(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch memory subsystem status, trying each configured URL.
 
     Returns the first successful status dict, or {offline: True, error: ...}.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: the failover walks up to N URLs, each of which may
+    perform a three-post cold-session handshake. Callers needing a hard bound
+    must still wrap this in ``asyncio.wait_for`` — ``metrics.py`` does.
     """
-    return await _first_success(client, config, 'get_status', {}, 'get_status')
+    return await _first_success(
+        client, config, 'get_status', {}, 'get_status', timeout=timeout,
+    )
 
 
 # Intentionally NOT converted to first_success: sums/collects across ALL
 # configured URLs rather than short-circuiting on the first success.
-async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_queue_stats(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch and aggregate write-queue stats from all configured servers.
 
     Counts are summed; oldest_pending_age_seconds is the max across servers.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: unlike a first-success failover this visits ALL N
+    configured URLs, so the aggregate cost scales with N. Callers needing a
+    hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
+    does.
     """
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
@@ -279,7 +302,9 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
 
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(client, url, 'get_queue_stats', {})
+            result = await mcp_tool_call(
+                client, url, 'get_queue_stats', {}, timeout=timeout,
+            )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             logger.debug('get_queue_stats failed for %s: %s', url, e)
