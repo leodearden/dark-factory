@@ -431,10 +431,12 @@ class TestShapeValidProseMatchesByDesign:
 
 
 class TestScanContentAmbiguityPartition:
-    """A task number claimed by BOTH an own-project and a foreign-qualified
-    mention in the same content is genuinely ambiguous about which task the
-    facts belong to. EVERY referent carrying that number goes to .ambiguous
-    and none to .refs — refuse rather than guess.
+    """A task number claimed by BOTH a BARE, unqualified own-project mention
+    and a foreign-qualified reference in the same content is genuinely
+    ambiguous about which task the facts belong to. EVERY referent carrying
+    that number goes to .ambiguous and none to .refs — refuse rather than
+    guess. (Only an UNQUALIFIED mention creates the contest;
+    TestSelfQualifiedRefsNeverContestForeignRefs pins the other half.)
 
     The partition is SYMMETRIC on purpose. Marking only the foreign side would
     hand a consumer a confidently-wrong LOCAL referent derived from provably
@@ -506,7 +508,8 @@ class TestScanContentAmbiguityPartition:
     def test_self_qualified_plus_bare_mention_is_not_ambiguous(self):
         """Both spellings denote the SAME own-project referent, so the
         self->local reclassification (which runs BEFORE this partition) lets
-        dedup collapse them into one unambiguous ref rather than a contest."""
+        dedup collapse them into one ref. There is no contest either way: the
+        bare mention has no FOREIGN referent of the same number to contest."""
         scan = scan_content('reify:5181 and task 5181', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['Task 5181']
         assert scan.ambiguous == []

@@ -226,10 +226,13 @@ class LabelScan:
     #: Referents safe to act on, in first-seen positional order,
     #: de-duplicated on (kind, project_id, number).
     refs: list[Referent] = field(default_factory=list)
-    #: Referents whose number is claimed by BOTH an own-project and a
-    #: foreign-qualified mention in the same content. Such content is
-    #: genuinely ambiguous about which task the facts belong to, so a consumer
-    #: must refuse to act on it and say so loudly rather than guess.
+    #: Referents whose number is claimed by BOTH a BARE, unqualified
+    #: own-project mention ('task 2500') and a foreign-qualified reference in
+    #: the same content. Such content is genuinely ambiguous about which task
+    #: the facts belong to, so a consumer must refuse to act on it and say so
+    #: loudly rather than guess. An explicitly qualified reference — including
+    #: a SELF-qualified one — already names its project and so never creates
+    #: ambiguity; see :func:`scan_content`.
     ambiguous: list[Referent] = field(default_factory=list)
 
 
@@ -298,7 +301,11 @@ def scan_content(
 
     Returns:
         A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
-        not be acted on silently.
+        not be acted on silently. A number goes to ``ambiguous`` only when the
+        content claims it BOTH bare ('task 2500', which never says which
+        project) and foreign-qualified. Two QUALIFIED references — even when
+        one of them is self-qualified — each already name their project and are
+        never mutually ambiguous.
 
     A path-shaped *group_id* yields an empty scan: without a trustworthy local
     project id, local and foreign references cannot be told apart, and the
@@ -312,10 +319,13 @@ def scan_content(
         return LabelScan()
 
     allowlist = _canonical_allowlist(known_project_ids)
-    found: list[tuple[int, Referent]] = []
+    # (offset, referent, arrived_bare). The third element records whether the
+    # referent came from an UNQUALIFIED mention, which is what the ambiguity
+    # partition below is decided on.
+    found: list[tuple[int, Referent, bool]] = []
 
     for match in _LOCAL_MENTION_PATTERN.finditer(content):
-        found.append((match.start(), Referent(kind='task', number=match.group(1))))
+        found.append((match.start(), Referent(kind='task', number=match.group(1)), True))
 
     for match in _QUALIFIED_REF_PATTERN.finditer(content):
         qualifier, number = match.group(1), match.group(2)
@@ -337,12 +347,12 @@ def scan_content(
             # complete for consumers that need it; the foreign-only filter in
             # cross_project_refs.find_cross_project_task_refs reproduces the
             # drop that module wants.
-            found.append((match.start(), Referent(kind='task', number=number)))
+            found.append((match.start(), Referent(kind='task', number=number), False))
             continue
         if allowlist is not None and project_id not in allowlist:
             continue
         found.append(
-            (match.start(), Referent(kind='task', project_id=project_id, number=number))
+            (match.start(), Referent(kind='task', project_id=project_id, number=number), False)
         )
 
     # Merge the two passes by OFFSET rather than concatenating them, so the
@@ -352,28 +362,45 @@ def scan_content(
 
     deduped: list[Referent] = []
     seen: set[tuple[str, str, str]] = set()
-    for _offset, referent in found:
+    for _offset, referent, _arrived_bare in found:
         key = (referent.kind, referent.project_id, referent.number)
         if key in seen:
             continue
         seen.add(key)
         deduped.append(referent)
 
-    # A number claimed by BOTH an own-project and a foreign-qualified referent
-    # cannot say which task the facts belong to. The partition is SYMMETRIC:
-    # both referents are derived from the same ambiguous prose, so handing a
-    # consumer the local one as clean evidence would be a confidently-wrong
-    # answer, not a safe fallback. Refuse both rather than pick either.
+    # A number claimed BOTH by a BARE, unqualified mention and by a
+    # foreign-qualified reference cannot say which task the facts belong to.
+    #
+    # Only an UNQUALIFIED mention creates a contest. Ambiguity is a property of
+    # what the prose FAILED to say: an explicitly project-qualified reference
+    # already names its project, so two qualified references — even when one of
+    # them is SELF-qualified and was reclassified into an own-project referent
+    # above — are never mutually ambiguous. Contesting on own-project-ness
+    # instead would make 'reify:2500 relates to dark_factory:2500' ambiguous in
+    # group reify, suppressing a real cross-project repair that nothing in the
+    # content actually cast doubt on.
+    #
+    # The partition is SYMMETRIC: when a contest IS real, both referents are
+    # derived from the same ambiguous prose, so handing a consumer the local one
+    # as clean evidence would be a confidently-wrong answer, not a safe
+    # fallback. Refuse both rather than pick either.
     #
     # It is per-NUMBER, not per-content, so one contested number never
     # suppresses an unrelated clean ref elsewhere in the same body.
     #
-    # Note the self-qualified reclassification above runs BEFORE this: that is
-    # why 'reify:5181 and task 5181' in group reify is a single own-project
-    # referent (deduped) rather than a local-vs-foreign contest.
-    local_numbers = {r.number for r in deduped if not r.project_id}
+    # bare_numbers is computed over the PRE-dedup `found` list, NOT over
+    # `deduped`, because bare-ness must be STICKY per number. Dedup is
+    # first-seen-wins on (kind, project_id, number), so in
+    # 'reify:2500 and task 2500 and dark_factory:2500' the self-qualified
+    # spelling arrives first and the surviving own-project referent is the one
+    # that arrived QUALIFIED — reading bare-ness off `deduped` would silently
+    # lose a genuine contest the content does contain. (Dedup still collapses
+    # 'reify:5181 and task 5181' to one own-project referent; that pair simply
+    # has no foreign side to contest.)
+    bare_numbers = {r.number for _offset, r, arrived_bare in found if arrived_bare}
     foreign_numbers = {r.number for r in deduped if r.project_id}
-    contested = local_numbers & foreign_numbers
+    contested = bare_numbers & foreign_numbers
 
     # Digits are compared as literals, never int-normalized, so '0250' and
     # '250' are different numbers and create no false contest.
