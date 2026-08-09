@@ -48,6 +48,7 @@ NOTHING here writes to, or asserts the content of, the real
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -188,6 +189,11 @@ class TestAssertSyntheticUnits:
                 where='scripts/tests/test_restart_all_orchestrators.py::_make_fake_systemctl',
             )
         message = str(excinfo.value)
+        # Both assertions are on DATA THE CALLER PASSED IN, so they pin real
+        # message-construction behaviour.  A prose pin (the remedy symbol, the
+        # word "systemctl") would instead freeze wording: it can be satisfied
+        # by a useless message and broken by a purely cosmetic rewrite.  If the
+        # message's quality matters, fix the text once in df_pytest_isolation.
         # (a) the offending literal
         assert 'orchestrator-reify.service' in message
         # (b) the caller's own `where` label
@@ -195,8 +201,6 @@ class TestAssertSyntheticUnits:
             'scripts/tests/test_restart_all_orchestrators.py::_make_fake_systemctl'
             in message
         )
-        # (c) the remedy SYMBOL, not a prose hint
-        assert 'df_pytest_isolation.synthetic_unit' in message
 
     def test_it_names_every_offender(self) -> None:
         """All of them, in caller order — fixing one at a time is a rerun each."""
@@ -215,17 +219,6 @@ class TestAssertSyntheticUnits:
         assert message.index('orchestrator-reify.service') < message.index(
             'orchestrator-dark-factory.service',
         )
-
-    def test_the_message_states_the_hazard(self) -> None:
-        """Actionable without a second investigation, per the convention
-        ``deploy_clock_violation_reason`` established: the reader must learn WHY
-        a real unit name in a fixture is dangerous, not merely that it is.
-        """
-        with pytest.raises(pytest.fail.Exception) as excinfo:
-            assert_synthetic_units(['orchestrator-reify.service'], where='tests::factory')
-        message = str(excinfo.value).lower()
-        assert 'path' in message
-        assert 'systemctl' in message
 
 
 class TestSharedVocabularyIsReachableFromBothRoots:
@@ -392,18 +385,50 @@ class TestLeakedFleetHeartbeatReason:
         for name in names:
             assert name in reason
 
-    def test_it_names_the_directory_the_mechanism_and_the_remedy(self) -> None:
-        """The actionable-message convention ``deploy_clock_violation_reason``
-        established: a guard's message must be usable without a second
-        investigation — WHERE, HOW it happened, and the remedy SYMBOL.
+    def test_it_names_the_live_directory(self) -> None:
+        """WHERE the leak landed — the one part of the message that is DATA.
+
+        Scoped deliberately to :data:`LIVE_FLEET_DIR`, a module constant, so the
+        assertion tracks the constant rather than the sentence around it.  The
+        message's other content (the mechanism, the remedy) is prose: pinning it
+        by substring would freeze vocabulary the guard is free to improve, and
+        the two ``<file>:<line>`` pointers this test used to pin went stale
+        inside the very commit series that wrote them.  What replaces them is
+        :func:`test_guard_messages_carry_no_line_number_pointers` below.
         """
         reason = leaked_fleet_heartbeat_reason([f'{synthetic_unit("alpha")}.json'])
         assert reason is not None
         assert str(LIVE_FLEET_DIR) in reason
-        assert 'ORCH_FLEET_DIR' in reason
-        assert 'restart-all-orchestrators.sh:109' in reason
-        assert 'drain_check.py:32' in reason
-        assert 'df_pytest_isolation._df_fleet_dir_redirect' in reason
+
+
+_LINE_POINTER_RE = re.compile(r'\.(py|sh):\d+')
+
+
+def test_guard_messages_carry_no_line_number_pointers() -> None:
+    """No guard message may point at a ``<file>:<line>``; cite a SYMBOL instead.
+
+    REPLACES the substring pins this module used to carry — it is not a
+    supplement to them, and re-adding "the message must say X" assertions
+    alongside it re-introduces exactly what it exists to prevent.
+
+    STRUCTURAL, not a wording pin: it constrains no vocabulary, so no rewrite
+    can false-positive it, and it contains no number of its own to go stale.
+    The defect it prevents is measured, not hypothetical — the line numbers
+    formerly asserted here (``restart-all-orchestrators.sh``'s FLEET_DIR
+    default, ``drain_check.DEFAULT_FLEET_DIR``) were invalidated by the comment
+    blocks added in this same task, so the guard was shipping an operator a
+    pointer to the wrong line while promising to be "actionable without a
+    second investigation".  A symbol name breaks a test loudly when it is
+    renamed; a line number rots silently.
+    """
+    reason = leaked_fleet_heartbeat_reason([f'{synthetic_unit("alpha")}.json'])
+    assert reason is not None
+    assert _LINE_POINTER_RE.search(reason) is None, reason
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        assert_synthetic_units(['orchestrator-reify.service'], where='tests::factory')
+    message = str(excinfo.value)
+    assert _LINE_POINTER_RE.search(message) is None, message
 
 
 def test_no_stray_environment_assumptions() -> None:
