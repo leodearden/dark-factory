@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
@@ -110,6 +112,12 @@ def _bg_launch_result(
 def _fg_bash(command: str) -> dict:
     """A FOREGROUND Bash tool_use (no run_in_background) — not a launch."""
     return {'type': 'tool_use', 'name': 'Bash', 'input': {'command': command}}
+
+
+def _verdict_submit(name: str) -> dict:
+    """A terminal-submission tool_use block, named exactly as the transcript
+    records it (server-prefixed or bare)."""
+    return {'type': 'tool_use', 'name': name, 'input': {'verdict': 'APPROVE'}}
 
 
 # A second bg-log path used by the malformed-record tolerance test.
@@ -460,6 +468,93 @@ class TestTaskToolReaps:
             ),
         ]
         assert detect_ended_awaiting_background(records) is False
+
+
+class TestVerdictSubmissionClearsVerdict:
+    """A terminal verdict submission is a reap (task 3639).
+
+    The four ``mcp__verdict-tools__`` entry points share the property that makes
+    the inference sound: calling one writes the role's whole deliverable to
+    ``verdicts/<role>.json``, so the role's job is finished and nothing can
+    still be pending.  Modelled as a REAP at the submission's position (not a
+    "was the last action a verdict?" special case), so every ordering gets the
+    right answer for free.  Deliberately NOT a loose ``submit_*`` prefix rule:
+    ``submit_task`` is called mid-session to file follow-up work while a
+    background command is genuinely still running.
+    """
+
+    def test_review_verdict_submission_is_false(self) -> None:
+        """The `_lane-31` final action: launch → submit_review_verdict → False."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        'tool_name',
+        [
+            'mcp__verdict-tools__submit_completion_verdict',
+            'mcp__verdict-tools__submit_triage',
+            'mcp__verdict-tools__submit_merge_disposition',
+        ],
+    )
+    def test_each_terminal_submission_is_false(self, tool_name: str) -> None:
+        """All four verdict-tools submissions clear the verdict, not just review."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_verdict_submit(tool_name)]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bare_unprefixed_spelling_is_false(self) -> None:
+        """Matching is on the segment after the last ``__``, so the server prefix
+        is not load-bearing (robust to a rename or an unprefixed exposure)."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_verdict_submit('submit_review_verdict')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_activity_after_submission_still_false(self) -> None:
+        """A session that submitted its deliverable is not waiting, regardless of
+        what harmless work it does afterwards (a literal last-action check would
+        wrongly fire here)."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            _assistant([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_launch_after_submission_is_true(self) -> None:
+        """The suppression is POSITIONAL, not a global "verdict anywhere" mute:
+        a launch after the submission outranks it → True."""
+        records = [
+            _assistant([_bash_launch(command='job-a')]),
+            _assistant([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            _assistant([_bash_launch(command='job-b')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_submit_task_is_not_a_terminal_submission(self) -> None:
+        """NEGATIVE control (no over-widening): filing a follow-up task is not a
+        terminal verdict — agents call it mid-session while a background command
+        is genuinely still running, which is exactly the 2761 abandonment."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_verdict_submit('mcp__fused-memory__submit_task')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_confirm_plan_is_not_a_terminal_submission(self) -> None:
+        """NEGATIVE control: confirm_plan is deliberately outside the set — the
+        architect may legitimately keep working after it."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_verdict_submit('mcp__plan-tools__confirm_plan')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
 
 
 class TestEndedAwaitingBackgroundForSession:
