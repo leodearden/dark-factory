@@ -1128,8 +1128,19 @@ class TestObservableProgressRefreshesTheWait:
     async def test_steady_progress_extends_the_wait_past_a_full_window(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        """~1.2s of steady progress against a 0.5s window."""
-        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        """~2.0s of steady progress (40 ticks @ 0.05s) against a 0.8s window.
+
+        The tick interval is kept small RELATIVE to the window (0.05s vs
+        0.8s, a 16x margin) rather than a fixed absolute gap: under xdist
+        full-suite load the event loop can be starved for a stretch between
+        when this wait's deadline is anchored and when the fake steward's
+        first tick actually lands, and a narrow margin (the previous 0.3s
+        tick vs 0.5s window, ~0.2s of slack) let that starvation land the
+        first tick AFTER the first give-up check — a race, not a logic
+        regression (task 3912). A wide margin keeps the guard meaningful
+        (see the negative control) while surviving that starvation.
+        """
+        local_config = _short_window_config(config, completion=0.3, invocation=0.5)
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1140,7 +1151,7 @@ class TestObservableProgressRefreshesTheWait:
         _wire_resolve_callback(queue, workflow)
         markers: list[str] = []
         workflow._steward_factory = _make_progressing_steward(
-            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            queue, task_assignment.task_id, tick=0.05, ticks=40, markers=markers,
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -1156,7 +1167,7 @@ class TestObservableProgressRefreshesTheWait:
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'
         assert archived.resolved_by == 'steward-auto-dismissed', (
-            f'the steward advanced metrics.invocations every 0.3s for ~1.2s — '
+            f'the steward advanced metrics.invocations every 0.05s for ~2.0s — '
             f'more than two full {window:.1f}s windows of visible progress — so '
             f'the wait must have been refreshed rather than expired.  '
             f'resolved_by={archived.resolved_by!r} means a fixed window fired '
@@ -1194,7 +1205,15 @@ class TestObservableProgressRefreshesTheWait:
         same cap.  That is exactly the outcome fix D2 says must happen ONLY on a
         genuinely SILENT producer, so the per-attempt counter has to count.
         """
-        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        # The tick interval is kept small RELATIVE to the window (0.05s vs
+        # 0.8s, a 16x margin) rather than a fixed absolute gap: under xdist
+        # full-suite load the event loop can be starved for a stretch between
+        # when this wait's deadline is anchored and when the fake steward's
+        # first tick actually lands, and a narrow margin (the previous 0.3s
+        # tick vs 0.5s window, ~0.2s of slack) let that starvation land the
+        # first tick AFTER the first give-up check — a race, not a logic
+        # regression (task 3912).
+        local_config = _short_window_config(config, completion=0.3, invocation=0.5)
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1205,7 +1224,7 @@ class TestObservableProgressRefreshesTheWait:
         _wire_resolve_callback(queue, workflow)
         markers: list[str] = []
         workflow._steward_factory = _make_progressing_steward(
-            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            queue, task_assignment.task_id, tick=0.05, ticks=40, markers=markers,
             counter='subprocess_attempts',
         )
         evrl_mock, _state = _make_evrl_returner(
@@ -1222,8 +1241,8 @@ class TestObservableProgressRefreshesTheWait:
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'
         assert archived.resolved_by == 'steward-auto-dismissed', (
-            f'the steward ticked metrics.subprocess_attempts every 0.3s for '
-            f'~1.2s — more than two full {window:.1f}s windows of visible '
+            f'the steward ticked metrics.subprocess_attempts every 0.05s for '
+            f'~2.0s — more than two full {window:.1f}s windows of visible '
             f'cap-retry progress — with metrics.invocations frozen throughout, '
             f'exactly as an all-accounts-capped steward looks.  '
             f'resolved_by={archived.resolved_by!r} means the backstop fired on '
