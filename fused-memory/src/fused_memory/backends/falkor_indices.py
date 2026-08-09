@@ -629,3 +629,57 @@ def range_create_statement(spec: IndexSpec) -> str:
         'statement shape: a wrong guess creates an index on the wrong thing, '
         'which the diff then reports as permanently missing.'
     )
+
+
+def plan_index_statements(
+    missing: set[IndexSpec],
+) -> list[tuple[str, tuple[IndexSpec, ...]]]:
+    """Turn a diff into the statements that would close it, each with what it covers.
+
+    The two halves are deliberately ASYMMETRIC, on measured grounds:
+
+    * RANGE is SYNTHESIZED per-property.  Upstream's composite form is rejected
+      wholesale when any listed property is already indexed (measured:
+      ``Attribute 'uuid' is already indexed``), and ``falkordb_driver.py``'s
+      ``execute_query`` swallows that rejection — so the ``Entity`` statement
+      loses all 4 of its properties and the ``RELATES_TO`` one all 7, silently.
+      That is the exact failure this PRD exists to remove.
+    * FULLTEXT is issued BYTE-VERBATIM from
+      ``get_fulltext_indices(GraphProvider.FALKORDB)``.  Measured against the same
+      trap state, all 4 fulltext statements succeeded as-is, so decomposing them
+      would be unmeasured churn against a form that already works — and the
+      node-side form is a ``CALL`` carrying a 33-word stopwords map that would
+      have to be re-derived to synthesize.
+
+    Each statement is paired with only the MISSING specs it was issued for, never
+    with every spec it happens to touch.  On a partially-provisioned graph a
+    fulltext statement legitimately re-covers already-present properties; claiming
+    those would inflate ``created`` past ``missing`` and break
+    :class:`IndexProvisionResult`'s ``len(created) + len(failed) == len(missing)``.
+
+    RESIDUAL, deliberately absorbed: a PARTIALLY-provisioned fulltext index could
+    still be rejected wholesale, exactly as the composite range form is.  That
+    lands in ``failed`` and is logged at WARNING rather than raised — β's
+    obligation is to be loud at its own boundary; detecting that such a failure
+    PERSISTS across cycles is task δ's drift detector.
+
+    Args:
+        missing: ``expected_index_set() - normalize_index_records(list_indices())``.
+
+    Returns:
+        ``[(statement, specs_covered), ...]`` in a deterministic order (RANGE
+        first, sorted; then fulltext in upstream order), so the issued-statement
+        log is stable and diffable across runs.  Empty when nothing is missing —
+        idempotence is structural here, not a tolerated re-create (D2).
+    """
+    plan: list[tuple[str, tuple[IndexSpec, ...]]] = []
+
+    for spec in sorted(s for s in missing if s[3] == 'RANGE'):
+        plan.append((range_create_statement(spec), (spec,)))
+
+    for statement in get_fulltext_indices(GraphProvider.FALKORDB):
+        covered = set(parse_index_statement(statement)) & missing
+        if covered:
+            plan.append((statement, tuple(sorted(covered))))
+
+    return plan
