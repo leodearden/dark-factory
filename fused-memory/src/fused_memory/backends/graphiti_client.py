@@ -491,9 +491,10 @@ class GraphitiBackend:
         positive nor a negative signal.  There was no signal in the logs at all.
         Task 3707 (β) deleted it; the structured :class:`IndexProvisionResult`
         (INFO on change, WARNING on failure) replaces it at the boundary where the
-        work actually happens.  ``test_ensure_indices.py`` guards the deletion by
-        scanning this module's source for that message, so do not reintroduce the
-        string even in prose.
+        work actually happens.  ``test_ensure_indices.py`` pins the property
+        behaviourally — this method must emit no log record at ANY level — so the
+        guard tracks the semantics rather than a substring, and stays valid under
+        any rewording here.
 
         β deliberately does NOT route this method through
         :meth:`ensure_indices`, and that is not an abandoned half-fix.
