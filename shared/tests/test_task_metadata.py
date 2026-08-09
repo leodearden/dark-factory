@@ -910,7 +910,7 @@ class TestTaskMetadataFields:
 
 
 class TestDeterministicInvariants:
-    """The two named cross-field invariants (CLAUDE.md field-combo presets)."""
+    """The named cross-field invariants (CLAUDE.md field-combo presets)."""
 
     _MINIMAL_BEFORE_DONE = {'script': 'scripts/x.sh', 'timeout_secs': 60}
 
@@ -950,6 +950,126 @@ class TestDeterministicInvariants:
                 task_kind='normal',
                 before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
             )
+
+    def test_curator_gate_with_before_done_rejected(self):
+        """human_curator_gate + before_done is a self-contradiction (task 3369).
+
+        A curator gate declares that only a human CONTENT judgement closes the
+        task; before_done is a machine step that closes it. Carrying both means
+        the machine step can drive the task to done without the human ever
+        adjudicating — the task-3181 phantom-done this line of work exists to
+        close. task_kind='deterministic' here deliberately, so the pre-existing
+        "before_done is only valid on deterministic tasks" clause cannot be
+        what fires: this test must isolate the NEW rule.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            TaskMetadata(
+                task_kind='deterministic',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                always_escalates=True,
+                # extra='allow' key, not a typed field — pyright can't see it.
+                human_curator_gate=True,  # type: ignore[call-arg]
+            )
+        # The message is the author-facing remediation, so naming only one side
+        # of the contradiction is not sufficient.
+        message = str(excinfo.value)
+        assert 'human_curator_gate' in message, message
+        assert 'before_done' in message, message
+
+    @pytest.mark.parametrize('marker', ['true', 'True', 1, ['x'], {'a': 1}])
+    def test_truthy_but_not_true_curator_marker_still_rejected(self, marker):
+        """Plain truthiness, not ``is True`` — this is a SAFETY gate.
+
+        Do NOT "simplify" this back to an ``is True`` check. The false
+        NEGATIVE is the expensive direction here: a hand-edited or
+        JSON-round-tripped ``'true'`` that slips past the write boundary lands
+        a record the runner's own guard structurally CANNOT protect, because
+        on the act-then-ask path the marker is never read at all — reproducing
+        the task-3181 phantom-done this line of work exists to close. A
+        truthy-but-not-``True`` value is precisely what a misauthoring LLM or
+        operator produces.
+
+        This deliberately mirrors
+        ``orchestrator.deterministic_runner._is_human_curator_gate``, which
+        uses plain ``bool()`` truthiness as a documented divergence from
+        ``_is_operational_llm_gate``'s ``is True``. Two divergent postures for
+        the same key across the write boundary and the runtime guard would be
+        strictly worse than either posture consistently applied.
+        """
+        with pytest.raises(ValidationError):
+            TaskMetadata(
+                task_kind='deterministic',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                always_escalates=True,
+                human_curator_gate=marker,  # type: ignore[call-arg]
+            )
+
+    def test_more_fundamental_clause_reports_first(self):
+        """Clause ORDER inside _deterministic_invariants is load-bearing.
+
+        The curator-gate clause is deliberately LAST: pydantic stops at the
+        first raise, so a blob that is ALSO malformed more fundamentally must
+        report that error, not the narrower curator one. This blob trips two
+        clauses at once — before_done on a non-deterministic task, and the
+        marker alongside before_done — and the author-facing remediation the
+        writer sees must be the fundamental one, because fixing task_kind is
+        the prerequisite for the curator question even being coherent.
+
+        Without this row, TestDeterministicInvariants pins each clause only in
+        ISOLATION, so reordering the three `if` blocks would silently swap the
+        message a mis-authoring writer gets with the whole suite still green.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            TaskMetadata(
+                task_kind='normal',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                human_curator_gate=True,  # type: ignore[call-arg]
+            )
+        message = str(excinfo.value)
+        assert 'before_done is only valid on deterministic tasks' in message, message
+        # ...and specifically NOT the curator-gate clause, which would mean the
+        # ordering had been reversed.
+        assert 'only valid on a pure gate' not in message, message
+
+    # ---- Accepted neighbours: the validator's blast radius is exactly the
+    # contradiction and nothing wider. Every shape below exists on the live
+    # task store today, so a regression here would break real writes.
+
+    def test_curator_gate_on_a_real_pure_gate_accepted(self):
+        # deterministic + no before_done + always_escalates=True + marker.
+        # Tasks 3063 / 3181 / 3234's shape — the whole point of the marker.
+        TaskMetadata(
+            task_kind='deterministic',
+            always_escalates=True,
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    def test_curator_gate_on_a_normal_task_accepted(self):
+        # task 3053's shape: the marker is inert on a non-deterministic task,
+        # but recorded-and-preserved rather than rejected.
+        TaskMetadata(
+            task_kind='normal',
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    @pytest.mark.parametrize('falsy', [False, None, 0, '', []])
+    def test_falsy_curator_marker_with_before_done_accepted(self, falsy):
+        # An explicitly-CLEARED marker must not block a legitimate deploy
+        # write — only a set one contradicts before_done.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+            human_curator_gate=falsy,  # type: ignore[call-arg]
+        )
+
+    def test_before_done_without_the_marker_accepted(self):
+        # The 33 existing deploy rows: before_done with no marker at all.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+        )
 
 
 class _DeployStateStub(BaseModel):
@@ -1663,6 +1783,57 @@ class TestParseMetadataFailurePolicy:
         )
         assert len(warnings) == 1
         assert model.task_kind == 'deterministic'
+
+    # human_curator_gate together with a non-null before_done (task 3369). The
+    # marker is blessed and `x_keep` is x_-namespaced, so neither manufactures
+    # an unknown_key warning — the single warning below is the cross-field one.
+    _CURATOR_GATE_CONTRADICTION = {
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        'before_done': {'script': 'scripts/x.sh', 'timeout_secs': 60},
+        'human_curator_gate': True,
+        'x_keep': 1,
+    }
+
+    def test_curator_gate_contradiction_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata(
+                copy.deepcopy(self._CURATOR_GATE_CONTRADICTION),
+                direction='write',
+                enforce=True,
+            )
+
+    def test_curator_gate_contradiction_write_warn_mode_accepts(self):
+        _, warnings = parse_metadata(
+            copy.deepcopy(self._CURATOR_GATE_CONTRADICTION),
+            direction='write',
+            enforce=False,
+        )
+        assert len(warnings) == 1, [(w.field, w.code) for w in warnings]
+        assert warnings[0].field == task_metadata_module._WHOLE_METADATA_FIELD
+        assert warnings[0].code == 'invalid_metadata'
+
+    def test_curator_gate_contradiction_read_warns_and_round_trips(self):
+        """direction='read' never raises, and I1 round-trip survives.
+
+        On this whole-model error branch parse_metadata falls back to
+        ``TaskMetadata.model_construct(**parsed)``, so ``before_done`` stays a
+        RAW dict (field validation was skipped) and a ``model_dump()``
+        assertion here would emit a benign pydantic UserWarning
+        ("PydanticSerializationUnexpectedValue(Expected `BeforeDone` ...)").
+        Assert on ``model_extra``/``before_done`` instead, so this test cannot
+        break under a future ``-W error`` run. That is pre-existing behaviour
+        of the whole-model branch, not something task 3369 introduced.
+        """
+        blob = copy.deepcopy(self._CURATOR_GATE_CONTRADICTION)
+        model, warnings = parse_metadata(blob, direction='read')
+        assert len(warnings) == 1, [(w.field, w.code) for w in warnings]
+        assert warnings[0].field == task_metadata_module._WHOLE_METADATA_FIELD
+        assert warnings[0].code == 'invalid_metadata'
+        extra = model.model_extra or {}
+        assert extra['human_curator_gate'] is True
+        assert extra['x_keep'] == 1
+        assert model.before_done == blob['before_done']
 
     # Valid JSON that decodes to something other than an object, plus one
     # direct non-dict/non-str Python input exercising the `else: parsed =

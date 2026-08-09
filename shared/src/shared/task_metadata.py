@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'BeforeDone',
     'DoneProvenance',
@@ -83,6 +84,23 @@ KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
         'simple_task',
     }
 )
+
+
+# The human-curator-gate marker (task 3341), read by
+# TaskMetadata._deterministic_invariants below and blessed in
+# _BLESSED_METADATA_KEYS. It is an ``extra='allow'`` metadata key, NOT a typed
+# TaskMetadata field, and is deliberately kept that way (task 3369): a typed
+# ``bool`` would COERCE the fail-closed string 'true' to True in pydantic's
+# non-strict mode -- silently rewriting an author's value in the one direction
+# that makes it look intentional, breaking I1 -- and a concrete default would
+# add ``human_curator_gate: false`` noise to every task's model_dump(), the
+# same objection already documented for merge_retry_pending.
+#
+# This is the key's SINGLE definition codebase-wide (exported via __all__):
+# orchestrator.deterministic_runner — the only other module that acts on the
+# key — imports it from here rather than restating the literal, so the write
+# boundary's rejection and the runner's dispatch-time guard cannot drift apart.
+HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 
 
 def validate_model_overrides(value: object) -> None:
@@ -492,6 +510,14 @@ class TaskMetadata(BaseModel):
     key this schema does not yet know about — a newer writer's field, a
     caller-private ``x_``-namespaced value — survives untouched through
     :func:`parse_metadata` rather than being silently dropped.
+
+    :meth:`_deterministic_invariants`' curator-gate clause is the *write-time*
+    counterpart to ``DeterministicRunner``'s dispatch WARNING (task 3341):
+    that WARNING fires when a record carrying both markers has already reached
+    the runner, whereas this rejects the record at the ``submit_task`` /
+    ``update_task`` boundary so it never lands (task 3369). The runner's
+    WARNING is deliberately retained as a defence-in-depth backstop for
+    records that did not pass through that boundary.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -536,6 +562,32 @@ class TaskMetadata(BaseModel):
             raise ValueError('deterministic task requires before_done or always_escalates')
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
+        # Read the marker from model_extra, NOT getattr: it is an extra='allow'
+        # key (see HUMAN_CURATOR_GATE_KEY), and pydantic v2 populates
+        # __pydantic_extra__ before mode='after' validators run. `or {}` keeps
+        # the clause total if model_extra is ever None.
+        #
+        # LAST clause deliberately: pydantic stops at the first raise, so a
+        # blob that is also malformed more fundamentally (e.g. task_kind
+        # 'normal' with a before_done) still reports that error instead of
+        # this narrower one.
+        #
+        # Plain TRUTHINESS, not `is True` — same fail-CLOSED posture as
+        # orchestrator.deterministic_runner._is_human_curator_gate, and for the
+        # same reason: this is a SAFETY marker whose false NEGATIVE is the
+        # expensive direction. A truthy-but-not-True value (the string 'true'
+        # from a hand edit or a JSON round-trip) must still be rejected here,
+        # because the runner's own guard structurally cannot catch it on the
+        # act-then-ask path.
+        # Pinned by test_truthy_but_not_true_curator_marker_still_rejected.
+        if self.before_done is not None and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY):
+            raise ValueError(
+                'human_curator_gate is only valid on a pure gate: a curator gate '
+                'declares that only a human content judgement closes this task, '
+                'while before_done is a machine step that closes it. Drop '
+                'before_done to make this a real curator gate, or drop the marker '
+                'if the machine step is what closes the task.'
+            )
         return self
 
 
@@ -801,7 +853,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # carries the `human_curator_` prefix rather than the bare `curator_`
         # one above precisely so the human content curator is not conflated
         # with the automated task curator.
-        'human_curator_gate',
+        HUMAN_CURATOR_GATE_KEY,
         'human_curator_adjudicated_at',
     }
 )

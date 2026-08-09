@@ -5147,14 +5147,14 @@ class TestRunCancellationReapsChild:
             f"os.replace(tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
+        # The deadline must outlast the child's interpreter startup, or the
+        # child is cancelled before it ever publishes its pid and the poll
+        # below fails as 'child never started'. Measured on a loaded box:
+        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
+        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
+        # child very much alive — which is what this test is about.
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
-                # 5.0s (not e.g. 1.0s) gives the python3 interpreter
-                # comfortable room to start up and flush its pid write
-                # under load before cancellation kills it — still far
-                # below the child's 60s sleep, so this stays a genuine
-                # cancel-a-hung-script scenario rather than a natural
-                # completion.
                 _run(['python3', '-c', script]), timeout=5.0
             )
 
