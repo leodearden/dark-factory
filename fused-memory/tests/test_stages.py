@@ -7470,6 +7470,50 @@ class TestSweepStaleMem0FlagMarkers:
         ]
         assert {'kind': 'stage1_flag_marker'} in scrolled_filters
 
+    @pytest.mark.asyncio
+    async def test_marker_carrying_both_source_and_kind_is_deleted_exactly_once(self):
+        """Union de-duplication pin (task 3915): the canonical flag_dedup
+        writer shape (flag_dedup.py:849-856) sets BOTH 'source' and 'kind'
+        to 'stage1_flag_marker' on the same record, so it is returned by
+        BOTH filter variants' scrolls under the SAME id. The merge must be
+        a union keyed on id — this member must be deleted exactly once, not
+        once per matching variant, or stale_mem0_flag_markers_gc_swept
+        would over-count and the delete/tombstone path would double-fire
+        for the entire pre-2406 canonical (both-keys-present) cohort."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        both_keys_member = {
+            'id': 'canonical-both-keys',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': 't1',
+                'run_id': 'prior-run',
+            },
+        }
+        memory_service = AsyncMock()
+        # Both filter variants match this record (it carries both keys), so
+        # every scroll call — regardless of which variant's filter it was
+        # issued with — returns the SAME member/id.
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[both_keys_member])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 1
+        assert memory_service.delete_memory.await_count == 1
+        tombstone.assert_awaited_once()
+        victims = tombstone.await_args.args[2]
+        assert len(victims) == 1
+        assert victims[0]['id'] == 'canonical-both-keys'
+
 
 class TestSweepStaleMem0FlagForStage2Markers:
     """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
