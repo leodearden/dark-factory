@@ -57,6 +57,7 @@ function that always runs its gates when called.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -72,6 +73,8 @@ from fused_memory.services.live_workflow_detector import (
     is_workflow_live_for_task,
 )
 from fused_memory.services.orchestrator_detector import orchestrator_started_at
+
+logger = logging.getLogger(__name__)
 
 # Metadata keys carrying the snapshot status a recon-stage caller observed
 # before writing. Promoted (Open Q3) from
@@ -562,7 +565,8 @@ def _corroboration_verdict(
     is being made to agree with: guard on ``status == 'in-progress'``, read the
     two per-project corroboration inputs, delegate to
     :func:`~fused_memory.services.live_workflow_detector.corroboration_for_task`,
-    and swallow every error to ``None``.
+    and swallow every error to ``None`` (logged at WARNING here, so the
+    fallback is never silent).
 
     Returns ``None`` — leaving the detector's corroboration gate byte-for-byte
     inert — unless *live_status* is ``'in-progress'`` AND *task_snapshot* is a
@@ -604,6 +608,13 @@ def _corroboration_verdict(
             orchestrator_started_at=orch_started,
         )
     except Exception:
+        logger.warning(
+            'recon_write_policy._corroboration_verdict: corroboration assembler '
+            'error for task_id=%s; falling back to corroborated=None (gate inert, '
+            'fail-safe toward live)',
+            task_id,
+            exc_info=True,
+        )
         return None
 
 
