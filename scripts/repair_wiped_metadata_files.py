@@ -1016,17 +1016,13 @@ CLIENT_NAME = "repair-wiped-metadata-files-3329"
 #
 # A DELIBERATE THIRD COPY of _task_db_scan.py's Tier-3 AUDIT_EXIT_* ladder, not
 # an un-deduplicated leftover: task 3817 decided this script does NOT adopt that
-# tier's run_audit_cli. The full rationale lives in ONE place — _task_db_scan.py's
-# module docstring — and is deliberately not restated here, because a second copy
-# of the reasoning is the very thing that task exists to prevent.
+# tier's run_audit_cli. Rationale: _task_db_scan.py's module docstring. Guard:
+# tests/scripts/test_repair_wiped_metadata_files.py.
 #
 # The one part a reader of THIS file needs before touching these constants:
 # 0-3 are numerically identical to Tier 3's codes, but 1 means "a write was
 # attempted and REJECTED" here versus "the read-only sweep found findings"
 # there, and 4 is this script's own extension with no Tier-3 counterpart.
-# That numeric lockstep is enforced by
-# tests/scripts/test_repair_wiped_metadata_files.py, so renumbering any of these
-# fails CI rather than drifting silently against the shared ladder.
 EXIT_OK = 0                    # ran; nothing failed to write
 EXIT_WRITE_FAILED = 1          # at least one candidate FAILED to write
 EXIT_NO_ROOT = 2               # no project root resolved to a readable tasks.db

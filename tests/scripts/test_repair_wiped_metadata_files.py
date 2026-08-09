@@ -1674,15 +1674,11 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# Cross-copy lockstep guard with _task_db_scan.py's Tier 3.
-#
-# Task 3817 decided this script does NOT adopt _task_db_scan.run_audit_cli and
-# keeps its own EXIT_* ladder — the rationale lives in _task_db_scan.py's module
-# docstring, and is NOT restated here. What that decision leaves behind is a
-# duplicated exit-code ladder that nothing checked: the two copies agreed only by
-# luck. These tests are what convert that luck into a CI failure. They import the
-# shared constants rather than re-spelling 0/1/2/3 as literals, because a
-# hardcoded copy in the guard would drift exactly as the thing it guards against.
+# Lockstep guard for the task-3817 decision that this script keeps its own
+# EXIT_* ladder instead of adopting _task_db_scan.run_audit_cli — rationale in
+# _task_db_scan.py's module docstring. The shared constants are IMPORTED below,
+# never re-spelled as 0/1/2/3 literals, or the guard would drift exactly as the
+# thing it guards against.
 # ---------------------------------------------------------------------------
 
 
@@ -1690,10 +1686,12 @@ def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
     """The four shared codes must keep the SAME integers as Tier 3's.
 
     Task 3817 decided repair_wiped_metadata_files.py keeps its own copy of the
-    ladder that _task_db_scan.py's AUDIT_EXIT_* constants own, so this test is
-    the only thing standing between the two copies and silent drift. An operator
-    (or a wrapper script) reading an exit code must not have to know WHICH of the
-    wiped-metadata tools produced it.
+    ladder that _task_db_scan.py's AUDIT_EXIT_* constants own. The two copies
+    were kept numerically aligned BY CONVENTION — nothing in the repo reads an
+    exit code from both tools today — and this test is what freezes that
+    convention, since a hand-maintained alignment nothing checks agrees only by
+    luck. Renumbering a copy deliberately is allowed; it must edit this test
+    rather than drift past it unnoticed.
     """
     assert EXIT_OK == AUDIT_EXIT_OK
     assert EXIT_WRITE_FAILED == AUDIT_EXIT_FINDINGS
@@ -1702,20 +1700,17 @@ def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
 
 
 def test_exit_server_unreachable_is_this_scripts_own_extension():
-    """4 is this script's, not Tier 3's — and must stay outside its value set.
+    """4 is this script's own code, with no Tier-3 counterpart.
 
     Tier 3 has no fifth code, so EXIT_SERVER_UNREACHABLE cannot be checked for
-    lockstep; what CAN be checked is that it never collides with a Tier-3 code
-    and thereby acquires a second, contradictory meaning. Anyone renumbering the
-    shared ladder upward lands on this test rather than on a silent collision.
+    lockstep; pinning the literal records that the value is this script's to
+    choose. Non-collision with the Tier-3 codes needs no assertion here — it is
+    already implied: the lockstep test above proves the four AUDIT_EXIT_* values
+    ARE this script's first four codes, and
+    test_repair_exit_constants_are_pairwise_distinct proves 4 differs from all
+    four of those.
     """
     assert EXIT_SERVER_UNREACHABLE == 4
-    assert EXIT_SERVER_UNREACHABLE not in {
-        AUDIT_EXIT_OK,
-        AUDIT_EXIT_FINDINGS,
-        AUDIT_EXIT_NO_ROOT,
-        AUDIT_EXIT_NOTHING_AUDITED,
-    }
 
 
 def test_repair_exit_constants_are_pairwise_distinct():
