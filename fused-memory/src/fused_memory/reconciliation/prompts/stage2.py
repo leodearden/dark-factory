@@ -23,6 +23,7 @@ from fused_memory.reconciliation.recon_self_model import (
     render_execution_class_section,
     render_investigation_outcome_section,
     render_source_completion_section,
+    render_task_creation_accounting_section,
 )
 
 STAGE2_SYSTEM_PROMPT = f"""\
@@ -312,7 +313,7 @@ was created — count it as a no-op, not a successful addition. Your stats \
 
 {_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
 
-**Per-Cycle Counter Schema** — include all three of the following fields in your \
+**Per-Cycle Counter Schema** — include all four of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
 report ambiguous or missing data):
 - `flag_deleted_records`: list of `{{"action": "flag_deleted", "flag_id": ..., \
@@ -328,6 +329,11 @@ report ambiguous or missing data):
   (including no-action notes). The framework clamps this value against \
   `len(prior_reports[0].items_flagged)` to catch under-counting. Set to 0 if \
   Stage 1 emitted no flagged_items.
+- `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
+  "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
+  one per confirmed task creation (see `## Task-Creation Accounting` below). The \
+  framework treats this list as the ground-truth source for `tasks_created` and \
+  repairs the counter upward when the two disagree.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
@@ -470,6 +476,8 @@ key while replacing only the legacy hint shape.
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
+
+{render_task_creation_accounting_section()}
 
 ## Knowledge-Deletion Absence Pre-Check
 Before deleting ANY knowledge edge or Mem0 entry that is attributed to a task being \
