@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until, pydantic_spec
+from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -592,25 +592,26 @@ async def test_worker_created_path_emits_journal_event(
             message='worker did not resolve the ticket',
         )
 
-        # The ticket is terminalised (via asyncio.shield) *before* the
-        # worker builds and journals the task_created event (see
-        # _process_add_tickets_batch_prepared / _process_add_ticket in
-        # task_interceptor.py), so the poll above can observe the
-        # post-pending status one event-loop hop before _journal actually
-        # runs. Close that narrow window with a short second bounded poll
-        # on the emission itself: a genuine regression (event never
-        # emitted) still fails fast, just in ~2s instead of the full 10s.
-        # The predicate matches the task_created event *specifically* rather
-        # than any journalled event, so an unrelated event landing first
-        # cannot let the `== 1` assertion below run before task_created has
-        # actually been emitted.
-        await poll_until(
-            lambda: any(
-                getattr(e, 'type', None) == EventType.task_created
-                for e in journal_calls
+        # SETTLE barrier, not a liveness poll: wait for the task_created count
+        # to STOP CHANGING, not merely to become non-zero.  The assertion below
+        # is an exact count, and a liveness poll returns at the *first* event —
+        # so a duplicate arriving milliseconds later would be structurally
+        # invisible.  The duplicate is concrete: task_created is emitted from
+        # two distinct paths (task_interceptor.py:3786-3795 and 4164-4173),
+        # both of which persist the terminal ticket row *before* emitting, so
+        # neither a ticket-row predicate nor a first-event predicate closes the
+        # emission window.  settle=0.2 restores exactly the width of the
+        # `asyncio.sleep(0.2)` this poll replaced — but measured from the first
+        # event rather than from submit_task, so a late-scheduled worker under
+        # `-n auto` no longer eats the window.
+        await poll_until_stable(
+            lambda: sum(
+                1 for e in journal_calls
+                if getattr(e, 'type', None) == EventType.task_created
             ),
-            timeout=2.0,
-            message='ticket resolved but no task_created event was emitted',
+            settle=0.2,
+            timeout=10.0,
+            message='worker did not journal a task_created event',
         )
 
     # Exactly one task_created event must have been journalled
