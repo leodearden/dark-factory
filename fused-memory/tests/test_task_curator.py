@@ -44,7 +44,6 @@ from fused_memory.middleware.task_curator import (
     _parse_decision_dict,
     _PoolEntry,
     _scale_budget,
-    _task_dependencies,
     _task_files,
     _to_pool_entry,
     _trim_pool,
@@ -81,18 +80,6 @@ class TestTaskFiles:
     def test_filters_empty_strings(self):
         task = {'id': '1', 'files_to_modify': ['', 'src/a.py', None, '']}
         assert _task_files(task) == ['src/a.py']
-
-
-class TestTaskDependencies:
-    def test_list(self):
-        assert _task_dependencies({'dependencies': ['1', '2', '3']}) == ['1', '2', '3']
-
-    def test_csv_fallback(self):
-        assert _task_dependencies({'dependencies': '1, 2,3'}) == ['1', '2', '3']
-
-    def test_empty(self):
-        assert _task_dependencies({}) == []
-        assert _task_dependencies({'dependencies': None}) == []
 
 
 class TestToPoolEntry:
