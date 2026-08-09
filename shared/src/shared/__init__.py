@@ -33,7 +33,7 @@ from shared.cli_invoke import (
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.locking import (
-    CODE_EXTENSIONS,
+    FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
     is_file_path,
@@ -96,7 +96,7 @@ __all__ = [
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',
-    'CODE_EXTENSIONS',
+    'FILE_EXTENSIONS',
     'is_file_path',
     'directory_locks',
     'strip_directory_locks',

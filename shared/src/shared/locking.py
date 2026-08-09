@@ -7,7 +7,7 @@ tasks whose module footprint overlaps a candidate.
 
 Directory/file path classifier (α/γ shared predicate)
 ------------------------------------------------------
-``CODE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
+``FILE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
 ``strip_directory_locks`` live here so the orchestrator scheduler (α
 enforcement point) can import them without a ``fused_memory`` dependency
 (the orchestrator must not import fused_memory; see
@@ -19,7 +19,7 @@ names so it remains self-contained in the fused-memory virtual environment
 predates this relocation).  The two copies are **not** connected by a
 re-export; drift between them is caught by explicit equality tests:
 
-- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
   (pins this copy)
 - ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins the lock_charter_guard.py copy)
@@ -31,7 +31,7 @@ from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
-    'CODE_EXTENSIONS',
+    'FILE_EXTENSIONS',
     'directory_locks',
     'files_to_modules',
     'is_file_path',
@@ -43,22 +43,21 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — authoritative Python copy for the α enforcement point.
 #
-# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
-# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
-# TOKENS whose presence after the last dot of a path's final segment is evidence
-# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# NAMING — the contract.  This is the set of recognised FILE-EXTENSION TOKENS
+# whose presence after the last dot of a path's final segment is evidence that
+# the segment names a FILE rather than a DIRECTORY — which is all any caller
 # (is_file_path, directory_locks, strip_directory_locks,
-# module_charter.derive_modules) relies on.  Its non-code members are therefore
-# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
-# typed service template example python-version gitignore gitkeep gitmodules
-# gitattributes npmrc envrc conf.
-# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
-# "is this code?".  That misreading of the name is exactly what let the list sit
-# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
-# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
-# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
-# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
-# dedicated follow-up rather than done half-way here.
+# module_charter.derive_modules) relies on.  It is NOT a code-file allowlist, so
+# its non-code members are correct and load-bearing: png svg ico icns log lock
+# diff golden manifest timer typed service template example python-version
+# gitignore gitkeep gitmodules gitattributes npmrc envrc conf.
+# ADMISSION RULE: judge a candidate addition by "does a real tracked file end in
+# this?", NEVER by "is this code?".  Reading this list's former, CODE_-prefixed
+# name as if it meant "code" is exactly what let it sit at a 22-extension
+# undercount until #3117 — the history this rule exists to prevent repeating,
+# and the reason the name now says FILE.
+# Renamed to FILE_EXTENSIONS by #3248, the dedicated follow-up #3117 deferred
+# that rename to.
 #
 # Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
 # git-ls-files sweep 2026-07-28 (reify #5726 / dark_factory #3117) — 22 tracked-file
@@ -71,11 +70,11 @@ __all__ = [
 # Widened 58 -> 59 on 2026-08-06: `csv` — caught by the corpus->allowlist guard
 # (test_every_tracked_extension_is_allowlisted) once plans/evidence/
 # scheduler-scoring-2026-08-06/*.csv landed on dark-factory main (e1c51efa8d).
-# Drift guard (this shared copy): shared/tests/test_locking.py::TestCodeExtensionsDriftGuard
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestFileExtensionsDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
-CODE_EXTENSIONS: frozenset[str] = frozenset(
+FILE_EXTENSIONS: frozenset[str] = frozenset(
     {
         'c',
         'cc',
@@ -152,7 +151,7 @@ def is_file_path(path: str) -> bool:
        Empty segment (path was all slashes) → directory → return False.
     3. If the segment contains no ``.`` → extension-less → return False.
     4. ext = substring after the last ``.`` in the segment.
-       Return ``ext in CODE_EXTENSIONS`` (case-sensitive, matching α's
+       Return ``ext in FILE_EXTENSIONS`` (case-sensitive, matching α's
        ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
     """
     # Strip all trailing slashes.
@@ -185,7 +184,7 @@ def is_file_path(path: str) -> bool:
     #                  rule: that rule would make '.worktrees' (the whole
     #                  worktree pool) declarable as a lock charter.
     # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
-    return ext in CODE_EXTENSIONS
+    return ext in FILE_EXTENSIONS
 
 
 def directory_locks(files: list[Any]) -> list[str]:
