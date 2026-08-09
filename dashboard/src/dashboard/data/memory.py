@@ -344,7 +344,9 @@ async def get_queue_stats(
 
 # Intentionally NOT converted to first_success: collects a per-URL entry from
 # ALL configured URLs rather than short-circuiting on the first success.
-async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_wal_status(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch per-store WAL checkpoint status from each fused-memory server.
 
     Returns ``{'stores': {server_url: {store_name: row, ...}}}`` — one
@@ -355,12 +357,19 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
     Returns ``{'offline': True, 'error': ...}`` if all configured servers
     are unreachable. Added 2026-05-14 in response to the 2026-05-13
     task-DB-loss incident — see ``docs/task-recovery-2026-05-13/``.
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: like ``get_queue_stats`` this visits ALL N configured
+    URLs, so the aggregate cost scales with N. Callers needing a hard bound
+    must still wrap this in ``asyncio.wait_for``.
     """
     per_server: dict[str, dict] = {}
     errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(client, url, 'get_wal_status', {})
+            result = await mcp_tool_call(
+                client, url, 'get_wal_status', {}, timeout=timeout,
+            )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             # Transition-only WARNING, as above — a per-server WAL column can
@@ -377,7 +386,9 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
     return {'stores': per_server}
 
 
-async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+async def get_curator_state(
+    client: httpx.AsyncClient, config: DashboardConfig, timeout: float = 10,
+) -> dict:
     """Fetch the curator UsageGate state from the fused-memory server.
 
     Returns the first successful result from any configured URL; on all-fail
@@ -388,7 +399,13 @@ async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) 
     Result shape (on success):
       ``{'paused': bool, 'paused_reason': str | None,
          'soonest_open_at': str | None, 'account_count': int}``
+
+    *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
+    bound on this call: the failover walks up to N URLs, each of which may
+    perform a three-post cold-session handshake. ``api_curator`` wraps it in
+    ``asyncio.wait_for`` for the whole-operation bound.
     """
     return await _first_success(
-        client, config, 'get_curator_state', {}, 'get_curator_state'
+        client, config, 'get_curator_state', {}, 'get_curator_state',
+        timeout=timeout,
     )

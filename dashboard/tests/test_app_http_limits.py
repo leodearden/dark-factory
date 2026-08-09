@@ -28,6 +28,7 @@ which is private and brittle across httpx versions.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -290,4 +291,84 @@ class TestLifespanWiresTheLimits:
         )
         assert captured[0].get('follow_redirects') is True, (
             'follow_redirects=True must be preserved alongside the new limits'
+        )
+
+
+class TestEndpointBudgetsReachTheMcpLegs:
+    """The route-level half of the same bound: per-call budgets, not 10s.
+
+    Lives in this module because it pins the *other* outbound-HTTP bound
+    app.py owns under task 3871 (the pool limits above bound how many sockets;
+    these bound how long any one request may hold one). The natural homes —
+    tests/test_app.py and tests/test_api_curator.py — are outside this task's
+    locked modules, so the coverage is kept here rather than dropped.
+    """
+
+    def test_api_memory_hands_each_mcp_leg_the_endpoint_budget(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        from dashboard.app import _MEMORY_ENDPOINT_TIMEOUT_SECONDS
+
+        status = AsyncMock(return_value={'offline': True, 'error': 'down'})
+        queue = AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None})
+        wal = AsyncMock(return_value={'offline': True, 'error': 'down'})
+
+        with (
+            patch('dashboard.data.memory.get_memory_status', new=status),
+            patch('dashboard.data.memory.get_queue_stats', new=queue),
+            patch('dashboard.data.memory.get_wal_status', new=wal),
+        ):
+            resp = client.get('/api/v2/dashboard/memory')
+
+        assert resp.status_code == 200
+        for name, mock in (('status', status), ('queue', queue), ('wal', wal)):
+            assert mock.await_args is not None, f'{name} leg was never awaited'
+            assert (
+                mock.await_args.kwargs.get('timeout')
+                == _MEMORY_ENDPOINT_TIMEOUT_SECONDS
+            ), (
+                f'the {name} leg must get the endpoint budget, not '
+                f"mcp_tool_call's 10s default; got "
+                f'{mock.await_args.kwargs.get("timeout")!r}'
+            )
+
+    def test_api_curator_bounds_the_curator_state_leg(self, client, monkeypatch):
+        """Both layers: the budget reaches the callee AND wait_for caps the leg.
+
+        Before this, /curator gathered get_curator_state with neither bound
+        while its fan_out_list_tickets sibling honoured 5s — so one dead
+        fused-memory instance could hold the endpoint for roughly N x 3 x 10s.
+        """
+        import time
+        from unittest.mock import AsyncMock, patch
+
+        budget = 0.05
+        monkeypatch.setattr('dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS', budget)
+
+        async def _never_returns(*_args, **_kwargs):
+            await asyncio.sleep(5.0)
+            return {'paused': False}
+
+        state = AsyncMock(side_effect=_never_returns)
+
+        with (
+            patch('dashboard.data.memory.get_curator_state', new=state),
+            patch(
+                'dashboard.app.fan_out_list_tickets',
+                new=AsyncMock(return_value=([], 0)),
+            ),
+        ):
+            started = time.monotonic()
+            resp = client.get('/api/v2/dashboard/curator')
+            elapsed = time.monotonic() - started
+
+        assert resp.status_code == 200, 'a hung leg must degrade, not 500'
+        assert elapsed < 2.0, (
+            f'the curator_state leg must be capped by asyncio.wait_for; the '
+            f'request took {elapsed:.2f}s against a {budget}s budget'
+        )
+        assert state.await_args is not None, 'the leg was never awaited'
+        assert state.await_args.kwargs.get('timeout') == budget, (
+            f'the per-call budget must reach the callee too, got '
+            f'{state.await_args.kwargs.get("timeout")!r}'
         )

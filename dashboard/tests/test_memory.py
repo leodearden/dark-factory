@@ -481,6 +481,91 @@ class TestAggregateTimeoutBudget:
         assert timeouts == [10] * 6, f'default must stay 10, got {timeouts}'
 
 
+class TestRemainingHelpersThreadTheirBudget:
+    """The last two helpers that were still pinned to the 10s default.
+
+    Threading the budget through most of this module but not these two left a
+    live incoherence: /api/v2/dashboard/curator gathered get_curator_state
+    alongside a fan_out_list_tickets leg honouring a 5s budget, so during a
+    fused-memory outage one leg could still block for roughly N x 3 x 10s.
+    ``get_wal_status`` had the same shape inside /memory.
+    """
+
+    async def test_get_wal_status_threads_budget_to_every_url(self, two_url_config):
+        from dashboard.data.memory import get_wal_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        payload = {'stores': {'tasks': {'busy': 0}}}
+        mock_client = AsyncMock()
+        # get_wal_status collects from ALL urls — two cold sessions, six posts.
+        mock_client.post.side_effect = [
+            *_cold_session_responses(payload, url_a),
+            *_cold_session_responses(payload, url_b),
+        ]
+
+        result = await get_wal_status(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected success: {result}'
+        assert set(result['stores']) == {url_a, url_b}, 'one column per server'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [3.0] * 6, (
+            f'the budget must reach every post of all N urls, got {timeouts}'
+        )
+
+    async def test_get_wal_status_default_timeout_is_ten(self, two_url_config):
+        from dashboard.data.memory import get_wal_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        payload = {'stores': {}}
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            *_cold_session_responses(payload, url_a),
+            *_cold_session_responses(payload, url_b),
+        ]
+
+        await get_wal_status(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10] * 6, f'default must stay 10, got {timeouts}'
+
+    async def test_get_curator_state_threads_budget_across_failover(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import get_curator_state
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            httpx.ConnectError('refused'),
+            *_cold_session_responses({'paused': False}, url_b),
+        ]
+
+        result = await get_curator_state(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected failover success: {result}'
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 4, (
+            f'expected 1 failed post on {url_a} + 3 cold-session posts on '
+            f'{url_b}, got {len(posts)}'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [3.0] * 4, (
+            f'the budget must reach every post of every URL tried, got {timeouts}'
+        )
+
+    async def test_get_curator_state_default_timeout_is_ten(self, two_url_config):
+        from dashboard.data.memory import get_curator_state
+
+        _url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _cold_session_responses({'paused': False}, url_b)
+
+        await get_curator_state(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], f'default must stay 10, got {timeouts}'
+
+
 # ── SSE response parsing ───────────────────────────────────────
 
 

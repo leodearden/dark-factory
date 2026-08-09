@@ -798,6 +798,20 @@ async def api_tasks(request: Request) -> JSONResponse:
     )
 
 
+# Per-HTTP-request budget for /memory's three MCP legs (task 3871), matching
+# the metrics samplers' 5.0s. Without it each leg silently ran to
+# mcp_tool_call's 10s default — including pool acquisition — while its
+# sibling legs honoured a real budget.
+#
+# Deliberately NOT also wrapped in asyncio.wait_for, unlike the curator leg
+# below: this gather has no return_exceptions=True, so a TimeoutError raised
+# by a wrapper would escape as a 500 rather than degrading one leg. The three
+# callees swallow their own per-URL failures and return offline dicts, so
+# adding a whole-operation bound here means first giving each leg its own
+# exception containment — a shape change beyond this task.
+_MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
+
+
 @app.get('/api/v2/dashboard/memory')
 async def api_memory(request: Request) -> JSONResponse:
     """MEMORY_STATUS, including queue counts and per-project totals."""
@@ -806,12 +820,18 @@ async def api_memory(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
     status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
-        memory_data.get_memory_status(http_client, config),
-        memory_data.get_queue_stats(http_client, config),
+        memory_data.get_memory_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
+        memory_data.get_queue_stats(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         get_memory_sparks(metrics_db, days=1),
         get_queue_pending_series(metrics_db, days=1),
         get_memory_24h_ago(metrics_db),
-        memory_data.get_wal_status(http_client, config),
+        memory_data.get_wal_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
     )
     return JSONResponse(
         redux_api.shape_memory(
@@ -1149,7 +1169,19 @@ async def api_curator(request: Request) -> JSONResponse:
         ),
         _sparks_leg(),
         _intervals_leg(),
-        memory_data.get_curator_state(http_client, config),
+        # Bounded on BOTH layers, like every other probe in task 3871: the
+        # budget bounds each individual HTTP request (including pool
+        # acquisition), wait_for bounds the whole operation because a cold
+        # session is three posts across up to N urls. Previously this leg took
+        # neither, so /curator could block for roughly N x 3 x 10s during a
+        # fused-memory outage while its fan-out sibling honoured 5s.
+        # TimeoutError lands in safe_gather_result below as the offline state.
+        asyncio.wait_for(
+            memory_data.get_curator_state(
+                http_client, config, timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+            ),
+            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         return_exceptions=True,
     )
     # fan_out_list_tickets never raises a normal Exception (per-root failures are
