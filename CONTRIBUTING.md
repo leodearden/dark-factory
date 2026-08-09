@@ -280,8 +280,8 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
 it's the single normative copy; don't restate them elsewhere (a restatement
 here went stale once already — task 3802, and
-`scripts/tests/test_design_invariants_consistency.py` now pins this
-section's silence). If you're hand-writing a task (not going through
+`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
 `/prd`) for a nontrivial design change, walk it against the same checklist
 yourself before filing.
 

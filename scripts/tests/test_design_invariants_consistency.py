@@ -23,7 +23,8 @@ THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     rationale prose, which the doc itself declares a point-in-time snapshot).
   * ``skills/prd/references/gates.md`` — TWO independent enumerations: the
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
-  * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it must restate NO slug at all.
+  * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
+    invariant, never a restatement of the family.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -38,14 +39,20 @@ The ONE surviving marked span, ``inv-trigger-shapes`` in gates.md, is a pure
 DELIMITER rather than a wording pin: that file carries decoy backticked slugs
 outside both of its enumerations (`no-lockstep-duplication` discussed in prose,
 a `G7 waiver: <slug>` template), so the trigger-shape SET check needs an
-explicit boundary that a content heuristic could not supply. The marker
-convention follows CONTRIBUTING.md's existing ``lint-command-mirror`` block.
+explicit boundary that a content heuristic could not supply. In the doc it is
+BARE — ``<!-- inv-trigger-shapes:begin -->``, no explanatory body — because /prd
+G7 Reads that file verbatim as gate instructions and pytest strategy notes
+interleaved with the screening list are noise to the agent executing it. The
+explanation of WHY that span is pinned as a set rather than an ordered list
+lives on ``test_gates_trigger_shape_list_covers_every_invariant`` below, where a
+reader of this guard will look for it. The marker convention follows
+CONTRIBUTING.md's existing ``lint-command-mirror`` block.
 
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
-synced verify worktree. This module is stdlib-only (``re``, ``pathlib``) plus
-``pytest``.
+synced verify worktree. This module is stdlib-only (``os``, ``re``, ``pathlib``)
+plus ``pytest``.
 
 EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
 naming its ``source`` rather than returning an empty list. An extractor that
@@ -57,6 +64,7 @@ edit; the live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -265,33 +273,73 @@ _VERDICT_ROW_RE = re.compile(r"^\| `INV-(\d+)-(PRD|CODE)` \|")
 
 _BACKTICKED_SLUG_RE = re.compile(r"^`([a-z0-9][a-z0-9-]*)`$")
 
+# The column this guard reads out of every verdict table, matched case-insensitively
+# on the header cell rather than by position.
+_EXPECTED_SLUG_HEADING = "expected slug"
+
+
+def _table_cells(line: str) -> list[str]:
+    """A pipe-table row's cells, index 1 being the first real column.
+
+    ``"| a | b |".split("|")`` yields a leading and a trailing empty string, so
+    the 1-based indexing is the split's, not a convention invented here — which
+    is why a header index resolved from one row is directly usable on another.
+    """
+    return [cell.strip() for cell in line.split("|")]
+
 
 def verdict_table_rows(md_text: str, *, source: str) -> list[tuple[int, str, str]]:
     """Every rehearsal verdict row as ``(number, shape, expected_slug)``.
 
-    The Expected-slug cell is column 4. A row that is too short, or whose cell is
-    empty or not a backticked slug, RAISES rather than yielding ``None``: a
-    ``None`` would flow into the slug-equality check and surface as "expected
-    `contracts-machine-checked`, got None" — a red with a misleading diagnosis
-    pointing at the family rather than at the malformed row.
+    The Expected-slug column index is resolved from each table's own HEADER row
+    rather than hardcoded. The live doc splits its rows across three tables (a
+    base table plus two dated addenda), each with its own header; hardcoding a
+    position means that a future addendum which inserts, drops or reorders a
+    column is read at whichever cell happens to land at that index — failing with
+    "an unreadable Expected-slug cell", which blames the row, or worse comparing
+    the wrong column against the canonical family and reading green.
+
+    A row that precedes any header, is too short for its table's resolved index,
+    or whose cell is empty or not a backticked slug, RAISES rather than yielding
+    ``None``: a ``None`` would flow into the slug-equality check and surface as
+    "expected `contracts-machine-checked`, got None" — a red with a misleading
+    diagnosis pointing at the family rather than at the malformed row.
     """
     rows: list[tuple[int, str, str]] = []
+    slug_column: int | None = None
     for line in md_text.splitlines():
+        heading_cells = _table_cells(line)
+        if any(cell.lower() == _EXPECTED_SLUG_HEADING for cell in heading_cells):
+            slug_column = next(
+                index
+                for index, cell in enumerate(heading_cells)
+                if cell.lower() == _EXPECTED_SLUG_HEADING
+            )
+
         match = _VERDICT_ROW_RE.match(line)
         if match is None:
             continue
-        cells = [cell.strip() for cell in line.split("|")]
-        assert len(cells) >= 6, (
-            f"{source}: verdict row {line!r} has {len(cells)} pipe-separated "
-            f"cells, too few to carry an Expected-slug column (task 3802)."
+        row_id = f"`INV-{match.group(1)}-{match.group(2)}`"
+        assert slug_column is not None, (
+            f"{source}: verdict row {row_id} appears before any table header "
+            f"naming an `Expected slug` column (task 3802). This guard resolves "
+            f"that column from the header of the table the row sits in, so a "
+            f"headerless table would have to be read positionally — which "
+            f"silently compares the wrong column when a table's layout differs."
         )
-        slug_match = _BACKTICKED_SLUG_RE.match(cells[4])
+        cells = _table_cells(line)
+        assert len(cells) > slug_column, (
+            f"{source}: verdict row {line!r} has {len(cells)} pipe-separated "
+            f"cells, too few to carry the Expected-slug column its table's "
+            f"header puts at index {slug_column} (task 3802)."
+        )
+        slug_match = _BACKTICKED_SLUG_RE.match(cells[slug_column])
         assert slug_match is not None, (
-            f"{source}: the Expected-slug cell of verdict row "
-            f"`INV-{match.group(1)}-{match.group(2)}` is {cells[4]!r}, not a "
-            f"backticked slug (task 3802). That column is the one this guard "
-            f"compares against the normative family, so an unreadable cell must "
-            f"fail loudly rather than compare as None."
+            f"{source}: the Expected-slug cell of verdict row {row_id} is "
+            f"{cells[slug_column]!r}, not a backticked slug (task 3802). That "
+            f"column is the one this guard compares against the normative "
+            f"family, so an unreadable cell must fail loudly rather than compare "
+            f"as None."
         )
         rows.append((int(match.group(1)), match.group(2), slug_match.group(1)))
 
@@ -365,7 +413,9 @@ PINNED_SITES = {
         "two independent enumerations — the family-inventory row (ordered) and "
         "the `inv-trigger-shapes` G7 fallback span (set)"
     ),
-    "CONTRIBUTING.md": ("pinned as an ABSENCE: it must restate NO slug at all"),
+    "CONTRIBUTING.md": (
+        "pinned as an ABSENCE: at most one by-name citation, never a restatement"
+    ),
 }
 
 # Four distinct slugs is an enumeration, not a discussion. Below it sit the docs
@@ -375,16 +425,29 @@ PINNED_SITES = {
 # readers to register files to silence the guard.
 _ENUMERATION_THRESHOLD = 4
 
-_SCAN_ROOTS = ("*.md", "docs/legibility/**/*.md", "skills/**/*.md")
-
-# Point-in-time record trees. Their PRDs and capability manifests transcribe
-# slugs as G7 walk records of the family AS IT WAS, and must not be retro-edited
-# when it changes (a scan measured fourteen such files at 5-7 slugs each). The
-# filter is applied to the scan result rather than assumed from the roots above,
-# so widening a root later cannot silently pull the records back in.
-_EXCLUDED_TREES = ("plans", "docs/prds")
+# EVERY markdown file in the repo, not a hand-listed set of roots. An earlier
+# revision scanned only `*.md`, `docs/legibility/**` and `skills/**` — which left
+# the rest of docs/ and every package tree invisible, so a new enumeration site
+# written into `docs/` or a package README would drift on the next invariant with
+# nothing going red. That is the exact failure this module exists to prevent, so
+# the scan is now repo-wide and the EXCLUSIONS below carry the whole policy.
+_EXCLUDED_TREES = (
+    # Point-in-time record trees. Their PRDs and capability manifests transcribe
+    # slugs as G7 walk records of the family AS IT WAS, and must not be
+    # retro-edited when it changes (a scan measured fourteen such files at 5-7
+    # slugs each). Pinning them would force rewriting history.
+    "plans",
+    "docs/prds",
+)
 
 _EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
+
+# Not repo content: build output and vendored trees. Dot-directories are pruned
+# by name rather than listed, which is what keeps the walk cheap in the main
+# checkout — `.worktrees/` there holds a full copy of the repo per in-flight task
+# (an unpruned `**/*.md` glob over it did not finish in 120s), and `.git`,
+# `.venv`, `.task` and `.pytest_cache` are the same shape of dead weight.
+_PRUNED_DIR_NAMES = frozenset({"node_modules", "__pycache__", "site-packages", "venv"})
 
 
 def _scan_label(path: Path) -> str:
@@ -402,17 +465,35 @@ def _scan_label(path: Path) -> str:
 
 
 def _enumeration_scan_files() -> list[Path]:
-    """Every markdown file the registry-completeness scan is responsible for."""
-    found = {
-        path
-        for root in _SCAN_ROOTS
-        for path in REPO_ROOT.glob(root)
-        if path.is_file() and not _in_excluded_tree(path)
-    }
+    """Every markdown file in the repo that the registry is responsible for.
+
+    Walks with ``os.walk`` and PRUNES excluded directories in place rather than
+    globbing everything and filtering the result. The distinction is not cosmetic:
+    ``REPO_ROOT.glob("**/*.md")`` in the main checkout descends into ``.worktrees/``
+    — one full repo copy per in-flight task — and did not finish inside 120s when
+    measured. Pruning keeps the same walk at well under a second there.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        directory = Path(dirpath)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not name.startswith(".")
+            and name not in _PRUNED_DIR_NAMES
+            and not _in_excluded_tree(directory / name)
+        )
+        found.extend(directory / name for name in filenames if name.endswith(".md"))
     return sorted(found)
 
 
 def _in_excluded_tree(path: Path) -> bool:
+    """Is *path* inside one of the point-in-time record trees?
+
+    Compares whole path COMPONENTS, never a string prefix: ``plans-archive/x.md``
+    is not inside ``plans/``, and a substring test would silently stop scanning a
+    tree nobody meant to exclude.
+    """
     parts = path.relative_to(REPO_ROOT).parts
     return any(parts[: len(tree)] == tree for tree in _EXCLUDED_TREE_PARTS)
 
@@ -428,13 +509,13 @@ def unregistered_enumeration_sites(
 
     Loud on an empty scan or an empty family rather than returning ``[]``: an
     empty result is this guard's strongest possible verdict ("every enumeration
-    site is pinned"), and a broken glob or an unparsed family would report it
-    while having compared nothing at all.
+    site is pinned"), and an over-broad prune or an unparsed family would report
+    it while having compared nothing at all.
     """
     assert files, (
         "the enumeration scan received no files to check (task 3802) — an empty "
         "scan returns an empty result, which is indistinguishable from `every "
-        "enumeration site is pinned`. Check the scan roots."
+        "enumeration site is pinned`. Check the walk's prune list."
     )
     assert family, (
         "the enumeration scan received an empty invariant family (task 3802) — "
@@ -690,9 +771,12 @@ def test_fixtures_doc_sections_match_the_normative_family() -> None:
 # marker, not one that exists in any committed doc.
 # ---------------------------------------------------------------------------
 
-# (a) Happy path, modelled on the real gates.md span: the begin marker carries an
-# explanatory comment naming the pinning test, and that comment's own prose sits
-# OUTSIDE the returned span.
+# (a) Happy path. The live gates.md marker is BARE — no explanatory body, so /prd
+# G7 does not Read pytest strategy notes as gate instructions — but the extractor
+# must still tolerate a commented begin marker, because the sibling
+# `lint-command-mirror` block in CONTRIBUTING.md carries one. What this fixture
+# pins is that such a comment's own prose lands OUTSIDE the returned span: it
+# names a test path, out of which a slug-shaped token could be read.
 _SPAN_HAPPY = """\
 Some prose above.
 
@@ -754,13 +838,21 @@ def test_marked_span_returns_only_the_text_between_the_markers() -> None:
     assert "prose above" not in span and "prose below" not in span
 
 
+_FIXTURE_BEGIN_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:begin"
+_FIXTURE_END_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:end -->"
+
+
 @pytest.mark.parametrize(
     ("markdown_text", "case", "expected_phrase"),
     [
-        pytest.param(_SPAN_NO_BEGIN, "missing begin", "begin", id="missing-begin"),
-        pytest.param(_SPAN_NO_END, "missing end", "end", id="missing-end"),
-        pytest.param(_SPAN_DUPLICATE_BEGIN, "duplicate begin", "found 2", id="duplicate-begin"),
-        pytest.param(_SPAN_DUPLICATE_END, "duplicate end", "found 2", id="duplicate-end"),
+        pytest.param(_SPAN_NO_BEGIN, "missing begin", _FIXTURE_BEGIN_MARKER, id="missing-begin"),
+        pytest.param(_SPAN_NO_END, "missing end", _FIXTURE_END_MARKER, id="missing-end"),
+        pytest.param(
+            _SPAN_DUPLICATE_BEGIN, "duplicate begin", _FIXTURE_BEGIN_MARKER, id="duplicate-begin"
+        ),
+        pytest.param(
+            _SPAN_DUPLICATE_END, "duplicate end", _FIXTURE_END_MARKER, id="duplicate-end"
+        ),
         pytest.param(_SPAN_INVERTED, "inverted", "precedes", id="inverted-markers"),
     ],
 )
@@ -773,6 +865,13 @@ def test_marked_span_fails_loudly_on_a_broken_marker(
     feeds by containing no slugs to compare. Duplicated is the same failure one
     level down — silently taking the first span leaves the second copy unpinned
     and free to drift, which is precisely the defect this module exists to catch.
+
+    The four marker cases pin the MARKER LITERAL the message must quote, not a
+    rendered count. Which of begin/end broke is the fact a reader needs in order
+    to go fix the doc; "found 2" is the same message's formatting, and pinning it
+    turns a reword red while leaving a message that dropped the marker name —
+    the part that makes it actionable — green. Inversion keeps a semantic phrase
+    because it is a distinct assertion, not a different input to the same one.
     """
     with pytest.raises(AssertionError) as excinfo:
         marked_span(markdown_text, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
@@ -884,14 +983,22 @@ def test_dark_factory_family_row_ignores_the_reify_row() -> None:
 
 
 @pytest.mark.parametrize(
-    ("markdown_text", "case", "expected_phrase"),
+    ("markdown_text", "case", "expected_matches"),
     [
-        pytest.param(_FAMILY_ROW_ABSENT, "absent", "found 0", id="row-absent"),
-        pytest.param(_FAMILY_ROW_DUPLICATED, "duplicated", "found 2", id="row-duplicated"),
+        pytest.param(_FAMILY_ROW_ABSENT, "absent", [], id="row-absent"),
+        pytest.param(
+            _FAMILY_ROW_DUPLICATED,
+            "duplicated",
+            [
+                "| dark-factory | INV-1..3 — `a-slug`, `b-slug`, `c-slug` |",
+                "| dark-factory | INV-1..2 — `a-slug`, `b-slug` |",
+            ],
+            id="row-duplicated",
+        ),
     ],
 )
 def test_dark_factory_family_row_fails_loudly(
-    markdown_text: str, case: str, expected_phrase: str
+    markdown_text: str, case: str, expected_matches: list[str]
 ) -> None:
     """A missing or duplicated row RAISES — never returns ''.
 
@@ -899,13 +1006,23 @@ def test_dark_factory_family_row_fails_loudly(
     empty-vs-a-real-family at least fails loudly — but empty-vs-empty would not,
     if the family ever failed to parse too). Duplicated means one of the two rows
     is unpinned and free to drift.
+
+    Both cases pin the REPR OF WHAT MATCHED rather than the rendered count. That
+    repr is what makes a duplicate report actionable — it names both offending
+    rows, so the reader can see which is the stale copy — whereas "found 2" is
+    the message's number formatting, red on a reword and green on a message that
+    dropped the rows entirely.
     """
     with pytest.raises(AssertionError) as excinfo:
         dark_factory_family_row(markdown_text)
 
     message = str(excinfo.value)
     assert "gates.md" in message, f"{case}: message must name the doc: {message!r}"
-    assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
+    assert _FAMILY_ROW_PREFIX in message, f"{case}: message must name the row anchor: {message!r}"
+    assert repr(expected_matches) in message, (
+        f"{case}: message must quote the rows it matched, so a reader can see "
+        f"which copy is stale: {message!r}"
+    )
 
 
 def test_gates_family_row_lists_the_whole_family_in_order() -> None:
@@ -918,12 +1035,14 @@ def test_gates_family_row_lists_the_whole_family_in_order() -> None:
     text = GATES_DOC.read_text(encoding="utf-8")
     source = _repo_relative(GATES_DOC)
     row = dark_factory_family_row(text)
+    listed = slugs_in_span(row)
+    canonical = canonical_slugs()
 
-    assert slugs_in_span(row) == canonical_slugs(), (
+    assert listed == canonical, (
         f"{source}: the `| dark-factory |` family-inventory row has drifted from "
         f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
-        f"  row:       {slugs_in_span(row)}\n"
-        f"  normative: {canonical_slugs()}\n"
+        f"  row:       {listed}\n"
+        f"  normative: {canonical}\n"
         f"Update the row to list every slug in canonical INV-1..N order. It is "
         f"illustrative — the doc is normative — but an illustration naming the "
         f"wrong family is worse than none."
@@ -940,6 +1059,14 @@ def test_gates_trigger_shape_list_covers_every_invariant() -> None:
     distinct trigger shapes map to that invariant. An ordered assertion would be
     RED-and-unfixable without rewriting normative gate prose this task is not
     scoped to author.
+
+    That rationale lives HERE rather than beside the marker in gates.md. The
+    ``inv-trigger-shapes:begin`` comment once carried it, which put pytest
+    strategy notes into a file /prd G7 Reads verbatim as gate instructions — an
+    agent executing the screening list would read "pinned as a SET ... one
+    invariant deliberately appears twice" as part of the gate. The marker there
+    is now bare; the delimiter is still needed, because gates.md carries decoy
+    backticked slugs outside both enumerations.
 
     A set still catches the defect this site has actually exhibited twice: an
     invariant added to the normative doc with no trigger shape appended here, so
@@ -980,16 +1107,27 @@ def test_gates_trigger_shape_list_covers_every_invariant() -> None:
 # anti-restatement rule itself.
 # ---------------------------------------------------------------------------
 
+# CONTRIBUTING.md's own bound, tighter than `_ENUMERATION_THRESHOLD` because that
+# doc is where the "single normative copy; don't restate them elsewhere" rule is
+# WRITTEN — a partial list there contradicts its own §6 long before it reaches
+# four slugs. Not zero, though: the rule being mechanized is "don't restate the
+# family", not "never name an invariant", and a single by-name citation is what
+# the rest of the repo does (gates.md discusses `no-lockstep-duplication` in
+# prose, skills/review's phase2-architecture.md names one in a JSON example).
+# An absolute-zero pin would turn the suite red for one correct sentence.
+_CONTRIBUTING_SLUG_BUDGET = 1
+
+
 def test_contributing_does_not_restate_the_invariant_family() -> None:
     """LIVE: CONTRIBUTING.md points at the normative doc instead of copying it.
 
-    ONE assertion — whole-file, zero canonical slugs. CONTRIBUTING.md §6 used to
-    restate all eight, twelve lines above its own rule forbidding restatement.
-    Re-syncing that list would have fixed the contradiction and left the site
-    free to drift again on the next invariant; deleting it means there is nothing
-    left to drift. This is the anti-restatement rule made machine-checkable — it
-    fails the moment anyone re-introduces a copy, which a content-equality pin
-    never would.
+    ONE assertion — whole-file, at most ``_CONTRIBUTING_SLUG_BUDGET`` distinct
+    canonical slugs. CONTRIBUTING.md §6 used to restate all eight, twelve lines
+    above its own rule forbidding restatement. Re-syncing that list would have
+    fixed the contradiction and left the site free to drift again on the next
+    invariant; deleting it means there is nothing left to drift. This is the
+    anti-restatement rule made machine-checkable — it fails the moment anyone
+    re-introduces a copy, which a content-equality pin never would.
 
     Deliberately the ONLY assertion here. Earlier revisions also pinned §6's
     prose (no `<cardinal> invariants` phrase, must contain the normative doc's
@@ -1001,8 +1139,9 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
     source = _repo_relative(CONTRIBUTING_DOC)
 
     restated = [slug for slug in canonical_slugs() if slug in text]
-    assert not restated, (
-        f"{source} restates {len(restated)} invariant slug(s) {restated} (task "
+    assert len(restated) <= _CONTRIBUTING_SLUG_BUDGET, (
+        f"{source} names {len(restated)} invariant slug(s) {restated}, more than "
+        f"the {_CONTRIBUTING_SLUG_BUDGET} a single by-name citation needs (task "
         f"3802). That doc's own §6 says of design-invariants.md: \"it's the "
         f"single normative copy; don't restate them elsewhere\", and the "
         f"normative doc says the same at its head (\"no restatement, per "
@@ -1059,9 +1198,34 @@ _VERDICT_WRONG_SLUG = _VERDICT_HAPPY.replace(
 
 _VERDICT_UNKNOWN_NUMBER = _VERDICT_HAPPY.replace("| `INV-2-CODE` |", "| `INV-9-CODE` |")
 
-_VERDICT_TOO_FEW_COLUMNS = "| `INV-1-PRD` | PRD |\n"
+_VERDICT_HEADER = "| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |\n|---|---|---|---|---|---|\n"
 
-_VERDICT_EMPTY_SLUG_CELL = "| `INV-1-PRD` | PRD | INV-1 a-slug |  | fires | Y |\n"
+_VERDICT_TOO_FEW_COLUMNS = _VERDICT_HEADER + "| `INV-1-PRD` | PRD |\n"
+
+_VERDICT_EMPTY_SLUG_CELL = _VERDICT_HEADER + "| `INV-1-PRD` | PRD | INV-1 a-slug |  | fires | Y |\n"
+
+# A data row with no header above it at all. Read positionally this parses fine
+# and yields a plausible-looking slug — which is exactly why it must not be.
+_VERDICT_NO_HEADER = "| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | fires | Y |\n"
+
+# An addendum table that inserts a `Walk date` column BEFORE `Expected slug`, so
+# the canonical index-4 cell is no longer the slug. This is the drift shape the
+# positional read would have swallowed: index 4 here holds a date, and the guard
+# would either blame the row for being "unreadable" or — with a slug-shaped cell
+# in that position — compare the wrong column and read green.
+_VERDICT_REORDERED_COLUMNS = """\
+| Fixture ID | Shape | Invariant | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|
+| `INV-1-PRD` | PRD | INV-1 a-slug | `a-slug` | G7's list fires | Y |
+| `INV-1-CODE` | CODE | INV-1 a-slug | `a-slug` | Step 5.5 fires | Y |
+
+### Addendum — a later walk that added a column
+
+| Fixture ID | Shape | Invariant | Walk date | Expected slug | Verdict | Match |
+|---|---|---|---|---|---|---|
+| `INV-2-PRD` | PRD | INV-2 b-slug | 2026-08-09 | `b-slug` | G7's list fires | Y |
+| `INV-2-CODE` | CODE | INV-2 b-slug | 2026-08-09 | `b-slug` | Step 5.5 fires | Y |
+"""
 
 
 def test_verdict_table_rows_collects_rows_across_every_table() -> None:
@@ -1074,21 +1238,42 @@ def test_verdict_table_rows_collects_rows_across_every_table() -> None:
     ]
 
 
+def test_verdict_table_rows_resolves_the_slug_column_per_table() -> None:
+    """Each table's Expected-slug column is resolved from ITS OWN header.
+
+    The live doc already splits its rows over three separately-headed tables. A
+    hardcoded column index survives that only for as long as every addendum
+    happens to repeat the same layout; the moment one inserts a column, the
+    positional read silently moves to a different cell. Resolving per header is
+    what makes "which column is the slug" a fact read off the document rather
+    than a constant maintained in this module.
+    """
+    assert verdict_table_rows(_VERDICT_REORDERED_COLUMNS, source=_FIXTURE_SOURCE) == [
+        (1, "PRD", "a-slug"),
+        (1, "CODE", "a-slug"),
+        (2, "PRD", "b-slug"),
+        (2, "CODE", "b-slug"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("markdown_text", "case"),
     [
         pytest.param(_VERDICT_TOO_FEW_COLUMNS, "too few columns", id="short-row"),
         pytest.param(_VERDICT_EMPTY_SLUG_CELL, "empty expected-slug cell", id="empty-slug-cell"),
+        pytest.param(_VERDICT_NO_HEADER, "no header row", id="no-header"),
         pytest.param("no table here at all\n", "no rows", id="no-rows"),
     ],
 )
 def test_verdict_table_rows_fails_loudly(markdown_text: str, case: str) -> None:
-    """A malformed or absent row RAISES rather than yielding ``None`` or ``[]``.
+    """A malformed, headerless or absent row RAISES rather than yielding ``None``.
 
     Yielding ``None`` for an unreadable Expected-slug cell would make the
     slug-equality check below compare ``None`` against a real slug — a red with a
     misleading diagnosis — and an empty row list would make coverage pass
-    vacuously.
+    vacuously. The headerless case is the same hazard one level up: a row with no
+    header above it can only be read positionally, and a positional read of a
+    table whose layout differs compares the wrong column without saying so.
     """
     with pytest.raises(AssertionError) as excinfo:
         verdict_table_rows(markdown_text, source=_FIXTURE_SOURCE)
@@ -1101,23 +1286,41 @@ def test_assert_verdict_table_covers_accepts_a_complete_table() -> None:
 
 
 @pytest.mark.parametrize(
-    ("markdown_text", "case", "expected_phrase"),
+    ("markdown_text", "case", "expected_repr"),
     [
-        pytest.param(_VERDICT_MISSING_CODE, "missing CODE row", "CODE", id="missing-code-row"),
-        pytest.param(_VERDICT_WRONG_SLUG, "wrong expected slug", "a-slug", id="wrong-slug"),
-        pytest.param(_VERDICT_UNKNOWN_NUMBER, "unknown invariant", "9", id="unknown-number"),
+        pytest.param(
+            _VERDICT_MISSING_CODE, "missing CODE row", repr(["PRD"]), id="missing-code-row"
+        ),
+        pytest.param(
+            _VERDICT_WRONG_SLUG,
+            "wrong expected slug",
+            repr((2, "PRD", "a-slug", "b-slug")),
+            id="wrong-slug",
+        ),
+        pytest.param(
+            _VERDICT_UNKNOWN_NUMBER, "unknown invariant", repr([9]), id="unknown-number"
+        ),
     ],
 )
 def test_assert_verdict_table_covers_rejects_drift(
-    markdown_text: str, case: str, expected_phrase: str
+    markdown_text: str, case: str, expected_repr: str
 ) -> None:
-    """Each drift shape the table can develop when the family changes fires."""
+    """Each drift shape the table can develop when the family changes fires.
+
+    Each case asserts the message quotes the REPR OF THE OFFENDING VALUE — the
+    shapes actually found, the mismatched ``(number, shape, cell, canonical)``
+    tuple, the orphan numbers — rather than a phrase of the message's wording.
+    A repr is contractually load-bearing: a reader cannot act on "the table has
+    drifted" without being told which row, so a message that stopped carrying it
+    would have genuinely regressed. Pinning wording instead makes an editorial
+    reword red while a message degraded to uselessness stays green.
+    """
     with pytest.raises(AssertionError) as excinfo:
         assert_verdict_table_covers(markdown_text, _SMALL_FAMILY, source=_FIXTURE_SOURCE)
 
     message = str(excinfo.value)
     assert _FIXTURE_SOURCE in message, f"{case}: {message!r}"
-    assert expected_phrase in message, f"{case}: message must quote the defect: {message!r}"
+    assert expected_repr in message, f"{case}: message must quote the offending value: {message!r}"
 
 
 def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
@@ -1142,19 +1345,52 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
 #
 # A drift guard whose site list is hand-maintained reproduces the exact defect it
 # exists to prevent: it reads green while a newly created enumeration site sits
-# unpinned. So `PINNED_SITES` is not trusted — it is checked against a scan. Any
-# markdown under the repo root, docs/legibility/ or skills/ carrying at least
+# unpinned. So `PINNED_SITES` is not trusted — it is checked against a scan of
+# EVERY markdown file in the repo. Any of them carrying at least
 # `_ENUMERATION_THRESHOLD` DISTINCT canonical slugs must be registered.
 #
+# Repo-wide is load-bearing, not thoroughness for its own sake. An earlier
+# revision scanned three roots (`*.md`, `docs/legibility/**`, `skills/**`), which
+# left the rest of docs/ and every package tree unwatched — a new enumeration in
+# a package README would have drifted on the next invariant with nothing red.
+#
 # Registration means "this file's relationship to the family is pinned", NOT
-# "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs,
-# because what is pinned there is the ABSENCE of a restatement.
+# "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs
+# today, because what is pinned there is the ABSENCE of a restatement.
 #
 # plans/ and docs/prds/ are excluded BY DESIGN, not by oversight. Their PRDs and
 # capability manifests transcribe slugs as point-in-time G7 walk records (a scan
 # measured fourteen such files at 5-7 slugs each); those records must NOT be
 # updated when the family changes, so pinning them would force rewriting history.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "excluded", "case"),
+    [
+        pytest.param("plans/some-prd.md", True, "inside an excluded tree", id="excluded-root"),
+        pytest.param("plans", True, "the excluded tree itself", id="excluded-dir"),
+        pytest.param("docs/prds/a-prd.md", True, "a nested excluded tree", id="excluded-nested"),
+        pytest.param("docs/prds", True, "the nested tree itself", id="excluded-nested-dir"),
+        pytest.param("plans-archive/x.md", False, "same prefix, different dir", id="same-prefix"),
+        pytest.param("docs/prdsomething.md", False, "same prefix, a file", id="same-prefix-file"),
+        pytest.param("docs/legibility/x.md", False, "a sibling of an excluded tree", id="sibling"),
+        pytest.param("CONTRIBUTING.md", False, "a repo-root file", id="repo-root"),
+    ],
+)
+def test_in_excluded_tree_matches_whole_path_components(
+    relative_path: str, excluded: bool, case: str
+) -> None:
+    """Exclusion is by path COMPONENT, never by string prefix.
+
+    The distinction has teeth in both directions: a prefix test would exclude a
+    hypothetical ``plans-archive/`` nobody meant to exclude (silently unwatching a
+    whole tree), while a bare basename test would exclude any ``prds`` directory
+    anywhere. Directories are checked as well as files because the scan PRUNES
+    excluded trees during the walk rather than filtering afterwards, so this
+    predicate is called on directory names too.
+    """
+    assert _in_excluded_tree(REPO_ROOT / relative_path) is excluded, case
 
 
 def _write_fixture_site(directory: Path, name: str, slugs: list[str]) -> Path:
@@ -1224,7 +1460,7 @@ def test_unregistered_enumeration_sites_fails_loudly_on_an_empty_scan(tmp_path: 
     """An empty file list RAISES rather than returning ``[]``.
 
     ``[]`` from an empty scan is indistinguishable from "every site is pinned" —
-    a broken glob would report the guard's strongest possible result while
+    an over-broad prune would report the guard's strongest possible result while
     checking nothing at all.
     """
     with pytest.raises(AssertionError) as excinfo:
@@ -1237,17 +1473,23 @@ def test_unregistered_enumeration_sites_fails_loudly_on_an_empty_scan(tmp_path: 
 def test_every_enumeration_site_is_pinned() -> None:
     """LIVE: no markdown file enumerates the family without being registered.
 
+    The scan is repo-wide — every ``*.md`` file, minus the point-in-time record
+    trees and non-content directories — so the claim in this docstring is the
+    claim the code checks. It used to cover three hand-listed roots while
+    promising the strong form, which left a new enumeration in `docs/` or a
+    package README free to drift with nothing red.
+
     This is the assertion that keeps `PINNED_SITES` honest. Without it the
     registry would be one more hand-maintained enumeration — the very shape this
     module exists to mechanize — and a newly written site could enumerate the
     family, drift on the next invariant, and never turn anything red.
 
     The scan is asserted NON-VACUOUS in two independent ways before its result is
-    trusted: every registered site must actually be reachable by the globs (a
-    typo'd root or a moved doc is otherwise silently unpinned), and the normative
-    doc itself must clear the threshold (it defines every slug, so if IT does not
-    register as an enumeration the reader, the slug family, or the threshold is
-    broken).
+    trusted: every registered site must actually be reachable by the walk (a
+    moved doc or an over-broad prune is otherwise silently unpinned), and the
+    normative doc itself must clear the threshold (it defines every slug, so if
+    IT does not register as an enumeration the reader, the slug family, or the
+    threshold is broken).
     """
     family = canonical_family()
     scanned = _enumeration_scan_files()
@@ -1255,19 +1497,29 @@ def test_every_enumeration_site_is_pinned() -> None:
     missing = sorted(site for site in PINNED_SITES if REPO_ROOT / site not in scanned)
     assert not missing, (
         f"registered site(s) {missing} are not reachable by the enumeration scan "
-        f"(task 3802). Either the file moved — update PINNED_SITES — or the scan "
-        f"roots {sorted(_SCAN_ROOTS)} no longer cover it, in which case a whole "
-        f"tree of sites is unpinned and this guard is reading green over nothing."
+        f"(task 3802). Either the file moved — update PINNED_SITES — or the walk "
+        f"now prunes it (excluded trees {sorted(_EXCLUDED_TREES)}, directory names "
+        f"{sorted(_PRUNED_DIR_NAMES)}, and anything dot-prefixed), in which case a "
+        f"whole tree of sites is unpinned and this guard is reading green over "
+        f"nothing."
     )
 
+    normative_text = NORMATIVE_DOC.read_text(encoding="utf-8")
     assert NORMATIVE_DOC in scanned and (
-        len({slug for _, slug in family if slug in NORMATIVE_DOC.read_text(encoding="utf-8")})
-        >= _ENUMERATION_THRESHOLD
+        len({slug for _, slug in family if slug in normative_text}) >= _ENUMERATION_THRESHOLD
     ), (
         f"{_repo_relative(NORMATIVE_DOC)} defines every slug in the family yet "
         f"does not clear the {_ENUMERATION_THRESHOLD}-slug enumeration threshold "
         f"(task 3802) — the scan cannot detect an enumeration site at all, so its "
         f"empty result below would be vacuous."
+    )
+
+    leaked = sorted(_repo_relative(path) for path in scanned if _in_excluded_tree(path))
+    assert not leaked, (
+        f"the enumeration scan returned {len(leaked)} file(s) from the excluded "
+        f"record trees {sorted(_EXCLUDED_TREES)} (task 3802): {leaked[:5]}. Those "
+        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"so pruning them is the policy, not an optimisation."
     )
 
     unregistered = unregistered_enumeration_sites(
