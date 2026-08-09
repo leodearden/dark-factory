@@ -13,7 +13,7 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.judge import Judge, is_phantom_verdict
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 
@@ -727,6 +727,81 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
         result = await judge._call_llm('Evaluate this run.')
 
     assert result == ''
+
+
+# --- is_phantom_verdict tests ---
+
+
+class TestIsPhantomVerdict:
+    """is_phantom_verdict(verdict) — True iff *verdict* is a fabricated
+    stand-in for a review that never happened (built by
+    Judge._parse_verdict's except-block fallback when the judge output
+    could not be parsed), as opposed to a genuine judge finding.
+
+    This step covers only the structured-marker branch
+    (``code == 'unparseable_judge_response'``, the shape written for every
+    run after task 2947 landed). The legacy unmarked shape (pre-2947 rows)
+    is added by a later step.
+    """
+
+    def test_marked_unparseable_finding_is_phantom(self):
+        """Real d741ffe3 / 33581299 / ad861d89 / c7d84e9f shape: severity=serious,
+        one finding carrying the structured code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-marked',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+                'code': 'unparseable_judge_response',
+                'recommendation': (
+                    'This verdict was not a real review — the judge output was '
+                    'unparseable. Investigate the judge LLM/CLI output before '
+                    'trusting subsequent verdicts.'
+                ),
+            }],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_genuine_serious_with_five_findings_and_no_code_is_not_phantom(self):
+        """Real bc9459b8 shape: severity=serious, five substantive findings,
+        none carrying the code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-genuine',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_empty_findings_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-empty-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_ordinary_ok_verdict_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-ok',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
 
 
 # --- Error trend detection tests ---
