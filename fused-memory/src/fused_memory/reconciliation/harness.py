@@ -23,6 +23,7 @@ from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ReconciliationEvent,
@@ -79,8 +80,12 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    is_workflow_live_for_task,
+)
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.orchestrator_detector import orchestrator_started_at
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -3827,28 +3832,34 @@ class ReconciliationHarness:
             else await self._fetch_filtered_task_tree(project_root)
         )
 
-        # Task 2031/2067: {str(task_id): status} and {str(task_id): task_kind} maps
-        # derived from remediation_tree in a single pass, used by the live-workflow
-        # gate below so never-dispatched cited tasks (deferred/done/cancelled) drop
-        # the project-wide orchestrator_live signal instead of being suppressed by
-        # it, and so BLOCKED cited tasks that are deterministic (never acquire a
+        # Task 2031/2067: a {str(task_id): task dict} map derived from
+        # remediation_tree in a single pass, used by the live-workflow gate below
+        # so never-dispatched cited tasks (deferred/done/cancelled) drop the
+        # project-wide orchestrator_live signal instead of being suppressed by it,
+        # and so BLOCKED cited tasks that are deterministic (never acquire a
         # worktree/branch of their own — routed to DeterministicRunner) do too —
-        # which status_by_id alone cannot express since 'blocked' is deliberately
-        # not in ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may
-        # legitimately auto-unblock mid-pipeline). remediation_tree is always a
-        # valid FilteredTaskTree (degrades to empty on fetch failure), so this is
-        # safe. Built together (rather than as two separate comprehensions) so the
-        # two maps are guaranteed key-identical from one iteration of the source
-        # lists.
-        # Coverage caveat: active_tasks is uncapped (deferred/blocked — the cited
-        # cases — always resolve), but done_tasks/cancelled_tasks are capped at
-        # MAX_DONE_TASKS_RETAINED=30 / MAX_CANCELLED_TASKS_RETAINED=15
-        # (task_filter.py). A cited done/cancelled task outside those caps, or one
-        # with an untracked status, is simply absent here and status_by_id.get(tid)
-        # / task_kind_by_id.get(tid) fall back to None below — the pre-2031
-        # status-blind behavior for that one id, not a new failure mode.
-        status_by_id: dict[str, str | None] = {}
-        task_kind_by_id: dict[str, str | None] = {}
+        # which status alone cannot express since 'blocked' is deliberately not in
+        # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+        # auto-unblock mid-pipeline). remediation_tree is always a valid
+        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+        #
+        # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
+        # scalar maps into this one: the gate now also needs `metadata` (for
+        # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
+        # corroboration), which no scalar map can express. Keying the whole dict
+        # subsumes all of them from the same single pass at no extra cost, and
+        # keeps every derived value guaranteed to come from ONE task snapshot.
+        #
+        # Coverage caveat (unchanged, restated for the consolidated map): active_
+        # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
+        # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
+        # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
+        # done/cancelled task outside those caps, or one with an untracked status,
+        # is simply absent here and task_by_id.get(tid) falls back to None below —
+        # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
+        # status-blind, fail-safe-toward-live values for that one id, not a new
+        # failure mode.
+        task_by_id: dict[str, dict] = {}
         for t in (
             list(remediation_tree.active_tasks)
             + list(remediation_tree.done_tasks)
@@ -3856,10 +3867,27 @@ class ReconciliationHarness:
         ):
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
-            tid = str(t.get('id'))
-            status_by_id[tid] = t.get('status')
-            _metadata = t.get('metadata')
-            task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
+            task_by_id[str(t.get('id'))] = t
+
+        # Task 2964: hoist the two per-project corroboration inputs ONCE per
+        # remediation pass, mirroring _render_live_workflow_section's hoist
+        # (reconciliation/stages/task_knowledge_sync.py). Both are constant for
+        # this project_root, and both are wrapped fail-safe → None: a None simply
+        # means that corroborating signal cannot fire (corroboration_for_task
+        # tolerates None inputs and never raises on them), which leaves the gate's
+        # verdict biased toward "not corroborated" — the direction that lets a
+        # stranded escalation through only when nothing at all vouches for the
+        # task. read_scheduler_state already returns an empty skeleton for an
+        # absent/invalid file; orchestrator_started_at returns None for an absent
+        # or unparseable lock.
+        try:
+            _sched_state: dict | None = read_scheduler_state(Path(project_root))
+        except Exception:
+            _sched_state = None
+        try:
+            _orch_started: datetime | None = orchestrator_started_at(project_root)
+        except Exception:
+            _orch_started = None
 
         current_stage_name: str | None = None
 
@@ -4099,11 +4127,11 @@ class ReconciliationHarness:
                         # escalate.  Guard detector errors as not-live (fail toward escalating
                         # rather than toward silencing a genuine stranded-work escalation).
                         # Task 2031: cited tasks in a never-dispatched status
-                        # (deferred/done/cancelled, via status_by_id above) drop the
+                        # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
                         # behind an unrelated live orchestrator still escalates.
                         # Task 2067: extends this to a BLOCKED cited task that is
-                        # deterministic (via task_kind_by_id above) — it never
+                        # deterministic (via task_by_id above) — it never
                         # acquires a worktree/branch of its own, so the bare
                         # orchestrator lock is not task-specific evidence for it
                         # either, and a stranded deterministic deploy still escalates.
@@ -4115,6 +4143,24 @@ class ReconciliationHarness:
                         # loop) still escalates instead of being suppressed
                         # indefinitely. A blocked normal task WITH genuine
                         # per-task evidence is unaffected and still suppresses.
+                        # Task 2964: forwards `corroborated` for IN-PROGRESS cited
+                        # tasks. This consumer previously diverged from the
+                        # render-time Live-Workflow Signals section for exactly the
+                        # killed-but-lingering in-progress shape: a fleet redeploy
+                        # kills the workflow, but the git worktree registration
+                        # lingers and the restarted orchestrator re-acquires the
+                        # project-wide lock, so both signals keep asserting liveness
+                        # with no recent commit. Post-2963 the renderer downgrades
+                        # that to indeterminate and drops the task, while this gate
+                        # still read it as live and silenced the stranded-work
+                        # escalation indefinitely. The fail-safe direction here is
+                        # UNCHANGED: any assembly error, a non-in-progress status,
+                        # or an absent task_by_id entry all leave corroborated=None,
+                        # the detector's gate stays inert, and the escalation is
+                        # still suppressed — this is never a new silencing path.
+                        # Only an explicit corroborated=False (nothing at all
+                        # vouches for the task) now lets a stranded escalation
+                        # through.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -4129,11 +4175,36 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
+                            _task = task_by_id.get(tid)
+                            _metadata = _task.get('metadata') if _task else None
+                            _status = _task.get('status') if _task else None
+                            # In-progress-only, mirroring the renderer's
+                            # `task.get('status') == 'in-progress'` guard so all
+                            # three consumers gate corroboration identically.
+                            corroborated: bool | None = None
+                            if _status == 'in-progress' and _task is not None:
+                                try:
+                                    corroborated = corroboration_for_task(
+                                        _task, tid,
+                                        now=datetime.now(UTC),
+                                        scheduler_state=_sched_state,
+                                        orchestrator_started_at=_orch_started,
+                                    )
+                                except Exception as _corr_exc:
+                                    logger.debug(
+                                        'corroboration_for_task error for task %s; '
+                                        'leaving the gate inert: %s',
+                                        tid, _corr_exc,
+                                    )
                             try:
                                 if is_workflow_live_for_task(
                                     tid, project_root,
-                                    status=status_by_id.get(tid),
-                                    task_kind=task_kind_by_id.get(tid),
+                                    status=_status,
+                                    task_kind=(
+                                        _metadata.get('task_kind')
+                                        if isinstance(_metadata, dict) else None
+                                    ),
+                                    corroborated=corroborated,
                                 ):
                                     any_live = True
                                     break
