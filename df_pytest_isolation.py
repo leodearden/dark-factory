@@ -85,12 +85,13 @@ copies of this harness could only ever be kept in step by a cross-checking
 test (``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` exists for
 exactly that reason).  This module is the one place BOTH already import.
 
-WHICH ROOTDIRS THE LEAK GUARD IS WIRED INTO, and why the rest are deliberately
-not.  Nine conftests import from this module; the two sibling defences above are
-in all nine, while ``_df_no_leaked_drain_processes`` is wired only into the ROOT
-conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
-exactly the two rootdirs that spawn the drain script — and they are the two the
-incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
+deliberately not.  Nine conftests import from this module; the git ceiling and
+the deploy-clock guard are in all nine, while ``_df_no_leaked_drain_processes``
+and task 3799's ``_df_fleet_dir_redirect`` are wired only into the ROOT conftest
+(covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are exactly the
+two rootdirs that spawn the drain script — and they are the two the incident
+came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
 ``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
 as their own pytest sessions from their own venvs, so the root conftest does not
 reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
@@ -1144,3 +1145,79 @@ def assert_synthetic_units(units: Iterable[str], *, where: str) -> None:
         'a monkeypatched subprocess.run instead.',
         pytrace=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Live-fleet isolation (task 3799)
+# ---------------------------------------------------------------------------
+
+_FLEET_DIR_ENV = 'ORCH_FLEET_DIR'
+
+# The machine-global fleet-heartbeat directory.
+#
+# A MACHINE-GLOBAL, CROSS-PROJECT RENDEZVOUS DIRECTORY, not a dark-factory
+# artifact. Measured 2026-08-07 and re-measured 2026-08-09: it holds live
+# heartbeats for SEVEN different projects' orchestrators. It lives under
+# dark-factory/data/ only because dark-factory is the fleet HOST. That is why
+# the bash script's default is absolute while the deploy clock six lines below
+# it is $REPO_DIR-relative — an asymmetry that looks like an oversight and is
+# not, so scripts/restart-all-orchestrators.sh carries the rationale inline and
+# tests/scripts/test_orchestrator_watchdog.py::
+# test_fleet_dir_default_matches_across_tiers pins all four mirrors together.
+#
+# A LITERAL, not an import of drain_check.DEFAULT_FLEET_DIR or
+# orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR: see the module docstring's
+# import constraint (STDLIB + PYTEST ONLY — escalation's venv stubs `shared`),
+# exactly as PROTECTED_DEPLOY_CLOCK_RELPATHS above is a literal for the same
+# reason. The cross-tier pin is what keeps the four copies honest.
+LIVE_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
+    """Point ``ORCH_FLEET_DIR`` at a tmp dir for this whole session (task 3799).
+
+    ``scripts/restart-all-orchestrators.sh:109`` and ``scripts/drain_check.py:32``
+    both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``, defaulting to
+    :data:`LIVE_FLEET_DIR`.  With the var unset — its state in this environment
+    before this fixture — a test-spawned drain gate READS five other projects'
+    LIVE production heartbeats and decides the real fleet's drain state from
+    them.  Nothing about that is visible in a green run.
+
+    A conftest fixture rather than an extra assignment in each spawner, for the
+    reason 3797's clock redirect spells out: the defect class is "a spawner that
+    forgets the env var", so fixing today's spawners leaves the hole open for the
+    next one.  Every spawner — present and future — inherits this for free
+    because each builds its child env from ``dict(os.environ)``.  A per-test or
+    per-call override still WINS, since every spawner applies its own ``env=``
+    last (``scripts/tests/test_restart_all_orchestrators.py``'s ``_run_script``,
+    ``tests/scripts/test_orchestrator_watchdog.py``'s ``_boundary_run_drain_script``).
+    Do not weaken this fixture to make room for one.
+
+    The directory is CREATED and left EMPTY.  That is the correct hermetic
+    default, not a gap: ``drain_check`` classifies a missing heartbeat as
+    ABSENT, which is the script's documented fail-toward-convergence branch, so
+    a spawner that forgets to write its own heartbeats gets a defined, LOCAL
+    answer instead of a reading taken from production.
+
+    SESSION scope for the same two reasons its three sibling defences document —
+    cost (an autouse function-scoped fixture runs once per test across ~90
+    spawning files, times every xdist worker) and coverage (module-/session-scoped
+    fixtures that spawn the script must be covered too, and that is where
+    expensive subprocess setup tends to live).
+
+    Restores the previous value EXACTLY on teardown, POPPING the key when it was
+    absent rather than setting an empty string — an empty ``ORCH_FLEET_DIR`` is
+    not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
+    through to the production path, i.e. be its own bug.
+    """
+    saved = os.environ.get(_FLEET_DIR_ENV)
+    fleet_dir = tmp_path_factory.mktemp('fleet-dir')
+    os.environ[_FLEET_DIR_ENV] = str(fleet_dir)
+    try:
+        yield fleet_dir
+    finally:
+        if saved is None:
+            os.environ.pop(_FLEET_DIR_ENV, None)
+        else:
+            os.environ[_FLEET_DIR_ENV] = saved
