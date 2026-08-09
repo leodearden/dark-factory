@@ -14,7 +14,13 @@ import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import first_success
+from dashboard.data.mcp_fanout import (
+    describe_exc,
+    first_success,
+    log_fanout_failure,
+    note_fanout_success,
+    reset_failure_streaks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,8 +197,16 @@ def _get_session(base_url: str) -> McpSession:
 
 
 def reset_sessions() -> None:
-    """Clear cached sessions (useful in tests)."""
+    """Clear cached sessions and fan-out failure streaks (useful in tests).
+
+    The streak state behind mcp_fanout's transition-only WARNING policy is
+    cleared here too: it is the one hook every session-touching test module
+    already calls, and a leftover streak would silently demote the next test's
+    first WARNING to DEBUG. Note that the per-failure ``invalidate_session``
+    deliberately does NOT clear it — that would defeat the throttling.
+    """
     _sessions.clear()
+    reset_failure_streaks()
 
 
 def invalidate_session(url: str) -> None:
@@ -307,10 +321,14 @@ async def get_queue_stats(
             )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
-            logger.debug('get_queue_stats failed for %s: %s', url, e)
+            # Same transition-only WARNING policy as first_success (task 3871):
+            # this loop visits ALL N urls, so a partial outage used to
+            # under-report queue counts at DEBUG with no journal trace at all.
+            log_fanout_failure('get_queue_stats', url, e)
             invalidate_session(url)
             continue
 
+        note_fanout_success('get_queue_stats', url)
         any_success = True
         for key, val in result.get('counts', {}).items():
             merged_counts[key] = merged_counts.get(key, 0) + (val or 0)
@@ -345,10 +363,13 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
             result = await mcp_tool_call(client, url, 'get_wal_status', {})
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
-            logger.debug('get_wal_status failed for %s: %s', url, e)
+            # Transition-only WARNING, as above — a per-server WAL column can
+            # vanish from the UI badge and, at DEBUG, leave nothing behind.
+            log_fanout_failure('get_wal_status', url, e)
             invalidate_session(url)
-            errors.append(f'{url}: {e}')
+            errors.append(f'{url}: {describe_exc(e)}')
             continue
+        note_fanout_success('get_wal_status', url)
         per_server[url] = result.get('stores') or {}
 
     if not per_server:

@@ -682,6 +682,86 @@ class TestGetQueueStats:
         assert 9001 in handler.ports_seen
 
 
+# ── the hand-rolled per-URL loops obey the same log policy ──────
+
+
+class TestAggregatingLoopsLogFailuresAtWarning:
+    """get_queue_stats / get_wal_status visit ALL N urls, not first-success.
+
+    They are therefore the paths where a *partial* outage silently
+    under-reports — a summed count quietly missing one server's contribution,
+    a WAL column quietly absent — and at DEBUG that left no journal trace at
+    all. They now share mcp_fanout's transition-only WARNING policy (task
+    3871) instead of each hand-rolling its own level.
+    """
+
+    async def test_get_queue_stats_partial_failure_warns_once_per_url(
+        self, two_url_config, caplog,
+    ):
+        from dashboard.data.memory import get_queue_stats
+
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await get_queue_stats(client, two_url_config)
+
+        assert 'offline' not in result, 'the reachable server still aggregates'
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'the one dead server must leave exactly one trace, got {warnings}'
+        )
+        assert 'get_queue_stats' in warnings[0] and '9000' in warnings[0], (
+            f'the warning must name the path and the failing url, got {warnings[0]}'
+        )
+
+    async def test_get_wal_status_partial_failure_warns_once_per_url(
+        self, two_url_config, caplog,
+    ):
+        from dashboard.data.memory import get_wal_status
+
+        handler = _SessionAwareHandler({'stores': {}}, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await get_wal_status(client, two_url_config)
+
+        assert 'offline' not in result, 'the reachable server still reports'
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'the one dead server must leave exactly one trace, got {warnings}'
+        )
+        assert 'get_wal_status' in warnings[0] and '9000' in warnings[0], (
+            f'the warning must name the path and the failing url, got {warnings[0]}'
+        )
+
+    async def test_repeat_failures_do_not_flood(self, two_url_config, caplog):
+        """A sustained partial outage warns once, not once per 2s poll."""
+        from dashboard.data.memory import get_queue_stats
+
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                for _ in range(5):
+                    await get_queue_stats(client, two_url_config)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'five poll cycles against one dead server must warn once, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+
 # ── Malformed responses ─────────────────────────────────────────
 
 

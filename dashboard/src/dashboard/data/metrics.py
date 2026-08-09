@@ -29,7 +29,7 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
-from dashboard.data.mcp_fanout import first_success
+from dashboard.data.mcp_fanout import describe_exc, first_success
 from dashboard.data.memory import (
     get_curator_state,
     get_memory_status,
@@ -80,10 +80,14 @@ async def fan_out_list_tickets(
     If any per-root count saturates at *limit* the server may have clipped the
     real depth — a WARNING is logged so it surfaces in operator logs.
 
-    Per-(url, root) network/decode errors are swallowed at DEBUG level; timeouts
-    surface at WARNING so slow fused-memory instances are visible to operators.
-    Unexpected exception types are logged at WARNING level so programming bugs
-    don't silently vanish into the fan-out loop.
+    Per-(url, root) failures — network, decode, and timeout alike — are
+    reported ONCE, by ``first_success``, under its transition-only WARNING
+    policy (first failure of a streak at WARNING, repeats at DEBUG). Each is
+    normalized to a ``ValueError`` whose message carries the real cause plus
+    the project root, so that single line is diagnostic. The DEBUG ``exc_info``
+    logs here are the traceback detail behind it, not a second report; only the
+    unexpected-exception branch still logs at WARNING itself, because it fires
+    only on a programming bug.
     """
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
@@ -140,35 +144,48 @@ async def fan_out_list_tickets(
                     {**r, 'project_id': project_id} for r in result.get('tickets', [])
                 ]
                 return count, root_tickets
+            # The sentinel ValueErrors below carry the REAL cause in their
+            # message (task 3871): first_success logs one WARNING per failing
+            # URL from that message, so a bare ValueError('http') produced a
+            # content-free "list_tickets failed for <url>: http" line naming no
+            # cause at all. Reporting is left to first_success — logging a
+            # WARNING here too gave one failure two identical-level lines.
             except TimeoutError:
-                logger.warning(
-                    'list_tickets timed out for project_root=%s url=%s after %.1fs',
-                    root_str,
-                    url,
-                    timeout,
-                )
-                raise ValueError('timeout') from None
-            except (httpx.HTTPError, ValueError):
+                raise ValueError(
+                    f'timed out after {timeout:.1f}s (project_root={root_str})'
+                ) from None
+            except (httpx.HTTPError, ValueError) as exc:
+                # DEBUG (not WARNING) and exc_info: this is the traceback
+                # detail behind first_success's operator-facing line, not a
+                # second report of the same failure.
                 logger.debug(
                     'list_tickets failed for %s / %s',
                     url,
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError('http') from None
-            except Exception:
+                raise ValueError(
+                    f'{describe_exc(exc)} (project_root={root_str})'
+                ) from None
+            except Exception as exc:
                 # Also catches a buggy/older MCP server returning a non-dict
                 # (list/None) for list_tickets: result.get(...) above raises
                 # AttributeError, which must be caught HERE (inside the try)
                 # so it is normalized to ValueError and first_success falls
                 # through to the next URL instead of the whole root aborting.
+                #
+                # This branch KEEPS its WARNING (unlike the two above) because
+                # it only fires on a programming bug, where the traceback is
+                # the point and must not be demoted to DEBUG.
                 logger.warning(
                     'list_tickets unexpected error for %s / %s',
                     url,
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError('unexpected') from None
+                raise ValueError(
+                    f'unexpected {describe_exc(exc)} (project_root={root_str})'
+                ) from None
 
         return await first_success(
             config.fused_memory_urls,

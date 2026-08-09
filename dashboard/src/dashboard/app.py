@@ -1064,6 +1064,11 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
         config.fused_memory_urls,
         _call,
         log_label='cancel_ticket',
+        # log_failures=False: _call above already emits a fully-detailed
+        # WARNING per failing URL (pinned by test_api_curator_cancel.py), so
+        # letting first_success report too would give one failure two
+        # identical-level lines. Reported exactly once, at the call site.
+        log_failures=False,
         offline_result=lambda errs: JSONResponse(
             {'error': 'fused_memory_unreachable', 'detail': '; '.join(errs)},
             status_code=502,
@@ -1287,7 +1292,14 @@ async def _scheduler_proxy(
         return JSONResponse(result)
 
     return await first_success(
-        config.fused_memory_urls, _call, log_label=tool_name, offline_result=_sched_fan_out_error,
+        config.fused_memory_urls,
+        _call,
+        log_label=tool_name,
+        # See the cancel_ticket fan-out: _call already logs each failing URL at
+        # WARNING with the same content, so first_success stays quiet here and
+        # the failure is reported exactly once.
+        log_failures=False,
+        offline_result=_sched_fan_out_error,
     )
 
 
