@@ -51,6 +51,42 @@ def _stub_prepare_candidate(mock_curator) -> None:
         )
     mock_curator.curate_batch_prepared = AsyncMock(side_effect=_batch_prepared)
 
+
+async def _poll_ticket_resolved(
+    ticket_store, ticket_id: str, *, timeout: float = 10.0,
+    what: str = 'the ticket',
+):
+    """Bounded wait for the curator worker to terminalise *ticket_id*.
+
+    Replaces the fixed `await asyncio.sleep(0.2)` worker-drain waits this
+    file used to carry (task 3854 deflaked the first site; task 3901 swept
+    the rest). Returns the terminal row verbatim so callers can assert on
+    it without a second `get`.
+
+    Waiting on 'pending' clearing — rather than on the specific expected
+    status — keeps a genuine regression loud: a ticket resolved to the
+    wrong status leaves the poll immediately and trips the caller's status
+    assertion with the real value, instead of burning the whole timeout.
+
+    NOTE: the `task_created` journal event is emitted *after* the terminal
+    write (task_interceptor.py:3812 single path / 4190 batch path), so this
+    is NOT a barrier for journal assertions — pair it with a short second
+    `poll_until` on the emission itself (see the two callers that do).
+
+    The 10s default is deliberately well inside the 60s pytest-timeout
+    (pyproject.toml), whose thread method os._exit(1)s the whole xdist
+    worker — a stuck worker must surface as this AssertionError, not as a
+    timeout that kills unrelated tests.
+    """
+    async def _resolved():
+        row = await ticket_store.get(ticket_id)
+        return row if row is not None and row['status'] != 'pending' else None
+
+    return await poll_until(
+        _resolved, timeout=timeout,
+        message=f'worker did not resolve {what} ({ticket_id})',
+    )
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -624,15 +660,7 @@ async def test_worker_created_path_emits_journal_event(
         # ticket that resolves without emitting the event trips the
         # assertions below immediately instead of burning the whole
         # timeout first.
-        async def _ticket_resolved() -> bool:
-            row = await ticket_store.get(ticket_id)
-            return row is not None and row['status'] != 'pending'
-
-        await poll_until(
-            _ticket_resolved,
-            timeout=10.0,
-            message='worker did not resolve the ticket',
-        )
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
         # SETTLE barrier, not a liveness poll: wait for the task_created count
         # to STOP CHANGING, not merely to become non-zero.  The assertion below
@@ -2600,10 +2628,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         queue = ti._ticket_queues.setdefault(project_id, asyncio.Queue())
         queue.put_nowait(t1)
 
-        async def _ticket_resolved() -> bool:
-            row = await ticket_store.get(t1)
-            return row is not None and row['status'] != 'pending'
-
         try:
             with patch.object(
                 type(ti), '_get_curator',
@@ -2622,10 +2646,8 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 # ticket resolved to 'failed' leaves the poll immediately
                 # and trips the status assertion below with the real
                 # status, instead of burning the whole timeout first.
-                await poll_until(
-                    _ticket_resolved,
-                    timeout=10.0,
-                    message='worker did not resolve the oversize ticket',
+                await _poll_ticket_resolved(
+                    ticket_store, t1, what='the oversize ticket',
                 )
         finally:
             for t in list(ti._worker_tasks.values()):
