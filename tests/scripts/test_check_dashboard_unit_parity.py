@@ -29,6 +29,7 @@ import sys
 import types
 
 import pytest
+from setup_host_sections import run_section, slice_section
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -2318,3 +2319,253 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 
     full = _run_checker(repo, installed)
     assert full.returncode == 1, full.stdout
+
+
+# ---------------------------------------------------------------------------
+# The section-8 PRE-INSTALL gate in setup-host.sh is wired so it can actually
+# stop something
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the CHECKER. This group tests its WIRING — the block
+# in scripts/setup-host.sh section 8 that runs it, decides what its exit status
+# meant, and then installs.
+#
+# The defect these pin: that block believed a bare exit status, and 2 is
+# overloaded three ways — the checker's benign "not yet installed", `python3`
+# refusing to open a missing script, and argparse rejecting an unknown flag. So
+# renaming the checker or one of its flags made the installer print a
+# reassuring "not yet installed in ... (installing below)" and overwrite the
+# units anyway: a gate reporting green because it never ran, which is the exact
+# silent-drift failure the checker exists to catch, reproduced one level up in
+# its own wiring.
+#
+# Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
+# UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
+
+_SECTION_8_START = 'info "Installing dashboard systemd units"'
+_SECTION_8_END = 'ok "Dashboard units installed'
+
+# The argparse-shaped stub: exit 2, usage-shaped stderr, and no
+# [dashboard_unit_parity] report — what renaming a flag would actually produce.
+_USAGE_ERROR_CHECKER = (
+    "import sys\n"
+    "sys.stderr.write('usage: check_dashboard_unit_parity.py [-h] "
+    "[--installed-dir INSTALLED_DIR] [--repo-root REPO_ROOT]\\n"
+    "error: unrecognized arguments: --installed-dir\\n')\n"
+    "sys.exit(2)\n"
+)
+
+
+def _gate_repo(
+    tmp_path: pathlib.Path,
+    mod: types.ModuleType,
+    *,
+    checker_body: str | None = None,
+    with_checker: bool = True,
+) -> pathlib.Path:
+    """_fake_repo plus the scripts/ files the installer slice reads.
+
+    The real checker is copied in (with its sibling systemd_unit_parity import)
+    so the gate drives the real one; only the TREE is fake.
+    """
+    repo = _fake_repo(tmp_path, mod)
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "dashboard.service.template").write_text(
+        (REPO_ROOT / "scripts" / "dashboard.service.template").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    if with_checker:
+        if checker_body is None:
+            for name in ("check_dashboard_unit_parity.py", "systemd_unit_parity.py"):
+                (repo / "scripts" / name).write_text(
+                    (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+        else:
+            (repo / "scripts" / "check_dashboard_unit_parity.py").write_text(
+                checker_body, encoding="utf-8"
+            )
+    return repo
+
+
+def _run_section_8(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    """Run the section-8 slice. UV_PATH is set upstream in the real script."""
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_8_START, _SECTION_8_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra={"UV_PATH": "/usr/bin/uv"},
+    )
+
+
+def _assert_units_installed(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
+    """The install ran: template rendered, both watchdog units copied."""
+    rendered = unit_dir / _DASHBOARD_SERVICE
+    assert rendered.is_file(), f"{_DASHBOARD_SERVICE} was not rendered into {unit_dir}"
+    text = rendered.read_text(encoding="utf-8")
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text, (
+        f"The template placeholders were not substituted:\n{text}"
+    )
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        installed = unit_dir / name
+        assert installed.is_file(), f"{name} was not copied into {unit_dir}"
+        assert installed.read_text(encoding="utf-8") == (
+            repo / "dashboard" / name
+        ).read_text(encoding="utf-8"), f"{name} is not the committed copy"
+
+
+def test_section_8_missing_checker_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 is the checker's benign "not yet installed in $UNIT_DIR (installing
+    below)". If the checker were renamed or moved, python3's own 2 would land
+    in that branch and the operator would be told the host was simply
+    un-provisioned — when in fact nothing was ever checked.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, (
+        "A missing checker was reported as the benign 'not yet installed on "
+        f"this host'.\n{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_usage_error_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error.
+
+    The [dashboard_unit_parity] tag, not the exit code, is what makes a status
+    believable — and the checker puts that tag on EVERY line it emits
+    (test_main_every_emitted_line_carries_the_log_tag), so its absence is
+    conclusive.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_installs_even_when_the_gate_did_not_run(tmp_path: pathlib.Path):
+    """DELIBERATE DIVERGENCE from the orchestrator gate: the install is UNCONDITIONAL.
+
+    The orchestrator gate makes its install opt-in (DF_INSTALL_ORCH_UNITS=1)
+    because there the COMMITTED side is sometimes the wrong one — two committed
+    units name --config paths that do not exist on this host, so copying them
+    would break those orchestrators on their next restart. Every one of those
+    facts inverts here, so this must NOT grow the same switch:
+
+    1. The install IS the remediation path. setup-host.sh says so directly
+       ("the install below is itself the remediation"), and the checker ships
+       no --fix precisely because re-running this installer is how a fix
+       propagates.
+    2. The checker's own report tells the operator to run setup-host.sh
+       (test_main_report_points_at_the_remediation_command). Refusing to
+       install on a bad verdict would close a circular dead end: the checker
+       says "run setup-host.sh", and setup-host.sh answers "I decline, because
+       of what the checker just reported."
+    3. The incident this checker was built around has the INSTALLED side stale,
+       not the committed side. Gating the install would hold that supervision
+       gap open indefinitely.
+
+    So the fix changes only the EPISTEMICS, never the action: the operator
+    stops being told a check passed when none ran. The units still land.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, (
+        "The section-8 install must stay unconditional — see the docstring.\n"
+        f"{result.stdout}"
+    )
+
+
+def test_section_8_reports_parity_and_installs(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "already at parity" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_drift_and_still_installs(tmp_path: pathlib.Path):
+    """Real drift stays a warning naming the report — and the install proceeds.
+
+    The exit-1 wording deliberately says "drift OR unverifiable state", because
+    1 also covers a vanished committed unit and a drop-in override, which the
+    checker words apart. Naming only DRIFT would collapse that distinction.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "drift or unverifiable state" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"Drift is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Path):
+    """The benign branch must survive: a real exit 2 still reads as 'not yet installed'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
