@@ -270,6 +270,83 @@ def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
 
 
 # ---------------------------------------------------------------------------
+# Helper: find the JSX opening tag that contains a given attribute
+# ---------------------------------------------------------------------------
+
+
+def _jsx_open_tag_end(src: str, start: int) -> int:
+    """Return the index of the ``>`` closing the opening tag that begins at ``start``.
+
+    ``-1`` when ``start`` does not begin one.  Quote- and brace-aware, which is
+    the whole point: a ``>`` or ``<`` inside an attribute EXPRESSION
+    (``onClick={() => ...}``, ``aria-label={points > 1 ? ... : ...}``) or inside
+    a string/template literal is an operator, not the end of the tag.
+    """
+    depth = 0  # brace depth inside attribute expressions
+    quote = ''  # active string/template delimiter
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = ''
+        elif c in '"\'`':
+            quote = c
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return -1  # started inside an expression, not at a tag
+        elif depth == 0:
+            if c == '>':
+                return i
+            if c == '<':
+                return -1  # a new tag opened first, so this was not one
+        i += 1
+    return -1
+
+
+def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
+    """Return the text of the single JSX opening tag containing ``needle``.
+
+    ``None`` when ``needle`` is absent or sits outside any opening tag.  Only
+    the FIRST occurrence of ``needle`` is considered; callers pass a unique
+    anchor (a ``data-testid=``).
+
+    WHY A WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``<[^<>]*<needle>[^<>]*>`` — matches an opening tag only while no attribute
+    expression inside it contains a bare ``<`` or ``>``.  That is a documented
+    false-FAILURE trap, not a theoretical one: measured on the shipped
+    drawn-chart tag, adding an ordinary ``onClick={() => onNavigate(m)}`` or
+    ``aria-label={points > 1 ? ... : ...}`` makes the search return ``None``,
+    so the test fails claiming the element is GONE — against behaviourally
+    correct code.  The previous spelling pushed that onto future authors as a
+    style rule ("hoist comparisons into locals"); this walks the tag instead,
+    the way ``_extract_function_body`` and ``_enclosing_function`` already walk
+    braces rather than spanning them.
+
+    Confinement to ONE opening tag is preserved, and is what gives callers
+    their meaning: a mention in a neighbouring element cannot satisfy a check
+    made against the returned text.  Attribute ORDER is not constrained — the
+    tag is taken whole, from its ``<`` to its matching ``>``.
+    """
+    idx = src.find(needle)
+    if idx == -1:
+        return None
+    # Innermost first: the closest tag start before the needle whose span
+    # actually reaches past it.
+    for m in reversed(list(re.finditer(r'<[A-Za-z_$/]', src[:idx]))):
+        end = _jsx_open_tag_end(src, m.start())
+        if end >= idx + len(needle):
+            return src[m.start() : end + 1]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract a module-scope `const <name> = { ... }` / `[ ... ]` literal
 # ---------------------------------------------------------------------------
 
@@ -1851,27 +1928,25 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     #         that element's own opening tag, so the breaks are explained where
     #         they appear (on hover) and not only in the footer below.
     #
-    #         Matched on the WHOLE opening tag — anchored on the testid, taking
-    #         the `[^<>]` runs on BOTH sides — rather than by a directional
-    #         `gaps ... <testid>` window.  A one-sided window would encode JSX
-    #         attribute ORDER, which is not behaviour: reordering to
+    #         Matched on the WHOLE opening tag, taken from its `<` to its
+    #         matching `>` by `_jsx_open_tag_containing`, rather than by a
+    #         directional `gaps ... <testid>` window.  A one-sided window would
+    #         encode JSX attribute ORDER, which is not behaviour: reordering to
     #         `<div style={...} data-testid="..." title={gaps ? ... : span}>`
-    #         renders identically yet would fail a before-the-testid regex.
-    #         `[^<>]` still confines the match to a SINGLE opening tag, so a
-    #         `gaps` mention in a neighbouring element cannot satisfy it — that
-    #         confinement is what gives the assertion its meaning.
-    tag = re.search(r'<[^<>]*data-testid="memory-eval-trend-chart"[^<>]*>', row_body)
+    #         renders identically yet would fail a before-the-testid regex.  The
+    #         walk still confines the match to a SINGLE opening tag, so a `gaps`
+    #         mention in a neighbouring element cannot satisfy it — that
+    #         confinement is what gives the assertion its meaning — but unlike
+    #         the `<[^<>]*...>` span it was spelled with before, it does not
+    #         mistake a `<`/`>` OPERATOR inside an attribute expression for the
+    #         end of the tag (see that helper's docstring for the measurement).
+    tag = _jsx_open_tag_containing(row_body, 'data-testid="memory-eval-trend-chart"')
     assert tag is not None, (
-        'no single opening tag carries `data-testid="memory-eval-trend-chart"`. '
-        'Either the drawn-chart arm is gone entirely — this assertion is also '
-        'the vacuity guard for the one below, which would otherwise pass '
-        'trivially — or an attribute expression inside that opening tag now '
-        'contains a bare `<`/`>` operator (e.g. `title={plotted > 0 ? ...}`), '
-        'which ends the `[^<>]` run early. If it is the latter, hoist the '
-        'comparison into a named local above the JSX, which this file already '
-        'does everywhere else.'
+        'no opening tag carries `data-testid="memory-eval-trend-chart"` — the '
+        'drawn-chart arm is gone. This assertion is also the vacuity guard for '
+        'the one below, which would otherwise pass trivially.'
     )
-    assert re.search(r'\bgaps\b', tag.group(0)), (
+    assert re.search(r'\bgaps\b', tag), (
         'the drawn-chart element does not consume `gaps` in its own opening '
         'tag. The sparkline is drawn with a break at every missing sample; '
         'without the count in that element\'s `title=`, an operator hovering '
