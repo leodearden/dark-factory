@@ -13309,6 +13309,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # zero-output wedge (transcript_turns==0/None).
                     'transcript_turns': result.transcript_turns,
                     'timed_out': result.timed_out,
+                    # Same truthful-reporting principle (task 3639): this flag
+                    # is what actually DECIDES the success verdict for a
+                    # downgraded run (subtype stays 'success' while success
+                    # flips False), yet it appeared in 0 of 3,340
+                    # invocation_end rows — so diagnosing the class required a
+                    # manual transcript dig.  Emitted unconditionally, False
+                    # included: present-and-false is what makes the
+                    # false-positive rate computable from runs.db, since a
+                    # True-only key leaves the denominator unknowable.
+                    'ended_awaiting_background': result.ended_awaiting_background,
                 },
             )
 
