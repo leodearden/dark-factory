@@ -7933,7 +7933,18 @@ def _psi_cpu_some10_or_none() -> float | None:
     try:
         sample = read_psi_sample()
     except Exception:
-        logger.debug('_psi_cpu_some10_or_none: PSI read failed', exc_info=True)
+        # WARN, not DEBUG: ``read_psi_sample`` already fails OPEN via
+        # ``read_ok=False``, so reaching this handler at all means the
+        # telemetry path broke in a way it does not itself model. Swallowing
+        # that at DEBUG is the silent-degradation shape the tree-wide
+        # silent-fallthrough gate exists to catch — the verdict is still
+        # unaffected (INV-1: telemetry may not change a gate's answer), but
+        # the psi column going quietly null must be visible to an operator.
+        logger.warning(
+            '_psi_cpu_some10_or_none: PSI read failed; '
+            'recording psi_cpu_some10=None for this observation',
+            exc_info=True,
+        )
         return None
     return sample.cpu_some10 if sample.read_ok else None
 
