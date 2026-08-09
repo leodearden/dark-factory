@@ -98,6 +98,48 @@ async def interceptor_with_store(taskmaster, event_buffer, ticket_store):
 
 
 # ---------------------------------------------------------------------------
+# _poll_ticket_resolved helper — task 3901
+# ---------------------------------------------------------------------------
+
+
+class TestPollTicketResolvedHelper:
+    """Pins the new ``_poll_ticket_resolved`` module-level helper (task 3901).
+
+    Both tests are fully deterministic — no timing dependence in either
+    direction. Generic ``poll_until`` machinery (truthy-return, timeout
+    raise, awaitable-predicate handling) is already covered by
+    ``TestPollUntil`` in test_fm_helpers.py:787+ (task 2377); these two
+    tests pin only what is new here: the ticket-row predicate and the
+    descriptive failure message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_once_row_is_terminal(self, ticket_store):
+        tid = await ticket_store.submit('p', '{}')
+        await ticket_store.mark_resolved(tid, status='created', task_id='42')
+
+        row = await _poll_ticket_resolved(ticket_store, tid)
+
+        assert row['status'] == 'created', (
+            f'Expected the terminal row to be returned verbatim, got: {row}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_raises_descriptive_assertion_when_row_stays_pending(
+        self, ticket_store,
+    ):
+        tid = await ticket_store.submit('p', '{}')
+
+        with pytest.raises(AssertionError) as exc:
+            await _poll_ticket_resolved(
+                ticket_store, tid, timeout=0.3, what='the never-resolved ticket',
+            )
+
+        assert 'did not resolve' in str(exc.value)
+        assert 'the never-resolved ticket' in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
 # step-21: worker processes a 'create' decision
 # ---------------------------------------------------------------------------
 
