@@ -61,6 +61,31 @@ assert len(TRUNCATED_PREFIX) != 36
 CANONICAL_UUID = 'fccfa232-16fe-404a-880a-8eca32eb974e'
 assert len(CANONICAL_UUID) == 36
 
+# The id shapes both entry points must reject, exercised THROUGH delete_memory
+# rather than only against the predicate. The trailing-newline and hyphenless
+# forms carry the weight: they are exactly what a regex-based reimplementation
+# of the guard would silently re-admit (Python's `$` matches immediately before
+# a trailing newline, so an anchored `^...$` gate applied with `.match()`
+# accepts a canonical id with one appended). Pinning them here is what stops a
+# future refactor of the guard back to a local regex from leaving the whole
+# delete-side suite green.
+_REJECTED_ID_CASES = [
+    (TRUNCATED_PREFIX, 'truncated-prefix'),
+    (CANONICAL_UUID + '\n', 'trailing-newline'),
+    (CANONICAL_UUID.replace('-', ''), 'hyphenless-32-hex'),
+    ('', 'empty'),
+    (None, 'none'),
+]
+REJECTED_IDS = [pytest.param(v, id=label) for v, label in _REJECTED_ID_CASES]
+
+# The MCP set omits None: there, `memory_id=None` means the argument was never
+# supplied, so the earlier "memory_id (or alias id) is required" check answers
+# it first (pinned in test_delete_memory_alias.py). Only the service layer sees
+# None as a value that reached the shape guard.
+REJECTED_IDS_MCP = [
+    pytest.param(v, id=label) for v, label in _REJECTED_ID_CASES if v is not None
+]
+
 
 @pytest.fixture
 def service(mock_config):
@@ -153,14 +178,29 @@ class TestMemoryServiceDeleteMemoryRejectsTruncatedUuid:
             )
         assert TRUNCATED_PREFIX in str(exc_info.value)
 
+    @pytest.mark.parametrize('bad_id', REJECTED_IDS)
     @pytest.mark.asyncio
-    async def test_mem0_store_raises(self, service):
-        """One guard covers BOTH store paths — not two copies that must agree."""
+    async def test_mem0_store_raises(self, service, bad_id):
+        """One guard covers BOTH store paths — not two copies that must agree —
+        and every non-canonical shape, not just the 8-char prefix."""
         with pytest.raises(InputValidationError) as exc_info:
             await service.delete_memory(
-                memory_id=TRUNCATED_PREFIX, store='mem0', project_id='test'
+                memory_id=bad_id, store='mem0', project_id='test'
             )
-        assert TRUNCATED_PREFIX in str(exc_info.value)
+        assert repr(bad_id) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_invalid_store_error_still_wins(self, service):
+        """Precedence matches the MCP boundary — store first, then shape — so an
+        internal caller that got both arguments wrong reads the same diagnosis
+        an agent would, rather than the inverse. The MCP half is pinned by
+        TestDeleteMemoryToolRejectsTruncatedUuid's same-named case."""
+        with pytest.raises(ValueError) as exc_info:
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='redis', project_id='test'
+            )
+        assert not isinstance(exc_info.value, InputValidationError)
+        assert 'redis' in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_graphiti_backend_not_reached(self, service):
@@ -272,16 +312,23 @@ class TestDeleteMemoryToolRejectsTruncatedUuid:
             await mcp_server._tool_manager.call_tool('delete_memory', args)
         )
 
+    @pytest.mark.parametrize('bad_id', REJECTED_IDS_MCP)
     @pytest.mark.asyncio
-    async def test_mem0_truncated_id_returns_validation_error(self, mcp_server):
-        parsed = await self._call(mcp_server)
+    async def test_mem0_truncated_id_returns_validation_error(
+        self, mcp_server, mock_service, bad_id
+    ):
+        parsed = await self._call(mcp_server, memory_id=bad_id)
         assert parsed.get('error_type') == 'ValidationError'
+        assert repr(bad_id) in parsed['error']
+        mock_service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_error_names_the_malformed_id(self, mcp_server):
-        """The signal explicitly requires the malformed id be named."""
+        """The signal explicitly requires the malformed id be named, labelled
+        with the argument the caller actually supplied."""
         parsed = await self._call(mcp_server)
         assert TRUNCATED_PREFIX in parsed['error']
+        assert parsed['error'].startswith('memory_id ')
 
     @pytest.mark.asyncio
     async def test_error_carries_a_hint(self, mcp_server):
@@ -311,7 +358,10 @@ class TestDeleteMemoryToolRejectsTruncatedUuid:
 
     @pytest.mark.asyncio
     async def test_id_alias_cannot_bypass_the_guard(self, mcp_server, mock_service):
-        """The `id` alias resolves to the same value, so it is guarded too."""
+        """The `id` alias resolves to the same value, so it is guarded too — and
+        the error is labelled with the argument the caller supplied. Telling
+        someone who passed `id` that `memory_id` is malformed names a parameter
+        they never sent."""
         parsed = _parse_result(
             await mcp_server._tool_manager.call_tool(
                 'delete_memory',
@@ -320,6 +370,8 @@ class TestDeleteMemoryToolRejectsTruncatedUuid:
         )
         assert parsed.get('error_type') == 'ValidationError'
         assert TRUNCATED_PREFIX in parsed['error']
+        assert parsed['error'].startswith('id ')
+        assert 'memory_id' not in parsed['error']
         mock_service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
