@@ -38,6 +38,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
+from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
@@ -187,6 +188,103 @@ class FakeScheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+
+class FakeMetadataBackend:
+    """Merge-faithful ``metadata`` backend for workflow tests (task 3579).
+
+    Unlike ``FakeScheduler`` — whose ``update_task`` records call arguments and
+    persists nothing — this fake keeps a real ``blob`` and models BOTH:
+
+    - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
+      ``Scheduler.update_task`` resolves (scheduler.py:3793-3799):
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``.
+      ``'merge'`` is shallow last-write-wins (supplied keys overwrite wholesale,
+      omitted keys are preserved), ``'replace'`` is a whole-blob overwrite, and
+      ``'additive'`` is list-union for list values / overwrite otherwise.
+    - the scheduler-side ``metadata.files`` persist that
+      ``handle_blast_radius_expansion(persist_files=...)`` performs via
+      ``Scheduler._persist_files_metadata`` (scheduler.py:6890),
+      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}``.
+
+    It exists so tests can assert on BACKEND STATE rather than merely on call
+    arguments — a whole-blob write that reverts a freshly-persisted
+    ``metadata.files`` is invisible to a call-argument assertion but obvious in
+    ``self.blob``.
+
+    ``update_task`` accepts *metadata* both positionally and as the ``metadata=``
+    keyword on purpose: workflow stamps call it either way, and a signature
+    mismatch would raise ``TypeError`` inside a caller's blanket
+    ``except Exception``, silently leaving the blob untouched.
+
+    Opt-in: wire it into a test's existing ``MagicMock()`` scheduler by
+    rebinding ``update_task`` / ``handle_blast_radius_expansion`` / ``get_task``.
+    ``FakeScheduler`` is deliberately NOT changed — it has ~20 importers and
+    ``test_workflow_dry_run_hook.py`` pins that passing ``metadata_mode`` to it
+    raises ``TypeError``.
+    """
+
+    def __init__(self, initial: dict | None = None):
+        self.blob: dict = dict(initial or {})
+        self.update_task_calls: list[dict] = []
+        self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
+        self.blast_radius_result: bool = True
+
+    async def update_task(
+        self,
+        task_id: str,
+        metadata: str | dict | None = None,
+        *,
+        append: bool = False,
+        metadata_mode: str | None = None,
+    ) -> bool:
+        self.update_task_calls.append({
+            'task_id': task_id,
+            'metadata': metadata,
+            'append': append,
+            'metadata_mode': metadata_mode,
+        })
+        payload = json.loads(metadata) if isinstance(metadata, str) else (metadata or {})
+        # Mirror Scheduler.update_task's precedence exactly.
+        if metadata_mode is not None:
+            effective = metadata_mode
+        elif append:
+            effective = 'additive'
+        else:
+            effective = 'merge'
+
+        if effective == 'additive':
+            for key, value in payload.items():
+                existing = self.blob.get(key)
+                if isinstance(existing, list) and isinstance(value, list):
+                    self.blob[key] = existing + value
+                else:
+                    self.blob[key] = value
+        elif effective == 'replace':
+            self.blob = dict(payload)
+        else:
+            self.blob = {**self.blob, **payload}
+        return True
+
+    async def handle_blast_radius_expansion(
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = None,
+    ) -> bool:
+        self.blast_radius_calls.append((current, needed, persist_files))
+        if self.blast_radius_result and persist_files is not None:
+            self.blob = {
+                **self.blob,
+                'files': sanitize_files_for_persist(persist_files),
+            }
+        return self.blast_radius_result
+
+    async def get_task(self, task_id: str) -> dict:
+        return {'id': task_id, 'metadata': dict(self.blob)}
 
 
 class FakeBriefing:
