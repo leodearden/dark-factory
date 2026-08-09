@@ -261,7 +261,12 @@ class TestProjectRootAbsoluteness:
             escalation_port: 8103
             cwd_prefixes: [/home/leo/src/dark-factory]
             """)
-        with pytest.raises(ValidationError, match='project_root'):
+        # Matches on 'absolute' — the token that pins the *behavior* under
+        # test — not 'project_root', which pydantic prints in the error
+        # header for ANY project_root-level failure (missing field, wrong
+        # type, ...) and would pass even if this validator were replaced by
+        # an unrelated constraint on the same field.
+        with pytest.raises(ValidationError, match='absolute'):
             mod.load_config(_write(tmp_path, text))
 
     def test_relative_dotdot_project_root_raises(self, tmp_path):
@@ -271,12 +276,79 @@ class TestProjectRootAbsoluteness:
             escalation_port: 8103
             cwd_prefixes: [/home/leo/src/dark-factory]
             """)
-        with pytest.raises(ValidationError, match='project_root'):
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_empty_string_project_root_raises(self, tmp_path):
+        # os.path.isabs('') is False — an accidentally-blanked required
+        # field is the likeliest real-world malformed value, so it must
+        # fail the same way as an explicit relative path rather than
+        # slipping through some falsy-value special case.
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ''
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_tilde_project_root_raises(self, tmp_path):
+        # os.path.isabs('~/src/foo') is False — tilde expansion is NOT
+        # performed before the absoluteness check, so a tilde-prefixed
+        # value is rejected today. Pinned here as a deliberate decision
+        # rather than left as an untested accident.
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: ~/src/foo
+            escalation_port: 8103
+            cwd_prefixes: [/home/leo/src/dark-factory]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
             mod.load_config(_write(tmp_path, text))
 
     def test_absolute_project_root_still_loads(self, tmp_path):
         cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
         assert cfg.project_root == '/home/leo/src/dark-factory'
+
+
+class TestCwdPrefixesAbsoluteness:
+    """Every ``cwd_prefixes`` entry must be an absolute path too —
+    ``inventory.is_member()`` matches each prefix against an absolute
+    session cwd, so a relative entry never matches anything and the
+    sampler/census would silently enumerate an empty corpus rather than
+    failing at config-load time (task 3702 amendment, reviewer suggestion
+    #1: the same silent-degradation defect the project_root check above
+    was added to prevent). ``agent_transcript_roots`` is deliberately
+    project_root-relative and is exercised separately in
+    TestAgentTranscriptRoots — it must stay exempt from this check.
+    """
+
+    def test_single_relative_cwd_prefix_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [.]
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_one_relative_entry_among_absolute_ones_raises(self, tmp_path):
+        text = textwrap.dedent("""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes:
+              - /home/leo/src/dark-factory
+              - src/foo
+            """)
+        with pytest.raises(ValidationError, match='absolute'):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_absolute_cwd_prefixes_still_load(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert cfg.cwd_prefixes == ['/home/leo/src/dark-factory']
 
 
 class TestShippedDarkFactoryConfig:
