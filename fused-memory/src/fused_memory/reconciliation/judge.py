@@ -96,6 +96,39 @@ _JUDGE_CLI_MAX_TURNS = 3
 # rather than from a real verdict construction.
 _VERDICT_PROBE_RUN_ID = '__verdict_schema_probe__'
 
+# Machine-readable marker on a JudgeVerdict finding that identifies the
+# verdict as PHANTOM — a placeholder fabricated by _parse_verdict's except
+# block when the judge's raw output could not be parsed, not a genuine
+# review. One spelling, shared by three production call sites (the stamp in
+# _parse_verdict, review_run's is_parse_failure halt-reason branch, and
+# is_phantom_verdict below) so a reword of the marker can never silently
+# desync the detector from the producer.
+_UNPARSEABLE_VERDICT_CODE = 'unparseable_judge_response'
+
+
+def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
+    """True iff *verdict* is a fabricated stand-in for a review that never
+    happened, not a genuine judge finding.
+
+    A phantom verdict is built by :meth:`Judge._parse_verdict`'s except
+    block when the judge's raw output could not be parsed into a verdict at
+    all — there is no real judge opinion behind it, only a loud, fail-closed
+    placeholder stamped so downstream code does not silently drop the run.
+    This is deliberately NOT the same thing as a genuine verdict whose
+    *content* the judge rated severity=serious: that is a real review
+    outcome and must never be treated as phantom.
+
+    Currently recognises only the structured marker: any row written after
+    task 2947 landed carries ``code == 'unparseable_judge_response'`` on its
+    (sole) finding. ``findings`` is ``list[dict]`` (models/reconciliation.py)
+    but may be deserialized from stored JSON, so each entry is walked
+    defensively rather than assumed to already be a well-formed dict.
+    """
+    return any(
+        isinstance(f, dict) and f.get('code') == _UNPARSEABLE_VERDICT_CODE
+        for f in verdict.findings
+    )
+
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
 """Fired by :meth:`Judge.unhalt` after the halt state is cleared.
@@ -301,7 +334,7 @@ class Judge:
                     # no --json-schema mechanism and so can still return prose
                     # that must be treated fail-closed.
                     is_parse_failure = any(
-                        f.get('code') == 'unparseable_judge_response'
+                        f.get('code') == _UNPARSEABLE_VERDICT_CODE
                         for f in verdict.findings
                     )
                     if is_parse_failure:
@@ -897,7 +930,7 @@ Review this run and provide your verdict as JSON.
                     # via a structured field rather than fragile substring
                     # matching. Kept on this SINGLE finding so len(findings)==1
                     # (the existing loud-not-fabricated test) still holds.
-                    'code': 'unparseable_judge_response',
+                    'code': _UNPARSEABLE_VERDICT_CODE,
                     'recommendation': (
                         'This verdict was not a real review — the judge output was '
                         'unparseable. Investigate the judge LLM/CLI output before '
