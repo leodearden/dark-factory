@@ -179,6 +179,24 @@ class TestForceExitWatchdog:
         on a saturated worker). Using an effectively-unbounded timeout_secs makes
         that gap structurally impossible to exceed rather than merely widening a
         still-tight window, and removes the need for a compensating sleep.
+
+        Synchronisation note (load-bearing, keep this ordering): ``calls`` is
+        mutated by the watchdog thread and read by the main thread, so it is
+        only meaningfully observable after a happens-before edge between the
+        two. ``thread.join()`` is that edge. The join below is therefore NOT
+        cleanup — it MUST run, and its ``is_alive()`` check MUST be asserted,
+        BEFORE the ``calls == []`` assertion. Checking `calls` first would be
+        vacuous: right after `disarm()` the watchdog thread has had no chance
+        to run at all, so `calls` reads `[]` regardless of whether the
+        production guard (`cli.py`'s `fired = not _event.wait(timeout_secs)`)
+        is correct or inverted, letting a real regression go undetected. The
+        join timeout is deliberately generous (30.0s, not the usual 1.0s used
+        for pure cleanup joins elsewhere in this file): once `disarm()` sets
+        the Event the thread wakes in microseconds on the happy path, so the
+        bound is free there, but on a saturated xdist worker a tight bound
+        could itself manufacture a spurious `is_alive()` failure — exactly the
+        load-sensitive flake class this task removes. Do not reorder or
+        shrink this without re-deriving both properties.
         """
         calls: list[int] = []
 
@@ -188,11 +206,13 @@ class TestForceExitWatchdog:
         handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
         handle.disarm()
 
-        assert calls == [], f'expected no calls, got {calls}'
-        handle.thread.join(timeout=1.0)
+        # Synchronisation point FIRST: join before making any claim about
+        # `calls`, which the watchdog thread mutates (see docstring above).
+        handle.thread.join(timeout=30.0)
         assert not handle.thread.is_alive(), (
             'watchdog thread did not exit after disarm'
         )
+        assert calls == [], f'expected no calls, got {calls}'
 
     def test_diagnostic_dump_lists_live_threads(self):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""
