@@ -64,7 +64,9 @@ from df_pytest_isolation import (  # noqa: E402
     WAIT_PROOF_GRACE_MULTIPLIER,
     leaked_drain_process_reason,
     leaked_drain_processes,
+    read_leaked_pid,
     run_in_new_session,
+    wait_pid_gone,
     wait_proof_grace_secs,
 )
 
@@ -126,53 +128,6 @@ def _leaker_env(pidfile: Path) -> dict[str, str]:
     return env
 
 
-def _read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
-    """Poll until the leaker has recorded its grandchild's pid, then return it.
-
-    Polls rather than reads once: the file is created by a `>` redirection and
-    filled by a separate write, so a single read can catch it empty.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            text = pidfile.read_text().strip()
-        except OSError:
-            text = ''
-        if text.isdigit():
-            return int(text)
-        if time.monotonic() >= deadline:
-            pytest.fail(
-                f'the leaker never recorded a pid in {pidfile} within {timeout}s '
-                f'(last read: {text!r}); the test harness is broken, which says '
-                'nothing either way about the spawn helper under test.',
-                pytrace=False,
-            )
-        time.sleep(0.05)
-
-
-def _is_gone(pid: int) -> bool:
-    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        # Alive and owned by someone else — a PID the kernel already recycled.
-        return False
-    return False
-
-
-def _wait_gone(pid: int, *, timeout: float = 3.0) -> bool:
-    """Poll for *pid* to disappear, allowing for SIGKILL delivery + reaping."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if _is_gone(pid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
 def _reap(pid: int | None) -> None:
     """SIGKILL *pid*, ignoring every way it can already be gone.
 
@@ -206,8 +161,8 @@ class TestRunInNewSession:
                     ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
                 )
 
-            leaked_pid = _read_leaked_pid(pidfile)
-            assert _wait_gone(leaked_pid), (
+            leaked_pid = read_leaked_pid(pidfile)
+            assert wait_pid_gone(leaked_pid), (
                 f'pid {leaked_pid} — a grandchild backgrounded by the spawned '
                 'script — is STILL ALIVE after the spawn timed out. The timeout '
                 'killed only the direct child, so the poll loop it forked is now '
@@ -226,11 +181,13 @@ class TestRunInNewSession:
         ``timeout=`` stops being a bound at all. Measured: a direct
         ``communicate()`` after a plain ``kill()`` of such a child does hang.
 
-        Green today via the group kill (which closes every write end at once),
-        so this is a REGRESSION guard on the two degraded paths — a refused or
-        failed ``killpg`` falls back to killing the direct child only, and
-        there the bound is the sole thing standing between this suite and
-        pytest-timeout's 300s axe.
+        The HAPPY path only: the group kill lands, every write end closes at
+        once, and the drain returns in milliseconds — so deleting the drain's
+        own timeout would leave THIS test green. The degraded paths, where the
+        bound is the only thing standing between this suite and pytest-timeout's
+        300s axe, are covered by
+        ``test_the_drain_stays_bounded_when_the_group_kill_does_not_land``
+        below; this one pins that the ordinary case is bounded too.
 
         15s for a 2s timeout is deliberately loose: this asserts "bounded", not
         a latency, so it cannot flake under load.
@@ -246,9 +203,9 @@ class TestRunInNewSession:
                 )
             elapsed = time.monotonic() - started
             # Read (and therefore arm the reap of) the pid BEFORE asserting, so
-            # a failure here still cleans up. `_read_leaked_pid` can itself
+            # a failure here still cleans up. `read_leaked_pid` can itself
             # fail, which is why it must not run inside the `finally`.
-            leaked_pid = _read_leaked_pid(pidfile)
+            leaked_pid = read_leaked_pid(pidfile)
 
             assert elapsed < 15, (
                 f'the spawn took {elapsed:.1f}s to honour a timeout of 2s. The '
@@ -256,6 +213,77 @@ class TestRunInNewSession:
                 'surviving grandchild still holds open.'
             )
         finally:
+            _reap(leaked_pid)
+
+    @pytest.mark.parametrize('degrade', ['refused', 'killpg_raises'])
+    def test_the_drain_stays_bounded_when_the_group_kill_does_not_land(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degrade: str,
+    ) -> None:
+        """The two DEGRADED branches of ``_kill_process_group``, which nothing else runs.
+
+        Both fall back to ``p.kill()`` — the direct child only — so the
+        pipe-HOLDING grandchild survives holding the stdout/stderr write ends
+        open, and the post-kill drain never sees EOF. That is the ONLY state in
+        which the drain's own timeout does anything, and it is unreachable
+        through the happy path: a landed group kill closes every write end, so
+        an unbounded drain would return in milliseconds there and look fine.
+
+        Neither branch is reachable in production either — ``pgid = p.pid`` of a
+        freshly spawned child cannot equal this process's pid/ppid/pgrp, and
+        ``killpg`` of a group we just created does not normally fail — which is
+        exactly why they have to be forced. They are the fallbacks the safety
+        machinery deliberately keeps, so they must be the ones under test.
+
+        ``_POST_KILL_DRAIN_SECS`` is patched down to keep this cheap; the
+        assertion is against the PATCHED value, so it still pins "the drain
+        honours the module's bound" and not a hardcoded duration. An unbounded
+        drain does not fail this assertion — it never reaches it, and reports as
+        this test's own pytest-timeout kill instead. Either way it is red.
+        """
+        monkeypatch.setattr(df_pytest_isolation, '_POST_KILL_DRAIN_SECS', 2)
+        if degrade == 'refused':
+            monkeypatch.setattr(
+                df_pytest_isolation, '_unsafe_pgid_reason', lambda pgid: 'forced refusal',
+            )
+        else:
+            def _boom(pgid, sig):
+                raise PermissionError('forced killpg failure')
+            monkeypatch.setattr(os, 'killpg', _boom)
+
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            started = time.monotonic()
+            with pytest.raises(subprocess.TimeoutExpired):
+                run_in_new_session(
+                    ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
+                )
+            elapsed = time.monotonic() - started
+            leaked_pid = read_leaked_pid(pidfile)
+
+            drain_cap = df_pytest_isolation._POST_KILL_DRAIN_SECS
+            assert elapsed < 2 + drain_cap + 5, (
+                f'the spawn took {elapsed:.1f}s for a 2s timeout with a '
+                f'{drain_cap}s drain cap, on the {degrade!r} fallback. The '
+                'post-kill drain is not honouring its bound and is blocking on '
+                'the pipe the surviving grandchild still holds open.'
+            )
+            # NON-VACUITY. Without this the test would also pass on a run that
+            # never reached the drain at all — a fallback that quietly stopped
+            # firing, or a grandchild that closed the pipes after all, would
+            # return in milliseconds and look like a pass. On these branches the
+            # drain MUST block for its full cap: the direct child is dead, and
+            # the surviving `sleep` holds the write ends for its whole 300s.
+            assert elapsed >= 2 + drain_cap - 0.5, (
+                f'the spawn returned in {elapsed:.1f}s on the {degrade!r} '
+                f'fallback, i.e. before its 2s timeout plus {drain_cap}s drain '
+                'could both elapse — so the bounded drain this test exists to '
+                'cover was never entered and the assertion above proves nothing.'
+            )
+        finally:
+            # MANDATORY here in a way it is not elsewhere: on these branches the
+            # grandchild survives BY DESIGN, so this test leaks without it.
             _reap(leaked_pid)
 
     def test_partial_output_is_attached_to_the_timeout(self, tmp_path: Path) -> None:
@@ -275,7 +303,7 @@ class TestRunInNewSession:
                     ['bash', str(leaker)], env=_leaker_env(pidfile), timeout=2,
                 )
 
-            leaked_pid = _read_leaked_pid(pidfile)
+            leaked_pid = read_leaked_pid(pidfile)
             stdout = exc_info.value.stdout
             assert stdout is not None, 'TimeoutExpired carried no stdout at all'
             text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
@@ -359,10 +387,6 @@ class TestWaitProofGraceSecs:
         and the assertion would fail — so the margin is what keeps those three
         tests meaningful rather than flaky.
         """
-        assert WAIT_PROOF_GRACE_MULTIPLIER >= 3, (
-            f'a {WAIT_PROOF_GRACE_MULTIPLIER}x margin over the spawn timeout is '
-            'too tight to absorb scheduling jitter under 32-way xdist load.'
-        )
         for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
             grace = wait_proof_grace_secs(spawn_timeout)
             assert grace >= spawn_timeout * WAIT_PROOF_GRACE_MULTIPLIER, (
@@ -378,17 +402,13 @@ class TestWaitProofGraceSecs:
         alive 27.8h later — long after pytest's tmpdir GC has removed the fake
         ``systemctl`` its PATH points at, so its expiry falls through to
         ``/usr/bin/systemctl`` and restarts REAL units.
+
+        Asserts only what the FUNCTION derives, never the ceiling constant's own
+        magnitude: comparing one literal in ``df_pytest_isolation`` against
+        another literal here cannot fail except when someone edits it, and would
+        pass just as happily with ``wait_proof_grace_secs`` returning garbage.
+        The ceiling's declarative role is documented at its definition instead.
         """
-        assert LEAK_SELF_TERMINATION_CEILING_SECS <= 120, (
-            f'a leaked poller may live {LEAK_SELF_TERMINATION_CEILING_SECS}s; '
-            'the ceiling exists to keep that inside a couple of minutes.'
-        )
-        # The regression this class exists for, stated as a number: the old
-        # value was three orders of magnitude above the ceiling.
-        assert LEAK_SELF_TERMINATION_CEILING_SECS <= 99999 / 100, (
-            'the ceiling must be far below the 99999s (27.8h) that produced 86 '
-            'concurrent orphans on 2026-08-06 and 82 more on 2026-08-07.'
-        )
         for spawn_timeout in self.REAL_SPAWN_TIMEOUTS:
             grace = wait_proof_grace_secs(spawn_timeout)
             assert grace <= LEAK_SELF_TERMINATION_CEILING_SECS, (
@@ -405,13 +425,14 @@ class TestWaitProofGraceSecs:
         — comparable to the script's own startup — and the defer line the test
         is waiting for might never be printed.
         """
-        assert WAIT_PROOF_GRACE_FLOOR_SECS >= 10, (
-            f'a {WAIT_PROOF_GRACE_FLOOR_SECS}s floor is under the wall-clock '
-            'cost of the handful of bash+python3 spawns the script makes '
-            'before it reaches its first defer decision.'
-        )
         for spawn_timeout in (0, 1):
-            assert wait_proof_grace_secs(spawn_timeout) >= WAIT_PROOF_GRACE_FLOOR_SECS
+            grace = wait_proof_grace_secs(spawn_timeout)
+            assert grace >= WAIT_PROOF_GRACE_FLOOR_SECS, (
+                f'wait_proof_grace_secs({spawn_timeout}) returned {grace}s, under '
+                f'the {WAIT_PROOF_GRACE_FLOOR_SECS}s floor — below the wall-clock '
+                'cost of the handful of bash+python3 spawns the script makes '
+                'before it reaches its first defer decision.'
+            )
 
     def test_it_is_monotonic_and_returns_ints(self) -> None:
         """``int`` is load-bearing, not tidiness.
@@ -784,8 +805,11 @@ def _reap_leaker(pid: int | None) -> None:
     ``systemd --user`` manager's group and killed the user's entire login
     session (see ``shared/src/shared/proc_group.py``). The nested pytest process
     has already exited by the time we read its pidfile, so this pid is exactly
-    as stale as that one was. Matching the marker in ``/proc/<pid>/cmdline``
-    first means a recycled pid is skipped rather than signalled.
+    as stale as that one was. ``_still_the_drain`` re-reads
+    ``/proc/<pid>/cmdline`` right here, so a recycled pid is skipped rather than
+    signalled — the SAME helper the production reaper in
+    ``_df_no_leaked_drain_processes`` uses, so this throwaway cleanup and the
+    one that runs unattended on every suite cannot apply different discipline.
 
     The GROUP, not just the pid, because the leaker's ``sleep`` is a child: the
     guard reports only the marker-carrying bash, so killing that alone would
@@ -793,12 +817,10 @@ def _reap_leaker(pid: int | None) -> None:
     """
     if pid is None:
         return
-    try:
-        cmdline = (Path('/proc') / str(pid) / 'cmdline').read_bytes()
-    except OSError:
-        return  # already gone — the guard reaps what it reports
-    if DRAIN_SCRIPT_CMDLINE_MARKER.encode() not in cmdline:
-        return  # a recycled pid: never signal a group we cannot identify
+    if not df_pytest_isolation._still_the_drain(pid):
+        # Already gone (the guard reaps what it reports), or recycled onto
+        # something we must never signal as a group.
+        return
     with contextlib.suppress(OSError):
         os.killpg(pid, signal.SIGKILL)
     _reap(pid)

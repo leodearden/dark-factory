@@ -28,9 +28,12 @@ import pytest
 # directory. Functions only -- importing one of that module's FIXTURES into a
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
+    PIPE_CLOSING_LEAKER_SRC,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    read_leaked_pid,
     run_in_new_session,
+    wait_pid_gone,
     wait_proof_grace_secs,
 )
 
@@ -238,56 +241,12 @@ def _load_state(state_path):
 # other's test modules, which is the same constraint that forced
 # test_boundary_fake_systemctl_matches_unit_suite_verbatim into existence. What
 # they DO share is the one thing that matters -- a single spawn implementation
-# in df_pytest_isolation.run_in_new_session.
+# in df_pytest_isolation.run_in_new_session, and (since the amendment pass) a
+# single set of probes: PIPE_CLOSING_LEAKER_SRC / read_leaked_pid /
+# wait_pid_gone. Copies of those here and in the mirror were byte-identical
+# under cosmetic renames, which is the same "which of the copies did I fix"
+# hazard one function over from the one the shared spawn exists to close.
 # ---------------------------------------------------------------------------
-
-# PIPE-CLOSING: the background child redirects its stdio away from the pipes it
-# inherited. See the test below for why that redirection is load-bearing.
-_PIPE_CLOSING_LEAKER = '''\
-sleep 300 >/dev/null 2>&1 &
-echo $! > "$LEAK_PIDFILE"
-echo MAIN_UP
-sleep 300
-'''
-
-
-def _read_leaked_pid(pidfile, *, timeout=10.0):
-    """Poll until the leaker records its grandchild's pid, then return it.
-
-    Polls rather than reading once: the file is created by a `>` redirection
-    and filled by a separate write, so a single read can catch it empty.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            text = pidfile.read_text().strip()
-        except OSError:
-            text = ""
-        if text.isdigit():
-            return int(text)
-        if time.monotonic() >= deadline:
-            pytest.fail(
-                f"the leaker never recorded a pid in {pidfile} within {timeout}s "
-                f"(last read: {text!r}); the harness is broken, which says nothing "
-                "either way about process-group containment.",
-                pytrace=False,
-            )
-        time.sleep(0.05)
-
-
-def _wait_gone(pid, *, timeout=3.0):
-    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False  # alive and owned by someone else -- a recycled pid
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
 
 
 def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
@@ -314,7 +273,7 @@ def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch)
     """
     pidfile = tmp_path / "leaked.pid"
     leaker = tmp_path / "leaker.sh"
-    leaker.write_text(_PIPE_CLOSING_LEAKER)
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
     monkeypatch.setattr(sys.modules[__name__], "SCRIPT", leaker)
 
     fleet_dir = tmp_path / "fleet"
@@ -331,8 +290,8 @@ def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch)
                 timeout=2,
             )
 
-        leaked_pid = _read_leaked_pid(pidfile)
-        assert _wait_gone(leaked_pid), (
+        leaked_pid = read_leaked_pid(pidfile)
+        assert wait_pid_gone(leaked_pid), (
             f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
             "script -- is STILL ALIVE after _run_script timed out. The timeout "
             "killed only the direct child, so every poll loop the script forked "
