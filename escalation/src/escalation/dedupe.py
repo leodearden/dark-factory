@@ -17,6 +17,14 @@ Design contracts (see plan.json design_decisions for rationale):
   This keeps the function pure/testable and avoids action-at-a-distance.
 - Cross-task: get_pending() scans all tasks, so infra fan-out (same
   summary from 30 task_ids simultaneously) collapses into a single parent.
+- Cross-LEVEL folding never happens (task 3236): find_dedupe_parent
+  requires parent.level == candidate.level.  The ladder levels have
+  different consumers by contract (L0 → steward, L1 →
+  escalation-watcher-auto, L2 → human), so folding across them would
+  hand the record to the wrong consumer.  Note this is orthogonal to the
+  born-at-L2 dedupe bypass in server._submit_or_dedupe, which is keyed on
+  SEVERITY: a level-1 filing carries severity='blocking' and therefore
+  does route through this matcher.
 """
 
 from __future__ import annotations
@@ -239,6 +247,10 @@ def find_dedupe_parent(
     A parent matches when ALL of the following hold:
     - ``parent.status == 'pending'`` (get_pending() already ensures this).
     - ``parent.category == candidate.category``.
+    - ``parent.level == candidate.level`` — dedupe never folds across ladder
+      levels, because the levels have different consumers by contract (L0 →
+      steward, L1 → escalation-watcher-auto, L2 → human), so folding an L1
+      into an L0 parent would hand the record to the wrong consumer.
     - ``key_fn(parent) == key_fn(candidate)`` where key_fn is resolved from
       ``config.key_fn`` (None → ``_default_summary_key`` wrapping
       ``summary_dedupe_key``).
@@ -284,6 +296,16 @@ def find_dedupe_parent(
         # Category filter — caller already verified candidate_category is in
         # infra_dedupe_categories, so checking equality is sufficient.
         if parent.category != candidate_category:
+            continue
+        # Level filter (task 3236) — dedupe NEVER folds across ladder levels.
+        # Placed alongside the category filter so it short-circuits before the
+        # key computation and the timestamp parse.  The levels have different
+        # consumers by contract (models.py module header: L0 → steward,
+        # L1 → escalation-watcher-auto, L2 → human), so folding an L1 into an
+        # L0 parent hands the record to the wrong consumer.  Concretely: a
+        # steward re-escalating an infra_issue at level=1 would otherwise fold
+        # straight back into the pending level-0 record it was handling.
+        if parent.level != candidate.level:
             continue
         # Key filter using the resolved key function.
         if _key_fn(parent) != candidate_key:
