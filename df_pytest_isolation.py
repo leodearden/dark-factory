@@ -122,6 +122,7 @@ import signal
 import subprocess
 import time
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -1038,3 +1039,108 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic fixture unit names (task 3799)
+# ---------------------------------------------------------------------------
+
+# The one prefix that makes a unit name a FIXTURE name.
+#
+# WHY A POSITIVE ALLOWLIST-BY-SHAPE, and not a denylist of the real installed
+# unit names. A denylist needs its own drift pin against the installed fleet (or
+# against the watchdog's WATCHED table) and goes stale SILENTLY the day an
+# eighth project's orchestrator is added — at which point the guard reports
+# all-clear on the newest and least-reviewed real unit. Nothing a future real
+# project can be named will start with `orchestrator-fake`, so the allowlist
+# needs no drift pin and cannot decay. It also keeps the rule readable at the
+# call site: `assert_synthetic_units(units, where=...)` says what it wants,
+# rather than what it happens to know about today.
+#
+# WHY THE NAMES STILL MATCH THE REAL `orchestrator-*.service` GLOB that
+# `scripts/restart-all-orchestrators.sh` passes to `systemctl list-units`. A
+# fixture name OUTSIDE that glob would make the harness less faithful, not
+# safer: the fake would be answering a question the real binary never gets
+# asked, and the very enumeration the tests exist to exercise would stop being
+# modelled. Containment comes from the name not existing as an installed unit,
+# not from it being unenumerable.
+#
+# Deliberately keeps the bare `orchestrator-fake.service` literal at
+# tests/scripts/test_restart_all_orchestrators.py:34 legal — it predates this
+# task and is the precedent the prefix was chosen around.
+SYNTHETIC_UNIT_PREFIX = 'orchestrator-fake'
+
+
+def synthetic_unit(stem: str) -> str:
+    """Build the fixture unit name for *stem* (``'reify'`` → the fake reify unit).
+
+    THE builder for every fake-``systemctl`` fixture in both test roots, so one
+    vocabulary governs them instead of three ad-hoc conventions. Its output is
+    always accepted by :func:`non_synthetic_unit_names` — a round-trip pinned in
+    ``tests/scripts/test_fleet_dir_isolation.py``, because two symbols encoding
+    one convention is exactly how a convention rots.
+
+    *stem* names what the fixture is STANDING IN FOR (``synthetic_unit('reify')``
+    for a test about the reify orchestrator), so the test still reads as being
+    about that unit while the name it puts on ``PATH`` is inert.
+    """
+    return f'{SYNTHETIC_UNIT_PREFIX}-{stem}.service'
+
+
+def non_synthetic_unit_names(units: Iterable[str]) -> list[str]:
+    """Every entry of *units* that is NOT a synthetic fixture unit name.
+
+    Order and duplicates are PRESERVED as given: the failure message names
+    offenders in the caller's own order, so each one maps straight back to its
+    argument position — which a deduping or sorting helper would break for the
+    multi-unit fixtures (``running_units=[...]``) this exists to check.
+
+    Empty in, empty out; a fixture with no units is not an error.
+    """
+    prefix = SYNTHETIC_UNIT_PREFIX
+    return [unit for unit in units if not str(unit).startswith(prefix)]
+
+
+def assert_synthetic_units(units: Iterable[str], *, where: str) -> None:
+    """Fail loudly unless every entry of *units* is a synthetic fixture name.
+
+    Called at each PATH-shimming construction point — the seam where a unit name
+    is handed to a fake ``systemctl`` that a REAL script subprocess will resolve
+    — so it covers fixtures nobody has written yet and is structurally incapable
+    of touching a contract pin. (``tests/scripts/test_orchestrator_watchdog.py``
+    contains ~40 REAL unit-name literals that assert against real production
+    configuration; a guard that grepped test sources would false-positive on
+    every one of them and could only be silenced by an exclusion list, which is
+    itself the thing that rots.)
+
+    *where* is the caller's own ``<file>::<factory>`` label. It is required and
+    keyword-only because the message is read far from here: a bare "a real unit
+    name was used" leaves the reader grepping five files for the seam that fired.
+
+    ``pytest.fail`` (not ``assert``) raises ``Failed``, a BaseException, so a
+    fixture's own ``except Exception`` cannot swallow it; ``pytrace=False``
+    because the traceback into this module tells the reader nothing the message
+    does not.
+    """
+    offenders = non_synthetic_unit_names(units)
+    if not offenders:
+        return
+    listed = ', '.join(repr(offender) for offender in offenders)
+    pytest.fail(
+        f'{where} was handed REAL orchestrator unit name(s): {listed}.\n'
+        'A fake-systemctl fixture shadows `systemctl` only for as long as its '
+        'tmpdir sits on PATH. A poll loop that outlives the test — task 3798 '
+        'measured orphans surviving 27.8 HOURS, well past pytest tmpdir GC — '
+        'resolves /usr/bin/systemctl instead and issues a REAL restart of '
+        'whatever unit name this fixture handed it.\n'
+        f'Fix: build the name with df_pytest_isolation.synthetic_unit(...), e.g. '
+        f'synthetic_unit(\'reify\') -> {synthetic_unit("reify")!r}. Every name it '
+        f'produces starts with {SYNTHETIC_UNIT_PREFIX!r}, matches the real '
+        "`orchestrator-*.service` glob the script enumerates with, and names no "
+        'installed unit — so the worst case above becomes a no-op.\n'
+        'If this name is a CONTRACT PIN rather than a fixture (asserting against '
+        'real production configuration, as the watchdog WATCHED-table tests do), '
+        'it does not belong at a PATH-shimming seam: assert it in-process against '
+        'a monkeypatched subprocess.run instead.',
+        pytrace=False,
+    )
