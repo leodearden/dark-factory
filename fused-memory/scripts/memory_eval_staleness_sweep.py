@@ -740,6 +740,7 @@ def _disclosure_counts(
     surfacing: SurfacingObservation,
     staleness: StalenessObservation,
     malformed: int,
+    refs: list[PointerRef],
 ) -> dict[str, int]:
     """The narrowings that must ride along INSIDE the machine-readable artifact.
 
@@ -754,12 +755,24 @@ def _disclosure_counts(
     ``supersedes`` edges, and those have different fixes. ``malformed`` splits
     "the target is gone" from "the pointer was never writable", which the
     aggregate also cannot express.
+
+    ``pointer_targets_unique_reads`` counts DISTINCT READABLE targets — one
+    live ``get_memory_by_id`` per unique target, which is exactly the read plan
+    :func:`resolve_pointer_targets` executes. It is deliberately not derived
+    from ``census.examined``/``census.resolved``: those count EDGES (see
+    :func:`dangling_census`, "``examined`` counts POINTERS, not distinct
+    targets"), so a target cited by three sources contributes three to them and
+    one read to the store. An operator reading a read-cost field wants reads,
+    and a field that instead grew with citation density would drift upward as
+    the corpus cross-references itself — a trend leaf α would read off this
+    artifact as real. Unreadable targets are excluded for the same reason
+    :func:`unique_pointer_targets` excludes them: no read is ever issued for
+    one. They stay disclosed under ``pointer_refs_malformed``, so nothing that
+    was visible becomes invisible — it simply stops being counted as a read.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
-        'pointer_targets_unique_reads': len(
-            {ref.target for ref in census.unresolved_refs if isinstance(ref.target, str)},
-        ) + census.resolved,
+        'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
         'surfacing_pairs_observed': len(surfacing.records),
         'task_terminal_entry_task_pairs': len(staleness.records),
     }
@@ -778,6 +791,7 @@ def build_series(
     project_id: str,
     stamp: str,
     *,
+    refs: list[PointerRef],
     eval_id: str = EVAL_ID,
 ):
     """Assemble the M1 metric series for one sweep run.
@@ -785,6 +799,11 @@ def build_series(
     Emits at most the four metrics this leaf owns, in the pinned vocabulary.
     β's ``superseded-above-successor`` and its topic metrics are that leaf's
     and never appear here.
+
+    *refs* is the scan's full ref list, threaded through for the read-cost
+    disclosure alone — no metric is computed from it. It is required rather
+    than defaulted because a caller that forgot it would silently disclose a
+    read plan of zero, and this runner exists to disclose.
 
     The result is validated before it is returned, so an aggregation bug
     surfaces in this runner rather than in leaf α's evaluator — the M1
@@ -844,7 +863,8 @@ def build_series(
 
     counts = dict(corpus_counts)
     disclosures = _disclosure_counts(
-        census, surfacing, staleness, len(malformed_pointer_refs(census.unresolved_refs)),
+        census, surfacing, staleness,
+        len(malformed_pointer_refs(census.unresolved_refs)), refs,
     )
     for key, value in disclosures.items():
         if key in counts:
@@ -1506,6 +1526,7 @@ async def run_sweep(
         corpus_counts=corpus_counts,
         project_id=corpus_project_id(tuple(project_ids)),
         stamp=effective_stamp,
+        refs=refs,
         eval_id=eval_id,
     )
 

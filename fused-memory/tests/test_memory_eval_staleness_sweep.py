@@ -550,6 +550,7 @@ def _multi_cited_inputs():
         'corpus_counts': {},
         'project_id': 'dark_factory',
         'stamp': STAMP,
+        'refs': refs,
     }
 
 
@@ -568,6 +569,7 @@ def _full_inputs():
         'corpus_counts': {'procedural_knowledge': 12},
         'project_id': 'dark_factory',
         'stamp': STAMP,
+        'refs': refs,
     }
 
 
@@ -655,6 +657,7 @@ class TestBuildSeries:
         m = _mod()
         inputs = _full_inputs()
         inputs['census'] = m.dangling_census([], {})
+        inputs['refs'] = []  # a scan that found nothing also planned no reads
         inputs['tripwire_items'] = []
         inputs['surfacing'] = m.EMPTY_SURFACING
         inputs['staleness'] = m.terminal_staleness([], set())
