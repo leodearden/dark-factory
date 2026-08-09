@@ -921,19 +921,31 @@ class TestIsPhantomVerdict:
 # --- Error trend detection tests ---
 
 
-def _make_verdicts(severities: list[str], *, spacing_seconds: float = 60.0):
+def _make_verdicts(
+    severities: list[str],
+    *,
+    spacing_seconds: float = 60.0,
+    findings_by_index: dict[int, list[dict]] | None = None,
+):
     """Build a list of JudgeVerdict objects, oldest first.
 
     Successive verdicts are spaced ``spacing_seconds`` apart so tests exercising
     time-windowed logic have a well-defined ordering.
+
+    ``findings_by_index`` optionally overrides the findings list of specific
+    verdicts by position (e.g. to build a phantom verdict inline). Existing
+    call sites that omit it are unaffected: every verdict still defaults to
+    findings=[], exactly as before this parameter existed.
     """
     from datetime import timedelta as _td
+    findings_by_index = findings_by_index or {}
     base = datetime.now(tz=UTC)
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
             reviewed_at=base + _td(seconds=i * spacing_seconds),
             severity=VerdictSeverity(s),
+            findings=findings_by_index.get(i, []),
         )
         for i, s in enumerate(severities)
     ]
@@ -1061,6 +1073,67 @@ async def test_error_trend_outside_window_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+# --- Error trend detection: phantom-verdict exclusion (task 3070) ---
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_serious_alone_does_not_halt(mock_journal):
+    """Six phantom severity=serious verdicts (a mix of the marked and
+    legacy-unmarked shapes) must NOT halt — a phantom carries no evidence
+    that a review ever happened, so it must not feed either gate.
+
+    Fails on current main: six serious verdicts satisfy both the
+    consecutive-most-recent streak gate (newest three are serious) and the
+    non-ok count gate (6 >= halt_trend_moderate_count=5), so the project
+    halts on evidence that is entirely fabricated.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    marked_finding = {
+        'issue': 'Judge response could not be parsed: boom',
+        'severity': 'serious',
+        'code': 'unparseable_judge_response',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+    legacy_finding = {
+        'issue': (
+            'Judge response could not be parsed: Expecting value: '
+            'line 1 column 1 (char 0)'
+        ),
+        'severity': 'serious',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+    verdicts = _make_verdicts(
+        ['serious'] * 6,
+        findings_by_index={
+            0: [marked_finding],
+            1: [legacy_finding],
+            2: [marked_finding],
+            3: [legacy_finding],
+            4: [marked_finding],
+            5: [legacy_finding],
+        },
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
 
 
 @pytest.mark.asyncio
