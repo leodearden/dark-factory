@@ -92,7 +92,9 @@ def test_finish_startup_seeds_from_an_event_store_attached_after_construction():
     scheduler = _make_scheduler()
     assert scheduler._hold_history.predicted_hold(['orchestrator/src']) is None
 
-    scheduler.event_store = _StubEventStore()  # harness.py:2121-2122
+    # harness.py:2121-2122.  The stub is duck-typed, hence the assignment ignore
+    # (Scheduler.event_store is annotated with the concrete EventStore | None).
+    scheduler.event_store = _StubEventStore()  # type: ignore[assignment]
     scheduler.finish_startup()                 # harness.py:2445
 
     for module, expected in F.EXPECTED_MEDIANS.items():
@@ -104,7 +106,7 @@ def test_finish_startup_seeds_from_an_event_store_attached_after_construction():
 def test_finish_startup_is_idempotent_for_the_seed_too():
     """``finish_startup`` documents itself as idempotent; the seed must be too."""
     scheduler = _make_scheduler()
-    scheduler.event_store = _StubEventStore()
+    scheduler.event_store = _StubEventStore()  # type: ignore[assignment]
 
     scheduler.finish_startup()
     scheduler.finish_startup()

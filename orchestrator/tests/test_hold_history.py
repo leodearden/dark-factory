@@ -844,7 +844,9 @@ def test_seed_is_fail_soft_when_the_store_raises():
 
     history = HoldHistory()
 
-    assert history.seed_from_event_store(_ExplodingStore()) == 0
+    # Duck-typed double: the seed only ever calls fetch_events_by_type_all_runs,
+    # but the parameter is annotated with the concrete store the Scheduler holds.
+    assert history.seed_from_event_store(_ExplodingStore()) == 0  # type: ignore[arg-type]
     assert history.sample_count(['orchestrator/src']) == 0
     assert history.predicted_hold(['orchestrator/src']) is None
 
