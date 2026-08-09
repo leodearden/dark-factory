@@ -330,6 +330,65 @@ async def _metrics_loop(
             logger.warning('Metrics snapshot error', exc_info=True)
 
 
+# ── shared httpx client pool bound (task 3871) ──────────────────────
+#
+# The dashboard shares ONE httpx.AsyncClient across every fan-out (merge_halt,
+# task_runtime, live merge queue, the metrics samplers). Constructed with no
+# `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
+# max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
+#
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds worst-case pool growth and stops
+# the client from racing the server's keep-alive close. It does NOT fix the
+# CLOSE-WAIT accumulation — that diagnosis is owned by the task-3857 re-spec,
+# and nothing here should be read as addressing it.
+#
+# keepalive_expiry is derived from the SMALLER of the two server populations
+# the dashboard talks to, because the smaller one binds:
+#   * escalation MCP servers (one per orchestrator, and the target of most of
+#     the fan-out) are served by uvicorn with NO timeout_keep_alive override
+#     — orchestrator/src/orchestrator/harness.py — and uvicorn's default is 5s.
+#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml),
+#     far looser, so 4.0 clears it comfortably too.
+# httpx's own default is exactly 5.0 — a DEAD TIE with the escalation servers'
+# close, i.e. the client considers a connection reusable at precisely the
+# moment the server may close it. 4.0 buys 1s of margin under that close while
+# staying above the ~3s dashboard poll interval (merge_halt.py names a "3s
+# polling loop"), so a connection still survives one poll cycle rather than
+# reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
+_HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
+
+# Sizing is derived from the config rather than frozen as a constant: the real
+# peak is (projects x concurrent endpoint families), which grows as
+# orchestrators are onboarded. Peak concurrency today is roughly three
+# concurrent families per project — get_merge_halt_status and
+# fetch_live_merge_queues are gathered concurrently over every escalation URL,
+# plus the task_runtime fan-out — with the metrics samplers over
+# fused_memory_urls on top. _HTTP_CONNS_PER_ENDPOINT supplies headroom over
+# that; _HTTP_MIN_CONNECTIONS is a floor so a single-project (or empty) config
+# still gets a workable pool instead of a pathologically small one.
+_HTTP_MIN_CONNECTIONS = 32
+_HTTP_CONNS_PER_ENDPOINT = 4
+
+
+def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
+    """Derive the shared client's connection-pool bound from *config*.
+
+    Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
+    limits, so a helper is the only way to test the sizing without asserting
+    on private internals (``client._transport._pool._max_connections``), which
+    are brittle across httpx versions.
+    """
+    endpoints = len(config.escalation_urls) + len(config.fused_memory_urls)
+    max_connections = max(
+        _HTTP_MIN_CONNECTIONS, _HTTP_CONNS_PER_ENDPOINT * endpoints,
+    )
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=max_connections // 2,
+        keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool.
