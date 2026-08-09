@@ -14,6 +14,22 @@ import subprocess
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent.parent / "restart-orchestrator.sh"
+# A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
+# `orchestrator-fake*` name by task 3799, which audited this whole fake-systemctl
+# family. The name flows SCRIPT -> fake -> assertion, not fixture -> script:
+# restart-orchestrator.sh:30 HARDCODES `SERVICE="orchestrator-dark-factory.service"`
+# with no env override, `_make_fake_systemctl` below takes no unit argument at
+# all, and this constant exists so `test_invokes_systemctl_restart_on_correct_unit`
+# can assert the script targeted the right unit. A synthetic name here would make
+# that test fail (the script still calls the real name) while closing nothing.
+#
+# The residual exposure is real but is NOT closable at this layer: driving the
+# script through a PATH-shimmed fake necessarily puts the real unit name in front
+# of whatever `systemctl` resolves to. Two things bound it — the script is
+# entirely FOREGROUND (no forked poll loop can outlive the test the way task
+# 3798's drain orphans did), and closing it properly means making SERVICE
+# overridable in the production script, which is out of task 3799's scope. Filed
+# as a follow-up; see the escalation on task 3799 before "finishing the job" here.
 UNIT = "orchestrator-dark-factory.service"
 
 FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3

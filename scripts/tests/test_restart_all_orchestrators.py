@@ -29,16 +29,24 @@ import pytest
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
     PIPE_CLOSING_LEAKER_SRC,
+    assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     read_leaked_pid,
     run_in_new_session,
+    synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
-UNIT_R = "orchestrator-reify.service"
+# SYNTHETIC, not the real `orchestrator-reify.service` this used to be (task
+# 3799). The fake systemctl shadows the real one only for as long as its tmpdir
+# sits on PATH; an orphaned poll loop that outlives it -- 27.8h in the worst
+# case measured for task 3798 -- resolves /usr/bin/systemctl and restarts
+# whatever name it was handed. `reify` still names what the fixture stands in
+# for, so the tests below keep reading as being about the reify orchestrator.
+UNIT_R = synthetic_unit("reify")
 
 FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake `systemctl` for testing restart-all-orchestrators.sh.
@@ -172,7 +180,17 @@ def _make_fake_systemctl(tmp_path, *, running_units, units=None):
     """Write a fake multi-unit `systemctl` into <tmp_path>/bin/.
 
     Returns (bin_dir, state_path).
+
+    Every unit name handed in must be SYNTHETIC (task 3799). This is the
+    PATH-shimming seam -- the point where a name starts being answerable by a
+    fake that only shadows `systemctl` while its tmpdir lives -- so checking it
+    here covers every caller, including the ones nobody has written yet. See
+    test_fake_systemctl_rejects_a_real_unit_name for the hazard.
     """
+    assert_synthetic_units(
+        [*running_units, *(units or {})],
+        where="scripts/tests/test_restart_all_orchestrators.py::_make_fake_systemctl",
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "systemctl"
@@ -417,7 +435,10 @@ def test_defer_withholds_restart_while_busy(tmp_path):
         )
 
     stdout = _decode(exc_info.value.stdout)
-    assert "deferring restart of orchestrator-reify.service: mid-merge" in stdout, (
+    # Interpolated, never a second copy of the literal: a hardcoded unit name
+    # here is how the task-3799 rename would silently half-land -- the defer
+    # assertion would just stop matching the name the fixture actually used.
+    assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
         f"expected a stable defer-prefix line; got stdout={stdout!r}"
     )
     state = _load_state(state_path)

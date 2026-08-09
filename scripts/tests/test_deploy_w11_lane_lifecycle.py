@@ -40,6 +40,14 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).parent.parent / "deploy-w11-lane-lifecycle.sh"
+# A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
+# `orchestrator-fake*` name by task 3799, for the same measured reason as
+# scripts/tests/test_restart_orchestrator.py:17 (which carries the full
+# rationale). deploy-w11-lane-lifecycle.sh:206 `exec`s restart-orchestrator.sh,
+# which HARDCODES `SERVICE="orchestrator-dark-factory.service"` at :30 with no
+# env override; `_fake_systemctl` below takes no unit argument. The name flows
+# SCRIPT -> fake -> assertion, so a synthetic constant here would break
+# test_apply_restarts_orchestrator without closing anything.
 UNIT = "orchestrator-dark-factory.service"
 
 # orchestrator/src/orchestrator/lane_lifecycle.py:42 -- directory (a direct

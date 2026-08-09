@@ -32,8 +32,10 @@ if str(REPO_ROOT.resolve()) not in sys.path:
 
 from df_pytest_isolation import (  # noqa: E402
     PIPE_CLOSING_LEAKER_SRC,
+    assert_synthetic_units,
     read_leaked_pid,
     run_in_new_session,
+    synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -3325,7 +3327,18 @@ def _boundary_make_fake_systemctl(base_dir, *, running_units, units=None):
 
     Returns (bin_dir, state_path). parents=True/exist_ok=True so callers may
     pass a not-yet-created base_dir (e.g. a fresh sub-scenario directory).
+
+    Every unit name handed in must be SYNTHETIC (task 3799). This is the
+    PATH-shimming seam -- the point where a name starts being answerable by a
+    fake that only shadows `systemctl` while its tmpdir lives -- so checking it
+    here covers every caller, including the ones nobody has written yet, and
+    cannot touch the in-process contract pins elsewhere in this file. See
+    test_boundary_fake_systemctl_rejects_a_real_unit_name for the hazard.
     """
+    assert_synthetic_units(
+        [*running_units, *(units or {})],
+        where="tests/scripts/test_orchestrator_watchdog.py::_boundary_make_fake_systemctl",
+    )
     bin_dir = base_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     fake = bin_dir / "systemctl"
@@ -3444,7 +3457,7 @@ def test_boundary_run_drain_script_timeout_kills_the_whole_process_group(
     monkeypatch.setattr(sys.modules[__name__], "RESTART_ALL_SCRIPT", leaker)
 
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
     )
@@ -3579,8 +3592,8 @@ def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) ->
     separately.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_a = "orchestrator-alpha.service"
-    unit_b = "orchestrator-bravo.service"
+    unit_a = synthetic_unit("alpha")
+    unit_b = synthetic_unit("bravo")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_a, unit_b],
@@ -3615,8 +3628,8 @@ def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) 
     can never silence the watchdog backstop for a full min-interval window.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_ok = "orchestrator-alpha.service"
-    unit_bad = "orchestrator-bravo.service"
+    unit_ok = synthetic_unit("alpha")
+    unit_bad = synthetic_unit("bravo")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_ok, unit_bad],
@@ -3657,8 +3670,8 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
     other units proceed while R defers.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_idle = "orchestrator-alpha.service"
-    unit_r = "orchestrator-reify.service"
+    unit_idle = synthetic_unit("alpha")
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_idle, unit_r],
@@ -3728,7 +3741,7 @@ def test_boundary5_force_restarts_busy_unit_after_grace(tmp_path: pathlib.Path) 
     makes it crash-safe -- see test_boundary10 below).
     """
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
     )
@@ -3766,7 +3779,7 @@ def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: path
     "unknown" branch drain_check.classify() recognizes.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_absent = "orchestrator-alpha.service"
+    unit_absent = synthetic_unit("alpha")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_absent], units={unit_absent: {"scenario": "fresh"}},
     )
@@ -3789,7 +3802,7 @@ def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: path
 
     # --- stale-heartbeat sub-case: same outcome via the other unknown branch ---
     fleet_dir_2 = tmp_path / "fleet2"
-    unit_stale_hb = "orchestrator-bravo.service"
+    unit_stale_hb = synthetic_unit("bravo")
     bin_dir_2, state_path_2 = _boundary_make_fake_systemctl(
         tmp_path / "run2",
         running_units=[unit_stale_hb], units={unit_stale_hb: {"scenario": "fresh"}},
@@ -4091,7 +4104,7 @@ def test_drain_grace_reprobe_delayed_fresh_unit_verifies_and_stamps_clock(
     show-counter cadence identical to the non-drain reference test.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_r],
