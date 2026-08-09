@@ -7617,6 +7617,133 @@ class TestSweepStaleMem0FlagMarkers:
         assert result == 1
         assert memory_service.get_memories_by_metadata.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_kind_only_members_emit_metadata_drift_warning(self, caplog):
+        """Task 3915 step-8: the union filter now REACHES kind-only,
+        source-less members (root cause C), but the LLM add_memory writer
+        that produces them is still live and unconstrained. Mirroring
+        _warn_on_flag_for_stage2_type_drift's posture (task 2966), the
+        sweep must emit exactly ONE loud, purely-diagnostic WARNING naming
+        the count of under-tagged members and the log_name, so a
+        still-drifting writer surfaces instead of silently refilling the
+        pool the fix just drained. The warning must never affect the
+        sweep's own delete/return behaviour — all three members here are
+        stale and unprotected, so all three must still be deleted."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-both-keys',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'kind-only-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+            {
+                'id': 'kind-only-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't3'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'know_live', run_id='r1', now=fixed_now,
+            )
+
+        # Purely diagnostic: normal age-filter/delete behaviour is unaffected —
+        # all three members are stale and none are protected-mirror records,
+        # so all three are still deleted regardless of the drift warning.
+        assert result == 3
+        assert memory_service.delete_memory.await_count == 3
+
+        drift_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and '_sweep_stale_mem0_flag_markers' in rec.message
+            and 'kind' in rec.message
+            and 'source' in rec.message
+        ]
+        assert len(drift_warnings) == 1, (
+            f'expected exactly one drift WARNING, got: '
+            f'{[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '2' in drift_warnings[0].message
+
+    @pytest.mark.asyncio
+    async def test_all_source_tagged_members_emit_no_drift_warning(self, caplog):
+        """Complementary case (task 3915 step-7): when every enumerated
+        member carries 'source', there is no under-tagged cohort and the
+        drift WARNING must stay silent — the diagnostic must not fire on
+        the canonical, correctly-tagged shape."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'canonical-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'source': 'stage1_flag_marker'} else 0
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 2
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
+
 
 class TestSweepStaleMem0FlagForStage2Markers:
     """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
