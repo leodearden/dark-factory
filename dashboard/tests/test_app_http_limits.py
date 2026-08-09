@@ -44,6 +44,13 @@ _UVICORN_KEEPALIVE_DEFAULT = 5.0
 # and every cycle pays a fresh handshake.
 _DASHBOARD_POLL_INTERVAL = 3.0
 
+# httpx's stock DEFAULT_LIMITS (httpx/_config.py): max_connections=100,
+# max_keepalive_connections=20. Spelled out here rather than read off
+# `httpx.Limits()`, whose no-arg defaults are None — DEFAULT_LIMITS is a
+# separate module constant that httpx does not re-export publicly.
+_HTTPX_STOCK_MAX_CONNECTIONS = 100
+_HTTPX_STOCK_MAX_KEEPALIVE = 20
+
 
 def _config(
     tmp_path: Path, *, escalation: int = 0, fused: int = 0,
@@ -115,6 +122,65 @@ class TestBuildHttpLimits:
             f'floor, got {limits.max_connections}'
         )
 
+    def test_small_install_is_never_tighter_than_httpx_stock(self, tmp_path):
+        """A guard on growth must not become a regression for small installs.
+
+        The derived product lands below httpx's stock 100 for a small fleet,
+        and every open browser tab drives its OWN 2s poll of merge_halt +
+        task_runtime + the live merge queue over every escalation URL — so
+        in-flight demand is (tabs x families x projects), not (families x
+        projects). Sizing below stock would turn contention that previously
+        just queued into httpx.PoolTimeout, which renders as an 'offline' pill
+        on a perfectly healthy orchestrator.
+        """
+        from dashboard.app import _build_http_limits
+
+        stock = _HTTPX_STOCK_MAX_CONNECTIONS
+
+        for kwargs in (
+            {'escalation': 0, 'fused': 0},
+            {'escalation': 1, 'fused': 1},
+            {'escalation': 3, 'fused': 1},  # the reviewer's 3-project install
+        ):
+            limits = _build_http_limits(_config(tmp_path, **kwargs))
+            assert limits.max_connections is not None
+            assert limits.max_connections >= stock, (
+                f'{kwargs} got {limits.max_connections} connections, tighter than '
+                f"httpx's stock {stock} — this change must never shrink the pool "
+                f'below what already shipped'
+            )
+
+    def test_idle_retention_is_held_flat_as_the_fleet_grows(self, tmp_path):
+        """max_keepalive must NOT scale as a fraction of max_connections.
+
+        A ``max_connections // 2`` rule hands a 40-project install 84 idle
+        keepalive slots against httpx's stock 20 — the "guard" would LOOSEN
+        idle retention for exactly the large fleets it is meant to bound, and
+        retention is the dimension the deferred CLOSE-WAIT investigation
+        (task 3857) cares about.
+        """
+        from dashboard.app import _HTTP_MAX_KEEPALIVE_CONNECTIONS, _build_http_limits
+
+        small = _build_http_limits(_config(tmp_path, escalation=1, fused=1))
+        large = _build_http_limits(_config(tmp_path, escalation=40, fused=8))
+
+        assert large.max_connections is not None and small.max_connections is not None
+        assert large.max_connections > small.max_connections, (
+            'concurrency is the dimension that scales with the fleet'
+        )
+        assert large.max_keepalive_connections == small.max_keepalive_connections, (
+            f'idle retention must stay flat as the fleet grows, got '
+            f'{small.max_keepalive_connections} -> {large.max_keepalive_connections}'
+        )
+        assert large.max_keepalive_connections == _HTTP_MAX_KEEPALIVE_CONNECTIONS, (
+            f'idle retention must be capped at the named ceiling '
+            f'({_HTTP_MAX_KEEPALIVE_CONNECTIONS}), got '
+            f'{large.max_keepalive_connections}'
+        )
+        assert _HTTP_MAX_KEEPALIVE_CONNECTIONS == _HTTPX_STOCK_MAX_KEEPALIVE, (
+            "the ceiling is httpx's stock retention, deliberately unchanged"
+        )
+
     def test_keepalive_connections_do_not_exceed_total(self, tmp_path):
         from dashboard.app import _build_http_limits
 
@@ -141,17 +207,48 @@ class TestLifespanWiresTheLimits:
     spelled out in lifespan's own docstring.
     """
 
-    async def test_lifespan_passes_derived_limits_to_the_shared_client(
+    async def test_lifespan_sizes_the_shared_client_from_the_assigned_config(
         self, tmp_path, monkeypatch,
     ):
+        """Assert the SOURCE of the sizing, not just that some sizing happened.
+
+        Comparing the captured kwarg against ``_build_http_limits(
+        DashboardConfig.from_env())`` would compare the helper's output to the
+        helper's output: it proves a ``limits=`` kwarg is passed, but it would
+        still pass if lifespan sized the client from a freshly-constructed
+        config rather than from ``app.state.config``. That ordering invariant
+        ("Config first: the pool bound is DERIVED from it") is the thing worth
+        pinning, so this stubs ``from_env`` to return a config with a
+        distinctive endpoint count and asserts the number derived from THAT.
+        """
+        import dataclasses
         from unittest.mock import AsyncMock, patch
 
         from _dashboard_helpers import apply_isolated_env
         from fastapi import FastAPI
 
-        from dashboard.app import _build_http_limits, lifespan
+        from dashboard.app import (
+            _HTTP_ASSUMED_CONCURRENT_VIEWERS,
+            _HTTP_CONNS_PER_ENDPOINT,
+            _HTTP_MAX_KEEPALIVE_CONNECTIONS,
+            lifespan,
+        )
 
         apply_isolated_env(monkeypatch, tmp_path)
+
+        # A real from_env() config (valid DB paths etc.), re-pointed at a
+        # distinctive 40-orchestrator fleet so the derived number is unique.
+        fleet_config = dataclasses.replace(
+            DashboardConfig.from_env(),
+            escalation_urls={
+                f'proj{i}': f'http://127.0.0.1:{18100 + i}' for i in range(40)
+            },
+            fused_memory_urls=['http://127.0.0.1:18000', 'http://127.0.0.1:18001'],
+        )
+        endpoints = 42
+        expected_max_connections = (
+            _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints
+        )
 
         captured: list[dict] = []
         real_async_client = httpx.AsyncClient
@@ -163,6 +260,10 @@ class TestLifespanWiresTheLimits:
 
         with (
             patch('dashboard.app.httpx.AsyncClient', _recording_async_client),
+            patch(
+                'dashboard.app.DashboardConfig.from_env',
+                return_value=fleet_config,
+            ),
             patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
             patch(
                 'dashboard.app.collect_metrics_snapshot',
@@ -173,12 +274,20 @@ class TestLifespanWiresTheLimits:
                 pass
 
         assert captured, 'lifespan did not construct an httpx.AsyncClient'
-        kwargs = captured[0]
-        expected = _build_http_limits(DashboardConfig.from_env())
-        assert kwargs.get('limits') == expected, (
-            f'lifespan must size the shared client from the config; got '
-            f'limits={kwargs.get("limits")!r}, expected {expected!r}'
+        limits = captured[0].get('limits')
+        assert isinstance(limits, httpx.Limits), (
+            f'lifespan must pass an httpx.Limits, got {limits!r}'
         )
-        assert kwargs.get('follow_redirects') is True, (
+        assert limits.max_connections == expected_max_connections, (
+            f'the pool must be sized from the config lifespan assigned to '
+            f'app.state.config ({endpoints} endpoints -> '
+            f'{expected_max_connections} connections), got '
+            f'{limits.max_connections} — a client sized from a different '
+            f'config, or from a frozen constant, fails here'
+        )
+        assert limits.max_keepalive_connections == _HTTP_MAX_KEEPALIVE_CONNECTIONS, (
+            'idle retention stays capped even for a 40-orchestrator fleet'
+        )
+        assert captured[0].get('follow_redirects') is True, (
             'follow_redirects=True must be preserved alongside the new limits'
         )

@@ -337,10 +337,11 @@ async def _metrics_loop(
 # `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
 # max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
 #
-# THIS IS A GUARD, NOT A LEAK FIX. It bounds worst-case pool growth and stops
-# the client from racing the server's keep-alive close. It does NOT fix the
-# CLOSE-WAIT accumulation — that diagnosis is owned by the task-3857 re-spec,
-# and nothing here should be read as addressing it.
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention and stops
+# the client from racing the server's keep-alive close, while letting the
+# concurrency ceiling track the fleet (see the two-dimensions note below). It
+# does NOT fix the CLOSE-WAIT accumulation — that diagnosis is owned by the
+# task-3857 re-spec, and nothing here should be read as addressing it.
 #
 # keepalive_expiry is derived from the SMALLER of the two server populations
 # the dashboard talks to, because the smaller one binds:
@@ -357,17 +358,42 @@ async def _metrics_loop(
 # reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
 _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 
-# Sizing is derived from the config rather than frozen as a constant: the real
-# peak is (projects x concurrent endpoint families), which grows as
-# orchestrators are onboarded. Peak concurrency today is roughly three
-# concurrent families per project — get_merge_halt_status and
-# fetch_live_merge_queues are gathered concurrently over every escalation URL,
-# plus the task_runtime fan-out — with the metrics samplers over
-# fused_memory_urls on top. _HTTP_CONNS_PER_ENDPOINT supplies headroom over
-# that; _HTTP_MIN_CONNECTIONS is a floor so a single-project (or empty) config
-# still gets a workable pool instead of a pathologically small one.
-_HTTP_MIN_CONNECTIONS = 32
+# TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
+#
+#   * CONCURRENCY (max_connections) SCALES UP with the fleet. The real peak is
+#     (viewers x concurrent endpoint families x projects). Roughly three
+#     families run concurrently per project — get_merge_halt_status and
+#     fetch_live_merge_queues are gathered over every escalation URL, plus the
+#     task_runtime fan-out — with the metrics samplers over fused_memory_urls
+#     on top; _HTTP_CONNS_PER_ENDPOINT rounds that up for headroom.
+#
+#     The multiplier that is easy to miss is the VIEWER count: every open
+#     browser tab drives its OWN 2s poll of all of the above, so in-flight
+#     demand is per-tab, not per-install. _HTTP_ASSUMED_CONCURRENT_VIEWERS
+#     names that assumption instead of leaving it implicit — raise it if the
+#     dashboard is ever put in front of a larger audience.
+#
+#     _HTTP_MIN_CONNECTIONS is deliberately httpx's own stock max_connections:
+#     for a small install the derived product lands below it, and this change
+#     must never make the pool TIGHTER than what already shipped. Sizing below
+#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
+#     now that the per-call budget also bounds pool acquisition, would render
+#     as an "offline" pill on a perfectly healthy orchestrator. (When that
+#     does happen it is diagnosable: mcp_fanout.describe_exc names the
+#     exception type, so 'PoolTimeout' in the log distinguishes local
+#     saturation from a dead endpoint.)
+#
+#   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
+#     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
+#     would hand a 40-project install 84 idle keepalive slots against httpx's
+#     stock 20 — i.e. this "guard" would LOOSEN retention for exactly the
+#     large fleets it is meant to bound, and retention is the dimension the
+#     deferred CLOSE-WAIT investigation (task 3857) cares about. The `// 2`
+#     term stays only as a sanity clamp for tiny pools.
+_HTTP_MIN_CONNECTIONS = 100
 _HTTP_CONNS_PER_ENDPOINT = 4
+_HTTP_ASSUMED_CONCURRENT_VIEWERS = 3
+_HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
 
 
 def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
@@ -380,11 +406,14 @@ def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
     """
     endpoints = len(config.escalation_urls) + len(config.fused_memory_urls)
     max_connections = max(
-        _HTTP_MIN_CONNECTIONS, _HTTP_CONNS_PER_ENDPOINT * endpoints,
+        _HTTP_MIN_CONNECTIONS,
+        _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints,
     )
     return httpx.Limits(
         max_connections=max_connections,
-        max_keepalive_connections=max_connections // 2,
+        max_keepalive_connections=min(
+            max_connections // 2, _HTTP_MAX_KEEPALIVE_CONNECTIONS,
+        ),
         keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     )
 
