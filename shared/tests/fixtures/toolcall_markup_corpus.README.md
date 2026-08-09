@@ -92,8 +92,12 @@ deterministic:
   truncation then drops the middle and leaves a value the corpus's own
   definition would never have picked up. Storing it verbatim is what keeps the
   replay test's predicate re-derivation an honest non-circular check instead of
-  something the extractor has to be exempted from. Hit once in 473 specimens on
-  this snapshot.
+  something the extractor has to be exempted from. This ground was hit once in
+  473 specimens on the 2026-08-08 snapshot and is **not hit at all** on the
+  current one: `repair`'s envelope-free guarantee (below) now declines that
+  whole shape outright, one branch earlier. The check is kept anyway — it does
+  not depend on that guarantee, and a future widening of the collection
+  predicate would make it live again.
 * An **unrepairable** value is stored **verbatim, however long**. Those are
   precisely the specimens a future improvement will be adjudicated against, so
   truncating them would destroy the evidence.
@@ -110,26 +114,61 @@ is non-emptiness.
 | | |
 |---|---|
 | Archive root | `/home/leo/src/dark-factory/data/orchestrator/agent-transcripts` |
-| Snapshot date | 2026-08-08 |
-| Transcript files walked | 5,343 `.jsonl.gz` (nested two directories below the root) |
-| Specimens committed | 473 (deduplicated by `tool_use_id`) |
-| Outcome split | 456 `repaired` / 17 `unrepairable` |
-| Records truncated | 450 (1 repaired record refused truncation, see above) |
-| File size | 385,166 bytes |
+| Snapshot date | 2026-08-09 |
+| Transcript files walked | 5,704 `.jsonl.gz` (nested two directories below the root) |
+| Transcript files unreadable | 0 (skipped and counted, never fatal — see below) |
+| Specimens committed | 504 (deduplicated by `tool_use_id`) |
+| Outcome split | 443 `repaired` / 61 `unrepairable` |
+| Records truncated | 438 (5 repaired records refused truncation, see above) |
+| File size | 494,394 bytes |
 
-For context, the PRD's own reference snapshot (2026-08-05, ~4,400 files) reported
-334 specimens and a 308/26 split. This snapshot is larger because the archive
-grew, and the two are **not** expected to match — which is exactly why neither
-is asserted. The file is likewise larger than the ~0.2 MB the truncation rule
-alone predicts, for three compounding reasons, all of them wanted: 42% more
-specimens than the reference snapshot; the 17 unrepairable values stored
-verbatim; and the `\u003c` escaping, which spends six bytes on every `\x3c` in
-the file.
+**What moved since the 2026-08-08 snapshot, and why.** That snapshot recorded
+473 specimens and a 456/17 split; this one records 504 and 443/61. Two
+independent causes, neither a regression:
+
+* the archive grew (5,343 to 5,704 files), which adds specimens under both
+  outcomes;
+* `repair` gained its envelope-free post-condition, which moves genuinely
+  ambiguous cases out of `repaired`. Measured in isolation, holding the record
+  set fixed at the 473-specimen snapshot: exactly **3** records moved
+  `repaired` to `unrepairable`. The rest of the 17 to 61 shift is the larger
+  archive.
+
+For context, the PRD's own reference snapshot (2026-08-05, ~4,400 files)
+reported 334 specimens and a 308/26 split. None of these three snapshots are
+expected to match, which is exactly why none is asserted. The file is likewise
+larger than the ~0.2 MB the truncation rule alone predicts, for three
+compounding reasons, all of them wanted: 51% more specimens than the reference
+snapshot; the 61 unrepairable values stored verbatim; and the `\u003c` escaping,
+which spends six bytes on every `\x3c` in the file.
 
 The determinism claim is measured, not assumed: two back-to-back full runs
-(5,343 and 5,345 files walked — the archive is written to live) produced
-byte-identical output, md5 `997ef08b5f61a3a4ba58f9953c2bc416`. That is the
+(5,704 and 5,705 files walked — the archive is written to live) produced
+byte-identical output, md5 `c4eeedac7d9ae688d513b24ca62420fe`. That is the
 extractor half of boundary row B13; the replay half is in the test.
+
+## Two properties worth knowing before you read a record
+
+**A `repaired` record's `clean_value` is guaranteed envelope-free.** `repair`
+refuses rather than return a partial repair: if the only mis-close whose tail
+parses would leave an envelope literal sitting in the prefix, the answer is
+`unrepairable`. Contract C2's middleware forwards `clean_value` as the repaired
+argument, so a residual envelope there would re-trip the write-time tripwire
+downstream *and* permanently drop whatever caller arguments were hiding in the
+residue. The replay test checks `detect(clean_value) is None` on every repaired
+record; unlike the machine-generated expectation column, that check is
+non-circular.
+
+**The walk delegates to `legibility.inventory.iter_json_lines`**, the canonical
+streaming transcript reader, which draws a deliberate line between two kinds of
+damage. A corrupt or truncated **line** is skipped silently — every
+fire-and-forget writer eventually produces one, and alarming on it would train
+the reader to ignore the alarm. An unreadable **file** (bad gzip magic, a
+truncated stream, a corrupt body, or a non-UTF-8 byte) is skipped, *counted*,
+logged at `WARNING` with its path, and reported in the run summary. Reading is
+strict UTF-8 on purpose: substituting replacement characters would let corrupt
+bytes into the corpus looking like real harness output. A run in which files
+were found but **none** were readable exits non-zero and writes nothing.
 
 ## Regenerating
 
