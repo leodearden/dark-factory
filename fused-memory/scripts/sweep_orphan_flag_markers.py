@@ -600,11 +600,54 @@ async def run(
     # see TestFlagForStage2IsNeverDeleted for the guard that enforces it, and
     # the module docstring's "Why the flag_for_stage2 pool is censused, never
     # deleted here" section for why that boundary is load-bearing.
-    flag_for_stage2_total = await memory_service.count_memories_by_metadata(
-        project_id=project_id, filters=FLAG_FOR_STAGE2_FILTERS,
-    )
+    # FAIL-SAFE, mirroring task_knowledge_sync._warn_on_flag_for_stage2_type_drift:
+    # any failure degrades this diagnostic to "unknown" and lets the sweep
+    # proceed, rather than letting a census probe abort a run whose real job
+    # is the delete set.
+    flag_for_stage2_total: int | None
     probe_failed = False
-    blind_spot = enumeration_blind_spot(total_source, flag_for_stage2_total)
+    try:
+        probe_result = await memory_service.count_memories_by_metadata(
+            project_id=project_id, filters=FLAG_FOR_STAGE2_FILTERS,
+        )
+    except Exception:
+        logger.warning(
+            'sweep_orphan_flag_markers: flag_for_stage2 census probe failed; '
+            'reporting the adjacent population as unknown (probe_failed=True) '
+            'and continuing the sweep unchanged. NOTE: a failed probe is NOT '
+            'evidence of a clean bill of health — the blind-spot cross-check '
+            'simply could not be taken this run.',
+            exc_info=True,
+        )
+        flag_for_stage2_total = None
+        probe_failed = True
+    else:
+        # `bool` is excluded deliberately: it is an int subclass, so a bare
+        # isinstance(x, int) would admit True and report the nonsense census
+        # `flag_for_stage2_total: true`. Any other unexpected shape (None, a
+        # str, a float, a Mock) degrades to unknown rather than raising on
+        # the `> 0` comparison inside enumeration_blind_spot.
+        if isinstance(probe_result, int) and not isinstance(probe_result, bool):
+            flag_for_stage2_total = probe_result
+        else:
+            logger.warning(
+                'sweep_orphan_flag_markers: flag_for_stage2 census probe '
+                'returned a non-int value of type %s (%r); treating the '
+                'adjacent population as unknown (probe_failed=True). The '
+                'sweep itself is unaffected.',
+                type(probe_result).__name__, probe_result,
+            )
+            flag_for_stage2_total = None
+            probe_failed = True
+
+    # Consulted ONLY when the probe produced a real int: the sweep must never
+    # claim a blind spot it did not actually observe, so an unknown adjacent
+    # population is reported as blind_spot=False (with probe_failed=True
+    # carrying the uncertainty) rather than as a finding.
+    blind_spot = (
+        False if flag_for_stage2_total is None
+        else enumeration_blind_spot(total_source, flag_for_stage2_total)
+    )
     if blind_spot:
         logger.warning(
             'sweep_orphan_flag_markers: ENUMERATION BLIND SPOT — this sweep '
