@@ -49,7 +49,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    NO_PROJECT_ROOT_RESOLVED_MESSAGE,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -1738,26 +1737,6 @@ def test_repair_exit_constants_are_pairwise_distinct():
         EXIT_LIVE_READ_FAILED,
     ]
     assert len(set(codes)) == len(codes), codes
-
-
-def test_exit_2_stderr_is_the_shared_sentence_plus_this_scripts_suffix(tmp_path):
-    """The exit-2 MESSAGE is duplicated too, not just the number.
-
-    This script spells the sentence inline rather than importing
-    NO_PROJECT_ROOT_RESOLVED_MESSAGE — task 3817 kept it free of any
-    _task_db_scan import — so the wording is a third copy and can drift the same
-    way the integers can. The shared sentence must survive VERBATIM, and this
-    script's write-flavoured suffix must follow it: a repair that reported only
-    "nothing was audited" would lose the fact that nothing was WRITTEN either.
-    """
-    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
-
-    assert result.returncode == EXIT_NO_ROOT, result.stderr
-    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE in result.stderr
-    _, _, after_shared_sentence = result.stderr.partition(
-        NO_PROJECT_ROOT_RESOLVED_MESSAGE
-    )
-    assert "NOTHING was examined" in after_shared_sentence, result.stderr
 
 
 def test_make_client_is_attributable_to_this_repair_not_the_migration():

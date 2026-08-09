@@ -84,12 +84,11 @@ rewording to accommodate a write caller, because there is none.
 
 The duplication that decision accepts is WATCHED, not merely tolerated. The
 numeric lockstep between this tier's ``AUDIT_EXIT_*`` codes and the repair's
-``EXIT_*`` codes — and the verbatim survival of
-:data:`NO_PROJECT_ROOT_RESOLVED_MESSAGE` inside the repair's exit-2 stderr — is
-enforced by tests in ``tests/scripts/test_repair_wiped_metadata_files.py``, so
-renumbering or rewording either copy fails CI instead of drifting silently. A
-reviewer who notices the third copy should land HERE rather than re-file the
-question: 3817 asked it, measured all four blockers, and closed it.
+``EXIT_*`` codes is enforced by tests in
+``tests/scripts/test_repair_wiped_metadata_files.py``, so renumbering either
+copy fails CI instead of drifting silently. A reviewer who notices the third
+copy should land HERE rather than re-file the question: 3817 asked it,
+measured all four blockers, and closed it.
 
 IMPORT-RESOLUTION CONTRACT — read before moving this file.
 This module MUST stay a flat sibling at ``scripts/_task_db_scan.py``. The
