@@ -114,6 +114,23 @@ class Timeouts(BaseModel):
     census_synthesis_secs: int = 1800
 
 
+def _require_absolute(value: str, *, field_name: str, detail: str) -> str:
+    """Raise ``ValueError`` naming *field_name* when *value* isn't absolute.
+
+    Shared by the ``project_root`` and ``cwd_prefixes`` validators below —
+    both fields are matched against a consuming process's own absolute cwd
+    (project_root: each consumer's process cwd; cwd_prefixes: a session's
+    absolute cwd), so a relative entry in either one silently resolves
+    against the wrong tree, or matches no real session at all, instead of
+    failing loudly here at config-load time. The word "absolute" is always
+    present in the message so callers can assert on the behavior rather
+    than the field name.
+    """
+    if not os.path.isabs(value):
+        raise ValueError(f'{field_name} must be an absolute path, got {value!r}. {detail}')
+    return value
+
+
 class LegibilityConfig(BaseModel):
     """The full ``docs/legibility/legibility.yaml`` schema (PRD §7.4).
 
@@ -156,12 +173,44 @@ class LegibilityConfig(BaseModel):
         documented contract is to propagate ``ValidationError`` on malformed
         input — is cheaper than letting each consumer guess.
         """
-        if not os.path.isabs(value):
-            raise ValueError(
-                f'project_root must be an absolute path, got {value!r}. '
+        return _require_absolute(
+            value,
+            field_name='project_root',
+            detail=(
                 'A relative project_root resolves against each consuming '
                 "process's own cwd (e.g. the trickle systemd unit's pinned "
                 'WorkingDirectory), not the config file location.'
+            ),
+        )
+
+    @field_validator('cwd_prefixes')
+    @classmethod
+    def _cwd_prefixes_must_be_absolute(cls, value: list[str]) -> list[str]:
+        """Reject any non-absolute ``cwd_prefixes`` entry at config-load time.
+
+        ``inventory.is_member()`` does
+        ``Path(cwd).is_relative_to(Path(prefix))`` and
+        ``iter_project_dirs()`` encodes each prefix against
+        ``~/.claude/projects``' absolute-cwd encoding, so a relative prefix
+        (e.g. ``.`` or ``src/foo``) never matches any real session cwd — the
+        sampler/census would silently enumerate an empty corpus and report a
+        legitimate-looking no-change night. That is the identical
+        silent-degradation failure mode the ``project_root`` check above
+        exists to prevent, so it gets the same loud-at-load-time treatment.
+        ``agent_transcript_roots`` is deliberately project_root-relative and
+        stays exempt from this check.
+        """
+        for entry in value:
+            _require_absolute(
+                entry,
+                field_name='cwd_prefixes',
+                detail=(
+                    'Every cwd_prefixes entry is matched against an '
+                    "absolute session cwd (inventory.is_member's "
+                    'Path(cwd).is_relative_to(Path(prefix)) and '
+                    "iter_project_dirs' ~/.claude/projects encoding), so a "
+                    'relative prefix would silently match nothing.'
+                ),
             )
         return value
 
