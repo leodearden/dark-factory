@@ -4107,21 +4107,35 @@ class MemoryService:
     ) -> dict:
         """Delete a memory from the specified store.
 
-        ``memory_id`` must be a full 36-character UUID. A truncated id (e.g. an
-        8-char hex prefix lifted out of a search-result snippet) raises rather
-        than silently no-opping: both backends treat a miss as "already
-        deleted", so without this guard the caller got a confirming
-        ``{'status': 'deleted'}`` envelope, a ``success=True`` journal entry and
-        a ``memory_deleted`` event while nothing was removed.
+        ``memory_id`` is validated for SHAPE ONLY: it must be a canonical
+        36-character UUID. A truncated id (e.g. an 8-char hex prefix lifted out
+        of a search-result snippet) raises rather than silently no-opping —
+        both backends treat a miss as "already deleted", so without this guard
+        such a call got a confirming ``{'status': 'deleted'}`` envelope, a
+        ``success=True`` journal entry and a ``memory_deleted`` event while
+        nothing was removed.
+
+        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
+        well-formed UUID that no longer resolves — a stale id copied out of an
+        old report, a survivor id from an earlier consolidation — still reports
+        ``deleted``, for exactly the same backend reason. Closing that half
+        needs a per-store existence read: ``update_memory`` below already does
+        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
+        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
+        not-found from already-deleted. Deliberately out of scope here — task
+        3132 closes the malformed-shape half only.
 
         The guard sits above the store branch so ONE check covers both the
         Graphiti and Mem0 paths, and above the journal write and event emission
-        so a rejected delete leaves no false audit trail.
+        so a rejected delete leaves no false audit trail. It sits BELOW
+        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        bad store first — the same store-then-shape precedence the MCP boundary
+        gives agents, rather than the inverse for internal callers.
         """
-        require_full_uuid(memory_id, field_name='memory_id')
-
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        require_full_uuid(memory_id, field_name='memory_id')
+
         write_op_id = str(uuid_mod.uuid4())
 
         if source == SourceStore.graphiti:

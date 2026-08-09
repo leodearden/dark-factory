@@ -503,15 +503,6 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 # cite_* error helpers (task β)
 # ---------------------------------------------------------------------------
 
-# The UUID shape gate below is `is_full_uuid` from utils/validation.py (task
-# 3132) — the same predicate delete_memory's guards and citation_verifier's
-# forwarding-pointer guard answer through, per INV-5.  It replaced a local
-# anchored regex that ACCEPTED a canonical id with a trailing newline, because
-# Python's `$` matches immediately before one; such an id passed this gate and
-# then resolved to nothing.  Only the shape predicate is shared — the
-# `invalid_uuid_shape` / `ReconReportInvalidUuid` envelope below stays this
-# module's own.
-
 _ERR_FINDING_UNKNOWN: dict[str, str] = {
     'error': 'finding_unknown',
     'error_type': 'ReconReportFindingUnknown',
@@ -549,6 +540,8 @@ _ERR_RUN_NOT_FOUND: dict[str, str] = {
     'error_type': 'ReconReportRunNotFound',
 }
 
+# Shape gate: utils.validation.is_full_uuid (INV-5).  Only the predicate is
+# shared; this envelope stays this module's own.
 _ERR_INVALID_UUID_SHAPE: dict[str, str] = {
     'error': 'invalid_uuid_shape',
     'error_type': 'ReconReportInvalidUuid',

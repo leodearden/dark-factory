@@ -3251,7 +3251,13 @@ def create_mcp_server(
         # the gate's own argument, answered by its distinct
         # ``CitationReplacementInvalid``/``NotFound`` contract; the two share
         # the shape predicate, not the error envelope.
-        if err := validate_full_uuid(resolved_id):
+        #
+        # The label follows the argument the caller actually supplied: telling
+        # someone who passed the documented ``id`` alias that "memory_id must
+        # be a full 36-character UUID" names a parameter they never sent.
+        if err := validate_full_uuid(
+            resolved_id, field_name='memory_id' if memory_id is not None else 'id'
+        ):
             return err
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         # Same write-time override idiom as add_memory's allow_near_duplicate

@@ -80,13 +80,11 @@ from fused_memory.topic_slug import (
 # "is this a canonical full UUID" from ONE definition (INV-5).
 from fused_memory.utils.validation import is_full_uuid
 
-#: Back-compat alias for the pre-move private spelling, bound to the *same
-#: object* — the same re-export-not-redefine treatment applied to
-#: ``TOPIC_SLUG_RE`` above, for the same INV-5 reason.  ``scripts/
-#: retro_stamp_topics.py`` imports this name and
-#: ``tests/test_retro_stamp_topics.py`` pins the binding by ``is``, so the
-#: alias is load-bearing rather than cosmetic.  New callers should import
-#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` directly.
+#: Back-compat alias for the pre-move private spelling; import
+#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
+# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
+# tests/test_retro_stamp_topics.py import the predicate directly (both are
+# outside this task's locked file scope).
 _is_full_uuid = is_full_uuid
 
 __all__ = [
