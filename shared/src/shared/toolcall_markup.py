@@ -33,6 +33,22 @@ clauses with ``strict=True``.
 earliest-position scan of the UNION, which is what the boundary middleware
 consumes.
 
+## Staged API — :func:`repair` and :func:`detect` have no production caller YET
+
+This is task ALPHA of a staged PRD, and it deliberately ships an API ahead of
+its consumer. Task **3689** (``shared/src/shared/mcp_markup_middleware.py``,
+``MarkupGuardMiddleware``, contract C2) is the filed follow-up that wires
+:func:`detect` and :func:`repair` at the FastMCP boundary; task **3690**
+registers that middleware on all four servers. Until 3689 lands, the only
+callers of ``repair``/``detect``/``Repair``/``closer_for``/
+:data:`ENVELOPE_LITERALS` are this package's own tests and the committed
+specimen corpus. That is intentional staging, NOT dead code — do not let a
+dead-code sweep delete it, and check 3689/3690 before concluding otherwise.
+The three names that DO have production callers today are
+:data:`MCP_MARKUP_PATTERNS` (``markup_tripwire``) and
+:data:`PARAMETER_CLOSER_NAMES` / :data:`PREFILTER_NEEDLES`
+(``toolcall_xml_leak``).
+
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
 Every literal below is spelled with the ``\\x3c`` escape for ``<``. This is NOT
@@ -349,7 +365,6 @@ def repair(
 
     schema = _as_name_set(schema_params)
     already_supplied = _as_name_set(supplied)
-    detected = detect(value)
 
     attempts = 0
     for candidate in _CLOSER_RE.finditer(value):
@@ -373,6 +388,15 @@ def repair(
             continue
 
         misclose = candidate.group(0)
+        # The union scan runs ONLY here, on the accept path. `detected` is read
+        # nowhere else, and repair() refuses far more often than it accepts —
+        # every value with no qualifying candidate at all, plus every ordinary
+        # argument that merely happens to contain a closing tag. Hoisting it
+        # above the loop would pay one full-string pass per ENVELOPE_LITERALS
+        # member (six) on that overwhelmingly common no-op path, at a
+        # per-tool-call middleware boundary (PRD contract C2) over values the
+        # corpus shows reaching tens of KB.
+        detected = detect(value)
         return Repair(
             clean_value=value[: candidate.start()],
             recovered=recovered,
