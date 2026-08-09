@@ -8,6 +8,7 @@ import enum
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -359,8 +360,12 @@ class AgentResult:
       candidate.  ``success`` stays False (NOT salvaged); callers should raise a
       loud, un-suppressed escalation so the deny-list gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      backgrounded Bash command was still pending (launched via
-      ``run_in_background`` and never subsequently polled/killed).  The headless
+      backgrounded Bash command was still pending — launched via
+      ``run_in_background`` and never subsequently REAPED, where a reap is a
+      ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill OR a tool_use of
+      any kind whose input references the launch's id / output-file path as
+      recorded in its tool_result (task 3639; see
+      ``detect_ended_awaiting_background`` for the full contract).  The headless
       one-shot ``claude --print`` session exits subtype=success and silently
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
       downgrades ``success`` to False when this is set on an otherwise-successful
@@ -626,6 +631,67 @@ def note_unreadable_transcript(
 # abandonment verdict.
 _BACKGROUND_REAP_TOOLS = frozenset({'BashOutput', 'KillShell', 'KillBash'})
 
+# Captures the output-file path from the CLI's background-launch tool_result
+# sentence: "... Output is being written to: /tmp/.../tasks/<id>.output. You
+# will be notified ...".  The trailing ``\.?`` strips the sentence-terminating
+# period without eating the path's own ``.output`` suffix (the lookahead
+# requires whitespace/end after it, which a mid-path dot never satisfies).
+_BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
+
+
+def _iter_result_texts(record: dict):
+    """Yield the text of every ``tool_result`` block in a transcript *record*.
+
+    Tolerant of both content nestings (``record['message']['content']`` and a
+    flat ``record['content']``) and of a block ``content`` that is either a
+    plain ``str`` or a list of ``{'type': 'text', 'text': ...}`` sub-blocks.
+    Malformed shapes yield nothing rather than raising.
+    """
+    message = record.get('message')
+    if isinstance(message, dict) and isinstance(message.get('content'), list):
+        blocks = message['content']
+    elif isinstance(record.get('content'), list):
+        blocks = record['content']
+    else:
+        return
+    for block in blocks:
+        if not isinstance(block, dict) or block.get('type') != 'tool_result':
+            continue
+        content = block.get('content')
+        if isinstance(content, str):
+            yield content
+        elif isinstance(content, list):
+            for sub in content:
+                if isinstance(sub, dict) and isinstance(sub.get('text'), str):
+                    yield sub['text']
+
+
+def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
+    """Add *record*'s background-launch identity tokens to *tokens*, if any.
+
+    A background launch's ``user`` tool_result record carries the task's
+    identity in TWO places; both are read (union, not either/or) so a CLI
+    version emitting only one still yields a token:
+
+    - structured — ``record['toolUseResult']['backgroundTaskId']``;
+    - text — the path captured from the ``Output is being written to: <path>``
+      sentence in the tool_result body.
+
+    The task id is a substring of the log path
+    (``/tmp/claude-1000/<slug>/<sess>/tasks/<id>.output``), so either token
+    identifies a later reference to the file.  Every access is isinstance-
+    guarded: a malformed record contributes nothing and never raises.
+    """
+    tur = record.get('toolUseResult')
+    if isinstance(tur, dict):
+        task_id = tur.get('backgroundTaskId')
+        if isinstance(task_id, str) and task_id:
+            tokens.add(task_id)
+    for text in _iter_result_texts(record):
+        for match in _BG_LOG_PATH_RE.findall(text):
+            if match:
+                tokens.add(match)
+
 
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
     """Return True when the transcript's final background action was an unreaped
@@ -637,13 +703,38 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
 
     - a **launch** = a ``Bash`` tool_use whose ``input.run_in_background`` is
       truthy;
-    - a **reap** = any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use.
+    - a **reap** = either of:
+
+      * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use;
+      * a tool_use of ANY kind whose input references the background task's id
+        or output-file path, as recorded in the launch's tool_result
+        (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
+        written to: <path>`` sentence).
 
     Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
     final background-management action was a launch never followed by a
     poll/kill.  Any engagement with a background task (a poll or kill after it)
     clears the verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
+
+    RCA for the second reap clause (task 3639): the original vocabulary named
+    only the three background-management tools, so the very common shape of
+    reading the bg-log directly — ``Bash tail/cat/grep <log>``, or ``Read`` /
+    ``Grep`` on that path, which the CLI's own launch message recommends ("To
+    check interim output, use Read on that file path") and which
+    ``agents/roles.py``'s wait-guidance explicitly sanctions — counted as no
+    engagement at all.  On the ``_lane-31`` specimen (four backgrounded
+    ``cargo test`` runs, each tailed, zero ``BashOutput``) the detector fired
+    and falsified ``success`` on a completed run; the measured false-positive
+    rate for the class was ~98%.  Matching on the tool_result's identity token
+    rather than on shell verbs covers the whole observed reap surface in one
+    tool-agnostic rule, with no enumeration of spellings to drift out of date.
+
+    ACCEPTED remaining gap: a launch whose own command self-redirects (e.g.
+    ``… > /tmp/x.log``) and is later tailed is NOT recognised as reaped, since
+    no CLI-issued token exists to key on and parsing the command's redirection
+    target would reintroduce exactly the fragility this rule avoids.  That
+    shape keeps today's (firing) behaviour.
 
     Fail-safe / conservative by construction — a ``success``→failure downgrade
     must NEVER re-run a genuinely complete task on ambiguous data:
@@ -667,8 +758,16 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     last_launch_idx = -1
     last_reap_idx = -1
     pos = 0  # strictly-increasing position over tool_use blocks (record- then block-order)
+    bg_tokens: set[str] = set()  # identity tokens of the launches seen so far
     for record in records:
-        if not isinstance(record, dict) or record.get('type') != 'assistant':
+        if not isinstance(record, dict):
+            continue
+        if record.get('type') == 'user':
+            # A launch's tool_result arrives on a ``user`` record; harvest its
+            # identity tokens so later foreground references can be matched.
+            _collect_bg_tokens(record, bg_tokens)
+            continue
+        if record.get('type') != 'assistant':
             continue
         message = record.get('message')
         if isinstance(message, dict) and isinstance(message.get('content'), list):
@@ -686,8 +785,21 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
                 inp = block.get('input')
                 if isinstance(inp, dict) and inp.get('run_in_background'):
                     last_launch_idx = pos
+                    continue
             elif name in _BACKGROUND_REAP_TOOLS:
                 last_reap_idx = pos
+                continue
+            # Branch order is load-bearing: launch → named reap tool →
+            # token reference.  A ``run_in_background`` Bash that happens to
+            # mention an earlier token is still classified as a LAUNCH.
+            if bg_tokens:
+                inp = block.get('input')
+                try:
+                    serialized = json.dumps(inp, default=str) if isinstance(inp, dict) else str(inp)
+                except Exception:  # pragma: no cover - json.dumps(default=str) is total
+                    serialized = str(inp)
+                if any(token in serialized for token in bg_tokens):
+                    last_reap_idx = pos
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
