@@ -798,9 +798,14 @@ def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
     this module green until step-2 adds the field.
 
     Mirrors what ``_remerge`` does in production: it is the single producer of
-    recovery items for all five consumer paths (merge_queue.py:14373, 16010,
-    16331, 16974, 17107), so the marker is set once at the producer rather
-    than threaded through each consumer.
+    recovery items for all five consumer paths — ``_verifier_loop``'s
+    head-failure cascade, ``_void_and_remerge`` (INV-3 adoption-time void),
+    ``_finalize_inflight``'s RUNNER_UNAVAILABLE re-dispatch, and
+    ``_dispatch_item``'s dead-base-straggler and Mechanism-2 sites — so the
+    marker is set once at the producer rather than threaded through each
+    consumer.  (Named, not line-numbered: line numbers in this ~17k-line
+    module rot within a release; PRD §5.3 carries the numbered list and is
+    reconciled at close-out.)
     """
     return dataclasses.replace(item, remerge_recovery=True)
 
@@ -985,6 +990,13 @@ class TestGuardWarningCarriesCallTimeContext:
         Task 1999 notes this call-time context is NOT available on the
         invariant/snapshot surface — the dispatch guard is the only place it
         can be captured, so it must not be dropped by a reword.
+
+        Every needle is DERIVED from the fixture's own request/item/worker
+        state rather than re-typed as a short literal, and verify_depth is
+        pinned as the RENDERED PAIR ``verify_depth=1``.  A bare ``'1'`` would
+        be satisfied vacuously — the message body itself contains 'ε=1890',
+        'task-3082' and 'task 3206' — so it would pin the label while letting
+        the %d argument be dropped or reordered against the other three.
         """
         import logging
 
@@ -1001,6 +1013,12 @@ class TestGuardWarningCarriesCallTimeContext:
             config=config, git_repo=git_repo,
         )
 
+        # Ground the expected verify_depth in the FIXTURE (exactly one frozen
+        # entry), not in the implementation, so the rendered pair asserted
+        # below is a genuine value pin.
+        assert len(worker.frozen_prefix()) == 1
+        expected_tip = worker.frozen_prefix_tip('main0')
+
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
 
@@ -1009,12 +1027,11 @@ class TestGuardWarningCarriesCallTimeContext:
         text = warnings[0].getMessage()
 
         for needle, what in (
-            ('t-e', 'task_id'),
+            (item_e.request.task_id, 'task_id'),
             (req_e.request_id, 'request_id'),
-            ('live-main-tip', 'actual base'),
-            ('sha-Dc', 'expected frozen tip'),
-            ('verify_depth', 'verify_depth label'),
-            ('1', 'verify_depth value'),
+            (item_e.base_sha, 'actual base'),
+            (expected_tip, 'expected frozen tip'),
+            ('verify_depth=1', 'verify_depth label AND value'),
         ):
             assert needle in text, (
                 f'WARNING lost its {what} ({needle!r}) — task 1999: this '
