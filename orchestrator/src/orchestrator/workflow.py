@@ -5083,19 +5083,32 @@ class TaskWorkflow:
         on its current attempt.
 
         Fire-and-forget — failure logs a warning and does not block.
+
+        A NARROW single-key merge write, mirroring ``_stamp_simple_saturated``
+        below (task 3579).  Both call sites stamp immediately after
+        ``_reconcile_scope_locks``, which persists the refined
+        ``metadata.files`` backend-only and never refreshes
+        ``self.task['metadata']`` — so writing the whole in-memory blob at
+        shallow-merge mode would re-assert the stale dispatch-time ``files``
+        over the value just persisted, reverting the task's scope.  A payload
+        holding only ``optimistic_path`` cannot clobber a sibling key under
+        any merge mode.
         """
         try:
-            metadata = dict(self.task.get('metadata') or {})
-            metadata['optimistic_path'] = kind
-            self.task['metadata'] = metadata
             await self.scheduler.update_task(
-                self.task_id, metadata=metadata,
+                self.task_id,
+                {'optimistic_path': kind},
+                metadata_mode='merge',  # type: ignore[reportCallIssue]
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
             )
+        # Unconditional in-memory mirror (same as _stamp_simple_saturated):
+        # the harness auto-eval hook reads optimistic_path in-process even if
+        # persistence failed.
+        self.task.setdefault('metadata', {})['optimistic_path'] = kind
 
     async def _stamp_simple_saturated(self) -> None:
         """Stamp ``metadata.routing.simple_saturated=True`` (task ν).

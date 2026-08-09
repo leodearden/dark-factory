@@ -220,13 +220,20 @@ async def test_overlap_zero_short_circuits(tmp_path: Path):
     assert data['plan_session_id'] == 'prior-session-aaa'
     assert data['main_sha'] == 'newmain456'
 
-    # optimistic_path metadata stamped for auto-eval
+    # optimistic_path metadata stamped for auto-eval, as a narrow single-key
+    # merge write (task 3579) — a positional payload, NOT the whole blob.
     update_calls = [
         c for c in f.update_task.call_args_list
-        if c.kwargs.get('metadata', {}).get('optimistic_path')
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and c.args[1].get('optimistic_path')
+        and c.kwargs.get('metadata_mode') == 'merge'
     ]
     assert update_calls
-    assert update_calls[-1].kwargs['metadata']['optimistic_path'] == 'revalidation_skip'
+    assert update_calls[-1].args[1]['optimistic_path'] == 'revalidation_skip'
+    # Single-key payload: a regression that re-broadens it to a whole blob
+    # would clobber sibling keys such as metadata.files.
+    assert set(update_calls[-1].args[1]) == {'optimistic_path'}
 
 
 @pytest.mark.asyncio
