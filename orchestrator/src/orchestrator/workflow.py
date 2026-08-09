@@ -5077,25 +5077,60 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    def _mutable_task_metadata(self) -> dict:
+        """Return ``self.task['metadata']`` as a mutable dict, normalising a
+        missing / ``None`` / non-dict value in place first (task 3579).
+
+        ``dict.setdefault('metadata', {})`` is NOT sufficient: it returns the
+        EXISTING value whenever the key is present, so a task dict carrying
+        ``metadata: None`` — or a not-yet-decoded JSON string, both shapes this
+        codebase defends against pervasively (``harness.py``,
+        ``deterministic_runner.py``, ``Scheduler._normalize_task_metadata``) —
+        would raise ``TypeError`` on the caller's item assignment.  The
+        in-memory stamps below deliberately run OUTSIDE their scheduler-write
+        ``try`` so they land regardless of persistence; that only stays
+        non-raising if the mirror itself cannot raise.
+        """
+        md = self.task.get('metadata')
+        if not isinstance(md, dict):
+            md = {}
+            self.task['metadata'] = md
+        return md
+
     async def _stamp_optimistic_path(self, kind: str) -> None:
         """Stamp ``metadata.optimistic_path`` on the task so the harness's
         auto-eval hook can detect that this task took the optimistic path
         on its current attempt.
 
         Fire-and-forget — failure logs a warning and does not block.
+
+        A NARROW single-key merge write, mirroring ``_stamp_simple_saturated``
+        below (task 3579).  Both call sites stamp immediately after
+        ``_reconcile_scope_locks``, which persists the refined
+        ``metadata.files`` backend-only and never refreshes
+        ``self.task['metadata']`` — so writing the whole in-memory blob at
+        shallow-merge mode would re-assert the stale dispatch-time ``files``
+        over the value just persisted, reverting the task's scope.  A payload
+        holding only ``optimistic_path`` cannot clobber a sibling key under
+        any merge mode.
         """
         try:
-            metadata = dict(self.task.get('metadata') or {})
-            metadata['optimistic_path'] = kind
-            self.task['metadata'] = metadata
             await self.scheduler.update_task(
-                self.task_id, metadata=metadata,
+                self.task_id,
+                {'optimistic_path': kind},
+                metadata_mode='merge',  # type: ignore[reportCallIssue]
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
             )
+        # Unconditional in-memory mirror (same as _stamp_simple_saturated):
+        # the harness auto-eval hook reads optimistic_path in-process even if
+        # persistence failed.  Routed through _mutable_task_metadata so a
+        # None/non-dict metadata cannot turn this fire-and-forget stamp into a
+        # TypeError that escapes into the caller.
+        self._mutable_task_metadata()['optimistic_path'] = kind
 
     async def _stamp_simple_saturated(self) -> None:
         """Stamp ``metadata.routing.simple_saturated=True`` (task ν).
@@ -5117,7 +5152,9 @@ class TaskWorkflow:
         failed scheduler write logs a warning and never raises, honoring the
         "routing telemetry must never block or crash a caller" philosophy.
         The in-memory ``self.task['metadata']['routing']`` update always runs
-        regardless of the scheduler write's outcome.
+        regardless of the scheduler write's outcome — via
+        ``_mutable_task_metadata`` so a None/non-dict metadata cannot make this
+        best-effort stamp raise (task 3579).
         """
         state = RoutingState.from_metadata(self.task.get('metadata'))
         if state.simple_saturated:
@@ -5135,7 +5172,7 @@ class TaskWorkflow:
                     'Task %s: failed to stamp routing.simple_saturated',
                     self.task_id, exc_info=True,
                 )
-        self.task.setdefault('metadata', {})['routing'] = new_state.model_dump()
+        self._mutable_task_metadata()['routing'] = new_state.model_dump()
 
     async def _validate_prerequisites_or_block(
         self, context: str
