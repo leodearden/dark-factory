@@ -34,6 +34,7 @@ from test_config_schema import (
 from fused_memory.config.schema import ProceduralTopicCluster, ReconciliationConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -501,7 +502,10 @@ class TestAddMemoryNearDuplicateGate:
             ]
         })
         real_results = await svc._search_mem0(
-            _CONTENT, types.SimpleNamespace(), limit=5, categories=['procedural_knowledge']
+            _CONTENT,
+            Scope(project_id=_PROJECT_ID),
+            limit=5,
+            categories=['procedural_knowledge'],
         )
 
         # Sanity-check the premise: this is genuinely the post-RRF shape.
