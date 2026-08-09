@@ -1167,14 +1167,19 @@ def test_a_bare_string_modules_payload_is_read_as_one_module():
 def test_non_string_and_empty_module_entries_are_filtered_out():
     """Both feeds guard their module lists.  An empty-string key would collect
     samples under a module no lock event can ever name again, quietly polluting
-    every pooled prediction that happens to include it."""
+    every pooled prediction that happens to include it.
+
+    The ill-typed entries are the POINT — the guard exists because ``modules``
+    is reconstructed from a JSON event payload, which the annotation cannot
+    enforce — hence the ignores rather than a well-typed list.
+    """
     history = HoldHistory(min_samples=1)
 
-    history.observe_acquired('T1', ['', None, 42, 'ok/src'], at=_at(0))
+    history.observe_acquired('T1', ['', None, 42, 'ok/src'], at=_at(0))  # type: ignore[list-item]
 
     assert history.open_modules('T1') == ['ok/src']
 
-    history.observe_released('T1', ['', None, 42, 'ok/src'], at=_at(30))
+    history.observe_released('T1', ['', None, 42, 'ok/src'], at=_at(30))  # type: ignore[list-item]
 
     assert history.sample_count(['ok/src']) == 1
     assert history.sample_count(['']) == 0
