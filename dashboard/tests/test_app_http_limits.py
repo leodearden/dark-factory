@@ -126,3 +126,59 @@ class TestBuildHttpLimits:
                 f'keepalive slots ({limits.max_keepalive_connections}) cannot exceed '
                 f'total slots ({limits.max_connections}) for {kwargs}'
             )
+
+
+class TestLifespanWiresTheLimits:
+    """The derived limits must actually reach the shared client's constructor.
+
+    The pure helper above proves the NUMBERS are right; this proves they are
+    WIRED. Both are needed — a correct helper nobody calls fixes nothing.
+
+    Reaching the lifespan-constructed client requires driving ``lifespan``
+    directly (the recipe from test_durability.py): the conftest ``client``
+    fixture is function-scoped while ~15 other modules hold module-scoped
+    ``TestClient(app)`` fixtures that clobber ``app.state`` — the reason
+    spelled out in lifespan's own docstring.
+    """
+
+    async def test_lifespan_passes_derived_limits_to_the_shared_client(
+        self, tmp_path, monkeypatch,
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from _dashboard_helpers import apply_isolated_env
+        from fastapi import FastAPI
+
+        from dashboard.app import _build_http_limits, lifespan
+
+        apply_isolated_env(monkeypatch, tmp_path)
+
+        captured: list[dict] = []
+        real_async_client = httpx.AsyncClient
+
+        def _recording_async_client(*args, **kwargs):
+            captured.append(kwargs)
+            # Return a REAL client so shutdown's .aclose()/is_closed still work.
+            return real_async_client(*args, **kwargs)
+
+        with (
+            patch('dashboard.app.httpx.AsyncClient', _recording_async_client),
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            async with lifespan(FastAPI(lifespan=lifespan)):
+                pass
+
+        assert captured, 'lifespan did not construct an httpx.AsyncClient'
+        kwargs = captured[0]
+        expected = _build_http_limits(DashboardConfig.from_env())
+        assert kwargs.get('limits') == expected, (
+            f'lifespan must size the shared client from the config; got '
+            f'limits={kwargs.get("limits")!r}, expected {expected!r}'
+        )
+        assert kwargs.get('follow_redirects') is True, (
+            'follow_redirects=True must be preserved alongside the new limits'
+        )
