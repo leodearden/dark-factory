@@ -557,6 +557,13 @@ class DegradedSurfacingQuery:
     ``failed_stores`` and the diagnostics ride along verbatim rather than a bare
     boolean, β's rule: "the run was degraded" tells an operator to distrust the
     numbers, while "mem0 raised TimeoutError" tells them what to restart.
+
+    A search that RAISES instead of returning the sentinel — a backend error on
+    a path that does not swallow — lands here too, under ``failed_stores =
+    ('mem0',)`` (the store the search is pinned to) with the exception type in
+    the diagnostics. Both are the same fact for every consumer of this artifact:
+    this edge produced no ranking, so it is outside family (1)'s exposure and
+    the report says why.
     """
 
     source_id: str
@@ -659,6 +666,69 @@ def superseded_surfacing(
         still_surfacing=len(inversions),
         records=tuple(records),
         inversions=inversions,
+    )
+
+
+def _is_unsearchable_supersedes(ref: PointerRef) -> bool:
+    """Is *ref* a ``supersedes`` edge family (1) can never pose a query for?
+
+    The ONE site that decides, shared by :func:`fetch_surfacing_ranks` (which
+    skips them) and :func:`unsearchable_supersedes_refs` (which reports them),
+    so the exposure and the disclosure of what narrowed it cannot drift apart.
+
+    Two ways an edge is unsearchable, and both are legitimate skips: a
+    non-string target can never be matched against a returned memory id, and a
+    blank successor content has no query to derive — an empty query's ranking
+    is arbitrary, so scoring against it would manufacture inversions out of
+    noise. What is NOT legitimate is a quietly smaller ``pairs_comparable``
+    with nothing in the artifact to explain it, which leaf α's count-shift
+    trend would read as a real corpus change.
+
+    A predicate rather than membership in a ``set`` of refs, for the reason
+    :func:`_is_unkeyable_successor` gives at length: a ``dict``-valued pointer
+    member yields an UNHASHABLE ref, and hashing one would abort the whole
+    sweep over the very damage this runner exists to report.
+    """
+    return ref.key == 'supersedes' and (
+        not isinstance(ref.target, str) or not ref.source_content.strip()
+    )
+
+
+def unsearchable_supersedes_refs(refs: list[PointerRef]) -> list[PointerRef]:
+    """The ``supersedes`` refs family (1) never issues a search for.
+
+    A SUPERSET of :func:`unkeyable_successor_refs` — every blank-content edge
+    is unsearchable too — widened by the edges whose target is not a string.
+    The two are disclosed under separate keys because they narrow different
+    things: the unkeyable set narrows the TRIPWIRE's item list, this one
+    narrows family (1)'s ``pairs_comparable``. A consumer adding them together
+    would double-count the overlap; each is a narrowing of its own family, not
+    a term in a total.
+    """
+    return [ref for ref in refs if _is_unsearchable_supersedes(ref)]
+
+
+def _degraded_observation(
+    ref: PointerRef,
+    *,
+    failed_stores: tuple[str, ...],
+    diagnostics: tuple[dict, ...] = (),
+) -> SurfacingObservation:
+    """A zero-exposure observation NAMING the edge whose search did not answer.
+
+    One spelling for both ways a search fails to produce a ranking — the
+    ``degraded``/``failed_stores`` sentinel ``MemoryService.search`` returns,
+    and an exception a backend actually raised — so neither can be recorded
+    with a shape the report or ``corpus.counts`` handles differently.
+    """
+    return SurfacingObservation(
+        pairs_comparable=0, still_surfacing=0, records=(), inversions=(),
+        degraded=(DegradedSurfacingQuery(
+            source_id=ref.source_id,
+            target=ref.target,
+            failed_stores=failed_stores,
+            diagnostics=diagnostics,
+        ),),
     )
 
 
@@ -916,6 +986,25 @@ def _disclosure_counts(
     ``pairs_comparable`` with nothing to say why. β discloses the same count as
     ``degraded_queries``.
 
+    ``surfacing_edges_unsearchable`` is family (1)'s OTHER narrowing, and it is
+    a separate row because it has a separate cause: a degraded edge was asked
+    and did not answer, an unsearchable one was never asked at all (see
+    :func:`unsearchable_supersedes_refs`). Both shrink ``pairs_comparable``
+    identically from the artifact's point of view, which is exactly why one
+    number for the pair would leave a consumer unable to tell a backend outage
+    from a corpus writing pointers this leaf cannot query. It OVERLAPS
+    ``successor_edges_unkeyable`` by construction — every blank-content edge is
+    unsearchable too — so the two are read per family, never summed.
+
+    There is deliberately no ``surfacing_pairs_observed`` row. It would be
+    identically ``surfacing.pairs_comparable``, which is already published as
+    the ``superseded-still-surfacing`` metric's ``n``; a second name for one
+    number can only ever disagree with the first, and a consumer would have no
+    way to tell which was authoritative. When the metric is absent (zero
+    exposure), ``metric_families_not_measured`` names the gap and the two rows
+    above say what caused it — which is the honest answer, where a bare ``0``
+    would have looked like a measurement.
+
     ``surfacing_search_depth`` is the only row here that is a PARAMETER rather
     than an observation, and it belongs for the same reason ``--scan-limit``'s
     firing does: it sets family (1)'s denominator, so it is a narrowing of the
@@ -929,7 +1018,7 @@ def _disclosure_counts(
         'pointer_refs_malformed': malformed,
         'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
         'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
-        'surfacing_pairs_observed': len(surfacing.records),
+        'surfacing_edges_unsearchable': len(unsearchable_supersedes_refs(refs)),
         'surfacing_queries_degraded': len(surfacing.degraded),
         'surfacing_search_depth': surfacing_depth,
         'task_terminal_entry_task_pairs': len(staleness.records),
@@ -1087,8 +1176,9 @@ SWEEP_CATEGORIES: tuple[str, ...] = (
 
 Mem0-primary only: ``scroll_by_metadata`` is a Qdrant payload scroll, so the
 three Graphiti-primary categories are not reachable through it at all. The
-report names that scope rather than leaving a near-zero count to be misread
-as an empty graph.
+report's ``scope`` section names that scope — the categories actually swept,
+and that the Graphiti-primary ones were not — rather than leaving a near-zero
+count to be misread as an empty graph.
 """
 
 _CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
@@ -1100,6 +1190,49 @@ is a defensive third. Same order and same reasoning as δ's ``fetch_memories``
 — the two runners read the same payloads and must agree about which string is
 the memory.
 """
+
+
+STORE_READ_CONCURRENCY = 8
+"""How many store reads either fetch band keeps in flight at once.
+
+NOT a threshold and NOT a narrowing, so G6 does not reach it and it is
+deliberately absent from the artifact's disclosures: every read still happens
+and every searchable edge is still scored, so no measured population depends
+on this number. Contrast ``--scan-limit`` and :data:`SURFACING_SEARCH_DEPTH`,
+which BOUND the population and are therefore disclosed.
+
+It exists because both bands are otherwise strictly sequential over a corpus
+whose ``supersedes`` population alone is ~150 records — one embedding-backed
+search each, plus one point read per unique pointer target — and leaf ε runs
+this on a schedule beside leaf β. Bounded rather than an unlimited fan-out for
+δ's reason (``audit_duplicate_memories``'s ANN band bounds its own the same
+way): a corpus-sized gather is a self-inflicted load spike on the store this
+runner is only supposed to be reading from.
+"""
+
+
+async def _gather_all(coroutines: Iterable[Any]) -> list[Any]:
+    """Run *coroutines* concurrently; results in SUBMISSION order.
+
+    ``return_exceptions=True`` so every coroutine reaches a terminal state
+    before this returns: a bare ``gather`` propagates the first exception
+    immediately and leaves its siblings running against a service the caller's
+    ``finally`` is about to close. The first failure is then re-raised
+    UNCHANGED — callers still see a plain ``TimeoutError`` rather than the
+    ``ExceptionGroup`` a ``TaskGroup`` would hand them, which keeps the
+    propagation contracts documented on the fetchers below exactly what they
+    were when these loops ran sequentially. ``bake_off_storage_shape``'s
+    ``gather_or_raise`` is the same four lines for the same two reasons; it is
+    copied rather than imported because this leaf holds no lock on that script.
+
+    Order is SUBMISSION order, not completion order, which is what keeps a
+    fold over the results reproducible run to run.
+    """
+    outcomes = await asyncio.gather(*coroutines, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    return list(outcomes)
 
 
 async def fetch_pointer_records(
@@ -1199,17 +1332,30 @@ async def resolve_pointer_targets(
     :func:`malformed_pointer_refs` names them, which keeps "the target is
     gone" and "the pointer was never writable" separable in the report.
 
+    The reads run concurrently under :data:`STORE_READ_CONCURRENCY`. Nothing
+    here depends on their ordering — the result is a plain map keyed by target
+    — and :func:`_gather_all` preserves submission order, so the map is built
+    in the same first-seen order the sequential loop left it in and two runs
+    over one corpus still agree.
+
     Raises:
         TimeoutError: Propagated, never folded into the unresolved count. The
             primitive distinguishes "genuinely absent" from "backend timed
             out" precisely so this caller can too; reporting a blip as a
             dangling pointer would fabricate a defect and fire an α alarm on
-            an infrastructure hiccup.
+            an infrastructure hiccup. Concurrency does not soften this:
+            :func:`_gather_all` re-raises the first failure unchanged, after
+            every sibling read has reached a terminal state.
     """
-    resolution: dict[str, bool] = {}
-    for target in unique_pointer_targets(refs):
-        resolution[target] = await memory.get_memory_by_id(project_id, target) is not None
-    return resolution
+    targets = unique_pointer_targets(refs)
+    semaphore = asyncio.Semaphore(STORE_READ_CONCURRENCY)
+
+    async def _read(target: str) -> bool:
+        async with semaphore:
+            return await memory.get_memory_by_id(project_id, target) is not None
+
+    found = await _gather_all(_read(target) for target in targets)
+    return dict(zip(targets, found, strict=True))
 
 
 async def fetch_surfacing_ranks(
@@ -1235,7 +1381,18 @@ async def fetch_surfacing_ranks(
 
     An edge whose successor content is empty is skipped rather than searched
     with an empty query: an empty query's ranking is arbitrary, and scoring
-    against it would manufacture inversions from noise.
+    against it would manufacture inversions from noise. So is an edge whose
+    target is not a string, which can never match a returned memory id. Both
+    skips go through :func:`_is_unsearchable_supersedes` and are counted into
+    ``corpus.counts`` as ``surfacing_edges_unsearchable``, because a narrowing
+    of this family's exposure that is visible only by reading this source is a
+    silent cap for leaf α, which reads the artifact.
+
+    The searches run concurrently under :data:`STORE_READ_CONCURRENCY`. Each
+    edge is scored against its OWN query and :func:`combine_surfacing` is a
+    pure fold, so nothing depends on the order they complete in; the fold is
+    still handed its input in ref order (:func:`_gather_all` preserves
+    submission order), which keeps the detail lists reproducible.
 
     *limit* is the retrieval depth, and it SETS this family's denominator — a
     pair whose superseded member ranks below it is dropped from
@@ -1269,37 +1426,67 @@ async def fetch_surfacing_ranks(
     live on a list SUBCLASS and do not survive a comprehension, a slice, or even
     the ``results or []`` guard below (an empty ``SearchResults`` is falsy, so
     that expression hands back a bare ``list`` with the metadata stripped).
+
+    A search that RAISES is recorded the same way rather than propagated, and
+    that asymmetry with the two fetchers above is deliberate. By the time this
+    band runs, the pointer scan and the target reads have already completed, so
+    an escaping exception would discard three otherwise-measurable families and
+    write no artifact at all — the same reasoning
+    :func:`fetch_terminal_task_ids` degrades a failing task backend to a NAMED
+    skip on. The other two fetchers propagate because their failure makes the
+    census itself unmeasurable, not merely narrower.
     """
-    observations: list[SurfacingObservation] = []
-    for ref in refs:
-        if ref.key != 'supersedes' or not isinstance(ref.target, str):
-            continue
-        query = (ref.source_content or '').strip()
-        if not query:
-            continue
-        results = await memory.search(
-            query,
-            project_id=project_id,
-            limit=limit,
-            stores=['mem0'],
-            categories=list(SWEEP_CATEGORIES),
-        )
+    # One predicate for what is skipped and what is disclosed as skipped; see
+    # `_is_unsearchable_supersedes`. Materialised before the fan-out so the
+    # fold below is handed its inputs in ref order.
+    searchable = [
+        ref for ref in refs
+        if ref.key == 'supersedes' and not _is_unsearchable_supersedes(ref)
+    ]
+    semaphore = asyncio.Semaphore(STORE_READ_CONCURRENCY)
+
+    async def _score(ref: PointerRef) -> SurfacingObservation:
+        async with semaphore:
+            try:
+                results = await memory.search(
+                    ref.source_content.strip(),
+                    project_id=project_id,
+                    limit=limit,
+                    stores=['mem0'],
+                    categories=list(SWEEP_CATEGORIES),
+                )
+            except Exception as exc:
+                logger.warning(
+                    'memory_eval_staleness_sweep: the surfacing search for '
+                    '%s -> %s raised %s; the edge is disclosed as degraded and '
+                    'excluded from family 1 rather than scored as a clean '
+                    'absence.', ref.source_id, ref.target, type(exc).__name__,
+                    exc_info=True,
+                )
+                # 'mem0' because the search is PINNED to it above, so that is
+                # the store that did not answer; the exception type rides in
+                # the diagnostics, in the same shape SearchResults uses for
+                # the failures it catches itself.
+                return _degraded_observation(
+                    ref,
+                    failed_stores=('mem0',),
+                    diagnostics=({
+                        'store': 'mem0',
+                        'error': type(exc).__name__,
+                        'detail': str(exc),
+                    },),
+                )
         failed_stores = tuple(str(s) for s in (getattr(results, 'failed_stores', ()) or ()))
         if bool(getattr(results, 'degraded', False)) or failed_stores:
-            observations.append(SurfacingObservation(
-                pairs_comparable=0, still_surfacing=0, records=(), inversions=(),
-                degraded=(DegradedSurfacingQuery(
-                    source_id=ref.source_id,
-                    target=ref.target,
-                    failed_stores=failed_stores,
-                    diagnostics=tuple(getattr(results, 'failure_diagnostics', ()) or ()),
-                ),),
-            ))
-            continue
+            return _degraded_observation(
+                ref,
+                failed_stores=failed_stores,
+                diagnostics=tuple(getattr(results, 'failure_diagnostics', ()) or ()),
+            )
         ranked_ids = [str(getattr(r, 'id', '') or '') for r in (results or [])]
-        observations.append(
-            superseded_surfacing([(ref.source_id, ref.target)], ranked_ids),
-        )
+        return superseded_surfacing([(ref.source_id, ref.target)], ranked_ids)
+
+    observations = await _gather_all(_score(ref) for ref in searchable)
     return combine_surfacing(observations)
 
 
@@ -1473,6 +1660,10 @@ def sweep_report_sections(
     """
     from shared.memory_eval_metrics import render_report  # noqa: PLC0415
 
+    # The categories this run ACTUALLY scrolled, not the module default: a
+    # caller may narrow them, and a scope line that named the default would be
+    # the one claim in this report the run had not measured.
+    swept = tuple(scan_stats)
     sections: list[ReportSection] = [
         ReportSection('header', (
             f'E4 staleness sweep — {series.eval_id} @ {series.run_stamp}',
@@ -1480,6 +1671,19 @@ def sweep_report_sections(
             '',
             'This report MEASURES. It evaluates no limit and reaches no',
             'verdict; every threshold lives in the limits evaluator (leaf α).',
+        )),
+        # The largest narrowing in the whole run, and the one a reader is least
+        # able to infer: nothing else here says that half the category
+        # vocabulary was out of reach, so a small corpus count would read as a
+        # small corpus rather than as the Mem0 half of a bigger one.
+        ReportSection('scope', (
+            '',
+            'SCOPE — the categories this run could see:',
+            f'  swept (Mem0-primary): {", ".join(swept) or "none"}',
+            '  NOT swept: the Graphiti-primary categories. Enumeration is a',
+            '  Qdrant payload scroll (scroll_by_metadata), which cannot reach',
+            '  them at all, so every number below describes the Mem0 half of',
+            '  this corpus — a low count is a narrower scope, not an empty graph.',
         )),
         ReportSection('metrics', ('', render_report(series).rstrip('\n'))),
     ]
@@ -1493,6 +1697,7 @@ def sweep_report_sections(
             '  An omitted metric is a gap in the trend, not a clean result.',
         )))
 
+    unsearchable = unsearchable_supersedes_refs(list(refs))
     sections.append(ReportSection('superseded_surfacing', (
         '',
         'Family 1 — superseded entries still surfacing',
@@ -1500,6 +1705,14 @@ def sweep_report_sections(
         # superseded member ranked below it was never comparable, and a reader
         # comparing two runs needs to know whether that number moved.
         f'  search depth (sets the denominator): {surfacing_depth}',
+        # The other thing that moves the denominator, named beside it for the
+        # same reason: these edges were never asked, so they cannot appear in
+        # the comparable count and nothing else in this section would say so.
+        f'  supersedes edges never searched:     {len(unsearchable)}',
+        *([
+            '    (no successor text, or a target that is not a memory id;',
+            '     each is named under a disclosure below)',
+        ] if unsearchable else []),
         f'  comparable pairs (both returned): {surfacing.pairs_comparable}',
         f'  superseded above its successor:   {surfacing.still_surfacing}',
         *_elided(
@@ -1712,25 +1925,6 @@ class SweepOutcome:
     report_path: Path | None
 
 
-def corpus_project_id(project_ids: tuple[str, ...]) -> str:
-    """The single ``Corpus.project_id`` for a run covering *project_ids*.
-
-    M1's Corpus carries one project id and this runner emits one artifact per
-    stamp, so a multi-project run needs a stable joined identifier. Single
-    project in, that project out — β's shape, so the two leaves' artifacts
-    stay comparable.
-
-    The join is UNREACHABLE from this leaf: :func:`run_sweep` refuses more than
-    one distinct id, because γ's resolution map is keyed by bare target id
-    where β's observations are not. The helper is kept rather than inlined so
-    the two leaves keep one spelling of the corpus id, and so the day
-    per-project resolution keys land the only change here is deleting that
-    guard. It is not an invitation to pass several ids today — that call
-    raises.
-    """
-    return '+'.join(project_ids)
-
-
 async def run_sweep(
     memory: Any,
     *,
@@ -1753,9 +1947,12 @@ async def run_sweep(
     names which families went unmeasured and that answer comes from the
     assembled series — a ``--no-metrics`` run must not be a less honest one.
 
-    ONE project id per run, ENFORCED below rather than merely documented.
-    *project_ids* is a tuple only so the loop reads the same as the rest of the
-    band. Several distinct ids would under-report: ``get_memory_by_id`` is
+    EXACTLY ONE project id per run, ENFORCED below rather than merely
+    documented. *project_ids* is a tuple only because leaf ε's call shape is a
+    tuple; the band unpacks it to a single id and there is deliberately no
+    accumulation logic for a second one, since code the guard makes unreachable
+    cannot be tested through this entry point and would rot in place. Several
+    distinct ids would under-report: ``get_memory_by_id`` is
     project-scoped, but the resolution map is keyed by target id alone, so a
     target present in project A would mark project B's ref RESOLVED — a
     dangling pointer reported as healthy, silently, and in the opposite
@@ -1770,44 +1967,32 @@ async def run_sweep(
     from shared.memory_eval_metrics import run_stamp, write_metric_series  # noqa: PLC0415
 
     distinct_projects = tuple(dict.fromkeys(project_ids))
-    if len(distinct_projects) > 1:
+    if len(distinct_projects) != 1:
         raise ValueError(
-            'run_sweep sweeps ONE project per run and was given '
-            f'{len(distinct_projects)}: {", ".join(distinct_projects)}. The '
+            'run_sweep sweeps exactly ONE project per run and was given '
+            f'{len(distinct_projects)}: '
+            f'{", ".join(distinct_projects) or "(none)"}. The '
             'resolution map is keyed by bare target id while '
             'get_memory_by_id is project-scoped, so a target present in one '
             "project would mark another project's pointer resolved — a "
             'dangling pointer reported as healthy. Run the sweep once per '
             'project (each emits its own artifact), or land per-project '
-            'resolution keys first.'
+            'resolution keys first. Zero ids is refused for the opposite '
+            'reason: it would emit an artifact reporting a clean corpus that '
+            'was never read.'
         )
+    (project_id,) = distinct_projects
 
     effective_stamp = stamp or run_stamp()
 
-    records: list[dict[str, Any]] = []
-    scan_stats: dict[str, dict[str, int]] = {}
-    refs: list[PointerRef] = []
-    resolution: dict[str, bool] = {}
-    surfacings: list[SurfacingObservation] = []
-
-    for project_id in distinct_projects:
-        project_records, project_stats = await fetch_pointer_records(
-            memory, project_id, scan_limit=scan_limit,
-        )
-        records.extend(project_records)
-        for category, row in project_stats.items():
-            merged = scan_stats.setdefault(category, {'scanned': 0, 'truncated': 0})
-            merged['scanned'] += row['scanned']
-            merged['truncated'] = max(merged['truncated'], row['truncated'])
-
-        project_refs = [ref for record in project_records for ref in pointer_targets(record)]
-        refs.extend(project_refs)
-        resolution.update(
-            await resolve_pointer_targets(memory, project_id, project_refs),
-        )
-        surfacings.append(await fetch_surfacing_ranks(
-            memory, project_id, project_refs, limit=surfacing_depth,
-        ))
+    records, scan_stats = await fetch_pointer_records(
+        memory, project_id, scan_limit=scan_limit,
+    )
+    refs = [ref for record in records for ref in pointer_targets(record)]
+    resolution = await resolve_pointer_targets(memory, project_id, refs)
+    surfacing = await fetch_surfacing_ranks(
+        memory, project_id, refs, limit=surfacing_depth,
+    )
 
     terminal_join = (
         await fetch_terminal_task_ids(config) if config is not None
@@ -1820,7 +2005,6 @@ async def run_sweep(
 
     census = dangling_census(refs, resolution)
     tripwire_items = successor_pointer_items(refs, resolution)
-    surfacing = combine_surfacing(surfacings)
     staleness = terminal_staleness(records, terminal_join.statuses)
 
     corpus_counts = {
@@ -1837,7 +2021,7 @@ async def run_sweep(
         surfacing=surfacing,
         staleness=staleness,
         corpus_counts=corpus_counts,
-        project_id=corpus_project_id(distinct_projects),
+        project_id=project_id,
         stamp=effective_stamp,
         refs=refs,
         eval_id=eval_id,

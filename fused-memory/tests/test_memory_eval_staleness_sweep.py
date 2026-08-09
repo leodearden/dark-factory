@@ -20,6 +20,7 @@ named item_keys and exact counts on seeded fixtures.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib.util
 import types
@@ -839,7 +840,7 @@ class TestBuildSeries:
             'pointer_refs_malformed',
             'pointer_targets_unique_reads',
             'successor_edges_unkeyable',
-            'surfacing_pairs_observed',
+            'surfacing_edges_unsearchable',
             'surfacing_queries_degraded',
             'surfacing_search_depth',
             'task_terminal_entry_task_pairs',
@@ -861,7 +862,9 @@ class TestBuildSeries:
         assert counts['successor_edges_unkeyable'] == len(
             m.unkeyable_successor_refs(_full_refs()),
         )
-        assert counts['surfacing_pairs_observed'] == len(inputs['surfacing'].records)
+        assert counts['surfacing_edges_unsearchable'] == len(
+            m.unsearchable_supersedes_refs(_full_refs()),
+        )
         assert counts['surfacing_queries_degraded'] == len(inputs['surfacing'].degraded)
         assert counts['surfacing_search_depth'] == m.SURFACING_SEARCH_DEPTH
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
@@ -906,11 +909,65 @@ class TestBuildSeries:
         series = m.build_series(**inputs)
 
         assert series.corpus.counts['surfacing_queries_degraded'] == 1
-        assert series.corpus.counts['surfacing_pairs_observed'] == 0
         # Zero exposure, so the family declines to emit rather than fabricate a
         # clean datapoint — and the disclosure is what says WHY it is missing.
         assert m.METRIC_SUPERSEDED_STILL_SURFACING not in _ids(series)
         assert m.METRIC_SUPERSEDED_STILL_SURFACING in m.metric_families_not_measured(series)
+
+    def test_the_family_1_exposure_is_published_once_not_under_a_second_name(self):
+        """One number, one authoritative home: the metric's own ``n``.
+
+        A ``surfacing_pairs_observed`` disclosure would be identically
+        ``pairs_comparable``, and two names for one number can only ever
+        disagree — at which point a consumer has no way to tell which is
+        authoritative. What the counts DO carry is the pair of narrowings the
+        metric's ``n`` cannot express: edges never searched, and searches that
+        did not answer.
+        """
+        m = _mod()
+        inputs = _full_inputs()
+        series = m.build_series(**inputs)
+        counts = series.corpus.counts
+
+        assert 'surfacing_pairs_observed' not in counts
+        assert _metric(series, m.METRIC_SUPERSEDED_STILL_SURFACING).n == (
+            inputs['surfacing'].pairs_comparable
+        )
+        assert {'surfacing_edges_unsearchable', 'surfacing_queries_degraded'} <= set(counts)
+
+    def test_the_edges_family_1_never_searched_are_disclosed(self):
+        """A shrunken ``pairs_comparable`` with nothing to explain it is a silent cap.
+
+        Two supersedes edges are unsearchable — one with no successor text to
+        derive a query from, one whose target is not a memory id — so neither
+        can ever join ``pairs_comparable``. Undisclosed, leaf α's count-shift
+        trend would read their absence as a corpus that stopped superseding.
+        """
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-blank', '', supersedes=UUID_C)),
+            *m.pointer_targets(_record('rec-bad', 'has text', supersedes={'oops': 1})),
+            # A `corrects` edge is not family 1's population at all, so it is
+            # not "unsearchable" — it was never in scope to be searched.
+            *m.pointer_targets(_record('rec-2', '', corrects=UUID_C)),
+        ]
+        inputs = _full_inputs()
+        inputs['refs'] = refs
+        inputs['census'] = m.dangling_census(refs, {UUID_B: True})
+        inputs['tripwire_items'] = m.successor_pointer_items(refs, {UUID_B: True})
+
+        counts = m.build_series(**inputs).corpus.counts
+
+        assert counts['surfacing_edges_unsearchable'] == 2
+        assert [ref.source_id for ref in m.unsearchable_supersedes_refs(refs)] == [
+            'rec-blank', 'rec-bad',
+        ]
+        # It OVERLAPS the tripwire's own narrowing rather than partitioning it:
+        # every blank-content edge is unsearchable too. Disclosed separately
+        # because they narrow different families, so a consumer reads each
+        # against its own metric and never sums the two.
+        assert counts['successor_edges_unkeyable'] == 1
 
     def test_the_disclosed_read_count_is_reads_not_citations(self):
         """``pointer_targets_unique_reads`` IS the plan ``resolve_pointer_targets`` runs.
@@ -1003,6 +1060,35 @@ class TestBuildSeries:
 def _raw_point(point_id: str, payload: dict) -> dict:
     """One record as ``scroll_by_metadata`` returns it."""
     return {'id': point_id, 'created_at': '2026-08-01T00:00:00+00:00', 'metadata': payload}
+
+
+class _ConcurrencyProbe:
+    """An async call double that records how many calls were IN FLIGHT at once.
+
+    The ``asyncio.sleep(0)`` is what makes overlap observable at all: a
+    coroutine that never suspends runs to completion before its sibling is
+    scheduled, so a sequential band and a concurrent one would produce the
+    same peak of 1 and the assertion would be vacuous.
+
+    *result* is returned to the caller, or called first if it is a callable
+    (so a per-call answer can be seeded without a second double).
+    """
+
+    def __init__(self, result=None):
+        self._result = result
+        self.in_flight = 0
+        self.peak = 0
+        self.calls: list[types.SimpleNamespace] = []
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append(types.SimpleNamespace(args=args, kwargs=kwargs))
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+            return self._result(*args, **kwargs) if callable(self._result) else self._result
+        finally:
+            self.in_flight -= 1
 
 
 def _mock_memory(*, scroll_return=None, by_id=None):
@@ -1204,6 +1290,35 @@ class TestResolvePointerTargets:
         memory = _mock_memory()
         assert await m.resolve_pointer_targets(memory, 'dark_factory', []) == {}
         assert memory.get_memory_by_id.await_count == 0
+
+    async def test_the_reads_overlap_rather_than_serialising_one_per_target(self):
+        """Concurrent, bounded by the module's own knob — and still ordered.
+
+        Not a threshold (G6 does not reach it): every read still happens and
+        no measured population depends on the fan-out. It is asserted because
+        a scheduled run (leaf ε) issues one point read per unique pointer
+        target, and a band that quietly went back to awaiting them one at a
+        time would still pass every other test in this class.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        targets = [f'{i:08d}-1111-4a2b-8c3d-4e5f60718293' for i in range(20)]
+        refs = [
+            ref for index, target in enumerate(targets)
+            for ref in m.pointer_targets(_record(f'rec-{index}', 'text', supersedes=target))
+        ]
+        probe = _ConcurrencyProbe(result=None)
+        memory = MagicMock()
+        memory.get_memory_by_id = probe
+
+        resolution = await m.resolve_pointer_targets(memory, 'dark_factory', refs)
+
+        assert 1 < probe.peak <= m.STORE_READ_CONCURRENCY
+        # Every target still read exactly once, and the map still keyed in
+        # first-seen order: overlap must not cost determinism.
+        assert [call.args[1] for call in probe.calls] == targets
+        assert list(resolution) == targets
 
 
 class _Hit:
@@ -1447,6 +1562,114 @@ class TestFetchSurfacingRanks:
         assert obs.still_surfacing == 1
         assert [r.successor_id for r in obs.inversions] == ['rec-2']
         assert [q.source_id for q in obs.degraded] == ['rec-1']
+
+    async def test_a_search_that_raises_is_disclosed_rather_than_aborting_the_run(self):
+        """An escaping exception here would discard three measured families.
+
+        ``MemoryService.search`` swallows the failures it knows about, but a
+        backend error on a path that does not swallow reaches this band — and
+        by then the pointer scan and the target reads have already completed.
+        Propagating would throw away dangling-pointers, successor-pointer-present
+        AND task-terminal-staleness and write no artifact at all, over a family
+        that was only ever going to be narrower. ``fetch_terminal_task_ids``
+        degrades a failing task backend to a NAMED skip for exactly this reason.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(side_effect=TimeoutError('mem0 search timed out'))
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert obs.pairs_comparable == 0
+        # Named, not swallowed: the edge lands in the same disclosure a
+        # sentinel-degraded search does, so the report and corpus.counts say
+        # this family was narrowed and by what.
+        assert len(obs.degraded) == 1
+        assert obs.degraded[0].source_id == 'rec-1'
+        assert obs.degraded[0].target == UUID_B
+        # 'mem0' because the search is PINNED to that store; the exception
+        # type rides in the diagnostics, where the store's own failures put it.
+        assert obs.degraded[0].failed_stores == ('mem0',)
+        assert obs.degraded[0].diagnostics[0]['error'] == 'TimeoutError'
+
+    async def test_one_raising_edge_never_costs_a_healthy_one_its_score(self):
+        """Per edge, exactly as the sentinel path is."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-2', 'successor two', supersedes=UUID_C)),
+        ]
+        memory = MagicMock()
+        memory.search = AsyncMock(side_effect=[
+            RuntimeError('the backend fell over'),
+            [_Hit(UUID_C), _Hit('rec-2')],
+        ])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert obs.pairs_comparable == 1
+        assert obs.still_surfacing == 1
+        assert [q.source_id for q in obs.degraded] == ['rec-1']
+
+    async def test_an_unsearchable_edge_costs_no_search_and_is_reported(self):
+        """The skip and its disclosure go through ONE predicate.
+
+        A non-string target can never match a returned memory id and a blank
+        successor content has no query to derive, so neither edge is searched.
+        Both narrow ``pairs_comparable``, which is why the same predicate that
+        skips them is the one that names them.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-blank', '  ', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-bad', 'has text', supersedes=[{'id': UUID_C}])),
+        ]
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert memory.search.await_count == 0
+        assert obs.pairs_comparable == 0
+        assert [ref.source_id for ref in m.unsearchable_supersedes_refs(refs)] == [
+            'rec-blank', 'rec-bad',
+        ]
+
+    async def test_the_searches_overlap_rather_than_serialising_one_per_edge(self):
+        """Concurrent, bounded by the module's own knob — and still ordered.
+
+        Each search is embedding-backed and the live ``supersedes`` population
+        is ~150 records, so a sequential band is ~150 serialised round trips on
+        a runner leaf ε schedules beside leaf β. Not a threshold: every edge is
+        still searched and the fold is still handed its inputs in ref order.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            ref for index in range(20)
+            for ref in m.pointer_targets(
+                _record(f'rec-{index}', f'successor {index}', supersedes=UUID_B),
+            )
+        ]
+        probe = _ConcurrencyProbe(result=[])
+        memory = MagicMock()
+        memory.search = probe
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert 1 < probe.peak <= m.STORE_READ_CONCURRENCY
+        assert [call.args[0] for call in probe.calls] == [
+            f'successor {index}' for index in range(20)
+        ]
+        assert obs.pairs_comparable == 0
 
     async def test_a_plain_list_search_double_is_never_read_as_degraded(self):
         """The old duck-typed doubles (and any plain list) stay non-degraded."""
@@ -1890,12 +2113,94 @@ class TestArtifactEmission:
         assert capsys.readouterr().out
         assert list(tmp_path.iterdir()) == []
 
+    def test_the_report_on_disk_is_this_runners_text_not_the_shared_table(
+        self, monkeypatch, tmp_path,
+    ):
+        """Asserting the file EXISTS would pass with none of this leaf's disclosures.
+
+        ``write_metric_series`` already writes a report at this exact path —
+        the shared minimal metric table — and ``write_report_text`` exists only
+        to replace it with the fuller sectioned text. Dropped, mis-pathed, or
+        ordered BEFORE the shared write, the artifact silently degrades to that
+        table: no not_measured, no scope, no scan_truncation, no
+        malformed_pointers, no surfacing_degraded. Every one of those is a
+        disclosure this module argues must never be inferable-only, and an
+        existence check cannot tell the two files apart.
+        """
+        outcome = _sweep(
+            monkeypatch, tmp_path, _seeded_double(),
+            taskmaster_statuses={'4802': 'done'}, write_metrics=True,
+        )
+
+        assert outcome.report_path is not None
+        on_disk = outcome.report_path.read_text(encoding='utf-8')
+        # The whole in-memory report, byte for byte: the file IS what the run
+        # says it produced, not a subset of it.
+        assert on_disk == outcome.report
+        # Section by section rather than by prose, so a copy edit does not fail
+        # this but a lost block does.
+        for section in outcome.sections:
+            assert section.text in on_disk
+        assert {'scope', 'dangling_pointers', 'successor_pointer_tripwire'} <= {
+            section.key for section in outcome.sections
+        }
+        # And the replacement landed AFTER the shared writer, not before it.
+        assert outcome.metrics_path is not None
+        assert outcome.metrics_path.exists()
+
+
+class TestWriteReportText:
+    """The atomic replace that widens the shared writer's report."""
+
+    def test_it_replaces_an_existing_report_leaving_no_temp_sibling(self, tmp_path):
+        m = _mod()
+        path = tmp_path / f'report-{STAMP}.txt'
+        path.write_text('the shared writer\'s minimal metric table\n', encoding='utf-8')
+
+        m.write_report_text(path, 'the fuller sectioned text\n')
+
+        assert path.read_text(encoding='utf-8') == 'the fuller sectioned text\n'
+        # mkstemp creates a real sibling under the shared artifact root the
+        # dashboard reads as plain files; one left behind is a permanent
+        # half-written report beside a valid one.
+        assert [p.name for p in tmp_path.iterdir()] == [path.name]
+
+    def test_an_interrupted_write_leaves_neither_a_temp_file_nor_a_truncation(
+        self, tmp_path, monkeypatch,
+    ):
+        """``except BaseException``, not ``except Exception``, and deliberately.
+
+        A KeyboardInterrupt or a cancellation between mkstemp and the replace
+        is exactly when the temp file would be orphaned, and those do not
+        derive from ``Exception``. The previous report must also survive
+        intact: the whole reason this is not a ``write_text`` is that a reader
+        must never see a truncated report where a valid one was.
+        """
+        m = _mod()
+        path = tmp_path / f'report-{STAMP}.txt'
+        path.write_text('the previous report\n', encoding='utf-8')
+
+        class _Interrupted(BaseException):
+            pass
+
+        def _explode(*args, **kwargs):
+            raise _Interrupted('interrupted between write and replace')
+
+        monkeypatch.setattr(m.os, 'replace', _explode)
+
+        with pytest.raises(_Interrupted):
+            m.write_report_text(path, 'never lands\n')
+
+        assert path.read_text(encoding='utf-8') == 'the previous report\n'
+        assert [p.name for p in tmp_path.iterdir()] == [path.name]
+
 
 def _sweep(
     monkeypatch, tmp_path, double, *,
     taskmaster_statuses=None,
     scan_limit=100,
     project_ids=('dark_factory',),
+    write_metrics=False,
     **run_kwargs,
 ):
     """Run the sweep band directly and return its outcome.
@@ -1904,9 +2209,10 @@ def _sweep(
     ProbeOutcome precedent), so what a run DISCLOSED is answerable without a
     test-only global in the script and without pattern-matching English.
 
-    *project_ids* and ``**run_kwargs`` are passed through verbatim so a test
-    can drive the real band at a non-default depth or project scope rather
-    than re-implementing the call.
+    *project_ids*, *write_metrics* and ``**run_kwargs`` are passed through
+    verbatim so a test can drive the real band at a non-default depth, project
+    scope, or with the artifacts actually written, rather than re-implementing
+    the call.
     """
     import asyncio  # noqa: PLC0415
 
@@ -1927,7 +2233,7 @@ def _sweep(
         out_root=tmp_path,
         stamp=STAMP,
         config=types.SimpleNamespace(taskmaster=taskmaster),
-        write_metrics=False,
+        write_metrics=write_metrics,
         **run_kwargs,
     ))
 
@@ -1957,6 +2263,18 @@ class TestRunSweepProjectScope:
         # which call site passed what.
         assert 'dark_factory' in message
         assert 'other_project' in message
+
+    def test_no_project_id_at_all_is_refused_too(self, monkeypatch, tmp_path):
+        """Zero ids would emit a clean-looking artifact for a corpus never read.
+
+        The same guard, in the other direction: nothing would be scrolled, so
+        every family would report zero exposure and the artifact would land
+        under a stamp leaf α trends — an unread corpus presented as a measured
+        one.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            _sweep(monkeypatch, tmp_path, _seeded_double(), project_ids=())
+        assert 'exactly ONE project' in str(excinfo.value)
 
     def test_one_id_repeated_is_not_several_projects(self, monkeypatch, tmp_path):
         """The guard counts DISTINCT ids — the band already de-duplicates."""
@@ -2007,6 +2325,70 @@ class TestReport:
         assert {
             'superseded_surfacing', 'dangling_pointers', 'task_terminal_staleness',
         } <= set(sections)
+
+    def test_the_swept_scope_is_named_rather_than_left_to_be_inferred(
+        self, monkeypatch, tmp_path,
+    ):
+        """The largest narrowing in the run, and the one nothing else names.
+
+        Only the Mem0-primary categories are reachable by a payload scroll, so
+        half the category vocabulary is out of scope on every run. Without a
+        section saying so, the only trace is the ``scanned_<category>`` rows —
+        which a reader can decode only if they already know six categories
+        exist and which three a Qdrant scroll cannot reach.
+        """
+        m = _mod()
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+
+        assert 'scope' in sections
+        text = sections['scope'].text
+        # The categories the run ACTUALLY scrolled, named one by one.
+        for category in m.SWEEP_CATEGORIES:
+            assert category in text
+        # And that the rest of the vocabulary was never in reach — the claim a
+        # low count must not be read against.
+        assert 'scroll_by_metadata' in text
+
+    def test_the_scope_section_names_what_the_run_swept_not_the_default(
+        self, monkeypatch, tmp_path,
+    ):
+        """A scope line copied from the module default could describe another run.
+
+        ``fetch_pointer_records`` takes its categories from the caller, so the
+        one honest source is the scan's own per-category stats.
+        """
+        double = _ServiceDouble(scrolls={'procedural_knowledge': []})
+        outcome = _sweep(monkeypatch, tmp_path, double)
+        scope = {s.key: s for s in outcome.sections}['scope']
+
+        swept = list(outcome.scan_stats)
+        assert swept  # the premise: something was scanned
+        for category in swept:
+            assert category in scope.text
+
+    def test_family_1s_unsearchable_edges_are_named_beside_its_denominator(
+        self, monkeypatch, tmp_path,
+    ):
+        """A shrunken comparable-pair count must never be unexplained.
+
+        Two supersedes edges here are never searched — one with no successor
+        text, one whose target is not a memory id — so neither can join
+        ``pairs_comparable``. The section that publishes that denominator is
+        where the narrowing has to be stated.
+        """
+        double = _ServiceDouble(scrolls={'procedural_knowledge': [
+            _raw_point('rec-blank', {'supersedes': UUID_A}),
+            _raw_point('rec-bad', {'data': 'has text', 'supersedes': [{'id': UUID_C}]}),
+        ]})
+        outcome = _sweep(monkeypatch, tmp_path, double)
+        sections = {s.key: s for s in outcome.sections}
+
+        assert outcome.series.corpus.counts['surfacing_edges_unsearchable'] == 2
+        assert '2' in sections['superseded_surfacing'].text
+        # Counted here, NAMED under the disclosures that already own them:
+        # a non-id target is a malformed pointer, a blank source is unkeyable.
+        assert 'rec-bad' in sections['malformed_pointers'].text
+        assert 'rec-blank' in sections['unkeyable_successor_edges'].text
 
     def test_an_unmeasured_family_is_named_rather_than_omitted_silently(
         self, monkeypatch, tmp_path,
