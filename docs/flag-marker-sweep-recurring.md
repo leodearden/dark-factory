@@ -11,6 +11,62 @@ wired it into anything that actually runs it, so the backlog only grew
 script into an automated, recurring systemd-timer drain so the backlog
 stays non-growing without any human running it by hand.
 
+### Scope: which pool this timer actually drains (task 3897)
+
+This timer's scope is the **legacy `source`-tagged pool** —
+`{'source': 'stage1_flag_marker'}` — and nothing else. As measured on
+2026-08-09 that filter matches **0 records in both `dark_factory` and
+`reify`**, so the nightly run is currently a no-op by construction.
+
+It is **not** the collector for the live Stage-1 → Stage-2 relay pool
+(`{'flag_for_stage2': True}`, 61 records in `dark_factory` and 80 in
+`reify` at the same measurement). That pool is drained in-cycle by
+`_sweep_stale_mem0_flag_for_stage2_markers` (task 2966,
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`),
+which runs unconditionally per-project every reconciliation cycle and
+age-GCs on a rolling 14-day window. Those records are **not** uncollected,
+and this script deliberately counts them without ever deleting them — see
+the sweep script's "Why the flag_for_stage2 pool is censused, never deleted
+here" docstring section.
+
+## Reading the output: `0 swept` is not automatically a clean bill
+
+Because the enumeration filter above matches nothing, the nightly run
+prints `orphan_count: 0` every night, and `--check`'s `backlog_verdict(0,
+N)` holds unconditionally. Neither is evidence of health on its own: both
+are counts taken against a pool the filter cannot see.
+
+Task 3897 makes that legible. Every run now emits a `cross_check` block in
+its JSON report:
+
+```json
+"cross_check": {
+  "source_total": 0,
+  "flag_for_stage2_total": 61,
+  "blind_spot": true,
+  "probe_failed": false
+}
+```
+
+- **`blind_spot: true`** — this sweep matched 0 records while a non-empty
+  adjacent `flag_for_stage2` population exists. Read `orphan_count: 0` as
+  "saw nothing", not "there was nothing". A matching WARNING naming both
+  counts is logged, so it also lands in
+  `journalctl --user -u fused-memory-flag-marker-sweep.service`.
+- **`blind_spot: false` with both totals 0** — a genuine no-op.
+- **`probe_failed: true`** (with `flag_for_stage2_total: null`) — the census
+  probe itself failed; `blind_spot` is then always `false`, because an
+  unobserved population is never reported as an observed blind spot. The
+  sweep is unaffected: the probe is count-only and can never alter the
+  delete set or abort a run.
+
+`--fail-on-blind-spot` (opt-in, default off) escalates an observed blind
+spot to exit 1 so a `before_done` predicate can gate on it. It is off by
+default for the same reason `--check` is absent from the recurring service
+(see below): the `flag_for_stage2` pool is a healthy rolling window that is
+legitimately never empty, so a gate keyed on its non-emptiness would fail
+forever and teach operators to ignore it. A failed probe never trips it.
+
 ## Install / enable
 
 Run on the host (not from a task worktree — see "Why this is an
@@ -115,3 +171,22 @@ healthy; a count that isn't shrinking at all across multiple nightly runs
 means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.
+
+**Caveat (task 3897): as of 2026-08-09 this probe returns 0**, and a 0 here
+does not distinguish "the drain worked" from "the timer never fired" —
+both render identically against an already-empty pool. To confirm the timer
+is actually firing, check `systemctl --user list-timers` and the journal
+directly rather than inferring it from this count. To see the adjacent
+relay pool the timer does **not** drain (and must not), probe it
+explicitly:
+
+```python
+mcp__fused-memory__count_memories_by_metadata(
+    project_id="dark_factory", filters={"flag_for_stage2": True},
+)
+```
+
+A non-zero result there is expected and healthy — it is the in-cycle
+collector's rolling 14-day window, not a backlog. Note the boolean `True`
+is load-bearing: Qdrant payload filters are type-sensitive, and the string
+variant `{"flag_for_stage2": "true"}` matches 0.
