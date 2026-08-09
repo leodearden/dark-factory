@@ -757,7 +757,11 @@ async def test_worker_note_created_and_record_task_run_under_write_lock(
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
 
-        await asyncio.sleep(0.2)
+        await poll_until(
+            lambda: len(call_order) >= 2,
+            timeout=10.0,
+            message='worker did not call both note_created and record_task',
+        )
 
     # Both were called in order: note_created before record_task
     assert len(call_order) == 2, f'Expected 2 calls, got {call_order}'
