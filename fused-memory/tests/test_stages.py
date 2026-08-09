@@ -7061,10 +7061,15 @@ class TestSweepStaleMem0FlagMarkers:
             assert kwargs.get('causation_id') == 'r1'
             assert kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
 
-        memory_service.get_memories_by_metadata.assert_awaited_once()
-        call = memory_service.get_memories_by_metadata.call_args
-        filters = call.kwargs.get('filters') or {}
-        assert filters == {'source': 'stage1_flag_marker'}
+        # task 3915: enumeration now probes BOTH key spellings — one await
+        # per filter variant, not a single {'source': ...}-only scroll.
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        scrolled_filters = [
+            call.kwargs.get('filters') or {}
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in scrolled_filters
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
 
         # Deterministic scroll only — semantic search must never be used for GC.
         memory_service.search.assert_not_awaited()
@@ -7331,9 +7336,15 @@ class TestSweepStaleMem0FlagMarkers:
         result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
 
         assert result == 0
-        memory_service.count_memories_by_metadata.assert_awaited_once()
-        call = memory_service.count_memories_by_metadata.call_args
-        assert call.kwargs.get('filters') == {'source': 'stage1_flag_marker'}
+        # task 3915: short-circuit requires EVERY variant to confirm zero —
+        # one probe per filter variant, not a single {'source': ...}-only probe.
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
         memory_service.get_memories_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -7366,7 +7377,8 @@ class TestSweepStaleMem0FlagMarkers:
         )
 
         assert result == 1
-        memory_service.get_memories_by_metadata.assert_awaited_once()
+        # task 3915: the fail-open scroll still runs once per filter variant.
+        assert memory_service.get_memories_by_metadata.await_count == 2
 
     @pytest.mark.asyncio
     async def test_persistence_markers_sweep_never_probes_count(self):

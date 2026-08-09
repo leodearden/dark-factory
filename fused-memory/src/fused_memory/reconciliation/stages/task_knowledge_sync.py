@@ -9,7 +9,7 @@ import itertools
 import json
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -883,6 +883,26 @@ _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# Enumeration filter variants for the pool above (task 3915). The canonical
+# retired writer (flag_dedup._persist_marker, flag_dedup.py:849-856) always
+# set BOTH 'source' and 'kind' to 'stage1_flag_marker'. But at least one
+# live record (measured: know_live marker a5732b3b, 37 days old) was
+# instead written by an LLM recon agent via the add_memory MCP tool, which
+# set 'kind' but omitted 'source' entirely — nothing at the add_memory
+# write boundary normalizes these keys, the same un-normalized-LLM-metadata
+# failure class task 2966 already documented for flag_for_stage2 (see the
+# type-drift note below). A {'source': ...}-only filter therefore silently
+# misses that cohort forever: measured live counts are know_live: 0 under
+# {'source': 'stage1_flag_marker'} vs 1 under {'kind': 'stage1_flag_marker'}.
+# Qdrant payload filters are AND-only within one dict, so a
+# source=X OR kind=X predicate cannot be expressed in a single call — each
+# variant must be enumerated separately and the results unioned by id (see
+# _sweep_stale_mem0_pool's enum_filters parameter).
+_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
+    {'source': _STAGE1_FLAG_MARKER_MEM0_SOURCE},
+    {'kind': _STAGE1_FLAG_MARKER_MEM0_SOURCE},
+)
+
 # Age-based GC for the Mem0-only flag_for_stage2 Stage-1 -> Stage-2 relay pool
 # (task 2966). flag_for_stage2 markers are written ONLY to Mem0 by the
 # Stage-1 flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no
@@ -1136,7 +1156,7 @@ async def _sweep_stale_mem0_pool(
     now: datetime | None = None,
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
-    enum_filters: dict | None = None,
+    enum_filters: dict | Sequence[dict] | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1232,25 +1252,70 @@ async def _sweep_stale_mem0_pool(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
-    filters = enum_filters if enum_filters is not None else {'source': source}
+    # Normalize enum_filters to a list of one-or-more filter variants (task
+    # 3915): a bare dict is the pre-3915 single-filter shape (one-element
+    # list); None preserves the {'source': source} default; a Sequence[dict]
+    # (e.g. _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS) is a pool that
+    # cannot be identified by any single payload filter and must be
+    # enumerated once per variant, unioned below.
+    if enum_filters is None:
+        filter_variants: list[dict] = [{'source': source}]
+    elif isinstance(enum_filters, dict):
+        filter_variants = [enum_filters]
+    else:
+        filter_variants = list(enum_filters)
 
     if count_short_circuit:
-        try:
-            count = await memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters=filters,
-            )
-        except Exception:
-            count = None
-        if count == 0:
+        # Short-circuit ONLY when EVERY variant probe confirms an exact
+        # count of 0 — an any-variant-zero rule would reintroduce the task
+        # 3915 bug: know_live's {'source': ...} probe reports 0 today, and
+        # short-circuiting on it alone is exactly what hid the leaked
+        # {'kind': ...}-only marker. Each probe keeps the original
+        # try/except -> None fail-open shape, so a backend error can never
+        # be read as an empty pool.
+        all_variants_confirmed_zero = True
+        for variant_filters in filter_variants:
+            try:
+                count = await memory_service.count_memories_by_metadata(
+                    project_id=project_id,
+                    filters=variant_filters,
+                )
+            except Exception:
+                count = None
+            if count != 0:
+                all_variants_confirmed_zero = False
+        if all_variants_confirmed_zero:
             return 0
 
+    # Enumerate each filter variant and union the results by id (first
+    # occurrence wins) so a member matched by more than one variant (e.g.
+    # the canonical both-keys-present shape) is neither double-deleted nor
+    # double-counted. Any enumeration failure aborts the whole sweep for
+    # this cycle rather than operating on a partial picture of the pool —
+    # the same fail-safe posture as the prior single-filter enumeration.
     try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters=filters,
-            limit=scroll_limit,
-        )
+        members: list[dict] = []
+        merged_by_id: dict = {}
+        for variant_filters in filter_variants:
+            variant_members = await memory_service.get_memories_by_metadata(
+                project_id=project_id,
+                filters=variant_filters,
+                limit=scroll_limit,
+            )
+            if len(variant_members) >= scroll_limit:
+                logger.warning(
+                    'reconciliation.%s: enumerated %d of scroll_limit=%d %s records — scroll cap '
+                    'reached; older stale markers may remain uncollected this cycle; re-run with a '
+                    'higher scroll_limit.',
+                    log_name, len(variant_members), scroll_limit, source,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+            for member in variant_members:
+                mid = member.get('id')
+                if mid in merged_by_id:
+                    continue
+                merged_by_id[mid] = member
+                members.append(member)
     except Exception:
         logger.warning(
             'reconciliation.%s: get_memories_by_metadata failed for project_id=%s; skipping sweep',
@@ -1258,15 +1323,6 @@ async def _sweep_stale_mem0_pool(
             extra={'project_id': project_id, 'run_id': run_id},
         )
         return 0
-
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation.%s: enumerated %d of scroll_limit=%d %s records — scroll cap '
-            'reached; older stale markers may remain uncollected this cycle; re-run with a '
-            'higher scroll_limit.',
-            log_name, len(members), scroll_limit, source,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
 
     if not members:
         return 0
@@ -1519,6 +1575,7 @@ async def _sweep_stale_mem0_flag_markers(
         now=now,
         scroll_limit=scroll_limit,
         count_short_circuit=True,
+        enum_filters=_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS,
     )
 
 
