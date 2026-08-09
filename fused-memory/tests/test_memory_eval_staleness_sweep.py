@@ -841,6 +841,7 @@ class TestBuildSeries:
             'successor_edges_unkeyable',
             'surfacing_pairs_observed',
             'surfacing_queries_degraded',
+            'surfacing_search_depth',
             'task_terminal_entry_task_pairs',
             'pointers_supersedes_examined',
             'pointers_supersedes_resolved',
@@ -862,10 +863,26 @@ class TestBuildSeries:
         )
         assert counts['surfacing_pairs_observed'] == len(inputs['surfacing'].records)
         assert counts['surfacing_queries_degraded'] == len(inputs['surfacing'].degraded)
+        assert counts['surfacing_search_depth'] == m.SURFACING_SEARCH_DEPTH
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
         for key, row in census.by_key.items():
             for field_name, value in row.items():
                 assert counts[f'pointers_{key}_{field_name}'] == value
+
+    def test_the_surfacing_search_depth_rides_in_the_artifact(self):
+        """The retrieval depth SETS family 1's denominator, so it is a narrowing.
+
+        A pair whose superseded member ranks below the depth never appears in
+        the ranked list, so it is dropped from ``pairs_comparable`` exactly the
+        way ``--scan-limit`` drops records from the census — and that cap is
+        disclosed. Undisclosed, a later change from 10 to 20 would move the
+        trend leaf α reads with nothing in the series to explain it, which is
+        the one reading of a count-shift this runner must never permit.
+        """
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['surfacing_depth'] = 25
+        assert m.build_series(**inputs).corpus.counts['surfacing_search_depth'] == 25
 
     def test_a_degraded_surfacing_query_reaches_the_machine_readable_artifact(self):
         """Prose-only disclosure is a silent cap for every JSON consumer.
@@ -1619,6 +1636,9 @@ class _ServiceDouble:
         self.scroll_calls: list[tuple[str, dict, int]] = []
         self.id_reads: list[str] = []
         self.search_calls: list[str] = []
+        # Recorded separately from search_calls so the depth a run actually
+        # searched at can be asserted against the depth it DISCLOSED.
+        self.search_limits: list[int] = []
         self.initialized = False
         self.closed = False
         self.mem0 = self
@@ -1634,6 +1654,7 @@ class _ServiceDouble:
 
     async def search(self, query, project_id='main', limit=10, **kwargs):
         self.search_calls.append(query)
+        self.search_limits.append(limit)
         seeded = self._searches.get(query, [])
         # A seeded SearchResults is handed back VERBATIM: its degraded /
         # failed_stores ride on a list SUBCLASS and would not survive the
@@ -1870,12 +1891,22 @@ class TestArtifactEmission:
         assert list(tmp_path.iterdir()) == []
 
 
-def _sweep(monkeypatch, tmp_path, double, *, taskmaster_statuses=None, scan_limit=100):
+def _sweep(
+    monkeypatch, tmp_path, double, *,
+    taskmaster_statuses=None,
+    scan_limit=100,
+    project_ids=('dark_factory',),
+    **run_kwargs,
+):
     """Run the sweep band directly and return its outcome.
 
     ``run_sweep`` returns the sections under their machine keys (β's
     ProbeOutcome precedent), so what a run DISCLOSED is answerable without a
     test-only global in the script and without pattern-matching English.
+
+    *project_ids* and ``**run_kwargs`` are passed through verbatim so a test
+    can drive the real band at a non-default depth or project scope rather
+    than re-implementing the call.
     """
     import asyncio  # noqa: PLC0415
 
@@ -1891,13 +1922,73 @@ def _sweep(monkeypatch, tmp_path, double, *, taskmaster_statuses=None, scan_limi
     )
     return asyncio.run(_mod().run_sweep(
         double,
-        project_ids=('dark_factory',),
+        project_ids=project_ids,
         scan_limit=scan_limit,
         out_root=tmp_path,
         stamp=STAMP,
         config=types.SimpleNamespace(taskmaster=taskmaster),
         write_metrics=False,
+        **run_kwargs,
     ))
+
+
+class TestRunSweepProjectScope:
+    """One project per run, enforced rather than merely documented."""
+
+    def test_more_than_one_project_id_is_refused_rather_than_under_reported(
+        self, monkeypatch, tmp_path,
+    ):
+        """The failure this refuses is silent and in the wrong direction.
+
+        ``get_memory_by_id`` is project-scoped but the resolution map is keyed
+        by bare target id, so sweeping two projects lets a target present in
+        project A mark project B's ref RESOLVED — a dangling pointer reported
+        as healthy, by a runner whose whole job is to find dangling pointers.
+        A docstring warning is the weakest possible guard for that; the run
+        must not start.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            _sweep(
+                monkeypatch, tmp_path, _seeded_double(),
+                project_ids=('dark_factory', 'other_project'),
+            )
+        message = str(excinfo.value)
+        # Names the ids it was given, so the operator does not have to guess
+        # which call site passed what.
+        assert 'dark_factory' in message
+        assert 'other_project' in message
+
+    def test_one_id_repeated_is_not_several_projects(self, monkeypatch, tmp_path):
+        """The guard counts DISTINCT ids — the band already de-duplicates."""
+        double = _seeded_double()
+        outcome = _sweep(
+            monkeypatch, tmp_path, double,
+            project_ids=('dark_factory', 'dark_factory'),
+        )
+        assert outcome.series.corpus.project_id == 'dark_factory'
+        # De-duplicated before the scroll, not after: a repeat must not double
+        # the scanned counts either.
+        assert [call[0] for call in double.scroll_calls] == ['dark_factory'] * len(
+            _mod().SWEEP_CATEGORIES,
+        )
+
+    def test_the_disclosed_depth_is_the_depth_the_run_searched_at(
+        self, monkeypatch, tmp_path,
+    ):
+        """A disclosure that cannot drift from the value it describes.
+
+        The depth is read once in ``run_sweep`` and used twice — for the search
+        and for the disclosure — so the artifact cannot claim a depth the run
+        did not use.
+        """
+        double = _seeded_double()
+        outcome = _sweep(monkeypatch, tmp_path, double, surfacing_depth=37)
+
+        assert double.search_limits == [37]
+        assert outcome.series.corpus.counts['surfacing_search_depth'] == 37
+        # And the human-facing report names it beside the denominator it sets.
+        sections = {section.key: section for section in outcome.sections}
+        assert '37' in sections['superseded_surfacing'].text
 
 
 class TestReport:
@@ -2083,8 +2174,15 @@ class TestReport:
         assert 'rec-mixed' in text
         assert '4802' in text
         assert 'done' in text
-        # But not as a claim about 4802's liveness, which was never measured.
-        assert 'claims task 4802 is live' not in text
+        # And attributed in the SANCTIONED shape. Asserted positively, not as
+        # the absence of one hand-picked over-claiming sentence: a negative
+        # prose assertion only rules out the exact wording it names, so
+        # rewording the renderer to "asserts task 4802 is live" would commit
+        # the very over-claim while still passing. Pinning the honest line
+        # instead fails on ANY reword, which makes changing it a decision.
+        assert (
+            'rec-mixed frames live task state and references task 4802 (done)'
+        ) in text
 
     def test_the_unresolved_targets_are_named_not_just_counted(
         self, monkeypatch, tmp_path,

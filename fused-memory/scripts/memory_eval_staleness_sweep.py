@@ -146,6 +146,25 @@ TRIPWIRE_ITEM_PREFIX = 's-'
 """``TripwireItem.item_key`` shape. A STORED key (α's grandfather set persists
 it), not a display string."""
 
+SURFACING_SEARCH_DEPTH = 10
+"""How deep each family (1) search looks — and therefore that family's
+DENOMINATOR.
+
+A pair whose superseded member ranks below this depth never appears in the
+ranked list, so it is dropped from ``pairs_comparable`` in exactly the sense
+``--scan-limit`` drops records from the census. That makes the depth a
+narrowing, and every narrowing in this runner is disclosed: it rides in
+``corpus.counts`` as ``surfacing_search_depth`` and is named in the family's
+report section. Undisclosed, a later change from 10 to 20 would move the trend
+leaf α reads with nothing in the series to explain it, which is the one
+reading of a count-shift this runner must never permit.
+
+Deliberately not a CLI flag: the depth is part of what the metric MEANS, and a
+series whose denominator moved run to run at an operator's discretion would not
+be a trend. Changing it is a decision recorded here, in one place, and visible
+in every artifact written after it.
+"""
+
 _DEFAULT_METRICS_ROOT = str(Path(__file__).resolve().parent.parent / 'data' / 'memory-evals')
 """``fused-memory/data/memory-evals`` (M1 §3), resolved off THIS file.
 
@@ -853,6 +872,7 @@ def _disclosure_counts(
     staleness: StalenessObservation,
     malformed: int,
     refs: list[PointerRef],
+    surfacing_depth: int,
 ) -> dict[str, int]:
     """The narrowings that must ride along INSIDE the machine-readable artifact.
 
@@ -895,6 +915,15 @@ def _disclosure_counts(
     surfacing superseded entries produce the SAME artifact — a small (or zero)
     ``pairs_comparable`` with nothing to say why. β discloses the same count as
     ``degraded_queries``.
+
+    ``surfacing_search_depth`` is the only row here that is a PARAMETER rather
+    than an observation, and it belongs for the same reason ``--scan-limit``'s
+    firing does: it sets family (1)'s denominator, so it is a narrowing of the
+    population the metric was measured over. A pair whose superseded member
+    ranks below the depth is dropped from ``pairs_comparable``, indistinguishably
+    from one the corpus genuinely stopped surfacing. Recorded on every run, a
+    later change to the depth explains its own step in leaf α's trend; recorded
+    nowhere, it looks like the corpus moved.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
@@ -902,6 +931,7 @@ def _disclosure_counts(
         'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
         'surfacing_pairs_observed': len(surfacing.records),
         'surfacing_queries_degraded': len(surfacing.degraded),
+        'surfacing_search_depth': surfacing_depth,
         'task_terminal_entry_task_pairs': len(staleness.records),
     }
     for key, row in sorted(census.by_key.items()):
@@ -921,6 +951,7 @@ def build_series(
     *,
     refs: list[PointerRef],
     eval_id: str = EVAL_ID,
+    surfacing_depth: int = SURFACING_SEARCH_DEPTH,
 ):
     """Assemble the M1 metric series for one sweep run.
 
@@ -932,6 +963,13 @@ def build_series(
     disclosure alone — no metric is computed from it. It is required rather
     than defaulted because a caller that forgot it would silently disclose a
     read plan of zero, and this runner exists to disclose.
+
+    *surfacing_depth* is the retrieval depth family (1) was actually measured
+    at, disclosed for the same reason. Unlike *refs* it defaults, because
+    there IS a right answer when a caller does not say
+    (:data:`SURFACING_SEARCH_DEPTH`, the same default
+    :func:`fetch_surfacing_ranks` searches at) — whereas there is no right
+    default ref list.
 
     The result is validated before it is returned, so an aggregation bug
     surfaces in this runner rather than in leaf α's evaluator — the M1
@@ -993,6 +1031,7 @@ def build_series(
     disclosures = _disclosure_counts(
         census, surfacing, staleness,
         len(malformed_pointer_refs(census.unresolved_refs)), refs,
+        surfacing_depth,
     )
     for key, value in disclosures.items():
         if key in counts:
@@ -1178,7 +1217,7 @@ async def fetch_surfacing_ranks(
     project_id: str,
     refs: list[PointerRef],
     *,
-    limit: int = 10,
+    limit: int = SURFACING_SEARCH_DEPTH,
 ) -> SurfacingObservation:
     """Score every ``supersedes`` edge in *refs* against its own search.
 
@@ -1197,6 +1236,13 @@ async def fetch_surfacing_ranks(
     An edge whose successor content is empty is skipped rather than searched
     with an empty query: an empty query's ranking is arbitrary, and scoring
     against it would manufacture inversions from noise.
+
+    *limit* is the retrieval depth, and it SETS this family's denominator — a
+    pair whose superseded member ranks below it is dropped from
+    ``pairs_comparable`` rather than counted as not-surfacing. It is therefore
+    disclosed alongside the metric, not left implicit; see
+    :data:`SURFACING_SEARCH_DEPTH`, which is the single place the value is
+    chosen and the value ``run_sweep`` both searches at and discloses.
 
     The search is pinned to ``stores=['mem0']`` and to :data:`SWEEP_CATEGORIES`
     rather than left to ``ReadRouter``, and that pin is what makes the metric
@@ -1408,6 +1454,7 @@ def sweep_report_sections(
     scan_stats: dict[str, dict[str, int]],
     terminal_join: TerminalTaskJoin,
     refs: Sequence[PointerRef] = (),
+    surfacing_depth: int = SURFACING_SEARCH_DEPTH,
 ) -> tuple[ReportSection, ...]:
     """The report, decomposed — one block per family, then the disclosures.
 
@@ -1449,6 +1496,10 @@ def sweep_report_sections(
     sections.append(ReportSection('superseded_surfacing', (
         '',
         'Family 1 — superseded entries still surfacing',
+        # The depth sits beside the denominator it sets: a pair whose
+        # superseded member ranked below it was never comparable, and a reader
+        # comparing two runs needs to know whether that number moved.
+        f'  search depth (sets the denominator): {surfacing_depth}',
         f'  comparable pairs (both returned): {surfacing.pairs_comparable}',
         f'  superseded above its successor:   {surfacing.still_surfacing}',
         *_elided(
@@ -1668,6 +1719,14 @@ def corpus_project_id(project_ids: tuple[str, ...]) -> str:
     stamp, so a multi-project run needs a stable joined identifier. Single
     project in, that project out — β's shape, so the two leaves' artifacts
     stay comparable.
+
+    The join is UNREACHABLE from this leaf: :func:`run_sweep` refuses more than
+    one distinct id, because γ's resolution map is keyed by bare target id
+    where β's observations are not. The helper is kept rather than inlined so
+    the two leaves keep one spelling of the corpus id, and so the day
+    per-project resolution keys land the only change here is deleting that
+    guard. It is not an invitation to pass several ids today — that call
+    raises.
     """
     return '+'.join(project_ids)
 
@@ -1682,6 +1741,7 @@ async def run_sweep(
     config: Any = None,
     eval_id: str = EVAL_ID,
     write_metrics: bool = True,
+    surfacing_depth: int = SURFACING_SEARCH_DEPTH,
 ) -> SweepOutcome:
     """Sweep *project_ids* against *memory* and assemble the run's artifacts.
 
@@ -1693,18 +1753,34 @@ async def run_sweep(
     names which families went unmeasured and that answer comes from the
     assembled series — a ``--no-metrics`` run must not be a less honest one.
 
-    ONE project id per run. The CLI enforces this (``--project-id`` is
-    single-valued) and *project_ids* is a tuple only so the loop below reads
-    the same as the rest of the band. Passing several is NOT supported and
-    would under-report: ``get_memory_by_id`` is project-scoped, but the
-    resolution map is keyed by target id alone, so a target present in project
-    A would mark project B's ref RESOLVED — silently, and in the loud
-    direction :func:`dangling_census` argues against. Keying resolution by
-    ``(project_id, target)`` means putting the project on
+    ONE project id per run, ENFORCED below rather than merely documented.
+    *project_ids* is a tuple only so the loop reads the same as the rest of the
+    band. Several distinct ids would under-report: ``get_memory_by_id`` is
+    project-scoped, but the resolution map is keyed by target id alone, so a
+    target present in project A would mark project B's ref RESOLVED — a
+    dangling pointer reported as healthy, silently, and in the opposite
+    direction from the one :func:`dangling_census` argues for. Keying
+    resolution by ``(project_id, target)`` means putting the project on
     :class:`PointerRef`, which is a wider change than this leaf; until that
-    lands, do not call this with more than one id.
+    lands, the run does not start. A docstring warning is the weakest possible
+    guard for a defect this module elsewhere insists must fail loudly, and the
+    CLI's single-valued ``--project-id`` only guards the CLI — this function is
+    called directly by the scheduled runner (leaf ε) too.
     """
     from shared.memory_eval_metrics import run_stamp, write_metric_series  # noqa: PLC0415
+
+    distinct_projects = tuple(dict.fromkeys(project_ids))
+    if len(distinct_projects) > 1:
+        raise ValueError(
+            'run_sweep sweeps ONE project per run and was given '
+            f'{len(distinct_projects)}: {", ".join(distinct_projects)}. The '
+            'resolution map is keyed by bare target id while '
+            'get_memory_by_id is project-scoped, so a target present in one '
+            "project would mark another project's pointer resolved — a "
+            'dangling pointer reported as healthy. Run the sweep once per '
+            'project (each emits its own artifact), or land per-project '
+            'resolution keys first.'
+        )
 
     effective_stamp = stamp or run_stamp()
 
@@ -1714,7 +1790,7 @@ async def run_sweep(
     resolution: dict[str, bool] = {}
     surfacings: list[SurfacingObservation] = []
 
-    for project_id in dict.fromkeys(project_ids):
+    for project_id in distinct_projects:
         project_records, project_stats = await fetch_pointer_records(
             memory, project_id, scan_limit=scan_limit,
         )
@@ -1729,7 +1805,9 @@ async def run_sweep(
         resolution.update(
             await resolve_pointer_targets(memory, project_id, project_refs),
         )
-        surfacings.append(await fetch_surfacing_ranks(memory, project_id, project_refs))
+        surfacings.append(await fetch_surfacing_ranks(
+            memory, project_id, project_refs, limit=surfacing_depth,
+        ))
 
     terminal_join = (
         await fetch_terminal_task_ids(config) if config is not None
@@ -1759,10 +1837,11 @@ async def run_sweep(
         surfacing=surfacing,
         staleness=staleness,
         corpus_counts=corpus_counts,
-        project_id=corpus_project_id(tuple(project_ids)),
+        project_id=corpus_project_id(distinct_projects),
         stamp=effective_stamp,
         refs=refs,
         eval_id=eval_id,
+        surfacing_depth=surfacing_depth,
     )
 
     sections = sweep_report_sections(
@@ -1774,6 +1853,7 @@ async def run_sweep(
         scan_stats=scan_stats,
         terminal_join=terminal_join,
         refs=refs,
+        surfacing_depth=surfacing_depth,
     )
     report = join_report_sections(sections)
 
