@@ -33,7 +33,7 @@ import logging
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -4794,7 +4794,7 @@ def _chokepoint_ranges(tree: ast.Module, cls_name: str, method_name: str) -> lis
     return ranges
 
 
-def _is_teardown_step_call(node: ast.AST) -> bool:
+def _is_teardown_step_call(node: ast.AST) -> TypeGuard[ast.Call]:
     """True for either HALF of the verify-abort teardown recipe.
 
     The abort half is any ``<something>._abort_remote_verify(...)``; the name
@@ -4805,6 +4805,11 @@ def _is_teardown_step_call(node: ast.AST) -> bool:
     futures) to guard unanchored. Exact-matching ``cancel`` also keeps the
     neighbouring ``verify_task.cancelled()`` / ``.done()`` / ``.result()``
     peeks out of the offender list.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so a True result
+    narrows the walked ``ast.AST`` to ``ast.Call`` at the call site — the
+    offender list reads ``.lineno``, which lives on ``ast.expr``, not on the
+    ``ast.AST`` base that :func:`ast.walk` yields.
     """
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
         return False
