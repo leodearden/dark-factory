@@ -115,36 +115,37 @@ def as_unreadable_file_error(exc: BaseException) -> OSError:
     than copy-pasted and test-pinned in sync (reviewer_comprehensive
     /duplication, task 3214 amendment pass).
 
-    Why normalization is needed at all: an unreadable transcript surfaces as
-    FOUR different exception types, only the first of which is already an
-    ``OSError``::
+    Why normalization is needed at all: with the archive stored plain (task
+    3618) an unreadable transcript surfaces as exactly ONE shape that is not
+    already an ``OSError``::
 
         undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
 
-    The last three are exactly what a fire-and-forget writer produces when a
-    unit is killed mid-write, a file is read while still being compressed, or
-    a stored byte flips; the archived fleet transcripts these readers walk are
-    live runtime state, so all three are expected shapes, not theoretical
-    ones. The decode shape is the odd one out in two ways worth stating: it is
-    the only shape reachable on a PLAIN ``.jsonl`` path as well as a ``.gz``
-    one (both are opened under strict ``encoding='utf-8'``), and it arrives as
-    a ``ValueError`` subclass, so an ``except OSError``-only handler misses it
-    however the gzip shapes are handled. Left un-normalized, any of them
-    escapes every consumer's degrade path and aborts a whole-archive walk over
-    one bad file.
+    That shape is reachable on any transcript, because the reader opens under
+    strict ``encoding='utf-8'`` and the archived fleet transcripts these
+    readers walk are live runtime state — a flipped byte in a file a killed
+    unit left behind is an expected shape, not a theoretical one. Being a
+    ``ValueError`` subclass it escapes an ``except OSError``-only handler
+    entirely, so left un-normalized it escapes every consumer's degrade path
+    and aborts a whole-archive walk over one bad file. Everything else an
+    unreadable file raises (a missing path, a permission failure, a read
+    error) already IS an ``OSError`` and only needs passing through.
+
+    The gzip container shapes this function once also normalized — bad magic,
+    a truncated stream, a corrupt body — are gone with the ``.gz`` archive
+    itself; the readers no longer open gzip, so they can no longer raise them.
 
     ``OSError`` is the normalized type because it is what ``sampling``,
     ``check_transcript_persistence`` and the cross-package
     ``memory_eval_transcript_corpus`` extractor already code against. The
     original message is preserved in the text, so a coverage report can still
-    tell a half-written transcript from a corrupted one from an undecodable
-    one — the decode shape gets its own wording rather than being labelled a
-    "gzip stream" failure, which would misdirect an operator reading a
-    disclosed reason for a plain ``.jsonl`` file.
+    tell an undecodable transcript from a merely missing or unopenable one —
+    the decode shape gets its own wording rather than a generic label, which
+    would misdirect an operator reading a disclosed reason.
 
-    Total and idempotent: an exception that is ALREADY an ``OSError`` (the bad
-    magic shape) is returned unchanged rather than double-wrapped, so a caller
-    can hand it anything it caught without first classifying it.
+    Total and idempotent: an exception that is ALREADY an ``OSError`` is
+    returned unchanged rather than double-wrapped, so a caller can hand it
+    anything it caught without first classifying it.
     """
     if isinstance(exc, OSError):
         return exc

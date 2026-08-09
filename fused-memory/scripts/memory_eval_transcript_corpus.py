@@ -714,15 +714,15 @@ def scan_archive(
     every fire-and-forget writer eventually produces — does not inflate it
     into a false alarm.
 
-    All FOUR unreadable-file shapes reach that ``except OSError`` — bad magic,
-    a truncated stream, a corrupt body, and a non-UTF-8 byte — because
-    ``legibility.inventory.as_unreadable_file_error`` normalizes them at the
-    reader seam. The handler is deliberately NOT widened here to also catch
-    ``EOFError``/``zlib.error``/``UnicodeDecodeError``: that helper is the one
-    answer to "which exceptions mean an unreadable file", and a second answer
-    at each call site is exactly what INV-5 forbids. The original message
-    survives normalization, so the disclosed ``parse_failures`` example still
-    says which shape it was.
+    With the archive stored plain (task 3618) the one unreadable-file shape
+    that is not already an ``OSError`` — a non-UTF-8 byte — still reaches that
+    ``except OSError``, because ``legibility.inventory.as_unreadable_file_error``
+    normalizes it at the reader seam. The handler is deliberately NOT widened
+    here to also catch ``UnicodeDecodeError``: that helper is the one answer to
+    "which exceptions mean an unreadable file", and a second answer at each
+    call site is exactly what INV-5 forbids. The original message survives
+    normalization, so the disclosed ``parse_failures`` example still says which
+    shape it was.
 
     A missing *root* is not an error here; it is zero transcripts found, which
     :func:`coverage_status` turns into ``no_input``.

@@ -539,13 +539,20 @@ def test_cli_exits_non_zero_when_any_file_failed(tmp_path):
     """(e) A non-zero failure count must be an EXIT CODE, not a warning buried
     in a log — this is a one-off migration whose failures an operator has to
     act on, which is why it diverges from gc_agent_transcripts' always-exit-0
-    sweep posture."""
+    sweep posture.
+
+    Pinned to the EXACT code, not merely non-zero: OPERATIONS.md §13 documents
+    three distinct values an operator triages on, so a `!= 0` assertion would
+    stay green while EXIT_FAILURES and EXIT_CONFLICTS swapped underneath the
+    runbook."""
     _write_truncated_gz(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
     _write_gz(tmp_path / "3618" / "enc" / "healthy.jsonl.gz", _payload())
 
     result = _run_cli("--root", str(tmp_path), "--apply")
 
-    assert result.returncode != 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == mig.EXIT_FAILURES, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
     summary = json.loads(result.stdout)
     assert summary["failed"] == 1
     assert summary["migrated"] == 1  # the healthy sibling still migrated
@@ -747,12 +754,15 @@ def test_cli_exits_non_zero_and_reports_conflicts(tmp_path):
     """(e) A conflict leaves a `.gz` on disk, which contradicts the runbook's
     `expect 0` confirmation — so it must carry an EXIT CODE, not just a counter
     the operator might not read. Distinct from the failure code: "needs
-    adjudication" is not "is damaged"."""
+    adjudication" is not "is damaged", and the runbook triages the two
+    differently, so this pins EXIT_CONFLICTS exactly rather than `!= 0`."""
     gz, twin, resumed = _write_resumed_session_conflict(tmp_path)
 
     result = _run_cli("--root", str(tmp_path), "--apply")
 
-    assert result.returncode != 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == mig.EXIT_CONFLICTS, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
     summary = json.loads(result.stdout)
     assert summary["conflicts"] == 1, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -762,6 +772,37 @@ def test_cli_exits_non_zero_and_reports_conflicts(tmp_path):
     )
     assert summary["failed"] == 0
     assert gz.exists()
+    assert twin.read_bytes() == resumed
+
+
+def test_cli_failures_outrank_conflicts_in_the_exit_code(tmp_path):
+    """(e) When BOTH shapes are present in one sweep, EXIT_FAILURES wins.
+
+    OPERATIONS.md §13 tells the operator to triage on the code, and the two
+    shapes want opposite responses: a conflict is adjudicated by hand and then
+    the run repeats, whereas a failure means a source could not be read at all
+    and something is damaged. Surfacing the milder code when both are present
+    would send the operator down the conflict path and leave the damaged file
+    unexamined, so the precedence is part of the contract — and it is invisible
+    to the two single-shape tests above, each of which would stay green with
+    the precedence inverted."""
+    gz, twin, resumed = _write_resumed_session_conflict(tmp_path)
+    _write_truncated_gz(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    assert result.returncode == mig.EXIT_FAILURES, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    summary = json.loads(result.stdout)
+    # Both counters non-zero: the code is a PRECEDENCE choice between two live
+    # conditions, not an artefact of the conflict having gone unnoticed.
+    assert summary["failed"] == 1, f"stdout={result.stdout!r}"
+    assert summary["conflicts"] == 1, f"stdout={result.stdout!r}"
+    # And both sources are still on disk, which is why step 4 of the runbook
+    # reconciles its residue against `conflicts + failed`.
+    assert gz.exists()
+    assert (tmp_path / "3618" / "enc" / "broken.jsonl.gz").exists()
     assert twin.read_bytes() == resumed
 
 

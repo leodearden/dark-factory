@@ -1154,8 +1154,13 @@ python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
 
 # 4. Confirm.
 find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
-#    expect 0 — or exactly the `conflicts` count from step 3, which are the
-#    files deliberately retained for you. Resolve those, then re-run 3 and 4.
+#    expect 0 — or exactly `conflicts + failed` from step 3. BOTH counters
+#    leave their `.gz` on disk: conflicts are the files deliberately retained
+#    for you to resolve, and a failed file retains its source precisely
+#    because it could not be corroborated. Account for the residue against
+#    that sum, not against `conflicts` alone, or a run that develops new
+#    failures during `--apply` reads as an unexplained leftover. Resolve
+#    both, then re-run 3 and 4.
 ```
 
 **Run this only AFTER the fleet has redeployed** past the task-3618 merge
@@ -1182,9 +1187,25 @@ yours:
 ```bash
 # For each path in conflict_paths — confirm the plain twin really is a superset
 # before deleting anything.
-zcat <sid>.jsonl.gz | diff - <(head -c "$(zcat <sid>.jsonl.gz | wc -c)" <sid>.jsonl) \
-  && rm <sid>.jsonl.gz
+(
+  set -o pipefail
+  gzip -t <sid>.jsonl.gz \
+    && n=$(zcat <sid>.jsonl.gz | wc -c) \
+    && zcat <sid>.jsonl.gz | diff - <(head -c "$n" <sid>.jsonl) \
+    && rm <sid>.jsonl.gz
+)
 ```
+
+**`gzip -t` and `pipefail` are load-bearing, not decoration.** A bare
+`zcat ... | diff ... && rm` takes its exit status from `diff`, never from
+`zcat`. A *damaged* `.gz` still emits a short prefix before it dies, so `diff`
+would compare that prefix against the same-length head of the twin, succeed,
+and the `&& rm` would delete the only copy of the unrecoverable tail — exactly
+the unverified destruction the sweep refuses to do on its own judgement.
+`gzip -t` rejects such a file up front; `pipefail` makes the comparison itself
+fail loudly if `zcat` dies mid-stream anyway. A `.gz` that fails `gzip -t` is
+not a conflict to resolve — it is a damaged archive copy, and the plain twin
+beside it is all you have.
 
 If the two disagree, do NOT delete: that is a genuinely divergent pair, and
 the archive copy is the only record of the pre-redeploy content.
