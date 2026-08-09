@@ -43,12 +43,14 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
 from fused_memory.backends.falkor_indices import (
+    IndexHeaderShapeError,
     IndexRecordShapeError,
     UnparsedIndexStatementError,
     expected_index_set,
     normalize_index_record,
     normalize_index_records,
     parse_index_statement,
+    resolve_header_positions,
 )
 
 
@@ -319,24 +321,27 @@ class TestExpectedIndexSet:
         expected = expected_index_set()
         assert {(label, entity_type, f, index_type) for f in fields} <= expected
 
-    def test_count_is_a_change_detector_not_the_contract(self):
-        """CHANGE-DETECTOR ONLY — NOT the contract.
+    def test_both_index_types_are_represented(self):
+        """A shape check, deliberately NOT a count.
 
-        Measured against **graphiti-core 0.28.2** on 2026-08-06: 38 specs, 26
-        RANGE + 12 FULLTEXT.
+        Measured 2026-08-06 under graphiti-core 0.28.2 the totals were 38 specs
+        (26 RANGE + 12 FULLTEXT), and an earlier revision asserted exactly that.
+        Those literals were removed: they go red on any legitimate graphiti
+        upgrade that adds or drops an index, which is the lock-step hand-copied
+        duplication INV-5 / PRD D3 exist to prevent, and a red count is
+        indistinguishable from a real parse regression.
+        ``test_every_upstream_statement_parses_with_zero_remainder`` already
+        covers the same ground derived FROM upstream, so the counts added
+        upgrade friction and no failure mode.
 
-        On a LEGITIMATE upstream change (graphiti adds or drops an index), UPDATE
-        these numbers — they are a cheap "something moved upstream, go look"
-        signal and nothing more.  The assertion that must NEVER be weakened is
-        ``test_every_upstream_statement_parses_with_zero_remainder``, which is
-        derived from upstream rather than copied from it.  Asserting a
-        hand-copied total AS the contract is exactly the lock-step duplication
-        this task exists to prevent (INV-5 / PRD D3).
+        What survives is the property that cannot silently rot: both halves of
+        the union are non-empty, so a generator returning ``[]`` (or a fan-out
+        that collapsed to one index type) is still caught.
         """
         expected = expected_index_set()
-        assert len(expected) == 38
-        assert len([s for s in expected if s[3] == 'RANGE']) == 26
-        assert len([s for s in expected if s[3] == 'FULLTEXT']) == 12
+        assert {spec for spec in expected if spec[3] == 'RANGE'}
+        assert {spec for spec in expected if spec[3] == 'FULLTEXT'}
+        assert {spec[3] for spec in expected} == {'RANGE', 'FULLTEXT'}
 
 
 class TestPlainEnumGotcha:
@@ -366,14 +371,31 @@ class TestPlainEnumGotcha:
         # at RUNTIME, where it quietly yields the neo4j set instead.  The
         # deliberate mis-call has to survive type-checking to be exercised.
         neo4j_statements = get_range_indices('falkordb')  # pyright: ignore[reportArgumentType]
-        assert len(neo4j_statements) == 27
+        # The DISCRIMINATING property, not a count.  An earlier revision asserted
+        # `len(...) == 27`; that pinned an upstream total in lock-step for no
+        # extra signal, since what makes the gotcha real is the SYNTAX the bare
+        # string yields, not how many statements of it there are.
+        assert neo4j_statements
         assert all('IF NOT EXISTS' in s for s in neo4j_statements)
 
     def test_enum_member_returns_the_falkordb_set(self):
         falkor_statements = get_range_indices(GraphProvider.FALKORDB)
-        assert len(falkor_statements) == 9
+        assert falkor_statements
         # IF NOT EXISTS is a FalkorDB syntax error, so its absence is load-bearing.
+        # (Also formerly a `len(...) == 9` assertion — dropped for the same reason.)
         assert not any('IF NOT EXISTS' in s for s in falkor_statements)
+
+    def test_the_two_providers_do_not_return_the_same_statements(self):
+        """The gotcha in one line, and it survives any upstream count change.
+
+        If a future graphiti made ``GraphProvider`` a ``StrEnum``, the bare
+        string would start returning the FalkorDB set and this would go red —
+        which is the moment to revisit the tripwire premise, not to silently
+        keep relying on it.
+        """
+        bare_string = get_range_indices('falkordb')  # pyright: ignore[reportArgumentType]
+        enum_member = get_range_indices(GraphProvider.FALKORDB)
+        assert list(bare_string) != list(enum_member)
 
     def test_the_neo4j_set_is_unparseable_which_is_what_makes_it_a_tripwire(self):
         # Deliberate mis-call again -- see test_bare_string_silently_returns_the_neo4j_set.
@@ -535,6 +557,65 @@ class TestNormalizeIndexRecords:
         with pytest.raises(IndexRecordShapeError):
             normalize_index_record(record)
 
+    @pytest.mark.parametrize(
+        'label',
+        [OrderedDict({'uuid': OrderedDict()}), None, '', 42],
+        ids=['options-dict', 'none', 'empty-string', 'int'],
+    )
+    def test_non_string_label_raises_the_documented_error_not_an_unhashable_typeerror(
+        self, label,
+    ):
+        """``label`` is exactly as bindable to the wrong column as ``entity_type`` was.
+
+        Without the guard a dict label sails through ``normalize_index_record``
+        and emits tuples like ``({'uuid': {}}, 'NODE', 'uuid', 'RANGE')``; the
+        set comprehension in ``normalize_index_records`` then dies with
+        ``TypeError: unhashable type: 'dict'`` — a traceback naming neither the
+        record nor the column, from a function whose contract says
+        ``IndexRecordShapeError``.  Asserting through the PLURAL entry point is
+        what pins that, since the singular one never raised the TypeError.
+        """
+        record = {
+            'label': label,
+            'field': ['uuid'],
+            'type': {'uuid': ['RANGE']},
+            'entity_type': 'NODE',
+        }
+        with pytest.raises(IndexRecordShapeError):
+            normalize_index_record(record)
+        with pytest.raises(IndexRecordShapeError):
+            normalize_index_records([record])
+
+    @pytest.mark.parametrize(
+        'field',
+        [None, [], {}, 42],
+        ids=['missing-none', 'empty-list', 'dict', 'int'],
+    )
+    def test_absent_or_empty_field_list_raises_rather_than_projecting_to_zero_tuples(
+        self, field,
+    ):
+        """Dropping ALL properties must be at least as loud as dropping one.
+
+        ``test_property_present_in_field_but_absent_from_type_raises`` refuses the
+        far milder surprise of ONE property going missing, on the grounds that it
+        under-reports what is actually indexed.  A ``None``/empty ``field`` drops
+        every property on the label, and the consequence flows into β: the ACTUAL
+        set comes back short, a fully-provisioned label reads as entirely missing,
+        and β re-creates indices that already exist.
+
+        MEASURED 2026-08-06: the live ``properties`` column is always a list, even
+        on a graph with zero indices, so tolerating ``None`` bought nothing.
+        """
+        record = {
+            'label': 'Entity',
+            'field': field,
+            'type': {'uuid': ['RANGE']},
+            'entity_type': 'NODE',
+        }
+        with pytest.raises(IndexRecordShapeError) as excinfo:
+            normalize_index_record(record)
+        assert 'Entity' in str(excinfo.value)
+
     def test_property_present_in_field_but_absent_from_type_raises(self):
         """A genuine SHAPE surprise — dropping it would silently under-report."""
         record = {
@@ -640,6 +721,73 @@ LIVE_ROW_ENTITY = [
     'OPERATIONAL',
     {},
 ]
+
+
+class TestResolveHeaderPositions:
+    """The SINGLE home for by-name ``CALL db.indexes()`` column resolution.
+
+    Extracted so ``list_indices`` — and later β's ``ensure_indices`` and δ's
+    ``summarize_index_health`` — share one implementation rather than each
+    re-forking the build-names / check-missing / ``.index()`` sequence.  A
+    re-forked copy is how the positional read survived in the first place.
+    (``_fm_helpers.await_index_operational`` still carries its own copy; it is
+    outside task 3706's locked scope and is filed as a follow-up.)
+    """
+
+    def test_resolves_every_wanted_key_to_its_named_column(self):
+        positions = resolve_header_positions(
+            LIVE_HEADER,
+            {'label': 'label', 'field': 'properties', 'entity_type': 'entitytype'},
+        )
+        assert positions == {'label': 0, 'field': 1, 'entity_type': 6}
+
+    def test_positions_follow_the_header_not_the_measured_order(self):
+        reordered = [[1, 'entitytype'], [1, 'label'], [1, 'properties']]
+        positions = resolve_header_positions(
+            reordered,
+            {'label': 'label', 'field': 'properties', 'entity_type': 'entitytype'},
+        )
+        assert positions == {'label': 1, 'field': 2, 'entity_type': 0}
+
+    def test_missing_column_raises_naming_it_and_the_header_it_saw(self):
+        with pytest.raises(IndexHeaderShapeError) as excinfo:
+            resolve_header_positions(
+                [c for c in LIVE_HEADER if c[1] != 'entitytype'],
+                {'label': 'label', 'entity_type': 'entitytype'},
+            )
+        message = str(excinfo.value)
+        assert 'entitytype' in message
+        assert 'label' in message  # the header it actually saw is named
+
+    @pytest.mark.parametrize(
+        'header',
+        [
+            ['label', 'properties'],
+            [[1, 'label'], [1]],
+            [[1, 'label'], None],
+            [[1, 'label'], 42],
+        ],
+        ids=['bare-strings', 'one-element-pair', 'none-entry', 'int-entry'],
+    )
+    def test_malformed_header_entry_raises_the_named_shape_error(self, header):
+        """A bare-string header is the trap: ``'label'[1]`` is ``'a'``, not an error.
+
+        Indexing ``col[1]`` unguarded turns a shape surprise into either an
+        IndexError/TypeError with no context or — worse, for the bare-string case
+        — a silently wrong set of column names.  Both are the silent degradation
+        by-name resolution exists to remove, so both must be the named error.
+        """
+        with pytest.raises(IndexHeaderShapeError):
+            resolve_header_positions(header, {'label': 'label'})
+
+    @pytest.mark.parametrize('header', [None, []], ids=['none', 'empty'])
+    def test_absent_header_raises_rather_than_resolving_nothing(self, header):
+        with pytest.raises(IndexHeaderShapeError):
+            resolve_header_positions(header, {'label': 'label'})
+
+    def test_error_is_a_valueerror_preserving_the_list_indices_contract(self):
+        """``list_indices`` historically raised ``ValueError``; callers may catch it."""
+        assert issubclass(IndexHeaderShapeError, ValueError)
 
 
 class TestListIndicesColumnBinding:

@@ -61,8 +61,12 @@ want opposite defaults:
   detector into a false-alarm generator on every real graph.
 
 The projection is NOT a blanket skip.  Every genuine SHAPE surprise still raises
-:class:`IndexRecordShapeError`: an ``entity_type`` outside ``{NODE, RELATIONSHIP}``,
-or a property present in ``field`` with no entry in ``type``.
+:class:`IndexRecordShapeError`: a ``label`` that is not a non-empty string, an
+``entity_type`` outside ``{NODE, RELATIONSHIP}``, a ``field`` that is neither a
+string nor a non-empty list, or a property present in ``field`` with no entry in
+``type``.  The unrepresentable index TYPE is the *only* thing projected away;
+every way a record can be structurally wrong is loud, because each of those means
+a column was bound to the wrong thing — the defect this module was written on.
 
 This module deliberately imports nothing from ``graphiti_client`` so the rules
 stay unit-testable with a plain import and no client/LLM/embedder stack.  That
@@ -76,6 +80,7 @@ indices).  Importing this module performs zero I/O.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
@@ -281,7 +286,75 @@ def expected_index_set() -> set[IndexSpec]:
     return {spec for statement in statements for spec in parse_index_statement(statement)}
 
 
-# --- The ACTUAL side -------------------------------------------------------
+# --- The ACTUAL side: the CALL db.indexes() header -------------------------
+
+
+class IndexHeaderShapeError(ValueError):
+    """``CALL db.indexes()`` did not expose the columns a caller resolves by name.
+
+    Every reader of ``CALL db.indexes()`` must resolve its columns BY NAME, never
+    positionally: the live header carries ``options`` at index 3 and
+    ``entitytype`` at index 6, and reading the former as the latter is exactly
+    the defect task 3706 was opened on — it degraded silently, returning an
+    ``OrderedDict`` where ``'NODE'``/``'RELATIONSHIP'`` belonged, and no test
+    noticed because they asserted key presence rather than value.
+
+    Subclasses ``ValueError`` so the historical ``list_indices()`` contract
+    (``raise ValueError`` on a missing column) is preserved for callers that
+    catch it.  The test-side ``_fm_helpers.IndexHeaderError`` deliberately
+    subclasses ``AssertionError`` instead, because there a header surprise must
+    read as a failed test rather than as an error the suite might swallow.
+    """
+
+
+def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
+    """Map each wanted output key to the position of its named FalkorDB column.
+
+    The single home for by-name column resolution over a ``CALL db.indexes()``
+    result header, so ``list_indices`` (and later β's ``ensure_indices`` /
+    δ's ``summarize_index_health``) share one implementation instead of each
+    re-forking the build-names / check-missing / ``.index()`` sequence.  A
+    re-forked copy is how the positional read survived in the first place.
+
+    Args:
+        header: The result header — the measured live shape is a list of
+            ``(type_code, column_name)`` pairs, e.g. ``[[1, 'label'], ...]``.
+        wanted: ``{output_key: column_name}``, e.g. ``{'entity_type': 'entitytype'}``.
+
+    Returns:
+        ``{output_key: position}`` for every entry in *wanted*.
+
+    Raises:
+        IndexHeaderShapeError: A header entry is not a ``(type, name)`` pair, or
+            a required column name is absent.  Both fail closed and name what was
+            actually seen (INV-2) rather than letting the caller read a column it
+            never verified.
+    """
+    names: list[object] = []
+    for position, entry in enumerate(header or []):
+        # A bare str is a Sequence whose [1] is a character, so it must be
+        # rejected explicitly -- otherwise a header of ['label', 'properties']
+        # would resolve to nonsense column names instead of failing.
+        if isinstance(entry, (str, bytes)) or not isinstance(entry, Sequence) or len(entry) < 2:
+            raise IndexHeaderShapeError(
+                f'CALL db.indexes() header entry at position {position} is '
+                f'{entry!r}, expected a (type, name) pair. FalkorDB changed its '
+                'result shape; refusing to guess which column is which. '
+                f'Header: {header!r}'
+            )
+        names.append(entry[1])
+
+    missing = [column for column in wanted.values() if column not in names]
+    if missing:
+        raise IndexHeaderShapeError(
+            f'CALL db.indexes() is missing required column(s) {missing}; '
+            f'FalkorDB changed its result shape (header={names}). '
+            'Refusing to return index records with silently-wrong values.'
+        )
+    return {key: names.index(column) for key, column in wanted.items()}
+
+
+# --- The ACTUAL side: the records ------------------------------------------
 
 #: The index types the PRD's normal form can represent.  Anything else (VECTOR
 #: today) is projected away rather than raised on -- see the module docstring's
@@ -330,11 +403,29 @@ def normalize_index_record(record) -> list[IndexSpec]:
         be empty — e.g. a VECTOR-only record.
 
     Raises:
-        IndexRecordShapeError: ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``,
-            or a property in ``field`` has no entry in ``type``.
+        IndexRecordShapeError: ``label`` is not a non-empty string,
+            ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``, ``field`` is
+            neither a string nor a non-empty list, or a property in ``field``
+            has no entry in ``type``.
     """
     label = record.get('label')
     entity_type = record.get('entity_type')
+
+    # Symmetric with the entity_type check below, and for the same reason: a
+    # column mis-binding is the failure class this module exists to catch, and
+    # `label` is just as bindable to the wrong column as `entity_type` was.
+    # Without this, a dict label sails through and the emitted tuple is only
+    # rejected later by `normalize_index_records`' set comprehension, as
+    # `TypeError: unhashable type: 'dict'` -- a traceback that names neither the
+    # record nor the column, from a function that documents raising
+    # IndexRecordShapeError.
+    if not isinstance(label, str) or not label:
+        raise IndexRecordShapeError(
+            f'index record has label {label!r}, expected a non-empty string. '
+            'CALL db.indexes() changed shape, or the caller bound the wrong '
+            'column. '
+            f'Record: {record!r}'
+        )
 
     # Catches the options-column mis-binding: an OrderedDict is not a valid
     # entity_type, and tolerating it would yield a set missing every record.
@@ -356,8 +447,21 @@ def normalize_index_record(record) -> list[IndexSpec]:
     # shape degrades to "one property" rather than silently to zero tuples.
     if isinstance(fields, str):
         fields = [fields]
-    elif fields is None:
-        fields = []
+    # Anything else RAISES, including a missing/None field list.  Projecting it
+    # to zero tuples would be strictly worse than the divergence the next block
+    # already refuses to tolerate: that one drops ONE property, this drops ALL of
+    # them, and the consequence flows straight into β -- a fully-provisioned
+    # label comes back as entirely missing and β re-creates indices that already
+    # exist.  MEASURED 2026-08-06: the live `properties` column is always a list,
+    # even on a graph with zero indices, so tolerating None buys nothing real.
+    elif not isinstance(fields, Sequence) or not fields:
+        raise IndexRecordShapeError(
+            f'index record for label {label!r} has field {fields!r}, expected a '
+            'non-empty list of property names (or a single property string). '
+            'Refusing to project it to zero tuples: that silently reports every '
+            'index on this label as missing. '
+            f'Record: {record!r}'
+        )
 
     types = record.get('type') or {}
 

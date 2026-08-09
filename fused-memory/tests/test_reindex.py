@@ -380,17 +380,53 @@ class TestDropIndex:
 # ---------------------------------------------------------------------------
 
 class TestDropVectorIndices:
-    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices."""
+    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices.
 
+    These stubs were rewritten (task 3706) from the SCALAR record shape
+    (``'type': 'VECTOR'``) to the MEASURED live one (``'type':
+    {'name_embedding': ['VECTOR']}``) — the same fiction ``TestListIndices``
+    above bans, and for the same reason: a stub live FalkorDB never emits is how
+    the ``entity_type: row[3]`` mis-binding survived unnoticed.
+
+    Against the real shape ``drop_vector_indices``' predicate
+    ``entry.get('type') == 'VECTOR'`` compares a dict to a string, is always
+    False, and the function drops nothing.  So the two tests that actually
+    exercise a VECTOR index are marked ``xfail(strict=True)`` — the no-op is now
+    recorded as a KNOWN RED rather than hidden behind a green fixture.  The fix
+    is **task 3769**, deliberately out of scope for 3706; when it lands, both
+    marks must be removed (``strict=True`` makes that mandatory — a fixed
+    implementation turns them into XPASS failures, so the marks cannot be
+    forgotten).
+
+    ``test_no_op_when_no_vector_indices`` is deliberately NOT marked: it passes
+    under both the broken and the fixed implementation, so it is insensitive to
+    the defect rather than evidence of it, and a strict xfail there would fail
+    on XPASS today.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason='drop_vector_indices compares the types dict against the string '
+               "'VECTOR', so it drops nothing — task 3769",
+    )
     @pytest.mark.asyncio
     async def test_drops_only_vector_type_indices(self, mock_config, make_backend):
         """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'RELATES_TO', 'field': 'fact_embedding', 'type': 'VECTOR', 'entity_type': 'RELATIONSHIP'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'RELATES_TO', 'field': ['fact_embedding'],
+                'type': {'fact_embedding': ['VECTOR']}, 'entity_type': 'RELATIONSHIP',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
@@ -403,14 +439,25 @@ class TestDropVectorIndices:
         assert ('Entity', 'name_embedding') in called_pairs
         assert ('RELATES_TO', 'fact_embedding') in called_pairs
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason='drop_vector_indices compares the types dict against the string '
+               "'VECTOR', so it returns [] — task 3769",
+    )
     @pytest.mark.asyncio
     async def test_returns_list_of_dropped_indices(self, mock_config, make_backend):
         """Returns list of dicts with 'label' and 'field' for each dropped index."""
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
@@ -422,12 +469,23 @@ class TestDropVectorIndices:
 
     @pytest.mark.asyncio
     async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
-        """When no VECTOR indices exist, drop_index not called and returns []."""
+        """When no VECTOR indices exist, drop_index not called and returns [].
+
+        NOT xfail-marked — see the class docstring: this passes both before and
+        after task 3769, so it is insensitive to the no-op rather than a witness
+        to it.
+        """
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'created_at', 'type': 'RANGE', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['created_at'],
+                'type': {'created_at': ['RANGE']}, 'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
