@@ -562,6 +562,16 @@ async def run(
             - targeted_correction_ids (list[str]): the subset of
               ``args.delete_ids`` actually found among the enumerated
               members (the found-intersection, not the raw input list).
+            - cross_check (dict): adjacent-population census (task 3897) —
+              ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
+              'probe_failed'}``. Diagnostic only, NEVER part of the delete
+              set: it exists so a ``0 swept`` result taken against a pool
+              this script's ``source`` filter cannot see is legible as a
+              blind spot rather than a clean bill of health. See
+              :func:`enumeration_blind_spot`. ``flag_for_stage2_total`` is
+              ``None`` and ``probe_failed`` is ``True`` when the probe could
+              not be taken; ``blind_spot`` is then ``False``, since an
+              unobserved population must never be asserted as a blind spot.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - after (dict with counts, only when apply=True)
@@ -583,6 +593,40 @@ async def run(
         project_id=project_id, filters=kind_filter,
     )
     before = {'total_source': total_source, 'total_with_kind': total_with_kind}
+
+    # --- Adjacent-population census (task 3897) ---
+    # COUNT-ONLY. The records this probe counts are never enumerated, never
+    # added to `members`, never run through a predicate, and never deleted —
+    # see TestFlagForStage2IsNeverDeleted for the guard that enforces it, and
+    # the module docstring's "Why the flag_for_stage2 pool is censused, never
+    # deleted here" section for why that boundary is load-bearing.
+    flag_for_stage2_total = await memory_service.count_memories_by_metadata(
+        project_id=project_id, filters=FLAG_FOR_STAGE2_FILTERS,
+    )
+    probe_failed = False
+    blind_spot = enumeration_blind_spot(total_source, flag_for_stage2_total)
+    if blind_spot:
+        logger.warning(
+            'sweep_orphan_flag_markers: ENUMERATION BLIND SPOT — this sweep '
+            "enumerates on {'source': %r} and matched %d records, while an "
+            "adjacent {'flag_for_stage2': True} population of %d records "
+            'exists in project %r. This run\'s "0 swept" is therefore NOT a '
+            'clean bill of health: it is a count taken against a pool this '
+            'filter cannot see. The flag_for_stage2 relay pool is drained by '
+            'the IN-CYCLE collector _sweep_stale_mem0_flag_for_stage2_markers '
+            '(task 2966, reconciliation/stages/task_knowledge_sync.py) on a '
+            'rolling 14-day window — those records are not uncollected, and '
+            'this script deliberately censuses them rather than deleting '
+            'them. Pass --fail-on-blind-spot to escalate this divergence to '
+            'a non-zero --check exit code.',
+            MARKER_SOURCE, total_source, flag_for_stage2_total, project_id,
+        )
+    cross_check = {
+        'source_total': total_source,
+        'flag_for_stage2_total': flag_for_stage2_total,
+        'blind_spot': blind_spot,
+        'probe_failed': probe_failed,
+    }
 
     # --- Enumerate via scroll (NOT semantic search) ---
     scroll_limit: int = getattr(args, 'limit', 1000)
@@ -671,6 +715,7 @@ async def run(
         'undated_kept_count': len(undated_kept),
         'bucket_counts': bucket_counts,
         'targeted_correction_ids': targeted_correction_ids,
+        'cross_check': cross_check,
     }
 
     if args.apply:

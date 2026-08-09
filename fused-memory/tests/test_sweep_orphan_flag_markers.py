@@ -629,7 +629,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # count_memories_by_metadata: total=3, total+kind=1  (so 2 orphans by count)
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 1])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 1, 0])
         # get_memories_by_metadata returns 1 valid + 2 orphans
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -658,7 +658,7 @@ class TestRun:
         # before: total=3, kind=1 → 2 orphans by count
         # after: total=1, kind=1 → 0 orphans
         memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 1, 1]
+            side_effect=[3, 1, 0, 1, 1]
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -685,7 +685,7 @@ class TestRun:
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count; after: total=2, kind=1 → 1 residual
         memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 2, 1]
+            side_effect=[3, 1, 0, 2, 1]
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -754,7 +754,7 @@ class TestRun:
 
         # --- Dry run: verify enumeration/report shape ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2])
+        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 0])
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -773,7 +773,7 @@ class TestRun:
 
         # --- Apply: verify delete fan-out is deduped by id ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 1, 1])
+        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 0, 1, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -819,7 +819,7 @@ class TestRun:
 
         # --- Dry run ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3])
+        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 0])
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -841,7 +841,7 @@ class TestRun:
 
         # --- Apply: overlap1 (stale AND terminal) deleted exactly once ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 1, 1])
+        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 0, 1, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -888,7 +888,7 @@ class TestRun:
         members = [dated_stale, undated_missing, undated_bad]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -917,7 +917,7 @@ class TestRun:
         members = [valid_fresh]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1066,6 +1066,11 @@ class TestTargetedCorrection:
     record (task_id='1944,2408', kept because not ALL components are
     terminal). Delete (not delete+recreate) is the honest correction — see
     design_decisions.
+
+    count_memories_by_metadata mock ordering (task 3897): the THIRD call is
+    run()'s flag_for_stage2 census probe, sitting between the two 'before'
+    counts and any 'after' counts. These fixtures pass 0 for it (no adjacent
+    population), which keeps blind_spot False and their semantics unchanged.
     """
 
     _NOW = datetime(2026, 7, 14, tzinfo=UTC)
@@ -1117,7 +1122,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1143,7 +1148,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1169,7 +1174,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1194,7 +1199,7 @@ class TestTargetedCorrection:
         members = [orphan]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1215,7 +1220,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
