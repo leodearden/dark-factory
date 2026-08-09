@@ -3528,6 +3528,42 @@ def test_boundary_fake_systemctl_matches_unit_suite_verbatim() -> None:
     )
 
 
+def test_boundary_fake_systemctl_rejects_a_real_unit_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_boundary_make_fake_systemctl must refuse a genuinely installed unit name.
+
+    THE HAZARD, in the terms the incident established: the fake shadows
+    `systemctl` only for as long as its tmpdir sits on PATH. A poll loop that
+    outlives the test -- task 3798 measured orphans surviving 27.8 HOURS, well
+    past pytest's tmpdir GC -- resolves /usr/bin/systemctl instead and issues a
+    REAL restart of whatever unit name this factory handed it.
+    `orchestrator-reify.service` is INSTALLED on this box, so that worst case is
+    a real fleet restart; a synthetic name makes it a no-op against a unit that
+    does not exist.
+
+    Sits beside test_boundary_fake_systemctl_matches_unit_suite_verbatim, the
+    other cross-root drift guard on this harness, and mirrors
+    scripts/tests/test_restart_all_orchestrators.py::
+    test_fake_systemctl_rejects_a_real_unit_name -- two copies because these
+    directories cannot import each other's test modules, so a green test in one
+    root says nothing about the other's factory.
+
+    The check is at the FACTORY rather than over test sources on purpose: this
+    file holds ~40 real unit-name literals that are CONTRACT PINS against real
+    production configuration (the WATCHED port table, unit-file parity, the
+    in-process restart_unit call-shape assertions), and a source-text guard
+    would false-positive on every one of them.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _boundary_make_fake_systemctl(
+            tmp_path, running_units=["orchestrator-reify.service"],
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-reify.service" in message, message
+    assert "_boundary_make_fake_systemctl" in message, message
+
+
 def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
     """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
     restart-all-orchestrators.sh --drain restarts every unit, verifies each

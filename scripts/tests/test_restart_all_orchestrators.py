@@ -233,6 +233,44 @@ def _load_state(state_path):
 
 
 # ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799).
+#
+# The mirror of this test lives in tests/scripts/test_orchestrator_watchdog.py
+# as test_boundary_fake_systemctl_rejects_a_real_unit_name. Two copies for the
+# same reason as the process-group pair below: these directories cannot import
+# each other's test modules, so each root must prove its OWN factory validates.
+# What they share is the rule itself -- df_pytest_isolation.assert_synthetic_units.
+# ---------------------------------------------------------------------------
+
+
+def test_fake_systemctl_rejects_a_real_unit_name(tmp_path):
+    """_make_fake_systemctl must refuse a genuinely installed unit name.
+
+    THE HAZARD, in the terms the incident established: the fake shadows
+    `systemctl` only for as long as its tmpdir sits on PATH. A poll loop that
+    outlives the test -- task 3798 measured orphans surviving 27.8 HOURS, well
+    past pytest's tmpdir GC -- resolves /usr/bin/systemctl instead and issues a
+    REAL restart of whatever unit name this factory handed it.
+    `orchestrator-reify.service` is INSTALLED on this box, so that worst case is
+    a real fleet restart; a synthetic name makes it a no-op against a unit that
+    does not exist.
+
+    Checked at the FACTORY, not by grepping test sources: this file's siblings
+    hold ~40 real unit-name literals that are CONTRACT PINS against real
+    production configuration, which a source-text guard would false-positive on.
+
+    pytest.raises(pytest.fail.Exception) rather than AssertionError -- pytest.fail
+    raises Failed, a BaseException, deliberately so a fixture's own
+    `except Exception` cannot swallow it.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _make_fake_systemctl(tmp_path, running_units=["orchestrator-reify.service"])
+    message = str(excinfo.value)
+    assert "orchestrator-reify.service" in message, message
+    assert "_make_fake_systemctl" in message, message
+
+
+# ---------------------------------------------------------------------------
 # Process-group containment (task 3798).
 #
 # The mirror of this test lives in tests/scripts/test_orchestrator_watchdog.py
