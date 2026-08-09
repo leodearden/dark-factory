@@ -30,7 +30,14 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
-from fused_memory.backends.falkor_indices import resolve_header_positions
+from fused_memory.backends.falkor_indices import (
+    IndexProvisionResult,
+    IndexSpec,
+    expected_index_set,
+    normalize_index_records,
+    plan_index_statements,
+    resolve_header_positions,
+)
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -3090,6 +3097,83 @@ class GraphitiBackend:
         for row in (result.result_set or []):
             indices.append({key: row[idx] for key, idx in positions.items()})
         return indices
+
+    @_canonicalize_group_args
+    async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult:
+        """Provision *group_id*'s graph up to the expected index set. Task 3707 (β).
+
+        Diff-then-create, never create-and-hope: the expected set
+        (``falkor_indices.expected_index_set``, derived from what graphiti itself
+        emits) is differenced against what the graph ACTUALLY carries
+        (``list_indices`` projected through ``normalize_index_records``), and only
+        the gap is written.
+
+        Contract
+        --------
+        * **Idempotent.**  A fully-provisioned graph is not written to at all —
+          the plan is empty, so no statement is issued.  Idempotence is
+          structural; it does NOT rest on FalkorDB tolerating a re-create (D2).
+        * **Never raises on a per-statement failure.**  A rejected statement is
+          recorded in ``failed`` with its error text and logged at WARNING, and
+          the remaining statements are still issued.  This is the whole point:
+          the loop it replaces lets one rejection take down everything after it,
+          and ``falkordb_driver.py``'s ``execute_query`` swallows the error so
+          nothing in the logs says so.
+        * **Raises only on an unreachable driver.**
+        * **RANGE indices are issued PER-PROPERTY**, never as upstream's composite
+          form — measured: the composite is rejected wholesale with
+          ``Attribute 'uuid' is already indexed`` when any listed property already
+          exists, losing all 4 (``Entity``) or all 7 (``RELATES_TO``) silently.
+          FULLTEXT is issued byte-verbatim, a form measured to succeed against
+          that same trap state.  See ``falkor_indices.plan_index_statements``.
+
+        LOAD-BEARING (INV-6): a spec in ``created`` means its ``CREATE`` was
+        ACCEPTED, **not** that the index is serving.  ``CREATE`` returns in
+        0.5-2.0 ms while the index reaches ``OPERATIONAL`` up to 594.5 ms later.
+        This method deliberately adds NO barrier and issues exactly one
+        ``CALL db.indexes()`` (the diff read) — establishing that an index is
+        serving is task ε's canary, and the wait belongs in test fixtures
+        (``tests/_fm_helpers.await_index_operational``), never here.
+
+        Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
+        the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
+        inner ``list_indices`` call being decorated does not cover that — the diff
+        read and the writes resolve the key independently (PRD seam S4).
+
+        Args:
+            group_id: The project/graph id to provision.
+
+        Returns:
+            An :class:`~fused_memory.backends.falkor_indices.IndexProvisionResult`
+            recording what was created, what was already there, what failed, and
+            the statements actually issued.
+        """
+        actual = normalize_index_records(await self.list_indices(group_id=group_id))
+        expected = expected_index_set()
+        missing = expected - actual
+        already_present = len(expected & actual)
+
+        graph = self._graph_for(group_id)
+        created: list[IndexSpec] = []
+        failed: list[tuple[IndexSpec, str]] = []
+        statements: list[str] = []
+
+        for statement, specs in plan_index_statements(missing):
+            statements.append(statement)
+            try:
+                await graph.query(statement)
+            except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
+                failed.extend((spec, str(exc)) for spec in specs)
+            else:
+                created.extend(specs)
+
+        return IndexProvisionResult(
+            created=created,
+            already_present=already_present,
+            failed=failed,
+            expected_total=len(expected),
+            statements=statements,
+        )
 
     @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
