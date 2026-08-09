@@ -3174,6 +3174,21 @@ class GraphitiBackend:
         inner ``list_indices`` call being decorated does not cover that — the diff
         read and the writes resolve the key independently (PRD seam S4).
 
+        Measured live 2026-08-09 against uuid-suffixed scratch graphs (pinned in
+        ``tests/test_ensure_indices_integration.py``):
+
+        * Trap state (an ``Entity(uuid)`` + ``RELATES_TO(uuid)`` range index) →
+          24 per-property RANGE + 4 verbatim FULLTEXT = 28 statements, 0 failures,
+          all 11 previously-lost range fields restored.
+        * Virgin graph → 26 + 4 = 30 statements, ``len(created) == 38 ==
+          expected_total``.  Statement and spec counts differ because the 4
+          fulltext statements cover 12 specs between them — hence per-SPEC
+          accounting.
+        * Round-trip afterwards: ``normalize_index_records(list_indices(g)) ==
+          expected_index_set()`` exactly, which is what makes ``already_present ==
+          expected_total`` reachable on the idempotent re-run (measured: 0
+          statements issued).
+
         Args:
             group_id: The project/graph id to provision.
 

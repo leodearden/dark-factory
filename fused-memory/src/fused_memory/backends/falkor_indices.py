@@ -93,12 +93,28 @@ and a ``RELATES_TO(uuid)`` range index already present):
   loss is silent — this is the defect the whole PRD exists to remove.
 * The same trap state provisioned per-property: 24 RANGE + 4 verbatim FULLTEXT =
   28 statements, **0 failures**, and all 11 previously-lost range fields present
-  afterwards.  Per-property converges to an identical index state while degrading
-  one property at a time.
+  afterwards (``Entity`` uuid/group_id/name/created_at and ``RELATES_TO``
+  uuid/group_id/name/created_at/expired_at/valid_at/invalid_at).  Per-property
+  converges to an identical index state while degrading one property at a time.
 * The 4 FULLTEXT statements were measured to succeed VERBATIM against that same
   trap state, so decomposing them would be unmeasured churn against a form that
   already works.  Hence: RANGE is synthesized per-property, FULLTEXT is issued
   exactly as upstream emits it.
+* Virgin graph: 26 RANGE + 4 FULLTEXT = **30 statements** creating
+  ``len(created) == 38 == expected_total`` specs (26 RANGE + 12 FULLTEXT — the 4
+  fulltext statements cover 12 specs between them, which is why statement and
+  spec counts differ and why accounting is per-SPEC).
+* Afterwards ``normalize_index_records(list_indices(g)) == expected_index_set()``
+  **exactly** — nothing missing, nothing extra.  That exactness is what makes
+  ``already_present == expected_total`` reachable on an idempotent re-run (which
+  measured 0 statements issued, ``created == []``, ``failed == []``).  It was
+  VERIFIED rather than assumed: this PRD exists precisely because that round-trip
+  was silently wrong before task 3706.
+* ``CALL db.indexes()`` against a graph KEY that has never been written raises
+  ``redis.exceptions.ResponseError: Invalid graph operation on empty key`` —
+  live, not hypothetical (PRD D6 names ``autotrade`` and ``mission_control`` as
+  registered projects with no graph yet).  The CREATE statements auto-create the
+  key, so provisioning from absent is self-healing.
 """
 
 from __future__ import annotations
