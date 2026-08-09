@@ -816,16 +816,12 @@ class TestRemergeCarveOutAtDispatchGuard:
 
     ADJUDICATION (task 3206, PRD §5.3): items produced by ``_remerge`` are
     RECOVERY re-merges that legitimately target real main rather than
-    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this is the
-    measured class-(b) shape:
-
-      2026-08-07 02:36:52  task 6063 (mr-14c8fe17)  base 4485bf77
-      2026-08-07 12:11:29  task 6067 (mr-eda61713)  base e2aeeb7e
-
-    both preceded seconds earlier by "dead-base straggler at dispatch —
-    re-merging".  Under hard enforcement both deliberate recoveries would have
-    been REFUSED — and the tip they'd have been forced onto can itself be the
-    dead commit they exist to escape.
+    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this reproduces
+    the measured class-(b) shape: a dead-base straggler re-merged onto real
+    main while another item was frozen.  Under hard enforcement both measured
+    instances of it would have been REFUSED, and the tip they'd have been
+    forced onto can itself be the dead commit they exist to escape.  PRD §5.3
+    holds the dated instances; they are not duplicated here to rot.
 
     The carve-out must be NARROW: it suppresses recovery items only, never a
     genuine class-(d) violation.

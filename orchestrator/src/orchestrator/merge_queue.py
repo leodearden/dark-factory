@@ -10188,43 +10188,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
     #
-    # TASK-3206 SWEEP OUTCOME (recorded here so the evidence behind the §5.3
-    # ADVISORY verdict is discoverable from the code, not only from the task
-    # record — cf. the task-3204 sweep note convention).
+    # §5.3 verify-base rule: ADVISORY BY DECISION, never enforced (task 3206).
+    # PRD §5.3 is the canonical record — verdict, re-merge carve-out, and the
+    # measured sweep behind them (4 classified hits, precision 0/4 as an
+    # enforcement predicate).  Deliberately a pointer, not a copy: that record
+    # is dated journald forensics and would rot here once retention rolls.
     #
-    # Swept `ε=1890 §5.3 guard` across all SEVEN orchestrator-* units over the
-    # full journald retention window.  4 hits, all on orchestrator-reify, all
-    # verify_depth=1; ZERO hits on the other six units.  Every hit classified,
-    # ZERO unexplained:
-    #   class (b) — `_remerge`-by-construction (2 hits):
-    #       2026-08-07 02:36:52  task 6063  base 4485bf77 / expected d8081962
-    #       2026-08-07 12:11:29  task 6067  base e2aeeb7e / expected 42847642
-    #     each preceded seconds earlier by "dead-base straggler at dispatch —
-    #     re-merging".  ELIMINATED BY CONSTRUCTION from this task onward via
-    #     the PRD §5.3 re-merge carve-out (`remerge_recovery`).
-    #   class (a) — task-3082 stranded/phantom finalize head (2 hits):
-    #       2026-08-08 00:09:07  task 5687  base 9d08d3d3 / expected 95908e44
-    #       2026-08-08 01:35:00  task 5830  base 2b903602 / expected 95908e44
-    #     same phantom expected-tip across 86 minutes; in BOTH the item's base
-    #     was the LIVE MAIN TIP and 5687 subsequently PASSED and LANDED.
-    #   class (c) — stale `_last_known_main_sha` false positives: ZERO, and
-    #     structurally excluded: the dispatch guard uses its OWN freshly-
-    #     fetched get_main_sha() and writes it into the cache, so task 2357's
-    #     defect only ever reached the snapshot surface, never that call site.
-    #   class (d) — genuine §5.3 violations: ZERO.
-    # Zero hits fleet-wide in the ~31h after task 3082 landed (e85124dd31,
-    # 2026-08-08 06:55).
-    #
-    # CONSEQUENCE FOR THE NEXT SWEEP: with class (b) gone by construction and
-    # class (c) structurally excluded, ANY future hit is either class (a) (a
-    # 3082-style phantom head) or a genuine class (d) — a materially sharper
-    # signal than the 4-hour journal archaeology this classification required.
-    #
-    # The verdict itself (guard STAYS ADVISORY) lives in PRD §5.3/§10 and in
-    # _warn_if_verify_base_not_frozen_tip's docstring.  Note that class (a) is
-    # evidence the frozen-prefix DEFINITION below is the weak point — a
-    # finalize head whose verify is dead still counts as frozen — but
-    # tightening it is deliberately a SEPARATE task, not folded in here.
+    # What matters at THIS definition: two of the four hits were a phantom
+    # frozen tip, i.e. evidence that the definition below is the weak point —
+    # a finalize head whose verify is dead still counts as frozen.  Tightening
+    # it is deliberately a SEPARATE task, not folded in here.
 
     def _frozen_inflight_entries(self) -> list[InflightEntry]:
         """Return ordered list of frozen InflightEntry objects (ε=1890).
@@ -10407,18 +10380,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         exclusion.
 
         The fourth tuple element is the entry item's ``remerge_recovery``
-        marker (task 3206 / PRD §5.3 re-merge carve-out).  It is REPORTED
-        here, never acted on: a recovery entry is still walked and still
-        advances the chain, because each entry's ``merge_commit`` is what
-        sets the expected base for its successors — filtering recovery
-        entries out of the WALK would corrupt the expected base of every
-        entry behind them, converting one carved-out entry into a cascade of
-        false violations.  Consumers decide for themselves whether the marker
-        suppresses their own output: :meth:`_verify_base_frozen_tip_violations`
-        skips EMISSION for marked entries (the §5.3 carve-out), while
-        :meth:`check_frozen_prefix_invariant` deliberately does NOT — it
-        checks structural base-chain integrity, a different question from
-        "did §5.3 permit this verify base".
+        marker (PRD §5.3 re-merge carve-out).  It is REPORTED here, never
+        acted on: a recovery entry is still walked and still advances the
+        chain, because each entry's ``merge_commit`` sets the expected base
+        for its successors — filtering recovery entries out of the WALK would
+        corrupt the expected base of every entry behind them, turning one
+        carved-out entry into a cascade of false violations.  Each consumer
+        decides what the marker means for its own output.
 
         Pure/synchronous (no await); never raises on well-formed
         InflightEntry data.
@@ -10624,19 +10592,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         change to the chain-walk itself (e.g. how passthrough entries
         advance the chain) cannot make the two surfaces silently disagree.
 
-        §5.3 RE-MERGE CARVE-OUT (task 3206, PRD §5.3): entries whose item
-        carries ``remerge_recovery=True`` are exempt.  Those are ``_remerge``
-        recovery items, which legitimately target real main rather than the
-        frozen tip, so a mismatch is correct by construction rather than a
-        violation.  :meth:`_warn_if_verify_base_not_frozen_tip` applies the
-        identical carve-out at dispatch time — both §5.3 surfaces must gain
-        it together or they would silently disagree, precisely the failure the
-        shared-generator paragraph above exists to prevent.
-
-        The carve-out is applied to violation EMISSION only, never by
-        filtering entries out of :meth:`_frozen_base_chain`: a carved-out
-        entry must still advance the expected base for its successors, or one
-        suppressed violation would become a cascade of false ones behind it.
+        §5.3 RE-MERGE CARVE-OUT (PRD §5.3): entries whose item carries
+        ``remerge_recovery=True`` are exempt — they legitimately target real
+        main, so a mismatch is correct by construction.  Applied to violation
+        EMISSION only, never by filtering :meth:`_frozen_base_chain` (see that
+        method), and applied identically by
+        :meth:`_warn_if_verify_base_not_frozen_tip` at dispatch time: both
+        §5.3 surfaces carve out together or they silently disagree, precisely
+        the failure the shared-generator paragraph above exists to prevent.
 
         Pure/synchronous (no await). Fail-safe: never raises — callers
         (:meth:`two_layer_invariants`) wrap this in their own try/except, but
@@ -11338,26 +11301,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         observability (λ integration gate / production debugging) WITHOUT
         changing control flow, raising, or mutating any state.
 
-        ADVISORY BY DECISION — do NOT flip this to enforcement (task 3206,
-        PRD §5.3).  The soundness property §5.3 is reaching for is already
-        enforced at ADOPTION time by INV-3: :meth:`_void_and_remerge` (called
-        from :meth:`_finalize_inflight`) discards a PASS *or* FAIL verdict
-        whose ``base_sha`` is a known-dead commit — "neither adopted nor
-        advanced" — so a verify against a base that turns out not to be the
-        eventual main is never ADOPTED.  Dispatch time cannot know whether the
-        item frozen ahead will land or fail; adoption time can.  Measured
-        precision of this predicate as an enforcement rule was 0/4 over the
-        full journal retention window: two hits were deliberate `_remerge`
-        recoveries and two (tasks 5687 / 5830, 2026-08-08) dispatched against
-        the LIVE MAIN tip while the "expected" tip was a stranded phantom's
-        dead merge commit — 5687 then passed and landed.  Enforcing here would
-        have refused all four, trading a bounded, already-backstopped
-        efficiency cost for an unbounded liveness risk (head-of-line wedge).
+        ADVISORY BY DECISION — do NOT flip this to enforcement (task 3206;
+        PRD §5.3 carries the adjudication and the measured evidence).  The
+        soundness property §5.3 is reaching for is already enforced at
+        ADOPTION time by INV-3: :meth:`_void_and_remerge` (called from
+        :meth:`_finalize_inflight`) discards a PASS *or* FAIL verdict whose
+        ``base_sha`` is a known-dead commit, so a verify against a base that
+        turns out not to be the eventual main is never ADOPTED.  Dispatch time
+        cannot know whether the item frozen ahead will land or fail; adoption
+        time can.
 
-        §5.3 RE-MERGE CARVE-OUT (task 3206): items carrying
-        ``remerge_recovery=True`` are exempt — they come from :meth:`_remerge`
-        and legitimately target real main rather than the frozen tip.
-        :meth:`_verify_base_frozen_tip_violations` applies the identical
+        §5.3 RE-MERGE CARVE-OUT: items carrying ``remerge_recovery=True`` are
+        exempt — they come from :meth:`_remerge` and legitimately target real
+        main.  :meth:`_verify_base_frozen_tip_violations` applies the identical
         carve-out on the snapshot surface; the two must stay in lockstep.
 
         Called from _dispatch_item immediately before launching the real-verify
@@ -11373,11 +11329,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if not isinstance(item, RealMergeItem) or not item.base_sha:
             return  # passthrough / conflict — not a real-verify candidate
         if item.remerge_recovery:
-            # §5.3 RE-MERGE CARVE-OUT (task 3206): items produced by _remerge
-            # are RECOVERY re-merges that legitimately target real main rather
-            # than the frozen tip, so a mismatch here is correct by
-            # construction, not a violation.  Suppressed at BOTH §5.3 surfaces
-            # (see _verify_base_frozen_tip_violations) so they cannot disagree.
+            # §5.3 re-merge carve-out (PRD §5.3): a recovery re-merge targets
+            # real main by construction, so a mismatch here is not a violation.
+            # Suppressed at BOTH surfaces (see
+            # _verify_base_frozen_tip_violations) so they cannot disagree.
             return
         expected_tip = self.frozen_prefix_tip(main_sha)
         if item.base_sha.strip() == expected_tip.strip():
@@ -11385,16 +11340,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         logger.warning(
             'ε=1890 §5.3 guard: task %s (rid=%s) dispatched for real-verify '
             'against a base (%r) that is NOT the frozen-prefix tip (%r); '
-            'verify_depth=%d.  TRIAGE — either half of that comparison can be '
-            'the wrong one: (a) the EXPECTED TIP is stale, i.e. a stranded / '
-            'phantom finalize head is still counted frozen so frozen_prefix_tip() '
-            'returned its dead merge commit (the task-3082 class; the base above '
-            'may be perfectly correct and this verify may pass and land), or '
-            '(b) the base really is a speculative-only base.  Recovery re-merges '
-            'are already carved out and never reach this line.  ADVISORY BY '
-            'DECISION (task 3206, PRD §5.3): control flow is unchanged '
-            '(log-only guard) — this is not a latent bug awaiting enforcement; '
-            'the soundness property is enforced at adoption time by INV-3.',
+            'verify_depth=%d.  TRIAGE — either half can be the wrong one: the '
+            'EXPECTED TIP may be a stranded finalize head\'s dead merge commit '
+            '(task-3082 class; this verify may still pass and land), or the '
+            'base really is speculative-only.  ADVISORY BY DECISION — control '
+            'flow unchanged, not a latent bug awaiting enforcement; see PRD '
+            '§5.3 (task 3206).',
             item.request.task_id,
             item.request.request_id,
             item.base_sha,
@@ -14499,12 +14450,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     _rid, _from_state,
                                     ItemLifecycleState.MERGING, live_obj=_entry,
                                 )
-                            # §5.3 re-merge carve-out, consumer 1/5 — head-failure
-                            # cascade (task 3206, PRD §5.3): the item returned
-                            # below targets real main, NOT frozen_prefix_tip(),
-                            # and carries remerge_recovery=True so both §5.3
-                            # surfaces exempt it.  Do not "fix" that to stack on
-                            # the frozen tip — see _remerge's docstring.
+                            # §5.3 re-merge carve-out, consumer 1/5 —
+                            # head-failure cascade.  Targets real main, NOT
+                            # frozen_prefix_tip(); do not "fix" that.  PRD §5.3.
                             _remerged = await self._remerge(
                                 _entry.item.request,
                                 _entry.item.started_monotonic,
@@ -16173,10 +16121,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ItemLifecycleState.MERGING, live_obj=entry,
         )
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
-        # (task 3206, PRD §5.3).  This site is also the reason §5.3 does NOT
-        # need dispatch-time enforcement: it is where a verdict built on a
-        # known-dead base is discarded, PASS or FAIL.  The replacement item
-        # targets real main and carries remerge_recovery=True.
+        # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
+        # enforcement: it is where a verdict built on a known-dead base is
+        # discarded, PASS or FAIL.  Replacement item targets real main.
         _remerged = await self._remerge(item.request, item.started_monotonic)
         self._note_transition(
             req.request_id, ItemLifecycleState.MERGING,
@@ -16499,8 +16446,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ItemLifecycleState.MERGING, live_obj=entry,
                 )
                 # §5.3 re-merge carve-out, consumer 3/5 — RUNNER_UNAVAILABLE
-                # re-dispatch (task 3206, PRD §5.3): targets real main, NOT
-                # frozen_prefix_tip(), and carries remerge_recovery=True.
+                # re-dispatch: targets real main, not frozen_prefix_tip().
+                # PRD §5.3.
                 _remerged_ru = await self._remerge(
                     entry.item.request, entry.item.started_monotonic,
                 )
@@ -17162,12 +17109,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if isinstance(item, RealMergeItem):
                 self._record_dead_base(item.merge_result.merge_commit or '')
             # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
-            # dispatch (task 3206, PRD §5.3).  This site is the CIRCULARITY
-            # argument in the flesh: it exists to ESCAPE a base known dead, and
-            # frozen_prefix_tip() can itself BE that dead/phantom commit — so
-            # re-merging onto the frozen tip here would be a churn loop.  Real
-            # main is the only known-good base; remerge_recovery=True exempts
-            # the result from both §5.3 surfaces.
+            # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
+            # flesh: it exists to ESCAPE a base known dead, and
+            # frozen_prefix_tip() can itself BE that dead commit — re-merging
+            # onto the frozen tip here would be a churn loop.
             item = await self._remerge(req, item.started_monotonic)
             self._note_transition(
                 req.request_id, ItemLifecycleState.MERGING,
@@ -17302,9 +17247,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if isinstance(item, RealMergeItem):
                     self._record_dead_base(item.merge_result.merge_commit or '')
                 # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
-                # staleness / chain-invalidation (task 3206, PRD §5.3):
-                # targets real main, NOT frozen_prefix_tip(), and carries
-                # remerge_recovery=True.
+                # staleness / chain-invalidation: targets real main, not
+                # frozen_prefix_tip().  PRD §5.3.
                 item = await self._remerge(req, item.started_monotonic)
                 # MQ-reliability kappa (task 2169): "then back" — regardless of
                 # whether the re-merged item now falls through to a passthrough
@@ -17377,9 +17321,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # it never changes control flow.  NOT wired into _verify_and_advance
         # (the compat shim used by direct-call tests) to keep shim tests green.
         #
-        # ADVISORY BY DECISION (task 3206, PRD §5.3) — this is not a
-        # not-yet-enforced TODO.  Measured precision as an enforcement
-        # predicate was 0/4; the soundness property is already enforced at
+        # ADVISORY BY DECISION (PRD §5.3, task 3206) — this is not a
+        # not-yet-enforced TODO; the soundness property is already enforced at
         # ADOPTION time by INV-3 (_void_and_remerge via _finalize_inflight).
         # Two traps make a naive flip here actively dangerous, so if one is
         # ever attempted anyway, it must solve BOTH:
