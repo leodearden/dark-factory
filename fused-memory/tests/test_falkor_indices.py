@@ -58,6 +58,7 @@ from fused_memory.backends.falkor_indices import (
     normalize_index_record,
     normalize_index_records,
     parse_index_statement,
+    plan_index_statements,
     range_create_statement,
     resolve_header_positions,
 )
@@ -1055,3 +1056,140 @@ class TestRangeCreateStatement:
         automatically instead of leaving a stale hard-coded list passing.
         """
         assert parse_index_statement(range_create_statement(spec)) == [spec]
+
+
+#: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
+#: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
+#: statement upstream emits for those two labels is rejected wholesale against it.
+_TRAP_PRESENT = {
+    ('Entity', 'NODE', 'uuid', 'RANGE'),
+    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+}
+
+
+def _trap_missing() -> set:
+    return expected_index_set() - _TRAP_PRESENT
+
+
+class TestPlanIndexStatements:
+    """The diff → statements step, and boundary test 1's NEGATIVE half with zero I/O.
+
+    "No composite RANGE statement is ever issued" is the guarantee that makes β
+    different from the code it replaces.  Observing it only against a live graph
+    would leave it untested in the default lane, so it is asserted here — and
+    asserted by parsing statements back through α's own
+    :func:`parse_index_statement` rather than by a regex, so the check tracks the
+    real statement grammar instead of drifting from it.
+    """
+
+    def test_nothing_missing_plans_nothing(self):
+        """Idempotence falls out STRUCTURALLY, not from FalkorDB swallowing a re-create.
+
+        D2: no correctness property may depend on FalkorDB's error behaviour or
+        wording.  An empty diff must produce an empty plan, so a fully-provisioned
+        graph is not written to at all.
+        """
+        assert plan_index_statements(set()) == []
+
+    def test_no_range_statement_lists_more_than_one_property(self):
+        """Boundary test 1's negative half: the composite form is never emitted.
+
+        Parsed back through α's parser, every RANGE statement must fan out to
+        exactly ONE spec. Upstream's composite ``Entity`` statement would fan out
+        to four, and its ``RELATES_TO`` one to seven.
+        """
+        for statement, _covered in plan_index_statements(_trap_missing()):
+            specs = parse_index_statement(statement)
+            if specs[0][3] == 'RANGE':
+                assert len(specs) == 1, f'composite RANGE statement planned: {statement}'
+
+    def test_every_missing_spec_is_covered_exactly_once(self):
+        missing = _trap_missing()
+        covered: list = []
+        for _statement, specs in plan_index_statements(missing):
+            covered.extend(specs)
+
+        assert len(covered) == len(set(covered)), 'a spec was covered by two statements'
+        assert set(covered) == missing
+
+    def test_covered_specs_never_exceed_missing(self):
+        """``created`` ⊆ ``missing`` is what keeps the accounting invariant exact.
+
+        A fulltext statement legitimately re-covers already-present properties on
+        a partially-provisioned graph; pairing it with its FULL spec list would
+        inflate ``created`` past ``missing`` and break
+        ``len(created) + len(failed) == len(missing)``.
+        """
+        missing = _trap_missing()
+        for _statement, specs in plan_index_statements(missing):
+            assert set(specs) <= missing
+
+    def test_fulltext_statements_are_upstream_byte_identical(self):
+        """Asserted against upstream's own output, never against a pasted literal.
+
+        A graphiti upgrade that changes the fulltext syntax must not leave a
+        stale hard-coded string silently passing here (INV-5: single home, never
+        restate).
+        """
+        upstream_fulltext = list(get_fulltext_indices(GraphProvider.FALKORDB))
+        planned = [s for s, _ in plan_index_statements(expected_index_set())]
+        fulltext_planned = [s for s in planned if s not in _synthesized_range_forms()]
+
+        assert fulltext_planned
+        for statement in fulltext_planned:
+            assert statement in upstream_fulltext
+
+    def test_fulltext_statement_is_paired_with_only_the_missing_subset(self):
+        """One missing fulltext property → the statement once, covering that one spec.
+
+        The statement necessarily re-covers its sibling properties when FalkorDB
+        executes it; the PLAN must still claim only what was actually missing.
+        """
+        one_fulltext = next(
+            spec for spec in sorted(expected_index_set())
+            if spec[3] == 'FULLTEXT' and spec[0] == 'Entity'
+        )
+        plan = plan_index_statements({one_fulltext})
+
+        assert len(plan) == 1
+        statement, covered = plan[0]
+        assert covered == (one_fulltext,)
+        assert statement in list(get_fulltext_indices(GraphProvider.FALKORDB))
+
+    def test_no_planned_statement_carries_if_not_exists(self):
+        """``IF NOT EXISTS`` is a FalkorDB syntax error — every statement would fail."""
+        for statement, _covered in plan_index_statements(expected_index_set()):
+            assert 'IF NOT EXISTS' not in statement.upper()
+
+    def test_statement_counts_are_derived_from_the_diff(self):
+        """Counts follow the input, so a graphiti upgrade cannot leave a magic number stale."""
+        missing = _trap_missing()
+        plan = plan_index_statements(missing)
+
+        expected_range_count = len([s for s in missing if s[3] == 'RANGE'])
+        expected_fulltext_count = len([
+            statement
+            for statement in get_fulltext_indices(GraphProvider.FALKORDB)
+            if set(parse_index_statement(statement)) & missing
+        ])
+
+        range_statements = [s for s, _ in plan if parse_index_statement(s)[0][3] == 'RANGE']
+        fulltext_statements = [s for s, _ in plan if parse_index_statement(s)[0][3] == 'FULLTEXT']
+
+        assert len(range_statements) == expected_range_count
+        assert len(fulltext_statements) == expected_fulltext_count
+        assert len(plan) == expected_range_count + expected_fulltext_count
+
+    def test_plan_is_deterministic(self):
+        """A stable order keeps the issued-statement log diffable across runs."""
+        missing = _trap_missing()
+        assert plan_index_statements(missing) == plan_index_statements(missing)
+
+
+def _synthesized_range_forms() -> set:
+    """Every statement β would synthesize for the full expected RANGE set."""
+    return {
+        range_create_statement(spec)
+        for spec in expected_index_set()
+        if spec[3] == 'RANGE'
+    }
