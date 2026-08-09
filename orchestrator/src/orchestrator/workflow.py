@@ -14722,11 +14722,67 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # resume the plan, not be triaged as "steward
                     # failed".  Dismiss the still-pending L0 — its only
                     # consumer (the steward) is done — and re-pend.
+                    #
+                    # Task 3236 — WHICH records this dismisses is deliberately
+                    # unchanged; only its OBSERVABILITY is.  Notes for anyone
+                    # tempted to narrow it:
+                    #
+                    # (i) The durable recourse for a steward that cannot
+                    #     resolve an L0 itself is escalate_blocker(level=1).
+                    #     A level-1 record is outside this level=0-scoped
+                    #     sweep BY CONSTRUCTION (no predicate to defeat), is
+                    #     non-gating per _is_gating_escalation, is read by the
+                    #     auto-watcher, and pins the task via
+                    #     escalation.pins QUEUE_HANDOFF regardless of the
+                    #     filer's liveness.  That is the structural fix; a
+                    #     preservation predicate here is not needed.
+                    # (ii) An agent_role-based predicate would be WRONG:
+                    #     agent_role is a free-form MCP tool argument, not an
+                    #     enforced property, and the steward routinely chains
+                    #     a benign follow-on infra_issue while resolving a
+                    #     task_failure (see
+                    #     test_workflow_merge_gating_strand.py), so preserving
+                    #     every steward-role L0 preserves mostly benign
+                    #     records — and a preserved severity='info' record
+                    #     defeats skip_if_idle in the post-merge success tail,
+                    #     burning the full steward_completion_timeout on an
+                    #     already-merged task.  Escalation.filing_claimant_run_id
+                    #     is the field that would make a real
+                    #     filed-by-this-incarnation predicate possible, but it
+                    #     is stamped only in tests today, never on a
+                    #     production filing path; stamping it is the
+                    #     principled follow-up.
+                    # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
+                    #     each of them has an L1 open by construction, so
+                    #     dismissing a stray L0 there is deliberate
+                    #     anti-duplicate-L1-churn behaviour (incident
+                    #     esc-3576-234), and steward._dismiss_capped_l0
+                    #     dismisses only the single record it was handed.
                     if self.escalation_queue:
                         orphan_l0 = self.escalation_queue.get_by_task(
                             self.task_id, status='pending', level=0,
                         )
                         for esc in orphan_l0:
+                            # WARNING, not INFO, and per-record rather than a
+                            # count: a swallowed filing must be traceable to
+                            # WHICH record went and WHO filed it
+                            # (loud-over-silent-degradation /
+                            # no-silent-fail-soft).  Logged BEFORE the resolve
+                            # so the record is named even if resolve raises.
+                            logger.warning(
+                                'Task %s: auto-dismissing pending L0 %s '
+                                '(agent_role=%s, category=%s): %s — steward '
+                                'interrupted (%s) with WIP present, resuming '
+                                'plan.  A steward that still needs a human '
+                                'should re-file with '
+                                'escalate_blocker(level=1), which this '
+                                'level=0-scoped sweep does not touch.',
+                                self.task_id, esc.id,
+                                getattr(esc, 'agent_role', '<unknown>'),
+                                getattr(esc, 'category', '<unknown>'),
+                                getattr(esc, 'summary', '<no summary>'),
+                                outcome.reason,
+                            )
                             self.escalation_queue.resolve(
                                 esc.id,
                                 'Auto-dismissed: steward interrupted '
