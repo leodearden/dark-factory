@@ -10,6 +10,12 @@ and δ (``summarize_index_health``):
 * the ACTUAL side — ``normalize_index_records()``, which fans a ``list_indices()``
   record out to one tuple per (property, index_type) pair.
 
+Since task 3707 (β) it additionally pins β's PURE planner — ``IndexProvisionResult``,
+``range_create_statement`` and ``plan_index_statements`` — which lives in the same
+module precisely because it is zero-I/O.  That placement makes D1's "β never issues
+the upstream composite range statement" guarantee assertable as a fast unit test
+rather than only as an observation against a live graph.
+
 The four FalkorDB statement forms, measured verbatim 2026-08-06 against the
 installed **graphiti-core 0.28.2** (pinned open-ended at ``pyproject.toml`` as
 ``graphiti-core[falkordb]>=0.28.1``)::
@@ -35,6 +41,7 @@ evidence (the current absence of indices on real graphs).
 
 from __future__ import annotations
 
+import dataclasses
 from collections import OrderedDict, defaultdict
 from unittest.mock import MagicMock
 
@@ -44,12 +51,14 @@ from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
 from fused_memory.backends.falkor_indices import (
     IndexHeaderShapeError,
+    IndexProvisionResult,
     IndexRecordShapeError,
     UnparsedIndexStatementError,
     expected_index_set,
     normalize_index_record,
     normalize_index_records,
     parse_index_statement,
+    range_create_statement,
     resolve_header_positions,
 )
 
@@ -920,3 +929,129 @@ class TestListIndicesColumnBinding:
 
         assert graph.ro_query.called
         assert not graph.query.called
+
+
+# --- β's pure planner (task 3707) ------------------------------------------
+
+
+def _expected_range_specs() -> list:
+    """Every RANGE spec in the expected set, DERIVED — never hard-coded."""
+    return sorted(spec for spec in expected_index_set() if spec[3] == 'RANGE')
+
+
+class TestIndexProvisionResult:
+    """The structured result β returns instead of a bare "did something" log.
+
+    The PRD contract names four fields (``created`` / ``already_present`` /
+    ``failed`` / ``expected_total``); β adds a fifth, ``statements`` — the
+    statements actually issued, in order — because two obligations need it and
+    neither is served by the four.  Boundary test 1 asserts that NO composite
+    statement appears in the issued-statement log, and D7 requires the WARNING to
+    name each FAILED STATEMENT, which cannot be reconstructed from an IndexSpec
+    (a fulltext spec's statement is upstream's verbatim string).
+    """
+
+    def test_field_set_is_exactly_the_contract_plus_statements(self):
+        """No accidental extra field, and none of the five silently dropped."""
+        assert dataclasses.is_dataclass(IndexProvisionResult)
+        names = [f.name for f in dataclasses.fields(IndexProvisionResult)]
+        assert set(names) == {
+            'created', 'already_present', 'failed', 'expected_total', 'statements',
+        }
+
+    def test_constructs_with_the_contract_field_types(self):
+        spec = ('Entity', 'NODE', 'name', 'RANGE')
+        result = IndexProvisionResult(
+            created=[spec],
+            already_present=2,
+            failed=[(spec, 'boom')],
+            expected_total=38,
+            statements=['CREATE INDEX FOR (n:Entity) ON (n.name)'],
+        )
+        assert result.created == [spec]
+        assert result.already_present == 2
+        assert result.failed == [(spec, 'boom')]
+        assert result.expected_total == 38
+        assert result.statements == ['CREATE INDEX FOR (n:Entity) ON (n.name)']
+
+    @pytest.mark.parametrize(
+        ('created', 'failed', 'expected'),
+        [
+            ([('Entity', 'NODE', 'name', 'RANGE')], [], True),
+            ([], [(('Entity', 'NODE', 'name', 'RANGE'), 'boom')], True),
+            ([], [], False),
+        ],
+        ids=['created-only', 'failed-only', 'neither'],
+    )
+    def test_changed_is_true_when_anything_was_created_or_failed(
+        self, created, failed, expected,
+    ):
+        """``changed`` is the predicate D7's INFO-on-change log keys on.
+
+        A FAILED statement counts as changed on purpose: a run that tried and
+        could not provision must not be indistinguishable from a run that found
+        nothing to do (INV-2 — emit the fact the caller actually has).
+        """
+        result = IndexProvisionResult(
+            created=created,
+            already_present=0,
+            failed=failed,
+            expected_total=38,
+            statements=[],
+        )
+        assert result.changed is expected
+
+
+class TestRangeCreateStatement:
+    """β synthesizes RANGE indices PER-PROPERTY, never as upstream's composite.
+
+    MEASURED against the seeded trap state: upstream's
+    ``CREATE INDEX FOR (n:Entity) ON (n.uuid, n.group_id, n.name, n.created_at)``
+    is rejected wholesale with ``Attribute 'uuid' is already indexed`` when ANY
+    listed property already exists — and ``falkordb_driver.py``'s
+    ``execute_query`` swallows that rejection, so all four properties are lost
+    silently.  Per-property statements converge to the identical index state
+    while degrading one property at a time.
+    """
+
+    def test_node_form_is_the_single_property_shape(self):
+        assert (
+            range_create_statement(('Entity', 'NODE', 'name', 'RANGE'))
+            == 'CREATE INDEX FOR (n:Entity) ON (n.name)'
+        )
+
+    def test_relationship_form_is_the_single_property_edge_shape(self):
+        assert (
+            range_create_statement(('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'))
+            == 'CREATE INDEX FOR ()-[e:RELATES_TO]-() ON (e.uuid)'
+        )
+
+    def test_fulltext_spec_raises_because_fulltext_is_issued_verbatim(self):
+        """D1: fulltext is emitted as upstream emits it, never synthesized here.
+
+        Synthesizing it would mean re-deriving the node-side
+        ``CALL db.idx.fulltext.createNodeIndex`` form — including its 33-word
+        stopwords map — which was measured to succeed VERBATIM against the same
+        trap state.  Rebuilding a form that already works is unmeasured churn.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            range_create_statement(('Entity', 'NODE', 'name', 'FULLTEXT'))
+        assert 'FULLTEXT' in str(excinfo.value)
+
+    @pytest.mark.parametrize('spec', _expected_range_specs(), ids=lambda s: f'{s[0]}.{s[2]}')
+    def test_never_emits_if_not_exists(self, spec):
+        """``IF NOT EXISTS`` is a FalkorDB SYNTAX ERROR — adding it breaks every write."""
+        assert 'IF NOT EXISTS' not in range_create_statement(spec).upper()
+
+    @pytest.mark.parametrize('spec', _expected_range_specs(), ids=lambda s: f'{s[0]}.{s[2]}')
+    def test_alpha_beta_seam_round_trip(self, spec):
+        """What β WRITES must parse back, through α's parser, to exactly what it meant.
+
+        This is the seam guard: β's synthesized form and α's ``parse_index_statement``
+        are the two halves of "what should exist", and a divergence between them
+        would make the diff permanently non-empty (β re-issuing statements forever
+        for indices it just created).  Specs are derived from
+        ``expected_index_set()``, so a graphiti upgrade widens this sweep
+        automatically instead of leaving a stale hard-coded list passing.
+        """
+        assert parse_index_statement(range_create_statement(spec)) == [spec]
