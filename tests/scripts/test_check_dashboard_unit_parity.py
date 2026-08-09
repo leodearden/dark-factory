@@ -24,12 +24,13 @@ tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import types
 
 import pytest
-from setup_host_sections import run_section, slice_section
+from setup_host_sections import run_section, setup_host_text, slice_section
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -2569,3 +2570,219 @@ def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Pa
         f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
     )
     _assert_units_installed(repo, unit_dir)
+
+
+# ---------------------------------------------------------------------------
+# The section-12 POST-INSTALL check in setup-host.sh
+# ---------------------------------------------------------------------------
+#
+# Same checker, second call site. This one runs AFTER the install, so a
+# mismatch does not mean "the host drifted" — it means the install did not
+# take. No install follows it, so these assertions are output-only.
+#
+# It carries the identical exit-2 defect, and here the false green is the
+# strongest of the three: a post-install check that silently never ran is the
+# LAST word the operator reads about whether the install took.
+
+_SECTION_12_START = "# Dashboard unit parity — POST-INSTALL SANITY CHECK ONLY."
+_SECTION_12_END = "\nfi\n"
+
+
+def _run_section_12(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_12_START, _SECTION_12_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+
+def test_section_12_missing_checker_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 here is "not installed in $UNIT_DIR (section 8 did not run?)" — already a
+    diagnosis, and the wrong one. A renamed or moved checker would send the
+    operator to investigate an install that in fact completed, while the thing
+    that actually failed (the check itself) goes unreported.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The check is non-fatal — fail() only printfs, so it must not abort the "
+        f"health-check section.\n{result.stdout}\n{result.stderr}"
+    )
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, (
+        "A missing checker was diagnosed as a failed section-8 install.\n"
+        f"{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_usage_error_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_reports_install_verified_on_parity(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "install verified" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+
+
+def test_section_12_reports_the_install_did_not_take_on_drift(
+    tmp_path: pathlib.Path,
+):
+    """Drift AFTER installing is a real verdict — and keeps its drop-in guidance.
+
+    A drop-in override survives reinstallation because setup-host.sh does not
+    touch <unit>.d/ directories, so the operator must be told to remove it by
+    hand. That guidance has to survive the rewrite.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "AFTER installing" in result.stdout, result.stdout
+    assert "drop-in" in result.stdout, (
+        f"The drop-in guidance must survive the rewrite.\n{result.stdout}"
+    )
+    assert "FAIL " not in result.stdout, (
+        f"Post-install drift is a real verdict from a check that RAN.\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural sweep: no parity-checker call site may branch on a bare status
+# ---------------------------------------------------------------------------
+#
+# The three tests above pin the three call sites that exist TODAY. This sweep
+# pins the RULE, so a fourth gate added later cannot reintroduce the defect
+# without failing here. Sites are DERIVED from the file text rather than
+# hardcoded, so a new checker is covered the moment it is wired up.
+
+_PARITY_SCRIPT_RE = re.compile(r"scripts/check_\w+_unit_parity\.py")
+_GREP_ON_MARKER_RE = re.compile(r"grep -qE?\s+'[^']*\[")
+_EXISTENCE_GUARD_RE = re.compile(r"\[\s+!?\s*-f\s")
+_EQ_2_RE = re.compile(r"-eq 2")
+
+
+def _parity_call_sites() -> list[tuple[int, str]]:
+    """Every parity-checker call site in setup-host.sh, as (line number, block).
+
+    A site is a NON-COMMENT line naming a `scripts/check_*_unit_parity.py`
+    path — either the hoisted `_x_script="..."` assignment or a direct `python3
+    "..."` invocation. Its block runs to the next column-0 `fi`, which closes
+    the enclosing verdict construct at all sites.
+
+    Comment lines are excluded deliberately: the fused-memory block cites
+    `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and a
+    citation is not a call site.
+    """
+    text = setup_host_text()
+    sites: list[tuple[int, str]] = []
+    offset = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        start = offset
+        offset += len(line) + 1
+        if line.lstrip().startswith("#") or not _PARITY_SCRIPT_RE.search(line):
+            continue
+        end = text.find("\nfi\n", start)
+        assert end != -1, (
+            f"No column-0 `fi` closes the parity block starting at line {lineno}."
+        )
+        sites.append((lineno, text[start : end + len("\nfi\n")]))
+    return sites
+
+
+def test_the_sweep_finds_every_known_parity_call_site():
+    """Guard against a vacuous sweep: matching nothing must not read as passing."""
+    sites = _parity_call_sites()
+
+    assert len(sites) >= 3, (
+        "Expected at least the orchestrator, dashboard pre-install and "
+        f"fused-memory call sites; found {len(sites)}: "
+        f"{[lineno for lineno, _ in sites]}. If the sweep below stops matching, "
+        "it silently stops guarding anything."
+    )
+
+
+@pytest.mark.parametrize("_idx", range(8))
+def test_every_parity_call_site_guards_its_script_and_validates_its_output(_idx: int):
+    """No call site may branch on a parity-checker exit status it cannot trust.
+
+    Exit 2 is overloaded three ways — the checker's own benign verdict,
+    `python3` refusing to open a missing script, and argparse rejecting an
+    unknown flag — so every site must (i) verify the script exists and
+    (ii) confirm the checker's own bracketed report is present BEFORE reading
+    the status.
+
+    Parametrized over a fixed range so an added call site surfaces as a new
+    failing case rather than silently extending an existing one.
+    """
+    sites = _parity_call_sites()
+    if _idx >= len(sites):
+        pytest.skip(f"only {len(sites)} parity call sites")
+    lineno, block = sites[_idx]
+
+    assert _EXISTENCE_GUARD_RE.search(block), (
+        f"The parity call site at setup-host.sh:{lineno} does not guard the "
+        f"script path with a `[ -f ` / `[ ! -f ` existence test, so a renamed "
+        f"or moved checker reaches python3 and its exit 2 is read as a "
+        f"verdict.\n{block}"
+    )
+
+    grep_match = _GREP_ON_MARKER_RE.search(block)
+    assert grep_match, (
+        f"The parity call site at setup-host.sh:{lineno} does not validate the "
+        f"checker's output with a `grep -q`/`grep -qE` on a bracketed marker, "
+        f"so it believes a status that may not have come from the checker at "
+        f"all.\n{block}"
+    )
+
+    eq_2 = _EQ_2_RE.search(block)
+    if eq_2:
+        assert grep_match.start() < eq_2.start(), (
+            f"The parity call site at setup-host.sh:{lineno} compares the exit "
+            f"status against 2 BEFORE validating that the output came from the "
+            f"checker. The validation must gate the ladder, not follow it.\n"
+            f"{block}"
+        )
