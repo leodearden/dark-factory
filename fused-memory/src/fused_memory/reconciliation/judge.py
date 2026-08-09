@@ -997,6 +997,13 @@ Review this run and provide your verdict as JSON.
            the pipeline produces a clean verdict.
         3. **No post-unhalt grace, no active cooldown**: operator intervention
            gets breathing room before the detector re-fires.
+
+        Before any of the above, phantom verdicts (task 3070) — fabricated by
+        ``_parse_verdict`` as a stand-in when judge output could not be parsed,
+        see ``is_phantom_verdict`` — are removed from the verdict list. A
+        phantom carries no evidence that a review ever happened, so it must
+        not be able to feed the count gate or complete the consecutive-streak
+        gate.
         """
         if not self.config.halt_on_judge_serious:
             return
@@ -1018,10 +1025,27 @@ Review this run and provide your verdict as JSON.
             )
             return
 
+        # Phantom non-ok verdicts (task 3070) are fabricated placeholders for a
+        # review that never happened — _parse_verdict stamps them when the
+        # judge output could not be parsed (see is_phantom_verdict). They
+        # carry no evidence either way, so they are removed from the evidence
+        # set BEFORE any of the three gates below run, not merely uncounted
+        # afterward: a phantom must not be able to complete the
+        # consecutive-most-recent streak any more than it should inflate the
+        # count. The exclusion is deliberately restricted to non-ok
+        # severities: a phantom is only ever severity=serious (see
+        # is_phantom_verdict), so this can never drop an ok/minor verdict
+        # from the ordering and un-break a streak (that would be a fail-open
+        # change, outside this task's ask).
+        evidence = [
+            v for v in verdicts
+            if not (v.severity in _NON_OK_SEVERITIES and is_phantom_verdict(v))
+        ]
+
         window_hours = float(self.config.halt_trend_window_hours)
         window_start = now - timedelta(hours=window_hours)
         windowed = sorted(
-            (v for v in verdicts if v.reviewed_at >= window_start),
+            (v for v in evidence if v.reviewed_at >= window_start),
             key=lambda v: v.reviewed_at,
             reverse=True,
         )
@@ -1035,18 +1059,9 @@ Review this run and provide your verdict as JSON.
         ):
             return
 
-        # Phantom non-ok verdicts (task 3070) are fabricated placeholders for
-        # a review that never happened — they carry no evidence either way,
-        # so they must not inflate the count gate. The exclusion is
-        # deliberately restricted to non-ok severities: a phantom is only
-        # ever severity=serious (see is_phantom_verdict), so this can never
-        # drop an ok/minor verdict from the ordering and un-break a streak
-        # (that would be a fail-open change, and belongs to the streak gate
-        # above, not here).
-        non_ok_in_window = [
-            v for v in windowed
-            if v.severity in _NON_OK_SEVERITIES and not is_phantom_verdict(v)
-        ]
+        # Phantoms are already excluded above, so this is now a plain
+        # membership test — the exclusion has exactly one spelling.
+        non_ok_in_window = [v for v in windowed if v.severity in _NON_OK_SEVERITIES]
         if len(non_ok_in_window) < self.config.halt_trend_moderate_count:
             return
 
