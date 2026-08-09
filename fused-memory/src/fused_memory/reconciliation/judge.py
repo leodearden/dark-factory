@@ -105,6 +105,13 @@ _VERDICT_PROBE_RUN_ID = '__verdict_schema_probe__'
 # desync the detector from the producer.
 _UNPARSEABLE_VERDICT_CODE = 'unparseable_judge_response'
 
+# Prefix of the 'issue' text _parse_verdict stamps on its fabricated finding
+# (see the f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}' construction below). Hoisted
+# to a constant for the same reason as _UNPARSEABLE_VERDICT_CODE: it is the
+# ONLY signal available on a pre-2947 row, which was written before the
+# 'code' marker existed and so cannot be identified any other way.
+_UNPARSEABLE_ISSUE_PREFIX = 'Judge response could not be parsed'
+
 
 def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
     """True iff *verdict* is a fabricated stand-in for a review that never
@@ -118,16 +125,40 @@ def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
     *content* the judge rated severity=serious: that is a real review
     outcome and must never be treated as phantom.
 
-    Currently recognises only the structured marker: any row written after
-    task 2947 landed carries ``code == 'unparseable_judge_response'`` on its
-    (sole) finding. ``findings`` is ``list[dict]`` (models/reconciliation.py)
-    but may be deserialized from stored JSON, so each entry is walked
-    defensively rather than assumed to already be a well-formed dict.
+    Two shapes are recognised:
+
+    1. **Structured marker** (primary): any row written after task 2947
+       landed (merged 2026-07-23) carries ``code ==
+       'unparseable_judge_response'`` on its (sole) finding. ``findings`` is
+       ``list[dict]`` (models/reconciliation.py) but may be deserialized
+       from stored JSON, so each entry is walked defensively rather than
+       assumed to already be a well-formed dict.
+    2. **Legacy unmarked shape** (fallback): rows written BEFORE task 2947
+       carry no ``code`` key at all, so they are identified by the shape
+       ``_parse_verdict`` has always fabricated — severity=serious AND
+       exactly one finding AND that finding's ``issue`` starts with
+       ``_UNPARSEABLE_ISSUE_PREFIX``. All three conjuncts matter: the
+       fabrication path only ever emits severity=serious (never moderate);
+       the sole genuine severity=serious row in the live DB (bc9459b8) has
+       FIVE findings, so the single-finding conjunct is what keeps this
+       fallback from swallowing it; and ``startswith`` (not a substring
+       test) means a genuine finding that merely *mentions* parsing
+       somewhere in its prose is not mistaken for the fabricated one. A
+       future variant shape that fails one of these conjuncts falls back to
+       the status quo (still counted as evidence) rather than silently
+       under-counting — fail-closed in the safe direction.
     """
-    return any(
-        isinstance(f, dict) and f.get('code') == _UNPARSEABLE_VERDICT_CODE
-        for f in verdict.findings
-    )
+    for f in verdict.findings:
+        if not isinstance(f, dict):
+            continue
+        if f.get('code') == _UNPARSEABLE_VERDICT_CODE:
+            return True
+    if verdict.severity == VerdictSeverity.serious and len(verdict.findings) == 1:
+        finding = verdict.findings[0]
+        issue = finding.get('issue') if isinstance(finding, dict) else None
+        if isinstance(issue, str) and issue.startswith(_UNPARSEABLE_ISSUE_PREFIX):
+            return True
+    return False
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
@@ -923,7 +954,12 @@ Review this run and provide your verdict as JSON.
                 reviewed_at=datetime.now(UTC),
                 severity=VerdictSeverity.serious,
                 findings=[{
-                    'issue': f'Judge response could not be parsed: {e}',
+                    # Built from _UNPARSEABLE_ISSUE_PREFIX (not a literal
+                    # string) so the stamped text and is_phantom_verdict's
+                    # legacy-shape prefix check can never drift apart — the
+                    # prefix is the ONLY signal is_phantom_verdict has for a
+                    # row that predates the 'code' marker below.
+                    'issue': f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}',
                     'severity': 'serious',
                     # Machine-readable marker (task 2947 ask b): lets review_run
                     # pick the truthful 'Unparseable judge response' halt reason
