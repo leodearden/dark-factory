@@ -47,12 +47,73 @@ def _assistant(blocks: list, *, nested: bool = True) -> dict:
     return {'type': 'assistant', 'content': blocks}
 
 
-def _bash_launch(*, background: bool = True, command: str = 'sleep 9999') -> dict:
+def _bash_launch(
+    *,
+    background: bool = True,
+    command: str = 'sleep 9999',
+    tool_id: str = 'toolu_1',
+) -> dict:
+    """A Bash tool_use block.  Real CLI blocks carry an ``id``; it is emitted
+    unconditionally (with a default) so the pre-existing tests are unaffected
+    while the bg-log-reap tests can correlate a launch with its tool_result."""
     return {
         'type': 'tool_use',
+        'id': tool_id,
         'name': 'Bash',
         'input': {'command': command, 'run_in_background': background},
     }
+
+
+def _bg_log_path(task_id: str = 'bz89cdzmh') -> str:
+    """The CLI's background-output path shape: the task id is a substring of it."""
+    return f'/tmp/claude-1000/-w-3639/sess/tasks/{task_id}.output'
+
+
+def _bg_launch_result(
+    tool_id: str = 'toolu_1',
+    task_id: str = 'bz89cdzmh',
+    log_path: str | None = None,
+    *,
+    structured: bool = True,
+    in_text: bool = True,
+) -> dict:
+    """The ``user`` tool_result record the CLI emits for a background launch.
+
+    Mirrors the REAL shape sampled from ``~/.claude/projects/*/*.jsonl``: the
+    record carries BOTH a structured ``toolUseResult.backgroundTaskId`` and a
+    result-text sentence naming the output file.  ``structured=False`` drops the
+    former and ``in_text=False`` drops the latter, so the detector's two
+    token-extraction sources can be exercised independently.
+    """
+    log_path = log_path if log_path is not None else _bg_log_path(task_id)
+    text = f'Command running in background with ID: {task_id}.'
+    if in_text:
+        text += (
+            f' Output is being written to: {log_path}.'
+            ' You will be notified when it completes.'
+            ' To check interim output, use Read on that file path.'
+        )
+    record: dict = {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [
+                {'type': 'tool_result', 'tool_use_id': tool_id, 'content': text},
+            ],
+        },
+    }
+    if structured:
+        record['toolUseResult'] = {'stdout': '', 'backgroundTaskId': task_id}
+    return record
+
+
+def _fg_bash(command: str) -> dict:
+    """A FOREGROUND Bash tool_use (no run_in_background) — not a launch."""
+    return {'type': 'tool_use', 'name': 'Bash', 'input': {'command': command}}
+
+
+# A second bg-log path used by the malformed-record tolerance test.
+LOG_ALT = _bg_log_path('zz99alt00')
 
 
 def _bash_output(shell_id: str = 'sh-1') -> dict:
@@ -208,6 +269,154 @@ class TestDetectEndedAwaitingBackground:
         assert detect_ended_awaiting_background(records) is False
 
 
+class TestForegroundBgLogReadIsAReap:
+    """A FOREGROUND read of a background launch's output file is a reap (task
+    3639).
+
+    The `_lane-31` specimen: an agent launches `cargo test` with
+    ``run_in_background=true``, then reads the CLI-reported bg-log with a
+    foreground ``tail``/``cat``/``grep`` — or with ``Read``, which the CLI's own
+    launch message explicitly recommends — and never calls ``BashOutput``.  That
+    session demonstrably engaged with its pending work, so the abandonment
+    verdict must not fire.  Identity comes from the launch's tool_result: the
+    structured ``toolUseResult.backgroundTaskId`` and the path captured from the
+    ``Output is being written to: <path>`` sentence.
+    """
+
+    LOG = _bg_log_path()
+
+    def test_foreground_tail_of_bg_log_is_false(self) -> None:
+        """The `_lane-31` shape: launch → its tool_result → foreground `tail` of
+        the reported bg-log → engaged → False."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_foreground_cat_of_bg_log_is_false(self) -> None:
+        """`cat <bg-log>` is the same reap, with no shell-verb enumeration."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_fg_bash(f'cat {self.LOG}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_foreground_grep_of_bg_log_is_false(self) -> None:
+        """`grep -c FAILED <bg-log>` likewise."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_fg_bash(f'grep -c FAILED {self.LOG}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_read_tool_of_bg_log_is_false(self) -> None:
+        """`Read` on the bg-log path — the reap the CLI's own launch message
+        recommends ("use Read on that file path") → False."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': self.LOG}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_grep_tool_of_bg_log_is_false(self) -> None:
+        """`Grep` with the bg-log as ``path`` → tool-agnostic token match → False."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant(
+                [
+                    {
+                        'type': 'tool_use',
+                        'name': 'Grep',
+                        'input': {'pattern': 'test result', 'path': self.LOG},
+                    }
+                ]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_token_from_structured_field_only_is_false(self) -> None:
+        """Token recovered from ``toolUseResult.backgroundTaskId`` alone (the
+        result text carries no ``Output is being written to:`` sentence) — the
+        task id is a substring of the log path, so the later `tail` matches."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(structured=True, in_text=False),
+            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_token_from_result_text_only_is_false(self) -> None:
+        """Token recovered from the result TEXT alone (no structured
+        ``toolUseResult``) — tolerates CLI versions emitting only one source."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(structured=False, in_text=True),
+            _assistant([_fg_bash(f'tail -50 {self.LOG}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_launch_with_nothing_after_still_true(self) -> None:
+        """2761 PRESERVATION: launch → its tool_result → nothing.  The genuine
+        Reify-5164 abandonment shape must still fire."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_unrelated_foreground_activity_still_true(self) -> None:
+        """2761 PRESERVATION: post-launch activity that never references the
+        bg-log token is not a reap → still True (no blanket "did anything
+        afterwards" mute)."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_fg_bash('git status')]),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_second_unreaped_launch_after_reaped_first_is_true(self) -> None:
+        """launch A → A's result → read A's log → launch B → B's result →
+        nothing: the reap is positional, so B's abandonment still fires."""
+        records = [
+            _assistant([_bash_launch(command='job-a', tool_id='toolu_a')]),
+            _bg_launch_result(tool_id='toolu_a', task_id='aaa11111'),
+            _assistant([_fg_bash(f'tail -50 {_bg_log_path("aaa11111")}')]),
+            _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
+            _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_malformed_user_records_never_raise(self) -> None:
+        """Malformed ``user`` records (toolUseResult not a dict, content not a
+        list, tool_use_id absent, backgroundTaskId empty/non-string) are skipped
+        rather than raising, and a text-derived token from a well-formed sibling
+        still clears the verdict → False."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            {'type': 'user', 'toolUseResult': 'not-a-dict', 'message': {'content': 'not-a-list'}},
+            {'type': 'user', 'toolUseResult': {'backgroundTaskId': ''}, 'content': None},
+            {'type': 'user', 'toolUseResult': {'backgroundTaskId': 42}, 'content': [None, 7]},
+            {
+                'type': 'user',
+                'content': [
+                    {'type': 'tool_result', 'content': f'Output is being written to: {LOG_ALT}.'}
+                ],
+            },
+            _assistant([_fg_bash(f'tail -50 {LOG_ALT}')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
     read_transcript_records, then the pure detector, mapping None (unresolvable
@@ -251,6 +460,53 @@ class TestEndedAwaitingBackgroundForSession:
         sid = 'sess-bg-empty'
         _write_transcript(tmp_path, sid, [])
         assert ended_awaiting_background_for_session(tmp_path, sid) is False
+
+    def test_lane31_specimen_transcript_is_false(self, tmp_path: Path) -> None:
+        """End-to-end replay of the `_lane-31` specimen that motivated task 3639:
+        FOUR background `cargo test` launches, each followed by its launch
+        tool_result and a FOREGROUND `tail` of its own bg-log, ZERO
+        BashOutput/KillShell/KillBash anywhere, final action a review-verdict
+        submission → the run completed and must NOT be downgraded."""
+        sid = 'sess-lane31'
+        records: list = [_assistant([_text('run the crate test suites in parallel')])]
+        for n in range(4):
+            tool_id = f'toolu_{n}'
+            task_id = f'bg{n}0000{n}'
+            records.append(
+                _assistant([_bash_launch(command=f'cargo test -p crate{n}', tool_id=tool_id)])
+            )
+            records.append(_bg_launch_result(tool_id=tool_id, task_id=task_id))
+            records.append(_assistant([_fg_bash(f'tail -50 {_bg_log_path(task_id)}')]))
+        records.append(
+            _assistant(
+                [
+                    {
+                        'type': 'tool_use',
+                        'name': 'mcp__verdict-tools__submit_review_verdict',
+                        'input': {'verdict': 'APPROVE'},
+                    }
+                ]
+            )
+        )
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
+
+    def test_lane31_shaped_transcript_ending_in_unreaped_launch_is_true(
+        self, tmp_path: Path
+    ) -> None:
+        """Control for the specimen replay: the same transcript shape whose TAIL
+        is an unreaped launch → the genuine abandonment still fires (True)."""
+        sid = 'sess-lane31-abandoned'
+        records: list = [
+            _assistant([_bash_launch(command='cargo test -p crate0', tool_id='toolu_0')]),
+            _bg_launch_result(tool_id='toolu_0', task_id='bg000000'),
+            _assistant([_fg_bash(f'tail -50 {_bg_log_path("bg000000")}')]),
+            _assistant([_bash_launch(command='cargo test -p crate1', tool_id='toolu_1')]),
+            _bg_launch_result(tool_id='toolu_1', task_id='bg111111'),
+            _assistant([_text('I will wait for the background test to finish')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is True
 
 
 # A clean success envelope: subtype='success', is_error absent, returncode 0 —
