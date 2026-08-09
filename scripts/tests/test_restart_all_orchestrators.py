@@ -10,9 +10,12 @@ write directly into a tmp fleet dir (ORCH_FLEET_DIR).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -24,7 +27,15 @@ import pytest
 # Importable because conftest.py appends REPO_ROOT to sys.path for this
 # directory. Functions only -- importing one of that module's FIXTURES into a
 # test module would bind a module-scoped copy that shadows the conftest's.
-from df_pytest_isolation import deploy_clock_snapshot, deploy_clock_violation_reason
+from df_pytest_isolation import (
+    PIPE_CLOSING_LEAKER_SRC,
+    deploy_clock_snapshot,
+    deploy_clock_violation_reason,
+    read_leaked_pid,
+    run_in_new_session,
+    wait_pid_gone,
+    wait_proof_grace_secs,
+)
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
 UNIT_R = "orchestrator-reify.service"
@@ -197,6 +208,12 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     autouse `_df_fleet_deploy_clock_redirect` already points it at a tmp file
     for every spawner in this directory (task 3797). A per-test override still
     wins via `env=`, which is applied after the os.environ copy below.
+
+    The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
+    plain subprocess.run: subprocess.run's timeout kill()s the direct child
+    only, and this script forks poll loops that outlived it by up to 27.8h,
+    reparented to systemd --user. `_decode` below still applies -- the re-raised
+    TimeoutExpired carries the partial output the timeout tests assert on.
     """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
@@ -204,17 +221,88 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
     if env:
         full_env.update(env)
-    return subprocess.run(
+    return run_in_new_session(
         ["bash", str(SCRIPT), *extra_args],
         env=full_env,
-        capture_output=True,
-        text=True,
         timeout=timeout,
     )
 
 
 def _load_state(state_path):
     return json.loads(state_path.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Process-group containment (task 3798).
+#
+# The mirror of this test lives in tests/scripts/test_orchestrator_watchdog.py
+# as test_boundary_run_drain_script_timeout_kills_the_whole_process_group. The
+# two are deliberately NOT cross-imported: these directories cannot import each
+# other's test modules, which is the same constraint that forced
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim into existence. What
+# they DO share is the one thing that matters -- a single spawn implementation
+# in df_pytest_isolation.run_in_new_session, and (since the amendment pass) a
+# single set of probes: PIPE_CLOSING_LEAKER_SRC / read_leaked_pid /
+# wait_pid_gone. Copies of those here and in the mirror were byte-identical
+# under cosmetic renames, which is the same "which of the copies did I fix"
+# hazard one function over from the one the shared spawn exists to close.
+# ---------------------------------------------------------------------------
+
+
+def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """_run_script's timeout must reach the poll loops the script forks.
+
+    subprocess.run's timeout path kill()s the DIRECT CHILD only, so a
+    backgrounded grandchild survives, is reparented to systemd --user, and
+    spends its grace unattended -- 86 concurrent orphans on 2026-08-06 and 82
+    more on 2026-08-07 (task 3798).
+
+    WHY THE LEAKER REDIRECTS ITS BACKGROUND CHILD'S STDIO, AND WHY THAT MUST
+    NOT BE "SIMPLIFIED" AWAY: a background child that KEPT the inherited
+    stdout/stderr pipes would hold their write ends open, so any drain run
+    against it after the kill never sees EOF. This test drives the REAL
+    spawner; with the stdio redirected to /dev/null nothing holds the pipe, the
+    timeout is raised on schedule, and a regression fails CLEANLY on the
+    surviving pid below. Dropping the `>/dev/null 2>&1` makes this test's
+    behaviour depend on internals of whatever the spawner does after its kill,
+    which is not what it is here to pin.
+
+    Points SCRIPT at the synthetic leaker rather than the real script: it is
+    read at call time inside _run_script, and the production script must never
+    be driven by a test that exists to observe a timeout.
+    """
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    leaked_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_script(
+                bin_dir, state_path, fleet_dir, "--drain",
+                env={"LEAK_PIDFILE": str(pidfile)},
+                timeout=2,
+            )
+
+        leaked_pid = read_leaked_pid(pidfile)
+        assert wait_pid_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _run_script timed out. The timeout "
+            "killed only the direct child, so every poll loop the script forked "
+            "is now an orphan free to spend its grace and then issue a REAL "
+            "systemctl restart. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
 
 
 def _decode(maybe_bytes):
@@ -271,15 +359,23 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     )
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
 
+    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift:
+    # the grace must outlast the timeout (or the script force-fires mid-test and
+    # the assertion below fails), and must stay small enough that a poller which
+    # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
+    spawn_timeout = 3
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            timeout=3,
+            timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)
@@ -480,15 +576,22 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     )
     # No heartbeat file written for UNIT_R at all.
 
+    # ONE binding feeding BOTH the grace and the timeout -- see
+    # test_defer_withholds_restart_while_busy above. This is the test named in
+    # every sampled orphan's PYTEST_CURRENT_TEST (task 3798).
+    spawn_timeout = 3
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "99999",
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            timeout=3,
+            timeout=spawn_timeout,
         )
 
     stdout = _decode(exc_info.value.stdout)

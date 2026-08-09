@@ -6,12 +6,15 @@ The watchdog module has a hyphenated filename so it cannot be imported via
 No live systemd runtime is needed — all subprocess.run calls are monkeypatched.
 """
 
+import contextlib
 import importlib.util
 import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
+import sys
 import time
 import types
 
@@ -19,6 +22,21 @@ import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
+
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
+# subproject directories (orchestrator/, shared/, ...) resolve as namespace
+# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
+# docstring exists to prevent. Mirrors test_deploy_clock_isolation.py.
+if str(REPO_ROOT.resolve()) not in sys.path:
+    sys.path.append(str(REPO_ROOT.resolve()))
+
+from df_pytest_isolation import (  # noqa: E402
+    PIPE_CLOSING_LEAKER_SRC,
+    read_leaked_pid,
+    run_in_new_session,
+    wait_pid_gone,
+    wait_proof_grace_secs,
+)
 
 
 def _load_watchdog() -> types.ModuleType:
@@ -3341,7 +3359,24 @@ def _boundary_run_drain_script(
     bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=20
 ):
     """Run the REAL restart-all-orchestrators.sh --drain with the fake
-    systemctl prepended onto PATH."""
+    systemctl prepended onto PATH.
+
+    The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
+    plain subprocess.run: subprocess.run's timeout kill()s the direct child
+    only, and this script forks poll loops that outlived it by up to 27.8h,
+    reparented to systemd --user. `_boundary_decode` below still applies -- the
+    re-raised TimeoutExpired carries the partial output the timeout tests
+    assert on.
+
+    That helper is now the SINGLE spawn implementation shared with
+    scripts/tests/test_restart_all_orchestrators.py::_run_script. These two
+    directories cannot import each other's test modules, so their duplicated
+    harnesses have historically had to be policed by hand (task 3336's three
+    collapsed tasks.db fixtures; test_boundary_fake_systemctl_matches_unit_
+    suite_verbatim, which exists solely to cross-check the two fake systemctls).
+    For the spawn path specifically, the "which of the two copies did I fix"
+    hazard can no longer recur -- there is only one copy.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
@@ -3349,17 +3384,93 @@ def _boundary_run_drain_script(
     full_env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
     if env:
         full_env.update(env)
-    return subprocess.run(
+    return run_in_new_session(
         ["bash", str(RESTART_ALL_SCRIPT), "--drain"],
         env=full_env,
-        capture_output=True,
-        text=True,
         timeout=timeout,
     )
 
 
 def _boundary_load_state(state_path):
     return json.loads(state_path.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Process-group containment (task 3798).
+#
+# Mirrors scripts/tests/test_restart_all_orchestrators.py::
+# test_run_script_timeout_kills_the_whole_process_group. The two are
+# deliberately NOT cross-imported -- these directories cannot import each
+# other's test modules, the same constraint that forced
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim into existence.
+# What they DO share is the one thing that matters: a single spawn
+# implementation in df_pytest_isolation.run_in_new_session, and (since the
+# amendment pass) a single set of probes -- PIPE_CLOSING_LEAKER_SRC /
+# read_leaked_pid / wait_pid_gone. The copies that used to live here and in the
+# mirror were byte-identical under a `_boundary_` prefix, i.e. the same "which
+# of the copies did I fix" hazard one function over from the one the shared
+# spawn exists to close.
+# ---------------------------------------------------------------------------
+
+
+def test_boundary_run_drain_script_timeout_kills_the_whole_process_group(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_boundary_run_drain_script's timeout must reach the forked poll loops.
+
+    subprocess.run's timeout path kill()s the DIRECT CHILD only, so a
+    backgrounded grandchild survives, is reparented to systemd --user, and
+    spends its grace unattended -- 86 concurrent orphans on 2026-08-06 and 82
+    more on 2026-08-07 (task 3798).
+
+    WHY THE LEAKER REDIRECTS ITS BACKGROUND CHILD'S STDIO, AND WHY THAT MUST
+    NOT BE "SIMPLIFIED" AWAY: a background child that KEPT the inherited
+    stdout/stderr pipes would hold their write ends open, so any drain run
+    against it after the kill never sees EOF. This test drives the REAL
+    spawner; with the stdio redirected to /dev/null nothing holds the pipe, the
+    timeout is raised on schedule, and a regression fails CLEANLY on the
+    surviving pid below. Dropping the `>/dev/null 2>&1` makes this test's
+    behaviour depend on internals of whatever the spawner does after its kill,
+    which is not what it is here to pin.
+
+    Points RESTART_ALL_SCRIPT at the synthetic leaker rather than the real
+    script: it is read at call time inside _boundary_run_drain_script, and the
+    production script must never be driven by a test that exists to observe a
+    timeout.
+    """
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setattr(sys.modules[__name__], "RESTART_ALL_SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
+    )
+
+    leaked_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _boundary_run_drain_script(
+                bin_dir, state_path, fleet_dir, tmp_path / "clock.json",
+                env={"LEAK_PIDFILE": str(pidfile)},
+                timeout=2,
+            )
+
+        leaked_pid = read_leaked_pid(pidfile)
+        assert wait_pid_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _boundary_run_drain_script timed "
+            "out. The timeout killed only the direct child, so every poll loop "
+            "the script forked is now an orphan free to spend its grace and "
+            "then issue a REAL systemctl restart. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
 
 
 def _boundary_decode(maybe_bytes):
@@ -3522,31 +3633,40 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
 
     clock_file = tmp_path / "clock.json"
 
+    # 20s (not 8s): under full tests/scripts/ suite load (32-way xdist), the
+    # handful of bash+python3 subprocess spawns needed to reach the assertion
+    # point below (SELF_UNIT/list-units, the idle unit's
+    # drain-check+baseline+restart, R's drain-check) can collectively take long
+    # enough under CPU contention that an 8s wall-clock cap kills the child
+    # before R's "deferring restart of ...: mid-merge" line (a plain,
+    # unbuffered bash `echo`) is even reached -- not a buffering issue, just
+    # insufficient scheduling margin. 20s matches _boundary_run_drain_script's
+    # own default timeout, which every other caller in this file already relies
+    # on safely.
+    #
+    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift.
+    # The grace is DERIVED rather than typed (task 3798): wait_proof_grace_secs
+    # gives 80s here, a 4x margin over this 20s timeout -- wide enough that
+    # widening the timeout cannot accidentally let R's own restart land first,
+    # and small enough that a poller which escapes the timeout's kill
+    # self-terminates in 80s. It was hardcoded 99999s (27.8 HOURS), which is
+    # what let 86 leaked pollers accumulate on 2026-08-06 and 82 more the next
+    # day, each eventually reaching expiry after its fake systemctl had been
+    # GC'd out of pytest's tmpdir. See wait_proof_grace_secs for both sides of
+    # that invariant.
+    spawn_timeout = 20
+
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _boundary_run_drain_script(
             bin_dir, state_path, fleet_dir, clock_file,
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "99999",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
                 "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
             },
-            # Wide margin over the couple of bash+python3 subprocess spawns
-            # needed to reach the assertion point below (SELF_UNIT/list-units,
-            # the idle unit's drain-check+baseline+restart, R's drain-check)
-            # so a loaded CI host can't push the idle unit's restart past the
-            # cutoff and flake the ordering assertion; FORCE_FIRE_AFTER_SECS
-            # is 99999s, so widening this can't accidentally let R's own
-            # restart land before the timeout fires.
-            #
-            # 20s (not 8s): under full tests/scripts/ suite load (32-way
-            # xdist), the handful of subprocess spawns above can collectively
-            # take long enough under CPU contention that an 8s wall-clock cap
-            # kills the child before R's "deferring restart of ...: mid-merge"
-            # line (a plain, unbuffered bash `echo`) is even reached -- not a
-            # buffering issue, just insufficient scheduling margin. 20s
-            # matches _boundary_run_drain_script's own default timeout, which
-            # every other caller in this file already relies on safely.
-            timeout=20,
+            timeout=spawn_timeout,
         )
 
     stdout = _boundary_decode(exc_info.value.stdout)
