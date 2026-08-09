@@ -390,6 +390,97 @@ class TestMcpToolCallTimeoutBudget:
         )
 
 
+class TestAggregateTimeoutBudget:
+    """The two multi-URL aggregates must thread a budget to every post.
+
+    ``metrics.py`` wraps ``get_memory_status`` and ``get_queue_stats`` in
+    ``asyncio.wait_for``, but those wrappers bound the *aggregate*: both
+    functions walk N fused-memory URLs (``get_memory_status`` short-circuits
+    on the first success, ``get_queue_stats`` visits all of them), so the
+    outer bound alone left each individual post free to wait httpx's 10s
+    default — including for a pool slot. The two layers are complementary,
+    not redundant, so both must be present.
+    """
+
+    async def test_get_memory_status_threads_budget_across_failover(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import get_memory_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        # First URL's initialize post fails outright → fall through to the
+        # second, which serves a full cold-session sequence.
+        mock_client.post.side_effect = [
+            httpx.ConnectError('refused'),
+            *_cold_session_responses({'graphiti': {'connected': True}}, url_b),
+        ]
+
+        result = await get_memory_status(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected failover success: {result}'
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 4, (
+            f'expected 1 failed post on {url_a} + 3 cold-session posts on '
+            f'{url_b}, got {len(posts)}'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [3.0] * 4, (
+            f'the budget must reach every post of every URL tried, got {timeouts}'
+        )
+
+    async def test_get_memory_status_default_timeout_is_ten(self, two_url_config):
+        """Guard: omitting the budget keeps the pre-existing 10s default."""
+        from dashboard.data.memory import get_memory_status
+
+        _url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _cold_session_responses({'ok': True}, url_b)
+
+        await get_memory_status(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], f'default must stay 10, got {timeouts}'
+
+    async def test_get_queue_stats_threads_budget_to_every_url(self, two_url_config):
+        from dashboard.data.memory import get_queue_stats
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
+        mock_client = AsyncMock()
+        # get_queue_stats visits ALL urls — two cold sessions, six posts.
+        mock_client.post.side_effect = [
+            *_cold_session_responses(stats, url_a),
+            *_cold_session_responses(stats, url_b),
+        ]
+
+        result = await get_queue_stats(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected success: {result}'
+        assert result['counts'] == {'graphiti': 2}, 'both urls must be summed'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [3.0] * 6, (
+            f'the budget must reach every post of all N urls, got {timeouts}'
+        )
+
+    async def test_get_queue_stats_default_timeout_is_ten(self, two_url_config):
+        """Guard: omitting the budget keeps the pre-existing 10s default."""
+        from dashboard.data.memory import get_queue_stats
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            *_cold_session_responses(stats, url_a),
+            *_cold_session_responses(stats, url_b),
+        ]
+
+        await get_queue_stats(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10] * 6, f'default must stay 10, got {timeouts}'
+
+
 # ── SSE response parsing ───────────────────────────────────────
 
 
