@@ -389,6 +389,69 @@ class TestSuccessorPointerItems:
         # declines them, so nothing that was measured becomes unmeasured.
         assert m.dangling_census(refs, {UUID_A: True}).examined == 4
 
+    @pytest.mark.parametrize('member', [
+        {'id': UUID_A},          # a dict member — unhashable
+        [UUID_A],                # a nested list member — unhashable
+        {UUID_A: 'why'},
+    ])
+    def test_an_unhashable_pointer_member_does_not_abort_the_sweep(self, member):
+        """A dict- or list-valued member must be REPORTED, never fatal.
+
+        ``normalize_supersedes`` wraps a non-list/non-str value verbatim ("any
+        other scalar is wrapped rather than rejected") and copies a list member
+        verbatim, so an unhashable member reaches :class:`PointerRef` intact —
+        and ``PointerRef.target`` is typed ``Any`` precisely to let it. Any code
+        that HASHES a ref therefore raises ``TypeError: unhashable type`` and
+        takes down the whole sweep — every family, for the entire corpus —
+        because of one malformed pointer. That is the exact collapse
+        ``is_readable_target`` and ``_tripwire_item_key``'s ``repr()`` were
+        written to prevent: this runner exists to report that kind of damage, so
+        the damage must never be what kills it.
+
+        Reachable, not hypothetical: ``validate_memory_metadata`` only became
+        fatal on non-UUID members after the fact and records live non-string
+        members already in the corpus, and ``parent_id``/``corrects`` get no
+        member validation at all.
+        """
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'real words', supersedes=[member]))
+        assert [r.target for r in refs] == [member]
+
+        # Neither the tripwire nor its disclosure may HASH the ref. The source
+        # has real content, so the edge is keyable (``_tripwire_item_key`` goes
+        # through ``repr``) and gets an item — failing, because a target that
+        # cannot name a memory has no predecessor to find.
+        items = m.successor_pointer_items(refs, {})
+        assert [item.passed for item in items] == [False]
+        assert m.unkeyable_successor_refs(refs) == []
+
+        # And the member is reported as malformed rather than swallowed: it can
+        # never name a memory, so no read is issued and the edge is unresolved.
+        assert [r.target for r in m.malformed_pointer_refs(refs)] == [member]
+        assert m.unique_pointer_targets(refs) == []
+        assert m.dangling_census(refs, {}).unresolved == 1
+
+    def test_a_keyable_edge_survives_an_unhashable_one_beside_it(self):
+        """One malformed member must not cost the tripwire its healthy items."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'real words', supersedes=[{'id': UUID_A}])),
+            *m.pointer_targets(_record('rec-2', 'other words', supersedes=UUID_B)),
+            # Content-less AND unhashable: the skip predicate must reach its
+            # verdict without hashing either.
+            *m.pointer_targets(_record('rec-3', '', supersedes=[[UUID_C]])),
+        ]
+        items = m.successor_pointer_items(refs, {UUID_B: True})
+        # Keyed by content hash, so the expectation is stated per SOURCE rather
+        # than by list position: rec-2's live edge passes, rec-1's unresolvable
+        # one fails, and rec-3 is skipped for having no content to key on.
+        verdicts = {item.item_key: item.passed for item in items}
+        assert verdicts == {
+            m._tripwire_item_key(refs[0]): False,
+            m._tripwire_item_key(refs[1]): True,
+        }
+        assert [r.source_id for r in m.unkeyable_successor_refs(refs)] == ['rec-3']
+
 
 class TestSupersededSurfacing:
     """Both-present-only exposure over corpus-discovered (successor, superseded) pairs."""
@@ -777,6 +840,7 @@ class TestBuildSeries:
             'pointer_targets_unique_reads',
             'successor_edges_unkeyable',
             'surfacing_pairs_observed',
+            'surfacing_queries_degraded',
             'task_terminal_entry_task_pairs',
             'pointers_supersedes_examined',
             'pointers_supersedes_resolved',
@@ -797,10 +861,39 @@ class TestBuildSeries:
             m.unkeyable_successor_refs(_full_refs()),
         )
         assert counts['surfacing_pairs_observed'] == len(inputs['surfacing'].records)
+        assert counts['surfacing_queries_degraded'] == len(inputs['surfacing'].degraded)
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
         for key, row in census.by_key.items():
             for field_name, value in row.items():
                 assert counts[f'pointers_{key}_{field_name}'] == value
+
+    def test_a_degraded_surfacing_query_reaches_the_machine_readable_artifact(self):
+        """Prose-only disclosure is a silent cap for every JSON consumer.
+
+        Which is all of them — leaf α's evaluator reads the artifact, never the
+        report. Without this row a mem0 outage and a corpus that genuinely stopped
+        surfacing superseded entries produce the SAME artifact: a small (or
+        absent) ``superseded-still-surfacing`` with nothing to say why.
+        """
+        m = _mod()
+        inputs = _full_inputs()
+        degraded = m.SurfacingObservation(
+            pairs_comparable=0, still_surfacing=0, records=(), inversions=(),
+            degraded=(
+                m.DegradedSurfacingQuery(
+                    source_id='rec-1', target=UUID_B, failed_stores=('mem0',),
+                ),
+            ),
+        )
+        inputs['surfacing'] = degraded
+        series = m.build_series(**inputs)
+
+        assert series.corpus.counts['surfacing_queries_degraded'] == 1
+        assert series.corpus.counts['surfacing_pairs_observed'] == 0
+        # Zero exposure, so the family declines to emit rather than fabricate a
+        # clean datapoint — and the disclosure is what says WHY it is missing.
+        assert m.METRIC_SUPERSEDED_STILL_SURFACING not in _ids(series)
+        assert m.METRIC_SUPERSEDED_STILL_SURFACING in m.metric_families_not_measured(series)
 
     def test_the_disclosed_read_count_is_reads_not_citations(self):
         """``pointer_targets_unique_reads`` IS the plan ``resolve_pointer_targets`` runs.
@@ -1222,6 +1315,135 @@ class TestFetchSurfacingRanks:
         # an absent superseded entry carries no possibility of an inversion.
         assert obs.pairs_comparable == 0
         assert obs.still_surfacing == 0
+        # ...and it is NOT a degraded query: the store answered, the pair simply
+        # did not come back. Those two must stay distinguishable.
+        assert obs.degraded == ()
+
+    async def test_a_degraded_search_is_disclosed_not_scored_as_a_missing_pair(self):
+        """``search`` swallows a store failure and returns an EMPTY list.
+
+        ``MemoryService.search`` never raises on a store error or a search
+        timeout: it catches / cancels and returns a ``SearchResults`` that is
+        empty but carries ``degraded=True`` and ``failed_stores``. Scoring that
+        empty list would drop the pair for not being both-present, silently
+        SHRINKING ``pairs_comparable`` — to zero in the limit, which omits the
+        metric entirely — with nothing recorded anywhere. Leaf α would then trend
+        a mem0 outage as a real corpus change. This module refuses that reading
+        everywhere else (``fetch_pointer_records`` and ``resolve_pointer_targets``
+        both propagate ``TimeoutError`` so "backend blipped" is never read as
+        "corpus is clean"), and β already excludes degraded observations from
+        every denominator while disclosing them.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=SearchResults(
+            [], degraded=True, failed_stores=['mem0'],
+            failure_diagnostics=[{'store': 'mem0', 'error': 'TimeoutError'}],
+        ))
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        # Excluded from the denominator, not scored as a clean absence...
+        assert obs.pairs_comparable == 0
+        assert obs.still_surfacing == 0
+        # ...and named, with the store that failed: "the run was degraded" tells
+        # an operator to distrust the numbers, "mem0 raised TimeoutError" tells
+        # them what to restart.
+        assert len(obs.degraded) == 1
+        assert obs.degraded[0].source_id == 'rec-1'
+        assert obs.degraded[0].target == UUID_B
+        assert obs.degraded[0].failed_stores == ('mem0',)
+        assert obs.degraded[0].diagnostics == ({'store': 'mem0', 'error': 'TimeoutError'},)
+
+    async def test_the_degrade_metadata_is_read_before_any_list_operation(self):
+        """It rides on a list SUBCLASS and does not survive ``results or []``.
+
+        ``SearchResults`` documents that ``degraded``/``failed_stores`` are lost
+        by slicing, ``sorted()``, concatenation and comprehensions — and an EMPTY
+        ``SearchResults`` is falsy, so the ``results or []`` guard itself hands
+        back a bare ``list`` with the metadata stripped. A degraded EMPTY result
+        is exactly the case that matters, so reading the attributes after that
+        guard would disclose nothing precisely when there is something to
+        disclose.
+        """
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+
+        m = _mod()
+        empty = SearchResults([], degraded=True, failed_stores=['mem0'])
+        # The premise, asserted rather than assumed.
+        assert not empty
+        assert not getattr(empty or [], 'degraded', False)
+
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=empty)
+
+        assert len((await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)).degraded) == 1
+
+    async def test_a_degraded_search_that_named_no_store_still_discloses(self):
+        """``degraded=True`` alone is enough; so is a store name alone."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        for results in (
+            SearchResults([], degraded=True),
+            SearchResults([_Hit(UUID_B), _Hit('rec-1')], failed_stores=['graphiti']),
+        ):
+            memory = MagicMock()
+            memory.search = AsyncMock(return_value=results)
+            obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+            # The second case would otherwise score a full inversion off a
+            # partial answer — a ranking verdict read from an incomplete list.
+            assert obs.pairs_comparable == 0
+            assert len(obs.degraded) == 1
+
+    async def test_one_degraded_edge_never_suppresses_a_healthy_one(self):
+        """The exclusion is PER EDGE, so a blip costs only its own query."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-2', 'successor two', supersedes=UUID_C)),
+        ]
+        memory = MagicMock()
+        memory.search = AsyncMock(side_effect=[
+            SearchResults([], degraded=True, failed_stores=['mem0']),
+            SearchResults([_Hit(UUID_C), _Hit('rec-2')]),
+        ])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert obs.pairs_comparable == 1
+        assert obs.still_surfacing == 1
+        assert [r.successor_id for r in obs.inversions] == ['rec-2']
+        assert [q.source_id for q in obs.degraded] == ['rec-1']
+
+    async def test_a_plain_list_search_double_is_never_read_as_degraded(self):
+        """The old duck-typed doubles (and any plain list) stay non-degraded."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[_Hit(UUID_B), _Hit('rec-1')])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert obs.degraded == ()
+        assert obs.pairs_comparable == 1
 
 
 class _BackendDouble:
@@ -1412,7 +1634,14 @@ class _ServiceDouble:
 
     async def search(self, query, project_id='main', limit=10, **kwargs):
         self.search_calls.append(query)
-        return list(self._searches.get(query, []))
+        seeded = self._searches.get(query, [])
+        # A seeded SearchResults is handed back VERBATIM: its degraded /
+        # failed_stores ride on a list SUBCLASS and would not survive the
+        # list(...) copy, which is the very metadata the degrade tests seed.
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        if isinstance(seeded, SearchResults):
+            return seeded
+        return list(seeded)
 
     # -- lifecycle ---------------------------------------------------------
     async def initialize(self):
@@ -1447,8 +1676,13 @@ class _ServiceDouble:
         raise _ReadOnlyViolation('the sweep called delete_entity')
 
 
-def _seeded_double() -> _ServiceDouble:
-    """A corpus with one live supersedes edge, one dangling edge, one stale entry."""
+def _seeded_double(*, search_results=None) -> _ServiceDouble:
+    """A corpus with one live supersedes edge, one dangling edge, one stale entry.
+
+    *search_results* overrides what the one surfacing query returns, so a test
+    can hand back a degraded ``SearchResults`` without reaching into the
+    double's internals.
+    """
     return _ServiceDouble(
         scrolls={'procedural_knowledge': [
             _raw_point(UUID_A, {
@@ -1463,7 +1697,9 @@ def _seeded_double() -> _ServiceDouble:
         ]},
         # UUID_B resolves; UUID_C was never written, so that edge dangles.
         by_id={UUID_B: {'id': UUID_B, 'content': 'the predecessor', 'metadata': {}}},
-        searches={'the successor text': [_Hit(UUID_B), _Hit(UUID_A)]},
+        searches={'the successor text': (
+            [_Hit(UUID_B), _Hit(UUID_A)] if search_results is None else search_results
+        )},
     )
 
 
@@ -1746,6 +1982,79 @@ class TestReport:
     ):
         sections = self._sections(monkeypatch, tmp_path, _seeded_double())
         assert 'unkeyable_successor_edges' not in sections
+
+    def test_a_degraded_surfacing_search_gets_its_own_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        """The whole run, against a search that reports a failed store.
+
+        ``search`` returns an EMPTY ``SearchResults`` carrying
+        ``degraded=True``/``failed_stores=['mem0']`` rather than raising, so
+        without this the run would report ``pairs_comparable: 0`` — a mem0
+        outage rendered as a corpus with nothing to compare, in the report an
+        operator reads to decide whether to trust the numbers.
+        """
+        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+
+        m = _mod()
+        outcome = _sweep(monkeypatch, tmp_path, _seeded_double(
+            search_results=SearchResults([], degraded=True, failed_stores=['mem0']),
+        ))
+        sections = {section.key: section for section in outcome.sections}
+
+        assert 'surfacing_degraded' in sections
+        text = sections['surfacing_degraded'].text
+        # Named with the failing store, so the operator knows what to restart.
+        assert 'mem0' in text
+        assert UUID_A in text
+        # The metric declines rather than reporting a fabricated clean zero, and
+        # the not-measured section says so.
+        assert m.METRIC_SUPERSEDED_STILL_SURFACING not in _ids(outcome.series)
+        assert m.METRIC_SUPERSEDED_STILL_SURFACING in sections['not_measured'].text
+        assert outcome.series.corpus.counts['surfacing_queries_degraded'] == 1
+
+    def test_a_healthy_run_produces_no_degraded_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        outcome = _sweep(monkeypatch, tmp_path, _seeded_double())
+        sections = {section.key: section for section in outcome.sections}
+        assert 'surfacing_degraded' not in sections
+        # And the count is disclosed as zero rather than omitted, so a consumer
+        # can tell "no degradation" from "this runner does not report it".
+        assert outcome.series.corpus.counts['surfacing_queries_degraded'] == 0
+
+    def test_an_unhashable_pointer_member_does_not_take_the_whole_run_down(
+        self, monkeypatch, tmp_path,
+    ):
+        """End to end: one dict-valued member must not cost every family.
+
+        The sweep exists to REPORT malformed pointers, so a malformed pointer
+        that aborts it before any artifact is produced is the worst available
+        outcome. ``normalize_supersedes`` wraps a non-string member verbatim, so
+        an unhashable target reaches the pure band intact and any hashing of a
+        ``PointerRef`` raises ``TypeError`` for the entire corpus.
+        """
+        double = _ServiceDouble(scrolls={'procedural_knowledge': [
+            _raw_point('rec-dict', {'data': 'x', 'supersedes': [{'id': UUID_A}]}),
+            _raw_point('rec-list', {'data': 'y', 'supersedes': [[UUID_B]]}),
+            # A healthy edge beside them, to prove the run still measures.
+            _raw_point('rec-ok', {'data': 'the successor text', 'supersedes': UUID_C}),
+        ]}, by_id={UUID_C: {'id': UUID_C, 'content': 'pred', 'metadata': {}}})
+
+        outcome = _sweep(monkeypatch, tmp_path, double)
+
+        sections = {section.key: section for section in outcome.sections}
+        # Reported as malformed rather than raising...
+        assert 'malformed_pointers' in sections
+        assert 'rec-dict' in sections['malformed_pointers'].text
+        assert 'rec-list' in sections['malformed_pointers'].text
+        # ...the census still counts all three edges...
+        assert outcome.census.examined == 3
+        assert outcome.census.unresolved == 2
+        # ...and the run still MEASURES: three keyable edges, of which only the
+        # healthy one passes. A TypeError would have produced no artifact at all.
+        assert sorted(item.passed for item in outcome.tripwire_items) == [False, False, True]
+        assert outcome.series.corpus.counts['pointer_refs_malformed'] == 2
 
     def test_the_staleness_detail_does_not_assert_per_task_liveness(
         self, monkeypatch, tmp_path,

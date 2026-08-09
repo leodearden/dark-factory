@@ -398,6 +398,30 @@ def _tripwire_item_key(ref: PointerRef) -> str:
     return f'{TRIPWIRE_ITEM_PREFIX}{content_key(ref.source_content)}-{target_digest}'
 
 
+def _is_unkeyable_successor(ref: PointerRef) -> bool:
+    """Is *ref* a ``supersedes`` edge the tripwire cannot key?
+
+    The ONE site that decides, shared by :func:`unkeyable_successor_refs`
+    (which reports them) and :func:`successor_pointer_items` (which skips
+    them), so the two can never disagree about which edges were dropped from
+    the tripwire while the disclosure claims otherwise.
+
+    A predicate rather than membership in a ``set`` of refs, and that is a
+    correctness requirement, not a style choice. :class:`PointerRef` is a
+    frozen dataclass whose ``target`` is deliberately typed ``Any``, and
+    ``normalize_supersedes`` wraps a non-string member VERBATIM rather than
+    rejecting it — so a ``dict``- or ``list``-valued member yields an
+    UNHASHABLE ref. Building ``set(unkeyable_successor_refs(refs))`` or testing
+    ``ref in`` such a set raises ``TypeError`` (CPython hashes the key even
+    against an empty set) and aborts the entire sweep — no metrics, no report —
+    over one malformed pointer in the corpus. That is exactly the collapse
+    :func:`is_readable_target` and ``_tripwire_item_key``'s ``repr()`` were
+    written to prevent: this runner exists to REPORT that kind of damage, so it
+    must never be the thing the damage kills.
+    """
+    return ref.key == 'supersedes' and not ref.source_content.strip()
+
+
 def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     """The ``supersedes`` refs whose source carries no content to key on.
 
@@ -415,10 +439,7 @@ def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     them, and a family that quietly shrinks is exactly what this leaf's
     disclosure posture forbids.
     """
-    return [
-        ref for ref in refs
-        if ref.key == 'supersedes' and not ref.source_content.strip()
-    ]
+    return [ref for ref in refs if _is_unkeyable_successor(ref)]
 
 
 def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool]) -> list:
@@ -452,9 +473,11 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
     from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
 
     by_key: dict[str, bool] = {}
-    skipped = set(unkeyable_successor_refs(refs))
     for ref in refs:
-        if ref.key != 'supersedes' or ref in skipped:
+        # `_is_unkeyable_successor`, not membership in a set of skipped refs: a
+        # ref whose target is a dict or a list is unhashable, and hashing one
+        # would abort the whole sweep. See that predicate's docstring.
+        if ref.key != 'supersedes' or _is_unkeyable_successor(ref):
             continue
         target = ref.target if isinstance(ref.target, str) else None
         passed = bool(target is not None and resolution.get(target, False))
@@ -497,6 +520,33 @@ class SurfacingRecord:
 
 
 @dataclass(frozen=True)
+class DegradedSurfacingQuery:
+    """One ``supersedes`` edge whose own surfacing search came back degraded.
+
+    ``MemoryService.search`` never raises on a store failure or a search
+    timeout: it swallows the exception (``memory_service.py`` ``_search`` error
+    path) or cancels the timed-out task, and returns a ``SearchResults`` that is
+    EMPTY but carries ``degraded=True`` and ``failed_stores=['mem0']``. An empty
+    ranked list scores every pair as not-both-present, so a mem0 outage or a
+    ``search_timeout_seconds`` blip would silently SHRINK ``pairs_comparable``
+    — to zero in the limit, omitting the metric entirely — and leaf α would
+    trend that shrunken exposure as a real corpus change. "Backend blipped" read
+    as "corpus is clean" is the one failure this module refuses everywhere else:
+    ``fetch_pointer_records`` and ``resolve_pointer_targets`` both propagate
+    ``TimeoutError`` for exactly this reason.
+
+    ``failed_stores`` and the diagnostics ride along verbatim rather than a bare
+    boolean, β's rule: "the run was degraded" tells an operator to distrust the
+    numbers, while "mem0 raised TimeoutError" tells them what to restart.
+    """
+
+    source_id: str
+    target: str
+    failed_stores: tuple[str, ...] = ()
+    diagnostics: tuple[dict, ...] = ()
+
+
+@dataclass(frozen=True)
 class SurfacingObservation:
     """Family (1)'s exposure, event count and detail.
 
@@ -504,12 +554,19 @@ class SurfacingObservation:
     value; ``records`` holds every both-present pair (the superseded entry
     coming back AT ALL is worth reading even when it came back below its
     successor) and ``inversions`` the subset that counted.
+
+    ``degraded`` names the edges whose search reported a failed store. They
+    contribute to NEITHER the exposure nor the count — β excludes degraded
+    observations from every denominator for the same reason — and are carried
+    here so the narrowing reaches ``corpus.counts`` and the report instead of
+    vanishing into a quietly smaller ``pairs_comparable``.
     """
 
     pairs_comparable: int
     still_surfacing: int
     records: tuple[SurfacingRecord, ...]
     inversions: tuple[SurfacingRecord, ...]
+    degraded: tuple[DegradedSurfacingQuery, ...] = ()
 
 
 EMPTY_SURFACING = SurfacingObservation(
@@ -594,6 +651,11 @@ def combine_surfacing(observations: list[SurfacingObservation]) -> SurfacingObse
     observation per pair rather than one for the whole sweep. Exposure and
     events are additive across those queries; concatenating the details keeps
     every pair nameable in the report.
+
+    Degraded queries concatenate the same way. A degraded observation carries no
+    exposure to add (see :class:`DegradedSurfacingQuery`), so the fold cannot
+    charge a backend outage to the family's denominator — but the edge stays
+    named, which is what keeps the shrinkage visible.
     """
     records = tuple(r for obs in observations for r in obs.records)
     inversions = tuple(r for obs in observations for r in obs.inversions)
@@ -602,6 +664,7 @@ def combine_surfacing(observations: list[SurfacingObservation]) -> SurfacingObse
         still_surfacing=sum(obs.still_surfacing for obs in observations),
         records=records,
         inversions=inversions,
+        degraded=tuple(q for obs in observations for q in obs.degraded),
     )
 
 
@@ -825,12 +888,20 @@ def _disclosure_counts(
     Without this row the tripwire's ``n`` would shrink with no way for a
     consumer to tell a corpus with fewer supersession edges from one whose
     edges stopped being keyable.
+
+    ``surfacing_queries_degraded`` is family (1)'s equivalent narrowing, and the
+    one whose absence would be most misread: a degraded search returns an empty
+    ranked list, so without this row a mem0 outage and a corpus that stopped
+    surfacing superseded entries produce the SAME artifact — a small (or zero)
+    ``pairs_comparable`` with nothing to say why. β discloses the same count as
+    ``degraded_queries``.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
         'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
         'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
         'surfacing_pairs_observed': len(surfacing.records),
+        'surfacing_queries_degraded': len(surfacing.degraded),
         'task_terminal_entry_task_pairs': len(staleness.records),
     }
     for key, row in sorted(census.by_key.items()):
@@ -1143,6 +1214,15 @@ async def fetch_surfacing_ranks(
     override short-circuits ``route()`` before any classification, and the
     category pin makes the searched population equal the swept one
     (``scroll_by_metadata`` enumerates exactly these Mem0-primary categories).
+
+    An edge whose search comes back DEGRADED is excluded from the fold entirely
+    rather than scored against the empty list ``search`` returns on a store
+    failure — see :class:`DegradedSurfacingQuery` for why scoring it would read
+    a mem0 outage as a clean corpus. The degrade metadata is read off the
+    ``SearchResults`` BEFORE any list operation: ``degraded``/``failed_stores``
+    live on a list SUBCLASS and do not survive a comprehension, a slice, or even
+    the ``results or []`` guard below (an empty ``SearchResults`` is falsy, so
+    that expression hands back a bare ``list`` with the metadata stripped).
     """
     observations: list[SurfacingObservation] = []
     for ref in refs:
@@ -1158,6 +1238,18 @@ async def fetch_surfacing_ranks(
             stores=['mem0'],
             categories=list(SWEEP_CATEGORIES),
         )
+        failed_stores = tuple(str(s) for s in (getattr(results, 'failed_stores', ()) or ()))
+        if bool(getattr(results, 'degraded', False)) or failed_stores:
+            observations.append(SurfacingObservation(
+                pairs_comparable=0, still_surfacing=0, records=(), inversions=(),
+                degraded=(DegradedSurfacingQuery(
+                    source_id=ref.source_id,
+                    target=ref.target,
+                    failed_stores=failed_stores,
+                    diagnostics=tuple(getattr(results, 'failure_diagnostics', ()) or ()),
+                ),),
+            ))
+            continue
         ranked_ids = [str(getattr(r, 'id', '') or '') for r in (results or [])]
         observations.append(
             superseded_surfacing([(ref.source_id, ref.target)], ranked_ids),
@@ -1419,6 +1511,27 @@ def sweep_report_sections(
             '',
             'DISCLOSURE — the task join did not run:',
             f'  {terminal_join.skipped_reason}',
+        )))
+
+    if surfacing.degraded:
+        sections.append(ReportSection('surfacing_degraded', (
+            '',
+            'DISCLOSURE — surfacing searches that came back DEGRADED:',
+            # Named with the failed store, not just counted: "the run was
+            # degraded" says distrust the numbers, "mem0 failed" says what to
+            # restart. These edges are excluded from comparable pairs entirely —
+            # a degraded search returns an empty ranked list, and scoring one
+            # would report a backend outage as a corpus with nothing to compare.
+            *_elided(
+                [
+                    f'  {query.source_id} -> {query.target} '
+                    f'(failed stores: {", ".join(query.failed_stores) or "unnamed"})'
+                    for query in surfacing.degraded[:_MAX_NAMED]
+                ],
+                len(surfacing.degraded),
+            ),
+            '  Family 1 describes only the edges whose search SUCCEEDED; its',
+            '  exposure is narrower than the corpus by this many edges.',
         )))
 
     truncated = sorted(
