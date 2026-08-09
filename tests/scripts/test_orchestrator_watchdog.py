@@ -1553,8 +1553,9 @@ def test_fleet_dir_default_matches_across_tiers() -> None:
     ORCH_FLEET_DIR (df_pytest_isolation._df_fleet_dir_redirect), never by
     changing this default.
     """
-    import df_pytest_isolation
     from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR as PRODUCER_DEFAULT
+
+    import df_pytest_isolation
 
     expected = str(PRODUCER_DEFAULT)
     drift_note = (
