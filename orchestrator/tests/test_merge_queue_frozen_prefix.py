@@ -9,6 +9,22 @@ Covers:
   step-09 RED  — HEADLINE property: in-flight immutable under suffix reorder;
                  recompute excludes frozen rids (exclusion filter)
   step-11 RED  — _warn_if_verify_base_not_frozen_tip log-only guard
+  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard:
+                 `_remerge` recovery items are exempt; the carve-out is
+                 narrow (an ordinary mismatch still warns exactly once).
+  3206 step-5  — the surviving WARNING is SELF-TRIAGING: it keeps its
+                 call-time context, names the stale-expected-tip / stranded-
+                 finalize-head (3082) class, and states it is advisory.
+  3206 step-7d — FIVE-SITE PARITY: every `_remerge` return path stamps the
+                 recovery marker.
+
+CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is
+ADVISORY BY DECISION and is never promoted to hard control-flow enforcement
+(PRD §5.3 and §10; measured precision as an enforcement predicate was 0/4).
+The 3206 tests above are the executable half of that fence: they are expected
+to pass immediately, and their purpose is to make a future SILENT flip to
+enforcement impossible — each fails the moment the guard changes control
+flow. If they go red, re-derive the evidence in PRD §5.3 before "fixing" them.
 
 INVARIANT (§5.3): frozen prefix = {items currently verifying} ∪ {landed}.
 An item once it enters verify is immutable (never reordered / re-based out
@@ -1350,3 +1366,99 @@ class TestDispatchItemGuardWiring:
             result.verify_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await result.verify_task
+
+
+# ── task 3206 step-7(d): FIVE-SITE PARITY for the _remerge recovery marker ───
+
+
+class TestRemergeReturnPathParity:
+    """Every item `_remerge` can produce carries `remerge_recovery=True`.
+
+    CHARACTERIZATION / chokepoint pin (task regression item 3), modelled on
+    task 3082's on_requeued/_note_requeue pairing test and task 3204's
+    `_requeue_request` chokepoint parity test.
+
+    `_remerge` is the SINGLE PRODUCER of recovery items for all five consumer
+    paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
+    void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
+    dead-base-straggler and Mechanism-2 sites).  That is only true while EVERY
+    return path stamps the marker — a sixth return path added later without it
+    would silently escape the PRD §5.3 carve-out and start crying wolf again
+    at both §5.3 surfaces.  This test fails the moment that happens.
+
+    Static (AST) rather than behavioural on purpose: driving all five paths
+    through real `classify_and_merge` outcomes would need five distinct git
+    failure environments, and would still only cover the paths the harness
+    happened to reach.  The AST walk covers them by construction.
+    """
+
+    def test_every_remerge_return_path_sets_the_marker(self) -> None:
+        import ast
+        import inspect
+        import textwrap
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
+        tree = ast.parse(src)
+
+        returns = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+        ]
+
+        # Guards the guard: if _remerge is ever restructured so its item
+        # construction no longer happens inline at `return X(...)`, this count
+        # assertion fails loudly rather than the test vacuously passing.
+        assert len(returns) == 5, (
+            f'expected _remerge to have exactly 5 item-constructing return '
+            f'paths (PRD §5.3 names all five consumers); found {len(returns)}. '
+            f'If a path was added or removed, update the PRD §5.3 carve-out '
+            f'and this pin together.'
+        )
+
+        for node in returns:
+            call = node.value
+            assert isinstance(call, ast.Call)
+            ctor = getattr(call.func, 'id', None) or getattr(call.func, 'attr', None)
+            assert ctor in {'RealMergeItem', 'DecidedItem'}, (
+                f'unexpected _remerge return constructor {ctor!r} at line '
+                f'{node.lineno} of _remerge'
+            )
+            marker = [
+                kw for kw in call.keywords
+                if kw.arg == 'remerge_recovery'
+            ]
+            assert marker, (
+                f'§5.3 CARVE-OUT ESCAPE (task 3206): the {ctor} returned at '
+                f'line {node.lineno} of _remerge does not set '
+                f'remerge_recovery. Every _remerge return path must stamp it — '
+                f'_remerge is the single producer covering all five consumer '
+                f'sites, so an unmarked path re-introduces the class-(b) false '
+                f'positives at BOTH §5.3 surfaces. See PRD §5.3.'
+            )
+            value = marker[0].value
+            assert isinstance(value, ast.Constant) and value.value is True, (
+                f'remerge_recovery must be the literal True on the {ctor} '
+                f'returned at line {node.lineno} of _remerge, got: '
+                f'{ast.dump(value)}'
+            )
+
+    def test_marker_defaults_false_on_both_item_variants(self) -> None:
+        """Only `_remerge` may produce recovery items.
+
+        The default must stay False so every OTHER construction site — and
+        every `dataclasses.replace` relabel/put-back, which copies all fields
+        — is unaffected by the carve-out. A default of True would exempt the
+        entire pipeline from §5.3 in one character.
+        """
+        from orchestrator.merge_types import DecidedItem as _DI
+        from orchestrator.merge_types import RealMergeItem as _RMI
+
+        for cls in (_RMI, _DI):
+            field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']
+            assert field.default is False, (
+                f'{cls.__name__}.remerge_recovery must default to False, got '
+                f'{field.default!r} — a True default would exempt every item '
+                f'from the §5.3 guard (task 3206).'
+            )

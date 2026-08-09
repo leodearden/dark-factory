@@ -21,6 +21,17 @@ Covers:
                 flagged), and BOTH §5.3 surfaces decide identically on the
                 same inputs — the anti-drift parity the shared-generator
                 design exists to protect.
+  3206 step-7  — REGRESSION PINS for the ADVISORY contract: a phantom frozen
+                tip never refuses a dispatch (the measured 5687 / 5830 shape),
+                the WARNING accompanies a COMPLETED dispatch, the mismatch
+                path leaks no host lease, and the healthy path is unchanged.
+
+CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is ADVISORY
+BY DECISION and is never promoted to hard control-flow enforcement (PRD §5.3
+and §10). The step-7 pins are expected to pass immediately; their purpose is
+to make a future SILENT flip to enforcement impossible — each fails the moment
+the guard changes control flow. If they go red, re-derive the evidence in PRD
+§5.3 before "fixing" them.
 
 See _warn_if_verify_base_not_frozen_tip (merge_queue.py) for the log-only
 dispatch-time guard this promotes to snapshot granularity, and
@@ -43,6 +54,7 @@ from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
@@ -713,4 +725,233 @@ class TestNoOverCorrectionRegressionLock:
         assert snap_violations == [], (
             f'expected snapshot() to be clean once _last_known_main_sha is the '
             f'real tip for a healthy chained stack, got: {snap_violations!r}'
+        )
+
+
+# ── task 3206 step-7: regression pins for the ADVISORY contract ──────────────
+#
+# CHARACTERIZATION TESTS. Most of these pass immediately after steps 2/4/6 —
+# that is the point. Their job is not to drive new behaviour but to make a
+# future SILENT flip to enforcement impossible: each one FAILS the moment the
+# §5.3 guard changes control flow. Task 3206 adjudicated that the guard STAYS
+# ADVISORY (PRD §5.3, §10); these are the executable half of that fence, the
+# PRD prose being the other half.
+
+
+@pytest.mark.asyncio
+class TestAdvisoryContractRegressionPins:
+    """The §5.3 guard is advisory: it may log, but it may never refuse.
+
+    Task regression items (1), (4), (5) plus the lease-leak trap. If a future
+    change makes `_warn_if_verify_base_not_frozen_tip` (or the dispatch site
+    around it) refuse a dispatch, every test here goes red — which is the
+    designed outcome, not a flake to be silenced. Re-derive the evidence in
+    PRD §5.3 first.
+    """
+
+    async def _stranded_finalize_head(
+        self, worker: SpeculativeMergeWorker, config: OrchestratorConfig,
+        git_repo: Path, *, dead_commit: str,
+    ) -> SpeculativeItem:
+        """Install a stranded (phantom) finalize head whose merge_commit is dead.
+
+        Reproduces the measured 2026-08-08 shape (the task-3082 class): an
+        entry registered at FINALIZING but NOT present in `_inflight` is
+        exactly what `_finalizing_head_entry()` returns, and `_entry_phase`
+        reports 'finalizing' — a qualifying phase — so
+        `_frozen_inflight_entries()` counts it and `frozen_prefix_tip(main)`
+        returns *dead_commit* instead of the live main tip.
+        """
+        _, head_item = _make_fake_item(
+            't-phantom', base_sha='some-older-main', merge_commit=dead_commit,
+            config=config, git_repo=git_repo,
+        )
+        head_entry = _make_inflight_entry(head_item, verifying=True)
+        worker._register_item(head_entry, initial=ItemLifecycleState.FINALIZING)
+        assert worker.frozen_prefix_tip('LIVEMAIN') == dead_commit, (
+            'fixture precondition: the phantom head must poison frozen_prefix_tip'
+        )
+        return head_item
+
+    async def test_phantom_frozen_tip_does_not_block_dispatch(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(a) THE 3082 COUPLING PIN — the headline regression (task item 4).
+
+        A stranded finalize head makes `frozen_prefix_tip()` return a DEAD
+        merge commit, so an unrelated item dispatching against the LIVE MAIN
+        TIP mismatches it.  That dispatch must still go through: the verify
+        task is launched, a live InflightEntry is returned, and the host lease
+        is NOT released.
+
+        Production instances (orchestrator-reify, both `verify_depth=1`):
+          2026-08-08 00:09:07  task 5687 (mr-441b5c13)  base 9d08d3d3
+          2026-08-08 01:35:00  task 5830 (mr-ad16d177)  base 2b903602
+        both mismatched a phantom expected-tip 95908e44 that persisted 86
+        minutes.  5687 then PASSED and LANDED — 'verify end (merge=2b903602,
+        passed=True)' → 'Advanced main to 2b903602' at 00:59:55.  Under hard
+        enforcement both would have been REFUSED; this test is what makes that
+        regression loud.
+        """
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        # The unrelated dispatch: its base IS the live main tip — correct by
+        # every measure except the poisoned frozen tip.
+        _, item = _make_fake_item(
+            't-victim', base_sha=live_main, merge_commit='c-victim',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)  # narrow for item.merge_wt (pyright)
+
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        allocator = _fake_local_allocator()
+        worker._host_allocator = allocator
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, (
+            'ADVISORY CONTRACT VIOLATED (task 3206, PRD §5.3): a phantom frozen '
+            'tip must never refuse a dispatch whose base is the live main tip. '
+            'This is the measured 5687 / 5830 shape — that dispatch passed and '
+            'landed in production.'
+        )
+        assert entry.verify_task is not None, (
+            'the real-verify task must still be launched, not skipped'
+        )
+        assert entry.passthrough_outcome is None, (
+            'the item must not be short-circuited into a passthrough outcome'
+        )
+
+    async def test_advisory_warns_and_still_dispatches(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) ADVISORY PROCEEDS (task item 1) — WARNING *and* dispatch, together.
+
+        Asserted in one test on purpose: nobody can keep the log and drop the
+        flow, or keep the flow and silently drop the log.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        _, item = _make_fake_item(
+            't-victim2', base_sha=live_main, merge_commit='c-victim2',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            entry = await worker._dispatch_item(item)
+
+        guard_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and '§5.3 guard' in r.getMessage()
+        ]
+        assert len(guard_warnings) == 1, (
+            f'expected exactly one §5.3 guard WARNING, got: '
+            f'{[r.getMessage() for r in guard_warnings]}'
+        )
+        assert entry is not None, (
+            'the guard WARNING must accompany a COMPLETED dispatch — logging '
+            'without proceeding is enforcement by another name'
+        )
+
+    async def test_mismatch_path_does_not_leak_the_host_lease(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(c) NO LEASE LEAK — the trap any future enforcement must solve.
+
+        The guard sits AFTER `allocator.acquire()` in `_dispatch_item`, so a
+        bare `return None` inserted at the guard would leak the host lease:
+        acquired, never released, never attached to a returned entry.  Pin
+        both halves — the lease is acquired and NOT released/cancelled, and it
+        is handed to the returned entry rather than dropped on the floor.
+        """
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        _, item = _make_fake_item(
+            't-victim3', base_sha=live_main, merge_commit='c-victim3',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        allocator = _fake_local_allocator()
+        worker._host_allocator = allocator
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert allocator.acquire.await_count == 1, (
+            'fixture precondition: the dispatch must have acquired a lease'
+        )
+        for leaked in ('release', 'cancel_and_release', 'quarantine_and_release'):
+            assert not getattr(allocator, leaked).called, (
+                f'HOST LEASE LEAK / premature release: allocator.{leaked} was '
+                f'called on the §5.3 mismatch path. The guard runs AFTER '
+                f'acquire(); an enforcement flip that returns early here must '
+                f'hand the lease back explicitly (task 3206).'
+            )
+        assert entry is not None and entry.lease is not None, (
+            'the acquired lease must be attached to the returned entry, not dropped'
+        )
+
+    async def test_healthy_base_dispatches_with_no_warning(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) HEALTHY UNAFFECTED (task item 5) — base == frozen tip.
+
+        No WARNING, dispatch completes exactly as before. Pins that steps
+        2/4/6 changed nothing on the healthy path.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+
+        _, item = _make_fake_item(
+            't-healthy', base_sha=live_main, merge_commit='c-healthy',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'a healthy dispatch must complete'
+        guard_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and '§5.3 guard' in r.getMessage()
+        ]
+        assert guard_warnings == [], (
+            f'healthy base == frozen tip must emit no §5.3 WARNING, got: '
+            f'{[r.getMessage() for r in guard_warnings]}'
         )
