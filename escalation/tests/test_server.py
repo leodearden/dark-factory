@@ -5785,3 +5785,109 @@ class TestResolveIssueEscalateModel:
         )
 
         harness.pre_increment_routing_tier.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestEscalateBlockerLevelParam: explicit `level` argument (task 3236)
+# ---------------------------------------------------------------------------
+
+
+class TestEscalateBlockerLevelParam:
+    """escalate_blocker accepts an explicit ``level``, restricted to {0, 1}.
+
+    roles.py instructs the steward to "re-escalate to level-1 via
+    escalate_blocker" in several places, but the tool had no ``level``
+    parameter: every agent filing landed at level=0, where the auto-watcher
+    (an L1 consumer filtering on level) never reads it and the level=0-scoped
+    workflow sweeps are entitled to dismiss it.  These tests pin the
+    parameter's runtime behaviour, reading the persisted record back through
+    the queue rather than trusting the response.
+    """
+
+    @pytest.mark.asyncio
+    async def test_level1_persists_level1(self, tmp_path: Path):
+        """escalate_blocker(level=1) → the ON-DISK record has level == 1."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 1, f'Expected on-disk level==1, got: {esc.level}'
+
+    @pytest.mark.asyncio
+    async def test_default_still_persists_level0(self, tmp_path: Path):
+        """No ``level`` passed → level == 0, so every existing caller is unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 0, f'Expected on-disk level==0, got: {esc.level}'
+
+    @pytest.mark.asyncio
+    async def test_explicit_level0_persists_level0(self, tmp_path: Path):
+        """An explicit level=0 is accepted and behaves like the default."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=0, **_COMMON_KWARGS)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 0, f'Expected on-disk level==0, got: {esc.level}'
+
+    @pytest.mark.asyncio
+    async def test_level2_rejected_and_nothing_submitted(self, tmp_path: Path):
+        """level=2 is rejected — agents must not self-mint L2 — and nothing is written.
+
+        Mirrors the existing agent-role severity downgrade policy: the
+        legitimate routes to L2 are a born-at-L2 severity from a harness
+        sentinel role, or promote_to_l2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=2, **_COMMON_KWARGS)
+
+        assert 'error' in result, f'Expected an error response, got: {result}'
+        assert 'id' not in result, f'Nothing should be submitted, got: {result}'
+        assert queue.get_pending() == [], 'level=2 must not submit any record'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_level', [-1, 3, 99])
+    async def test_out_of_range_level_rejected(self, tmp_path: Path, bad_level: int):
+        """An out-of-range level is rejected with {'error': ...} and submits nothing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=bad_level, **_COMMON_KWARGS)
+
+        assert 'error' in result, f'level={bad_level}: expected error, got: {result}'
+        assert queue.get_pending() == [], f'level={bad_level} must not submit any record'
+
+    @pytest.mark.asyncio
+    async def test_born_at_l2_severity_keeps_precedence_over_level1(self, tmp_path: Path):
+        """A sentinel-filed critical still persists level==2 even when level=1 is passed.
+
+        The born-at-L2 stamp runs inside _chokepoint_or_submit, i.e. AFTER
+        construction, so ``esc.level = 2`` naturally overrides the explicitly
+        passed level.  Pinning it keeps that ordering dependency explicit.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server, level=1, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2, f'Expected born-at-L2 to win, got level={esc.level}'
