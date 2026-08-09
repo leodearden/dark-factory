@@ -118,6 +118,28 @@ _UNPARSEABLE_ISSUE_PREFIX = 'Judge response could not be parsed'
 _NON_OK_SEVERITIES = ('moderate', 'serious')
 
 
+def _has_unparseable_marker(verdict: JudgeVerdict) -> bool:
+    """True iff any finding on *verdict* carries the structured
+    ``code == 'unparseable_judge_response'`` marker.
+
+    This is the machine-readable half of phantom detection: the marker
+    ``_parse_verdict`` stamps on its fabricated placeholder finding for
+    every row written after task 2947 landed (see
+    ``_UNPARSEABLE_VERDICT_CODE``). Shared by :func:`is_phantom_verdict`'s
+    primary branch and :meth:`Judge.review_run`'s halt-reason branch so the
+    marker scan has exactly one spelling and the two call sites can never
+    independently drift on what counts as a match.
+
+    No isinstance guard on each finding: ``JudgeVerdict.findings`` is
+    pydantic-validated ``list[dict]`` (models/reconciliation.py), and
+    ``journal.get_recent_verdicts`` — the path that rehydrates a verdict
+    from stored JSON — builds ``JudgeVerdict`` through its normal
+    (validating) constructor, so every entry reaching here is already
+    guaranteed to be a ``dict``.
+    """
+    return any(f.get('code') == _UNPARSEABLE_VERDICT_CODE for f in verdict.findings)
+
+
 def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
     """True iff *verdict* is a fabricated stand-in for a review that never
     happened, not a genuine judge finding.
@@ -132,12 +154,9 @@ def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
 
     Two shapes are recognised:
 
-    1. **Structured marker** (primary): any row written after task 2947
-       landed (merged 2026-07-23) carries ``code ==
-       'unparseable_judge_response'`` on its (sole) finding. ``findings`` is
-       ``list[dict]`` (models/reconciliation.py) but may be deserialized
-       from stored JSON, so each entry is walked defensively rather than
-       assumed to already be a well-formed dict.
+    1. **Structured marker** (primary, via :func:`_has_unparseable_marker`):
+       any row written after task 2947 landed (merged 2026-07-23) carries
+       ``code == 'unparseable_judge_response'`` on its (sole) finding.
     2. **Legacy unmarked shape** (fallback): rows written BEFORE task 2947
        carry no ``code`` key at all, so they are identified by the shape
        ``_parse_verdict`` has always fabricated — severity=serious AND
@@ -153,14 +172,10 @@ def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
        the status quo (still counted as evidence) rather than silently
        under-counting — fail-closed in the safe direction.
     """
-    for f in verdict.findings:
-        if not isinstance(f, dict):
-            continue
-        if f.get('code') == _UNPARSEABLE_VERDICT_CODE:
-            return True
+    if _has_unparseable_marker(verdict):
+        return True
     if verdict.severity == VerdictSeverity.serious and len(verdict.findings) == 1:
-        finding = verdict.findings[0]
-        issue = finding.get('issue') if isinstance(finding, dict) else None
+        issue = verdict.findings[0].get('issue')
         if isinstance(issue, str) and issue.startswith(_UNPARSEABLE_ISSUE_PREFIX):
             return True
     return False
@@ -369,10 +384,7 @@ class Judge:
                     # survives for the anthropic/openai text fallback, which has
                     # no --json-schema mechanism and so can still return prose
                     # that must be treated fail-closed.
-                    is_parse_failure = any(
-                        f.get('code') == _UNPARSEABLE_VERDICT_CODE
-                        for f in verdict.findings
-                    )
+                    is_parse_failure = _has_unparseable_marker(verdict)
                     if is_parse_failure:
                         halt_reason = (
                             f'Unparseable judge response in run {run_id} '
