@@ -66,10 +66,6 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     package-bundled ``orchestrator/src/orchestrator/defaults.yaml:7`` layered
     over it on every load: THIS project's ``dark-factory-orchestrator.yaml``
     overrides both, and that override is what a real load resolves here.
-    ``derive_modules([SAMPLE_TOUCHED_FILE], cfg.lock_depth)`` returns the full
-    path ``['tests/scripts/test_spawn_claude.py']``, NOT ``['tests/scripts']``
-    — 3 path components is below the truncation threshold at every layer, so
-    ``normalize_lock`` leaves it whole whichever one is in force.
 
         CORRECTED IN PLACE (task 3866): this note used to say "The EFFECTIVE
         value is 4" and reason "at depth 4", which broke when lock_depth moved
@@ -78,6 +74,24 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
         substitution would defeat its purpose. Which is also why the repair
         names no new constant: assertion (3) reads ``cfg.lock_depth`` live, so
         the next retune of that knob falsifies nothing written here.
+
+        CORRECTED AGAIN (task 3866, review repair): that first repair broke
+        the rule it had just stated. In place of the stale constant it
+        asserted a resolved path — ``derive_modules([SAMPLE_TOUCHED_FILE],
+        cfg.lock_depth)`` "returns the full path ..., NOT ['tests/scripts'] —
+        3 path components is below the truncation threshold at every layer" —
+        and that quantifier is false at a layer the paragraph above
+        enumerates by hand. MEASURED:
+        ``normalize_lock('tests/scripts/test_spawn_claude.py', 2)`` ->
+        ``'tests/scripts'``, which is exactly the value the sentence claimed
+        was excluded; depths 3 / 4 / 12 do leave it whole. A 3-component path
+        survives only at ``lock_depth >= 3``, and the pydantic Field default
+        of 2 sits below that threshold. The sentence is DELETED rather than
+        re-scoped, because a resolved lock key IS a depth assertion in prose
+        and the note directly above already forbids those; re-scoping would
+        merely re-stake the claim on ``SAMPLE_TOUCHED_FILE`` remaining 3
+        components. What survives is the depth-invariant claim the assertions
+        actually check — every derived key RESOLVES back to this config.
 
     That does not weaken the fix, and the plan's conclusion still holds: what
     actually matters is that the derived lock key RESOLVES to this module
