@@ -176,9 +176,13 @@ Design decisions (captured in plan.json):
   negative lookbehinds pinned immediately before '\\btasks\\b', which a
   single intervening determiner defeated wholesale ("Reviews for the
   tasks A and B are pending"); it now runs in Python against the
-  preceding text, which also covers a multi-space/newline gap. Deliberate
-  residual, fail-safe direction: an unlisted preposition still slips
-  through. Note ``_COPULA_ALT`` is untouched and still shared by the
+  preceding text, which also covers a multi-space/newline gap. Two
+  residuals in OPPOSITE directions, and the first is the forbidden one:
+  an unlisted preposition slips through and OVER-selects (the vocabulary
+  was widened once already, for exactly this reason — see
+  ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
+  directly preceded by a listed word is missed, which is the fail-safe
+  direction. Note ``_COPULA_ALT`` is untouched and still shared by the
   other paths; only this one narrows. (amendment, reviewer_comprehensive
   correctness-precision finding, task 3079)
 - ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
@@ -630,13 +634,36 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # start, with '$' anchoring, so cost is bounded by the prefix scan the regex
 # engine already does.
 #
-# Deliberate residual, unchanged and in the fail-safe under-selection
-# direction: the preposition and determiner vocabularies are closed lists, so
-# an unlisted preposition (e.g. 'concerning') still slips through, and a
-# genuine subject-position enumeration directly preceded by one of these
-# words is missed.
+# Residuals, in BOTH directions — and the vocabulary one points the WRONG
+# way. CORRECTION (amendment, reviewer_comprehensive correctness-precision
+# finding, task 3079): this note previously called the whole residual
+# "fail-safe under-selection". That is wrong for half of it and is what made
+# the gap read as acceptable. An UNLISTED preposition does not cause a miss —
+# the guard simply fails to fire, the plural path matches, and the ids are
+# selected: OVER-selection, the direction this module forbids, since the
+# sweep would then invalidate a still-true edge the moment any named id goes
+# terminal. Only the second residual is fail-safe: a genuine subject-position
+# enumeration directly preceded by a LISTED word is missed. So the closed
+# vocabulary below is a liability, not a safety margin, and it was widened
+# (from/by/under/within/around/through/via/during/concerning) after the
+# initial list was found to admit exactly the shapes it exists to refuse:
+#
+#     'Dependencies from tasks 1020 and 1030 are blocked.'   -> {1020, 1030}
+#     'Failures within tasks 1020 and 1030 are blocked.'     -> {1020, 1030}
+#     'Reviews by tasks 1020 and 1030 are pending.'          -> {1020, 1030}
+#
+# Kept as a single flat tuple rather than inlined into the pattern so the
+# vocabulary has ONE source of truth: the regression test parametrizes
+# directly over it, so an entry added here without a plural-head case fails
+# immediately instead of shipping unexercised.
+_ENUM_PREP_WORDS: tuple[str, ...] = (
+    'of', 'in', 'on', 'to', 're', 'for', 'with', 'among', 'about', 'across',
+    'against', 'between', 'regarding', 'from', 'by', 'under', 'within',
+    'around', 'during', 'through', 'via', 'concerning',
+)
+
 _ENUM_PREP_PREFIX_RE: re.Pattern[str] = re.compile(
-    r'\b(?:of|in|on|to|re|for|with|among|about|across|against|between|regarding)'
+    r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')'
     r'\s+(?:the|these|those|all|our|its)?\s*$',
     re.IGNORECASE,
 )

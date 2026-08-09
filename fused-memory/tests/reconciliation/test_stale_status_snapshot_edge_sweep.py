@@ -32,7 +32,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -40,7 +39,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
-    _ENUM_PREP_PREFIX_RE,
+    _ENUM_PREP_WORDS,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -771,35 +770,49 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
-    #: Every preposition in ``_ENUM_PREP_PREFIX_RE``, each paired with a
-    #: PLURAL head noun. Plural agreement is what refuses the far more
-    #: natural singular-copula phrasing of most of these ('Work on tasks
-    #: ... IS blocked'), so only a plural head puts the preposition guard
-    #: itself on the hook. See the test below for why that distinction
-    #: decides whether these cases test anything at all.
-    _PREPOSITION_GUARD_CASES = (
-        ('of', 'Statuses of tasks 1020 and 1030 are blocked.'),
-        ('in', 'Delays in tasks 1020 and 1030 are blocked.'),
-        ('on', 'Notes on tasks 1020 and 1030 are pending.'),
-        ('to', 'Updates to tasks 1020 and 1030 are pending.'),
-        ('re', 'Comments re tasks 1020 and 1030 are pending.'),
-        ('for', 'Reviews for tasks 1020 and 1030 are pending.'),
-        ('with', 'Problems with tasks 1020 and 1030 are blocked.'),
-        ('among', 'Conflicts among tasks 1020 and 1030 are blocked.'),
-        ('about', 'Notes about tasks 1020 and 1030 are pending.'),
-        ('across', 'Regressions across tasks 1020 and 1030 are pending.'),
-        ('against', 'Complaints against tasks 1020 and 1030 are pending.'),
-        ('between', 'Dependencies between tasks 1020 and 1030 are blocked.'),
-        ('regarding', 'Notes regarding tasks 1020 and 1030 are pending.'),
-    )
+    #: A plural-head fact per preposition in ``_ENUM_PREP_WORDS``. Plural
+    #: agreement is what refuses the far more natural singular-copula
+    #: phrasing of most of these ('Work on tasks ... IS blocked'), so only a
+    #: plural head puts the preposition guard itself on the hook. See the
+    #: test below for why that distinction decides whether these cases test
+    #: anything at all.
+    #:
+    #: This maps the SOURCE tuple's entries rather than restating the
+    #: vocabulary: the test parametrizes over ``_ENUM_PREP_WORDS`` directly,
+    #: so a preposition added to the guard without a case here fails as its
+    #: own parametrized case instead of shipping unexercised. (Earlier this
+    #: sync was enforced by scraping ``_ENUM_PREP_PREFIX_RE.pattern`` with a
+    #: second regex — an introspection meta-test on a private constant's
+    #: spelling, deleted in favour of inverting the dependency. amendment,
+    #: reviewer_comprehensive test-quality finding, task 3079)
+    _PREPOSITION_GUARD_FACTS = {
+        'of': 'Statuses of tasks 1020 and 1030 are blocked.',
+        'in': 'Delays in tasks 1020 and 1030 are blocked.',
+        'on': 'Notes on tasks 1020 and 1030 are pending.',
+        'to': 'Updates to tasks 1020 and 1030 are pending.',
+        're': 'Comments re tasks 1020 and 1030 are pending.',
+        'for': 'Reviews for tasks 1020 and 1030 are pending.',
+        'with': 'Problems with tasks 1020 and 1030 are blocked.',
+        'among': 'Conflicts among tasks 1020 and 1030 are blocked.',
+        'about': 'Notes about tasks 1020 and 1030 are pending.',
+        'across': 'Regressions across tasks 1020 and 1030 are pending.',
+        'against': 'Complaints against tasks 1020 and 1030 are pending.',
+        'between': 'Dependencies between tasks 1020 and 1030 are blocked.',
+        'regarding': 'Notes regarding tasks 1020 and 1030 are pending.',
+        'from': 'Dependencies from tasks 1020 and 1030 are blocked.',
+        'by': 'Reviews by tasks 1020 and 1030 are pending.',
+        'under': 'Sub-issues under the tasks 1020 and 1030 are blocked.',
+        'within': 'Failures within tasks 1020 and 1030 are blocked.',
+        'around': 'Discussions around tasks 1020 and 1030 are pending.',
+        'during': 'Blockers during tasks 1020 and 1030 are pending.',
+        'through': 'Regressions through tasks 1020 and 1030 are pending.',
+        'via': 'Escalations via tasks 1020 and 1030 are pending.',
+        'concerning': 'Notes concerning tasks 1020 and 1030 are pending.',
+    }
 
-    @pytest.mark.parametrize(
-        ('preposition', 'fact'),
-        _PREPOSITION_GUARD_CASES,
-        ids=[p for p, _ in _PREPOSITION_GUARD_CASES],
-    )
+    @pytest.mark.parametrize('preposition', _ENUM_PREP_WORDS)
     def test_every_guarded_preposition_is_exercised_against_a_plural_head(
-        self, preposition, fact
+        self, preposition
     ):
         """Each entry in ``_ENUM_PREP_PREFIX_RE`` is load-bearing. (task 3079)
 
@@ -814,24 +827,15 @@ class TestExtractSnapshotEdgeTaskIds:
 
         (amendment, reviewer_comprehensive test-coverage finding, task 3079)
         """
+        fact = self._PREPOSITION_GUARD_FACTS.get(preposition)
+        assert fact is not None, (
+            f'preposition {preposition!r} was added to _ENUM_PREP_WORDS '
+            f'without a plural-head case in _PREPOSITION_GUARD_FACTS'
+        )
         assert extract_snapshot_edge_task_ids(fact) == set(), (
-            f'preposition {preposition!r} is in _ENUM_PREP_PREFIX_RE but its '
+            f'preposition {preposition!r} is in _ENUM_PREP_WORDS but its '
             f'complement still over-selects'
         )
-
-    def test_preposition_guard_cases_cover_the_whole_guard_list(self):
-        """The case list above must track ``_ENUM_PREP_PREFIX_RE`` exactly.
-
-        Without this, a preposition added to the guard would ship with no
-        plural-head coverage and could later be dropped unnoticed — the very
-        gap the test above closes. Ties the fixture to the source of truth
-        rather than to a hand-maintained copy of it.
-        """
-        alternation = re.search(r'\(\?:([^)]*)\)', _ENUM_PREP_PREFIX_RE.pattern)
-        assert alternation is not None, 'could not parse _ENUM_PREP_PREFIX_RE'
-        assert set(alternation.group(1).split('|')) == {
-            p for p, _ in self._PREPOSITION_GUARD_CASES
-        }
 
     @pytest.mark.parametrize(
         ('fact', 'expected'),
