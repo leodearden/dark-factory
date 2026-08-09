@@ -63,11 +63,14 @@ if str(REPO_ROOT) not in sys.path:
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    LIVE_FLEET_DIR,
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
     non_synthetic_unit_names,
     synthetic_unit,
 )
+
+_FLEET_DIR_ENV = 'ORCH_FLEET_DIR'
 
 
 class TestSyntheticUnit:
@@ -253,6 +256,57 @@ class TestSharedVocabularyIsReachableFromBothRoots:
         source = (REPO_ROOT / 'df_pytest_isolation.py').read_text(encoding='utf-8')
         for forbidden in ('import drain_check', 'from drain_check', 'import orchestrator'):
             assert forbidden not in source, forbidden
+
+
+def test_fleet_dir_is_redirected_away_from_the_live_checkout(
+    _df_fleet_dir_redirect: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """``ORCH_FLEET_DIR`` must point somewhere hermetic for the WHOLE session.
+
+    THE CONSEQUENCE of it being unset, which is what this pins and why the
+    assertion messages say it out loud: ``restart-all-orchestrators.sh:109`` and
+    ``drain_check.py:32`` both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``,
+    so an unset (or EMPTY — ``${VAR:-…}`` treats those identically) value falls
+    through to the machine-global ``/home/leo/src/dark-factory/data/fleet``.  A
+    test-spawned drain gate then reads five other projects' LIVE production
+    heartbeats and decides the real fleet's drain state from them.
+
+    Takes the redirect from the fixture BY NAME rather than reading
+    ``os.environ`` bare: deleting the fixture then fails collection with a
+    message naming ``_df_fleet_dir_redirect``, instead of this test quietly
+    passing off some other suite's leftover env var or failing with a bare
+    KeyError that names nothing.
+
+    This is the ``tests/`` root's own proof.  ``scripts/tests/`` has its own copy
+    (``test_restart_all_orchestrators.py``), because the two roots are wired
+    separately and a green test in one says nothing about the other.
+    """
+    value = os.environ.get(_FLEET_DIR_ENV)
+    assert value, (
+        f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through the '
+        "script's ${VAR:-…} default to the machine-global "
+        f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other projects\' '
+        'LIVE production heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+    )
+
+    resolved = Path(value).resolve()
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    assert resolved.is_relative_to(basetemp), (
+        f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp {basetemp}. '
+        'The redirect must land in pytest tmp space, or the suite is writing '
+        'heartbeats somewhere that outlives it.'
+    )
+
+    live = LIVE_FLEET_DIR.resolve()
+    assert resolved != live and not resolved.is_relative_to(live), (
+        f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or inside it). '
+        'That directory is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous dir holding '
+        "seven projects' live orchestrator heartbeats."
+    )
+
+    # The fixture's yielded value IS the redirect, not a parallel path.
+    assert Path(_df_fleet_dir_redirect).resolve() == resolved
 
 
 def test_no_stray_environment_assumptions() -> None:
