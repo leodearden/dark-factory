@@ -1069,7 +1069,36 @@ class TestFetchSurfacingRanks:
         # derived from the successor's own text poses that question.
         memory.search.assert_awaited_once()
         assert memory.search.await_args.args[0] == 'the successor text'
-        assert memory.search.await_args.kwargs == {'project_id': 'dark_factory', 'limit': 7}
+        assert memory.search.await_args.kwargs == {
+            'project_id': 'dark_factory',
+            'limit': 7,
+            'stores': ['mem0'],
+            'categories': list(m.SWEEP_CATEGORIES),
+        }
+
+    async def test_the_search_is_pinned_to_the_swept_population(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        m = _mod()
+        # "before" matches ReadRouter's temporal heuristic, which routes to
+        # GRAPHITI ALONE -- so an unpinned search over this perfectly ordinary
+        # successor text would return no Mem0 point ids at all and drop the
+        # pair out of pairs_comparable. The explicit stores override
+        # short-circuits route() before any classification (heuristic OR the
+        # per-edge LLM fallback), so the population searched is the population
+        # swept, and two runs over an unchanged corpus agree.
+        refs = m.pointer_targets(
+            _record('rec-1', 'the state before the migration', supersedes=UUID_B),
+        )
+        memory = MagicMock()
+        memory.search = AsyncMock(return_value=[_Hit(UUID_B), _Hit('rec-1')])
+
+        obs = await m.fetch_surfacing_ranks(memory, 'dark_factory', refs)
+
+        assert memory.search.await_args.kwargs['stores'] == ['mem0']
+        assert memory.search.await_args.kwargs['categories'] == list(m.SWEEP_CATEGORIES)
+        assert obs.pairs_comparable == 1
+        assert obs.still_surfacing == 1
 
     async def test_only_supersedes_edges_are_searched(self):
         from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415

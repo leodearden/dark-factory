@@ -1069,6 +1069,23 @@ async def fetch_surfacing_ranks(
     An edge whose successor content is empty is skipped rather than searched
     with an empty query: an empty query's ranking is arbitrary, and scoring
     against it would manufacture inversions from noise.
+
+    The search is pinned to ``stores=['mem0']`` and to :data:`SWEEP_CATEGORIES`
+    rather than left to ``ReadRouter``, and that pin is what makes the metric
+    mean anything. Left unpinned, ``MemoryService.search`` classifies each
+    per-edge query: a successor whose prose happens to contain "before" or
+    "after" matches the temporal heuristic and is routed to GRAPHITI ALONE,
+    which returns no Mem0 point ids, so a real pair silently drops out of
+    ``pairs_comparable`` and the family reads cleaner than it is. When no
+    heuristic matches — the common case for free-form memory text — routing
+    falls through to an LLM classification call per edge whose answer is not
+    stable run to run, so which store an edge is scored against could change
+    over an unchanged corpus. Either way the wobble lands in a persisted
+    artifact that leaf α trends with a count-shift test, where it is
+    indistinguishable from a real corpus change. An explicit ``stores``
+    override short-circuits ``route()`` before any classification, and the
+    category pin makes the searched population equal the swept one
+    (``scroll_by_metadata`` enumerates exactly these Mem0-primary categories).
     """
     observations: list[SurfacingObservation] = []
     for ref in refs:
@@ -1077,7 +1094,13 @@ async def fetch_surfacing_ranks(
         query = (ref.source_content or '').strip()
         if not query:
             continue
-        results = await memory.search(query, project_id=project_id, limit=limit)
+        results = await memory.search(
+            query,
+            project_id=project_id,
+            limit=limit,
+            stores=['mem0'],
+            categories=list(SWEEP_CATEGORIES),
+        )
         ranked_ids = [str(getattr(r, 'id', '') or '') for r in (results or [])]
         observations.append(
             superseded_surfacing([(ref.source_id, ref.target)], ranked_ids),
