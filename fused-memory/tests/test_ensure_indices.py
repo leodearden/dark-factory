@@ -35,9 +35,7 @@ fire-and-forgets.
 
 from __future__ import annotations
 
-import inspect
 import logging
-import pathlib
 from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -45,7 +43,6 @@ import pytest
 import redis.exceptions
 from test_falkor_indices import LIVE_HEADER
 
-from fused_memory.backends import graphiti_client
 from fused_memory.backends.falkor_indices import (
     IndexSpec,
     expected_index_set,
@@ -486,23 +483,50 @@ class TestStructuredLogging:
         assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
 
     @pytest.mark.asyncio
-    async def test_the_false_positive_debug_line_is_never_emitted(
-        self, mock_config, make_backend, make_graph_mock, caplog,
+    async def test_the_deliberate_no_op_claims_nothing_at_any_level(
+        self, mock_config, make_backend, caplog,
     ):
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        """INV-2: ``_ensure_indices`` does nothing, so it must claim nothing — at ANY level.
+
+        ``build_indices_and_constraints`` is a ``pass`` override (D4), so this
+        method provisions no index.  A log line emitted after it would be a
+        false positive whatever it said, and DEBUG is the worst place to say it:
+        below the service's INFO level it is neither a positive nor a negative
+        signal.  So the property asserted here is the ABSENCE of any record from
+        this module's logger, with NO claim about wording — a differently-phrased
+        re-addition is exactly as wrong, and a substring check would wave it
+        through.
+
+        Non-vacuity matters as much as the absence: the ``_indexed_graphs`` early
+        return would let this pass with the body never executing, so the awaited
+        build and the memoised group_id are asserted too.
+
+        HAZARD: the driver is a bare mock.  Constructing a real ``FalkorDriver``
+        (or ``_MultiTenantFalkorDriver``) here would fire-and-forget a genuine
+        index build under the running loop.
+        """
+        driver = MagicMock()
+        driver.build_indices_and_constraints = AsyncMock(return_value=None)
         backend = make_backend(mock_config)
-        _wire(backend, graph)
+        backend._driver_for = MagicMock(return_value=driver)
+        assert 'test' not in backend._indexed_graphs, (
+            'the memoisation set must start empty or the body never runs'
+        )
 
         with caplog.at_level(logging.DEBUG, logger=self._LOGGER):
-            await backend.ensure_indices(group_id='test')
+            await backend._ensure_indices('test')
 
-        assert not any(
-            'Ensured indices on graph' in r.getMessage() for r in caplog.records
-        )
+        assert [r for r in caplog.records if r.name == self._LOGGER] == []
+        assert driver.build_indices_and_constraints.await_count == 1
+        assert 'test' in backend._indexed_graphs
 
 
 class TestProvisioningHazardGuards:
-    """Two things β must NOT break while adding a provisioning path."""
+    """The D4 override β must NOT break while adding a provisioning path.
+
+    Both guards assert on the class ``__dict__`` and on invoking the override —
+    behaviour, not source text.
+    """
 
     def test_the_build_indices_override_is_still_a_no_op_on_the_subclass(self):
         """D4: removal of the ``pass`` override was EXPLICITLY REJECTED.
@@ -526,16 +550,3 @@ class TestProvisioningHazardGuards:
     async def test_the_override_returns_none_without_building_anything(self):
         driver = _MultiTenantFalkorDriver.__dict__['build_indices_and_constraints']
         assert await driver(MagicMock()) is None
-
-    def test_the_false_positive_debug_line_is_gone_from_the_source(self):
-        """D7: the log that fired unconditionally after a no-op is deleted, not muted.
-
-        It sat after a ``pass`` and was at DEBUG, so at the service's INFO level
-        it produced neither a positive nor a negative signal — there was no signal
-        in the logs at all.  Read via ``inspect`` rather than a hard-coded repo
-        path so the guard survives a checkout move.
-        """
-        source_file = inspect.getsourcefile(graphiti_client)
-        assert source_file is not None
-        source = pathlib.Path(source_file).read_text(encoding='utf-8')
-        assert 'Ensured indices on graph' not in source
