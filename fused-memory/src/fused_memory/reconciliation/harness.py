@@ -82,6 +82,7 @@ from fused_memory.reconciliation.task_filter import (
 )
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
+    is_pure_gate_metadata,
     is_workflow_live_for_task,
 )
 from fused_memory.services.memory_service import MemoryService
@@ -4204,6 +4205,18 @@ class ReconciliationHarness:
                                         _metadata.get('task_kind')
                                         if isinstance(_metadata, dict) else None
                                     ),
+                                    # Task 3751 rule 5 (pending + deterministic +
+                                    # pure gate). is_pure_gate_metadata's own
+                                    # non-Mapping -> False contract is the guard,
+                                    # so an absent or malformed blob degrades
+                                    # toward live with no extra check here. This
+                                    # completes the input parity: this consumer,
+                                    # recon_write_policy Gate 2 and
+                                    # _render_live_workflow_section now all pass
+                                    # the identical status/task_kind/pure_gate/
+                                    # corroborated tuple — the invariant task 2964
+                                    # exists to establish.
+                                    pure_gate=is_pure_gate_metadata(_metadata),
                                     corroborated=corroborated,
                                 ):
                                     any_live = True
