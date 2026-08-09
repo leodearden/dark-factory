@@ -763,3 +763,78 @@ def test_cli_exits_non_zero_and_reports_conflicts(tmp_path):
     assert summary["failed"] == 0
     assert gz.exists()
     assert twin.read_bytes() == resumed
+
+
+# ---------------------------------------------------------------------------
+# step-20: the DESTINATION side of corroborate-before-destroy
+#
+# step-1 pins that an unreadable SOURCE is never destroyed. This pins the other
+# half: an unreadable source must not destroy the DESTINATION either. Writing
+# `open(dest, 'wb')` truncates a pre-existing twin before a single source byte
+# has been validated, and the failure path's `_discard_partial` then unlinks the
+# remains — so a damaged `.gz` beside a healthy plain twin loses BOTH copies and
+# the session's transcript is gone entirely.
+#
+# This is reachable on the DOCUMENTED operator path, not a contrived one.
+# OPERATIONS.md §13 instructs a re-run after the fleet redeploy, which is
+# exactly when both forms coexist (step-19). The resumed-session conflict guard
+# cannot save it: `_gz_uncompressed_size` reads the last 4 bytes of a DAMAGED
+# stream as an ISIZE trailer, which is an effectively uniform 32-bit number
+# (~2e9 expected), so `_twin_supersedes_gz` almost always compares against
+# garbage, returns False, and drops the file straight through to `gunzip_one`.
+#
+# The contract: when the source cannot be read, BOTH files survive untouched.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_unreadable_source_never_destroys_a_pre_existing_twin(tmp_path, build_corrupt):
+    """(a) THE REGRESSION. A damaged `.gz` beside a healthy plain twin must not
+    cost the twin. Asserts BYTES and MTIME, because a destination write that
+    truncates-then-refills would preserve neither."""
+    gz = build_corrupt(tmp_path / "3618" / "enc" / "sess.jsonl.gz")
+    twin = tmp_path / "3618" / "enc" / "sess.jsonl"
+    # Deliberately a DIFFERENT length from the corruption fixtures' own
+    # `_payload(200)` body, and shorter than it. The corrupt-body shape damages
+    # only the DEFLATE stream, leaving a valid ISIZE trailer — so a twin that
+    # happened to match that length would corroborate and take the skip path,
+    # never reaching the destination-truncation bug this test pins. Shorter also
+    # keeps `_twin_supersedes_gz` False, so all three shapes land on `gunzip_one`.
+    live = _payload(137)
+    twin.write_bytes(live)
+    os.utime(twin, (ARCHIVED_MTIME + DAY, ARCHIVED_MTIME + DAY))
+    before_mtime_ns = twin.stat().st_mtime_ns
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert twin.exists(), (
+        "the pre-existing plain twin was DESTROYED by a failed migration of its "
+        "damaged .gz — both copies of the transcript are now gone"
+    )
+    assert twin.read_bytes() == live, "the live twin was truncated or overwritten"
+    # gc_agent_transcripts derives the retention age from the newest descendant
+    # mtime, so even a byte-identical rewrite that rolled the mtime would age a
+    # live task dir out early.
+    assert twin.stat().st_mtime_ns == before_mtime_ns
+    # The source is damaged, so it is still retained and reported, exactly as
+    # step-1 requires — this test tightens that contract, it does not relax it.
+    assert gz.exists()
+    assert summary["failed"] == 1
+    assert str(gz) in summary["failed_paths"]
+    assert summary["migrated"] == 0
+
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_failed_migration_leaves_no_temp_debris(tmp_path, build_corrupt):
+    """(b) Whatever staging the fix uses must clean up after itself. A stray
+    scratch file left in the archive root would be swept into the corpus every
+    reader now walks plainly, and could be mistaken for a transcript."""
+    build_corrupt(tmp_path / "3618" / "enc" / "sess.jsonl.gz")
+    twin = tmp_path / "3618" / "enc" / "sess.jsonl"
+    twin.write_bytes(_payload(137))  # see (a): must not match the fixture's ISIZE
+
+    mig.migrate_archive(tmp_path, apply=True)
+
+    survivors = sorted(p.name for p in (tmp_path / "3618" / "enc").iterdir())
+    assert survivors == ["sess.jsonl", "sess.jsonl.gz"], (
+        f"unexpected debris left in the archive dir: {survivors}"
+    )
