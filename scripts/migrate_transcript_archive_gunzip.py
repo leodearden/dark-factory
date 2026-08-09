@@ -15,17 +15,32 @@ The ordering contract (INV-3 corroborate-before-destroy)
 :func:`gunzip_one` executes STRICTLY in this order, and the order is the whole
 point of the module:
 
-1. stream-decompress ``<name>.jsonl.gz`` to the sibling ``<name>.jsonl``
-   (chunked, so peak RSS stays bounded over multi-MB transcripts);
+1. stream-decompress ``<name>.jsonl.gz`` to a STAGING sibling
+   ``<name>.jsonl.migrate-tmp`` (chunked, so peak RSS stays bounded over
+   multi-MB transcripts);
 2. close, then RE-OPEN the written file and read it back, corroborating that it
    is both fully written and decodable;
 3. mirror the ``.gz`` mtime onto it via ``os.utime``;
-4. ONLY THEN unlink the source ``.gz``.
+4. ``os.replace`` the staging file over ``<name>.jsonl`` — atomic, same
+   directory, therefore same filesystem;
+5. ONLY THEN unlink the source ``.gz``.
 
 A file that cannot be corroborated is NEVER destroyed. Step 2 is not
 ceremonial: a short write (ENOSPC part-way through a ~1.4 GB expansion) yields
 a plausible-looking but truncated transcript, and unlinking the authoritative
 source on top of that would be unrecoverable data loss.
+
+Step 1 stages rather than writing ``<name>.jsonl`` DIRECTLY, and that is the
+destination half of the same invariant. Opening the final path ``'wb'`` would
+truncate a PRE-EXISTING plain twin before a single source byte had been
+validated, and the failure path would then unlink the remains — so a damaged
+``.gz`` sitting beside a healthy plain twin would cost BOTH copies and lose the
+session's transcript entirely. That is reachable on the documented operator
+path: the runbook instructs a re-run after the fleet redeploy, exactly when
+both forms coexist, and the resumed-session guard below cannot catch it because
+a damaged stream has no trustworthy ISIZE trailer to compare against. Staging
+makes the destination untouched until a complete, corroborated, correctly
+stamped file exists to replace it atomically.
 
 Step 3 is not cosmetic either. ``gc_agent_transcripts.scan_task_dirs`` derives
 each task dir's retention age from its NEWEST descendant file mtime, and the
@@ -93,6 +108,13 @@ DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 
 GZ_SUFFIX = '.gz'
 
+# Suffix for the staging file each decompression is written to before being
+# atomically moved onto its final name. Deliberately NOT ``.jsonl``-terminated,
+# so a leftover from a hard kill is invisible to both this sweep's
+# ``*.jsonl.gz`` walk and every downstream reader's ``*.jsonl`` glob — inert
+# debris, never mistakable for a transcript. A re-run rewrites it in place.
+STAGING_SUFFIX = '.migrate-tmp'
+
 # Exit codes. DIVERGES from gc_agent_transcripts' unconditional exit 0: that is
 # a routine cron sweep whose per-dir hiccups must not alarm a watchdog, whereas
 # this is a one-off migration whose failures an operator has to act on. A
@@ -147,6 +169,15 @@ def plain_sibling(gz_path: Path) -> Path:
     return gz_path
 
 
+def staging_path(dest: Path) -> Path:
+    """Return the staging path a decompression is written to before *dest*.
+
+    A sibling in the SAME directory, which is what makes the final
+    :func:`os.replace` an atomic same-filesystem rename rather than a copy.
+    """
+    return dest.with_name(dest.name + STAGING_SUFFIX)
+
+
 def _decompress_to(gz_path: Path, dest: Path) -> int:
     """Stream *gz_path* into *dest*, returning the byte count written.
 
@@ -154,6 +185,9 @@ def _decompress_to(gz_path: Path, dest: Path) -> int:
     so peak RSS stays bounded regardless of transcript size. The returned count
     is what :func:`_corroborate` checks the on-disk size against, which is how a
     short write (ENOSPC) is caught before the source is destroyed.
+
+    *dest* is always a STAGING path (see :func:`gunzip_one`) — this opens it
+    ``'wb'``, which truncates, so it must never be handed a live transcript.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(gz_path, 'rb') as src, open(dest, 'wb') as out:
@@ -207,12 +241,16 @@ def _warn_migrate_failure(path: Path, err: BaseException) -> None:
 
 
 def _discard_partial(dest: Path) -> None:
-    """Remove a partially-written destination after a failed migration.
+    """Remove a partially-written STAGING file after a failed migration.
 
     Not tidiness — correctness. :func:`migrate_archive` decides whether to
     trust an existing twin, and a half-written file left behind by a failure
     is exactly the debris a later resume run could mistake for a finished
     migration and then unlink the authoritative ``.gz`` on top of.
+
+    Only ever called with a staging path, NEVER the final ``.jsonl``: the
+    caller has not yet replaced the destination when this runs, so a
+    pre-existing twin is still whole and must stay that way.
     """
     try:
         dest.unlink(missing_ok=True)
@@ -229,27 +267,38 @@ def _discard_partial(dest: Path) -> None:
 def gunzip_one(gz_path: Path) -> Path:
     """Migrate one ``.jsonl.gz`` to its plain sibling, returning the new path.
 
-    Implements the module's ordering contract exactly: decompress → corroborate
-    → mirror mtime → unlink. The source ``.gz`` is removed ONLY after the plain
-    twin has been read back and stamped; any exception before that point leaves
-    the authoritative source untouched and clears the partial destination.
+    Implements the module's ordering contract exactly: decompress to staging →
+    corroborate → mirror mtime → atomically replace → unlink. The source ``.gz``
+    is removed ONLY after the plain twin has been read back and stamped; any
+    exception before that point leaves the authoritative source untouched, the
+    destination untouched, and clears only the staging file.
+
+    Nothing is ever written over ``dest`` in place. Until the ``os.replace``,
+    an existing plain twin is whole — so a source that turns out to be damaged
+    costs neither copy. This is the destination half of corroborate-before-
+    destroy, and it is the reason the write goes to staging at all.
 
     Raises the underlying failure rather than swallowing it — classification
     and counting belong to :func:`migrate_archive`, which owns the report.
     """
     dest = plain_sibling(gz_path)
+    staging = staging_path(dest)
     # Capture the source mtime BEFORE any mutation — it is the retention age
     # gc_agent_transcripts keys on, and the source is gone by the end.
     source_stat = gz_path.stat()
 
     try:
-        written = _decompress_to(gz_path, dest)      # (1) decompress
-        _corroborate(dest, expected_size=written)    # (2) read back
-        os.utime(dest, (source_stat.st_atime, source_stat.st_mtime))  # (3) mtime
+        written = _decompress_to(gz_path, staging)      # (1) decompress
+        _corroborate(staging, expected_size=written)    # (2) read back
+        os.utime(staging, (source_stat.st_atime, source_stat.st_mtime))  # (3) mtime
     except _UNREADABLE_SOURCE_ERRORS:
-        _discard_partial(dest)
+        _discard_partial(staging)
         raise
-    gz_path.unlink()                                 # (4) only now destroy
+    # (4) atomic same-dir rename. The mtime mirror rides across it, so the
+    # published file is stamped correctly from the instant it appears — there
+    # is no window where a reader sees a `now`-stamped transcript.
+    os.replace(staging, dest)
+    gz_path.unlink()                                    # (5) only now destroy
     return dest
 
 

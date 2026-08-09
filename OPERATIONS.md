@@ -1110,12 +1110,21 @@ stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
 `conflicts` / `conflict_paths` / `failed` / `failed_paths`); the LOUD lines go
 to stderr, so `... --apply | jq` works while failures stay visible.
 
-Per file it decompresses to the sibling `.jsonl`, **reads the result back**,
-mirrors the `.gz` mtime, and only then unlinks the source. A file it cannot
-corroborate is never destroyed — it is retained, counted and named. The mtime
-mirror matters: `gc_agent_transcripts` derives each task dir's retention age
-from its newest descendant mtime, so stamping `now` would silently reset the
-whole 90-day retention window.
+Per file it decompresses to a staging sibling (`<name>.jsonl.migrate-tmp`),
+**reads the result back**, mirrors the `.gz` mtime, atomically renames it over
+`<name>.jsonl`, and only then unlinks the source. A file it cannot corroborate
+is never destroyed — it is retained, counted and named. The mtime mirror
+matters: `gc_agent_transcripts` derives each task dir's retention age from its
+newest descendant mtime, so stamping `now` would silently reset the whole
+90-day retention window.
+
+Nothing is ever written over a plain `.jsonl` in place, which is what makes the
+re-run in step 5 safe when both forms coexist: if the `.gz` turns out to be
+damaged, the existing plain twin is left whole rather than being truncated by
+the attempt. A hard kill (SIGKILL, power loss) can strand a `.migrate-tmp`
+file; it is inert — no reader's `*.jsonl` glob matches it — and the next
+`--apply` rewrites it, so `find data/orchestrator/agent-transcripts -name
+'*.migrate-tmp' -delete` is cleanup, never recovery.
 
 It is **idempotent and re-runnable**. A `.gz` whose `.jsonl` twin already
 reads back cleanly is skipped and its source dropped, so a run you kill
