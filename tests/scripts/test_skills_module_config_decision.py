@@ -111,9 +111,6 @@ import posixpath
 import shlex
 import subprocess
 
-from orchestrator import verify_cmd
-from orchestrator.config import _discover_module_configs
-
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
 # because tests/scripts/conftest.py puts this directory on sys.path (pytest's
@@ -122,6 +119,9 @@ from orchestrator.config import _discover_module_configs
 # for systemd_unit_invariants. A bare `import`, never an importorskip: if the
 # probe stops importing, this guard must fail loudly.
 import test_root_lint_covers_nonmember_py as skills_ruff_probe
+from orchestrator.config import _discover_module_configs
+
+from orchestrator import verify_cmd
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

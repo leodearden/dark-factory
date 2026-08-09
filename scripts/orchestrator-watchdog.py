@@ -29,6 +29,7 @@ Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -251,20 +252,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        try:
+        # The fallback is itself best-effort: writing to stderr raises on a
+        # broken pipe or a full/failing journal socket, and that OSError
+        # would otherwise escape log() and abort a caller's tick (see the
+        # never-raises contract in the docstring). Both journal routes are
+        # gone at this point, so there is nothing left to report WITH —
+        # dropping the message is the only remaining option, and it is
+        # strictly better than dropping the rest of the tick with it.
+        with contextlib.suppress(OSError):
             print(
                 f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
                 file=sys.stderr,
             )
-        except OSError:
-            # The fallback is itself best-effort: writing to stderr raises on a
-            # broken pipe or a full/failing journal socket, and that OSError
-            # would otherwise escape log() and abort a caller's tick (see the
-            # never-raises contract in the docstring). Both journal routes are
-            # gone at this point, so there is nothing left to report WITH —
-            # dropping the message is the only remaining option, and it is
-            # strictly better than dropping the rest of the tick with it.
-            pass
 
 
 class _JournalLog:
@@ -286,10 +285,9 @@ class _JournalLog:
     """
 
     def warning(self, msg: str) -> None:
-        try:
+        # Broad by design: logging must never break a fail-soft probe.
+        with contextlib.suppress(Exception):
             log(f"WARNING: {msg}")
-        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft probe
-            pass
 
 
 logger = _JournalLog()
@@ -900,10 +898,8 @@ def _stamp_fm_deploy_clock() -> None:
         tmp_path = None  # renamed away — nothing to clean up
     except Exception as exc:  # noqa: BLE001
         if tmp_path is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
         log(f"_stamp_fm_deploy_clock: failed to stamp {FM_DEPLOY_CLOCK_PATH}: {exc!r}")
 
 

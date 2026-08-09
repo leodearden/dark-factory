@@ -88,6 +88,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
+    is_pure_gate_metadata,
 )
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
@@ -2518,6 +2519,20 @@ def _render_live_workflow_section(
     orchestrator lock also has the signal dropped (task 2409 — closes the
     repeated re-deferral loop this caused for tasks 2335/2196).
 
+    A PENDING deterministic PURE GATE — ``always_escalates`` truthy with no
+    ``before_done``, classified by :func:`is_pure_gate_metadata` and forwarded
+    as ``pure_gate`` — likewise has the project-wide signal dropped (task
+    3751).  Its entire ``DeterministicRunner`` run is "file one born-at-L2
+    escalation, stamp ``gate_escalated_at``, set status blocked": no script, no
+    systemd, no ``git_ops``, and (like every deterministic task) no
+    worktree/branch, so the bare lock can never be task-specific evidence for
+    it.  A pending deterministic task carrying a ``before_done`` KEEPS the
+    signal: that path runs a blocking deploy/predicate script while the status
+    is still ``'pending'`` (``Harness._run_deterministic_slot`` never flips it
+    to ``'in-progress'``) with no git evidence to reveal it.  Confirmed
+    incident: task 3845 was listed here with ONLY the bare ``orchestrator``
+    signal for 3+ consecutive reconciliation cycles, blocking its disposition.
+
     **In-progress corroboration gate (task 2963).** For an ``in-progress`` task
     whose only live signals are a lingering registered worktree and/or the
     project-wide orchestrator lock (no ``recent_commit``), a fleet redeploy that
@@ -2594,6 +2609,10 @@ def _render_live_workflow_section(
         raw_metadata = task.get('metadata')
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         task_kind = metadata.get('task_kind')
+        # `metadata` is already the isinstance-guarded dict above, so a task
+        # with absent/non-dict metadata yields pure_gate=False — fail-safe
+        # toward live. See the docstring's pending-pure-gate paragraph.
+        pure_gate = is_pure_gate_metadata(metadata)
 
         # Per-task corroboration gate (task 2963). For an IN-PROGRESS task,
         # compute an explicit corroboration verdict so the detector can downgrade
@@ -2621,6 +2640,7 @@ def _render_live_workflow_section(
             liveness = detect_live_workflow(
                 task_id, project_root,
                 status=task.get('status'), task_kind=task_kind,
+                pure_gate=pure_gate,
                 corroborated=corroborated, **kwargs
             )
         except Exception:

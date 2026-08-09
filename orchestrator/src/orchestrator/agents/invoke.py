@@ -30,6 +30,7 @@ from shared.cli_invoke import (  # noqa: F401
     build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    require_non_blank_prompt,
 )
 
 # Process-group termination helper for subprocess tree cleanup
@@ -248,6 +249,15 @@ async def _invoke_claude_with_sandbox(
         from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
         active = resolve_active_backend()
         if active != 'none':
+            # Same lockstep obligation as the argv build below, applied to the
+            # precondition (task 3143): this path never calls
+            # shared.cli_invoke._invoke_claude, so that function's guard does
+            # not cover it and a blank prompt would reach the CLI as an opaque
+            # argument error (esc-3118-1).  Placed BEFORE build_claude_argv so
+            # no system-prompt / mcp-config temp file is created for an
+            # invocation that can never produce a useful run.
+            require_non_blank_prompt(prompt, context='_invoke_claude_with_sandbox')
+
             # Build command via the shared single source of truth (task 2465
             # dedup) so this sandboxed path stays in lockstep with the
             # non-sandbox path in shared.cli_invoke._invoke_claude — including

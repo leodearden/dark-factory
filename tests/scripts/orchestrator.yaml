@@ -170,6 +170,25 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # merge_verify_breadth=full, and type_check widens to this directory form when a
 # touched file classifies STRUCTURAL — hence pre-1 checking the directory form
 # rather than only the per-file one.
+#
+# RULE SET (task 3457). This directory sits in the identical position to
+# scripts/: outside every workspace member, so it resolved ruff's built-in
+# defaults until the repo-root pyproject.toml declared a [tool.ruff] table, and
+# --project shared above did not change that (it selects the ENVIRONMENT ruff
+# runs from, not the config that applies). The lint_command VALUE below is
+# UNCHANGED by 3457 — only the rule set it resolves changed.
+#
+# MEASUREMENT: widening surfaced 25 findings in tests/scripts/, all FIXED in the
+# same branch as the config change, never excluded — task 3350's own
+# fix-don't-weaken precedent, which is also why this command must stay
+# directory-wide and exclude-free.
+#
+# The resolved values, the mechanism and the full rationale are stated ONCE, in
+# the [tool.ruff] comment block in the repo-root pyproject.toml, and held there
+# by test_nonmember_ruff_config.py — which sweeps every non-member directory,
+# this one and scripts/ included, for parity with a live member. Read them
+# there; do not restate them here, or the two will drift and only one copy is
+# guarded.
 lint_command: "uv run --project shared ruff check tests/scripts/"
 type_check_command: "npx pyright tests/scripts/"
 
@@ -206,9 +225,19 @@ type_check_command: "npx pyright tests/scripts/"
 # leg on its own — not the sum of test+lint+type.
 #
 # verify_cold_command_timeout_secs is deliberately left UNSET here: this suite
-# has no build step whose cold cost would justify a separate cold budget. Note
-# what that actually means, per the _resolve_verify_timeout cascade
-# (verify.py:3634-3640) — an unset module cold knob falls through to
-# config.verify_cold_command_timeout_secs, which the repo root DOES set (3600),
-# NOT to the 600 below. The 600 is the warm budget only.
+# has no build step whose cold cost would justify a separate cold budget. An
+# unset module cold knob falls through to
+# config.verify_cold_command_timeout_secs (5400) — per the
+# verify._resolve_verify_timeout cascade, cited by SYMBOL, not file:line, since
+# a prior numeric pin here had already rotted onto unrelated code within a week
+# of being written — NOT to the 600 below, which is the warm budget only. Under
+# a merge-role cold verify (this file's commands run VERBATIM under
+# merge_verify_breadth: "full", noted above), the cascade instead consults
+# config.merge_verify_cold_command_timeout_secs (7200) FIRST: that value ships
+# from the package-bundled orchestrator/src/orchestrator/defaults.yaml, not
+# dark-factory-orchestrator.yaml, so it stays invisible to a reader checking
+# only the root config — the same defaults.yaml-shadows-root blind spot
+# test_tests_scripts_module_config.py::
+# test_tests_scripts_is_a_registered_module_config already records for
+# lock_depth.
 verify_command_timeout_secs: 600

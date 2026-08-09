@@ -1426,9 +1426,9 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     # may point ORCH_CONFIG_PATH at a different checkout).
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == pytest.approx(
+    assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs
-    )
+    ) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
 
 
 def test_orch_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1448,22 +1448,25 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
 
     orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH is the single
     authoritative relative path (task 2396). Neither the stdlib watchdog
-    (FLEET_DEPLOY_CLOCK_PATH) nor restart-all-orchestrators.sh (CLOCK_FILE)
-    can import it, so each hardcodes its own mirror. If those mirrors ever
-    drifted from the authoritative constant, the watchdog would read a
-    different file than the script writes — permanently un-gating the
-    staleness backstop and silently reintroducing the I2 hole this task
-    closes, with every other test still green. This pins all three copies
-    together, mirroring test_orch_restart_min_interval_secs_matches_config_default
-    above.
+    (FLEET_DEPLOY_CLOCK_PATH), restart-all-orchestrators.sh (CLOCK_FILE), nor
+    df_pytest_isolation (PROTECTED_DEPLOY_CLOCK_RELPATHS — stdlib+pytest only,
+    since every subproject conftest imports it) can import it, so each
+    hardcodes its own mirror. If those mirrors ever drifted from the
+    authoritative constant, the watchdog would read a different file than the
+    script writes — permanently un-gating the staleness backstop and silently
+    reintroducing the I2 hole this task closes, with every other test still
+    green; and the test-suite guard (task 3797) would watch a file nobody
+    writes, i.e. green and useless. This pins all FOUR copies together,
+    mirroring test_orch_restart_min_interval_secs_matches_config_default above.
     """
     from orchestrator.service_restart import FLEET_DEPLOY_CLOCK_RELPATH
 
     # --- watchdog mirror (FLEET_DEPLOY_CLOCK_PATH) ---
     monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
     expected_watchdog_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
-    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_watchdog_path
+    assert expected_watchdog_path == wdog.FLEET_DEPLOY_CLOCK_PATH
 
     # --- bash script mirror (CLOCK_FILE default) ---
     script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
@@ -1476,6 +1479,28 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
         "did its literal shape change? Update this regex to match."
     )
     assert match.group(1) == FLEET_DEPLOY_CLOCK_RELPATH
+
+    # --- pytest-guard mirror (df_pytest_isolation, task 3797) ---
+    # The suite-wide guard that fails a run which stamped a REAL deploy clock
+    # can only protect the file it names. A drifted mirror there is the worst
+    # kind of failure: silently green, watching a path nobody writes.
+    import df_pytest_isolation
+
+    assert FLEET_DEPLOY_CLOCK_RELPATH in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off "
+        f"FLEET_DEPLOY_CLOCK_RELPATH ({FLEET_DEPLOY_CLOCK_RELPATH!r}); the "
+        "test-suite deploy-clock guard would watch a file nobody writes."
+    )
+
+    fm_relpath = str(
+        pathlib.Path(wdog.FM_DEPLOY_CLOCK_PATH).relative_to(pathlib.Path(wdog.REPO_DIR))
+    )
+    assert fm_relpath in df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+        "df_pytest_isolation.PROTECTED_DEPLOY_CLOCK_RELPATHS has drifted off the "
+        f"watchdog's FM_DEPLOY_CLOCK_PATH default ({fm_relpath!r}); fused-memory's "
+        "deploy clock has the identical min-interval semantics and needs the "
+        "same guard."
+    )
 
 
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
@@ -3711,7 +3736,7 @@ def test_boundary8_coordinator_fire_while_busy_link_seam(
     monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
     expected_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
-    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_path, (
+    assert expected_path == wdog.FLEET_DEPLOY_CLOCK_PATH, (
         "the watchdog and the coordinator must honor the exact same shared "
         "fleet-deploy clock path for fire-while-busy to be safe under the "
         "8h cap"
@@ -3975,7 +4000,7 @@ def test_fused_memory_port_matches_configured_server_port() -> None:
     server = cfg.get("server") if isinstance(cfg, dict) else None
     port = server.get("port") if isinstance(server, dict) else None
     assert port is not None, f"{config_path}: missing 'server.port' (schema may have changed)"
-    assert wdog.FUSED_MEMORY_PORT == port, (
+    assert port == wdog.FUSED_MEMORY_PORT, (
         f"FUSED_MEMORY_PORT ({wdog.FUSED_MEMORY_PORT}) != "
         f"fused-memory/config/config.yaml server.port ({port})"
     )
@@ -4266,15 +4291,22 @@ def test_print_fused_memory_liveness_row(
     for verdict_token, ss_stdout, health_outcome in scenarios:
         recorded_calls: list[list[str]] = []
 
-        def fake_run(cmd, **kwargs):  # noqa: ANN001
-            recorded_calls.append(list(cmd))
+        # The loop variables are bound explicitly as KEYWORD-ONLY defaults (so no
+        # positional caller can ever reach them). A closure defined in a loop
+        # otherwise reads whatever the name holds when it is CALLED, not when it
+        # was defined (B023) — benign only while every call stays inside the same
+        # iteration, which nothing here enforces. `_recorded` is the same list
+        # object `recorded_calls` names, so the assertion below still sees the
+        # appends.
+        def fake_run(cmd, *, _recorded=recorded_calls, _ss=ss_stdout, **kwargs):  # noqa: ANN001
+            _recorded.append(list(cmd))
             assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-            return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=_ss, stderr="")
 
-        def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            if isinstance(health_outcome, Exception):
-                raise health_outcome
-            return _FakeHealthResponse(health_outcome)
+        def fake_urlopen(*args, _outcome=health_outcome, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(_outcome, Exception):
+                raise _outcome
+            return _FakeHealthResponse(_outcome)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -4604,9 +4636,9 @@ def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """FM_DEPLOY_CLOCK_PATH defaults to fm's OWN clock file under REPO_DIR."""
     monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
-    assert wdog.FM_DEPLOY_CLOCK_PATH == os.path.join(
+    assert os.path.join(
         wdog.REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"
-    )
+    ) == wdog.FM_DEPLOY_CLOCK_PATH
 
 
 def test_fm_deploy_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

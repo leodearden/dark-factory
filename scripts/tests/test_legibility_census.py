@@ -18,18 +18,18 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
-
-import pytest
 
 import census as mod
 import codebook
 import coder
-import config as config_mod
 import digest as digest_mod
 import inventory
+import pytest
 from legibility import census_trigger
+
+import config as config_mod
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -976,7 +976,7 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     # days_since is well past tasks_landed_min_days. Condition (a)
     # (max_interval_days) remains the unconditional backstop.
     config = census_trigger.CensusConfig()
-    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
     decision = census_trigger.evaluate(
         now=now,
         last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
@@ -2899,7 +2899,7 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
         inventory, "enumerate_sessions_in_range", fake_enumerate_sessions_in_range
     )
 
-    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
     # Consume the generator: nothing enumerates until it is iterated.
     list(mod.default_batch_source(cfg, projects_root=tmp_path / "projects", now=now))
 

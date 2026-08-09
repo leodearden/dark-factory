@@ -64,7 +64,7 @@ import sys
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Identify ourselves explicitly on `initialize`. The TaskInterceptor derives an
 # actor class from the MCP client identity, so a nightly automated mutator of
@@ -313,7 +313,7 @@ class McpClient:
         self._timeout = timeout
         self._session_id: str | None = None
 
-    def __enter__(self) -> 'McpClient':
+    def __enter__(self) -> McpClient:
         # No session id on the FIRST request: the MCP streamable-HTTP contract
         # requires `initialize` to be sent session-less. A STATEFUL server 404s
         # "Session not found" if a client invents its own id here. The
@@ -483,7 +483,7 @@ def _parse_timestamp(value):
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 

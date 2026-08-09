@@ -34,17 +34,19 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # generic SQLite write-queue component. Keep in sync with
 # config.schema.QueueConfig.transient_error_names' default.
 #
-# TOPOLOGY CAVEAT on the not-found entries (task 3585, esc-3561-3).
-# 'NodeNotFoundError' was added here by task 1936 on the hypothesis of a "node
-# -visibility race". Two independent lines of evidence say that premise does
-# not hold as things stand, and they do NOT age the same way:
+# THE NOT-FOUND FAMILY IS DELIBERATELY ABSENT (task 3585, esc-3561-3).
+# 'NodeNotFoundError' / 'EdgeNotFoundError' / 'EdgesNotFoundError' were added
+# here by task 1936 on the hypothesis of a "node-visibility race". Task 3585
+# removed all three on two independent lines of evidence, which do NOT age the
+# same way — keep them distinct:
 #
-#   * Empirical, and topology-independent: across all 28 recorded add_episode
-#     calls there were 304 execution attempts and 0 successes; one was retried
-#     55 times across replays and never converged. A visibility race
-#     converges. 1936's own motivating incident (dead-letter id 8533) was in
-#     fact the self-referential add_episode uuid bug that task 3561 fixes —
-#     not a race at all.
+#   * Empirical, and topology-independent — PERMANENT: across all 28 recorded
+#     add_episode calls there were 304 execution attempts and 0 successes; one
+#     was retried 55 times across replays and never converged. A visibility
+#     race converges. 1936's own motivating incident (dead-letter id 8533) was
+#     in fact the self-referential add_episode uuid bug that task 3561 fixes —
+#     not a race at all. EdgesNotFoundError additionally has zero raise sites
+#     anywhere in graphiti_core, so it could never have matched.
 #
 #   * Topology-dependent, AND THIS HALF EXPIRES: graphiti_core's by-uuid
 #     lookups pass routing_='r', which can land on a lagging follower only on
@@ -53,14 +55,25 @@ _DELETE_DEAD_BATCH_SIZE = 500
 #     under MemoryService's per-group identity lock, so that window is
 #     ~nil here.
 #
-# If Graphiti ever moves to a clustered or read-routed backend, the second
-# argument lapses and an extended budget for the not-found family becomes
-# defensible again. Revisit this set at that point — its removal is a
+# REINSTATEMENT CONDITION. If Graphiti ever moves to a clustered or
+# read-routed backend, the second argument lapses and an extended budget for
+# the not-found family becomes defensible again — re-derive it from the
+# empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
+#
+# ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
+# above argues the stronger claim. Dropping these names only returns them to
+# the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
+# still spends five backend round-trips plus exponential backoff proving what
+# attempt 1 already showed. Making it terminal on the first attempt is task
+# 3586 (payload-aware classifier: _handle_failure already holds the whole
+# QueueItem and passes none of it to _is_transient, and the 'dead' outcome
+# plus the on_terminal hook below are the machinery it would reuse). If
+# 3586's payload discrimination proves too fine-grained, a blunter terminal
+# counterpart to this set — matched the same way, checked first — is the
+# cheaper fallback. Either shape is 3586's call; 3585 deliberately changed
+# only WHICH errors get the extended budget.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
-    'NodeNotFoundError',
-    'EdgeNotFoundError',
-    'EdgesNotFoundError',
     'TimeoutError',
     'ConnectionError',
     'ConnectionResetError',

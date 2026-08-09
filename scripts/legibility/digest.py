@@ -83,10 +83,14 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     agreement directly, including that they share the one implementation.
     """
     records: list[dict[str, Any]] = []
+    # noqa SIM115 x2: the branch only PICKS the opener; the handle is closed by
+    # the `with f:` two lines down. Collapsing it into the `with` would mean
+    # duplicating the loop body, and the plain-path call is kept verbatim for
+    # the byte-parity this docstring pins.
     if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
+        f = gzip.open(path, 'rt', encoding='utf-8')  # noqa: SIM115
     else:
-        f = open(path, encoding='utf-8')
+        f = open(path, encoding='utf-8')  # noqa: SIM115
     with f:
         # Wrap only the read/decompress iteration — decompression happens
         # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError

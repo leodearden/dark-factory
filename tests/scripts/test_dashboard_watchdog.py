@@ -191,10 +191,9 @@ def test_probe_health_false_on_timeout(monkeypatch):
     ``socket.timeout`` is an alias of the builtin TimeoutError on 3.10+; both
     spellings are exercised so neither regresses.
     """
-    import socket
 
     mod = _load_watchdog()
-    _patch_urlopen(monkeypatch, mod, socket.timeout("timed out"))
+    _patch_urlopen(monkeypatch, mod, TimeoutError("timed out"))
     assert mod.probe_health() is False
 
     mod2 = _load_watchdog()

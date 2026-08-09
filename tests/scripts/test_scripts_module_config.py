@@ -66,10 +66,10 @@ import tomllib
 from typing import Any
 
 import pytest
-
-from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
+
+from orchestrator import verify, verify_cmd, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

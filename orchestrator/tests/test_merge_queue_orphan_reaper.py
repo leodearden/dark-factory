@@ -736,13 +736,26 @@ class TestHeartbeatLoopReapWiring:
         worker._running = True
         task = asyncio.create_task(worker._heartbeat_loop())
         try:
-            # Give the loop enough wall time for several timeout-bounded
-            # polls. Without the asyncio.wait_for bound, the very first call
-            # would hang for the full 10s sleep and this window would only
-            # ever observe calls == 1.
-            await asyncio.sleep(0.3)
+            # Poll for the second timeout-bounded reap instead of a
+            # hard-coded wall-clock window: under full-suite xdist
+            # contention the event loop can be starved badly enough that a
+            # fixed 0.3s window only ever observes one poll (task 3684).
+            # Without the asyncio.wait_for bound, the first hung reap would
+            # block for the full 10s sleep and `calls` would never reach 2,
+            # so the deadline below is exhausted and the assertion still
+            # fails — the guard keeps its teeth.
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while calls < 2 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
             worker._running = False
-            await asyncio.wait_for(task, timeout=2.0)
+            timed_out = False
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except TimeoutError:
+                # Guard-regression case: the first hung reap is still
+                # sleeping unbounded. Let the assertions below report
+                # it cleanly instead of surfacing a raw TimeoutError.
+                timed_out = True
         finally:
             if not task.done():
                 task.cancel()
@@ -752,6 +765,7 @@ class TestHeartbeatLoopReapWiring:
             f'keeps polling instead of blocking on the first hung sweep '
             f'forever; got {calls} call(s) in the observation window'
         )
+        assert not timed_out, '_heartbeat_loop must exit promptly once _running is False'
 
     async def test_heartbeat_loop_reap_survives_raising_touch(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,

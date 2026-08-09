@@ -557,9 +557,39 @@ async def test_worker_created_path_emits_journal_event(
             description='Checking event emission',
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
 
-        # Let the worker drain
-        await asyncio.sleep(0.2)
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flaked under load (task 3854: observed failing
+        # in a 388s-wall full-suite run, passing in isolation and in a
+        # 226s-wall run). Waiting on the ticket leaving 'pending' rather
+        # than on journal_calls directly keeps a genuine regression loud: a
+        # ticket that resolves without emitting the event trips the
+        # assertions below immediately instead of burning the whole
+        # timeout first.
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the ticket',
+        )
+
+        # The ticket is terminalised (via asyncio.shield) *before* the
+        # worker builds and journals the task_created event (see
+        # _process_add_tickets_batch_prepared / _process_add_ticket in
+        # task_interceptor.py), so the poll above can observe the
+        # post-pending status one event-loop hop before _journal actually
+        # runs. Close that narrow window with a short second bounded poll
+        # on the emission itself: a genuine regression (event never
+        # emitted) still fails fast, just in ~2s instead of the full 10s.
+        await poll_until(
+            lambda: journal_calls,
+            timeout=2.0,
+            message='ticket resolved but no journal event was emitted',
+        )
 
     # Exactly one task_created event must have been journalled
     task_created_events = [

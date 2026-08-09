@@ -283,7 +283,8 @@ def _alarm_merge_request_stuck(
 
     * ``level=1`` (L1 blocking) — loud (steward -> auto-watcher -> human
       ladder), but not itself a merge-halt trigger; the merge-halt gate keys
-      off the ``wip_conflict`` / ``unmerged_state`` categories only.
+      off the ``wip_conflict`` / ``unmerged_state`` / ``stash_failed``
+      categories only.
     * ``category='merge_request_stuck'``
     * ``task_id=_merge_request_stuck_sentinel(stuck.request_id)``
 

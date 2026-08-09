@@ -14,9 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 import check_method_param_wiring as cmpw
+import pytest
 
 # scripts/tests -> scripts -> repo root. Same idiom as
 # shared/tests/capability_manifest_corpus.py; correct inside a worktree too.

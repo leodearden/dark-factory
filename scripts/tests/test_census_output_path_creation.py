@@ -31,6 +31,7 @@ import json
 from typing import Any
 
 import census as mod
+
 import config as config_mod
 
 _DATE = "2026-08-03"
