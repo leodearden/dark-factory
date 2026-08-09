@@ -21,6 +21,7 @@ from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.dedupe import DedupeConfig
+from escalation.dedupe import observed_submit_response as _observed_submit_response
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
     AGENT_FILABLE_LEVELS,
@@ -349,7 +350,13 @@ def create_server(
         original lower level) would silently drop the L2 routing signal.
 
         Response shapes (from dedupe.submit_or_dedupe):
-        - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+        - Queued:        ``{'id': esc_id, 'status': 'queued', 'level': <persisted>}``
+        - Auto-resolved/dismissed (the record was NOT pending after the write,
+          e.g. a concurrent sweep won the race): ``{'id', 'status',
+          'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
+          function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
+          post-write state rather than write intent, and fail open to
+          ``'queued'`` when the re-read is unavailable.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id}``
           (never returned for L2 escalations — they always produce 'queued')
@@ -361,8 +368,10 @@ def create_server(
         # L2 escalations bypass deduplication: their level=2 stamp must be
         # preserved on an independent on-disk record (see docstring above).
         if esc.severity in BORN_AT_L2_SEVERITIES:
-            queue.submit(esc)
-            return {'id': esc.id, 'status': 'queued'}
+            esc_id = queue.submit(esc)
+            # Task 3236: this branch does NOT route through dedupe, so it needs
+            # the observed-state response separately.  Fail-open to 'queued'.
+            return _observed_submit_response(queue, esc_id)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
     # --- Terminal-task chokepoint helper ---
@@ -525,10 +534,14 @@ def create_server(
         intervention (a ref move / rewind) — re-run or re-measure first.
 
         Response shape:
-        - Queued (task alive):    ``{id, status}``  where status='queued'
+        - Queued (task alive):    ``{id, status, level}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id}``
           (L2 escalations are never deduped — they always produce 'queued')
         - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
+        - Already resolved/dismissed at filing time (a concurrent resolver or
+          sweep won the race): ``{id, status, resolution, resolved_by, level}``
+          with the record's REAL status — the response reports observed
+          post-write state, never write intent (task 3236).
           Callers needing the full record can call get_escalation(id).
         """
         if severity not in KNOWN_SEVERITIES:
@@ -620,10 +633,17 @@ def create_server(
         intervention (a ref move / rewind) — re-run or re-measure first.
 
         Response shape always includes ``action='terminate_cleanly'`` plus:
-        - Queued:        ``{id, status, action}``  where status='queued'
+        - Queued:        ``{id, status, level, action}``  where status='queued'
         - Deduped:       ``{id, status, parent_id, child_id, action}``
           (L2 escalations are never deduped — they always produce 'queued')
         - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
+        - Already resolved/dismissed at filing time (a concurrent resolver or
+          sweep won the race): ``{id, status, resolution, resolved_by, level,
+          action}`` with the record's REAL status.  Task 3236: the response
+          reports observed post-write state, never write intent — a
+          ``status='queued'`` reply now means the record really was pending
+          after the write.  ``level`` echoes the level actually persisted, so a
+          caller that passed ``level=1`` can confirm it landed.
           Callers needing the full record can call get_escalation(id).
         """
         if severity not in KNOWN_SEVERITIES:

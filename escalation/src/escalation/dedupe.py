@@ -34,11 +34,13 @@ __all__ = [
     'compute_content_fingerprint',
     'content_fingerprint_key',
     'find_dedupe_parent',
+    'observed_submit_response',
     'submit_or_dedupe',
     'summary_dedupe_key',
 ]
 
 import hashlib
+import logging
 import math
 import re
 from collections.abc import Callable
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
 # to a hashable value used for matching.  None return (e.g. unset fingerprint)
 # is treated as "never fold" by the empty-key guard in find_dedupe_parent.
 KeyFn = Callable[['Escalation'], Any]
+
+logger = logging.getLogger(__name__)
 
 _NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
 _WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
@@ -354,9 +358,16 @@ def submit_or_dedupe(
       fall through to ``queue.submit()`` so the escalation is never dropped.
 
     Response shapes (identical to server._submit_or_dedupe):
-    - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+    - Queued:        ``{'id': esc_id, 'status': 'queued', 'level': <persisted>}``
+    - Auto-resolved/dismissed (the record was NOT pending after the write —
+      e.g. a concurrent sweep won the race): ``{'id', 'status', 'resolution',
+      'resolved_by', 'level'}``.  See ``observed_submit_response``: the
+      response reports observed post-write state, never write intent, and
+      fails open to ``'queued'`` if the re-read is unavailable.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id}``
+      (shape deliberately unchanged — it is already explicit that the filing
+      folded into another record)
 
     Recon (A7b) calls this directly with ``DedupeConfig.for_recon()`` instead
     of ``queue.submit()``, routing through the same gate + TOCTOU logic used
@@ -366,6 +377,8 @@ def submit_or_dedupe(
     """
     # Gate 1 (enabled) and Gate 2 (category membership) both short-circuit
     # in pure memory before any disk I/O via find_dedupe_parent.
+    # NOTE: the post-write response is shaped by observed_submit_response, not
+    # by a hardcoded 'queued' — see that function's docstring.
     if config.infra_dedupe_enabled and esc.category in config.infra_dedupe_categories:
         parent_id = find_dedupe_parent(queue, esc, config, now=now)
         # TOCTOU guard: attach_dedupe_child returns None when the parent was
@@ -379,4 +392,57 @@ def submit_or_dedupe(
                 'child_id': esc.id,
             }
     esc_id = queue.submit(esc)
-    return {'id': esc_id, 'status': 'queued'}
+    return observed_submit_response(queue, esc_id)
+
+
+def observed_submit_response(queue: EscalationQueue, esc_id: str) -> dict[str, Any]:
+    """Shape a post-write response from OBSERVED state, never from write intent.
+
+    Task 3236.  The submit paths used to return a hardcoded
+    ``{'id': ..., 'status': 'queued'}`` with no re-read, so a filing that a
+    concurrent resolver/sweep had already dismissed in the same instant was
+    still reported to its filer as 'queued'.  The filer then had no way to
+    learn its escalation had been swallowed.
+
+    Re-reads the persisted record and returns:
+    - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
+      the persisted level so a caller that asked for ``level=1`` can confirm
+      it landed);
+    - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
+      already promises, ``{'id', 'status', 'resolution', 'resolved_by',
+      'level'}``, carrying the record's REAL values.  No new status vocabulary
+      is invented, so no consumer needs updating.
+
+    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
+    back to the historical ``'queued'`` response and logs a WARNING rather than
+    raising.  A filing must never be lost to a bookkeeping read — that is the
+    very failure mode being fixed here.
+    """
+    try:
+        persisted = queue.get(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+            esc_id, exc,
+        )
+        return {'id': esc_id, 'status': 'queued'}
+    if persisted is None:
+        logger.warning(
+            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
+            esc_id,
+        )
+        return {'id': esc_id, 'status': 'queued'}
+    if persisted.status == 'pending':
+        return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
+    logger.warning(
+        'Escalation %s was already %s at filing time (resolved_by=%r); '
+        'reporting observed state instead of queued',
+        esc_id, persisted.status, persisted.resolved_by,
+    )
+    return {
+        'id': esc_id,
+        'status': persisted.status,
+        'resolution': persisted.resolution,
+        'resolved_by': persisted.resolved_by,
+        'level': persisted.level,
+    }
