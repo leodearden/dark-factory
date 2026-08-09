@@ -23,6 +23,23 @@ re-export; drift between them is caught by explicit equality tests:
   (pins this copy)
 - ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins the lock_charter_guard.py copy)
+
+STATUS — deliberate cross-repo divergence (dark_factory #3248)
+--------------------------------------------------------------
+``EXTENSIONLESS_FILENAMES`` (below) is a dark_factory-only lead.  reify's
+``scripts/lock-charter-guard.sh`` still conservative-rejects every one of
+those 8 names, per its PRD §5.2 ``files=[]`` escape hatch, so the two
+predicates now DISAGREE on exactly those names and only those names.  This
+is the mirror image of #3117's one-sided lead, and it is recorded loudly
+here rather than left to be rediscovered.
+
+The Tier-2 cross-source drift guard
+(``test_extension_drift_guard_vs_reify_script``) is UNAFFECTED, and that is
+measured rather than assumed: it compares ``sorted(FILE_EXTENSIONS)`` against
+``lock-charter-guard.sh --list-extensions``, i.e. an EXTENSION vector only.  A
+separate frozenset is invisible to it.  So this divergence will NOT surface as
+a red test — which is exactly why it is written down.  Mirroring it into reify
+is filed as a follow-up.
 """
 
 from __future__ import annotations
@@ -31,6 +48,7 @@ from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
+    'EXTENSIONLESS_FILENAMES',
     'FILE_EXTENSIONS',
     'directory_locks',
     'files_to_modules',
@@ -138,6 +156,59 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Canonical extension-LESS filename allowlist (dark_factory #3248).
+#
+# CONTRACT: recognised final-segment NAMES that carry no extension at all yet
+# denote a FILE.  FILE_EXTENSIONS above can never reach these — there is no dot,
+# so there is no token to look up — which is why they need a second enumerated
+# vector rather than another entry in the first.  Matched against the final
+# segment BEFORE the "no dot ⇒ directory" reject in is_file_path.
+#
+# EVIDENCE: `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (identical
+# to the 2026-07-31 measurement) — every tracked path whose final segment
+# contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
+# pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
+# reference-transaction.  Union = the 8 below.
+#
+# GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
+# accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
+# mount points (`graphiti`, `mem0` in dark-factory).  They are extension-less and
+# would otherwise qualify, but admitting them would let a task declare an ENTIRE
+# VENDORED SUBMODULE as its lock charter — strictly worse than the bug being
+# fixed.  They stay DIRECTORIES.  The corpus sweeps assert this filter is doing
+# real work rather than passing vacuously.
+#
+# CASE-SENSITIVITY: exact tracked spelling only.  `LICENSE` matches; `license`
+# and `License` do not.  Same rule as the (lowercase) extension allowlist: a
+# tracked file whose case differs is a naming problem, not an allowlist gap.
+#
+# ADMISSION RULE, as for FILE_EXTENSIONS: judge a candidate by "is this a real
+# tracked file?", never by "does it look like a file?".  The list must stay
+# ENUMERATED — a general rule such as "an extension-less segment naming an
+# executable is a file" cannot be evaluated as pure string (C-P3) and would
+# re-admit directories.
+#
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
+# Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
+# Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
+#   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
+#   as a red test rather than as another LockCharterViolation incident.
+# ---------------------------------------------------------------------------
+
+EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset(
+    {
+        'Dockerfile',
+        'LICENSE',
+        'cargo',
+        'cargo-audit-orphans',
+        'pre-commit',
+        'pre-merge-commit',
+        'project-checks',
+        'reference-transaction',
+    }
+)
+
 
 def is_file_path(path: str) -> bool:
     """Return True iff *path* is a file-level declaration (not a directory).
@@ -149,10 +220,18 @@ def is_file_path(path: str) -> bool:
     1. Strip ALL trailing ``/`` from *path*.
     2. Final segment = substring after last ``/``.
        Empty segment (path was all slashes) → directory → return False.
-    3. If the segment contains no ``.`` → extension-less → return False.
-    4. ext = substring after the last ``.`` in the segment.
+    3. If the segment is in ``EXTENSIONLESS_FILENAMES`` → file → return True.
+       Checked BEFORE the no-dot reject below, because these names carry no
+       extension and would otherwise be rejected at step 4 (dark_factory #3248).
+    4. If the segment contains no ``.`` → extension-less → return False.
+    5. ext = substring after the last ``.`` in the segment.
        Return ``ext in FILE_EXTENSIONS`` (case-sensitive, matching α's
        ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
+
+    C-P3 is PRESERVED by step 3: it is a set membership test on a string, so
+    the predicate remains pure string — no stat, no filesystem access, no model
+    call.  A ghost path that is not on disk still classifies deterministically,
+    exactly as before.
     """
     # Strip all trailing slashes.
     p = path
@@ -165,6 +244,11 @@ def is_file_path(path: str) -> bool:
     # Empty segment → path was all slashes → directory.
     if not seg:
         return False
+
+    # Recognised extension-less FILE name → file.  Must precede the no-dot
+    # reject below, which would otherwise swallow every one of these.
+    if seg in EXTENSIONLESS_FILENAMES:
+        return True
 
     # No dot in segment → extension-less → treat as directory (REJECT).
     if '.' not in seg:

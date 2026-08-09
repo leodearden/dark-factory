@@ -313,45 +313,51 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
 async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path):
     """Directory-shaped entries from git diff are stripped before persisting.
 
-    After the 2026-07-28 allowlist widening (reify #5726 / dark_factory #3117)
-    the ONLY directory-shaped output ``git diff --name-only`` can realistically
-    produce is an **extension-less tracked file** — measured: of 2124 tracked
-    paths in this repo, zero have a non-allowlisted extension, and 7 are
-    extension-less (``LICENSE``, ``hooks/pre-commit``,
-    ``fused-memory/docker/Dockerfile``, ...).  Both fixture entries below are
-    therefore real ``git ls-files`` paths that git genuinely emits in a diff,
-    not synthetic directory names: ``git diff --name-only`` lists *files*, never
-    bare directories.
+    The strip itself (``strip_directory_locks`` applied to diff output before
+    writing, mirroring the change-#1 ``scheduler._persist_files_metadata`` fix)
+    is unchanged and still pinned below.  What changed is WHICH entries are
+    directory-shaped.
 
-    Note the classification rule is per-segment-extension, NOT "dotfiles as a
-    class" — ``.gitignore`` IS file-shaped now (``gitignore`` is allowlisted).
-    The converse case (a leading-dot segment that stays directory-shaped, e.g.
-    ``.worktrees``) is pinned in the predicate suites themselves
-    (``test_leading_dot_directories_stay_directories`` in both
-    ``shared/tests/test_locking.py`` and
+    AMENDED by dark_factory #3248 — this test previously encoded the bug.  Its
+    fixture used ``fused-memory/docker/Dockerfile`` and ``hooks/pre-commit`` as
+    the entries that "must be stripped", and its own docstring explained why
+    that was wrong without drawing the conclusion: it argued that the only
+    directory-shaped output ``git diff --name-only`` can realistically produce
+    is an **extension-less tracked FILE**, because "git diff --name-only lists
+    *files*, never bare directories".  Both fixture entries were, by that same
+    reasoning, real ``git ls-files`` paths.  Asserting they be stripped was
+    therefore asserting that real tracked files be silently erased from
+    ``metadata.files`` on every reconcile — the exact data-loss defect #3248
+    fixes, not a property worth pinning.
+
+    Since #3248 those names are in ``EXTENSIONLESS_FILENAMES`` and classify as
+    files, so they now SURVIVE, and this test pins that.  A genuinely
+    directory-shaped entry is kept in the fixture so the strip is still proven
+    to function — it cannot arise from ``--name-only`` output, but the strip is
+    defensive and the coverage is worth keeping.
+
+    Note the classification rule is per-segment-extension (plus the enumerated
+    extension-less name list), NOT "dotfiles as a class" — ``.gitignore`` IS
+    file-shaped (``gitignore`` is allowlisted).  The converse case (a leading-dot
+    segment that stays directory-shaped, e.g. ``.worktrees``) is pinned in the
+    predicate suites themselves (``test_leading_dot_directories_stay_directories``
+    in both ``shared/tests/test_locking.py`` and
     ``fused-memory/tests/test_lock_charter_guard.py``) and deliberately is NOT
     re-asserted here, because such a path cannot appear in a merge diff.
-
-    ``is_file_path`` classifies extension-less entries as directory-shaped, so
-    they would cause the update_task lock-charter guard (changes #2/#3) to return
-    a LockCharterViolation — silently rejected (return value ignored at line
-    1343) — leaving stale plan.files and potentially tripping the phantom-done
-    gate.
-
-    The fix applies ``strip_directory_locks`` to the diff output before writing,
-    mirroring the change-#1 scheduler._persist_files_metadata fix.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(project_root=tmp_path)
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    # Mixed: both extension-less tracked files (Dockerfile, hooks/pre-commit) are
-    # directory-shaped to is_file_path; the .py files are file-level.
+    # Mixed: the two extension-less entries are real tracked FILES and must
+    # SURVIVE (#3248); 'crates/reify-eval/src' is a real directory and must be
+    # stripped; the .py files are ordinary file-level entries.
     get_merge_commit_diff_files.return_value = (
         [
             'fused-memory/docker/Dockerfile',
             'hooks/pre-commit',
+            'crates/reify-eval/src',
             'src/landed.py',
             'orchestrator/src/orchestrator/workflow.py',
         ],
@@ -363,10 +369,13 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     persisted = _persisted_payload(update_task)['files']
     # Only file-level entries must survive (order preserved).
     assert persisted == [
+        'fused-memory/docker/Dockerfile',
+        'hooks/pre-commit',
         'src/landed.py',
         'orchestrator/src/orchestrator/workflow.py',
     ], (
-        f'directory-shaped entries must be stripped; got {persisted!r}'
+        f'directory-shaped entries must be stripped and real tracked files '
+        f'must survive; got {persisted!r}'
     )
     # The persisted set passes the update_task lock-charter guard.
     assert directory_locks(persisted) == [], (

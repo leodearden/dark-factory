@@ -33,6 +33,7 @@ from shared.cli_invoke import (
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.locking import (
+    EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
@@ -97,6 +98,7 @@ __all__ = [
     'files_to_modules',
     'modules_conflict',
     'FILE_EXTENSIONS',
+    'EXTENSIONLESS_FILENAMES',
     'is_file_path',
     'directory_locks',
     'strip_directory_locks',
