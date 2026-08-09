@@ -233,6 +233,41 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
 _DF_REPO_ROOT = Path(__file__).parents[2]
 _REIFY_REPO_ROOT = Path(__file__).parents[5] / 'reify'
 
+# The bash third copy of the predicate.  Same resolution the γ suite uses.
+_REIFY_GUARD_SCRIPT = _REIFY_REPO_ROOT / 'scripts' / 'lock-charter-guard.sh'
+
+
+def _reify_guard_vector(flag: str) -> list[str]:
+    """Return the sorted vector emitted by the reify guard script's *flag*.
+
+    Verbatim counterpart of the γ suite's helper of the same name, duplicated
+    for the same reason the corpora are: the two suites are not linked by an
+    import, and each must be able to pin its own copy of the predicate against
+    bash on its own.
+
+    LOUD on failure.  The callers skipif on the script's ABSENCE — a standalone
+    checkout legitimately has no reify sibling — but a script that EXISTS and
+    then fails is real signal and is raised, never skipped.  Measured
+    2026-08-09: an unrecognised flag prints usage and exits 2, so a
+    skip-on-any-non-zero would retire the guard the moment reify renamed an
+    emitter, leaving it green forever while enforcing nothing.
+    """
+    result = subprocess.run(
+        ['bash', str(_REIFY_GUARD_SCRIPT), flag],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f'reify {_REIFY_GUARD_SCRIPT.name} {flag} exited {result.returncode}, '
+        f'expected 0 — the emitter this cross-source drift guard depends on is '
+        f'gone, renamed, or broken.  Check `bash {_REIFY_GUARD_SCRIPT} --help`.  '
+        f'Hard failure, not a skip: silently retiring a cross-source guard would '
+        f'let the three copies of the predicate diverge with every test green.\n'
+        f'  stdout: {result.stdout[:400]!r}\n'
+        f'  stderr: {result.stderr[:400]!r}'
+    )
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+
 
 def _tracked_file_paths(repo_root: Path) -> list[str] | None:
     """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout.
@@ -496,6 +531,42 @@ class TestExtensionlessFilenamesDriftGuard:
     def test_matches_canonical_vector(self):
         assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
 
+    @pytest.mark.skipif(
+        not _REIFY_GUARD_SCRIPT.is_file(),
+        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    )
+    def test_extensionless_drift_guard_vs_reify_script(self):
+        """Tier-2 (cross-source): this α copy must match reify --list-extensionless.
+
+        WHY THIS EXISTS ON THE α SIDE TOO, rather than being left to the γ
+        suite's identical test.  Tier-1 above compares this frozenset against
+        ``_CANONICAL_EXTENSIONLESS``, a literal in THIS file.  An edit that
+        changes both together — the natural way to "add a name" — therefore
+        passes every guard in the shared tree while silently diverging from the
+        γ copy and from bash.  The whole hole was that nothing in this package
+        could observe the other two copies.
+
+        With both suites pinned against the same bash emitter the α↔γ agreement
+        follows transitively: α == bash here and γ == bash there implies α == γ,
+        which is what lets the two Python copies stay verbatim duplicates
+        without a re-export linking them.  Neither Tier-2 alone gives that; both
+        together do, and that is the precise sense in which three-way agreement
+        is ENFORCED.
+
+        A present-but-failing script is a hard failure, not a skip — see
+        _reify_guard_vector.
+        """
+        script_names = _reify_guard_vector('--list-extensionless')
+        assert script_names == sorted(EXTENSIONLESS_FILENAMES), (
+            f'α/γ/bash drift detected on the extension-less vector!\n'
+            f'  reify --list-extensionless        : {script_names!r}\n'
+            f'  α EXTENSIONLESS_FILENAMES         : {sorted(EXTENSIONLESS_FILENAMES)!r}\n'
+            f'Update EXTENSIONLESS_FILENAMES here, in '
+            f'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+            f"and reify's own scripts/lock-charter-guard.sh _EXTLESS, plus "
+            f'_CANONICAL_EXTENSIONLESS in both test copies — all five places.'
+        )
+
     def test_is_frozenset(self):
         assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
 
@@ -745,4 +816,31 @@ class TestFileExtensionsDriftGuard:
             f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
             f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
             f'lock_charter_guard.py.'
+        )
+
+    @pytest.mark.skipif(
+        not _REIFY_GUARD_SCRIPT.is_file(),
+        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    )
+    def test_extension_drift_guard_vs_reify_script(self):
+        """Tier-2 (cross-source): this α copy must match reify --list-extensions.
+
+        The extension-half counterpart of
+        TestExtensionlessFilenamesDriftGuard::test_extensionless_drift_guard_vs_reify_script,
+        added for the same reason and closing the same structural hole: before
+        this, ONLY the γ suite invoked the bash emitter, so an α-only edit that
+        moved FILE_EXTENSIONS and the local _CANONICAL_EXTENSIONS together
+        passed everything in this package while diverging from the other two
+        copies.  That hole predates #3248 — the extension vector has been
+        α-unpinned against bash since the two Python copies were split — and is
+        fixed here rather than left as the one asymmetry between the suites.
+        """
+        script_exts = _reify_guard_vector('--list-extensions')
+        assert script_exts == sorted(FILE_EXTENSIONS), (
+            f'α/γ/bash drift detected on the extension vector!\n'
+            f'  reify --list-extensions : {script_exts!r}\n'
+            f'  α FILE_EXTENSIONS       : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS here, in lock_charter_guard.py, and in '
+            f"reify's scripts/lock-charter-guard.sh _EXTS, plus "
+            f'_CANONICAL_EXTENSIONS in both test copies.'
         )

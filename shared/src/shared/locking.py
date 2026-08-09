@@ -39,10 +39,21 @@ The extension-half Tier-2 drift guard
 (``test_extension_drift_guard_vs_reify_script``) compares
 ``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
 vector only, and is structurally blind to this frozenset.  That gap is closed
-by its extension-less sibling
-(``test_extensionless_drift_guard_vs_reify_script``), which pins this vector
-against ``--list-extensionless`` so three-way α/γ/bash agreement is ENFORCED
-rather than merely asserted in prose.
+by its extension-less sibling (``test_extensionless_drift_guard_vs_reify_script``),
+which pins this vector against ``--list-extensionless``.
+
+WHAT IS ACTUALLY ENFORCED, precisely — the Tier-1 guards compare each Python
+copy against a literal in its OWN test file, so they cannot see the other two
+copies; only the Tier-2 guards reach across a source boundary.  Both vectors
+are therefore pinned against the bash emitters from BOTH sides — α in
+``shared/tests/test_locking.py`` and γ in
+``fused-memory/tests/test_lock_charter_guard.py`` — and α↔γ agreement follows
+transitively (α == bash and γ == bash ⇒ α == γ).  That two-sided arrangement is
+what makes three-way α/γ/bash agreement ENFORCED rather than merely asserted in
+prose; a single-sided Tier-2 would NOT, because an edit changing one Python copy
+together with its own local literal would pass every guard in that package.
+The Tier-2 guards hard-fail (never skip) when the reify script is present but
+its emitter is gone, so the enforcement cannot silently retire itself.
 """
 
 from __future__ import annotations
