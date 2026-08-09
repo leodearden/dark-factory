@@ -29,11 +29,13 @@ from _capacity_skip import (
     REAL_CLI_NEAR_CAP_MESSAGES,
 )
 from _cross_account_evidence import (
+    PAIR_OVERRIDE_VAR,
     emit_run_evidence,
     format_r1_failure_evidence,
     format_run_evidence,
     select_token_pair,
 )
+from _oauth_accounts import ALL_TOKEN_LETTERS
 
 from shared.cli_invoke import AgentResult
 
@@ -592,8 +594,17 @@ def reload_integration_module(monkeypatch):
 
     Yields ``reload(**tokens)`` -> the reloaded module.  Every
     ``CLAUDE_OAUTH_TOKEN_*`` letter and the override var are cleared first, so
-    the machine's real ``.env`` (which has B..G all set) cannot leak in and make
-    these assertions environment-dependent.
+    the machine's real ``.env`` (which has A..G all set) cannot leak in and make
+    these assertions environment-dependent.  Neither the letter set nor the
+    override var name is restated here — they are imported from
+    ``_oauth_accounts`` and ``_cross_account_evidence`` respectively, so this
+    fixture cannot become the copy that drifts (task 3700).
+
+    ``test_oauth_accounts.py`` holds ``reload_module_under_env``, a strict
+    generalisation of this fixture over the module name.  The two coexist only
+    because pytest fixtures are module-scoped by visibility and the shared home
+    for one would be ``conftest.py``, outside task 3700's lock set; consolidating
+    there is filed as follow-up.
 
     Reloading mutates the module object other collected items may hold, so on
     teardown the real environment is restored (``monkeypatch.undo()`` first,
@@ -605,9 +616,9 @@ def reload_integration_module(monkeypatch):
     module = importlib.import_module('test_cli_invoke_integration')
 
     def _reload(**tokens: str):
-        for ch in 'ABCDEFG':
+        for ch in ALL_TOKEN_LETTERS:
             monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
-        monkeypatch.delenv('CROSS_ACCOUNT_RESUME_TOKENS', raising=False)
+        monkeypatch.delenv(PAIR_OVERRIDE_VAR, raising=False)
         for name, value in tokens.items():
             monkeypatch.setenv(name, value)
         return importlib.reload(module)

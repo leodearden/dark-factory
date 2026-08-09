@@ -120,12 +120,12 @@ import pytest
 from _capacity_skip import result_looks_like_capacity_failure
 from _cross_account_evidence import (
     PAIR_OVERRIDE_VAR,
-    available_tokens,
     emit_run_evidence,
     format_r1_failure_evidence,
     format_run_evidence,
     select_token_pair,
 )
+from _oauth_accounts import available_tokens
 
 from shared.cli_invoke import (
     invoke_claude_agent,
