@@ -142,12 +142,11 @@ Design decisions (captured in plan.json):
 - ``_COMPOUND_PREFIX`` admits ONE optional hyphenated modifier before the
   marker in the adjacency-anchored arms, so 'pairwise-stalled' anchors to
   its copula. The single-token bound ('\\w+' cannot cross whitespace)
-  bounds the gap's WIDTH only — NOT its lexical class, which an earlier
-  version of this bullet wrongly claimed. 'un-', 'non-', 'previously-',
-  'in-' are each one '\\w+-' token, so the unguarded prefix re-admitted
-  the negation / past-exit readings ('Task 5 is un-blocked' -> {5}) that
-  ``_ADVERB_ALT``'s closed-class discipline refuses for free on the bare
-  marker. What refuses them is a negative lookahead subtracting a closed
+  bounds the gap's WIDTH only — NOT its lexical class. 'un-', 'non-',
+  'previously-', 'in-' are each one '\\w+-' token, so the unguarded prefix
+  re-admitted the negation / past-exit readings ('Task 5 is un-blocked'
+  -> {5}) that ``_ADVERB_ALT``'s closed-class discipline refuses for free
+  on the bare marker. What refuses them is a negative lookahead subtracting a closed
   class of inverting prefixes, kept as a SUBTRACTION from an open-class
   prefix because the innocent modifier vocabulary ('pairwise-', 'merge-',
   'self-', 'auto-') is not closed. The privative 'in-' needs a second,
@@ -322,15 +321,10 @@ _GAP_NO_TASK_REF = r'(?!(?:task|df|\d)\w*\b)'
 # readings the mandatory-copula arms exist to exclude ('Tasks A and B are
 # awaiting a blocked merge' — the MERGE is blocked).
 #
-# CORRECTION (amendment, reviewer_comprehensive correctness-precision
-# finding, task 3079): an earlier version of this comment claimed the
-# single-token bound meant this "never becomes an open-class gap that would
-# re-admit the readings the mandatory-copula arms exist to exclude". That was
-# wrong, and the error mattered. Non-crossing-whitespace bounds the WIDTH of
-# the gap, not its LEXICAL CLASS — and 'un-', 'non-', 'not-', 'previously-'
-# are each a single '\w+-' token. So the unguarded form admitted exactly the
-# negation / past-exit readings _ADVERB_ALT's closed-class discipline refuses
-# for free on the bare marker:
+# That bound is on the gap's WIDTH, NOT on its lexical class: 'un-', 'non-',
+# 'not-', 'previously-' are each one '\w+-' token, so an unguarded prefix
+# re-admits the negation / past-exit readings _ADVERB_ALT's closed-class
+# discipline refuses for free on the bare marker:
 #
 #     'Task 5 is un-blocked.'                -> {5}
 #     'Task 5 is previously-blocked.'        -> {5}
@@ -630,67 +624,44 @@ _ENUM_IDS_ALT = r'\d++(?:' + _ENUM_SEP_ALT + r'\d++)+'
 # path narrows.
 _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 
-# (2) Preposition negative lookbehinds. Agreement alone is NOT sufficient:
+# (2) Preposition guard. Agreement alone is NOT sufficient:
 # when the outer head is itself PLURAL the plural copula agrees with THAT
 # head and the over-selection survives ('Dependencies for tasks A and B are
 # blocked', 'The merges of tasks A and B are blocked', 'Reviews of tasks A,
 # B, and C are pending' — all ordinary phrasings for this repo's memory
 # corpus, all verified still over-selecting under a copula-only fix). The
 # two remedies are complementary and ship together: agreement is a general
-# grammatical constraint with no vocabulary to maintain, and the lookbehind
-# covers the plural-outer-head residue agreement cannot see.
+# grammatical constraint with no vocabulary to maintain, and the preposition
+# check covers the plural-outer-head residue agreement cannot see.
 #
-# CORRECTION (amendment, reviewer_comprehensive correctness-precision
-# finding, task 3079): this guard was first written as a stack of fixed-width
-# negative LOOKBEHINDS anchored immediately before '\btasks\b'. Because a
-# lookbehind is pinned to a single offset, a single intervening DETERMINER
-# defeated every entry in the list at once — not merely "an unlisted
-# preposition", as the residual then claimed:
+# The check runs in PYTHON against the text preceding the match (see
+# extract_snapshot_edge_task_ids), and it scans the whole CLAUSE rather than a
+# fixed offset or a bounded slot: reject when a listed preposition appears
+# anywhere between the last clause break and the enumeration. Both properties
+# are load-bearing, because the gap between the preposition and the list noun
+# is an OPEN class — determiners, quantifiers, bare adjectives, possessives,
+# participles, and stacks of them — that neither a fixed offset nor any bound
+# can cover. Each of these over-selects under a narrower spelling (a
+# fixed-width lookbehind pinned before '\btasks\b'; a closed determiner slot;
+# the review's suggested bound of two arbitrary words), and every outer head
+# here is plural, so agreement does not save them either:
 #
-#     'Statuses of the tasks 1020 and 1030 are blocked.'  -> {1020, 1030}
-#     'Reviews for the tasks 1020 and 1030 are pending.'  -> {1020, 1030}
-#     'Notes about the tasks 1020 and 1030 are pending.'  -> {1020, 1030}
+#     'Statuses of the tasks 1020 and 1030 are blocked.'         (1 word)
+#     "Reviews of Leo's tasks 1020 and 1030 are pending."        (1 word)
+#     'Notes about a few tasks 1020 and 1030 are pending.'       (2 words)
+#     'Statuses of quite a few tasks 1020 and 1030 are pending.' (3 words)
 #
-# Those are the very prepositional-complement over-selections this guard
-# exists to close, reachable by inserting one extremely common word. Plural
-# agreement does not save them: the outer heads ('Statuses', 'Reviews',
-# 'Notes') are plural, which is exactly the residue the guard covers.
-#
-# So the check now lives in PYTHON, applied to the text preceding the match
-# (see extract_snapshot_edge_task_ids). Being freed from the fixed-width
-# constraint buys the arbitrary gap between the preposition and the list noun,
-# the multi-space/newline run the lookbehind form also mishandled, and the
-# disappearance of the hand-computed per-width alternations, so the vocabulary
-# is now one flat list.
-#
-# SECOND CORRECTION (amendment, reviewer_comprehensive correctness-precision
-# finding, task 3079): that freedom was FIRST spent on a hard-coded six-word
-# determiner slot — '\s+(?:the|these|those|all|our|its)?\s*$'. The slot was a
-# second, undocumented CLOSED vocabulary and it failed exactly the way the
-# lookbehind had, one word over: any intervening word outside those six
-# defeated every preposition in the list at once.
-#
-#     'Statuses of some tasks 1020 and 1030 are pending.'        -> {1020, 1030}
-#     'Notes about a few tasks 1020 and 1030 are pending.'       -> {1020, 1030}
-#     "Reviews of Leo's tasks 1020 and 1030 are pending."        -> {1020, 1030}
-#     'Blockers for downstream tasks 1020 and 1030 are pending.' -> {1020, 1030}
-#
-# The gap is an OPEN class — quantifiers, bare adjectives, possessives,
-# determiner stacks, participles — so no word list can close it. The review
-# suggested bounding the slot instead (up to two arbitrary words). That is the
-# same liability with a number substituted for a list: 'Statuses of quite a few
-# tasks 1020 and 1030 are pending' is three words and would over-select again.
-# So the gap is left UNBOUNDED and the guard is scoped by CLAUSE: reject when a
-# listed preposition appears anywhere between the last strong punctuation break
-# and the enumeration. Every case the two forms disagree on is one the clause
-# form REJECTS and the bounded form admits — the divergence is entirely in the
-# fail-safe under-selection direction, and it closes the intervening-word class
-# outright rather than moving its boundary.
+# Clause scoping closes that class outright rather than moving its boundary,
+# and it is the safe direction to err in: every case where it disagrees with a
+# bounded form is one the clause form REJECTS. Its own cost is the converse
+# residual below.
 #
 # '\b'-anchoring is retained, which is what keeps 'Migration tasks' /
 # 'Verification tasks' matching — the 'on' inside 'Migration' is not
-# '\b'-preceded. Matching is against a prefix slice ending at the match start,
-# so cost is bounded by the prefix scan the regex engine already does.
+# '\b'-preceded. Matching runs over the fact's prefix from the last clause
+# break onward, located by a reverse character scan rather than by splitting
+# the prefix into clauses (see _enumeration_is_prepositional_complement), so
+# cost is one bounded scan of text the regex engine has already walked.
 #
 # ONE residual now, and it points the WRONG way: the preposition vocabulary is
 # still a closed list, so an UNLISTED preposition does not cause a miss — the
@@ -811,20 +782,18 @@ def _enumeration_is_prepositional_complement(prefix: str) -> bool:
 #     copula is mandatory, using _STATUS_MARKER_ALT whole — including the
 #     transitive-capable markers — is safe here.
 # (b) The enumeration must be the copula's SUBJECT, established jointly by
-#     plural agreement (_PLURAL_COPULA_ALT) and the absence of a preceding
-#     preposition (_ENUM_PREP_PREFIX_RE, applied in
-#     extract_snapshot_edge_task_ids). CORRECTION (amendment,
-#     reviewer_comprehensive correctness-precision finding, task 3079):
-#     this property used to be stated as "the marker sits immediately after
-#     the enumeration and its copula", as though adjacency established the
-#     reading. It does not, and that was exactly the defect — in 'The merge
-#     of tasks 1020 and 1030 is blocked' the marker IS adjacent to the
-#     copula, but the copula's subject is the outer head noun and the MERGE
-#     is what is blocked. Adjacency is the separate, weaker property (c).
-#     Both remedies are needed: agreement alone still admits a plural outer
-#     head ('Dependencies for tasks A and B are blocked'), and the
-#     preposition check alone is a closed word list. See _PLURAL_COPULA_ALT
-#     and _ENUM_PREP_PREFIX_RE for the full argument and the residual.
+#     plural agreement (_PLURAL_COPULA_ALT) and the absence of a governing
+#     preposition (_ENUM_PREP_WORDS, applied by
+#     _enumeration_is_prepositional_complement inside
+#     extract_snapshot_edge_task_ids). Adjacency does NOT establish this
+#     reading — in 'The merge of tasks 1020 and 1030 is blocked' the marker
+#     IS adjacent to the copula, but the copula's subject is the outer head
+#     noun and the MERGE is what is blocked. Adjacency is the separate,
+#     weaker property (c). Both remedies are needed: agreement alone still
+#     admits a plural outer head ('Dependencies for tasks A and B are
+#     blocked'), and the preposition check alone is a closed word list. See
+#     _PLURAL_COPULA_ALT and _ENUM_PREP_WORDS for the full argument and the
+#     residuals.
 # (c) The marker must sit immediately after the enumeration and its copula,
 #     with only closed-class function words (adverb, 'all', article) in
 #     between, so 'Tasks 1020 and 1030 were merged into the active branch'

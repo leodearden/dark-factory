@@ -869,10 +869,11 @@ class TestExtractSnapshotEdgeTaskIds:
     #: vocabulary: the test parametrizes over ``_ENUM_PREP_WORDS`` directly,
     #: so a preposition added to the guard without a case here fails as its
     #: own parametrized case instead of shipping unexercised. (Earlier this
-    #: sync was enforced by scraping ``_ENUM_PREP_PREFIX_RE.pattern`` with a
-    #: second regex — an introspection meta-test on a private constant's
-    #: spelling, deleted in favour of inverting the dependency. amendment,
-    #: reviewer_comprehensive test-quality finding, task 3079)
+    #: sync was enforced by scraping the then-lookbehind guard constant's
+    #: ``.pattern`` with a second regex — an introspection meta-test on a
+    #: private constant's spelling, deleted in favour of inverting the
+    #: dependency. amendment, reviewer_comprehensive test-quality finding,
+    #: task 3079)
     _PREPOSITION_GUARD_FACTS = {
         'of': 'Statuses of tasks 1020 and 1030 are blocked.',
         'in': 'Delays in tasks 1020 and 1030 are blocked.',
@@ -902,7 +903,7 @@ class TestExtractSnapshotEdgeTaskIds:
     def test_every_guarded_preposition_is_exercised_against_a_plural_head(
         self, preposition
     ):
-        """Each entry in ``_ENUM_PREP_PREFIX_RE`` is load-bearing. (task 3079)
+        """Each entry in ``_ENUM_PREP_WORDS`` is load-bearing. (task 3079)
 
         The guard list could previously have SILENTLY LOST entries: most of
         its prepositions appeared only in singular-copula facts ('Work on
