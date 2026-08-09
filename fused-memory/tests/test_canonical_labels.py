@@ -14,6 +14,8 @@ leaf-module shape and pytest conventions this module copies.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from fused_memory.utils.canonical_labels import (
@@ -77,12 +79,12 @@ class TestReferentIsFrozen:
 
     def test_project_id_is_immutable(self):
         referent = Referent(number='132')
-        with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError subclasses AttributeError
+        with pytest.raises(dataclasses.FrozenInstanceError):
             referent.project_id = 'other'  # type: ignore[misc]
 
     def test_number_is_immutable(self):
         referent = Referent(number='132')
-        with pytest.raises(Exception):  # noqa: B017
+        with pytest.raises(dataclasses.FrozenInstanceError):
             referent.number = '999'  # type: ignore[misc]
 
 
@@ -194,17 +196,43 @@ class TestParseNodeNameNonMatches:
 
 class TestLabelScanIsFrozen:
     """LabelScan is frozen for the same reason Referent is: it is evidence for
-    destructive graph surgery, not a mutable accumulator."""
+    destructive graph surgery, not a mutable accumulator.
 
-    def test_both_lists_default_empty(self):
-        scan = LabelScan()
-        assert scan.refs == []
-        assert scan.ambiguous == []
+    ``frozen=True`` alone does NOT deliver that: it blocks attribute rebinding
+    only, so list-typed fields would stay freely mutable in place. The fields
+    are tuples, and these tests pin BOTH halves — no rebinding and no in-place
+    mutation — so the class docstring's claim is actually enforced.
+    """
 
-    def test_refs_is_immutable(self):
+    def test_both_fields_default_empty(self):
         scan = LabelScan()
-        with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError subclasses AttributeError
-            scan.refs = []  # type: ignore[misc]
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_refs_cannot_be_rebound(self):
+        scan = LabelScan()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.refs = ()  # type: ignore[misc]
+
+    @pytest.mark.parametrize('attr', ['refs', 'ambiguous'])
+    def test_fields_cannot_be_mutated_in_place(self, attr):
+        """The half ``frozen=True`` does not cover. With list fields
+        ``scan.refs.append(...)`` silently succeeded, letting a consumer add a
+        referent the scanner deliberately refused to infer."""
+        scan = scan_content(
+            'dark_factory:2500 blocks task 2500; also see dark_factory:99', group_id='reify'
+        )
+        assert getattr(scan, attr)  # both fields are populated, so this is a real test
+        with pytest.raises(AttributeError):
+            getattr(scan, attr).append(Referent(number='9'))
+
+    def test_a_scan_is_hashable(self):
+        """A frozen dataclass holding lists is silently unhashable despite its
+        generated __hash__ — a trap for any consumer that sets/dict-keys a
+        scan. Tuple fields make the generated __hash__ actually work."""
+        assert hash(LabelScan()) == hash(LabelScan())
+        scan = scan_content('see dark_factory:2500', group_id='reify')
+        assert len({scan, scan_content('see dark_factory:2500', group_id='reify')}) == 1
 
 
 class TestScanContentFindsOwnProjectReferents:
@@ -307,8 +335,8 @@ class TestScanContentPrecision:
     )
     def test_noise_yields_no_referents(self, content):
         scan = scan_content(content, group_id='reify')
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
     @pytest.mark.parametrize(
         'content',
@@ -330,6 +358,48 @@ class TestScanContentPrecision:
         scanner sits on a write path."""
         scan = scan_content('see dark_factory:2500', group_id='-home-leo-src-reify')
         assert scan == LabelScan()
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            # A markdown heading after a paragraph break is not a task mention.
+            'Completed the task\n\n# 1153 retrospective',
+            'Completed the task\n# 1153 retrospective',
+            # A numbered-list item after a 'tasks:' lead-in is not task 1.
+            'The following tasks:\n\n1. fix the parser',
+            'The following tasks:\n1. fix the parser',
+        ],
+    )
+    def test_the_hash_and_colon_separators_never_span_a_line_break(self, content):
+        """The '#'/':' separator branch is padded with '[ \\t]', not '\\s'.
+
+        '\\s' matches '\\n', so the branch task 3667 added would otherwise read a
+        markdown heading or a numbered-list item across a paragraph break as a
+        bare task mention. Neither spelling could match before 3667 (the
+        pre-existing mention pattern was 'tasks?\\s+(\\d+)', which cannot see a
+        '#'), so this is a phantom the extraction introduced, not a narrowing of
+        prior behaviour.
+        """
+        assert scan_content(content, group_id='reify').refs == ()
+
+    def test_a_phantom_heading_mention_cannot_suppress_a_real_foreign_ref(self):
+        """The live consequence, and why this is a correctness fix and not
+        cosmetics: a phantom bare mention lands in bare_numbers and contests the
+        matching foreign ref, moving a genuine cross-project repair into
+        .ambiguous where the consumer refuses to act on it."""
+        scan = scan_content(
+            'dark_factory:1153 owns it\n\nthe task\n\n# 1153 notes', group_id='reify'
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:1153']
+        assert scan.ambiguous == ()
+
+    def test_the_hash_separator_still_matches_on_one_line(self):
+        """Guard against over-tightening: the '#' form is the headline signal of
+        task 3667 and must keep matching with any same-line padding."""
+        for content in ('task #1153 here', 'task#1153 here', 'TASK # 1153 here', 'task\t#\t1153'):
+            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+                'Task 1153'
+            ], content
 
 
 class TestScanContentOrderingAndDedup:
@@ -427,7 +497,7 @@ class TestShapeValidProseMatchesByDesign:
 
     def test_allowlist_removes_the_prose_match(self):
         scan = scan_content('Total: 42 items', group_id='reify', known_project_ids={'dark_factory'})
-        assert scan.refs == []
+        assert scan.refs == ()
 
 
 class TestScanContentAmbiguityPartition:
@@ -450,7 +520,7 @@ class TestScanContentAmbiguityPartition:
 
     def test_same_number_local_and_foreign_is_ambiguous(self):
         scan = scan_content('dark_factory:2500 blocks task 2500 here', group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
     @pytest.mark.parametrize(
@@ -468,7 +538,7 @@ class TestScanContentAmbiguityPartition:
     )
     def test_every_bare_spelling_triggers_ambiguity(self, bare_form):
         scan = scan_content(f'dark_factory:2500 relates to {bare_form}', group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
     def test_ambiguity_is_per_number_not_per_content(self):
@@ -483,7 +553,7 @@ class TestScanContentAmbiguityPartition:
         int-normalized, so the two numbers never contest each other."""
         scan = scan_content('dark_factory:0250 relates to task 250', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['dark_factory:0250', 'Task 250']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     @pytest.mark.parametrize(
         'lookalike',
@@ -495,7 +565,7 @@ class TestScanContentAmbiguityPartition:
         mention pattern's lookbehind."""
         scan = scan_content(f'dark_factory:2500 relates to {lookalike}', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_bare_mention_of_a_different_number_does_not_suppress_the_ref(self):
         """The incident content that motivated the split hook: the bare mention
@@ -503,7 +573,7 @@ class TestScanContentAmbiguityPartition:
         content = 'Reify task 5181 was cancelled; its work was rerouted to dark_factory:2500.'
         scan = scan_content(content, group_id='reify')
         assert [r.node_name for r in scan.refs] == ['Task 5181', 'dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_self_qualified_plus_bare_mention_is_not_ambiguous(self):
         """Both spellings denote the SAME own-project referent, so the
@@ -512,12 +582,12 @@ class TestScanContentAmbiguityPartition:
         bare mention has no FOREIGN referent of the same number to contest."""
         scan = scan_content('reify:5181 and task 5181', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['Task 5181']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_ambiguous_referents_are_deduplicated_too(self):
         content = 'dark_factory:2500 blocks task 2500; dark_factory:2500 again'
         scan = scan_content(content, group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
 
@@ -546,17 +616,17 @@ class TestSelfQualifiedRefsNeverContestForeignRefs:
     def test_self_qualified_ref_does_not_contest_a_foreign_ref(self):
         scan = scan_content('reify:2500 relates to dark_factory:2500', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_the_rule_is_order_independent(self):
         scan = scan_content('dark_factory:2500 relates to reify:2500', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500', 'Task 2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_unrelated_self_qualified_refs_also_survive(self):
         scan = scan_content('reify:2500 and dark_factory:2500 and reify:99', group_id='reify')
         assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500', 'Task 99']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_self_qualification_is_recognised_after_canonicalization(self):
         """Both sides are canonicalized before the local comparison, so a
@@ -564,7 +634,7 @@ class TestSelfQualifiedRefsNeverContestForeignRefs:
         still never contests."""
         scan = scan_content('Reify-Factory:2500 and dark_factory:2500', group_id='reify_factory')
         assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_a_bare_mention_still_contests_even_when_self_qualified_wins_dedup(self):
         """The guard against over-correcting: bare-ness is STICKY per number.
@@ -576,7 +646,7 @@ class TestSelfQualifiedRefsNeverContestForeignRefs:
         """
         content = 'reify:2500 and task 2500 and dark_factory:2500'
         scan = scan_content(content, group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['Task 2500', 'dark_factory:2500']
 
 

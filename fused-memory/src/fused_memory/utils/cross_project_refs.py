@@ -57,7 +57,7 @@ any future reconciliation sweep without import cycles.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 from fused_memory.utils.canonical_labels import Referent, scan_content
@@ -110,7 +110,7 @@ class CrossProjectRefScan:
     ambiguous: list[CrossProjectRef] = field(default_factory=list)
 
 
-def _foreign_refs(referents: list[Referent]) -> list[CrossProjectRef]:
+def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
     """Map FOREIGN referents to CrossProjectRefs, preserving order.
 
     The ``if r.project_id`` filter is what makes this module's output mean

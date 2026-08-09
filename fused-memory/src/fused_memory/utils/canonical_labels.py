@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -40,6 +40,13 @@ from fused_memory.utils.validation import (
 #: and is NOT added speculatively. Extending the vocabulary means adding an
 #: entry here, which is the whole point of routing every caller through one
 #: module.
+#:
+#: NOTE for a reader hunting the caller that emits a non-'task' kind: there
+#: isn't one. Both public entry points hardcode ``kind='task'``, and both
+#: compiled patterns hardcode the literal word 'task', so ``__post_init__``'s
+#: rejection is reachable only from a direct ``Referent(kind=...)`` call.
+#: Adding 'escalation' will need new patterns and new parse/scan branches too —
+#: this registry is where the LABEL lives, not a one-line extension point.
 _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 
 # ANCHORED (whole-string) task-node name: a bare 'task(s) N', optionally padded
@@ -54,7 +61,14 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # '^\s*tasks?\s+(\d+)\s*$' — now match, while 'task132' still does NOT. The
 # obvious spelling 'tasks?\s*#?\s*(\d+)' would have matched 'task132' too,
 # silently widening what _normalize_task_node_names renames.
-_TASK_NODE_NAME_PATTERN = re.compile(r'^\s*tasks?(?:\s*[#:]\s*|\s+)(\d+)\s*$', re.IGNORECASE)
+#
+# The '#'/':' branch is padded with '[ \t]', NOT '\s', so it cannot span a line
+# break. '\s' matches '\n', which would let 'task\n#132' parse as a task label —
+# a widening this task never intended and never measured (see
+# _LOCAL_MENTION_PATTERN, where the same widening had a live consequence). The
+# whitespace branch keeps '\s+' VERBATIM from the ancestor pattern: narrowing it
+# would be an equally undeclared change in the opposite direction.
+_TASK_NODE_NAME_PATTERN = re.compile(r'^\s*tasks?(?:[ \t]*[#:][ \t]*|\s+)(\d+)\s*$', re.IGNORECASE)
 
 # The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
 # name, '<project_id>:<task_number>'. Shares that pattern's letter-start and
@@ -89,8 +103,24 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   real foreign ref.
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
 #   captured.
+# - The '#'/':' branch is padded with '[ \t]', NOT '\s', so a mention can never
+#   span a line break. This is measured, not stylistic: '\s' matches '\n', so
+#   '\s*[#:]\s*' read a markdown heading across a paragraph break as a mention —
+#   'Completed the task\n\n# 1153 retrospective' yielded a bare Task 1153, and
+#   'The following tasks:\n\n1. fix the parser' yielded a bare Task 1. A phantom
+#   bare mention lands in bare_numbers and pushes a genuine foreign ref into
+#   .ambiguous, silently suppressing a real cross-project repair. Neither
+#   spelling was reachable before task 3667 added this branch, so trimming it
+#   restores the pre-3667 answer rather than inventing a new narrowing.
+# - The whitespace branch deliberately keeps '\s+' VERBATIM from the pre-3667
+#   _BARE_TASK_MENTION_PATTERN, newline-spanning and all. Tightening it to
+#   '[ \t]+' would be an UNDECLARED narrowing of behaviour this task never
+#   touched, and it narrows in the dangerous direction: fewer bare mentions
+#   means fewer contests, which means MORE confident splits on prose that
+#   pre-3667 refused. A false positive here only ever adds ambiguity, which the
+#   consumer refuses; a false negative lets destructive surgery proceed.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])tasks?(?:\s*[#:]\s*|\s+)(\d+)(?!\d)', re.IGNORECASE
+    r'(?<![\w:-])tasks?(?:[ \t]*[#:][ \t]*|\s+)(\d+)(?!\d)', re.IGNORECASE
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
@@ -182,7 +212,7 @@ def parse_node_name(name: str) -> Referent | None:
 
     Digits are preserved VERBATIM, never int-normalized, so a referent never
     invents or reformats a task number ('task 0132' -> ``Task 0132``, and
-    ``Referent('0132') != Referent('132')``).
+    ``Referent(number='0132') != Referent(number='132')``).
 
     Returns None for a path-shaped qualifier rather than canonicalizing it: a
     mangled path must never be silently mapped into a new, wrong project key
@@ -221,11 +251,18 @@ class LabelScan:
 
     Frozen for the same reason :class:`Referent` is: a scan is evidence for
     destructive graph surgery, not a mutable accumulator.
+
+    The two fields are TUPLES rather than lists, which is what makes that claim
+    true. ``frozen=True`` only blocks attribute REBINDING, so list fields would
+    leave ``scan.refs.append(...)`` wide open — a consumer could quietly add a
+    referent the scanner refused to infer and the frozen-ness would not notice.
+    Tuples also make the scan hashable, which a frozen dataclass holding lists
+    silently is not.
     """
 
     #: Referents safe to act on, in first-seen positional order,
     #: de-duplicated on (kind, project_id, number).
-    refs: list[Referent] = field(default_factory=list)
+    refs: tuple[Referent, ...] = ()
     #: Referents whose number is claimed by BOTH a BARE, unqualified
     #: own-project mention ('task 2500') and a foreign-qualified reference in
     #: the same content. Such content is genuinely ambiguous about which task
@@ -233,7 +270,7 @@ class LabelScan:
     #: loudly rather than guess. An explicitly qualified reference — including
     #: a SELF-qualified one — already names its project and so never creates
     #: ambiguity; see :func:`scan_content`.
-    ambiguous: list[Referent] = field(default_factory=list)
+    ambiguous: tuple[Referent, ...] = ()
 
 
 def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset[str] | None:
@@ -389,7 +426,16 @@ def scan_content(
     # It is per-NUMBER, not per-content, so one contested number never
     # suppresses an unrelated clean ref elsewhere in the same body.
     #
-    # bare_numbers is computed over the PRE-dedup `found` list, NOT over
+    # The contest is keyed on (kind, number) — the same tuple dedup uses, minus
+    # project_id, which is exactly the axis being contested. Keying on the bare
+    # number alone happens to agree today only because _KIND_LABELS holds one
+    # entry; the moment 'escalation' joins the registry, a bare 'escalation
+    # 2500' mention would contest an unrelated foreign TASK ref
+    # 'dark_factory:2500' and suppress a real repair. That failure could not be
+    # caught by any test, since no test can construct a second kind, so the
+    # guard has to be structural.
+    #
+    # bare_keys is computed over the PRE-dedup `found` list, NOT over
     # `deduped`, because bare-ness must be STICKY per number. Dedup is
     # first-seen-wins on (kind, project_id, number), so in
     # 'reify:2500 and task 2500 and dark_factory:2500' the self-qualified
@@ -398,13 +444,13 @@ def scan_content(
     # lose a genuine contest the content does contain. (Dedup still collapses
     # 'reify:5181 and task 5181' to one own-project referent; that pair simply
     # has no foreign side to contest.)
-    bare_numbers = {r.number for _offset, r, arrived_bare in found if arrived_bare}
-    foreign_numbers = {r.number for r in deduped if r.project_id}
-    contested = bare_numbers & foreign_numbers
+    bare_keys = {(r.kind, r.number) for _offset, r, arrived_bare in found if arrived_bare}
+    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id}
+    contested = bare_keys & foreign_keys
 
     # Digits are compared as literals, never int-normalized, so '0250' and
     # '250' are different numbers and create no false contest.
     return LabelScan(
-        refs=[r for r in deduped if r.number not in contested],
-        ambiguous=[r for r in deduped if r.number in contested],
+        refs=tuple(r for r in deduped if (r.kind, r.number) not in contested),
+        ambiguous=tuple(r for r in deduped if (r.kind, r.number) in contested),
     )
