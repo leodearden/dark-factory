@@ -30,6 +30,7 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_indices import resolve_header_positions
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -3014,6 +3015,43 @@ class GraphitiBackend:
 
         Each record is a dict with keys: label, field, type, entity_type.
 
+        Columns are resolved BY NAME from ``result.header``, not positionally.
+        The measured live header (2026-08-06, task 3706) is 9 two-tuples::
+
+            [label, properties, types, options, language, stopwords,
+             entitytype, status, info]
+
+        This method previously bound ``entity_type`` to ``row[3]`` — the
+        ``options`` column, an ``OrderedDict`` like ``{'uuid': {}}`` — instead of
+        ``entitytype`` (``row[6]``, the string ``'NODE'``/``'RELATIONSHIP'``).
+        The fix is by-name resolution rather than a corrected index: switching to
+        ``row[6]`` would repair today's symptom while leaving the same silent
+        degradation armed for the next FalkorDB column reorder.
+
+        The resolution is delegated to
+        ``fused_memory.backends.falkor_indices.resolve_header_positions`` rather
+        than hand-rolled here, so the next reader of ``CALL db.indexes()``
+        (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
+        implementation instead of re-forking the build-names / check-missing /
+        ``.index()`` sequence — re-forking is how the positional read survived.
+        ``tests/_fm_helpers.await_index_operational`` still carries its own copy
+        (it resolves ``status`` by name for exactly this reason); collapsing that
+        third copy onto this helper is filed as a follow-up, as ``_fm_helpers``
+        is outside task 3706's locked scope.
+
+        A missing required column — or a header entry that is not a
+        ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
+        subclass, preserving this method's historical contract) rather than
+        returning a record with a silently-wrong or absent value.
+
+        Note the returned ``type`` value is the ``types`` COLUMN — a dict of
+        property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
+        NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
+        models that shape.  (``drop_vector_indices`` still compares that dict
+        against the string ``'VECTOR'`` and is therefore a latent no-op; that is
+        pre-existing, deliberately out of scope for task 3706, and filed as a
+        separate follow-up.)
+
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
         read-only path in this file — all other ``ro_query`` callers use plain
@@ -3033,14 +3071,24 @@ class GraphitiBackend:
         # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
         # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
+
+        # Resolve columns by name, so a FalkorDB column reorder fails loudly
+        # here instead of silently reading the wrong column (see the docstring).
+        # The resolution itself lives in falkor_indices so this is not a second
+        # hand-rolled copy of it -- see resolve_header_positions.
+        positions = resolve_header_positions(
+            result.header,
+            {
+                'label': 'label',
+                'field': 'properties',
+                'type': 'types',
+                'entity_type': 'entitytype',
+            },
+        )
+
         indices = []
         for row in (result.result_set or []):
-            indices.append({
-                'label': row[0],
-                'field': row[1],
-                'type': row[2],
-                'entity_type': row[3],
-            })
+            indices.append({key: row[idx] for key, idx in positions.items()})
         return indices
 
     @_canonicalize_group_args

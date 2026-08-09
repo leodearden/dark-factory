@@ -244,6 +244,14 @@ class TestBackendListIndicesLive:
             assert len(records) >= 1
             for rec in records:
                 assert set(rec.keys()) >= {'label', 'field', 'type', 'entity_type'}
+                # Assert the VALUE, not just the key (task 3706). Key-presence
+                # alone is why the pre-3706 mis-binding survived: entity_type was
+                # bound to the `options` column and returned an OrderedDict like
+                # {'uuid': {}}, which passes a presence check and fails this one.
+                assert rec['entity_type'] in {'NODE', 'RELATIONSHIP'}, (
+                    f'entity_type={rec["entity_type"]!r} is not a FalkorDB entity '
+                    'type — list_indices() is reading the wrong column again'
+                )
             # At least one record should be the Entity.name index we created in the fixture.
             # Note: FalkorDB returns field names as a list (e.g. ['name']), not a bare string.
             entity_records = [r for r in records if r['label'] == 'Entity']
