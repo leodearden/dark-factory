@@ -20,6 +20,19 @@ called unconditionally every cycle from ``TaskKnowledgeSync.run()`` via the shar
 age-GCs at 14 days, for every project, not just ``dark_factory`` (the only project
 this script's own systemd timer targets by default); see
 ``_sweep_stale_mem0_flag_markers``'s own docstring for the gap it documents closing.
+
+That "only enumeration filter is ``source``" claim is true of
+``_sweep_stale_mem0_flag_markers`` but materially incomplete as a description of
+the in-cycle drain as a whole (task 3897). Task 2966 shipped a SECOND in-cycle
+collector, ``_sweep_stale_mem0_flag_for_stage2_markers``, which enumerates on
+``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``), age-GCs at the
+same 14 days, and is likewise wired unconditionally per-project every cycle
+(``task_knowledge_sync.py:3038``, recording
+``report.stats['stale_mem0_flag_for_stage2_markers_gc_swept']``). THAT collector —
+not this script — is what drains the live Stage-1 -> Stage-2 relay pool. The
+distinction matters because the two collectors address disjoint populations, and
+this script can only see the first one (see "Enumeration strategy" below).
+
 The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
 ``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
 no longer *uncollected* dead weight. This script is therefore a manual adjunct to
@@ -41,6 +54,17 @@ exit-code-driven tool usable as a ``task_kind='deterministic'`` ``before_done.sc
 
 Original background (task-1659/2108)
 -------------------------------------
+MEASURED-ZERO, RETAINED (task 3897, work item (c)). Both predicates below —
+:func:`find_orphan_markers` (missing ``kind``) and :func:`find_taskless_markers`
+(missing ``task_id``) — operate on a population that counts 0 in both projects
+probed. They are deliberately KEPT rather than retired: they remain this
+script's actual delete-set contract, they stay reachable through the
+``--delete-ids`` targeted-correction path, they are the only collector for the
+legacy pool of any project not yet probed, and the blind-spot cross-check is
+DEFINED as the comparison between this ``source`` enumeration and the adjacent
+population — retiring the source side would leave nothing to compare against
+and would delete the very signal that makes the defect observable.
+
 Prior to task-1659, ``flag_dedup._write_and_confirm_marker`` wrote markers with
 ``metadata.source='stage1_flag_marker'`` but omitted ``metadata.kind``.  Dual-filter
 queries keyed on *both* source and kind silently under-count those markers.  At the
@@ -97,6 +121,60 @@ Markers are enumerated via ``get_memories_by_metadata(filters={'source':MARKER_S
 which performs a deterministic Qdrant payload-filter scroll — NOT semantic search.
 Semantic top-N silently drops low-similarity markers (the documented failure mode in
 ``_query_stage2_flags``), making it unsuitable for exhaustive enumeration.
+
+READ THE ``cross_check`` BLOCK, NOT JUST ``orphan_count`` (task 3897). Measured
+live on 2026-08-09 via ``count_memories_by_metadata``:
+
+===========================================  ============  =======
+filter                                        dark_factory  reify
+===========================================  ============  =======
+``{'source': 'stage1_flag_marker'}``                     0        0
+``{'kind':   'stage1_flag_marker'}``                     0        —
+``{'flag_for_stage2': True}``                           61       80
+``{'flag_for_stage2': 'true'}`` (str drift)              0        —
+===========================================  ============  =======
+
+So this script's enumeration is STRUCTURALLY EMPTY today: it scrolls a filter that
+matches nothing, in both projects probed. Two consequences an operator must not
+misread:
+
+1. ``before.total_source`` is always 0, so ``backlog_verdict(0, N)`` holds
+   unconditionally and forever — a ``--check`` gate wired on it structurally
+   cannot fail.
+2. The nightly timer prints ``orphan_count: 0`` every night. That is not a clean
+   bill of health; it is a count taken against a pool this filter cannot see.
+
+:func:`run` therefore issues a count-only census probe on
+``FLAG_FOR_STAGE2_FILTERS`` and emits a ``cross_check`` report block plus a
+WARNING when :func:`enumeration_blind_spot` fires. Use ``--fail-on-blind-spot``
+to escalate that divergence to a non-zero ``--check`` exit code.
+
+Why the flag_for_stage2 pool is censused, never deleted here
+-------------------------------------------------------------
+The cross-check counts the adjacent pool and stops there. It never enumerates it,
+never runs a predicate over it, and never adds it to the delete set — enforced by
+``TestFlagForStage2IsNeverDeleted``. Three reasons, two of them measured:
+
+1. 23 of the 61 live records carry NO usable ``task_id``, so
+   :func:`find_taskless_markers` would delete all 23 on the very next nightly
+   ``--apply`` run. They are LIVE Stage-1 -> Stage-2 relay markers, not dead
+   weight, and the nightly timer's ``--terminal-drain`` would additionally reap
+   markers citing already-done tasks.
+2. :func:`delete_orphan_markers` has NEITHER the ``is_protected_mirror_record``
+   guard NOR the ``record_mem0_deletion_tombstones`` write that the shared
+   in-cycle ``_sweep_stale_mem0_pool`` applies. ``flag_for_stage2`` is an
+   LLM-supplied key any writer can stamp on any record — ``mem0_tombstone.py``'s
+   module docstring names this exact filter as its motivating over-breadth case.
+   (Measured: 0 cycle_summary/ledger_stamp records in the pool today, so the risk
+   is latent rather than active — but this script is the wrong place to take it.)
+3. The pool is already drained correctly, on a rolling 14-day window, by
+   ``_sweep_stale_mem0_flag_for_stage2_markers`` (task 2966). Adding a second
+   collector here would race a correct one, producing duplicate deletes and
+   duplicate tombstones for the same records.
+
+Whether the 61 should ultimately be deleted is a separate question, to be
+adjudicated now that the sweep can see them. Making them visible is this
+script's job; deleting them is not.
 
 Usage
 -----
