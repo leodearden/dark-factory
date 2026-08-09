@@ -25,6 +25,10 @@ Design properties (see plans/agent-transcript-archival-prd.md, task α):
   machine-readable substrate for a future health/digest consumer. The function
   is total so the producer can call it inside ``_invoke``'s ``finally`` during
   exception propagation.
+* **Never publishes a partial transcript** — each copy is written to a
+  staging sibling and ``os.replace``'d onto its final name, so an interrupted
+  or ENOSPC-truncated copy is discarded rather than left at the canonical
+  archive path (see :func:`_archive_one`).
 
 The archive is a VERBATIM copy: one plain, greppable ``.jsonl`` corpus, so
 ``rg`` works across it and no reader needs a decompression branch (task 3618,
@@ -52,6 +56,13 @@ logger = logging.getLogger(__name__)
 # retention.* config knobs here for the δ GC consumer (task 2731) to enforce;
 # the small read/reset accessor pair below keeps tests isolated in the meantime.
 _ARCHIVAL_FAILURES: int = 0
+
+# Suffix of the staging file every archive copy is written to before being
+# atomically moved onto its final name. Deliberately NOT ``.jsonl``-terminated,
+# mirroring migrate_transcript_archive_gunzip.STAGING_SUFFIX: debris stranded by
+# a hard kill matches no reader's ``*.jsonl`` glob, so it is inert rather than a
+# transcript lookalike, and the next archival of the same session rewrites it.
+_STAGING_SUFFIX = '.archive-tmp'
 
 
 def _archival_failures() -> int:
@@ -87,6 +98,24 @@ def _record_failure(src: Path, task_id: str, exc: OSError) -> None:
     )
 
 
+def _discard_staging(staging: Path) -> None:
+    """Remove a partially-written staging file after a failed archive copy.
+
+    Best-effort and never raises: the caller is re-raising the ORIGINAL failure,
+    which is the one an operator needs to see, so a cleanup failure must not
+    mask it. It still gets its own WARNING, because leftover debris that could
+    not be removed is a fact worth one line.
+    """
+    try:
+        staging.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover - cleanup is itself best-effort
+        logger.warning(
+            'transcript_archive: failed to remove staging file %s: %s',
+            staging,
+            exc,
+        )
+
+
 def _archive_one(
     src: Path,
     projects_root: Path,
@@ -103,6 +132,21 @@ def _archive_one(
     returned. A resumed session only ever grows its transcript, so its mtime
     strictly advances and the grown file is re-archived (last-write-wins).
     Returns ``True`` when a file was newly written.
+
+    The copy goes to a STAGING sibling and is ``os.replace``'d onto *dest*, so
+    the canonical archive path only ever holds a COMPLETE copy. Writing *dest*
+    directly would publish a truncated transcript whenever a copy is
+    interrupted (a hard kill, or ENOSPC part-way through), and a plain
+    ``.jsonl`` truncation is SILENT: every reader's ``*.jsonl`` glob picks it
+    up as an ordinary transcript and ``iter_json_lines`` skips the partial
+    trailing line, so the corpus under-reports that session with nothing
+    counting it (design-invariants INV-4, loud over silent). For the teardown
+    backstop's final archival there is no later pass to correct it either —
+    the worktree is destroyed immediately after. ``os.replace`` is a
+    same-directory rename, hence atomic on one filesystem, and the mtime mirror
+    is applied to the staging file BEFORE the rename so the published file is
+    correctly stamped from the instant it appears (a ``now``-stamped transcript
+    would read to ``gc_agent_transcripts`` as a reset retention age).
     """
     rel = src.relative_to(projects_root)
     dest = archive_root / task_id / rel.parent / rel.name
@@ -112,14 +156,24 @@ def _archive_one(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # shutil.copyfile uses the platform fast-copy path (copy_file_range /
-    # sendfile) and is exactly as memory-bounded as an explicit chunked loop:
-    # agent-session JSONL can be many MB and only grows on resume, so peak RSS
-    # stays flat regardless of transcript size. This is a COPY, not a rename —
-    # the session may still be live and reading its own source file. Any I/O
-    # error here is an OSError, caught + counted by the caller (best-effort).
-    shutil.copyfile(src, dest)
-    os.utime(dest, (st.st_atime, st.st_mtime))
+    staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+    try:
+        # shutil.copyfile uses the platform fast-copy path (copy_file_range /
+        # sendfile) and is exactly as memory-bounded as an explicit chunked
+        # loop: agent-session JSONL can be many MB and only grows on resume, so
+        # peak RSS stays flat regardless of transcript size. This is a COPY,
+        # not a rename — the session may still be live and reading its own
+        # source file. Any I/O error here is an OSError, caught + counted by
+        # the caller (best-effort).
+        shutil.copyfile(src, staging)
+        os.utime(staging, (st.st_atime, st.st_mtime))
+        os.replace(staging, dest)
+    except OSError:
+        # Only the staging file is ever touched before the replace, so a
+        # pre-existing archived copy is still whole — drop the partial and let
+        # the caller count + log the original failure.
+        _discard_staging(staging)
+        raise
     return True
 
 

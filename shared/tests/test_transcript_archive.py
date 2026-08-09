@@ -190,3 +190,96 @@ class TestBestEffortLoud:
         assert rec.task_id == task_id
         assert str(bad) in rec.path
         assert rec.errno == errno.EISDIR
+
+    @staticmethod
+    def _copyfile_dies_part_way(monkeypatch, prefix: bytes):
+        """Make ``shutil.copyfile`` write *prefix* to its dest, then ENOSPC.
+
+        The real shape of an interrupted copy: bytes land on disk and THEN the
+        write fails. A mock that raised before writing anything would pass
+        against an in-place copy too, and prove nothing about where the partial
+        bytes went.
+        """
+        def fake_copyfile(src, dst, **kwargs):
+            Path(dst).write_bytes(prefix)
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfile', fake_copyfile
+        )
+
+    def test_an_interrupted_copy_publishes_no_partial_transcript(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A truncated PLAIN .jsonl at the canonical archive path is SILENT
+        # damage: every reader's *.jsonl glob admits it as an ordinary
+        # transcript and iter_json_lines skips the partial trailing line, so
+        # the session under-reports with nothing counting it. The staged write
+        # is what keeps the failure loud (counted + logged) instead.
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        task_id = '42'
+        sid = 'sess-killed'
+
+        src = config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        _write(src, b'{"line":1}\n{"line":2}\n{"line":3}\n')
+        self._copyfile_dies_part_way(monkeypatch, b'{"line":1}\n{"li')
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            count = archive_task_transcripts(
+                config_dir, task_id, sid, archive_root=root
+            )
+
+        assert count == 0
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert not dest.exists()
+        # Nothing at all is left behind — not the partial transcript, and not
+        # the staging file it was written to.
+        assert [p for p in root.rglob('*') if p.is_file()] == []
+
+        # Loud, not silent: counted and logged with the real errno.
+        assert transcript_archive_module._archival_failures() == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].errno == errno.ENOSPC
+
+    def test_an_interrupted_copy_does_not_truncate_the_previous_archive(
+        self, tmp_path, monkeypatch
+    ):
+        # The resumed-session shape: an archived copy already exists and the
+        # grown source is being re-archived when the copy dies. An in-place
+        # copy would truncate the only durable copy of the earlier records;
+        # staging leaves it byte-for-byte intact, mtime included.
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        task_id = '42'
+        sid = 'sess-grown'
+
+        src = config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        orig = b'{"line":1}\n'
+        _write(src, orig)
+        assert archive_task_transcripts(
+            config_dir, task_id, sid, archive_root=root
+        ) == 1
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        before_mtime_ns = dest.stat().st_mtime_ns
+
+        # Grow the source (mtime advances, so the idempotency skip does not
+        # apply) and kill the copy part-way through.
+        src_stat = src.stat()
+        src.write_bytes(orig + b'{"line":2}\n')
+        os.utime(src, (src_stat.st_atime + 10, src_stat.st_mtime + 10))
+        self._copyfile_dies_part_way(monkeypatch, b'{"line":1}\n{"li')
+
+        transcript_archive_module._reset_archival_failures()
+        count = archive_task_transcripts(
+            config_dir, task_id, sid, archive_root=root
+        )
+
+        assert count == 0
+        assert dest.read_bytes() == orig
+        assert dest.stat().st_mtime_ns == before_mtime_ns
+        assert [p.name for p in root.rglob('*') if p.is_file()] == [dest.name]
+        assert transcript_archive_module._archival_failures() == 1
