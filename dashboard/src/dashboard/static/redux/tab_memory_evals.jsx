@@ -109,6 +109,27 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
   const Chart = ME_CHART_BY_TAG[chartForKind(m.kind)] || null;
+  // `gaps` counts the runs this metric has NO USABLE SAMPLE for, which is two
+  // kinds of thing at once, and every sentence below has to be true of both:
+  //
+  //   * the run produced nothing — a `null`/`undefined` slot. The common case,
+  //     and a legitimate shape: a metric INTRODUCED MID-WINDOW has no sample
+  //     for the runs that predate it (memory_evals.py).
+  //   * the run produced something unplottable — NaN/±Infinity, a numeric
+  //     string, any non-number. The producer reads the value straight out of
+  //     the run payload (memory_evals.py `by_id.get(...).get('value')`), so a
+  //     malformed payload arrives here as a value that cannot be a point.
+  //
+  // Hence "no USABLE sample" everywhere, never "no sample": the second kind DID
+  // emit something, and reporting it as a run that emitted nothing would
+  // silently reclassify a malformed payload as missing data — the class of fact
+  // the seriesMismatch state below exists to NAME rather than absorb.
+  //
+  // The two are deliberately counted TOGETHER rather than disclosed separately.
+  // They are identically undrawable, the gate needs one number to subtract, and
+  // this cell can act on neither: the honest minimum is a sentence that is true
+  // of both. If the malformed kind ever needs naming in its own right it is a
+  // state of its own, alongside the mismatch arm — not a reword of this count.
   const gaps = trendGaps(trend.values);
   // An EMPTY series is not a drawable series: both Sparkline and StepSpark
   // return null for a zero-length array, so without this count a metric with
@@ -227,14 +248,15 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
                 series would be trustworthy. Named, never silently reconciled
                 by picking one length over the other.
               * no runs — the metric simply has NOT BEEN MEASURED yet.
-              * not one sample — the metric HAS run, but every run came back
-                empty, so there is nothing for the primitive to draw a point
-                from. Kept separate from "no runs" because they are different
-                facts about the metric: collapsing them would tell an operator
-                that a measured-but-empty metric had never run. Folding either
-                into the other's wording would also print a nonsense sentence
-                like "none of the 0 runs produced a sample", which reads as a
-                bug — the very outcome these states exist to prevent.
+              * not one usable sample — the metric HAS run, but no run came
+                back with a value the primitive can plot, so there is nothing
+                to draw a point from. Kept separate from "no runs" because they
+                are different facts about the metric: collapsing them would
+                tell an operator that a measured-but-unplottable metric had
+                never run. Folding either into the other's wording would also
+                print a nonsense sentence like "none of the 0 runs produced a
+                usable sample", which reads as a bug — the very outcome these
+                states exist to prevent.
 
             `!Chart` stays first: an unrenderable kind is the more actionable
             fact than an empty or malformed series.  In every suppressed case
@@ -246,13 +268,14 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
             /* The title accounts for the BREAKS in the drawn line, where they
                appear. `span` (the labels-derived first→last range) is what it
                says on its own; a holed series adds how many of those runs
-               produced no sample, so the discontinuities are explained on
-               hover rather than left to read as a rendering fault. Both counts
-               come from the same two locals every other disclosure here
-               reads. */
+               produced no USABLE sample, so the discontinuities are explained
+               on hover rather than left to read as a rendering fault. "Usable"
+               because the count covers both hole kinds — see the `gaps`
+               declaration above. Both counts come from the same two locals
+               every other disclosure here reads. */
             <div
               style={{ height: 26 }}
-              title={gaps ? `${span} · ${gaps} of ${points} runs produced no sample` : span}
+              title={gaps ? `${span} · ${gaps} of ${points} runs produced no usable sample` : span}
               data-testid="memory-eval-trend-chart"
             >
               {/* values passed through verbatim — never filtered or compacted */}
@@ -304,7 +327,7 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
                       style={{ fontSize: 10, color: 'var(--fg-3)' }}
                       data-testid="memory-eval-trend-all-gaps"
                     >
-                      no chart — none of the {points} runs produced a sample
+                      no chart — none of the {points} runs produced a usable sample
                     </span>
                   )
                   : null}
@@ -316,10 +339,14 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
             above are what say whether anything was drawn, so no clause here
             may claim a chart was withheld: it would render directly beneath a
             sparkline that had in fact been drawn. Still conditional, so a
-            clean series prints no dangling separator. */}
+            clean series prints no dangling separator.
+
+            "unusable", not "missing": the count also covers runs that emitted
+            a value the chart cannot plot, and calling those missing would state
+            something untrue about them (see the `gaps` declaration above). */}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
           {points} pts
-          {gaps ? ` · ${gaps} missing` : ''}
+          {gaps ? ` · ${gaps} unusable` : ''}
         </div>
       </td>
     </tr>

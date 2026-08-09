@@ -72,8 +72,15 @@ function ageText(seconds) {
   return `${Math.round(h / 24)}d ago`;
 }
 
-// Count the deliberate holes in a trend series.  A `null` in `trend.values`
-// means that run produced no sample.
+// Count the runs a trend series has NO USABLE SAMPLE for.  That is two kinds of
+// slot: one the run produced nothing for (`null`/`undefined`, the common case —
+// a metric introduced mid-window has no sample for the runs that predate it),
+// and one the run produced something unplottable for (NaN/±Infinity, a numeric
+// string, any non-number — the producer passes a run's `value` through
+// verbatim, so a malformed payload arrives as a value that cannot be a point).
+// Both are counted together because both are identically undrawable; the
+// caller's disclosures therefore say "no usable sample", never "no sample",
+// which would report a run that DID emit something as one that emitted nothing.
 //
 // The array is handed on UNMODIFIED — dropping a hole would shift this
 // metric's points against every other metric's, since all series share the
@@ -92,8 +99,8 @@ function ageText(seconds) {
 //
 // RESOLVED (task 3490): the holed series IS now drawn, by that hole-aware
 // primitive.  This count is therefore no longer a SUPPRESSION TRIGGER but a
-// DISCLOSURE — it says how many of the runs produced no sample, next to a line
-// that visibly breaks at each of them.  It has a second job too:
+// DISCLOSURE — it says how many of the runs produced no usable sample, next to
+// a line that visibly breaks at each of them.  It has a second job too:
 // tab_memory_evals.jsx subtracts it from the series length to learn how many
 // samples the primitive will actually draw, and gates the chart on that being
 // at least one.  (A series in which NOTHING was measured is still not drawable:

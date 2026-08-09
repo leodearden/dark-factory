@@ -357,8 +357,11 @@ test('chartForKind: the tag vocabulary is exactly {step, spark, null}', () => {
 });
 
 // ---------------------------------------------------------------------------
-// trendGaps — count the deliberate holes in a trend series. A `null` (or
-// `undefined`) in `trend.values` means that run produced no sample.
+// trendGaps — count the runs a trend series has no USABLE sample for. This
+// block covers the classic hole: a `null` (or `undefined`) in `trend.values`,
+// a run that produced nothing. The other hole kind — a run that produced
+// something unplottable — is covered by the mirror-agreement block below, and
+// is why every caller-facing sentence says "usable".
 //
 // DETECT WITHOUT DROPPING is the load-bearing property. The array is handed on
 // UNMODIFIED: all metrics share one `run_stamps` x-axis, so compacting one
