@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html.parser
 import re
+from typing import NamedTuple
 
 import pytest
 from starlette.testclient import TestClient
@@ -1604,6 +1605,119 @@ def test_no_client_side_alarm_derivation(
             )
 
 
+# ---------------------------------------------------------------------------
+# Helper: derive the trend cell's chart gate out of MemoryEvalMetricRow
+# ---------------------------------------------------------------------------
+
+
+class _TrendGate(NamedTuple):
+    """The locals the trend chart's gate is built from, plus the gate's own text.
+
+    ``points``     — the series length: ``const points = (trend.values || []).length``
+    ``plotted``    — the drawable-sample count: ``const plotted = points - gaps``
+    ``gate``       — the gate: ``const plottable = Chart && plotted > 0 && ...``
+    ``gate_decl``  — that gate declaration's full source text, for callers that
+                     need to assert what ELSE it consumes (e.g. the mismatch local).
+    """
+
+    points: str
+    plotted: str
+    gate: str
+    gate_decl: str
+
+
+def _derive_trend_gate(row_body: str) -> _TrendGate:
+    """Walk ``points -> plotted -> gate`` in MemoryEvalMetricRow, asserting each hop.
+
+    ONE derivation, shared by both trend tests, because the two must not drift
+    apart on what "the gate" means — between them they are the only thing
+    standing between an unrenderable series and a blank 26px box.  That
+    agreement used to be prose in two docstrings, and the copies had ALREADY
+    diverged: one required the ``const <name> = ...gaps...;`` candidate to name
+    the series-length local before accepting it, the other took the first
+    candidate and only then asserted it did.  Measured, not argued: inserting an
+    unrelated ``const gapPct = gaps * 100;`` above ``const plotted = points -
+    gaps;`` passed the first test and failed the second, with a message blaming
+    ``plotted`` for something ``gapPct`` had done.  Structure, not comments, is
+    what keeps them identical now.
+
+    The surviving rule is the stricter of the two: among the ``gaps``-consuming
+    declarations that are neither ``gaps`` itself nor the gate, the drawable
+    count is the one that ALSO consumes the series length.  When no candidate
+    qualifies, the rejected ones are named in the failure so an author is not
+    left guessing which declaration the assertion was looking at.
+
+    Every assertion lives here rather than at the call sites, so a caller cannot
+    accidentally accept a shape its sibling rejects.
+    """
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so it '
+        'can neither tell an empty series from a populated one nor subtract the '
+        'gap count from it to learn how many samples the primitive will actually '
+        'draw. `trendGaps([])` is 0, so the gap count alone passes a no-runs '
+        'metric straight to a chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # The drawable count: a plain arithmetic local (NOT the gate itself, hence
+    # the `Chart` exclusion) combining the series length and the gap count.
+    candidates = [
+        decl
+        for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body)
+        if decl.group(1) != 'gaps' and not re.search(r'\bChart\b', decl.group(0))
+    ]
+    plotted_decl = next(
+        (
+            decl
+            for decl in candidates
+            if re.search(r'\b' + re.escape(points_local) + r'\b', decl.group(0))
+        ),
+        None,
+    )
+    assert plotted_decl is not None, (
+        'MemoryEvalMetricRow never derives the DRAWABLE-sample count. The chart '
+        'is gated on how many samples the primitive will draw, so a '
+        f'`const plotted = {points_local} - gaps;` local (any name, but not '
+        '`gaps` and not the gate itself) must exist. Without it the gate is '
+        'either back to a zero-hole veto or blind to an all-hole series. '
+        + (
+            'Rejected candidates, none of which consume the series-length local '
+            f'`{points_local}`: {[d.group(0).strip() for d in candidates]!r}.'
+            if candidates
+            else 'No `const <name> = ...gaps...;` declaration exists at all.'
+        )
+    )
+    plotted_local = plotted_decl.group(1)
+
+    gate_decl = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
+        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
+            continue
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'the `<Chart ...>` render site is not gated on the drawable-sample count '
+        f'`{plotted_local}`. Expected a single-line '
+        f'`const plottable = Chart && {plotted_local} > 0 && ...;` whose local '
+        'reaches a `{<local>` JSX position. Neither an empty series nor an '
+        'all-hole one may reach a primitive: sparkPaths returns an empty line, '
+        'Sparkline/StepSpark return null, and the cell renders a blank 26px box. '
+        f'The empty series is excluded TRANSITIVELY — {points_local} -> '
+        f'{plotted_local} -> gate — not by a direct `{points_local} > 0` term.'
+    )
+
+    return _TrendGate(
+        points=points_local,
+        plotted=plotted_local,
+        gate=gate_decl.group(1),
+        gate_decl=gate_decl.group(0),
+    )
+
+
 def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
@@ -1689,50 +1803,12 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     #       POSITIVE check that a gate exists at all, and deleting it lets the
     #       cell hand a series of nothing but holes to a primitive that returns
     #       null, leaving the blank 26px box.
-    points_decl = re.search(
-        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
-    )
-    assert points_decl is not None, (
-        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
-        'it cannot subtract the gap count from it to learn how many samples '
-        'the primitive will actually draw.'
-    )
-    points_local = points_decl.group(1)
-
-    # The drawable count: a plain arithmetic local (NOT the gate itself, hence
-    # the `Chart` exclusion) combining the series length and the gap count.
-    plotted_local = None
-    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body):
-        name, text = decl.group(1), decl.group(0)
-        if name == 'gaps' or re.search(r'\bChart\b', text):
-            continue
-        if re.search(r'\b' + re.escape(points_local) + r'\b', text):
-            plotted_local = name
-            break
-    assert plotted_local is not None, (
-        'MemoryEvalMetricRow never derives the DRAWABLE-sample count. The '
-        f'chart is gated on how many samples the primitive will draw, so a '
-        f'`const plotted = {points_local} - gaps;` local (any name, but not '
-        '`gaps` and not the gate itself) must exist. Without it the gate is '
-        'either back to a zero-hole veto or blind to an all-hole series.'
-    )
-
-    gate_local = None
-    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
-        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
-            continue
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
-            gate_local = decl.group(1)
-            break
-    assert gate_local is not None, (
-        'the `<Chart ...>` render site is not gated on the drawable-sample '
-        f'count `{plotted_local}`. Expected a single-line '
-        f'`const plottable = Chart && {plotted_local} > 0 && ...;` whose local '
-        'reaches a `{<local>` JSX position. A series in which NOTHING was '
-        'measured must not reach a primitive: sparkPaths returns an empty '
-        'line, Sparkline/StepSpark return null, and the cell renders a blank '
-        '26px box.'
-    )
+    #
+    #       Derived through the SHARED `_derive_trend_gate` walk — the same call
+    #       test_empty_trend_is_a_named_state_not_an_empty_chart_box makes, so
+    #       "the two tests derive the gate the same way" is structural rather
+    #       than a promise in two docstrings.
+    gate = _derive_trend_gate(row_body)
 
     # (ii'-negative) the RETIRED suppression must be gone. Without this,
     #                leaving `gaps === 0` in the gate would keep the old
@@ -1741,7 +1817,7 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     assert suppression is None, (
         f'a zero-gap veto survives: {suppression.group(0)!r}. Task 3490 '
         'retired it — a holed series is DRAWN by the hole-aware primitive and '
-        f'its gaps disclosed. The gate is `{plotted_local} > 0` (at least one '
+        f'its gaps disclosed. The gate is `{gate.plotted} > 0` (at least one '
         'drawable sample), never "no holes at all".'
     )
 
@@ -1752,7 +1828,7 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     bare = re.search(r'\{\s*Chart\s*(?:\?|&&)', body)
     assert bare is None, (
         f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
-        f'it bypasses the `{gate_local}` gate, so a series in which nothing '
+        f'it bypasses the `{gate.gate}` gate, so a series in which nothing '
         'was measured would reach the primitive and render a blank box.'
     )
 
@@ -1828,11 +1904,14 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     the primitive will actually draw", and the empty series is now excluded
     TRANSITIVELY through that count rather than by its own `points > 0` term.
 
-    This test therefore derives the gate in exactly the hops its sibling
-    test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed uses.  That
+    This test therefore derives the gate through ``_derive_trend_gate``, the
+    same call its sibling
+    test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed makes.  That
     pairing is deliberate and load-bearing: the two tests must not drift apart
     on what "the gate" means, because between them they are the only thing
-    standing between an unrenderable series and a blank box.
+    standing between an unrenderable series and a blank box.  It is one shared
+    walk rather than two matching copies because the copies had already
+    diverged — the helper's docstring records the measurement.
 
     Asserted on structure and on `data-testid` values, never on copy: a
     rewording keeps this green, deleting a state does not.
@@ -1843,61 +1922,19 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
     assert row_body, 'could not extract the MemoryEvalMetricRow body.'
 
-    # (a) something must MEASURE the series length. Nothing did.
-    points_decl = re.search(
-        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
-    )
-    assert points_decl is not None, (
-        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
-        'it cannot tell an empty series from a populated one. `trendGaps([])` '
-        'is 0, so the gap check alone passes a no-runs metric straight to a '
-        'chart primitive that renders nothing.'
-    )
-    points_local = points_decl.group(1)
-
-    # (b) the chart gate must CONSUME that measurement — now TRANSITIVELY,
-    #     through the drawable-sample count, since the gate no longer names
-    #     `points` directly (gaps <= points always, so `plotted > 0` implies
-    #     `points > 0` and restating it would leave a dead conjunct).  Derived
-    #     in exactly the two hops
-    #     test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed uses, so
-    #     the two tests cannot drift apart on what "the gate" means.
-    plotted_decl = None
-    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body):
-        if decl.group(1) == 'gaps' or re.search(r'\bChart\b', decl.group(0)):
-            continue
-        plotted_decl = decl
-        break
-    assert plotted_decl is not None, (
-        'no `const <name> = ...gaps...;` drawable-sample count (excluding the '
-        '`gaps` declaration itself and the gate) — see '
-        'test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed, which '
-        'derives it the same way.'
-    )
-    plotted_local = plotted_decl.group(1)
-    assert re.search(r'\b' + re.escape(points_local) + r'\b', plotted_decl.group(0)), (
-        f'the drawable-sample count {plotted_decl.group(0).strip()!r} does not '
-        f'consume the series-length local `{points_local}`, so the chain that '
-        'excludes an empty series from the chart is broken at its first hop.'
-    )
-
-    gate_decl = None
-    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
-        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
-            continue
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
-            gate_decl = decl
-            break
-    assert gate_decl is not None, (
-        f'no single-line `const <name> = ...Chart...{plotted_local}...;` gate '
-        'whose local reaches a `{<local>` JSX position — see '
-        'test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed, which '
-        'derives the gate the same way. An empty series must never reach a '
-        'charts.jsx primitive: both Sparkline and StepSpark return null for a '
-        f'zero-length array, leaving a blank 26px box. It is excluded '
-        f'TRANSITIVELY — {points_local} -> {plotted_local} -> gate — not by a '
-        f'direct `{points_local} > 0` term.'
-    )
+    # (a)+(b) the series length must be MEASURED, and the chart gate must
+    #     CONSUME that measurement — now TRANSITIVELY, through the
+    #     drawable-sample count, since the gate no longer names `points`
+    #     directly (gaps <= points always, so `plotted > 0` implies `points > 0`
+    #     and restating it would leave a dead conjunct).
+    #
+    #     Both hops come from the SHARED `_derive_trend_gate` walk, the same
+    #     call test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed
+    #     makes.  One derivation, so the two tests cannot drift apart on what
+    #     "the gate" means — which they had already begun to do while the rule
+    #     was only stated in prose (see that helper's docstring).
+    gate = _derive_trend_gate(row_body)
+    points_local, plotted_local = gate.points, gate.plotted
 
     # (c) FIVE structurally distinct trend states. A separate no-runs arm is
     #     required rather than folding it into the all-gaps message because
@@ -1998,8 +2035,8 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
         'and nothing this cell says about the series would be trustworthy.'
     )
     mismatch_local = mismatch_decl.group(1)
-    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate.gate_decl), (
+        f'the chart gate {gate.gate_decl.strip()!r} does not consume '
         f'`{mismatch_local}`, so a malformed series is still drawn — against a '
         'title derived from the other, differently-sized array.'
     )
