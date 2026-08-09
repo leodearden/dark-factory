@@ -722,13 +722,48 @@ info "Installing dashboard systemd units"
 # Deliberately no --fix in the checker (see its module docstring): re-running
 # this installer is the propagation path, and re-ARMING the watchdog timer
 # belongs to task 3289.
-if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
-     --installed-dir "$UNIT_DIR" \
-     --repo-root     "$REPO_ROOT"; then
-  ok "Dashboard units: already at parity with the committed copies"
+#
+# The gate distinguishes "ran and found drift" from "did not run at all", and
+# the install proceeds either way. Exit code alone is NOT trusted, because 2 is
+# overloaded three ways: the checker's "not yet installed" (benign), `python3`
+# refusing to open a missing script file, and argparse rejecting an unknown
+# flag. Renaming the checker or one of its flags would otherwise print a
+# reassuring "installing below" on a host whose units are installed AND
+# drifted — a gate reporting green because it never ran, which is the silent-
+# drift failure the checker exists to catch, reproduced in its own wiring.
+# So no status is believed unless the checker's own [dashboard_unit_parity] tag
+# appears in the output it produced. That tag is on EVERY line it emits, which
+# test_main_every_emitted_line_carries_the_log_tag pins, so its absence is
+# conclusive rather than a heuristic.
+#
+# UNLIKE the orchestrator gate above, a bad verdict does NOT make the install
+# opt-in, and must not be changed to: the install is itself the remediation,
+# the checker's own report tells the operator to run this script, and the
+# incident it guards has the INSTALLED side stale. See
+# test_section_8_installs_even_when_the_gate_did_not_run for the full argument.
+# What changes on a gate that did not run is only the EPISTEMICS — the operator
+# is no longer told a check passed when none ran.
+_dash_parity_script="$REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+
+if [ ! -f "$_dash_parity_script" ]; then
+  fail "Dashboard parity gate missing: $_dash_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
+  fail "  The install below still runs; it simply gathered no evidence first."
 else
-  _dash_parity_exit=$?
-  if [ "$_dash_parity_exit" -eq 2 ]; then
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _dash_parity_out="$(python3 "$_dash_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" && _dash_parity_exit=0 || _dash_parity_exit=$?
+  printf '%s\n' "$_dash_parity_out"
+
+  if ! printf '%s\n' "$_dash_parity_out" | grep -q '\[dashboard_unit_parity\]'; then
+    fail "Dashboard parity gate produced no [dashboard_unit_parity] report"
+    fail "  (status $_dash_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+    fail "  The install below still runs; it simply gathered no evidence first."
+  elif [ "$_dash_parity_exit" -eq 0 ]; then
+    ok "Dashboard units: already at parity with the committed copies"
+  elif [ "$_dash_parity_exit" -eq 2 ]; then
     info "Dashboard units: not yet installed in $UNIT_DIR (installing below)"
   else
     # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
