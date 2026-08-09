@@ -163,8 +163,11 @@ If an agent files `critical` or `urgent`, the escalation server **downgrades it 
 severity buys no faster human attention — only noise.
 
 To reach a human, use the existing ladder: file with `escalate_blocker` (L0 →
-steward); if the steward cannot resolve it, re-escalate with `level=1` (steward →
-auto-watcher; auto-watcher promotes to L2 if a human is needed).
+steward); if the steward cannot resolve it, re-escalate by passing `level=1` to
+`escalate_blocker` (steward → auto-watcher; auto-watcher promotes to L2 if a
+human is needed).  `escalate_blocker` accepts only `level=0` (the default) or
+`level=1` — anything else is rejected with an `{'error': ...}` response and
+nothing is filed.
 """
 
 _MEMORY_TOOLS = [
@@ -1441,8 +1444,12 @@ wording differs.
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding
    code or add features.
-2. **Be conservative.** If the fix is not obvious, re-escalate with level=1 (steward→auto-watcher; auto-watcher promotes to L2 if a human is needed)
-   via `escalate_blocker` rather than guessing.
+2. **Be conservative.** If the fix is not obvious, re-escalate by calling
+   `escalate_blocker(..., level=1)` (steward→auto-watcher; auto-watcher promotes to L2
+   if a human is needed) rather than guessing.  The `level=1` argument is what makes it
+   a re-escalation: a filing left at the default `level=0` lands back in your own
+   queue, is never read by the auto-watcher, and is eligible for the workflow's
+   level=0 dismissal sweeps.
 3. **Verify fixes.** Run the relevant tests after making changes.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
@@ -1453,8 +1460,9 @@ wording differs.
    uncommitted work; `unmerged_state` means project_root already had UU/AA/DD markers
    before the merge attempted to advance. Do NOT run destructive git commands (`git reset`,
    `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
-   main project root. Instead, immediately re-escalate to level-1 via `escalate_blocker`
-   preserving the original category (`wip_conflict` or `unmerged_state`) and
+   main project root. Instead, immediately re-escalate by calling
+   `escalate_blocker(..., level=1)`, preserving the original category
+   (`wip_conflict` or `unmerged_state`) and
    `suggested_action='manual_intervention'`.
 
 ## CRITICAL: Git Staging Rules
@@ -1485,8 +1493,8 @@ choose your response:
 - **MAX_TURNS** — the agent ran out of its turn budget without completing.
   This is NOT transient. Retrying the same inputs will fail the same way.
   Either the task is under-specified, the agent is thrashing, or the budget
-  is too low. Prefer re-escalating to level=1 unless you can narrow the task
-  or raise the budget deliberately.
+  is too low. Prefer re-escalating via `escalate_blocker(..., level=1)` unless
+  you can narrow the task or raise the budget deliberately.
 - **EMPTY_OUTPUT** (`subtype='error_empty_output'`) — the agent WAS dispatched
   and the model ran, but the invocation came back with no output. This may be
   transient (CLI glitch); one retry is reasonable before re-escalating. Do not
@@ -1502,8 +1510,9 @@ choose your response:
   session), and for planning also at the workflow layer. So by the time you see
   it, the automatic retries are spent and a second occurrence is NOT transient
   — it means a deterministic cause (a genuinely blank prompt, or a persistent
-  wrapper/stdio bug) that needs a human. Re-escalate to level=1 with the stderr
-  cause rather than retrying again.
+  wrapper/stdio bug) that needs a human. Re-escalate via
+  `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
+  again.
 - **API_ERROR** — HTTP error from the provider. Usually transient; account
   failover often helps. Retry is reasonable.
 - **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
