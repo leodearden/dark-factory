@@ -627,9 +627,14 @@ def note_unreadable_transcript(
 
 # Background-management tool names that "reap" a launched background task — a
 # poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling).  Any of these AFTER the last background launch clears the
-# abandonment verdict.
-_BACKGROUND_REAP_TOOLS = frozenset({'BashOutput', 'KillShell', 'KillBash'})
+# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
+# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
+# 3639).  All five are equally conclusive evidence that the session engaged with
+# its pending work rather than abandoning it, so any of them AFTER the last
+# background launch clears the abandonment verdict.
+_BACKGROUND_REAP_TOOLS = frozenset(
+    {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
+)
 
 # Captures the output-file path from the CLI's background-launch tool_result
 # sentence: "... Output is being written to: /tmp/.../tasks/<id>.output. You
@@ -705,7 +710,9 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
       truthy;
     - a **reap** = either of:
 
-      * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use;
+      * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use, or their
+        Task-tool analogues ``TaskOutput`` (collects a backgrounded
+        Task/subagent's result) and ``TaskStop`` (terminates it);
       * a tool_use of ANY kind whose input references the background task's id
         or output-file path, as recorded in the launch's tool_result
         (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
