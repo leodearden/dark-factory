@@ -1037,10 +1037,34 @@ Review this run and provide your verdict as JSON.
         # is_phantom_verdict), so this can never drop an ok/minor verdict
         # from the ordering and un-break a streak (that would be a fail-open
         # change, outside this task's ask).
-        evidence = [
-            v for v in verdicts
-            if not (v.severity in _NON_OK_SEVERITIES and is_phantom_verdict(v))
-        ]
+        evidence: list[JudgeVerdict] = []
+        excluded_run_ids: list[str] = []
+        for v in verdicts:
+            if v.severity in _NON_OK_SEVERITIES and is_phantom_verdict(v):
+                excluded_run_ids.append(v.run_id)
+            else:
+                evidence.append(v)
+
+        # The detector is discarding evidence here, not just failing to find
+        # a trend — those are different operator-facing facts. Without this
+        # record, an operator watching a project that did NOT halt cannot
+        # tell "no trend" apart from "trend evidence was discounted as
+        # phantom" (loud-over-silent-degradation). Silent when nothing was
+        # dropped, so this never adds noise to the common case.
+        if excluded_run_ids:
+            logger.warning(
+                'reconciliation.judge_trend_phantom_excluded',
+                extra={
+                    'project_id': project_id,
+                    'excluded_count': len(excluded_run_ids),
+                    # Bounded defensively: the trend query itself caps at
+                    # limit=50 (get_recent_verdicts), so this slice cannot
+                    # truncate real information today, only guard against a
+                    # future caller passing a larger verdict list.
+                    'excluded_run_ids': excluded_run_ids[:50],
+                    'remaining_verdicts': len(evidence),
+                },
+            )
 
         window_hours = float(self.config.halt_trend_window_hours)
         window_start = now - timedelta(hours=window_hours)
