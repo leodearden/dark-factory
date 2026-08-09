@@ -10350,8 +10350,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return base
         return None
 
-    def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str]]:
-        """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual).
+    def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str, bool]]:
+        """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual, recovery).
 
         Shared chain-walk consumed by BOTH :meth:`check_frozen_prefix_invariant`
         and :meth:`_verify_base_frozen_tip_violations` — the two checks compare
@@ -10368,6 +10368,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         guard's own ``item.merge_result is None or not item.base_sha``
         exclusion.
 
+        The fourth tuple element is the entry item's ``remerge_recovery``
+        marker (task 3206 / PRD §5.3 re-merge carve-out).  It is REPORTED
+        here, never acted on: a recovery entry is still walked and still
+        advances the chain, because each entry's ``merge_commit`` is what
+        sets the expected base for its successors — filtering recovery
+        entries out of the WALK would corrupt the expected base of every
+        entry behind them, converting one carved-out entry into a cascade of
+        false violations.  Consumers decide for themselves whether the marker
+        suppresses their own output: :meth:`_verify_base_frozen_tip_violations`
+        skips EMISSION for marked entries (the §5.3 carve-out), while
+        :meth:`check_frozen_prefix_invariant` deliberately does NOT — it
+        checks structural base-chain integrity, a different question from
+        "did §5.3 permit this verify base".
+
         Pure/synchronous (no await); never raises on well-formed
         InflightEntry data.
         """
@@ -10382,10 +10396,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # No merge_commit — nothing to chain; do not advance.
                 continue
             actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
-            yield rid, expected_base, actual_base
+            yield rid, expected_base, actual_base, entry.item.remerge_recovery
             # Advance expected_base for the next entry regardless of whether
-            # this one matched, so subsequent chain errors are also surfaced
-            # (not shadowed).
+            # this one matched (or was carved out), so subsequent chain errors
+            # are also surfaced (not shadowed).
             expected_base = mr.merge_commit.strip()
 
     def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
@@ -10414,7 +10428,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         violations: list[str] = []
 
         # ── 1. Base-chain integrity ───────────────────────────────────────────
-        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
+        # NOTE (task 3206): the §5.3 re-merge carve-out is deliberately NOT
+        # applied here.  This check asks "is the frozen prefix's base chain
+        # structurally intact?", which is a different question from §5.3's
+        # "was this verify permitted to start against this base?" — a recovery
+        # re-merge genuinely does break the chain, and hiding that would blind
+        # λ's integration gate to real structural damage.
+        for rid, expected_base, actual_base, _recovery in self._frozen_base_chain(main_sha):
             if actual_base != expected_base:
                 violations.append(
                     f'frozen-prefix base-chain broken at {rid}: '
@@ -10547,12 +10567,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         change to the chain-walk itself (e.g. how passthrough entries
         advance the chain) cannot make the two surfaces silently disagree.
 
+        §5.3 RE-MERGE CARVE-OUT (task 3206, PRD §5.3): entries whose item
+        carries ``remerge_recovery=True`` are exempt.  Those are ``_remerge``
+        recovery items, which legitimately target real main rather than the
+        frozen tip, so a mismatch is correct by construction rather than a
+        violation.  :meth:`_warn_if_verify_base_not_frozen_tip` applies the
+        identical carve-out at dispatch time — both §5.3 surfaces must gain
+        it together or they would silently disagree, precisely the failure the
+        shared-generator paragraph above exists to prevent.
+
+        The carve-out is applied to violation EMISSION only, never by
+        filtering entries out of :meth:`_frozen_base_chain`: a carved-out
+        entry must still advance the expected base for its successors, or one
+        suppressed violation would become a cascade of false ones behind it.
+
         Pure/synchronous (no await). Fail-safe: never raises — callers
         (:meth:`two_layer_invariants`) wrap this in their own try/except, but
         the loop body itself cannot raise on well-formed InflightEntry data.
         """
         violations: list[str] = []
-        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
+        for rid, expected_base, actual_base, recovery in self._frozen_base_chain(main_sha):
+            if recovery:
+                continue  # §5.3 re-merge carve-out (task 3206) — emission only
             if actual_base != expected_base:
                 violations.append(
                     f'verify-base⊄frozen-tip at {rid!r}: dispatched for real-verify '
