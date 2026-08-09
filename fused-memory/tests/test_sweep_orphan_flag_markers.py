@@ -1112,6 +1112,66 @@ class TestTargetedCorrection:
 
 
 # ===========================================================================
+# Tests: enumeration_blind_spot (task 3897)
+# ===========================================================================
+
+class TestEnumerationBlindSpot:
+    """Tests for the pure predicate enumeration_blind_spot(enumerated, adjacent).
+
+    Task 3897: this script enumerates on {'source': 'stage1_flag_marker'},
+    which measures 0 records in BOTH dark_factory and reify as of
+    2026-08-09, while the adjacent {'flag_for_stage2': True} relay pool
+    measures 61 and 80 respectively. The consequence is a structural false
+    all-clear: `before.total_source` is always 0, so backlog_verdict(0, N)
+    holds unconditionally and forever, and the nightly sweep prints
+    `orphan_count: 0` every night against a pool it cannot see.
+
+    This predicate is what makes that divergence nameable. It distinguishes
+    "swept nothing because there was nothing" (a true no-op) from "swept
+    nothing because the enumeration filter cannot see the population" (a
+    blind spot).
+    """
+
+    @pytest.mark.parametrize('enumerated,adjacent,expected', [
+        # The live dark_factory shape as measured 2026-08-09: the source
+        # filter sees nothing while 61 flag_for_stage2 records exist.
+        (0, 61, True),
+        # The live reify shape, same defect, different magnitude.
+        (0, 80, True),
+        # Genuinely nothing anywhere — a true no-op, NOT a blind spot. This
+        # is the case that must not warn, or the warning becomes noise on
+        # every clean run.
+        (0, 0, False),
+        # The sweep can see its own pool. An adjacent population merely
+        # existing is not a blind spot — the two pools are distinct
+        # populations and both being non-empty is the healthy steady state.
+        (3, 61, False),
+        (3, 0, False),
+    ])
+    def test_blind_spot_predicate(self, enumerated, adjacent, expected):
+        """Blind spot iff the enumeration saw nothing AND an adjacent
+        population is non-empty."""
+        assert _mod.enumeration_blind_spot(enumerated, adjacent) is expected
+
+    def test_flag_for_stage2_filters_constant_shape(self):
+        """The census filter mirrors task_knowledge_sync._FLAG_FOR_STAGE2_ENUM_FILTERS."""
+        assert _mod.FLAG_FOR_STAGE2_FILTERS == {'flag_for_stage2': True}
+
+    def test_flag_for_stage2_filter_value_is_boolean_not_string(self):
+        """The boolean True is load-bearing: Qdrant payload filters are
+        type-sensitive, and the string variant {'flag_for_stage2': 'true'}
+        measures 0 against live dark_factory (independently re-confirmed
+        2026-08-09). A silent str/bool drift here would reintroduce exactly
+        the zero-matching blind spot this cross-check exists to detect —
+        `== {'flag_for_stage2': True}` alone would NOT catch it, since
+        `True == 1` and Python's dict equality would also accept 1.
+        """
+        value = _mod.FLAG_FOR_STAGE2_FILTERS['flag_for_stage2']
+        assert isinstance(value, bool)
+        assert value is True
+
+
+# ===========================================================================
 # Tests: backlog_verdict
 # ===========================================================================
 
