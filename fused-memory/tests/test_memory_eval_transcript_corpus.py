@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -580,19 +581,6 @@ yield record 0 and skip record 1) instead of silently passing.
 """
 
 
-def _write_corrupt(root: Path, rel: str) -> Path:
-    """A .jsonl file whose bytes are not valid UTF-8 — unreadable at the text layer.
-
-    With the archive stored plain, this is the ONLY shape that still makes a
-    whole file unreadable. "Not gzip" is no longer a failure at all: those
-    bytes are simply ordinary text now.
-    """
-    path = root / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_UNDECODABLE_BODY)
-    return path
-
-
 def _write_undecodable(root: Path, rel: str) -> Path:
     """A ``.jsonl`` whose payload is not valid UTF-8.
 
@@ -603,6 +591,12 @@ def _write_undecodable(root: Path, rel: str) -> Path:
     readers normalize it, and it is reachable on a plain ``.jsonl`` exactly as
     it was on a ``.gz``. A flipped byte in stored archive data, or a file
     half-written by a killed unit, produces it.
+
+    THE fixture for an unreadable transcript body, deliberately singular: with
+    the archive stored plain this is the only damage shape that makes a whole
+    file unreadable by its CONTENT. "Not gzip" is not a failure at all any
+    more — those bytes are simply ordinary text. (A file can still be
+    unreadable for reasons outside its bytes; see ``_write_unopenable``.)
     """
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -633,7 +627,7 @@ class TestScanArchive:
         ])
         # Parses fine, holds no searches — must count as READ, not as failed.
         _write_transcript(root, self.EMPTY_REL, [{'type': 'queue-operation'}])
-        _write_corrupt(root, self.BAD_REL)
+        _write_undecodable(root, self.BAD_REL)
         return root
 
     def test_returns_the_good_files_records(self, tmp_path):
@@ -729,8 +723,8 @@ class TestFailureExamplesAreCapped:
 
     def _two_failures(self, tmp_path: Path) -> Path:
         root = tmp_path / 'archive'
-        _write_corrupt(root, '1/-enc/a.jsonl')
-        _write_corrupt(root, '2/-enc/b.jsonl')
+        _write_undecodable(root, '1/-enc/a.jsonl')
+        _write_undecodable(root, '2/-enc/b.jsonl')
         return root
 
     def test_count_is_never_capped(self, tmp_path):
@@ -1117,7 +1111,7 @@ class TestZeroSearchCasesAreDistinguishableEndToEnd:
     def _all_corrupt(self, tmp_path) -> Path:
         root = tmp_path / 'corrupt-archive'
         for rel in ('1/-enc/a.jsonl', '2/-enc/b.jsonl', '3/-enc/c.jsonl'):
-            _write_corrupt(root, rel)
+            _write_undecodable(root, rel)
         return root
 
     def test_all_unparseable_exits_three(self, tmp_path):
@@ -1309,9 +1303,16 @@ class TestSingleTranscriptMode:
 # The `except OSError` handlers in this script are only as good as the
 # contract the readers keep. With the archive stored PLAIN (task 3618), the
 # three gzip container shapes — bad magic, truncated stream, corrupt body —
-# cease to exist, and exactly one file-level failure remains:
+# cease to exist, and exactly one file-level failure remains that is not
+# ALREADY an OSError:
 #
 #     undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
+#
+# (A transcript can still be unreadable for reasons outside its bytes — EACCES,
+# EIO — but those arrive as OSError and only need passing through. Both routes
+# to the counted path are exercised below, because a normalization that
+# flattened the two into one indistinguishable reason would misdirect the
+# operator reading it.)
 #
 # It is the shape that never depended on compression in the first place: the
 # fault is at the readers' strict `encoding='utf-8'` text wrapper, so it was
@@ -1335,9 +1336,13 @@ class TestSingleTranscriptMode:
 
 class TestPartiallyWrittenTranscriptsAreCounted:
     GOOD_REL = '5150/-enc-a/good-session.jsonl'
-    SECOND_BAD_REL = '5150/-enc-a/second-bad-session.jsonl'
-    THIRD_BAD_REL = '5151/-enc-b/third-bad-session.jsonl'
     UNDECODABLE_REL = '5152/-enc-c/undecodable-session.jsonl'
+    UNOPENABLE_REL = '5153/-enc-d/unopenable-session.jsonl'
+    ALL_BAD_RELS = (
+        '5150/-enc-a/undecodable-a.jsonl',
+        '5151/-enc-b/undecodable-b.jsonl',
+        '5152/-enc-c/undecodable-c.jsonl',
+    )
 
     def _good(self, root: Path) -> Path:
         _write_transcript(root, self.GOOD_REL, [
@@ -1347,17 +1352,46 @@ class TestPartiallyWrittenTranscriptsAreCounted:
         ])
         return root
 
-
-
     def _one_undecodable_one_good(self, tmp_path: Path) -> Path:
         root = self._good(tmp_path / 'undecodable-archive')
         _write_undecodable(root, self.UNDECODABLE_REL)
         return root
 
     def _all_bad(self, tmp_path: Path) -> Path:
+        """Three transcripts, not one of them readable.
+
+        The files are deliberately IDENTICAL in kind: this fixture exists only
+        to prove the wholesale-failure verdict (every file found, none read),
+        and reading a distinction into three same-shaped files was exactly the
+        false discrimination this class used to claim. Genuinely different
+        causes are exercised by ``_two_distinct_causes`` below.
+        """
         root = tmp_path / 'all-bad-archive'
-        for rel in (self.SECOND_BAD_REL, self.THIRD_BAD_REL, self.UNDECODABLE_REL):
+        for rel in self.ALL_BAD_RELS:
             _write_undecodable(root, rel)
+        return root
+
+    def _two_distinct_causes(self, tmp_path: Path) -> Path:
+        """One file unreadable by its BYTES, one by its PERMISSIONS.
+
+        The two causes that actually remain once the archive is plain, and they
+        travel different routes to the same counted path: the undecodable body
+        raises ``UnicodeDecodeError`` (a ``ValueError``) and reaches
+        ``except OSError`` only because ``as_unreadable_file_error`` normalizes
+        it, while ``EACCES`` is already an ``OSError`` and passes through
+        unwrapped. A disclosed reason that could not tell them apart would send
+        an operator looking for a flipped byte in a file they simply cannot
+        open.
+
+        The unopenable file's BODY is well-formed on purpose, so its only
+        defect is the mode — which is what makes the two reasons comparable.
+        """
+        root = tmp_path / 'two-cause-archive'
+        _write_undecodable(root, self.UNDECODABLE_REL)
+        unopenable = _write_transcript(root, self.UNOPENABLE_REL, [
+            _tool_use('toolu_locked', 'a search nobody can reach'),
+        ])
+        unopenable.chmod(0o000)
         return root
 
     # -- (b) wholesale corruption: total_failure, said in words -------------
@@ -1367,7 +1401,7 @@ class TestPartiallyWrittenTranscriptsAreCounted:
 
         assert code == 3
         assert coverage['status'] == 'total_failure'
-        assert coverage['parse_failures']['count'] == 3
+        assert coverage['parse_failures']['count'] == len(self.ALL_BAD_RELS)
         assert records == []
 
     def test_every_file_unreadable_report_says_so_in_words(self, tmp_path):
@@ -1378,22 +1412,47 @@ class TestPartiallyWrittenTranscriptsAreCounted:
         assert 'total_failure' in report
         assert 'none could be read' in report.lower()
 
-    # -- (c) both shapes reach the counted path, distinguishably ------------
+    # -- (c) both causes reach the counted path, distinguishably ------------
 
-    def test_the_surviving_corruption_shape_names_the_offending_byte(self, tmp_path):
+    def test_the_undecodable_reason_names_the_offending_byte(self, tmp_path):
         # The reason is normalized to OSError so one handler catches it, but it
-        # must still say WHAT went wrong. With the gzip container gone there is
-        # only one file-level shape left, so the discriminating detail is no
-        # longer "which of three" but the offending byte itself — the thing an
-        # operator needs to go and find in the file.
-        _, coverage, _, _ = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
+        # must still say WHAT went wrong. With the gzip container gone the
+        # discriminating detail is no longer "which of three container shapes"
+        # but the offending byte itself — the thing an operator needs to go and
+        # find in the file.
+        _, coverage, _, _ = _run_cli(
+            self._one_undecodable_one_good(tmp_path), tmp_path / 'out')
 
         reasons = {ex['transcript']: ex['reason'] for ex in
                    coverage['parse_failures']['examples']}
-        assert set(reasons) == {
-            self.SECOND_BAD_REL, self.THIRD_BAD_REL, self.UNDECODABLE_REL}
-        for reason in reasons.values():
-            assert '0xff' in reason.lower()
+        assert set(reasons) == {self.UNDECODABLE_REL}
+        assert '0xff' in reasons[self.UNDECODABLE_REL].lower()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason='root bypasses file read permissions, so EACCES is unreachable',
+    )
+    def test_the_two_unreadable_causes_report_different_reasons(self, tmp_path):
+        # Both files are counted, and the disclosed reasons DISCRIMINATE: same
+        # normalized type, different text. Normalizing the decode shape into
+        # `except OSError` is only safe because it does not flatten what the
+        # operator is told — one reason names the byte, the other names the
+        # permission failure.
+        code, coverage, records, _ = _run_cli(
+            self._two_distinct_causes(tmp_path), tmp_path / 'out')
+
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert records == []
+        assert coverage['parse_failures']['count'] == 2
+
+        reasons = {ex['transcript']: ex['reason'] for ex in
+                   coverage['parse_failures']['examples']}
+        assert set(reasons) == {self.UNDECODABLE_REL, self.UNOPENABLE_REL}
+        assert reasons[self.UNDECODABLE_REL] != reasons[self.UNOPENABLE_REL]
+        assert '0xff' in reasons[self.UNDECODABLE_REL].lower()
+        assert '0xff' not in reasons[self.UNOPENABLE_REL].lower()
+        assert 'permission' in reasons[self.UNOPENABLE_REL].lower()
 
     # -- (b2) the decode shape, on its own, at the archive boundary ---------
 
