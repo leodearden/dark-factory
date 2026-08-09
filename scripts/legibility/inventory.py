@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger('legibility.inventory')
 
 
 def encode_cwd(cwd: str) -> str:
@@ -372,6 +375,37 @@ def _build_session_record(
     )
 
 
+RESIDUAL_GZ_GLOB = '*.jsonl.gz'
+"""Glob for the pre-3618 archived form, kept ONLY to count what is invisible."""
+
+
+def count_residual_gz(root: Path | str) -> int:
+    """Count archived ``*.jsonl.gz`` transcripts under *root* — a count, NOT a read.
+
+    Task 3618 dropped gzip from the archive, but the destructive ``--apply``
+    sweep that converts the EXISTING corpus
+    (``scripts/migrate_transcript_archive_gunzip.py``) is deliberately a
+    human-operated step, so between that merge and the operator's run every
+    residual ``.gz`` is simply not enumerated by
+    :func:`_iter_archive_transcripts` — silently absent from the corpus rather
+    than loudly failed. The gap is accepted and documented (OPERATIONS.md §13),
+    but "accepted" must not mean "invisible": its duration is bounded only by
+    someone remembering, which is exactly the shape design-invariant INV-4
+    rejects.
+
+    So the gap announces itself. This is the machine-readable half — a consumer
+    that renders coverage can report it as a field (the memory-eval extractor's
+    ``residual_gz``); :func:`_iter_archive_transcripts` emits the human half as
+    one greppable WARNING. No gzip branch is reintroduced: nothing here opens a
+    file, and once the migration runs this returns 0 and both signals vanish on
+    their own.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    return sum(1 for _ in root.rglob(RESIDUAL_GZ_GLOB))
+
+
 def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     """Yield every ``*.jsonl`` transcript under *root*, recursively.
 
@@ -388,9 +422,26 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
 
     The archive holds ONE class of transcript (task 3618 dropped the gzipped
     form), so this is a single ``rglob('*.jsonl')`` with no suffix filter.
+
+    Any residual ``*.jsonl.gz`` is therefore not enumerated AT ALL until the
+    human-operated migration sweep has run. That would be a silent
+    under-report, so it is counted (:func:`count_residual_gz`) and announced
+    once per walk as a greppable WARNING — a count, never a read.
     """
     if not root.is_dir():
         return
+    residual_gz = count_residual_gz(root)
+    if residual_gz:
+        logger.warning(
+            'inventory: %d residual %s under %s are NOT enumerated — the '
+            'archive corpus under-reports by that many transcripts until '
+            'scripts/migrate_transcript_archive_gunzip.py --apply is run '
+            '(OPERATIONS.md §13). This warning disappears on its own once it '
+            'has been.',
+            residual_gz,
+            RESIDUAL_GZ_GLOB,
+            root,
+        )
     yield from sorted(root.rglob('*.jsonl'))
 
 

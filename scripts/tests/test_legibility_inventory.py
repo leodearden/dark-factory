@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import re
 import subprocess
 from collections.abc import Callable
@@ -644,9 +645,9 @@ class TestEnumerateArchiveRoots:
     """enumerate_sessions additionally walks agent_transcript_roots — the
     archived fleet-transcript tree written by shared.transcript_archive in
     the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl``
-    (+ a plain ``.jsonl`` variant) — recursively, gated solely by
-    :func:`is_member` on each session's REAL cwd. The empty-roots path is
-    byte-identical to today (the archive loop simply does not execute).
+    — recursively, gated solely by :func:`is_member` on each session's REAL
+    cwd. The empty-roots path is byte-identical to today (the archive loop
+    simply does not execute).
     """
 
     TARGET_DATE = dt_date(2026, 7, 13)
@@ -669,7 +670,7 @@ class TestEnumerateArchiveRoots:
         )
         return root
 
-    def test_enumerates_gz_and_plain_archive_sessions(self, tmp_path):
+    def test_enumerates_nested_archive_sessions(self, tmp_path):
         archive = self._build_archive(tmp_path / 'archive')
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
@@ -723,6 +724,79 @@ class TestEnumerateArchiveRoots:
             agent_transcript_roots=[tmp_path / 'does-not-exist'],
         )
         assert records == []
+
+
+class TestResidualGzIsAnnounced:
+    """The archive walk only enumerates ``*.jsonl``, so anything still gzipped
+    is not skipped-with-a-reason — it is not seen at all.
+
+    That window is real and accepted: the destructive migration sweep is a
+    human-operated step (OPERATIONS.md §13), so between this merge and the
+    operator's run the corpus under-reports. What is NOT acceptable is the gap
+    being invisible, since its duration is bounded only by someone remembering.
+    So the walk counts what it cannot see and says so — a count, never a read,
+    and it disappears on its own once the migration has run.
+    """
+
+    TARGET_DATE = dt_date(2026, 7, 13)
+    WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
+    LOGGER = 'legibility.inventory'
+
+    def _archive_with_residue(self, tmp_path: Path, *, residual: int) -> Path:
+        root = tmp_path / 'archive'
+        enc_dir = root / '2573' / self.WT_ENC
+        _write_session(
+            enc_dir, 'migrated-session', WORKTREE_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        for i in range(residual):
+            # NOT valid gzip on purpose: the count must never open these, so
+            # bytes no decompressor would accept are the honest fixture.
+            (enc_dir / f'un-migrated-{i}.jsonl.gz').write_bytes(b'not gzip either')
+        return root
+
+    def _enumerate(self, tmp_path: Path, archive: Path):
+        return mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+
+    def test_residual_gz_is_counted_and_announced_once(self, tmp_path, caplog):
+        archive = self._archive_with_residue(tmp_path, residual=2)
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            records = self._enumerate(tmp_path, archive)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        message = warnings[0].getMessage()
+        assert '2' in message
+        assert '.jsonl.gz' in message
+        # Actionable on its own: it names the fix, not just the symptom.
+        assert 'migrate_transcript_archive_gunzip.py' in message
+        # And the residue costs nothing else: the migrated session still lands.
+        assert {r.path.name for r in records} == {'migrated-session.jsonl'}
+
+    def test_a_fully_migrated_archive_says_nothing(self, tmp_path, caplog):
+        archive = self._archive_with_residue(tmp_path, residual=0)
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            self._enumerate(tmp_path, archive)
+
+        # The signal is self-clearing — an operator who ran the sweep must not
+        # keep being told about a gap that no longer exists.
+        assert [r.getMessage() for r in caplog.records] == []
+
+    def test_count_residual_gz_never_opens_a_file(self, tmp_path):
+        # The fixtures are undecompressable, so a count that tried to read
+        # them would raise rather than answer. No gzip branch comes back.
+        archive = self._archive_with_residue(tmp_path, residual=3)
+        assert mod.count_residual_gz(archive) == 3
+
+    def test_count_residual_gz_on_an_absent_root_is_zero(self, tmp_path):
+        # Same posture as the walk itself: an archive root that does not exist
+        # yet is normal (the tree is git-ignored), not an error.
+        assert mod.count_residual_gz(tmp_path / 'does-not-exist') == 0
 
 
 class TestEnumerateSessionsInRange:

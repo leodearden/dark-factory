@@ -1218,7 +1218,20 @@ a one-off cost against ~2.1 TB free.
 The reader-side changes in task 3618 land at merge, but this migration runs
 later. In that window the legibility toolchain **under-reports** the archive:
 `_iter_archive_transcripts` now walks `rglob('*.jsonl')`, so a residual `.gz`
-is not enumerated at all — silently skipped rather than loudly failed.
+is not enumerated at all — skipped rather than loudly failed.
+
+The gap announces itself rather than relying on you to remember it:
+
+- `inventory._iter_archive_transcripts` counts the residue on every walk and
+  emits one greppable WARNING — `rg 'residual \*.jsonl.gz'` over the nightly
+  logs — naming the count and this runbook.
+- `memory_eval_transcript_corpus`'s coverage JSON carries a `residual_gz`
+  field, and its report says in words how many transcripts the run could not
+  see. That is separate from `transcripts_found` and from `parse_failures`:
+  the residue was never found, and never failed to parse.
+
+Both are counts, not reads — no reader reopens a gzip stream — and both go to
+zero on their own once you have run the sweep.
 
 This is a known, accepted cost of not letting an agent delete live data, not
 a defect. It closes when you complete the sequence above. Validation for the

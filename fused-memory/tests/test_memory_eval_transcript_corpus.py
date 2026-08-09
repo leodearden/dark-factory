@@ -1196,6 +1196,63 @@ class TestReaderBindings:
         import legibility.inventory  # type: ignore[reportMissingImports]
         assert _mod.iter_json_lines is legibility.inventory.iter_json_lines
 
+    def test_residual_gz_count_is_the_imported_function(self):
+        # Same rule for "what counts as residual": one answer, in the module
+        # that owns the archive walk, not a second glob written here.
+        import legibility.inventory  # type: ignore[reportMissingImports]
+        assert _mod.count_residual_gz is legibility.inventory.count_residual_gz
+
+
+class TestResidualGzIsDisclosed:
+    """A transcript still gzipped is not enumerated at all, so it cannot show
+    up as a parse failure — it shows up as nothing.
+
+    Between this merge and the human-operated migration sweep the archive can
+    hold thousands of them, and a corpus short by that many would otherwise be
+    indistinguishable from a complete scan of a smaller archive. The coverage
+    says how many it could not see; the report says it in words.
+    """
+
+    GOOD_REL = '2280/-enc-a/readable.jsonl'
+
+    def _tree(self, tmp_path: Path, *, residual: int) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [
+            _tool_use('toolu_1', 'a search that is visible'),
+            _tool_result('toolu_1', {'results': [_result('a', 0.9)]}),
+        ])
+        for i in range(residual):
+            # Not valid gzip: the count must never open these.
+            (root / '2280' / '-enc-a' / f'stale-{i}.jsonl.gz').write_bytes(b'nope')
+        return root
+
+    def test_coverage_names_what_the_walk_could_not_see(self, tmp_path):
+        _, coverage, records, _ = _run_cli(
+            self._tree(tmp_path, residual=2), tmp_path / 'out')
+
+        assert coverage['residual_gz'] == 2
+        # Not conflated with either counter it could be mistaken for: the
+        # residue was never found, and never failed to parse.
+        assert coverage['transcripts_found'] == 1
+        assert coverage['parse_failures']['count'] == 0
+        assert [r['query'] for r in records] == ['a search that is visible']
+
+    def test_the_report_says_it_in_words(self, tmp_path):
+        _, _, _, report = _run_cli(
+            self._tree(tmp_path, residual=2), tmp_path / 'out')
+
+        assert 'gzipped' in report
+        assert 'migrate_transcript_archive_gunzip.py' in report
+
+    def test_a_migrated_archive_reports_zero_and_says_nothing(self, tmp_path):
+        # Always present, even at zero — an absent counter reads as "not
+        # measured", a different claim. But the prose is self-clearing.
+        _, coverage, _, report = _run_cli(
+            self._tree(tmp_path, residual=0), tmp_path / 'out')
+
+        assert coverage['residual_gz'] == 0
+        assert 'gzipped' not in report
+
 
 class TestSingleTranscriptMode:
     """``--transcript`` drives the SAME core through the OTHER reader."""

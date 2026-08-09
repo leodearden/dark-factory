@@ -222,7 +222,10 @@ if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
 # from fused-memory/ whose extraPaths cannot see repo-root scripts/. Same
 # situation, same idiom, as escalation/'s imports of orchestrator.*.
 from legibility.digest import load_transcript  # type: ignore[reportMissingImports]  # noqa: E402
-from legibility.inventory import iter_json_lines  # type: ignore[reportMissingImports]  # noqa: E402
+from legibility.inventory import (  # type: ignore[reportMissingImports]  # noqa: E402
+    count_residual_gz,
+    iter_json_lines,
+)
 from shared.memory_eval_metrics import (  # noqa: E402
     RUN_STAMP_ENV_VAR,
     MetricSchemaError,
@@ -658,6 +661,11 @@ def _new_coverage() -> dict[str, Any]:
         'tasks_scanned': 0,
         'transcripts_found': 0,
         'transcripts_read': 0,
+        # Archived transcripts still in the pre-3618 gzipped form, which the
+        # walk does not enumerate at all. Zero once the human-operated
+        # migration sweep has run; non-zero it says, in a field rather than by
+        # omission, exactly how much of the archive this run could not see.
+        'residual_gz': 0,
         'searches_extracted': 0,
         'searches_unresolved': 0,
         'parse_failures': {
@@ -753,6 +761,13 @@ def scan_archive(
         records.extend(extracted)
 
     coverage['tasks_scanned'] = len(tasks)
+    # What the walk could NOT see. `iter_transcripts` globs `*.jsonl` only, so
+    # a residual `.jsonl.gz` is absent from `transcripts_found` rather than
+    # counted as a failure — an under-report indistinguishable from a smaller
+    # archive, which is the one thing this coverage exists to prevent. Counted
+    # through inventory's helper (never a second answer to "what is residual"),
+    # and it costs no read.
+    coverage['residual_gz'] = count_residual_gz(root)
     coverage['searches_extracted'] = len(records)
     coverage['searches_unresolved'] = sum(
         1 for record in records if record['result_status'] != 'ok'
@@ -942,6 +957,18 @@ def render_report(coverage: Mapping[str, Any]) -> str:
         lines.append(
             '  DEGRADED — some transcripts were unreadable. The corpus is '
             'usable but incomplete by exactly the count above.'
+        )
+
+    residual_gz = coverage.get('residual_gz', 0)
+    if residual_gz:
+        # Not a parse failure — these were never opened, or even listed. Said
+        # in words next to the counters, because a corpus that is short by
+        # thousands of transcripts otherwise reads as a complete small one.
+        lines.append(
+            f'  NOTE: {residual_gz} archived transcript(s) are still gzipped '
+            'and were NOT enumerated. Run '
+            'scripts/migrate_transcript_archive_gunzip.py --apply '
+            '(OPERATIONS.md §13); this note clears itself once you have.'
         )
 
     examples = failures.get('examples') or []
