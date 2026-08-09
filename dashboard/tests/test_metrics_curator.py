@@ -2185,3 +2185,65 @@ async def test_get_curator_sparks_shape_is_unchanged_by_the_refusal_signal():
     assert set((await get_curator_sparks(None, days=1)).keys()) == {
         'pending', 'p50', 'p90', 'p99',
     }
+
+
+# ---------------------------------------------------------------------------
+# task-3871: fan_out_list_tickets threads its budget into mcp_tool_call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_threads_its_budget_to_mcp_tool_call(tmp_path: Path):
+    """The sampler's own budget — not mcp_tool_call's 10s default — is used.
+
+    fan_out_list_tickets already declares a ``timeout`` and wraps each call in
+    asyncio.wait_for, but it dropped that budget on the floor when invoking
+    mcp_tool_call, so each underlying post ran to httpx's 10s default — which
+    also governs pool acquisition on the shared client. Contract-level: the
+    caller's budget must reach the callee.
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    mock_mcp = AsyncMock(return_value={'count': 1, 'tickets': [], 'project_id': 'p'})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            await fan_out_list_tickets(http_client, cfg, timeout=0.25)
+
+    assert mock_mcp.call_count == 1, f'expected one call, got {mock_mcp.call_count}'
+    assert mock_mcp.call_args.kwargs.get('timeout') == 0.25, (
+        f"fan_out_list_tickets must hand its own budget to mcp_tool_call, not "
+        f"leave it at the 10s default; got "
+        f"{mock_mcp.call_args.kwargs.get('timeout')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_default_budget_is_the_sampler_timeout(
+    tmp_path: Path,
+):
+    """Guard: the default stays _HTTP_SAMPLER_TIMEOUT_SECONDS (5.0), unraised."""
+    from dashboard.data.metrics import (
+        _HTTP_SAMPLER_TIMEOUT_SECONDS,
+        fan_out_list_tickets,
+    )
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    mock_mcp = AsyncMock(return_value={'count': 1, 'tickets': [], 'project_id': 'p'})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            await fan_out_list_tickets(http_client, cfg)
+
+    assert mock_mcp.call_args.kwargs.get('timeout') == _HTTP_SAMPLER_TIMEOUT_SECONDS
