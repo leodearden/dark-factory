@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeMetadataBackend
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
 
 from orchestrator.artifacts import TaskArtifacts
@@ -107,19 +107,10 @@ def _make(
     scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
     scheduler.update_task = update_task
     if metadata_backend is not None:
-        # Keep the MagicMock scheduler (so every other auto-mocked attribute
-        # still works) but route the three metadata-bearing methods through the
-        # merge-faithful backend, seeded from the same blob the workflow starts
-        # with in memory — as production is at dispatch time.
-        metadata_backend.blob = {**dict(task_md), **metadata_backend.blob}
-        metadata_backend.blast_radius_result = blast_radius_grants
-        handle_blast_radius_expansion = AsyncMock(
-            side_effect=metadata_backend.handle_blast_radius_expansion,
+        handle_blast_radius_expansion, update_task = wire_metadata_backend(
+            scheduler, metadata_backend,
+            seed=task_md, grants=blast_radius_grants,
         )
-        update_task = AsyncMock(side_effect=metadata_backend.update_task)
-        scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
-        scheduler.update_task = update_task
-        scheduler.get_task = AsyncMock(side_effect=metadata_backend.get_task)
 
     git_ops = MagicMock()
     git_ops.is_ancestor = AsyncMock(return_value=True)
@@ -501,3 +492,42 @@ async def test_optimistic_stamp_preserves_widened_files(tmp_path: Path):
     assert backend.blob['files'] == ['mod_a/src/foo.py', 'mod_b/src/bar.py']
     assert backend.blob['optimistic_path'] == 'simple_task'
     assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_mirrors_in_memory_when_persist_fails(
+    tmp_path: Path,
+):
+    """Task 3579: the in-memory mirror sits OUTSIDE the scheduler-write try, so
+    a failed persist must still leave optimistic_path readable in-process (the
+    harness auto-eval hook reads it there) and must not change the outcome."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_good_plan(),
+    )
+    f.wf.scheduler.update_task = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=RuntimeError('backend down'),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    # Non-vacuity: the raising write really was attempted.
+    assert f.wf.scheduler.update_task.await_count >= 1  # type: ignore[attr-defined]
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_survives_non_dict_metadata(tmp_path: Path):
+    """Task 3579: the mirror normalises a None/non-dict metadata before
+    assigning. ``setdefault`` would return the existing None and raise
+    TypeError — which, sitting outside the try, would escape this
+    fire-and-forget stamp into its caller."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    for corrupt in (None, '{"files": []}', ['not', 'a', 'dict']):
+        f.wf.task['metadata'] = corrupt
+
+        await f.wf._stamp_optimistic_path('simple_task')
+
+        assert f.wf.task['metadata'] == {'optimistic_path': 'simple_task'}
