@@ -1367,6 +1367,133 @@ class TestTargetedCorrection:
 
 
 # ===========================================================================
+# Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
+# ===========================================================================
+
+class TestFlagForStage2IsNeverDeleted:
+    """The cross-check must never widen the delete set. Guard against a
+    future well-meaning edit that turns the census into a deletion.
+
+    Why this boundary is load-bearing, from live measurement (2026-08-09):
+
+    1. 23 of the 61 live flag_for_stage2 records carry NO usable task_id, so
+       this script's existing find_taskless_markers predicate would delete
+       all 23 on the very next nightly --apply run. Those are LIVE Stage-1 ->
+       Stage-2 relay markers, not dead weight. The nightly timer runs
+       --apply --terminal-drain, which would additionally reap markers citing
+       already-done tasks.
+    2. This script's delete_orphan_markers has NEITHER the
+       is_protected_mirror_record guard NOR the record_mem0_deletion_tombstones
+       write that the shared in-cycle _sweep_stale_mem0_pool applies.
+       flag_for_stage2 is an LLM-supplied key any writer can stamp on any
+       record — mem0_tombstone.py's module docstring names this exact filter
+       as its motivating over-breadth case.
+    3. The pool is already drained correctly, on a rolling 14-day window, by
+       the in-cycle _sweep_stale_mem0_flag_for_stage2_markers (task 2966).
+
+    So the probe is count-only by design, and this class is what stops that
+    from silently regressing.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=True, project_id='dark_factory', max_age_days=14,
+        )
+
+    @pytest.mark.asyncio
+    async def test_census_never_widens_the_delete_set(self):
+        """--apply + --terminal-drain + a 61-record adjacent population:
+        only scrolled, source-filtered members are ever deleted."""
+        # The scroll returns the source-filtered population only. 'keep1' is
+        # dated, non-terminal and has a task_id, so no predicate catches it.
+        members = [
+            _member('keep1', task_id='1970'),
+            _member('term1', task_id='2440'),   # terminal -> deleted
+            _taskless('taskless1'),             # no task_id -> deleted
+        ]
+        # Ids that live in the adjacent flag_for_stage2 pool. They are never
+        # scrolled, so they can only reach the delete set via a regression.
+        forbidden_ids = {'ffs2-a', 'ffs2-b', 'ffs2-c'}
+
+        memory_service = AsyncMock()
+        # [before_source, before_kind, flag_for_stage2 probe, after_source, after_kind]
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[3, 3, 61, 1, 1]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+            terminal_task_ids={'2440'},
+        )
+
+        # The blind spot IS reported — the census did its job.
+        assert report['cross_check']['flag_for_stage2_total'] == 61
+        assert report['cross_check']['blind_spot'] is False  # source_total is 3
+
+        # (a) Every delete targets an id drawn from the scrolled members.
+        scrolled_ids = {m['id'] for m in members}
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'term1', 'taskless1'}
+        assert deleted_ids <= scrolled_ids
+
+        # (b) Nothing from the adjacent pool is touched, by id or by filter.
+        assert not (deleted_ids & forbidden_ids)
+        for call in memory_service.delete_memory.call_args_list:
+            assert 'filters' not in call.kwargs, (
+                'delete_memory must be called per-id, never with a bulk '
+                f'filter: {call.kwargs}'
+            )
+            assert 'flag_for_stage2' not in repr(call.kwargs)
+
+        # (c) The enumeration was NOT widened: exactly one scroll, on source.
+        memory_service.get_memories_by_metadata.assert_called_once()
+        scroll_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert scroll_kwargs['filters'] == {'source': _mod.MARKER_SOURCE}
+        assert 'flag_for_stage2' not in scroll_kwargs['filters']
+
+    @pytest.mark.asyncio
+    async def test_probe_only_ever_counts_never_scrolls(self):
+        """The adjacent filter appears in count calls only — never in a
+        get_memories_by_metadata scroll, which is the only way records could
+        become delete-set candidates."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[0, 0, 61, 0, 0]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.run(
+            self._args(), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        scroll_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert all(
+            'flag_for_stage2' not in (f or {}) for f in scroll_filters
+        ), f'Adjacent filter leaked into a scroll: {scroll_filters}'
+
+        count_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in count_filters
+        memory_service.delete_memory.assert_not_called()
+
+
+# ===========================================================================
 # Tests: enumeration_blind_spot (task 3897)
 # ===========================================================================
 
