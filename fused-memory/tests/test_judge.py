@@ -1,5 +1,6 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1220,6 +1221,79 @@ async def test_error_trend_phantom_minor_still_breaks_streak(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_logs_structured_record_when_phantoms_excluded(
+    mock_journal, caplog,
+):
+    """Discarding phantom evidence must be loud, not silent: an operator
+    looking at a run that did NOT halt must be able to tell "no trend"
+    apart from "trend evidence was discounted as phantom" (task 3070's
+    loud-over-silent-degradation requirement).
+
+    Fails on current main: _check_error_trends drops phantoms from the
+    evidence set with no log record at all.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    marked_finding = {
+        'issue': 'Judge response could not be parsed: boom',
+        'severity': 'serious',
+        'code': 'unparseable_judge_response',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+    # oldest -> newest: moderate, moderate, phantom-serious, phantom-serious
+    # (run-2, run-3 per _make_verdicts' f'run-{i}' naming).
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'serious', 'serious'],
+        findings_by_index={2: [marked_finding], 3: [marked_finding]},
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert len(excluded) == 1, (
+        f"Expected exactly one phantom-excluded log record, got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    record = excluded[0]
+    assert getattr(record, 'project_id', None) == 'proj'
+    assert getattr(record, 'excluded_count', None) == 2
+    assert set(getattr(record, 'excluded_run_ids', [])) == {'run-2', 'run-3'}
+
+
+@pytest.mark.asyncio
+async def test_error_trend_no_log_when_no_phantoms_excluded(mock_journal, caplog):
+    """Companion silence assertion: a trend run over verdicts with NO
+    phantoms must not emit the phantom-excluded record at all."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['minor'] * 10)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert excluded == []
 
 
 @pytest.mark.asyncio
