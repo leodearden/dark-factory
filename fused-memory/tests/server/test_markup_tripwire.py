@@ -722,78 +722,6 @@ class TestEmitMarkupStormEscalation:
         monkeypatch.setattr(markup_tripwire.EscalationQueue, 'get_by_task', _boom)
         assert emit_markup_storm_escalation(str(tmp_path), _STORM) is not None
 
-
-# ---------------------------------------------------------------------------
-# INV-5: the envelope literals are enumerated ONCE, in shared.toolcall_markup.
-# ---------------------------------------------------------------------------
-
-#: The opening angle bracket, built rather than typed. Spelling it verbatim here
-#: would force any agent editing this file to emit it inside its own tool-call
-#: envelope — the sentinel-literal hazard that
-#: ``fused_memory/utils/toolcall_xml_leak.py`` documents at length.
-_ANGLE = chr(0x3c)
-
-
-def _envelope_literal_assignment_sites() -> list[tuple[str, list[str]]]:
-    """Every assignment under ``fused-memory/src`` that re-enumerates literals.
-
-    Returns ``(module, bound_names)`` for each assignment whose value is a tuple
-    or list literal containing at least one string that opens with an angle
-    bracket. Deliberately shape-based rather than name-based: renaming the
-    constant must not buy an exemption.
-    """
-    src = Path(__file__).resolve().parents[2] / 'src'
-    assert src.is_dir(), f'expected the package source at {src}'
-    sites: list[tuple[str, list[str]]] = []
-    for path in sorted(src.rglob('*.py')):
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            if isinstance(node, ast.Assign):
-                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-                value = node.value
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                names = [node.target.id]
-                value = node.value
-            else:
-                continue
-            if not isinstance(value, (ast.Tuple, ast.List)):
-                continue
-            strings = [
-                element.value
-                for element in value.elts
-                if isinstance(element, ast.Constant) and isinstance(element.value, str)
-            ]
-            if any(text.startswith(_ANGLE) for text in strings):
-                sites.append((str(path.relative_to(src)), names))
-    return sites
-
-
-class TestSingleSourceOfTruth:
-    """INV-5, enforced from the consumer side."""
-
-    def test_mcp_markup_patterns_is_the_shared_object(self):
-        """IDENTITY, not equality — a copied tuple would re-open the drift.
-
-        ``==`` is satisfied by a tuple re-spelled here with the same value,
-        which is precisely the state this task exists to end: this write-time
-        list and ``toolcall_xml_leak``'s read-time list drifted apart while both
-        were documented as the single source of truth. Object identity is the
-        one assertion a duplicate cannot pass.
-        """
-        assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
-
-    def test_no_third_enumeration_site_in_the_package(self):
-        """AST walk: nothing under ``fused-memory/src`` re-enumerates them.
-
-        The test-side twin of the capability manifest's ``expect: absent`` grep.
-        The grep pins one spelling; this pins the SHAPE, so a third site cannot
-        slip in under a different name or with the literals reordered.
-        """
-        sites = _envelope_literal_assignment_sites()
-        assert sites == [], (
-            'these assignments re-enumerate the envelope literals; import them '
-            f'from shared.toolcall_markup instead: {sites!r}'
-        )
-
     def test_returns_none_when_the_escalation_package_is_unavailable(
         self, tmp_path, monkeypatch
     ):
@@ -824,3 +752,160 @@ class TestSingleSourceOfTruth:
         assert payload['task_id'] == 'markup-tripwire'
         assert payload['detail'], f'a detail is still required: {payload!r}'
         assert '3083' in payload['detail'], f'must still route to DF 3083: {payload!r}'
+
+
+# ---------------------------------------------------------------------------
+# INV-5: the envelope literals are enumerated ONCE, in shared.toolcall_markup.
+#
+# Kept at END OF FILE deliberately: an INV-5 block spliced into the middle of a
+# test class silently adopts every method below the splice point, which is how
+# the escalation cases above briefly became methods of TestSingleSourceOfTruth.
+# Append new blocks here rather than inserting them.
+# ---------------------------------------------------------------------------
+
+#: The opening angle bracket, built rather than typed. Spelling it verbatim here
+#: would force any agent editing this file to emit it inside its own tool-call
+#: envelope — the sentinel-literal hazard that
+#: ``fused_memory/utils/toolcall_xml_leak.py`` documents at length.
+_ANGLE = chr(0x3c)
+
+#: The two envelope SHAPES: a closing tag, and the canonical opener prefix.
+#: Narrow on purpose. A bare ``startswith(_ANGLE)`` would also flag any future
+#: constant that merely holds angle-bracket data — a list of HTML tags, an XML
+#: element table, a comparison-operator vocabulary, a dashboard template
+#: fragment — and fail it with a message telling its author to import from
+#: shared.toolcall_markup, which would be the wrong-shaped fix. A residual
+#: over-report remains by design: an enumeration of CLOSING tags of any name
+#: still trips this, because inside this package that is exactly the shape
+#: worth a second look before it becomes a third enumeration site.
+_ENVELOPE_PREFIXES = (_ANGLE + '/', _ANGLE + 'parameter name=')
+
+#: Call names whose single literal argument is still a literal collection, e.g.
+#: ``frozenset(('\x3c/content>',))``.
+_COLLECTION_CALLS = frozenset({'tuple', 'list', 'set', 'frozenset'})
+
+
+def _collection_strings(node: ast.expr | None) -> list[str] | None:
+    """The string constants of a literal collection, or ``None`` if not one.
+
+    Handles tuple/list/set displays, ``+`` concatenation (so appending literals
+    to an imported tuple — ``PREFILTER_NEEDLES + ('\x3c/foo>',)`` — is still
+    seen), and a single-argument ``tuple``/``list``/``set``/``frozenset`` call
+    wrapping one of those.
+
+    KNOWN GAPS — this is a ratchet, not a proof of impossibility. Literals
+    reached only through dict values, comprehensions, a helper function's
+    return, ``str.split()`` on one long string, or assembled at runtime from
+    ``chr(60)`` are NOT seen. Two other layers cover what slips past: the
+    capability manifest's ``expect: absent`` grep pins the one historical
+    spelling, and the identity assertions in this class mean a second
+    enumeration cannot be *used* by these consumers without failing loudly.
+    """
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [
+            element.value
+            for element in node.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        ]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _collection_strings(node.left)
+        right = _collection_strings(node.right)
+        if left is None and right is None:
+            return None
+        return (left or []) + (right or [])
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _COLLECTION_CALLS
+        and len(node.args) == 1
+    ):
+        return _collection_strings(node.args[0])
+    return None
+
+
+def _envelope_literal_assignment_sites() -> list[tuple[str, list[str]]]:
+    """Every assignment under ``fused-memory/src`` that re-enumerates literals.
+
+    Returns ``(module, bound_names)`` for each assignment whose value is a
+    literal collection (see :func:`_collection_strings` for the shapes covered
+    and the known gaps) containing at least one ENVELOPE-SHAPED string — a
+    closing tag or the canonical opener prefix. Deliberately shape-based rather
+    than name-based: renaming the constant must not buy an exemption.
+    """
+    src = Path(__file__).resolve().parents[2] / 'src'
+    assert src.is_dir(), f'expected the package source at {src}'
+    sites: list[tuple[str, list[str]]] = []
+    for path in sorted(src.rglob('*.py')):
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                value = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names = [node.target.id]
+                value = node.value
+            else:
+                continue
+            strings = _collection_strings(value)
+            if not strings:
+                continue
+            if any(text.startswith(_ENVELOPE_PREFIXES) for text in strings):
+                sites.append((str(path.relative_to(src)), names))
+    return sites
+
+
+class TestSingleSourceOfTruth:
+    """INV-5, enforced from the consumer side."""
+
+    def test_mcp_markup_patterns_is_the_shared_object(self):
+        """IDENTITY, not equality — a copied tuple would re-open the drift.
+
+        ``==`` is satisfied by a tuple re-spelled here with the same value,
+        which is precisely the state this task exists to end: this write-time
+        list and ``toolcall_xml_leak``'s read-time list drifted apart while both
+        were documented as the single source of truth. Object identity is the
+        one assertion a duplicate cannot pass.
+        """
+        assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
+
+    def test_no_third_enumeration_site_in_the_package(self):
+        """AST walk: nothing under ``fused-memory/src`` re-enumerates them.
+
+        The test-side twin of the capability manifest's ``expect: absent`` grep.
+        The grep pins one spelling; this pins the SHAPE, so a third site cannot
+        slip in under a different name or with the literals reordered.
+        """
+        sites = _envelope_literal_assignment_sites()
+        assert sites == [], (
+            'these assignments spell envelope literals (a closing tag or the '
+            'canonical opener prefix) inline; import them from '
+            f'shared.toolcall_markup instead: {sites!r}'
+        )
+
+    def test_the_walk_would_catch_a_reintroduced_enumeration(self):
+        """The pin above is only worth its green if it can go red.
+
+        A shape check that silently matches nothing is indistinguishable from a
+        passing one, so exercise the predicate on a synthetic module carrying a
+        re-spelled tuple, and on a decoy holding unrelated angle-bracket data
+        that must NOT be flagged.
+        """
+        offender = ast.parse(
+            'PATTERNS: tuple[str, ...] = ("' + _ANGLE + '/content>", "x")\n'
+        )
+        decoy = ast.parse('HTML_TAGS = ("' + _ANGLE + 'div>", "' + _ANGLE + 'p>")\n')
+
+        def strings_of(tree):
+            return [
+                _collection_strings(node.value)
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+            ]
+
+        assert any(
+            any(text.startswith(_ENVELOPE_PREFIXES) for text in (found or []))
+            for found in strings_of(offender)
+        ), 'the predicate must flag a re-spelled envelope literal'
+        assert not any(
+            any(text.startswith(_ENVELOPE_PREFIXES) for text in (found or []))
+            for found in strings_of(decoy)
+        ), 'unrelated angle-bracket data must not be flagged'

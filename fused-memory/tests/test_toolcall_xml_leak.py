@@ -32,6 +32,7 @@ file being written. The escaped form is byte-identical at runtime.
 """
 from __future__ import annotations
 
+import importlib
 import re
 
 import pytest
@@ -371,11 +372,25 @@ class TestSingleSourceOfTruth:
         )
         assert toolcall_xml_leak.LEAK_TAIL.flags & re.DOTALL
 
-    def test_leak_tail_stays_a_single_compiled_object(self) -> None:
+    def test_leak_tail_stays_a_module_level_compiled_object(self) -> None:
         """``scripts/tests/test_scan_task_toolcall_leaks.py`` asserts
-        ``scan_task_toolcall_leaks.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL``.
-        Rebuilding the pattern behind a module ``__getattr__`` or a property
-        would satisfy every value assertion above and still break that `is`.
+        ``scan_task_toolcall_leaks.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL``,
+        so LEAK_TAIL must be one compiled object bound in the module dict.
+
+        ``LEAK_TAIL is LEAK_TAIL`` would NOT pin that: it is a tautology for a
+        plain attribute, and even a module-level ``__getattr__`` recomputing
+        ``re.compile(SAME_PATTERN, re.DOTALL)`` per access satisfies it, since
+        ``re`` memoises compiled patterns by ``(pattern, flags)`` in
+        ``re._cache`` (verified: two such calls return the same object). What
+        actually excludes a recomputing shim is membership in ``vars()`` — a
+        module ``__getattr__`` fires only for names ABSENT from the module
+        dict — plus identity across a second, independent import path.
         """
         assert isinstance(toolcall_xml_leak.LEAK_TAIL, re.Pattern)
-        assert toolcall_xml_leak.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL
+        assert 'LEAK_TAIL' in vars(toolcall_xml_leak), (
+            'LEAK_TAIL must be bound in the module dict, not synthesised by a '
+            'module-level __getattr__ — a per-access rebuild would break the '
+            'cross-module `is` in scripts/tests/test_scan_task_toolcall_leaks.py'
+        )
+        reimported = importlib.import_module('fused_memory.utils.toolcall_xml_leak')
+        assert reimported.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL
