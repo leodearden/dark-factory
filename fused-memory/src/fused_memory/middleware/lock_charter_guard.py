@@ -406,6 +406,9 @@ def lock_charter_error(
             'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
             'shared/src/shared/locking.py and '
             'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
-            'plus the _CANONICAL_EXTENSIONLESS vector in both test copies.'
+            'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
+            'must agree — the Tier-2 --list-extensionless drift guard goes RED '
+            'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
+            'copies.'
         ),
     }

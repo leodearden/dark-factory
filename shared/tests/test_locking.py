@@ -661,6 +661,9 @@ class TestExtensionlessFilenames:
             + '\nAdd each name to EXTENSIONLESS_FILENAMES in '
             'shared/src/shared/locking.py AND '
             'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+            'and to reify scripts/lock-charter-guard.sh _EXTLESS (all three must '
+            'agree — omitting reify reds '
+            'test_extensionless_drift_guard_vs_reify_script), '
             'plus _CANONICAL_EXTENSIONLESS and _EXTENSIONLESS_ACCEPT_PATHS in '
             'both test copies.'
         )

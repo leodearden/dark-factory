@@ -65,6 +65,39 @@ _CANONICAL_EXTENSIONS = [
 _REIFY_GUARD_SCRIPT = Path(__file__).parents[5] / 'reify' / 'scripts' / 'lock-charter-guard.sh'
 
 
+def _reify_guard_vector(flag: str) -> list[str]:
+    """Return the sorted vector emitted by the reify guard script's *flag*.
+
+    LOUD on failure, by design, and the distinction is deliberate: the callers
+    are guarded by a ``skipif`` on the script's ABSENCE — a standalone checkout
+    legitimately has no reify sibling — but a script that EXISTS and then fails
+    is real signal and is raised, never skipped.
+
+    Measured 2026-08-09 on the live script: an unrecognised flag prints usage to
+    stderr and exits 2.  So the previous skip-on-any-non-zero would have retired
+    both Tier-2 guards the moment reify renamed or dropped an emitter, leaving
+    them green forever while enforcing nothing — the precise silent degradation
+    that the "three-way α/γ/bash agreement is ENFORCED rather than merely
+    asserted in prose" claim in both module docstrings rules out.
+    """
+    result = subprocess.run(
+        ['bash', str(_REIFY_GUARD_SCRIPT), flag],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f'reify {_REIFY_GUARD_SCRIPT.name} {flag} exited {result.returncode}, '
+        f'expected 0 — the emitter this cross-source drift guard depends on is '
+        f'gone, renamed, or broken.  Check `bash {_REIFY_GUARD_SCRIPT} --help`.  '
+        f'This is a HARD failure and not a skip on purpose: silently retiring a '
+        f'cross-source guard would let the three copies of the predicate diverge '
+        f'with every test in the tree still green.\n'
+        f'  stdout: {result.stdout[:400]!r}\n'
+        f'  stderr: {result.stderr[:400]!r}'
+    )
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
 def test_extension_drift_guard():
     """Tier-1 (same-file): sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
@@ -85,18 +118,11 @@ def test_extension_drift_guard_vs_reify_script():
     Invokes the real scripts/lock-charter-guard.sh --list-extensions and
     compares its output to sorted(FILE_EXTENSIONS), catching any α/γ divergence
     that the same-file Tier-1 guard would miss.
+
+    A present-but-failing script is a hard failure, not a skip — see
+    _reify_guard_vector.
     """
-    result = subprocess.run(
-        ['bash', str(_REIFY_GUARD_SCRIPT), '--list-extensions'],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        pytest.skip(
-            f'reify script exited with code {result.returncode}; '
-            f'stderr: {result.stderr[:200]}'
-        )
-    script_exts = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    script_exts = _reify_guard_vector('--list-extensions')
     assert script_exts == sorted(FILE_EXTENSIONS), (
         f'α/γ drift detected!\n'
         f'  reify --list-extensions : {script_exts!r}\n'
@@ -370,24 +396,20 @@ def test_extensionless_drift_guard_vs_reify_script():
     could pin against it.  ``classify hooks/project-checks`` returns ACCEPT.  So
     no follow-up is owed, and the seam is CONVERGED — this test is what keeps it
     that way.
+
+    A present-but-failing script is a hard failure, not a skip — see
+    _reify_guard_vector.  That matters more here than for the extension half:
+    ``--list-extensionless`` is the NEWER emitter (reify #5890), so it is the
+    likelier of the two to be renamed or dropped upstream.
     """
-    result = subprocess.run(
-        ['bash', str(_REIFY_GUARD_SCRIPT), '--list-extensionless'],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        pytest.skip(
-            f'reify script exited with code {result.returncode}; '
-            f'stderr: {result.stderr[:200]}'
-        )
-    script_names = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    script_names = _reify_guard_vector('--list-extensionless')
     assert script_names == sorted(EXTENSIONLESS_FILENAMES), (
         f'α/γ/bash drift detected on the extension-less vector!\n'
         f'  reify --list-extensionless : {script_names!r}\n'
         f'  γ EXTENSIONLESS_FILENAMES  : {sorted(EXTENSIONLESS_FILENAMES)!r}\n'
         f'Update EXTENSIONLESS_FILENAMES here, in shared/src/shared/locking.py, '
-        f'and _CANONICAL_EXTENSIONLESS in both test copies, to match reify.'
+        f"and reify's own scripts/lock-charter-guard.sh _EXTLESS, plus "
+        f'_CANONICAL_EXTENSIONLESS in both test copies — all five places.'
     )
 
 
@@ -747,6 +769,8 @@ def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: P
         + '\nAdd each name to EXTENSIONLESS_FILENAMES in '
         'shared/src/shared/locking.py AND '
         'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+        'and to reify scripts/lock-charter-guard.sh _EXTLESS (all three must '
+        'agree — omitting reify reds test_extensionless_drift_guard_vs_reify_script), '
         'plus _CANONICAL_EXTENSIONLESS and _EXTENSIONLESS_ACCEPT_PATHS in '
         'both test copies.'
     )
