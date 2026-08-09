@@ -7390,6 +7390,74 @@ class TestSweepStaleMem0FlagMarkers:
         memory_service.count_memories_by_metadata.assert_not_awaited()
         memory_service.get_memories_by_metadata.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_kind_only_marker_without_source_is_enumerated_and_deleted(self):
+        """Regression pin for task 3915 (measured root cause C): the live
+        leaked marker a5732b3b carries metadata.kind='stage1_flag_marker'
+        with NO 'source' key at all — written by an LLM recon add_memory
+        call that omitted 'source' (the canonical retired writer,
+        flag_dedup.py:849-856, always set BOTH keys; this record did not go
+        through it). Pre-fix, this sweep enumerates ONLY
+        {'source': 'stage1_flag_marker'}, which matches zero records for
+        this marker in know_live; combined with count_short_circuit=True,
+        the scroll never even runs, so the record is invisible forever —
+        present-and-zero, indistinguishable from a clean pool. Fixed
+        behaviour must ALSO probe {'kind': 'stage1_flag_marker'} and delete
+        what it finds there. Uses the exact measured live record shape
+        (memory_id, metadata, 37-day age) from get_memory_by_id."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        live_marker = {
+            'id': 'a5732b3b-801d-4113-b9e3-ca67f72c822b',
+            'created_at': (fixed_now - timedelta(days=37)).isoformat(),
+            'metadata': {
+                'kind': 'stage1_flag_marker',
+                'task_id': 'dark_factory:1943',
+                'flag_type': 'stale_flag_marker_cleanup',
+                'confidence': 'verified',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+            },
+        }
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [live_marker]
+            return []
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return 1
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        call = memory_service.delete_memory.call_args
+        assert call.kwargs.get('memory_id') == 'a5732b3b-801d-4113-b9e3-ca67f72c822b'
+        assert call.kwargs.get('store') == 'mem0'
+        assert call.kwargs.get('causation_id') == 'r1'
+        assert call.kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
+
+        scrolled_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
+
 
 class TestSweepStaleMem0FlagForStage2Markers:
     """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
