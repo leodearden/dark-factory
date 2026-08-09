@@ -1055,6 +1055,7 @@ class RealMergeItem:
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     cap_permit: CapPermit | None = None  # θ: merge-ahead-cap token owned by PermitLedger; non-None for non-speculative, non-train successful merges (Mechanism 1)
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    remerge_recovery: bool = False  # task 3206 / PRD §5.3 re-merge carve-out: True → produced by _remerge (a RECOVERY re-merge onto real main), so the §5.3 verify-base⊄frozen-tip guard is exempt. Set ONLY by _remerge (single producer, all five consumer paths); default False keeps every other construction site and every dataclasses.replace unchanged.
 
 
 @dataclass
@@ -1079,6 +1080,7 @@ class DecidedItem:
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    remerge_recovery: bool = False  # task 3206 / PRD §5.3: mirrors RealMergeItem for chain parity — _remerge can return either variant, so both arms of the union carry the marker and no consumer has to type-narrow before reading it.
 
 
 SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem

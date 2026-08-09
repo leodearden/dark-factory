@@ -11258,6 +11258,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         if not isinstance(item, RealMergeItem) or not item.base_sha:
             return  # passthrough / conflict — not a real-verify candidate
+        if item.remerge_recovery:
+            # §5.3 RE-MERGE CARVE-OUT (task 3206): items produced by _remerge
+            # are RECOVERY re-merges that legitimately target real main rather
+            # than the frozen tip, so a mismatch here is correct by
+            # construction, not a violation.  Suppressed at BOTH §5.3 surfaces
+            # (see _verify_base_frozen_tip_violations) so they cannot disagree.
+            return
         expected_tip = self.frozen_prefix_tip(main_sha)
         if item.base_sha.strip() == expected_tip.strip():
             return  # invariant holds
@@ -14575,6 +14582,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         — stays here, re-driving classify_and_merge a second time against a
         freshly-read main SHA (which also means the retry now gets its own
         full guard pass, including drop-guard).
+
+        §5.3 RE-MERGE CARVE-OUT (task 3206, PRD §5.3): every item returned
+        here carries ``remerge_recovery=True``.  This method is the SINGLE
+        PRODUCER of recovery items for all five consumer paths (_verifier_loop
+        head-failure cascade, _void_and_remerge INV-3 void, _finalize_inflight
+        RUNNER_UNAVAILABLE, and _dispatch_item's dead-base-straggler and
+        Mechanism-2/chain-invalidation sites), so setting the marker on all
+        five return paths below covers every site with no per-consumer edit.
+        Both §5.3 surfaces (:meth:`_warn_if_verify_base_not_frozen_tip` and
+        :meth:`_verify_base_frozen_tip_violations`) honour it, so they cannot
+        silently disagree.
+
+        ``base_sha=actual_main`` and ``speculative=False`` are ADJUDICATED and
+        must NOT be changed to stack on ``frozen_prefix_tip()``: (i) the
+        dead-base-straggler consumer exists to ESCAPE a base known dead, and
+        the frozen tip can itself be that dead/phantom commit — stacking on it
+        is a churn loop; (ii) ``speculative=False`` is load-bearing for
+        SpecPermit release symmetry (LATE-ARRIVAL ATTACH SYMMETRY note above,
+        ``item_permit`` in ``_dispatch_item``), so a non-main base with
+        ``speculative=False`` would be an internally inconsistent item and
+        flipping the flag risks a double-release; (iii) INV-3's adoption-time
+        void backstops the residual soundness gap.
         """
         actual_main = await self._git_ops.get_main_sha()
         result = await classify_and_merge(
@@ -14593,6 +14622,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 base_sha=actual_main, speculative=False,
                 merged_branch_tip=result.branch_tip,  # γ2: parity with merger loop
                 started_monotonic=started_monotonic,
+                remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 1/5)
             )
 
         # ── Speculation-race retry ─────────────────────────────────────────────
@@ -14660,6 +14690,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     base_sha=retry_main, speculative=False,
                     merged_branch_tip=retry.branch_tip,  # γ2: parity with merger loop
                     started_monotonic=started_monotonic,
+                    remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 2/5)
                 )
 
             # Retry Decided.  classify_and_merge already emitted whichever
@@ -14678,6 +14709,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     immediate_outcome=retry.outcome,
                     failure_diagnostic=retry_diag,
                     started_monotonic=started_monotonic,
+                    remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 3/5)
                 )
 
             # Retry non-conflict failure — combine μ diagnostics for BOTH attempts
@@ -14702,6 +14734,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
                 failure_diagnostic=combined_diag,
                 started_monotonic=started_monotonic,
+                remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 4/5)
             )
         # ── END speculation-race retry ─────────────────────────────────────────
 
@@ -14714,6 +14747,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             immediate_outcome=result.outcome,
             failure_diagnostic=result.outcome.failure_diagnostic,
             started_monotonic=started_monotonic,
+            remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 5/5)
         )
 
     def _resolve_or_drop_abandoned(
