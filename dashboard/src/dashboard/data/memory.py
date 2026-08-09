@@ -96,15 +96,23 @@ class McpSession:
         self._request_id += 1
         return self._request_id
 
-    async def _ensure_initialized(self, client: httpx.AsyncClient) -> None:
+    async def _ensure_initialized(
+        self, client: httpx.AsyncClient, timeout: float = 10,
+    ) -> None:
+        """Perform the initialize handshake once, under the caller's budget.
+
+        *timeout* is threaded into both handshake posts so a caller working
+        to a tight budget is not silently held to the 10s default while the
+        session warms up.
+        """
         if self._initialized:
             return
         await self._raw_call(client, 'initialize', {
             'protocolVersion': '2025-03-26',
             'capabilities': {},
             'clientInfo': {'name': 'dashboard', 'version': '0.1'},
-        })
-        await self._raw_notify(client, 'notifications/initialized')
+        }, timeout=timeout)
+        await self._raw_notify(client, 'notifications/initialized', timeout=timeout)
         self._initialized = True
 
     async def call_tool(
@@ -114,8 +122,12 @@ class McpSession:
         arguments: dict,
         timeout: float = 10,
     ) -> dict:
-        """Initialize (if needed), call a tool, return the inner result dict."""
-        await self._ensure_initialized(client)
+        """Initialize (if needed), call a tool, return the inner result dict.
+
+        *timeout* is a PER-HTTP-REQUEST budget applied to every post this
+        performs — up to three on a cold session (see :func:`mcp_tool_call`).
+        """
+        await self._ensure_initialized(client, timeout=timeout)
         rpc = await self._raw_call(
             client, 'tools/call',
             {'name': tool_name, 'arguments': arguments},
@@ -154,13 +166,14 @@ class McpSession:
         self,
         client: httpx.AsyncClient,
         method: str,
+        timeout: float = 10,
     ) -> None:
         payload: dict = {'jsonrpc': '2.0', 'method': method}
         headers = dict(MCP_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
         resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=10,
+            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
         )
         if resp.status_code not in (200, 202, 204):
             logger.warning('MCP notify %s returned %s', method, resp.status_code)
@@ -199,13 +212,28 @@ async def mcp_tool_call(
     base_url: str,
     tool_name: str,
     arguments: dict,
+    timeout: float = 10,
 ) -> dict:
     """Make a JSON-RPC tools/call request via a cached MCP session.
 
     Raises on HTTP or connection errors (caller is expected to catch).
+
+    *timeout* is a **per-HTTP-request** budget, not a whole-operation one. It
+    is handed to ``client.post``, so it bounds connect/read/write **and pool
+    acquisition** — the last of which is why threading it matters: a caller
+    working to a 2.0s budget would otherwise still block up to httpx's 10s
+    default waiting for a free connection slot.
+
+    Because it is per-request, it does **not** bound this call as a whole: a
+    *cold* session performs three posts (``initialize``,
+    ``notifications/initialized``, then ``tools/call``), so the worst case is
+    roughly ``3 * timeout`` plus the server's own think time. Callers needing
+    a hard whole-operation bound must still wrap this in
+    ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
+    the two layers are complementary rather than redundant.
     """
     session = _get_session(base_url)
-    return await session.call_tool(client, tool_name, arguments)
+    return await session.call_tool(client, tool_name, arguments, timeout=timeout)
 
 
 async def _first_success(
