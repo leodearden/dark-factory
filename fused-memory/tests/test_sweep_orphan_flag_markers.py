@@ -1635,6 +1635,82 @@ class TestResolveCheckExitCode:
         }
         assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
 
+    # -----------------------------------------------------------------
+    # --fail-on-blind-spot escalation (task 3897)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _blind_spot_report(blind_spot=True, probe_failed=False, total_source=0):
+        return {
+            'before': {'total_source': total_source, 'total_with_kind': total_source},
+            'cross_check': {
+                'source_total': total_source,
+                'flag_for_stage2_total': None if probe_failed else 61,
+                'blind_spot': blind_spot,
+                'probe_failed': probe_failed,
+            },
+        }
+
+    def test_blind_spot_does_not_change_exit_code_by_default(self):
+        """BACKWARD COMPATIBILITY, the load-bearing case.
+
+        scripts/fused-memory-flag-marker-check.sh is ALREADY wired as a
+        before_done.script predicate for a deterministic watch task. A blind
+        spot must not silently start failing that gate: without the opt-in
+        flag, a report with blind_spot=True and total_source=0 still holds.
+        """
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=False,
+        ) == 0
+
+    def test_blind_spot_fails_when_opted_in(self):
+        """With --fail-on-blind-spot, an observed blind spot is exit 1 even
+        though the backlog itself trivially 'holds' at 0."""
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_opted_in_without_blind_spot_falls_through_to_backlog_verdict(self):
+        """--fail-on-blind-spot only adds a failure mode; it never masks the
+        existing backlog verdict."""
+        holds = self._blind_spot_report(blind_spot=False, total_source=0)
+        assert _mod._resolve_check_exit_code(
+            holds, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        violated = self._blind_spot_report(blind_spot=False, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_even_when_opted_in(self):
+        """An UNOBSERVABLE population must not fail the gate.
+
+        A transient Qdrant blip would otherwise flap a deterministic
+        before_done predicate — the gate escalates on observed divergence
+        only, never on missing evidence.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+    def test_report_without_cross_check_block_does_not_raise(self):
+        """Defensive: an older/cached report shape with no cross_check key
+        resolves through the pre-existing backlog path rather than raising."""
+        report = {'before': {'total_source': 0, 'total_with_kind': 0}}
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        report_violated = {'before': {'total_source': 9, 'total_with_kind': 9}}
+        assert _mod._resolve_check_exit_code(
+            report_violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
 
 # ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
@@ -1661,6 +1737,17 @@ class TestBuildParser:
         assert args.check is False
         assert args.max_backlog == 0
         assert args.terminal_drain is False
+        # task 3897: OFF by default. The flag_for_stage2 pool is a healthy
+        # rolling 14-day window, so a gate keyed on its non-emptiness would
+        # fail forever — the same footgun already documented for
+        # --max-backlog 0 against undated markers.
+        assert args.fail_on_blind_spot is False
+
+    def test_fail_on_blind_spot_opt_in(self):
+        """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--fail-on-blind-spot'])
+        assert args.fail_on_blind_spot is True
 
     def test_max_age_days_override(self):
         """--max-age-days accepts an int override."""
