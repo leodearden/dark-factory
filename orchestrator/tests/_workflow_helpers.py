@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
+from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -190,6 +191,44 @@ class FakeScheduler:
         pass
 
 
+def _merge_values_additive(old: object, new: object) -> object:
+    """Port of fused-memory's ``_merge_values`` (sqlite_task_backend.py:3264).
+
+    Kept byte-for-byte faithful to the production rules so the fake's
+    ``'additive'`` mode cannot pin behaviour production does not have:
+
+    * both lists — concatenate then dedupe hashable items in stable
+      old-then-new order; fall back to plain concatenation if any item is
+      unhashable;
+    * both dicts — recurse over the union of keys, pass through keys present on
+      only one side;
+    * anything else (scalar collision, type mismatch) — **OLD wins**.
+    """
+    if isinstance(old, list) and isinstance(new, list):
+        combined = old + new
+        try:
+            seen: set = set()
+            deduped: list = []
+            for item in combined:
+                if item not in seen:
+                    seen.add(item)
+                    deduped.append(item)
+            return deduped
+        except TypeError:
+            return combined
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged: dict = {}
+        for key in old.keys() | new.keys():
+            if key in old and key in new:
+                merged[key] = _merge_values_additive(old[key], new[key])
+            elif key in old:
+                merged[key] = old[key]
+            else:
+                merged[key] = new[key]
+        return merged
+    return old
+
+
 class FakeMetadataBackend:
     """Merge-faithful ``metadata`` backend for workflow tests (task 3579).
 
@@ -198,14 +237,29 @@ class FakeMetadataBackend:
 
     - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
       ``Scheduler.update_task`` resolves (scheduler.py:3793-3799):
-      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``.
-      ``'merge'`` is shallow last-write-wins (supplied keys overwrite wholesale,
-      omitted keys are preserved), ``'replace'`` is a whole-blob overwrite, and
-      ``'additive'`` is list-union for list values / overwrite otherwise.
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, and
+      the same per-mode semantics ``_merge_metadata`` implements
+      (sqlite_task_backend.py:3301) — ``'merge'`` shallow last-write-wins
+      (supplied keys overwrite wholesale, omitted keys preserved),
+      ``'replace'`` whole-blob overwrite, ``'additive'`` recursive list
+      union+dedup / dict-recursive / scalar OLD-wins (see
+      ``_merge_values_additive`` above).  An unrecognised mode raises rather
+      than silently degrading to ``'merge'`` — the backend validates against
+      ``_METADATA_MODES`` too.
     - the scheduler-side ``metadata.files`` persist that
       ``handle_blast_radius_expansion(persist_files=...)`` performs via
       ``Scheduler._persist_files_metadata`` (scheduler.py:6890),
-      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}``.
+      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}`` —
+      on BOTH the successful-refinement branch (scheduler.py:6974) and the
+      lock-conflict/requeue branch (scheduler.py:7023, task 2868).  The only
+      non-persist path is the no-op early return when the depth-normalised
+      module set is unchanged, modelled here too.
+
+    NOT modelled: the corrupt-existing-blob guard (``'merge'``/``'additive'``
+    raise ``TaskmasterError`` rather than clobber a non-dict blob), the legacy
+    ``memory_hints`` shape normalisation, and the lock-table/``set_task_status``
+    side-effects of the requeue branch — no workflow test drives any of them,
+    and the blob here is always a dict.
 
     It exists so tests can assert on BACKEND STATE rather than merely on call
     arguments — a whole-blob write that reverts a freshly-persisted
@@ -217,18 +271,20 @@ class FakeMetadataBackend:
     mismatch would raise ``TypeError`` inside a caller's blanket
     ``except Exception``, silently leaving the blob untouched.
 
-    Opt-in: wire it into a test's existing ``MagicMock()`` scheduler by
-    rebinding ``update_task`` / ``handle_blast_radius_expansion`` / ``get_task``.
-    ``FakeScheduler`` is deliberately NOT changed — it has ~20 importers and
-    ``test_workflow_dry_run_hook.py`` pins that passing ``metadata_mode`` to it
-    raises ``TypeError``.
+    Opt-in: wire it into a test's existing ``MagicMock()`` scheduler with
+    ``wire_metadata_backend`` below.  ``FakeScheduler`` is deliberately NOT
+    changed — it has ~20 importers and ``test_workflow_dry_run_hook.py`` pins
+    that passing ``metadata_mode`` to it raises ``TypeError``.
     """
 
-    def __init__(self, initial: dict | None = None):
+    def __init__(self, initial: dict | None = None, *, lock_depth: int = 2):
         self.blob: dict = dict(initial or {})
         self.update_task_calls: list[dict] = []
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
         self.blast_radius_result: bool = True
+        # Matches the fixtures' config.lock_depth; only used to model
+        # handle_blast_radius_expansion's no-op early return.
+        self.lock_depth = lock_depth
 
     async def update_task(
         self,
@@ -253,17 +309,16 @@ class FakeMetadataBackend:
         else:
             effective = 'merge'
 
-        if effective == 'additive':
-            for key, value in payload.items():
-                existing = self.blob.get(key)
-                if isinstance(existing, list) and isinstance(value, list):
-                    self.blob[key] = existing + value
-                else:
-                    self.blob[key] = value
+        if effective == 'merge':
+            self.blob = {**self.blob, **payload}
         elif effective == 'replace':
             self.blob = dict(payload)
+        elif effective == 'additive':
+            merged = _merge_values_additive(self.blob, payload)
+            assert isinstance(merged, dict)
+            self.blob = merged
         else:
-            self.blob = {**self.blob, **payload}
+            raise ValueError(f'unsupported metadata_mode: {effective!r}')
         return True
 
     async def handle_blast_radius_expansion(
@@ -276,7 +331,17 @@ class FakeMetadataBackend:
         persist_files: list[str] | None = None,
     ) -> bool:
         self.blast_radius_calls.append((current, needed, persist_files))
-        if self.blast_radius_result and persist_files is not None:
+        depth = self.lock_depth
+        if {normalize_lock(m, depth) for m in current} == {
+            normalize_lock(m, depth) for m in needed
+        }:
+            # No-op early return (scheduler.py:6935): nothing acquired, nothing
+            # released, nothing persisted.
+            return True
+        # Production persists metadata.files on BOTH the grant and the
+        # lock-conflict/requeue branch — only the RETURN differs.  Gating the
+        # persist on blast_radius_result would model the deny path wrongly.
+        if persist_files is not None:
             self.blob = {
                 **self.blob,
                 'files': sanitize_files_for_persist(persist_files),
@@ -285,6 +350,41 @@ class FakeMetadataBackend:
 
     async def get_task(self, task_id: str) -> dict:
         return {'id': task_id, 'metadata': dict(self.blob)}
+
+
+def wire_metadata_backend(
+    scheduler: MagicMock,
+    backend: FakeMetadataBackend,
+    *,
+    seed: dict,
+    grants: bool,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Route a ``MagicMock`` scheduler's metadata methods through *backend*.
+
+    Keeps the MagicMock (so every other auto-mocked attribute such as
+    ``set_task_status`` still works) but rebinds ``update_task`` /
+    ``handle_blast_radius_expansion`` / ``get_task`` to *backend*, wrapped in
+    ``AsyncMock`` side-effects so call-argument assertions keep working
+    alongside blob assertions.
+
+    *seed* is the dispatch-time ``task['metadata']`` the workflow starts with in
+    memory; the backend's blob is seeded from it (any value already on the blob
+    wins) so backend and in-memory start consistent, as production does at
+    dispatch time.  *grants* sets ``blast_radius_result``.
+
+    Returns ``(handle_blast_radius_expansion, update_task)`` so a fixture can
+    expose the same AsyncMocks it exposes in the un-wired case.
+    """
+    backend.blob = {**dict(seed), **backend.blob}
+    backend.blast_radius_result = grants
+    handle_blast_radius_expansion = AsyncMock(
+        side_effect=backend.handle_blast_radius_expansion,
+    )
+    update_task = AsyncMock(side_effect=backend.update_task)
+    scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+    scheduler.update_task = update_task
+    scheduler.get_task = AsyncMock(side_effect=backend.get_task)
+    return handle_blast_radius_expansion, update_task
 
 
 class FakeBriefing:

@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeMetadataBackend
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -128,21 +128,10 @@ def _make(
     scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
     scheduler.update_task = update_task
     if metadata_backend is not None:
-        # Keep the MagicMock scheduler (so every other auto-mocked attribute
-        # still works) but route the three metadata-bearing methods through the
-        # merge-faithful backend, seeded from the same blob the workflow starts
-        # with in memory — as production is at dispatch time.
-        metadata_backend.blob = {
-            **dict(task_metadata or {}), **metadata_backend.blob,
-        }
-        metadata_backend.blast_radius_result = blast_radius_grants
-        handle_blast_radius_expansion = AsyncMock(
-            side_effect=metadata_backend.handle_blast_radius_expansion,
+        handle_blast_radius_expansion, update_task = wire_metadata_backend(
+            scheduler, metadata_backend,
+            seed=task_metadata or {}, grants=blast_radius_grants,
         )
-        update_task = AsyncMock(side_effect=metadata_backend.update_task)
-        scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
-        scheduler.update_task = update_task
-        scheduler.get_task = AsyncMock(side_effect=metadata_backend.get_task)
 
     get_main_sha = AsyncMock(return_value=new_main_sha)
     get_changed_files = AsyncMock(return_value=changed_files)
