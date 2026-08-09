@@ -141,10 +141,27 @@ Design decisions (captured in plan.json):
   task 3079)
 - ``_COMPOUND_PREFIX`` admits ONE optional hyphenated modifier before the
   marker in the adjacency-anchored arms, so 'pairwise-stalled' anchors to
-  its copula. Bounded to a single token on purpose: '\\w+' cannot cross
-  whitespace, so it never becomes an open-class gap that would re-admit
-  the readings the mandatory-copula arms exist to exclude. (amendment,
+  its copula. The single-token bound ('\\w+' cannot cross whitespace)
+  bounds the gap's WIDTH only — NOT its lexical class, which an earlier
+  version of this bullet wrongly claimed. 'un-', 'non-', 'previously-',
+  'in-' are each one '\\w+-' token, so the unguarded prefix re-admitted
+  the negation / past-exit readings ('Task 5 is un-blocked' -> {5}) that
+  ``_ADVERB_ALT``'s closed-class discipline refuses for free on the bare
+  marker. What refuses them is a negative lookahead subtracting a closed
+  class of inverting prefixes, kept as a SUBTRACTION from an open-class
+  prefix because the innocent modifier vocabulary ('pairwise-', 'merge-',
+  'self-', 'auto-') is not closed. The privative 'in-' needs a second,
+  narrower lookahead, since 'in[-\\s]?progress' is itself a marker.
+  (amendment, reviewer_comprehensive correctness-precision findings,
   task 3079)
+- A plural enumeration REJECTED by the subjecthood guard also suppresses
+  every id inside its own span on the other anchored paths. Suppressing
+  only the plural match left the tail of a repeated-reference-token
+  enumeration — a shape this task newly supports as a positive — reaching
+  the individual arm on its own ('Reviews for tasks 1020, task 1030 and
+  task 1031 are pending' -> {1031}). Scoped to the span, not the fact, so
+  a genuine snapshot in a later clause survives. (amendment,
+  reviewer_comprehensive correctness-precision finding, task 3079)
 - Two hypotheses were investigated and RULED OUT; do not re-open them.
   (1) Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs
   ``MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL`` with
@@ -198,7 +215,7 @@ Design decisions (captured in plan.json):
   copula and a marker. The sharper finding is that the base scales with
   whitespace-run WIDTH, not id count alone: ', ' is ~2**n, ',  ' ~3**n and
   ',\\n    ' ~6**n, so a newline-indented list of only NINE ids already
-  cost 8.5s (measured 6.1s at n=20 for ', ' on this branch). That is a far
+  cost 16.6s (measured 6.1s at n=20 for ', ' on this branch). That is a far
   lower real-world trigger threshold than a flat 2**n reading suggests,
   and is why the regression test sizes each whitespace shape separately.
   Possessive-ness is language-preserving here because every possessive
@@ -331,11 +348,22 @@ _GAP_NO_TASK_REF = r'(?!(?:task|df|\d)\w*\b)'
 # marker begins with one of these tokens, so the prefix-less shape ('is
 # blocked') is unaffected.
 #
+# The privative 'in-' belongs to the same subtracted class but cannot be
+# spelled as a bare 'in' entry in the alternation above: the lookahead is
+# evaluated at the marker's own start position, and 'in[-\s]?progress' is
+# itself a MARKER, so 'in' in the main list would refuse 'Task 5 is
+# in-progress' along with 'Task 5 is in-active'. It gets a second, narrower
+# lookahead that fires only when 'in-' is NOT the head of 'in-progress'.
+# The spaced spelling ('is in progress') is untouched either way, since this
+# lookahead requires a literal hyphen. (amendment, reviewer_comprehensive
+# correctness-precision finding, task 3079)
+#
 # Used only in the adjacency-anchored arms (individual, genitive, plural
 # enumeration); the phrase form needs no equivalent, since its marker is
 # pinned on the far side by the literal noun 'status'. (task 3079)
 _COMPOUND_PREFIX = (
     r'(?!(?:un|non|not|never|no|previously|formerly|once|briefly|de|dis)-)'
+    r'(?!in-(?!progress\b))'
     r'(?:\w+-)?'
 )
 
@@ -903,9 +931,8 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     if not SNAPSHOT_STATUS_RE.search(fact):
         return set()
 
-    ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
-    ids |= {int(m.group(1)) for m in GENITIVE_STATUS_RE.finditer(fact)}
-    ids |= {int(m.group(1)) for m in SNAPSHOT_STATUS_PHRASE_RE.finditer(fact)}
+    ids: set[int] = set()
+    rejected_spans: list[tuple[int, int]] = []
 
     for enum in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
         # Subjecthood guard, second half: reject an enumeration that is a
@@ -917,8 +944,33 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
         # may sit in that gap are an open class no bound can cover. See
         # _ENUM_PREP_WORDS.
         if _enumeration_is_prepositional_complement(fact[: enum.start()]):
+            rejected_spans.append(enum.span())
             continue
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+
+    # Suppressing only the PLURAL match left the rejected enumeration's tail
+    # extractable by the other anchored paths, because an enumeration may
+    # REPEAT the reference token — a shape this module newly supports as a
+    # positive ('Tasks 1020, task 1030 and task 1031 are pending'). Its
+    # prepositional-complement counterpart therefore reached the individual
+    # arm on its own and over-selected the trailing id:
+    #
+    #     'Reviews for tasks 1020, task 1030 and task 1031 are pending.' -> {1031}
+    #     'Statuses of the tasks 1020 and task 1030 are blocked.'        -> {1030}
+    #
+    # A rejected span is, by construction, a region established to be a
+    # preposition's complement, so NO id inside it is the copula's subject
+    # whichever pattern found it — hence the drop is applied to every
+    # anchored path rather than to the individual arm alone. It is scoped to
+    # the span, not the fact, so a genuine snapshot in a later clause
+    # survives. (amendment, reviewer_comprehensive correctness-precision
+    # finding, task 3079)
+    for pattern in (INDIVIDUAL_SNAPSHOT_RE, GENITIVE_STATUS_RE, SNAPSHOT_STATUS_PHRASE_RE):
+        ids.update(
+            int(m.group(1))
+            for m in pattern.finditer(fact)
+            if not any(start <= m.start() < end for start, end in rejected_spans)
+        )
 
     for intro in LIST_INTRODUCER_RE.finditer(fact):
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))

@@ -791,6 +791,58 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Reviews for tasks 1020, task 1030 and task 1031 are pending.',
+            'Statuses of the tasks 1020 and task 1030 are blocked.',
+            'Notes about tasks 1020, task 1030 and task 1031 are pairwise-stalled.',
+            "Reviews of Leo's tasks 1020 and task 1030 are pending.",
+        ],
+    )
+    def test_guard_rejected_enumeration_suppresses_ids_on_every_path(self, fact):
+        """Rejecting the plural match must not leave its tail extractable.
+
+        (amendment, reviewer_comprehensive correctness-precision finding,
+        task 3079)
+
+        The subjecthood guard used to ``continue`` past the plural match
+        and nothing more, so an enumeration that REPEATS the reference
+        token still handed its trailing ids to the unguarded individual
+        path: 'Reviews for tasks 1020, task 1030 and task 1031 are
+        pending' suppressed the plural match and then matched 'task 1031
+        are pending' on its own, yielding {1031}.
+
+        That leak is only reachable because this task newly blessed the
+        repeated-reference-token enumeration as a supported POSITIVE shape
+        (see the '{1020, 1030, 1031}' case below); its
+        prepositional-complement counterpart is therefore a live shape the
+        guard is documented to close. Every fact here is a permanently-true
+        meta assertion about reviews/statuses/notes, so extracting any id
+        retires a still-true edge as soon as that id goes terminal — the
+        unrecoverable over-selection direction.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, task 1030 and task 1031 are pending.', {1020, 1030, 1031}),
+            # The suppression is scoped to the REJECTED span, not to the
+            # whole fact: a genuine snapshot in a later clause survives.
+            ('Reviews for tasks 1020 and task 1030 are pending. Task 55 is blocked.', {55}),
+        ],
+    )
+    def test_span_suppression_is_scoped_to_the_rejected_enumeration(self, fact, expected):
+        """The suppression must not become a blanket whole-fact veto.
+
+        Pins the other edge of the guard above: the repeated-reference-token
+        enumeration is a supported positive when it IS the copula's subject,
+        and a rejected enumeration only silences ids inside its own span.
+        (task 3079)
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
     #: A plural-head fact per preposition in ``_ENUM_PREP_WORDS``. Plural
     #: agreement is what refuses the far more natural singular-copula
     #: phrasing of most of these ('Work on tasks ... IS blocked'), so only a
@@ -1062,6 +1114,13 @@ class TestExtractSnapshotEdgeTaskIds:
             'Task 5 is formerly-pending.',
             'Task 5 is once-blocked.',
             'Task 5 is briefly-stalled.',
+            # The privative 'in-', reached through the same door. Guarded by
+            # its own narrower lookahead because 'in-progress' is itself a
+            # marker, so a bare 'in' entry in the main alternation would
+            # refuse the positive along with the negation. (task 3079)
+            'Task 5 is in-active.',
+            "Task 5's status is in-active.",
+            'Tasks 1020 and 1030 are in-active.',
         ],
     )
     def test_compound_prefix_refuses_inverting_modifiers(self, fact):
@@ -1095,6 +1154,14 @@ class TestExtractSnapshotEdgeTaskIds:
             ('Task 5 is self-blocked.', {5}),
             ('Tasks 7 and 8 are auto-stalled.', {7, 8}),
             ("Task 5's status is merge-blocked.", {5}),
+            # The 'in-' lookahead is narrowed to spare 'in-progress', which
+            # is a MARKER rather than a prefixed one. Both the hyphenated
+            # and the spaced spellings must survive it, on every anchored
+            # path. (task 3079)
+            ('Task 5 is in-progress.', {5}),
+            ('Task 5 is in progress.', {5}),
+            ("Task 5's status is in-progress.", {5}),
+            ('Tasks 1020 and 1030 are in-progress.', {1020, 1030}),
         ],
     )
     def test_compound_prefix_still_admits_ordinary_modifiers(self, fact, expected):
