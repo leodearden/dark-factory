@@ -480,13 +480,43 @@ class GraphitiBackend:
         return cast(Any, driver).client
 
     async def _ensure_indices(self, group_id: str) -> None:
-        """Build indices on *group_id*'s graph if not already done this session."""
+        """A DELIBERATE no-op today. NOT the provisioning path — see ``ensure_indices``.
+
+        ``build_indices_and_constraints`` is overridden to ``pass`` on
+        ``_MultiTenantFalkorDriver`` (D4, kept on purpose: removing it is what
+        caused the ``723ec915c3`` connection storm), so this method builds
+        nothing.  It previously ended with a ``logger.debug`` line claiming the
+        graph's indices had been ensured — fired unconditionally after that
+        no-op, and at DEBUG, so at the service's INFO level it produced neither a
+        positive nor a negative signal.  There was no signal in the logs at all.
+        Task 3707 (β) deleted it; the structured :class:`IndexProvisionResult`
+        (INFO on change, WARNING on failure) replaces it at the boundary where the
+        work actually happens.  ``test_ensure_indices.py`` guards the deletion by
+        scanning this module's source for that message, so do not reintroduce the
+        string even in prose.
+
+        β deliberately does NOT route this method through
+        :meth:`ensure_indices`, and that is not an abandoned half-fix.
+        ``initialize()`` enumerates every graph on the server under the
+        ``!= 'default_db' and not endswith('_db')`` filter — all 35 probe / test /
+        scratch graphs plus the 6 real trap graphs — and calls this on each.
+        Wiring it here would therefore provision every real project graph on the
+        next ``fused-memory.service`` restart: destroying esc-3375-1's protected
+        evidence (the current absence of indices) and bypassing PRD D10's
+        activation gate, which is exactly why the follow-on task γ depends on
+        external tasks 3658/3659/3660 and is named "the task whose merge changes
+        live graphs".
+
+        **Task γ owns the rewiring** — both call sites (the startup enumeration
+        and the first-write choke point) — and lands the D5 registry filter in the
+        same change, so the enumeration stops sweeping scratch graphs at the
+        moment it starts doing real work.
+        """
         if group_id in self._indexed_graphs:
             return
         driver = self._driver_for(group_id)
         await driver.build_indices_and_constraints()
         self._indexed_graphs.add(group_id)
-        logger.debug('Ensured indices on graph %r', group_id)
 
     async def initialize(self, *, skip_maintenance: bool = False) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
@@ -3214,7 +3244,7 @@ class GraphitiBackend:
 
         # Nothing is logged when nothing changed: a no-op must never emit a line
         # an operator would read as "provisioned" (INV-2).  That false-positive is
-        # exactly what the deleted DEBUG `Ensured indices on graph` line was.
+        # exactly what the DEBUG line deleted from _ensure_indices was.
         if result.changed:
             logger.info(
                 'Provisioned indices on graph %r: created=%d already_present=%d '
