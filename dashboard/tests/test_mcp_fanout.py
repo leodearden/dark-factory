@@ -13,6 +13,7 @@ propagation.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -129,6 +130,52 @@ class TestFirstSuccessAllFail:
         assert 'http://a' in result['error']
         assert 'http://b' in result['error']
         assert 'refused' in result['error']
+
+
+# ── (c2) every per-URL failure is surfaced at WARNING ────────────────
+
+
+class TestFirstSuccessLogsFailuresAtWarning:
+    """A failing URL must leave a journal trace at WARNING, not DEBUG.
+
+    The dashboard runs at the default WARNING root level, so a DEBUG log
+    here means a *total* fused-memory/escalation outage produces no journal
+    record at all — the fan-out silently degrades to the offline sentinel
+    and the operator sees only an "offline" pill with no cause. Same class
+    of fix as task 1814.
+    """
+
+    async def test_each_failing_url_logs_one_warning(self, caplog):
+        urls = ['http://a', 'http://b']
+
+        async def call(url):
+            raise httpx.ConnectError(f'{url} refused')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                urls, call, log_label='get_memory_status',
+                offline_result=_offline_result,
+            )
+
+        assert result['offline'] is True, 'still returns the caller offline sentinel'
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == len(urls), (
+            f'expected one WARNING per failing URL, got {len(warnings)}: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        messages = [r.getMessage() for r in warnings]
+        for url, message in zip(urls, messages, strict=True):
+            assert 'get_memory_status' in message, (
+                f'warning must name the log_label, got: {message}'
+            )
+            assert url in message, f'warning must name the failing url, got: {message}'
+            assert 'refused' in message, (
+                f'warning must carry the underlying error, got: {message}'
+            )
 
 
 # ── (d) success path: no invalidation, exactly one call ──────────────
