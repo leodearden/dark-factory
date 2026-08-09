@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from fused_memory.middleware.lock_charter_guard import (
-    CODE_EXTENSIONS,
+    FILE_EXTENSIONS,
     directory_locks,
     extract_files,
     is_file_path,
@@ -26,19 +26,19 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 # Drift guard — two tiers:
 #
 # Tier 1 (test_extension_drift_guard): same-file consistency check.
-#   Asserts sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, where both are
-#   defined in this file.  Catching that CODE_EXTENSIONS and _CANONICAL_EXTENSIONS
+#   Asserts sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, where both are
+#   defined in this file.  Catching that FILE_EXTENSIONS and _CANONICAL_EXTENSIONS
 #   stay in sync with each other.  Update BOTH lists together when the allowlist
 #   changes.  This does NOT catch cross-language α/γ drift on its own.
 #
 # Tier 2 (test_extension_drift_guard_vs_reify_script): cross-source guard.
 #   Invokes the real reify/scripts/lock-charter-guard.sh --list-extensions and
-#   compares its output to sorted(CODE_EXTENSIONS).  Skipped when the script
+#   compares its output to sorted(FILE_EXTENSIONS).  Skipped when the script
 #   is not present (e.g. in a standalone fused-memory checkout).  Run this in
 #   any environment that has both repos checked out side-by-side.
 # ---------------------------------------------------------------------------
 
-# The canonical α/γ vector — update this list AND CODE_EXTENSIONS together.
+# The canonical α/γ vector — update this list AND FILE_EXTENSIONS together.
 # Widened 36 -> 58 by the git-ls-files sweep 2026-07-28
 # (reify #5726 / dark_factory #3117); generated from α's --list-extensions.
 # Widened 58 -> 59 on 2026-08-06: `csv`, flagged by the corpus->allowlist guard
@@ -65,13 +65,13 @@ _REIFY_GUARD_SCRIPT = Path(__file__).parents[5] / 'reify' / 'scripts' / 'lock-ch
 
 
 def test_extension_drift_guard():
-    """Tier-1 (same-file): sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+    """Tier-1 (same-file): sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
-    This is a same-file consistency check — CODE_EXTENSIONS and _CANONICAL_EXTENSIONS
+    This is a same-file consistency check — FILE_EXTENSIONS and _CANONICAL_EXTENSIONS
     must be updated together.  For cross-source α/γ drift detection see
     test_extension_drift_guard_vs_reify_script.
     """
-    assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS
+    assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS
 
 
 @pytest.mark.skipif(
@@ -79,10 +79,10 @@ def test_extension_drift_guard():
     reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
 )
 def test_extension_drift_guard_vs_reify_script():
-    """Tier-2 (cross-source): sorted(CODE_EXTENSIONS) must match reify --list-extensions.
+    """Tier-2 (cross-source): sorted(FILE_EXTENSIONS) must match reify --list-extensions.
 
     Invokes the real scripts/lock-charter-guard.sh --list-extensions and
-    compares its output to sorted(CODE_EXTENSIONS), catching any α/γ divergence
+    compares its output to sorted(FILE_EXTENSIONS), catching any α/γ divergence
     that the same-file Tier-1 guard would miss.
     """
     result = subprocess.run(
@@ -96,11 +96,11 @@ def test_extension_drift_guard_vs_reify_script():
             f'stderr: {result.stderr[:200]}'
         )
     script_exts = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
-    assert script_exts == sorted(CODE_EXTENSIONS), (
+    assert script_exts == sorted(FILE_EXTENSIONS), (
         f'α/γ drift detected!\n'
         f'  reify --list-extensions : {script_exts!r}\n'
-        f'  γ CODE_EXTENSIONS       : {sorted(CODE_EXTENSIONS)!r}\n'
-        f'Update CODE_EXTENSIONS (and _CANONICAL_EXTENSIONS) to match reify.'
+        f'  γ FILE_EXTENSIONS       : {sorted(FILE_EXTENSIONS)!r}\n'
+        f'Update FILE_EXTENSIONS (and _CANONICAL_EXTENSIONS) to match reify.'
     )
 
 
@@ -379,7 +379,7 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path):
     h, icns, ico, jq, manifest, npmrc, png, ri, ts, tsx).  ``manifest`` is in that
     reify-only group — zero ``.manifest`` files are tracked in dark-factory — so a
     dark-factory-only sweep would NOT have caught the very incident that motivated
-    this task.  Verified by mutation: removing ``manifest`` from CODE_EXTENSIONS
+    this task.  Verified by mutation: removing ``manifest`` from FILE_EXTENSIONS
     fails the reify parametrization (naming
     ``tests/infra/harness-layout-baseline.manifest``) and passes the dark-factory
     one.  Each repo is skipped independently when that checkout is absent,
@@ -419,11 +419,11 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path):
 
     assert not unknown, (
         f'{len(unknown)} extension(s) on real tracked {repo} files are absent '
-        f'from CODE_EXTENSIONS, so those files classify as DIRECTORIES and any '
+        f'from FILE_EXTENSIONS, so those files classify as DIRECTORIES and any '
         f'task declaring one in metadata.files is rejected with a '
         f'LockCharterViolation:\n'
         + '\n'.join(f'  .{ext} — e.g. {path}' for ext, path in sorted(unknown.items()))
-        + '\nAdd each to CODE_EXTENSIONS here, to shared/src/shared/locking.py, '
+        + '\nAdd each to FILE_EXTENSIONS here, to shared/src/shared/locking.py, '
         'and to reify scripts/lock-charter-guard.sh _EXTS (all three must agree), '
         'plus _CANONICAL_EXTENSIONS and _ACCEPT_PATHS in both test copies.'
     )
