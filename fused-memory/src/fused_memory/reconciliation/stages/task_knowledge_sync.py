@@ -1303,15 +1303,25 @@ async def _sweep_stale_mem0_pool(
                 limit=scroll_limit,
             )
             if len(variant_members) >= scroll_limit:
+                # Each filter variant has its own scroll_limit budget (task
+                # 3915): naming the variant filter lets the operator tell
+                # which key spelling is backlogged rather than just "this
+                # pool has more than scroll_limit records" undifferentiated.
                 logger.warning(
-                    'reconciliation.%s: enumerated %d of scroll_limit=%d %s records — scroll cap '
-                    'reached; older stale markers may remain uncollected this cycle; re-run with a '
-                    'higher scroll_limit.',
-                    log_name, len(variant_members), scroll_limit, source,
+                    'reconciliation.%s: enumerated %d of scroll_limit=%d %s records via filter '
+                    '%r — scroll cap reached; older stale markers may remain uncollected this '
+                    'cycle; re-run with a higher scroll_limit.',
+                    log_name, len(variant_members), scroll_limit, source, variant_filters,
                     extra={'project_id': project_id, 'run_id': run_id},
                 )
             for member in variant_members:
                 mid = member.get('id')
+                # Skip falsy ids here too — exactly as the age-filter loop
+                # below already does — so a None/'' id from one variant's
+                # scroll can never occupy the merge dict and mask a
+                # DIFFERENT id-less member surfaced by another variant.
+                if not mid:
+                    continue
                 if mid in merged_by_id:
                     continue
                 merged_by_id[mid] = member
