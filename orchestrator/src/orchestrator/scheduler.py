@@ -40,6 +40,7 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
@@ -1444,6 +1445,13 @@ class Scheduler:
         )
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
+        # Module hold-duration predictor (task 3822 / PRD task ζ).  Built
+        # unconditionally, BEFORE any event store exists: the Harness
+        # constructs the Scheduler with event_store=None and attribute-injects
+        # the store later (harness.py:1498-1514 -> :2121-2122), so the live
+        # feed needs somewhere to go from the first tick.  The durable seed
+        # happens in finish_startup(), by which time the store is attached.
+        self._hold_history = HoldHistory()
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
@@ -6310,12 +6318,12 @@ class Scheduler:
                         pin_tid, coerce_tier(pin_task.get('priority'))
                     )
                     self._dispatched_priority[pin_tid] = pin_pri
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.lock_acquired,
-                            task_id=pin_tid,
-                            data={'modules': pin_modules, 'priority': pin_pri},
-                        )
+                    self._emit_lock_event(
+                        EventType.lock_acquired,
+                        task_id=pin_tid,
+                        modules=pin_modules,
+                        priority=pin_pri,
+                    )
                     await self._write_snapshot_best_effort()
                     return TickOutcome(TaskAssignment(
                         task_id=pin_tid, task=pin_task, modules=pin_modules
@@ -6423,12 +6431,12 @@ class Scheduler:
                 else:
                     # A lower-ranked task won — top was passed over this tick.
                     self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.lock_acquired,
-                        task_id=task_id,
-                        data={'modules': modules, 'priority': pri},
-                    )
+                self._emit_lock_event(
+                    EventType.lock_acquired,
+                    task_id=task_id,
+                    modules=modules,
+                    priority=pri,
+                )
                 await self._write_snapshot_best_effort()
                 return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
 
@@ -6949,13 +6957,36 @@ class Scheduler:
 
         released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
+            if additional:
+                # A WIDEN/SHIFT really does take new module locks here, so it
+                # emits a lock_acquired for them like any other acquire.  Without
+                # this the predictor never sees a start for the widened modules:
+                # the eventual full release names them (they are in
+                # lock_table._held), the history has no matching open span, and
+                # they are discarded as orphan releases — so refinement-acquired
+                # holds contribute nothing, forever.  Worse for a pure SHIFT,
+                # where every original module is stale and every new one is
+                # additional: the task's open-span set empties out and
+                # predicted_remaining refuses for a task that is demonstrably
+                # holding locks right now — the exact case task η must reason
+                # about.  Routed through _emit_lock_event so the durable stream
+                # gains the row too: feeding only the in-process history would
+                # make the live feed and seed_from_event_store disagree about
+                # this hold, which is the drift INV-5 forbids.
+                self._emit_lock_event(
+                    EventType.lock_acquired,
+                    task_id=task_id,
+                    modules=additional,
+                    reason='plan_refinement',
+                )
             if stale:
                 released = self.lock_table.release_subset(task_id, stale)
-                if released and self.event_store:
-                    self.event_store.emit(
+                if released:
+                    self._emit_lock_event(
                         EventType.lock_released,
                         task_id=task_id,
-                        data={'modules': released, 'reason': 'plan_refinement'},
+                        modules=released,
+                        reason='plan_refinement',
                     )
             # Persist metadata.files on EVERY successful refinement (widen,
             # narrow, or shift) — hoisted OUT of `if stale:` so a pure widen
@@ -7056,12 +7087,23 @@ class Scheduler:
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
         restored_pairs = self.lock_table.clear_parks_for(task_id)
-        if self.event_store and modules:
-            self.event_store.emit(
+        if modules:
+            self._emit_lock_event(
                 EventType.lock_released,
                 task_id=task_id,
-                data={'modules': modules},
+                modules=modules,
             )
+        # Reconcile the predictor's live open-span map with the lock table,
+        # UNCONDITIONALLY — including when `modules` was empty and no event was
+        # emitted.  This call drops every lock the task holds, so nothing of its
+        # may still be open afterwards; anything left is residue from a hold
+        # whose release the history never saw.  Left in place it is not inert:
+        # predicted_remaining would keep answering for the phantom, and as its
+        # elapsed time grew would answer a floored 0.0 forever — the "overdue
+        # holder" reading, which is a live actionable claim, about a task that
+        # released hours ago.  The whole contract turns on callers telling 0.0
+        # from None, so a permanent 0.0 is the worst output this API can give.
+        self._hold_history.forget(task_id)
         if self.event_store:
             for restored_owner, restored_modules in restored_pairs:
                 self.event_store.emit(
@@ -7170,14 +7212,136 @@ class Scheduler:
         """
         return self._started
 
+    # --- Hold-duration prediction (task 3822 / PRD task ζ, consumed by η) ---
+
+    def predicted_hold(self, task: dict) -> float | None:
+        """Predicted lock-hold duration (seconds) for *task*, or None.
+
+        Takes the TASK, not a module list, on purpose: ``_get_modules`` applies
+        the ``lock_depth`` coarsening, the deterministic-task short-circuit and
+        the ``task-<id>`` fallback, so it is the only thing that produces the
+        keys the lock layer — and therefore the history — actually uses.  A
+        caller splitting paths its own way would key the history on strings
+        that never appear in a lock event.
+
+        **None means NO PREDICTION** — too few observed holds on this task's
+        modules to say anything.  A caller (task η deciding whether a backfill
+        is worth the wait) MUST refuse on None rather than substitute a
+        default: 0.0, a global mean or a configured "typical" hold would all
+        read as a confident answer the evidence does not support.  The measured
+        basis for that caution is
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
+        — every static-attribute predictor scored WORSE than the test-set mean
+        (R² -0.22 to -0.82); only module hold history scored positive.
+        """
+        return self._hold_history.predicted_hold(self._get_modules(task))
+
+    def predicted_remaining(self, holder: str) -> float | None:
+        """Predicted seconds *holder* will keep its locks, or None.
+
+        Reads the Scheduler's own wall clock (``_wall_now``) rather than taking
+        a ``now`` argument: hold starts are wall-clock POSIX seconds, comparable
+        with the ISO timestamps in the event log, and a caller passing a
+        monotonic reading would get a remainder computed across two unrelated
+        epochs.
+
+        **None means NO PREDICTION** — *holder* holds nothing, or its modules
+        are below ``min_samples``.  It is NOT the same answer as 0.0, which
+        means "predicted to have finished already, and hasn't": that is a live
+        fact about an overdue holder and the one signal a waiting caller most
+        needs.  η must keep them apart.
+        """
+        return self._hold_history.predicted_remaining(
+            holder, now=self._wall_now().timestamp()
+        )
+
+    def _emit_lock_event(
+        self,
+        event_type: EventType,
+        *,
+        task_id: str,
+        modules: list[str],
+        **extra,
+    ) -> None:
+        """The ONE writer for ``lock_acquired`` / ``lock_released`` events.
+
+        Every lock event both (a) feeds the in-process hold-history predictor
+        and (b) lands in the event store, in that order and from this one
+        place.  Splitting them across call sites is what INV-5 forbids: a site
+        that emitted without feeding would leave the event stream complete —
+        so nothing would look broken — while the live history silently drifted
+        from what ``seed_from_event_store`` would reconstruct off the same
+        stream.  test_scheduler_hold_history.py enforces the single site
+        structurally, by AST scan.
+
+        The predictor is fed even when ``self.event_store`` is None: the
+        Harness runs a store-less Scheduler through construction and the store
+        is attached later, and holds observed in that window are real.
+
+        Being the one writer is necessary but not sufficient for the predictor
+        to see every hold — a site that acquires locks without calling this at
+        all is invisible to both halves of INV-5 at once, so the drift never
+        shows up as a seed/live disagreement.  ``try_acquire_additional`` on the
+        plan-refinement path was exactly that gap and now routes through here;
+        the release half is reconciled by ``HoldHistory.forget`` in
+        ``release()``, which catches any hold whose release this never saw.
+
+        Timestamps come from ``self._wall_now()`` — the injectable WALL clock,
+        not ``_time_source`` (monotonic).  Durations must be comparable with
+        the ISO-8601 timestamps ``EventStore.emit`` writes, which the seed
+        parses back into POSIX seconds; a monotonic reading has no epoch
+        relation and would produce nonsense the moment the two feeds mixed.
+
+        *extra* is merged into the event payload verbatim (``priority`` for an
+        acquire, ``reason`` for a partial release), so each site's payload is
+        preserved byte-for-byte.
+
+        Each branch names its ``EventType`` constant LITERALLY rather than
+        forwarding the ``event_type`` parameter into ``emit``.  That is not
+        redundancy to tidy away: it is what lets the AST guard see that each
+        lock event has exactly one emit site, and it puts the constant right
+        next to the ``observe_*`` call that must always accompany it.
+        Forwarding the parameter would make both constants invisible to the
+        scan, and the guard would pass with zero sites found.
+        """
+        at = self._wall_now().timestamp()
+        data = {'modules': modules, **extra}
+        if event_type == EventType.lock_acquired:
+            self._hold_history.observe_acquired(task_id, modules, at=at)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.lock_acquired, task_id=task_id, data=data,
+                )
+        elif event_type == EventType.lock_released:
+            self._hold_history.observe_released(task_id, modules, at=at)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.lock_released, task_id=task_id, data=data,
+                )
+        else:
+            # Loud, not fail-soft: a caller routing some third event through
+            # the lock chokepoint would have its payload emitted while the
+            # predictor saw nothing, which is precisely the drift INV-5 forbids.
+            raise ValueError(f'_emit_lock_event: not a lock event: {event_type!r}')
+
     def finish_startup(self) -> None:
         """Mark startup complete, allowing ``acquire_next()`` to run.
 
         Callers (the Harness main-loop bootstrap, and Scheduler-only test
         factories that drive ``acquire_next()`` directly) must call this
         once their startup reconcile sweeps have finished.  Idempotent.
+
+        This is also where the hold-history predictor is seeded from the
+        durable event log.  It cannot happen in ``__init__``: the Harness
+        builds the Scheduler with ``event_store=None`` and attribute-injects
+        the store afterwards (harness.py:2121-2122), so a constructor seed
+        would read None and leave the predictor permanently empty.
+        ``seed_from_event_store`` is itself seed-once and fail-soft, which is
+        what keeps this call safe under the idempotence promise above.
         """
         self._started = True
+        if self.event_store:
+            self._hold_history.seed_from_event_store(self.event_store)
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
