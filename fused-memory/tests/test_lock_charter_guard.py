@@ -343,16 +343,52 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
 def test_extensionless_drift_guard():
     """Tier-1 (same-file): sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS.
 
-    Same shape and same reason as test_extension_drift_guard above.  Note there
-    is deliberately NO Tier-2 counterpart: as of #3248 this vector is a
-    dark_factory-only lead, and reify's bash ``_is_file_path`` still
-    conservative-rejects all 8 names per its PRD 5.2 ``files=[]`` escape hatch.
-    Tier-2 compares ``--list-extensions`` output, which is a vector of EXTENSION
-    strings, so it is structurally blind to this frozenset and stays green — the
-    divergence is recorded in both module docstrings rather than caught by a
-    test, and a reify follow-up is filed to close it.
+    Same shape and same reason as test_extension_drift_guard above; the Tier-2
+    cross-source counterpart is test_extensionless_drift_guard_vs_reify_script.
     """
     assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+
+
+@pytest.mark.skipif(
+    not _REIFY_GUARD_SCRIPT.is_file(),
+    reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+)
+def test_extensionless_drift_guard_vs_reify_script():
+    """Tier-2 (cross-source): EXTENSIONLESS_FILENAMES must match --list-extensionless.
+
+    The extension-less sibling of test_extension_drift_guard_vs_reify_script,
+    and the reason the extension-half guard cannot stand in for it: that one
+    compares ``--list-extensions``, a vector of EXTENSION strings, so it is
+    structurally blind to this frozenset.  Without this test the three copies
+    could silently disagree on the 8 names while every other guard stayed green.
+
+    #3248 was PLANNED on the premise that this vector was a dark_factory-only
+    lead and that reify's bash ``_is_file_path`` still conservative-rejected all
+    8 names, with a reify follow-up to be filed.  That premise was refuted by
+    measurement on 2026-08-09: reify #5890 had already landed the identical
+    vector and added ``--list-extensionless`` specifically so the other side
+    could pin against it.  ``classify hooks/project-checks`` returns ACCEPT.  So
+    no follow-up is owed, and the seam is CONVERGED — this test is what keeps it
+    that way.
+    """
+    result = subprocess.run(
+        ['bash', str(_REIFY_GUARD_SCRIPT), '--list-extensionless'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            f'reify script exited with code {result.returncode}; '
+            f'stderr: {result.stderr[:200]}'
+        )
+    script_names = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    assert script_names == sorted(EXTENSIONLESS_FILENAMES), (
+        f'α/γ/bash drift detected on the extension-less vector!\n'
+        f'  reify --list-extensionless : {script_names!r}\n'
+        f'  γ EXTENSIONLESS_FILENAMES  : {sorted(EXTENSIONLESS_FILENAMES)!r}\n'
+        f'Update EXTENSIONLESS_FILENAMES here, in shared/src/shared/locking.py, '
+        f'and _CANONICAL_EXTENSIONLESS in both test copies, to match reify.'
+    )
 
 
 def test_extensionless_filenames_is_frozenset():

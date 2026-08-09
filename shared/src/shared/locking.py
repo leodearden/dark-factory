@@ -24,22 +24,25 @@ re-export; drift between them is caught by explicit equality tests:
 - ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins the lock_charter_guard.py copy)
 
-STATUS — deliberate cross-repo divergence (dark_factory #3248)
---------------------------------------------------------------
-``EXTENSIONLESS_FILENAMES`` (below) is a dark_factory-only lead.  reify's
-``scripts/lock-charter-guard.sh`` still conservative-rejects every one of
-those 8 names, per its PRD §5.2 ``files=[]`` escape hatch, so the two
-predicates now DISAGREE on exactly those names and only those names.  This
-is the mirror image of #3117's one-sided lead, and it is recorded loudly
-here rather than left to be rediscovered.
+STATUS — cross-repo agreement on the extension-less vector (#3248)
+-------------------------------------------------------------------
+``EXTENSIONLESS_FILENAMES`` (below) is NOT a dark_factory-only lead, and this
+paragraph exists because #3248 was planned on the opposite assumption.  reify
+got there FIRST: ``scripts/lock-charter-guard.sh`` already carries the same
+8-name vector inside its bash ``_is_file_path`` and exposes it via
+``--list-extensionless`` (reify #5890).  Measured 2026-08-09 on the live
+script — the two vectors are identical, and ``classify hooks/project-checks``
+returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
+opening one; no reify follow-up is owed.
 
-The Tier-2 cross-source drift guard
-(``test_extension_drift_guard_vs_reify_script``) is UNAFFECTED, and that is
-measured rather than assumed: it compares ``sorted(FILE_EXTENSIONS)`` against
-``lock-charter-guard.sh --list-extensions``, i.e. an EXTENSION vector only.  A
-separate frozenset is invisible to it.  So this divergence will NOT surface as
-a red test — which is exactly why it is written down.  Mirroring it into reify
-is filed as a follow-up.
+The extension-half Tier-2 drift guard
+(``test_extension_drift_guard_vs_reify_script``) compares
+``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
+vector only, and is structurally blind to this frozenset.  That gap is closed
+by its extension-less sibling
+(``test_extensionless_drift_guard_vs_reify_script``), which pins this vector
+against ``--list-extensionless`` so three-way α/γ/bash agreement is ENFORCED
+rather than merely asserted in prose.
 """
 
 from __future__ import annotations
