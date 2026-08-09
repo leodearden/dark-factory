@@ -12,9 +12,10 @@ Covers:
   3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard:
                  `_remerge` recovery items are exempt; the carve-out is
                  narrow (an ordinary mismatch still warns exactly once).
-  3206 step-5  — the surviving WARNING is SELF-TRIAGING: it keeps its
-                 call-time context, names the stale-expected-tip / stranded-
-                 finalize-head (3082) class, and states it is advisory.
+  3206 step-5  — the surviving WARNING keeps its CALL-TIME CONTEXT (task_id,
+                 request_id, both shas, verify_depth), which task 1999 records
+                 as available on no other §5.3 surface.  Data only: the
+                 message's wording is deliberately NOT pinned here.
   3206 step-7d — FIVE-SITE PARITY: every `_remerge` return path stamps the
                  recovery marker.
 
@@ -940,26 +941,36 @@ class TestRemergeCarveOutAtDispatchGuard:
             )
 
 
-# ── task 3206 step-5 RED: the surviving WARNING must be self-triaging ────────
+# ── task 3206: the surviving WARNING keeps its call-time context ─────────────
 
 
 @pytest.mark.asyncio
-class TestGuardWarningIsSelfTriaging:
-    """The surviving §5.3 WARNING must carry its own triage (task 3206).
+class TestGuardWarningCarriesCallTimeContext:
+    """The §5.3 WARNING must keep its call-time context (task 3206).
 
     Once the re-merge carve-out removes class (b), the only benign class left
     is the class-(a) PHANTOM FROZEN TIP: a stranded finalize head makes
     `frozen_prefix_tip()` return a dead merge commit, so a dispatch whose base
-    is perfectly correct still mismatches.  The original wording ("This may
-    indicate a verify against a speculative-only base") is actively misleading
-    for that class — in all four measured 2026-08-07/08 hits the item's base
-    was CORRECT and it was the EXPECTED TIP that was wrong.
+    is perfectly correct still mismatches.  Triaging that from the log needs
+    the ids and both shas — which is what this class pins.
 
-    Assertions are on a few stable substrings (ids, both shas, an identifiable
-    'advisory' marker), NOT on full prose: this pins runtime log CONTENT that
-    an operator triages from, deliberately not the exact wording.
+    SCOPE — DATA, NOT PROSE.  Two sibling tests here previously asserted the
+    message's WORDING too (that it says 'stale'/'stranded'/'phantom', cites
+    3082, says 'advisory', cites 3206 / §5.3).  They were deleted on review:
+    they pinned cosmetic detail — a task number, an adjective — inside an
+    ~800-character log paragraph, went red on any harmless reword, and covered
+    no failure mode not already covered elsewhere.  Do not re-add them, and do
+    not reintroduce them as looser substring matching.
 
-    RED against the current message until step-6 rewrites it.
+    That narrative is NOT gone, it simply lives where it belongs: the
+    `logger.warning(...)` message itself, the `_warn_if_verify_base_not_frozen_tip`
+    docstring, and PRD §5.3 — all of which still carry it.  The enforcement
+    fence they were reaching for is held by CONTROL-FLOW assertions that go red
+    the moment the guard refuses a dispatch: `TestDispatchItemGuardWiring` and
+    `TestRemergeReturnPathParity` below, plus
+    `TestAdvisoryContractRegressionPins` (dispatch returns a live InflightEntry,
+    verify task launched, host lease not released — including the measured
+    phantom-tip 5687 / 5830 shape) in test_merge_queue_verify_base_invariant.py.
     """
 
     async def test_warning_carries_call_time_context(
@@ -1009,95 +1020,6 @@ class TestGuardWarningIsSelfTriaging:
                 f'WARNING lost its {what} ({needle!r}) — task 1999: this '
                 f'call-time context exists on NO other §5.3 surface. Got: {text!r}'
             )
-
-    async def test_warning_names_the_stale_expected_tip_possibility(
-        self,
-        git_ops: GitOps,
-        config: OrchestratorConfig,
-        git_repo: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """(2) The message must name the phantom / stranded-finalize-head class.
-
-        Measured: 2026-08-08 00:09:07 (task 5687) and 01:35:00 (task 5830)
-        both dispatched against the LIVE MAIN tip and mismatched a phantom
-        expected-tip 95908e44 that persisted 86 minutes; 5687 then passed and
-        landed. A message that only offers "verify against a speculative-only
-        base" points the operator at the wrong half of the comparison.
-        """
-        import logging
-
-        worker = _make_worker(git_ops)
-        _, item_d = _make_fake_item(
-            't-d', base_sha='main0', merge_commit='sha-Dc',
-            config=config, git_repo=git_repo,
-        )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        _, item_e = _make_fake_item(
-            't-e', base_sha='live-main-tip', merge_commit='sha-Ec',
-            config=config, git_repo=git_repo,
-        )
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
-
-        text = [
-            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
-        ][0].lower()
-
-        assert 'stale' in text or 'stranded' in text or 'phantom' in text, (
-            f'WARNING must name the possibility that the EXPECTED TIP is stale '
-            f'(the stranded-finalize-head / 3082 class), not only that the base '
-            f'is wrong. Got: {text!r}'
-        )
-        assert '3082' in text, (
-            f'WARNING must cite the 3082 class so the operator can look it up. '
-            f'Got: {text!r}'
-        )
-
-    async def test_warning_states_it_is_advisory_and_cites_the_decision(
-        self,
-        git_ops: GitOps,
-        config: OrchestratorConfig,
-        git_repo: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """(3) 'advisory by decision', pointing at task 3206 / PRD §5.3.
-
-        So the next operator sweep does not have to re-derive the triage —
-        or, worse, read the WARNING as a latent bug awaiting enforcement.
-        """
-        import logging
-
-        worker = _make_worker(git_ops)
-        _, item_d = _make_fake_item(
-            't-d', base_sha='main0', merge_commit='sha-Dc',
-            config=config, git_repo=git_repo,
-        )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        _, item_e = _make_fake_item(
-            't-e', base_sha='live-main-tip', merge_commit='sha-Ec',
-            config=config, git_repo=git_repo,
-        )
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
-
-        text = [
-            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
-        ][0]
-        lowered = text.lower()
-
-        assert 'advisory' in lowered, (
-            f'WARNING must state it is ADVISORY by decision, not a pending bug. '
-            f'Got: {text!r}'
-        )
-        assert '3206' in text, (
-            f'WARNING must cite task 3206 (the adjudication). Got: {text!r}'
-        )
-        assert '5.3' in text, (
-            f'WARNING must cite PRD §5.3 (the contract of record). Got: {text!r}'
-        )
 
 
 # ── Amendment: _finalizing_head branch coverage (review suggestion) ───────────
