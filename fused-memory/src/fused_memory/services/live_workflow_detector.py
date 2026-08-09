@@ -352,13 +352,17 @@ def detect_live_workflow(
             in-progress workflow whose lingering worktree registration and the
             freshly-restarted project-wide orchestrator lock both still assert
             liveness. ``recent_commit`` is EXEMPT (genuine per-task work
-            evidence). ``corroborated is None`` (the default — used by every
-            existing caller, and by ``recon_write_policy``/integrity-escalation
-            which lack the task dict) and ``corroborated is True`` both leave
-            the gate inert, so the detector's behavior is byte-for-byte
-            unchanged for all existing callers. The verdict is computed by
-            :func:`corroboration_for_task` and passed in only by
-            :func:`_render_live_workflow_section`, which HAS the task dict.
+            evidence). ``corroborated is None`` (the default) and
+            ``corroborated is True`` both leave the gate inert, so the
+            detector's behavior is byte-for-byte unchanged for any caller that
+            does not pass this kwarg. The verdict is computed by
+            :func:`corroboration_for_task` and passed in by the three consumers
+            that hold the task dict, which task 2964 made agree with each other:
+            :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._render_live_workflow_section`
+            (the render-time Live-Workflow Signals section),
+            ``recon_write_policy.check``'s Gate 2 (via its
+            ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
+            integrity-escalation gate over cited tasks.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
