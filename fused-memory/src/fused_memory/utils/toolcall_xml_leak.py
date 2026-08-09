@@ -113,7 +113,8 @@ carries that bootstrap, records the same cost in a comment, and is the
 pattern to copy. Making a shared leaf importable without the package init
 (a lazy ``__getattr__`` in ``shared/__init__.py``) would restore the
 dependency-light property, but it is a shared-wide change that task 3688
-held no lock for and deliberately did not take on.
+held no lock for and deliberately did not take on. **Task 3896** owns it;
+when that lands, revisit this section rather than trusting it.
 """
 from __future__ import annotations
 
