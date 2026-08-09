@@ -1523,6 +1523,84 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
     )
 
 
+def test_fleet_dir_default_matches_across_tiers() -> None:
+    """The fleet-heartbeat DIRECTORY default must not diverge across tiers.
+
+    Four mirrors of one absolute path, none of which can import the others'
+    home: the bash script (stdlib-free), scripts/drain_check.py (stdlib-only, so
+    it cannot import orchestrator), orchestrator.fleet_heartbeat (the canonical
+    PRODUCER) and df_pytest_isolation (STDLIB+PYTEST only, since every subproject
+    conftest imports it). scripts/tests/test_drain_check.py already pins legs 2
+    and 3 against each other; this adds the BASH leg, which has never had a pin,
+    and the task-3799 guard leg.
+
+    THE DECISION THIS ENCODES, not merely the mismatch: data/fleet/ is a
+    MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory (task 2395's Open-Q2,
+    decided at decompose) — measured 2026-08-07 and again 2026-08-09 holding live
+    heartbeats for SEVEN different projects' orchestrators. It sits under
+    dark-factory/data/ only because dark-factory is the fleet HOST.
+
+    So the tempting symmetry with the adjacent CLOCK_FILE six lines below it in
+    the script — "make it $REPO_DIR-relative like its neighbour" — is WRONG, and
+    wrong in the silent direction: every .worktrees/<id> checkout would resolve
+    to its own empty data/fleet, read ZERO heartbeats, and conclude the fleet is
+    absent. That is a fail-SOFT in exactly the drain gate this task family exists
+    to protect. The clock is a dark-factory REPO artifact, for which per-checkout
+    IS correct; the asymmetry is deliberate.
+
+    A CHARACTERIZATION PIN, not a RED test: the production values are already
+    correct and must not change. Test isolation is achieved by SETTING
+    ORCH_FLEET_DIR (df_pytest_isolation._df_fleet_dir_redirect), never by
+    changing this default.
+    """
+    import df_pytest_isolation
+    from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR as PRODUCER_DEFAULT
+
+    expected = str(PRODUCER_DEFAULT)
+    drift_note = (
+        "\ndata/fleet/ is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory "
+        "(task 2395 Open-Q2) holding seven projects' live orchestrator "
+        "heartbeats; it lives under dark-factory/data/ only because dark-factory "
+        "is the fleet host. Making it $REPO_DIR-relative -- the tempting symmetry "
+        "with the CLOCK_FILE default six lines below it -- would make every "
+        ".worktrees/<id> checkout resolve to its own EMPTY data/fleet, read zero "
+        "heartbeats, and silently conclude the fleet is absent: a fail-soft in "
+        "exactly the drain gate this guards. Isolate tests by setting "
+        "ORCH_FLEET_DIR instead."
+    )
+
+    # --- bash script mirror (FLEET_DIR default) ---
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(r'FLEET_DIR="\$\{ORCH_FLEET_DIR:-([^}]+)\}"', script_src)
+    assert match is not None, (
+        "restart-all-orchestrators.sh FLEET_DIR default pattern not found -- "
+        "did its literal shape change? Update this regex to match."
+    )
+    assert match.group(1) == expected, (
+        f"restart-all-orchestrators.sh FLEET_DIR default {match.group(1)!r} has "
+        f"drifted from orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR {expected!r}."
+        + drift_note
+    )
+
+    # --- drain_check mirror (the gate the script actually spawns) ---
+    import drain_check
+
+    assert str(drain_check.DEFAULT_FLEET_DIR) == expected, (
+        f"drain_check.DEFAULT_FLEET_DIR {str(drain_check.DEFAULT_FLEET_DIR)!r} has "
+        f"drifted from the producer's {expected!r}." + drift_note
+    )
+
+    # --- pytest-guard mirror (df_pytest_isolation, task 3799) ---
+    # A drifted mirror here is the worst kind: silently green, guarding a
+    # directory nothing writes while the real one takes the leaks.
+    assert str(df_pytest_isolation.LIVE_FLEET_DIR) == expected, (
+        f"df_pytest_isolation.LIVE_FLEET_DIR "
+        f"{str(df_pytest_isolation.LIVE_FLEET_DIR)!r} has drifted from the "
+        f"producer's {expected!r}; the synthetic-heartbeat leak guard would watch "
+        "a directory nothing writes." + drift_note
+    )
+
+
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
