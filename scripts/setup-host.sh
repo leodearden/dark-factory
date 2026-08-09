@@ -970,13 +970,41 @@ fi
 # touch <unit>.d/ directories.
 #
 # Warn-only, like the pre-install check.
-if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
-     --installed-dir "$UNIT_DIR" \
-     --repo-root     "$REPO_ROOT"; then
-  ok "Dashboard units: install verified (installed copies match the committed ones)"
+#
+# Same exit-2 overloading as the section-8 gate, and here the false green is
+# the strongest of the three sites: this is the LAST word the operator reads
+# about whether the install took, and its exit-2 wording is not merely
+# reassuring but already a diagnosis ("section 8 did not run?"). A renamed
+# checker would send them to investigate an install that in fact completed,
+# while the thing that actually failed — the check itself — went unreported.
+# So the script path is guarded and no status is believed without the
+# checker's own [dashboard_unit_parity] tag.
+#
+# Distinct variable names from section 8's on purpose: both blocks share one
+# shell scope, so under `set -u` a stale _dash_parity_out/_exit from section 8
+# would still be readable here and a check that never ran could silently
+# inherit the earlier block's verdict.
+_dash_post_parity_script="$REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+
+if [ ! -f "$_dash_post_parity_script" ]; then
+  fail "Dashboard post-install check missing: $_dash_post_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
+  fail "  The install above is therefore UNVERIFIED, not verified."
 else
-  _dash_parity_exit=$?
-  if [ "$_dash_parity_exit" -eq 2 ]; then
+  _dash_post_parity_out="$(python3 "$_dash_post_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" \
+       && _dash_post_parity_exit=0 || _dash_post_parity_exit=$?
+  printf '%s\n' "$_dash_post_parity_out"
+
+  if ! printf '%s\n' "$_dash_post_parity_out" | grep -q '\[dashboard_unit_parity\]'; then
+    fail "Dashboard post-install check produced no [dashboard_unit_parity] report"
+    fail "  (status $_dash_post_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+    fail "  The install above is therefore UNVERIFIED, not verified."
+  elif [ "$_dash_post_parity_exit" -eq 0 ]; then
+    ok "Dashboard units: install verified (installed copies match the committed ones)"
+  elif [ "$_dash_post_parity_exit" -eq 2 ]; then
     warn "Dashboard units: not installed in $UNIT_DIR (section 8 did not run?)"
   else
     warn "Dashboard units: still not at parity AFTER installing — the install"
