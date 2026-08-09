@@ -518,6 +518,65 @@ class TestScanContentAmbiguityPartition:
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
 
+class TestSelfQualifiedRefsNeverContestForeignRefs:
+    """A SELF-qualified reference ('reify:2500' scanned in group reify) is
+    EXPLICITLY project-qualified, so it is not evidence of ambiguity about
+    anything. Only an UNQUALIFIED bare mention ('task 2500') leaves the project
+    in doubt.
+
+    Ambiguity is a property of what the PROSE failed to say. Two qualified
+    references — even when one of them names the local project — each already
+    name their project, so they can never be mutually ambiguous.
+
+    This closes a regression the extraction introduced by composing two
+    individually-reasonable changes: scan_content RECLASSIFIES a self-qualified
+    ref into an own-project referent instead of dropping it, and the partition
+    contested any own-project referent. Measured on this branch, with a
+    self-qualified ref plus a foreign ref and nothing bare anywhere:
+    find_cross_project_task_refs('reify:2500 relates to dark_factory:2500',
+    group_id='reify') returned refs=['dark_factory:2500'], ambiguous=[]
+    pre-3667 (fe89df000d) and refs=[], ambiguous=['dark_factory:2500'] at
+    d295f5402e — a real cross-project repair silently suppressed on a path that
+    performs destructive edge surgery.
+    """
+
+    def test_self_qualified_ref_does_not_contest_a_foreign_ref(self):
+        scan = scan_content('reify:2500 relates to dark_factory:2500', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500']
+        assert scan.ambiguous == []
+
+    def test_the_rule_is_order_independent(self):
+        scan = scan_content('dark_factory:2500 relates to reify:2500', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500', 'Task 2500']
+        assert scan.ambiguous == []
+
+    def test_unrelated_self_qualified_refs_also_survive(self):
+        scan = scan_content('reify:2500 and dark_factory:2500 and reify:99', group_id='reify')
+        assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500', 'Task 99']
+        assert scan.ambiguous == []
+
+    def test_self_qualification_is_recognised_after_canonicalization(self):
+        """Both sides are canonicalized before the local comparison, so a
+        differently-spelled self-qualifier is still self-qualified — and so
+        still never contests."""
+        scan = scan_content('Reify-Factory:2500 and dark_factory:2500', group_id='reify_factory')
+        assert [r.node_name for r in scan.refs] == ['Task 2500', 'dark_factory:2500']
+        assert scan.ambiguous == []
+
+    def test_a_bare_mention_still_contests_even_when_self_qualified_wins_dedup(self):
+        """The guard against over-correcting: bare-ness is STICKY per number.
+
+        Here the self-qualified spelling appears FIRST, so it wins first-seen
+        dedup and the surviving own-project referent is the one that arrived
+        qualified — but the content DOES also say 'task 2500' bare, so the
+        contest is real and both sides must still be refused.
+        """
+        content = 'reify:2500 and task 2500 and dark_factory:2500'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == []
+        assert [r.node_name for r in scan.ambiguous] == ['Task 2500', 'dark_factory:2500']
+
+
 class TestUnregisteredKindIsRejectedLoudly:
     """The kind is registry-extensible ('escalation' is the next entry per the
     PRD) and today's registry holds only 'task'.

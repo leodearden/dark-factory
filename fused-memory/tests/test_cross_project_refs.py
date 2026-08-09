@@ -445,6 +445,39 @@ class TestHashSpelledBareMentionsCreateAmbiguity:
         assert scan.ambiguous == []
 
 
+class TestSelfQualifiedRefsNeverSuppressForeignRefs:
+    """A self-qualified reference never makes a same-numbered FOREIGN ref
+    ambiguous, because neither reference is unqualified.
+
+    This pins RESTORED pre-3667 behaviour: measured on this branch,
+    'reify:2500 relates to dark_factory:2500' in group reify yielded
+    refs=['dark_factory:2500'], ambiguous=[] at fe89df000d and refs=[],
+    ambiguous=['dark_factory:2500'] at d295f5402e, silently suppressing a real
+    cross-project repair.
+
+    It is also exactly what this module's own surviving narrowing already
+    describes — 'a task number mentioned both qualified and BARE in one episode
+    is ambiguous'. Qualified-and-qualified never was.
+    """
+
+    def test_self_qualified_ref_does_not_suppress_the_foreign_ref(self):
+        scan = find_cross_project_task_refs(
+            'reify:2500 relates to dark_factory:2500', group_id='reify'
+        )
+        assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == []
+
+    def test_an_actual_bare_mention_still_makes_it_ambiguous(self):
+        """The guard against over-correcting: the self-qualified spelling comes
+        first and wins dedup, but the content still says 'task 2500' bare, so
+        the foreign ref remains genuinely ambiguous."""
+        scan = find_cross_project_task_refs(
+            'reify:2500 and task 2500 and dark_factory:2500', group_id='reify'
+        )
+        assert scan.refs == []
+        assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
+
+
 class TestNoSecondCopyOfTheLabelPattern:
     """INV-5 (no lockstep duplication), the invariant task 3667 exists to
     enforce: the task-label vocabulary lives ONLY in utils/canonical_labels.py,
