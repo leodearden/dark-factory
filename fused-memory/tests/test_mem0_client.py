@@ -1343,6 +1343,55 @@ class TestIsMissingCollectionError:
         exc = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
         assert is_missing_collection_error(exc) is False
 
+    def test_unrelated_404_is_false(self):
+        """The status code alone is NOT enough — the message must name a
+        collection.
+
+        Qdrant answers 404 for several absent resources, and only the missing
+        COLLECTION means "zero memories".  Reading any other 404 as an empty
+        result would be exactly the silent fail-soft this predicate exists to
+        avoid, so widening the match to `status_code == 404` must fail here.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is False
+
+    def test_missing_snapshot_404_is_false(self):
+        """Boundary on the phrase itself: Qdrant words a missing SNAPSHOT with
+        the same "doesn't exist!" wording, so the phrase alone cannot decide.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b"Snapshot `daily-2026-08-09` doesn't exist!",
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is False
+
+    def test_str_content_is_decoded_leniently(self):
+        """`.content` is typed bytes but assigned verbatim by qdrant_client, so
+        an already-decoded str must still match rather than crash the caller's
+        error path.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            "Collection `fused_solar_challenge` doesn't exist!",  # type: ignore[arg-type]
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is True
+
+    def test_none_content_is_false(self):
+        """A 404 carrying no body proves nothing about a collection, and must
+        not blow up the predicate on the way to returning False.
+        """
+        exc = UnexpectedResponse(404, 'Not Found', None, httpx.Headers())  # type: ignore[arg-type]
+        assert is_missing_collection_error(exc) is False
+
     def test_generic_exception_is_false(self):
         assert is_missing_collection_error(RuntimeError('qdrant down')) is False
 

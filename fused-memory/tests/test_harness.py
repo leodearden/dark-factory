@@ -15675,6 +15675,26 @@ class TestHarnessReconcileStatusCorrection:
             'a missing collection is an empty result, not a failure — it must '
             'not emit the per-cycle WARNING the generic handler logs'
         )
+        # Loud-over-silent: quiet is NOT the contract, INFO is.  The disclosure
+        # is an operator's only way to tell "collection absent" from "collection
+        # genuinely empty" behind found=False, so pin its presence AND its
+        # structured project_id — not merely the absence of a WARNING, which
+        # deleting the logger.info call outright would also satisfy.
+        missing_records = [
+            r
+            for r in caplog.records
+            if 'reconciliation.status_correction_collection_missing' in r.getMessage()
+        ]
+        assert missing_records, (
+            'Expected an INFO reconciliation.status_correction_collection_missing '
+            f'record disclosing WHY found=False; got '
+            f'{[(r.levelno, r.getMessage()) for r in caplog.records]}'
+        )
+        assert missing_records[0].levelno == logging.INFO
+        assert getattr(missing_records[0], 'project_id', None) == 'solar_challenge', (
+            'the disclosure must name the project in a structured extra= field, '
+            f'got {getattr(missing_records[0], "project_id", None)!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_non_missing_collection_response_still_errors(

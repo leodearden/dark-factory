@@ -81,7 +81,14 @@ def is_missing_collection_error(exc: BaseException) -> bool:
     content = exc.content
     if isinstance(content, bytes | bytearray):
         content = content.decode('utf-8', errors='replace')
-    return "doesn't exist" in str(content).lower()
+    text = str(content).lower()
+    # BOTH tokens, never the phrase alone: Qdrant words several other not-found
+    # errors identically ("Snapshot `x` doesn't exist!", alias/shard variants),
+    # and only the COLLECTION one means "zero memories".  Requiring 'collection'
+    # is what makes the narrowness the docstring promises actually hold.
+    # Verified against a live Qdrant scroll on an absent collection:
+    # {"status":{"error":"Not found: Collection `x` doesn't exist!"}}.
+    return "doesn't exist" in text and 'collection' in text
 
 
 # ---------------------------------------------------------------------------

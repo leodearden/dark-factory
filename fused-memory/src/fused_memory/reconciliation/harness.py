@@ -1527,6 +1527,18 @@ class ReconciliationHarness:
                 # (task 2949).  Narrow by construction: anything else — a 500, a
                 # TimeoutError, any other exception — re-raises into the outer
                 # handler unchanged, so real failures still surface loudly.
+                #
+                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
+                # collection still raises from every other Mem0 read in the cycle
+                # (targeted.py, standing_decision_writer.py, summary_pool.py,
+                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
+                # same scroll_by_metadata), so a brand-new project can still see
+                # errors from those paths.  Task 2949 scopes the fix to the
+                # status_correction path and keeps scroll_by_metadata's
+                # no-silent-fail contract untouched for its other callers —
+                # including hot pool-GC loops that would pay for a proactive
+                # collection_exists round-trip.  Generalising the degradation to
+                # the whole read surface is filed as a follow-up.
                 if not is_missing_collection_error(exc):
                     raise
                 logger.info(
