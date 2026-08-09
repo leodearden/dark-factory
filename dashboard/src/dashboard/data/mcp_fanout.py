@@ -76,6 +76,16 @@ async def first_success(
     caller reproduce its own existing offline shape (e.g.
     ``{'offline': True, 'error': '; '.join(errors)}``) while preserving the
     per-URL error detail.
+
+    **Each per-URL failure is logged at WARNING**, not DEBUG. The fall-through
+    is silent to the caller — a total outage just yields the offline sentinel
+    — so at DEBUG (the dashboard runs at the default WARNING root level) a
+    complete fused-memory/escalation outage would leave *no* journal trace at
+    all, and the operator would see an "offline" pill with no recorded cause.
+    This is one record per *failing URL*, not one per outage: a fan-out over N
+    dead URLs logs N lines, which is the intended detail level (each URL's
+    error string differs). Same class of fix as task 1814; this path had
+    regressed to DEBUG.
     """
     # Local import breaks the memory<->mcp_fanout import cycle: memory.py
     # imports first_success at module top, so invalidate_session (which
@@ -89,7 +99,7 @@ async def first_success(
             return await call(url)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
-            logger.debug('%s failed for %s: %s', log_label, url, e)
+            logger.warning('%s failed for %s: %s', log_label, url, e)
             errors.append(f'{url}: {e}')
             invalidate_session(url)
     return offline_result(errors)
