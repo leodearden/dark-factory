@@ -195,9 +195,17 @@ def assert_repair_invariants(value: object, result: Repair | None) -> None:
     * every recovered value is a VERBATIM SUBSTRING of the input — the repairer
       never synthesises a value;
     * ``misclose`` sits exactly at the prefix boundary, so the three fields
-      describe one consistent cut of the input rather than three guesses.
+      describe one consistent cut of the input rather than three guesses;
+    * ``clean_value`` is ENVELOPE-FREE — ``detect(clean_value) is None``. A
+      repair whose own output still trips the detector is a SILENT PARTIAL
+      repair: contract C2's middleware forwards ``clean_value`` as the repaired
+      argument, so a residual envelope there would re-trip the write-time
+      tripwire downstream AND leave the arguments hiding in the residue
+      permanently dropped, with no diagnostic. Refusing outright is the only
+      honest answer; this clause is what makes that hold corpus-wide rather
+      than for one hand-authored specimen.
 
-    ``None`` (unrepairable) satisfies all three trivially and is accepted, so a
+    ``None`` (unrepairable) satisfies all four trivially and is accepted, so a
     caller can pass any result through unconditionally.
     """
     if result is None:
@@ -212,6 +220,13 @@ def assert_repair_invariants(value: object, result: Repair | None) -> None:
         )
     assert value[len(result.clean_value):].startswith(result.misclose), (
         'D5 violated: misclose does not sit at the clean_value boundary'
+    )
+    residual = detect(result.clean_value)
+    assert residual is None, (
+        f'SILENT PARTIAL REPAIR: clean_value still carries {residual!r}; '
+        'repair() must refuse rather than hand the middleware a value that '
+        'still trips detect() and still swallows the caller arguments hiding '
+        'in the residue'
     )
 
 
@@ -579,3 +594,118 @@ class TestRepairInvariants:
             for value in _HOSTILE_VALUES
         ]
         assert any(result is not None for result in results)
+
+
+class TestNoSilentPartialRepair:
+    """The accept-time PREFIX-CLEAN post-condition (step 14/15).
+
+    The candidate scan advances past a closer whose tail does not parse, which
+    is right — but nothing stopped the ACCEPTED candidate's prefix from still
+    containing the closer that was skipped over. When that skipped closer is
+    itself an envelope literal, the returned ``clean_value`` is a value the
+    middleware would forward while it still trips ``detect()``, and the
+    arguments buried in the residue are dropped for good. The fix is a third
+    accept-time condition, uniform with B8 and B9: reject the candidate and
+    keep scanning.
+
+    The pair below is the point. Both have the same SHAPE — an earlier
+    qualifying closer whose tail leaves leftover text, then a later closer that
+    parses cleanly. They must land differently, because only one of the two
+    earlier closers is an envelope literal:
+
+    * :meth:`test_earlier_candidate_rejected_then_a_later_one_accepted` — the
+      earlier closer is ``priority``, a schema parameter but NOT one of
+      ``PARAMETER_CLOSER_NAMES``, so the prefix stays clean and the scan's
+      advance-and-accept behaviour must SURVIVE the new condition;
+    * :meth:`test_the_same_shape_with_an_envelope_literal_prefix_is_refused` —
+      the earlier closer is ``details``, which IS an envelope literal, so every
+      later candidate's prefix is poisoned and the only honest answer is None.
+
+    Without the first case the post-condition could be "fixed" by refusing
+    every value with more than one qualifying closer, which would gut the scan.
+    """
+
+    def test_the_regression_returns_none_rather_than_a_partial_repair(self):
+        """Reproduced verbatim from the review, then re-verified at this HEAD.
+
+        ``nonesuch`` is not a submit-task-shaped parameter, so the FIRST
+        ``description`` closer's tail fails the B8 schema check and the scan
+        advances to the second one. Its tail parses and validates — but the
+        prefix it would hand back still contains the first ``description``
+        closer AND the whole ``nonesuch`` argument. Before the fix this
+        returned ``Repair(clean_value='A\\x3c/description>\\x3cnonesuch>x...B',
+        recovered={'priority': 'low'})``: a value that still trips ``detect``
+        and has silently eaten a caller argument.
+        """
+        value = (
+            'A'
+            + _closer('description')
+            + _opener('nonesuch') + 'x' + _closer('nonesuch')
+            + 'B'
+            + _closer('description')
+            + _opener('priority') + 'low' + _closer('priority')
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params={'description', 'priority'},
+            supplied={'description'},
+        ) is None
+
+    def test_earlier_candidate_rejected_then_a_later_one_accepted(self):
+        """The advance-and-accept path the review found untested ENTIRELY.
+
+        ``priority`` is in the schema so its closer qualifies as a candidate,
+        but its tail is the leftover text ``junk B...`` and the candidate is
+        rejected. The scan advances to the ``description`` closer, whose tail
+        parses. The prefix ``A\\x3c/priority>junk B`` carries a closing tag —
+        but ``priority`` is not one of the four ``PARAMETER_CLOSER_NAMES``, so
+        it is not an envelope literal and the prefix is clean. The repair must
+        still be returned: the post-condition REFINES the scan, it does not
+        kill it.
+        """
+        value = (
+            'A'
+            + _closer('priority') + 'junk B'
+            + _closer('description')
+            + _opener('task_id') + '7' + _closer('task_id')
+        )
+
+        result = repair(
+            value,
+            param='description',
+            schema_params={'description', 'priority', 'task_id'},
+            supplied={'description'},
+        )
+
+        assert result == Repair(
+            clean_value='A' + _closer('priority') + 'junk B',
+            recovered={'task_id': '7'},
+            pattern=_closer('description'),
+            misclose=_closer('description'),
+        )
+        assert detect(result.clean_value) is None
+        assert_repair_invariants(value, result)
+
+    def test_the_same_shape_with_an_envelope_literal_prefix_is_refused(self):
+        """Same shape, one substitution: the skipped closer is now a literal.
+
+        ``details`` is in the schema AND is one of ``PARAMETER_CLOSER_NAMES``,
+        so once the scan steps over it every later candidate's prefix is
+        poisoned — and stays poisoned, because candidate start positions only
+        increase. Refuse.
+        """
+        value = (
+            'A'
+            + _closer('details') + 'junk B'
+            + _closer('description')
+            + _opener('task_id') + '7' + _closer('task_id')
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params={'description', 'details', 'task_id'},
+            supplied={'description'},
+        ) is None
