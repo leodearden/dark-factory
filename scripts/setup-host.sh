@@ -876,16 +876,51 @@ fi
 # (Environment=MEM0_TELEMETRY=false, WatchdogSec=120).  Warn-only: drift does
 # not abort the install; re-run with --fix to correct in-place without clobbering
 # host-specific lines (e.g. extra DASHBOARD_KNOWN_PROJECT_ROOTS entries).
-if python3 "$REPO_ROOT/scripts/check_fused_memory_unit_parity.py" \
-     --installed "$UNIT_DIR/fused-memory.service" \
-     --template  "$REPO_ROOT/scripts/fused-memory.service.template"; then
-  ok "Fused-memory unit: parity with template (all safety directives present)"
+#
+# POST-INSTALL HEALTH CHECK, not a gate on anything: the fused-memory unit is
+# rendered and installed back in section 4, and nothing installs after this
+# block, so there is no action here to make conditional. What it owes the
+# operator is an honest verdict.
+#
+# The exit code alone is NOT trusted, because 2 is overloaded three ways: the
+# checker's "not installed on this host" (benign), `python3` refusing to open a
+# missing script file, and argparse rejecting an unknown flag. Renaming the
+# checker or one of its flags would therefore print a reassuring "skipping
+# parity check" — a check reporting green because it never ran, which is the
+# silent-drift failure the checker exists to catch, reproduced one level up in
+# its own wiring.
+#
+# The orchestrator gate above greps the checker's [orchestrator_unit_parity]
+# tag. This checker has no LOG_TAG (and is read-only for this task), so its own
+# bracketed markers stand in for one. That vocabulary is an implicit contract of
+# a file this block does not own, so it is pinned directly by
+# test_gate_markers_appear_on_every_real_exit_path_and_neither_collision in
+# tests/scripts/test_check_fused_memory_unit_parity.py: markers present on all
+# three real exit paths, absent on both collision sources.
+_fm_parity_script="$REPO_ROOT/scripts/check_fused_memory_unit_parity.py"
+
+if [ ! -f "$_fm_parity_script" ]; then
+  fail "Fused-memory parity check missing: $_fm_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
 else
-  _parity_exit=$?
-  if [ "$_parity_exit" -eq 2 ]; then
+  # 2>&1 is load-bearing: the [skip] line and the drift trailer go to stderr.
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _fm_parity_out="$(python3 "$_fm_parity_script" \
+       --installed "$UNIT_DIR/fused-memory.service" \
+       --template  "$REPO_ROOT/scripts/fused-memory.service.template" 2>&1)" \
+       && _fm_parity_exit=0 || _fm_parity_exit=$?
+  printf '%s\n' "$_fm_parity_out"
+
+  if ! printf '%s\n' "$_fm_parity_out" | grep -qE '^\[(ok|skip|drift|fixed)\]'; then
+    fail "Fused-memory parity check produced no recognizable report"
+    fail "  (status $_fm_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+  elif [ "$_fm_parity_exit" -eq 0 ]; then
+    ok "Fused-memory unit: parity with template (all safety directives present)"
+  elif [ "$_fm_parity_exit" -eq 2 ]; then
     warn "Fused-memory unit: not installed at $UNIT_DIR/fused-memory.service (skipping parity check)"
   else
-    warn "Fused-memory unit: DRIFT detected — run: python3 $REPO_ROOT/scripts/check_fused_memory_unit_parity.py --fix"
+    warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
   fi
 fi
 
