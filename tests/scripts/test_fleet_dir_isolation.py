@@ -66,7 +66,9 @@ from df_pytest_isolation import (  # noqa: E402
     LIVE_FLEET_DIR,
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
+    leaked_fleet_heartbeat_reason,
     non_synthetic_unit_names,
+    synthetic_heartbeats_in,
     synthetic_unit,
 )
 
@@ -307,6 +309,101 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     # The fixture's yielded value IS the redirect, not a parallel path.
     assert Path(_df_fleet_dir_redirect).resolve() == resolved
+
+
+class TestSyntheticHeartbeatsIn:
+    """Which files in a fleet dir the leak guard counts as evidence.
+
+    Exercised ONLY against tmp dirs — never the real LIVE_FLEET_DIR, since a
+    test that wrote there would BE the defect under guard.
+    """
+
+    def test_it_ignores_real_unit_heartbeats(self, tmp_path: Path) -> None:
+        """THE property that makes the guard immune to production churn.
+
+        The live fleet dir is rewritten by the running orchestrators roughly
+        every 30s (measured 2026-08-09: six of seven files moved between two
+        readings five minutes apart), so a guard keyed on "did anything change"
+        would fail on essentially every run.  Keyed on the SYNTHETIC name, it
+        fires only on a file no production process can produce.
+        """
+        (tmp_path / 'orchestrator-reify.service.json').write_text('{}')
+        (tmp_path / 'orchestrator-dark-factory.service.json').write_text('{}')
+        (tmp_path / f'{synthetic_unit("reify")}.json').write_text('{}')
+
+        assert synthetic_heartbeats_in(tmp_path) == [
+            f'{synthetic_unit("reify")}.json',
+        ]
+
+    def test_results_are_sorted(self, tmp_path: Path) -> None:
+        """So the failure message is stable across filesystems (readdir order
+        is not guaranteed), which is what makes it diffable between runs.
+        """
+        for stem in ('zulu', 'alpha', 'mike'):
+            (tmp_path / f'{synthetic_unit(stem)}.json').write_text('{}')
+
+        assert synthetic_heartbeats_in(tmp_path) == sorted(
+            f'{synthetic_unit(stem)}.json' for stem in ('zulu', 'alpha', 'mike')
+        )
+
+    def test_a_missing_directory_is_empty_not_an_error(self, tmp_path: Path) -> None:
+        """It runs in SESSION TEARDOWN, where an exception would mask whatever
+        the run was actually reporting.  A fleet dir that does not exist is the
+        ordinary state on a box that has never hosted the fleet.
+        """
+        assert synthetic_heartbeats_in(tmp_path / 'nope') == []
+
+    def test_an_unreadable_directory_is_empty_not_an_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same reason.  Chmod 0 rather than a mocked OSError, so this pins the
+        real syscall behaviour and not a stub's idea of it.
+        """
+        blocked = tmp_path / 'blocked'
+        blocked.mkdir()
+        (blocked / f'{synthetic_unit("reify")}.json').write_text('{}')
+        blocked.chmod(0o000)
+        try:
+            assert synthetic_heartbeats_in(blocked) == []
+        finally:
+            blocked.chmod(0o755)
+
+    def test_an_empty_directory_is_empty(self, tmp_path: Path) -> None:
+        assert synthetic_heartbeats_in(tmp_path) == []
+
+    def test_it_ignores_non_json_files(self, tmp_path: Path) -> None:
+        """A heartbeat is ``<unit>.json``; anything else in that directory is
+        not one, and reporting it would send the reader after the wrong file.
+        """
+        (tmp_path / f'{synthetic_unit("reify")}.txt').write_text('')
+        assert synthetic_heartbeats_in(tmp_path) == []
+
+
+class TestLeakedFleetHeartbeatReason:
+    """The message the guard fails with."""
+
+    def test_no_leak_is_none(self) -> None:
+        assert leaked_fleet_heartbeat_reason([]) is None
+
+    def test_it_names_every_offender(self) -> None:
+        names = [f'{synthetic_unit("alpha")}.json', f'{synthetic_unit("bravo")}.json']
+        reason = leaked_fleet_heartbeat_reason(names)
+        assert reason is not None
+        for name in names:
+            assert name in reason
+
+    def test_it_names_the_directory_the_mechanism_and_the_remedy(self) -> None:
+        """The actionable-message convention ``deploy_clock_violation_reason``
+        established: a guard's message must be usable without a second
+        investigation — WHERE, HOW it happened, and the remedy SYMBOL.
+        """
+        reason = leaked_fleet_heartbeat_reason([f'{synthetic_unit("alpha")}.json'])
+        assert reason is not None
+        assert str(LIVE_FLEET_DIR) in reason
+        assert 'ORCH_FLEET_DIR' in reason
+        assert 'restart-all-orchestrators.sh:109' in reason
+        assert 'drain_check.py:32' in reason
+        assert 'df_pytest_isolation._df_fleet_dir_redirect' in reason
 
 
 def test_no_stray_environment_assumptions() -> None:
