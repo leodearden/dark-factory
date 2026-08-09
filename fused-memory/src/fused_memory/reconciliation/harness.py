@@ -3870,25 +3870,20 @@ class ReconciliationHarness:
                 continue
             task_by_id[str(t.get('id'))] = t
 
-        # Task 2964: hoist the two per-project corroboration inputs ONCE per
-        # remediation pass, mirroring _render_live_workflow_section's hoist
-        # (reconciliation/stages/task_knowledge_sync.py). Both are constant for
-        # this project_root, and both are wrapped fail-safe → None: a None simply
-        # means that corroborating signal cannot fire (corroboration_for_task
-        # tolerates None inputs and never raises on them), which leaves the gate's
-        # verdict biased toward "not corroborated" — the direction that lets a
-        # stranded escalation through only when nothing at all vouches for the
-        # task. read_scheduler_state already returns an empty skeleton for an
-        # absent/invalid file; orchestrator_started_at returns None for an absent
-        # or unparseable lock.
-        try:
-            _sched_state: dict | None = read_scheduler_state(Path(project_root))
-        except Exception:
-            _sched_state = None
-        try:
-            _orch_started: datetime | None = orchestrator_started_at(project_root)
-        except Exception:
-            _orch_started = None
+        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
+        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
+        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
+        # so it must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
+        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
+        # a fresh now() there would age a heartbeat that was fresh when read past the
+        # TTL purely because the pass was slow, reporting corroborated=False for a
+        # task that is in fact live and filing a spurious stranded-work escalation.
+        # Pinning the clock to the read makes the verdict "was there a fresh
+        # per-task signal in the snapshot we hold" — evaluable, and biased toward
+        # suppression (the fail-safe direction) rather than toward escalating.
+        # task_by_id's own staleness is pre-existing and orthogonal.
+        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 
@@ -4117,6 +4112,36 @@ class ReconciliationHarness:
                         )
                         # resolved_fps stays empty → no suppressions → fail-open
 
+                # Task 2964: read the two per-project corroboration inputs ONCE,
+                # HERE — immediately before the live-workflow gate that consumes
+                # them, not at the top of the pass. They are freshness signals, and
+                # the top of the pass is minutes of LLM stage work away from this
+                # point: a task the scheduler picked up (or parked) mid-pass would
+                # read as uncorroborated from a t0 snapshot and the gate would file
+                # a stranded-work escalation for a task that is in fact live. The
+                # renderer's identical hoist (_render_live_workflow_section in
+                # reconciliation/stages/task_knowledge_sync.py) is safe at the top of
+                # its call only because its read-to-use gap is microseconds; this
+                # one's is not, so the read moves to the use.
+                #
+                # Both are constant for this project_root over the gate loop below,
+                # and both are wrapped fail-safe → None: a None simply means that
+                # corroborating signal cannot fire (corroboration_for_task tolerates
+                # None inputs and never raises on them), which leaves the verdict
+                # biased toward "not corroborated" — the direction that lets a
+                # stranded escalation through only when nothing at all vouches for
+                # the task. read_scheduler_state already returns an empty skeleton
+                # for an absent/invalid file; orchestrator_started_at returns None
+                # for an absent or unparseable lock.
+                try:
+                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                except Exception:
+                    _sched_state = None
+                try:
+                    _orch_started: datetime | None = orchestrator_started_at(project_root)
+                except Exception:
+                    _orch_started = None
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -4187,7 +4212,12 @@ class ReconciliationHarness:
                                 try:
                                     corroborated = corroboration_for_task(
                                         _task, tid,
-                                        now=datetime.now(UTC),
+                                        # The snapshot's own clock, NOT now() — see
+                                        # the _tasks_snapshot_at comment above: the
+                                        # heartbeat being aged came from that same
+                                        # read, and the 10-minute TTL is comparable
+                                        # to a remediation pass.
+                                        now=_tasks_snapshot_at,
                                         scheduler_state=_sched_state,
                                         orchestrator_started_at=_orch_started,
                                     )

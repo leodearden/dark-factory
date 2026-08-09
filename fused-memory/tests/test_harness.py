@@ -11709,9 +11709,9 @@ class TestIntegrityGateInputParityWithRenderer:
 
         A killed workflow's `claimant_run_id` PERSISTS — heartbeat freshness,
         not the claimant's presence, separates a live pipeline from a stranded
-        one. No routing metadata, and the harness's project_root
-        (/tmp/test-project) has no scheduler_state.json / orchestrator.lock, so
-        none of the three corroborating signals can fire.
+        one. No routing metadata, and `_run_gate` stubs the other two
+        corroboration inputs to their empty forms (see there), so none of the
+        three corroborating signals can fire.
         """
         task = {
             'id': int(cls._TASK_ID),
@@ -11760,6 +11760,29 @@ class TestIntegrityGateInputParityWithRenderer:
         }
 
         monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', fake_is_live)
+
+        # Pin the two on-disk corroboration inputs to their empty forms. Every
+        # case in this class rests on "no scheduler/orchestrator signal can
+        # corroborate" — but _make_test_harness hard-codes project_root to the
+        # shared, pytest-unmanaged /tmp/test-project, so leaving these real would
+        # make the premise depend on that directory happening not to exist on the
+        # machine. A stale /tmp/test-project/data/orchestrator/scheduler_state.json
+        # dropped by any other process or developer would flip `corroborated` and
+        # break test_uncorroborated_in_progress_cited_task_escalates for reasons
+        # having nothing to do with the code under test. Stub values mirror the
+        # real absent-file returns exactly: read_scheduler_state's empty skeleton
+        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # for an absent/unparseable lock.
+        monkeypatch.setattr(
+            harness_module, 'read_scheduler_state',
+            lambda _root: {
+                'queue': [], 'parks': {}, 'park_stacks': {},
+                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
+                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
+                'snapshot_at': None,
+            },
+        )
+        monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
         n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
         base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
