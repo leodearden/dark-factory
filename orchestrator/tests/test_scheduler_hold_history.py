@@ -184,16 +184,20 @@ def test_lock_events_are_emitted_from_exactly_one_site(event_name: str):
     )
 
 
-def test_the_guard_can_actually_find_emit_sites():
-    """Meta-test: a scanner that finds nothing would pass the guard vacuously."""
+def test_the_guard_can_actually_find_emit_sites(tmp_path):
+    """Meta-test: a scanner that finds nothing would pass the guard vacuously.
+
+    The probe goes in ``tmp_path``, never in the tests tree: this suite runs
+    under pytest-xdist, so a fixed path shared by every worker is a race, and a
+    hard interrupt mid-test would strand an untracked .py file in
+    ``orchestrator/tests/`` — where the guard's own ``rglob`` would then find it.
+    """
     source = 'from x import EventType\ndef f(self):\n    self.event_store.emit(\n' \
              '        EventType.lock_acquired, task_id="T1", data={})\n'
-    tmp = Path(__file__).parent / '_guard_meta_probe.py'
-    tmp.write_text(source)
-    try:
-        found = _emit_sites(tmp, 'lock_acquired')
-    finally:
-        tmp.unlink()
+    probe = tmp_path / '_guard_meta_probe.py'
+    probe.write_text(source)
+
+    found = _emit_sites(probe, 'lock_acquired')
 
     assert [(line, fn) for _f, line, fn in found] == [(3, 'f')]
 
@@ -316,3 +320,212 @@ async def test_dispatch_then_release_lands_a_real_sample_in_the_history():
         scheduler._hold_history.record(module, 10_000.0)
 
     assert scheduler._hold_history.predicted_hold(modules) == pytest.approx(120.0)
+
+
+# ===========================================================================
+# The plan-refinement path acquires locks too
+# ===========================================================================
+#
+# ``handle_blast_radius_expansion`` takes NEW module locks via
+# ``try_acquire_additional``.  A site that acquires without routing through the
+# chokepoint is invisible to BOTH halves of INV-5 at once — the event simply
+# does not exist, so the gap never shows up as a seed/live disagreement, and
+# the single-writer AST guard above cannot see it either.  These are the
+# behavioural tests that can.
+
+
+# lock_depth=5 keeps ``normalize_lock`` an identity over these four-component
+# paths, so ``current``/``needed`` below name exactly the keys the lock table
+# and the history hold.  At the default depth of 2 the two disagree — a
+# pre-existing asymmetry between ``derive_modules`` and ``normalize_lock`` that
+# is not this task's to resolve, and that would only obscure what is asserted
+# here.
+_REFINEMENT_DEPTH = 5
+_WIDENED = 'shared/src'
+
+
+async def _dispatch(scheduler: Scheduler, task: dict) -> list[str]:
+    """Dispatch *task* through the real acquire path; return its modules."""
+    from unittest.mock import AsyncMock
+
+    scheduler.get_tasks = AsyncMock(return_value=[task])          # type: ignore[method-assign]
+    scheduler.get_task = AsyncMock(return_value=task)             # type: ignore[method-assign]
+    scheduler.update_task = AsyncMock(return_value=True)          # type: ignore[method-assign]
+    assigned = await scheduler.acquire_next()
+    assert assigned is not None and assigned.task_id == task['id']
+    modules = scheduler._get_modules(task)
+    assert scheduler._hold_history.open_modules(task['id']) == modules
+    return modules
+
+
+@pytest.mark.asyncio
+async def test_a_refinement_widen_opens_the_widened_modules_in_the_history():
+    """A widen really does take a lock on ``additional``, so the predictor must
+    see a start for it.  Without one the eventual full release names those
+    modules (they ARE in ``lock_table._held``), the history has no matching open
+    span, and they are discarded as orphan releases — refinement-acquired holds
+    would contribute nothing to the window, forever."""
+    scheduler = _make_scheduler(lock_depth=_REFINEMENT_DEPTH)
+    scheduler.event_store = _StubEventStore(rows=[])  # type: ignore[assignment]
+    scheduler.finish_startup()
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    held = await _dispatch(scheduler, task)
+
+    ok = await scheduler.handle_blast_radius_expansion(
+        '1', current=held, needed=[*held, _WIDENED],
+    )
+
+    assert ok is True
+    assert sorted(scheduler._hold_history.open_modules('1')) == sorted([*held, _WIDENED])
+
+
+@pytest.mark.asyncio
+async def test_the_widen_acquire_also_lands_in_the_durable_stream():
+    """Fed to the predictor AND emitted, not one or the other.  Feeding only the
+    in-process history would make the live feed and ``seed_from_event_store``
+    disagree about this hold — the drift INV-5 forbids."""
+    scheduler = _make_scheduler(lock_depth=_REFINEMENT_DEPTH)
+    store = _StubEventStore(rows=[])
+    scheduler.event_store = store  # type: ignore[assignment]
+    scheduler.finish_startup()
+    held = await _dispatch(
+        scheduler, _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    )
+
+    await scheduler.handle_blast_radius_expansion(
+        '1', current=held, needed=[*held, _WIDENED],
+    )
+
+    refinement_acquires = [
+        data for evt, _tid, data in store.emitted
+        if evt == 'lock_acquired' and (data or {}).get('reason') == 'plan_refinement'
+    ]
+    assert len(refinement_acquires) == 1
+    assert refinement_acquires[0]['modules'] == [_WIDENED]
+
+
+@pytest.mark.asyncio
+async def test_a_refinement_shift_leaves_the_task_predictable():
+    """The case task η must reason about.  In a pure SHIFT every original module
+    is stale and every new one is additional, so without the widen feed the
+    task's open-span set empties out entirely and ``predicted_remaining``
+    refuses — for a task that is demonstrably holding locks right now."""
+    scheduler = _make_scheduler(lock_depth=_REFINEMENT_DEPTH)
+    scheduler.event_store = _StubEventStore(rows=[])  # type: ignore[assignment]
+    scheduler.finish_startup()
+    for duration in (100.0, 200.0, 300.0):
+        scheduler._hold_history.record(_WIDENED, duration)
+    held = await _dispatch(
+        scheduler, _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    )
+
+    await scheduler.handle_blast_radius_expansion(
+        '1', current=held, needed=[_WIDENED],
+    )
+
+    assert scheduler._hold_history.open_modules('1') == [_WIDENED]
+    # Acquired at the scheduler's fixed wall clock, so nothing has elapsed yet.
+    assert scheduler.predicted_remaining('1') == pytest.approx(200.0)
+
+
+@pytest.mark.asyncio
+async def test_a_widened_hold_lands_a_real_sample_when_the_task_releases():
+    """End to end: the widened module's hold becomes a SAMPLE, not an orphan."""
+    wall = [FIXED_DT]
+    config = OrchestratorConfig(max_per_module=1, lock_depth=_REFINEMENT_DEPTH)
+    scheduler = Scheduler(config, wall_time_source=lambda: wall[0])
+    scheduler.event_store = _StubEventStore(rows=[])  # type: ignore[assignment]
+    scheduler.finish_startup()
+    held = await _dispatch(
+        scheduler, _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    )
+    await scheduler.handle_blast_radius_expansion(
+        '1', current=held, needed=[*held, _WIDENED],
+    )
+
+    wall[0] = datetime.fromtimestamp(FIXED_DT.timestamp() + 90.0, tz=UTC)
+    scheduler.release('1')
+
+    assert scheduler._hold_history.sample_count([_WIDENED]) == 1
+    for duration in (0.0, 10_000.0):  # sandwich the observed hold as the median
+        scheduler._hold_history.record(_WIDENED, duration)
+    assert scheduler._hold_history.predicted_hold([_WIDENED]) == pytest.approx(90.0)
+
+
+# ===========================================================================
+# release() reconciles the live open-span map
+# ===========================================================================
+
+
+def test_release_drops_an_open_hold_the_lock_table_no_longer_knows_about():
+    """``release()`` drops ALL of a task's locks, so nothing of its may still be
+    open afterwards.  Residue left behind is not inert: ``predicted_remaining``
+    keeps answering for the phantom and, once elapsed exceeds the prediction,
+    answers a floored 0.0 — "overdue holder" — forever, about a task that
+    released long ago.  0.0 vs None is the whole contract."""
+    scheduler = _make_scheduler()
+    for duration in (100.0, 200.0, 300.0):
+        scheduler._hold_history.record('ghost/src', duration)
+    # A hold the history saw start and whose release never reached it.
+    scheduler._hold_history.observe_acquired(
+        '1', ['ghost/src'], at=FIXED_DT.timestamp() - 10.0,
+    )
+    assert scheduler.predicted_remaining('1') is not None
+
+    scheduler.release('1')
+
+    assert scheduler._hold_history.open_modules('1') == []
+    assert scheduler.predicted_remaining('1') is None
+
+
+def test_release_reconciles_even_when_the_task_held_no_locks_at_all():
+    """The ``if modules:`` guard skips the event — the reconciliation must not
+    be skipped with it, since an empty lock table is exactly the state a lost
+    release leaves behind."""
+    scheduler = _make_scheduler()
+    scheduler._hold_history.observe_acquired(
+        '1', ['ghost/src'], at=FIXED_DT.timestamp(),
+    )
+    assert scheduler.lock_table._held.get('1') in (None, set())
+
+    scheduler.release('1')
+
+    assert scheduler._hold_history.open_modules('1') == []
+
+
+def test_release_does_not_fabricate_a_sample_for_the_dropped_hold():
+    """Dropped, not closed at "now": an entry surviving to here means the
+    bookkeeping for that key is already broken and its start may be arbitrarily
+    stale."""
+    scheduler = _make_scheduler()
+    scheduler._hold_history.observe_acquired(
+        '1', ['ghost/src'], at=FIXED_DT.timestamp() - 10.0,
+    )
+
+    scheduler.release('1')
+
+    assert scheduler._hold_history.sample_count(['ghost/src']) == 0
+
+
+# ===========================================================================
+# The chokepoint refuses anything that is not a lock event
+# ===========================================================================
+
+
+def test_emit_lock_event_rejects_a_non_lock_event():
+    """Loud, not fail-soft.  A caller routing some third event type through the
+    lock chokepoint would have its payload emitted while the predictor saw
+    nothing — precisely the drift INV-5 forbids, and precisely the misuse a
+    silent fall-through would make invisible."""
+    from orchestrator.event_store import EventType
+
+    scheduler = _make_scheduler()
+    store = _StubEventStore(rows=[])
+    scheduler.event_store = store  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match='not a lock event'):
+        scheduler._emit_lock_event(
+            EventType.task_skipped, task_id='1', modules=['orchestrator/src'],
+        )
+
+    assert store.emitted == [], 'nothing may be emitted for a rejected event type'

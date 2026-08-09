@@ -1075,3 +1075,312 @@ def test_predicted_remaining_is_scoped_to_the_asking_task():
 
     assert history.predicted_remaining('T1', now=_at(50)) == pytest.approx(150.0)
     assert history.predicted_remaining('T2', now=_at(50)) is None
+
+
+# ===========================================================================
+# Defensive branches — the ones whose rationale is in a docstring
+# ===========================================================================
+#
+# Each branch below exists to keep bad data out of the window rather than to
+# implement a feature, so none of them is reachable from the canonical trace.
+# Left untested, a regression that made one of them swallow REAL data (say
+# ``_modules_of`` returning [] for a well-formed payload) would pass the whole
+# suite — the failure is silent by construction, which is exactly why it needs
+# a direct test rather than incidental coverage.
+
+
+def test_duration_clamps_a_span_that_ends_before_it_starts():
+    """A clock step (NTP correction, VM resume) can put a release before its
+    acquire.  ``start``/``end`` stay faithful to the rows they came from; the
+    clamp is what stops a NEGATIVE sample — time credit that never existed —
+    from entering the window and dragging the median below zero."""
+    span = HoldSpan('T1', 'orchestrator/src', 100.0, 40.0)
+
+    assert span.duration == 0.0
+    assert (span.start, span.end) == (100.0, 40.0), 'the raw row values must survive'
+
+
+def test_unparseable_timestamp_drops_only_its_own_row():
+    """A malformed ``timestamp`` costs its own row and nothing else.
+
+    The alternative — letting it through as 0.0, or aborting the replay — would
+    either file a hold of epoch length or throw away every span after it.
+    """
+    rows = [
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        dict(F.acquire(2, 10, 'T2', ['shared/src']), timestamp='not-a-date'),
+        F.release(3, 60, 'T1', ['orchestrator/src']),
+        F.release(4, 90, 'T2', ['shared/src']),
+    ]
+
+    spans = _by_key(iter_hold_spans(rows))
+
+    # T1's span is untouched by its malformed neighbour.
+    assert spans[('T1', 'orchestrator/src')].duration == pytest.approx(60.0)
+    # T2's acquire never happened, so its release is an orphan — no span at all.
+    assert ('T2', 'shared/src') not in spans
+
+
+def test_a_missing_timestamp_column_drops_the_row_too():
+    rows = [
+        dict(F.acquire(1, 0, 'T1', ['orchestrator/src']), timestamp=None),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+    ]
+
+    assert list(iter_hold_spans(rows)) == []
+
+
+@pytest.mark.parametrize(
+    'data',
+    [
+        pytest.param(None, id='data-is-None'),
+        pytest.param('orchestrator/src', id='data-is-a-string'),
+        pytest.param({'modules': None}, id='modules-is-None'),
+        pytest.param({'modules': 42}, id='modules-is-not-a-list'),
+        pytest.param({}, id='no-modules-key'),
+    ],
+)
+def test_a_lock_row_with_an_unusable_payload_opens_nothing(data):
+    """No modules means no span — never a phantom key like '' or 'None'."""
+    rows = [
+        dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data=data),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+    ]
+
+    assert list(iter_hold_spans(rows)) == []
+
+
+def test_a_bare_string_modules_payload_is_read_as_one_module():
+    """analyze_modules.py:135-136 tolerates the same shape.  It is coerced, not
+    dropped: a string is unambiguous about which single module it names, so
+    discarding it would throw away a real hold."""
+    rows = [
+        dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'}),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+    ]
+
+    spans = _by_key(iter_hold_spans(rows))
+
+    assert spans[('T1', 'orchestrator/src')].duration == pytest.approx(60.0)
+
+
+def test_non_string_and_empty_module_entries_are_filtered_out():
+    """Both feeds guard their module lists.  An empty-string key would collect
+    samples under a module no lock event can ever name again, quietly polluting
+    every pooled prediction that happens to include it."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T1', ['', None, 42, 'ok/src'], at=_at(0))
+
+    assert history.open_modules('T1') == ['ok/src']
+
+    history.observe_released('T1', ['', None, 42, 'ok/src'], at=_at(30))
+
+    assert history.sample_count(['ok/src']) == 1
+    assert history.sample_count(['']) == 0
+    assert history.predicted_hold(['ok/src']) == pytest.approx(30.0)
+
+
+def test_record_ignores_an_empty_module_key():
+    history = HoldHistory(min_samples=1)
+
+    history.record('', 100.0)
+
+    assert history.sample_count(['']) == 0
+
+
+# ===========================================================================
+# truncated_fraction — how much of the evidence is censored
+# ===========================================================================
+#
+# A truncated sample is a right-censored LOWER BOUND: the hold was still
+# running when its end was imposed.  Such samples are counted (record_span),
+# but a prediction made mostly from them is biased low-to-unknown, and task η
+# cannot down-weight what it cannot see.  On the production event log the
+# durable seed produces far more acquires than releases, so this is not a
+# hypothetical: 28.3% of the spans replayed from the 2026-08-09 runs.db were
+# truncated.
+
+
+def test_truncated_fraction_is_zero_for_cleanly_observed_holds():
+    history = HoldHistory(min_samples=1)
+
+    for start, end in ((0.0, 10.0), (0.0, 20.0), (0.0, 30.0)):
+        history.record_span(HoldSpan('T1', 'clean/src', start, end))
+
+    assert history.truncated_fraction(['clean/src']) == pytest.approx(0.0)
+
+
+def test_truncated_fraction_counts_the_censored_share():
+    history = HoldHistory(min_samples=1)
+
+    history.record_span(HoldSpan('T1', 'mixed/src', 0.0, 10.0))
+    history.record_span(HoldSpan('T2', 'mixed/src', 0.0, 20.0, truncated=True))
+    history.record_span(HoldSpan('T3', 'mixed/src', 0.0, 30.0, truncated=True))
+    history.record_span(HoldSpan('T4', 'mixed/src', 0.0, 40.0))
+
+    assert history.truncated_fraction(['mixed/src']) == pytest.approx(0.5)
+    # The flag changes NOTHING about the prediction itself — [10,20,30,40].
+    assert history.predicted_hold(['mixed/src']) == pytest.approx(25.0)
+
+
+def test_truncated_fraction_pools_across_the_modules_named():
+    """Same pooling rule as ``predicted_hold``, so the two answers describe the
+    same evidence rather than two different subsets of it."""
+    history = HoldHistory(min_samples=1)
+
+    history.record_span(HoldSpan('T1', 'a/src', 0.0, 10.0, truncated=True))
+    history.record_span(HoldSpan('T2', 'b/src', 0.0, 20.0))
+    history.record_span(HoldSpan('T3', 'b/src', 0.0, 30.0))
+
+    assert history.truncated_fraction(['a/src', 'b/src']) == pytest.approx(1 / 3)
+    # Deduplicated, exactly like the pooled median.
+    assert history.truncated_fraction(['a/src', 'b/src', 'a/src']) == pytest.approx(1 / 3)
+
+
+def test_truncated_fraction_refuses_when_there_are_no_samples():
+    """None, not 0.0.  A fraction of nothing is not "clean evidence" — it is no
+    evidence, and 0.0 would read as the former to every caller.  Same refusal
+    shape as ``predicted_hold``."""
+    history = HoldHistory(min_samples=1)
+
+    assert history.truncated_fraction(['never/seen']) is None
+    assert history.truncated_fraction([]) is None
+
+
+def test_truncated_fraction_survives_the_rolling_window():
+    """The flag is evicted WITH its duration, not decoupled from it."""
+    history = HoldHistory(window=2, min_samples=1)
+
+    history.record_span(HoldSpan('T1', 'm/src', 0.0, 10.0, truncated=True))
+    history.record_span(HoldSpan('T2', 'm/src', 0.0, 20.0))
+    history.record_span(HoldSpan('T3', 'm/src', 0.0, 30.0))
+
+    # The truncated sample has been evicted; only the two clean ones remain.
+    assert history.sample_count(['m/src']) == 2
+    assert history.truncated_fraction(['m/src']) == pytest.approx(0.0)
+
+
+def test_the_canonical_trace_reports_its_own_truncated_share():
+    """Exact, from the fixture's own hand-listed truncated set."""
+    history = HoldHistory(min_samples=1)
+    for span in iter_hold_spans(F.build_trace()):
+        history.record_span(span)
+
+    expected = len(F.EXPECTED_TRUNCATED_SPANS) / F.EXPECTED_SPAN_COUNT
+
+    assert history.truncated_fraction(list(F.EXPECTED_SAMPLES)) == pytest.approx(expected)
+
+
+# ===========================================================================
+# forget — reconciling the live open-span map
+# ===========================================================================
+#
+# ``observe_released`` closes only the modules it is NAMED, so a hold whose
+# release never reaches the feed stays open for the life of the process.  That
+# residue is not inert: predicted_remaining keeps answering for the phantom,
+# and once elapsed exceeds the prediction it answers a floored 0.0 — the
+# "overdue holder" reading — forever.  0.0 vs None is the whole contract, so a
+# permanent 0.0 is the worst-shaped output this API can produce.
+
+
+def test_forget_drops_every_open_hold_for_the_task():
+    history = _history_of({'a/src': [100.0] * 3, 'b/src': [100.0] * 3}, min_samples=3)
+    history.observe_acquired('T1', ['a/src', 'b/src'], at=_at(0))
+
+    assert history.forget('T1') == 2
+
+    assert history.open_modules('T1') == []
+    assert history.predicted_remaining('T1', now=_at(10)) is None
+
+
+def test_forget_is_scoped_to_the_task_it_names():
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+    history.observe_acquired('T2', ['a/src'], at=_at(0))
+
+    assert history.forget('T1') == 1
+
+    assert history.open_modules('T2') == ['a/src']
+    assert history.predicted_remaining('T2', now=_at(50)) == pytest.approx(50.0)
+
+
+def test_forget_records_no_sample_for_the_dropped_holds():
+    """DROPPED, not closed at "now".  An entry that survives to ``forget`` means
+    the bookkeeping for that key is already broken, so its ``start`` may be
+    arbitrarily stale; charging a duration against it would file a fabricated
+    sample — the same refusal ``iter_hold_spans`` makes for a span still open at
+    end of stream."""
+    history = HoldHistory(min_samples=1)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+
+    history.forget('T1')
+
+    assert history.sample_count(['a/src']) == 0
+    assert history.predicted_hold(['a/src']) is None
+
+
+def test_forget_for_a_task_holding_nothing_is_a_no_op():
+    history = HoldHistory(min_samples=1)
+
+    assert history.forget('T1') == 0
+
+
+def test_forget_leaves_already_recorded_samples_alone():
+    """It reconciles the OPEN map only — the window is history, not state."""
+    history = HoldHistory(min_samples=1)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+    history.observe_released('T1', ['a/src'], at=_at(30))
+
+    assert history.forget('T1') == 0
+
+    assert history.sample_count(['a/src']) == 1
+    assert history.predicted_hold(['a/src']) == pytest.approx(30.0)
+
+
+# --- the staleness backstop ------------------------------------------------
+
+
+def test_predicted_remaining_refuses_a_hold_older_than_the_staleness_ceiling():
+    """The backstop for a release that never reached the feed at all.
+
+    Without it the answer is 0.0 — "predicted to have finished already, and
+    hasn't" — asserted forever about a task that is not holding anything.
+    """
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+
+    # Inside the ceiling: the overdue reading is preserved, because an overdue
+    # holder is a real and actionable fact.
+    assert history.predicted_remaining('T1', now=_at(999)) == pytest.approx(0.0)
+    # Past it: no answer at all.
+    assert history.predicted_remaining('T1', now=_at(1001)) is None
+
+
+def test_the_staleness_ceiling_also_drops_the_phantom_entry():
+    """Otherwise ``_open`` grows without bound for the life of the process."""
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+
+    history.predicted_remaining('T1', now=_at(5000))
+
+    assert history.open_modules('T1') == []
+
+
+def test_the_staleness_ceiling_is_absolute_not_a_multiple_of_the_prediction():
+    """A hold running 10x its module's median is exactly the overdue holder this
+    method exists to surface.  A relative ceiling would silence it."""
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+
+    assert history.predicted_remaining('T1', now=_at(900)) == pytest.approx(0.0)
+
+
+def test_the_default_staleness_ceiling_is_a_day():
+    """Far above any real hold — the orchestrator's own role timeouts are tens
+    of minutes — so it can only ever catch a lost release."""
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+
+    assert history.predicted_remaining('T1', now=_at(86_000)) == pytest.approx(0.0)
+    assert history.predicted_remaining('T1', now=_at(86_401)) is None
