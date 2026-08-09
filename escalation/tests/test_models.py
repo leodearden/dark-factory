@@ -1120,3 +1120,71 @@ class TestFilingClaimantRunId:
         payload['not_a_real_field'] = 'boom'
         restored = Escalation.from_dict(payload)
         assert not hasattr(restored, 'not_a_real_field')
+
+
+class TestTimestampIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
+
+    The task asked for an investigation of an escalation whose ``timestamp``
+    and ``resolved_at`` looked backdated relative to the incident report.  The
+    read: ``Escalation.timestamp`` is stamped by a per-instance
+    ``field(default_factory=...)`` reading the live clock, and the queue
+    stamps ``resolved_at`` from ``datetime.now(UTC)``.  There is no cached or
+    session clock in the stamping code to fix, and the measured values were
+    internally consistent as a real sub-second sequence shortly before a UTC
+    midnight boundary, which accounts for the reported date discrepancy
+    without a clock bug.
+
+    So these assertions guard against a FUTURE regression rather than
+    describing a current one: specifically the classic mistake of hoisting the
+    stamp to an import-time constant (``field(default=...)`` instead of
+    ``default_factory``), which would make every record in a process share one
+    timestamp.  They are expected to pass on first run — that is the correct
+    outcome for a pin.
+    """
+
+    def test_timestamp_is_within_300s_of_now(self):
+        """A freshly constructed Escalation is stamped from the live clock."""
+        from datetime import UTC, datetime
+
+        esc = Escalation(
+            id='esc-1-1', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+
+        stamped = datetime.fromisoformat(esc.timestamp)
+        assert stamped.tzinfo is not None, f'Naive timestamp: {esc.timestamp!r}'
+        delta = abs((datetime.now(UTC) - stamped).total_seconds())
+        # 300s is derived, not guessed: the value comes from datetime.now(UTC)
+        # at construction, so real slack is milliseconds.  300s never flakes on
+        # a loaded CI box yet is three orders of magnitude tighter than the
+        # >24h discrepancy that prompted the investigation.
+        assert delta < 300, f'Timestamp {esc.timestamp!r} is {delta}s from now'
+
+    def test_two_constructions_get_distinct_non_decreasing_timestamps(self):
+        """THE assertion that catches a hoisted default.
+
+        If the stamp were ever moved to ``field(default=...)`` — evaluated once
+        at import — every Escalation in the process would share one timestamp
+        and this would fail.
+        """
+        import time
+        from datetime import datetime
+
+        first = Escalation(
+            id='esc-1-1', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        time.sleep(0.01)
+        second = Escalation(
+            id='esc-1-2', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+
+        assert first.timestamp != second.timestamp, (
+            'Both Escalations share one timestamp — the stamp looks hoisted to '
+            'an import-time constant rather than a per-instance default_factory'
+        )
+        assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
+            first.timestamp,
+        ), 'Timestamps must be non-decreasing across constructions'
