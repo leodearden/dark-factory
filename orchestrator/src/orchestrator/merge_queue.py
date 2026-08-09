@@ -10453,6 +10453,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              does not match expected_base, record a violation naming the rid,
              expected, and actual base.  Entries with no merge_result
              (passthrough / conflict) are skipped — they carry no commit.
+             A ``remerge_recovery`` entry is still reported (it really does
+             break the chain) but its violation string is ANNOTATED
+             'recovery re-merge (expected)' so λ/operators can tell it from
+             genuine structural damage — see the in-body note.
           2. Frozen/suffix disjointness: any rid that appears in BOTH
              frozen_prefix() and unfrozen_suffix() is a structural bug; record
              one violation per duplicate.
@@ -10472,11 +10476,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # "was this verify permitted to start against this base?" — a recovery
         # re-merge genuinely does break the chain, and hiding that would blind
         # λ's integration gate to real structural damage.
-        for rid, expected_base, actual_base, _recovery in self._frozen_base_chain(main_sha):
+        #
+        # It is still ANNOTATED, though: a recovery re-merge anywhere but the
+        # head of the frozen prefix trips this check by construction (its base
+        # is real main while its chained expected base is its predecessor's
+        # merge_commit), so without the annotation an operator reading
+        # snapshot()['two_layer_invariants'] cannot tell that entry apart from
+        # genuine structural damage — and the §5.3 carve-out's whole point was
+        # to stop crying wolf about exactly those entries.  Suppressing them
+        # is not an option (see above); labelling them is.
+        for rid, expected_base, actual_base, recovery in self._frozen_base_chain(main_sha):
             if actual_base != expected_base:
+                annotation = (
+                    ' [recovery re-merge (expected): this item came from _remerge '
+                    'and targets real main by design — PRD §5.3 carve-out, task '
+                    '3206; not structural damage]'
+                ) if recovery else ''
                 violations.append(
                     f'frozen-prefix base-chain broken at {rid}: '
                     f'expected base {expected_base!r} but item has {actual_base!r}'
+                    f'{annotation}'
                 )
 
         # ── 2. Frozen/suffix disjointness ────────────────────────────────────
@@ -16816,7 +16835,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # against; merged_branch_tip was the field 1928 had to add
                     # back by hand).  Re-invokes __post_init__, re-validating
                     # the rebuilt REAL item.
-                    item = dataclasses.replace(item, base_sha=rebased_onto)
+                    #
+                    # remerge_recovery is the ONE field deliberately not
+                    # copied (task 3206): this rebuild RE-ANCHORS the item onto
+                    # a fresh base, so the §5.3 carve-out — which exempts an
+                    # item because _remerge deliberately based it on real main
+                    # — no longer applies to the base it now carries.  Leaving
+                    # it set would suppress §5.3 reporting for the rest of the
+                    # request's life, a silent false negative for the one class
+                    # the guard still exists to catch.
+                    item = dataclasses.replace(
+                        item, base_sha=rebased_onto, remerge_recovery=False,
+                    )
                     logger.info(
                         'Task %s: gate cleared (disjoint or green re-verify); '
                         'advancing with rebased SHA %s (gate attempt %d/%d)',
@@ -16889,8 +16919,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Update base_sha to current main for retry.
                 # I3 (task 1990): replace-only rebuild — see the
-                # rebased_pending_reverify rebuild above for rationale.
-                item = dataclasses.replace(item, base_sha=await self._git_ops.get_main_sha())
+                # rebased_pending_reverify rebuild above for rationale,
+                # including why remerge_recovery is cleared on re-anchor
+                # (task 3206 §5.3).
+                item = dataclasses.replace(
+                    item,
+                    base_sha=await self._git_ops.get_main_sha(),
+                    remerge_recovery=False,
+                )
                 logger.info(
                     f'Task {req.task_id}: CAS failed (attempt {total}/'
                     f'{self.MAX_CAS_RETRIES}), retrying'
