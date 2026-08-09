@@ -23,6 +23,7 @@ from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
+    AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
@@ -418,6 +419,14 @@ def create_server(
         # gate bypass.  L2 escalations also skip deduplication in _submit_or_dedupe
         # so they are never silently folded into a lower-level parent.
         # After the downgrade above, only sentinel-filed criticals/urgents reach here.
+        #
+        # Task 3236 ordering dependency — do NOT move this above the Escalation
+        # construction in escalate_blocker.  That tool now accepts an explicit
+        # `level` (restricted to {0, 1}), stamped at construction time; because
+        # this assignment runs AFTER construction, the born-at-L2 severity route
+        # keeps precedence over any explicitly passed level, which is the
+        # intended precedence and is pinned by
+        # test_server.py::TestEscalateBlockerLevelParam.
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc.level = 2
 
@@ -559,6 +568,7 @@ def create_server(
         workflow_state: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
+        level: int = 0,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, commit any in-progress work,
         log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
@@ -580,6 +590,24 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
+
+        *level* — the escalation ladder rung this filing is born at.  Defaults to
+        ``0`` (agent → steward).  Pass ``level=1`` to file a level-1
+        re-escalation (steward → escalation-watcher-auto): this is the steward's
+        documented recourse when it cannot resolve an L0 itself, and it is the
+        ONLY way an agent-side filing reaches the auto-watcher, which filters on
+        level.  A level-1 record is also outside the workflow's level=0-scoped
+        dismissal sweeps by construction, and ``escalation.pins`` routes any
+        ``level != 0`` record to QUEUE_HANDOFF, so it pins the task independently
+        of the filer's liveness.
+
+        Only ``{0, 1}`` are accepted — anything else (including ``2``) is
+        rejected with an ``{'error': ...}`` response and NOTHING is submitted.
+        Agents must not self-mint L2: the legitimate routes there are a
+        born-at-L2 *severity* filed by a harness sentinel role, or
+        ``promote_to_l2``.  Note that born-at-L2 severity takes precedence over
+        this parameter — a sentinel-filed ``severity='critical'`` still lands at
+        level 2 even when ``level=1`` is passed.
 
         *evidence* — optional list of structured raw-OBSERVATION entries, each a
         ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
@@ -605,6 +633,22 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        # Task 3236: validate `level` BEFORE constructing the Escalation, using
+        # the same {'error': ...} early-return shape as the severity guard above,
+        # so a misconfigured caller gets immediate feedback instead of a
+        # silently-misrouted escalation.  bool is an int subclass — reject it
+        # explicitly so escalate_blocker(level=True) is not read as level=1.
+        if isinstance(level, bool) or not isinstance(level, int) or level not in AGENT_FILABLE_LEVELS:
+            return {
+                'error': (
+                    f'invalid level {level!r}; expected one of '
+                    f'{sorted(AGENT_FILABLE_LEVELS)} (0 = agent→steward, '
+                    '1 = steward re-escalation → escalation-watcher-auto). '
+                    'Agents cannot self-mint level 2: file with a born-at-L2 '
+                    "severity ('critical'/'urgent') from a harness sentinel role, "
+                    'or use promote_to_l2.'
+                ),
+            }
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,
@@ -617,6 +661,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
             evidence=cast(list[EvidenceEntry], evidence or []),
+            level=level,
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}
