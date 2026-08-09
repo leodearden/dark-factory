@@ -26,11 +26,18 @@ fire-and-forgets ``build_indices_and_constraints()`` when an event loop is
 running, so merely constructing one would create indices on a real graph and
 destroy esc-3375-1's protected evidence (the current absence of indices).  The
 live lane lives in ``tests/test_ensure_indices_integration.py``.
+
+``_MultiTenantFalkorDriver`` is IMPORTED here, but never INSTANTIATED: the D4
+guard reads the class ``__dict__`` and invokes the unbound override with a mock
+``self``.  Importing the class performs no I/O; it is ``__init__`` that
+fire-and-forgets.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import pathlib
 from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,11 +45,13 @@ import pytest
 import redis.exceptions
 from test_falkor_indices import LIVE_HEADER
 
+from fused_memory.backends import graphiti_client
 from fused_memory.backends.falkor_indices import (
     IndexSpec,
     expected_index_set,
     plan_index_statements,
 )
+from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 from fused_memory.utils.validation import PathShapedProjectIdError
 
 _PATH_SHAPED = '-home-leo-src-x'
@@ -490,3 +499,43 @@ class TestStructuredLogging:
         assert not any(
             'Ensured indices on graph' in r.getMessage() for r in caplog.records
         )
+
+
+class TestProvisioningHazardGuards:
+    """Two things β must NOT break while adding a provisioning path."""
+
+    def test_the_build_indices_override_is_still_a_no_op_on_the_subclass(self):
+        """D4: removal of the ``pass`` override was EXPLICITLY REJECTED.
+
+        ``FalkorDriver.__init__`` fire-and-forgets ``build_indices_and_constraints()``
+        when an event loop is running, and every per-group driver handed out by
+        ``_driver_for()`` / ``_client_for()`` comes from ``clone()``.  The override
+        suppresses that implicit build on every clone — removing it is the path
+        that caused the ``723ec915c3`` connection storm (166 leaked connections).
+
+        Asserted against the subclass ``__dict__``, not mere callability: an
+        INHERITED upstream method is callable too, so a callability check would
+        pass with the override deleted.
+        """
+        assert 'build_indices_and_constraints' in _MultiTenantFalkorDriver.__dict__, (
+            'the build_indices_and_constraints override was removed from '
+            '_MultiTenantFalkorDriver; D4 rejects that explicitly'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_override_returns_none_without_building_anything(self):
+        driver = _MultiTenantFalkorDriver.__dict__['build_indices_and_constraints']
+        assert await driver(MagicMock()) is None
+
+    def test_the_false_positive_debug_line_is_gone_from_the_source(self):
+        """D7: the log that fired unconditionally after a no-op is deleted, not muted.
+
+        It sat after a ``pass`` and was at DEBUG, so at the service's INFO level
+        it produced neither a positive nor a negative signal — there was no signal
+        in the logs at all.  Read via ``inspect`` rather than a hard-coded repo
+        path so the guard survives a checkout move.
+        """
+        source_file = inspect.getsourcefile(graphiti_client)
+        assert source_file is not None
+        source = pathlib.Path(source_file).read_text(encoding='utf-8')
+        assert 'Ensured indices on graph' not in source
