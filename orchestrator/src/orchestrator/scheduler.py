@@ -6957,6 +6957,28 @@ class Scheduler:
 
         released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
+            if additional:
+                # A WIDEN/SHIFT really does take new module locks here, so it
+                # emits a lock_acquired for them like any other acquire.  Without
+                # this the predictor never sees a start for the widened modules:
+                # the eventual full release names them (they are in
+                # lock_table._held), the history has no matching open span, and
+                # they are discarded as orphan releases — so refinement-acquired
+                # holds contribute nothing, forever.  Worse for a pure SHIFT,
+                # where every original module is stale and every new one is
+                # additional: the task's open-span set empties out and
+                # predicted_remaining refuses for a task that is demonstrably
+                # holding locks right now — the exact case task η must reason
+                # about.  Routed through _emit_lock_event so the durable stream
+                # gains the row too: feeding only the in-process history would
+                # make the live feed and seed_from_event_store disagree about
+                # this hold, which is the drift INV-5 forbids.
+                self._emit_lock_event(
+                    EventType.lock_acquired,
+                    task_id=task_id,
+                    modules=additional,
+                    reason='plan_refinement',
+                )
             if stale:
                 released = self.lock_table.release_subset(task_id, stale)
                 if released:
@@ -7071,6 +7093,17 @@ class Scheduler:
                 task_id=task_id,
                 modules=modules,
             )
+        # Reconcile the predictor's live open-span map with the lock table,
+        # UNCONDITIONALLY — including when `modules` was empty and no event was
+        # emitted.  This call drops every lock the task holds, so nothing of its
+        # may still be open afterwards; anything left is residue from a hold
+        # whose release the history never saw.  Left in place it is not inert:
+        # predicted_remaining would keep answering for the phantom, and as its
+        # elapsed time grew would answer a floored 0.0 forever — the "overdue
+        # holder" reading, which is a live actionable claim, about a task that
+        # released hours ago.  The whole contract turns on callers telling 0.0
+        # from None, so a permanent 0.0 is the worst output this API can give.
+        self._hold_history.forget(task_id)
         if self.event_store:
             for restored_owner, restored_modules in restored_pairs:
                 self.event_store.emit(
@@ -7244,6 +7277,14 @@ class Scheduler:
         The predictor is fed even when ``self.event_store`` is None: the
         Harness runs a store-less Scheduler through construction and the store
         is attached later, and holds observed in that window are real.
+
+        Being the one writer is necessary but not sufficient for the predictor
+        to see every hold — a site that acquires locks without calling this at
+        all is invisible to both halves of INV-5 at once, so the drift never
+        shows up as a seed/live disagreement.  ``try_acquire_additional`` on the
+        plan-refinement path was exactly that gap and now routes through here;
+        the release half is reconciled by ``HoldHistory.forget`` in
+        ``release()``, which catches any hold whose release this never saw.
 
         Timestamps come from ``self._wall_now()`` — the injectable WALL clock,
         not ``_time_source`` (monotonic).  Durations must be comparable with
