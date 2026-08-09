@@ -1636,7 +1636,7 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 39 Tier-A blessed conventional keys
+    # A representative spread of the 40 Tier-A blessed conventional keys
     # (see _BLESSED_METADATA_KEYS), plus one genuine control key
     # (mystery_zzz) that must still warn. RED: none of the blessed keys are
     # skipped yet, so each one currently emits its own unknown_key warning.
@@ -1689,7 +1689,7 @@ class TestParseMetadataFailurePolicy:
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
     # directly), rather than the hand-maintained partial sample above (which
-    # only covers 25 of the 39 entries). Every key gets its own parametrized
+    # only covers 25 of the 40 entries). Every key gets its own parametrized
     # case, so a typo'd or accidentally-unskipped entry fails immediately
     # instead of silently reappearing as unknown_key census noise, and the
     # test stays in lockstep as the allowlist grows -- no manual sample to
@@ -1771,6 +1771,36 @@ class TestParseMetadataFailurePolicy:
         )
         assert 'human_curator_adjudicated_at' not in unknown_key_fields, (
             f'Expected no unknown_key warning for human_curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
+        )
+
+    def test_last_blocked_at_metadata_key_is_blessed(self):
+        """The orchestrator's block stamp must not census-warn (task 3697).
+
+        Promoted to Tier-A rather than renamed under `x_`, which is the
+        non-obvious part. `last_blocked_at` is MACHINE-written by the
+        orchestrator on every block (orchestrator/src/orchestrator/workflow.py,
+        `_mark_blocked`) and READ back by
+        orchestrator/src/orchestrator/agents/briefing.py to decide whether a
+        briefing is stale — so it is load-bearing, not decorative. A census
+        over .taskmaster/tasks/tasks.db counts 78 tasks carrying it (measured
+        2026-08-06), so x_-renaming it on one task would fork the vocabulary
+        against 77 siblings, blind the briefing reader, and be silently undone
+        the next time the orchestrator wrote the canonical spelling anyway.
+
+        docs/task-authoring.md "Promoting a convention" prescribes exactly this
+        remedy for exactly this profile, and the key's shape matches the
+        already-blessed machine-written *_at stamps (files_tagged_at,
+        gate_escalated_at, combined_at, before_done_ran_at). RED until
+        'last_blocked_at' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'last_blocked_at': '2026-08-01T07:31:13.914220+00:00'}, direction='read'
+        )
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'last_blocked_at'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):

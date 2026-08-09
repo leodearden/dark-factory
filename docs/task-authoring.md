@@ -778,7 +778,7 @@ gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
 cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at
+human_curator_adjudicated_at, last_blocked_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
@@ -883,6 +883,68 @@ the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
 
+### `allow_mcp_markup`: a write-time flag, not a metadata key
+
+`metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
+that **deliberately quotes the MCP envelope literals** — documenting the
+leak, pasting a specimen, quoting a rejection's `matched_pattern`. It is
+honoured at all four guarded write boundaries: `submit_task`,
+`update_task`, `add_memory`, `add_episode`.
+
+**Why it belongs in this section.** The convention that grew up instead —
+paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key such as `markup_tripwire_rejections_<date>` —
+manufactures *both* failure classes at once: a `code=unknown_key` census
+line (Tier-C, above) for every such key, and a bounced write for every
+author who quotes the literals without the flag. It was self-perpetuating
+because it was documented inside task 3083's own `details`, so each reader
+learned the workaround rather than the flag. Task 3697 retires it.
+
+**Scope of the gate.** The guard reads only the caller's *text* arguments,
+never the metadata blob: `title` / `description` / `details` / `prompt` on
+`submit_task` and `update_task`, and `content` on `add_memory` and
+`add_episode`. Metadata is handed to the guard for exactly one purpose —
+reading this flag. So it is a description that trips the tripwire, not a
+metadata *value* that happens to contain the literals. `update_task`'s own
+docstring states the same contract
+(`fused-memory/src/fused_memory/server/tools.py`).
+
+**Fail-closed: only a literal boolean `True`.** `'yes'`, `1` and `'true'`
+do not enable it — `markup_override_requested` tests
+`parsed.get(...) is True` (`markup_tripwire.py`). That strictness is the
+containment argument, not pedantry: the failure being contained is an
+accidental harness serialization leak, and an accidental leak never sets
+an explicit flag. A deliberate author can.
+
+**Write-time-only — it never persists.** `strip_markup_override`
+(`markup_tripwire.py`) removes the key at every one of the four
+boundaries before the metadata reaches storage, so the flag never lands in
+stored metadata and never mints an `unknown_key` census line of its own.
+It is non-mutating (the caller's own dict is left intact) and honours both
+accepted metadata shapes — dict in / dict out, JSON string in / JSON
+string out. Pinned by
+`fused-memory/tests/server/test_markup_tripwire_gate.py::test_override_flag_is_stripped_before_persistence`
+and `::test_override_flag_is_not_persisted_into_task_metadata`.
+
+**This is routine, not exotic.** The 2026-08-05 decompose session that
+filed the toolcall-markup-containment batch had its *first* `submit_task`
+rejected by this tripwire for quoting the literals, and needed the flag on
+seven of the nine tasks it filed. The guard was working as designed; the
+missing piece was the convention around it.
+
+**What it is not: an escape hatch for an accidental leak.** If you did not
+mean to quote the markup, strip the fragment and resubmit — do not reword
+the payload to sneak it past the guard, and report a recurrence per the
+hint the rejection itself carries. Using the flag to push an accidental
+leak through the boundary defeats the containment it exists to provide.
+
+The authoritative enumeration of the literals lives in exactly one place,
+`fused-memory/src/fused_memory/server/markup_tripwire.py`, and is
+deliberately **not** repeated here: restating them in this file would
+oblige every future task write quoting this section to set the override,
+which is precisely the loop this section exists to break. For the full
+picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -892,6 +954,52 @@ allowlist — an allowlist rather than typed optional fields, so
 there only for a genuinely load-bearing, stable convention; Tier-B/C drift
 should be fixed by renaming to the canonical key or moving under `x_`, not
 by blessing it.
+
+### Known gaps (measured 2026-08-06 — not fixed)
+
+Three `unknown_key` sources are known, measured, and deliberately left
+open. They are recorded here so the next reader does not re-measure them.
+All counts are a snapshot of a **growing** corpus (3553 tasks carried dict
+metadata at measurement), not an invariant.
+
+| Gap | Measured | Owner |
+|---|---|---|
+| `execution_class` is read by two live guards but is neither blessed nor typed | 272 tasks | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+
+**`execution_class`** is not in `_BLESSED_METADATA_KEYS`, is not a typed
+`TaskMetadata` field and is not a registered submodel — yet
+`execution_class_guard` and `routing_intent_guard` both read it, so every
+one of those 272 tasks plausibly emits this same warning class. It was
+deliberately **not** blessed by task 3697: 272 tasks and two live guards
+make it a broader vocabulary decision (bless / promote to a typed field /
+retire) than a single-task cleanup should settle. Originally recorded as
+Finding 5 of the toolcall-markup-containment capability manifest. The
+count is still climbing — 253 at that PRD's decompose, 272 here.
+
+**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
+a ~30-task metadata rewrite has a very different blast radius from one
+reserved task. `x_`-prefixed precedents for these same spellings already
+exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
+`x_related_df_tasks` 5), so the target spelling is not in doubt and the
+sweep is a mechanical per-task re-run of
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
+script's "no reader anywhere" grep argument covers only its six built-in
+default keys, so when you re-run it with your own `--keys` it validates
+them first and refuses an already-`x_`-prefixed key, a typed
+`TaskMetadata` field or a Tier-A blessed key — its read-back proves the
+rename *landed*, never that the rename was *safe*.
+
+**The write-path blocker** is why the third row is still open, and it
+bounds both of the others: `update_task` rejects any metadata payload
+containing `done_provenance` — a presence-only write-authority floor
+evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
+retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
+with no deletion sentinel. A whole-blob `'replace'` is therefore
+structurally impossible on any `done`/merged task, which is most of the
+corpus above. Check a target task's status before assuming its metadata is
+writable.
 
 ---
 

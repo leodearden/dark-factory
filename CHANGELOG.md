@@ -206,6 +206,71 @@ to prove the documented recovery is still executable, so deleting the artifact
 holding the only surviving copy fails loudly instead of silently. Hermetic — no
 live store — so it stays green whether or not Qdrant is up.
 
+#### `allow_mcp_markup` documented; `last_blocked_at` blessed (task 3697)
+
+**`allow_mcp_markup` is now documented in `docs/task-authoring.md` §8** as the
+correct move for a write that deliberately quotes the MCP envelope literals. The
+guard (task 3141, below) has been live and working since it shipped; what was
+missing was the convention around it, so authors reached for a workaround
+instead — paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key. That workaround manufactures *both* failure classes at
+once: a `code=unknown_key` census line for every such key, and a bounced write
+for every author who quotes the literals without the flag. It was
+self-perpetuating because it was documented inside task 3083's own `details`.
+The new section records the scope of the gate (text arguments only — never the
+metadata blob), that only a literal boolean `True` enables it, and that it is
+write-time-only and stripped before the merge, so it never persists into stored
+metadata. It deliberately does not restate the literals: doing so would oblige
+every future task write quoting that section to set the override, which is the
+loop it exists to break.
+
+**`last_blocked_at` promoted to the Tier-A blessed-key allowlist**
+(`_BLESSED_METADATA_KEYS`, mirrored into the hand-maintained listing in
+`docs/task-authoring.md` §8 in the same commit — that listing is a manual copy
+with no drift test guarding it). It is written by the orchestrator on every
+block and read back by the briefing stale-check, and 78 tasks carry it, so every
+one of them was minting an `unknown_key` line. Promotion rather than an `x_`
+rename, because renaming a machine-written key on one task forks the vocabulary
+against its siblings and the orchestrator would re-add the canonical spelling on
+the next block anyway.
+
+**Added `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`** for
+retiring ad-hoc metadata keys into the `x_` namespace. The gotcha it exists for:
+**`metadata_mode='merge'` cannot retire a key.** `_merge_metadata` is a shallow
+`{**old, **new}` with no deletion sentinel, so merge can add the `x_` spelling
+but never remove the old one — both would coexist and the warnings would
+persist. The script is dry-run by default (`--apply` required), requires an
+explicit `--task-id`, refuses on a collision rather than clobbering, and runs a
+mandatory read-back proving the `x_` keys landed, the old spellings are gone,
+sibling keys are byte-identical, and `description`/`details` sha256 and `status`
+are unchanged. Two guards cover what the read-back structurally cannot, since
+it verifies *intent* (did the rename land) and not *safety* (should it have):
+`--keys` is validated up front and refuses an already-`x_`-prefixed, typed
+`TaskMetadata` or Tier-A blessed key (`--force` overrides), and `--apply`
+writes the full pre-write row — metadata *and* `description`/`details` — to
+`--backup-path` first, refusing to write at all if that snapshot cannot be
+saved. The read-back also discounts the backend's own reserved control keys
+(`append`, `metadata_mode`, stripped from every incoming payload in all modes),
+so migrating a task that carries a leaked control key reports the drop as
+information rather than raising a false corruption alarm after the write has
+already committed.
+
+**This task's stated signal — zero `unknown_key` lines on task 3083 — is
+PARTIALLY MET, and is recorded as such rather than claimed.** Blessing
+`last_blocked_at` took it from 7 to 6. The remaining 6 need a live metadata
+write that is currently impossible: `update_task` rejects any metadata payload
+containing `done_provenance` (a presence-only write-authority floor evaluated
+before `metadata_mode` is resolved), so a whole-blob `'replace'` cannot run
+against any `done`/merged task, and task 3083 is one. Task 3083 is unchanged and
+undamaged — metadata still 20124 bytes / 18 keys, `description` and `details`
+sha256 identical to the pre-migration snapshot, status still `done`. Ticket
+`tkt_0RS4WVMH1RSTSY88N781E70F5S` owns the write-path decision and the re-run.
+Two further pre-existing gaps are measured and recorded in the new "Known gaps"
+table in `docs/task-authoring.md` §8, owned by
+`tkt_0RS4XDWJQ9PR8MFXY5DKW950WS`: `execution_class` is read by two live guards
+but is neither blessed nor typed (272 tasks), and the `x_` sweep has not been
+run corpus-wide.
+
 ### Changed (BREAKING)
 
 #### MCP writes carrying raw envelope markup are now REJECTED (task 3141)

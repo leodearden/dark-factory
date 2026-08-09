@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until, pydantic_spec
+from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -134,8 +134,23 @@ async def test_worker_processes_create_decision(
         )
         ticket_id = result['ticket']
 
-        # Let the worker drain the queue
-        await asyncio.sleep(0.1)
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flakes under `-n auto` CPU oversubscription when
+        # the worker is scheduled late (observed: status still 'pending').
+        # Same cause and same fix as the oversize-ticket test below.  Waiting
+        # on 'pending' clearing rather than on 'created' directly keeps a
+        # genuine regression loud: a ticket resolved to 'failed' leaves the
+        # poll immediately and trips the status assertion below with the real
+        # status, instead of burning the whole timeout first.
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the create-decision ticket',
+        )
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
@@ -577,18 +592,26 @@ async def test_worker_created_path_emits_journal_event(
             message='worker did not resolve the ticket',
         )
 
-        # The ticket is terminalised (via asyncio.shield) *before* the
-        # worker builds and journals the task_created event (see
-        # _process_add_tickets_batch_prepared / _process_add_ticket in
-        # task_interceptor.py), so the poll above can observe the
-        # post-pending status one event-loop hop before _journal actually
-        # runs. Close that narrow window with a short second bounded poll
-        # on the emission itself: a genuine regression (event never
-        # emitted) still fails fast, just in ~2s instead of the full 10s.
-        await poll_until(
-            lambda: journal_calls,
-            timeout=2.0,
-            message='ticket resolved but no journal event was emitted',
+        # SETTLE barrier, not a liveness poll: wait for the task_created count
+        # to STOP CHANGING, not merely to become non-zero.  The assertion below
+        # is an exact count, and a liveness poll returns at the *first* event —
+        # so a duplicate arriving milliseconds later would be structurally
+        # invisible.  The duplicate is concrete: task_created is emitted from
+        # two distinct paths (task_interceptor.py:3786-3795 and 4164-4173),
+        # both of which persist the terminal ticket row *before* emitting, so
+        # neither a ticket-row predicate nor a first-event predicate closes the
+        # emission window.  settle=0.2 restores exactly the width of the
+        # `asyncio.sleep(0.2)` this poll replaced — but measured from the first
+        # event rather than from submit_task, so a late-scheduled worker under
+        # `-n auto` no longer eats the window.
+        await poll_until_stable(
+            lambda: sum(
+                1 for e in journal_calls
+                if getattr(e, 'type', None) == EventType.task_created
+            ),
+            settle=0.2,
+            timeout=10.0,
+            message='worker did not journal a task_created event',
         )
 
     # Exactly one task_created event must have been journalled
