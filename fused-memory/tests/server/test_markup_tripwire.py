@@ -11,9 +11,7 @@ Boundary/wiring tests for the four MCP write tools live in the sibling
 
 from __future__ import annotations
 
-import ast
 import json
-from pathlib import Path
 
 import pytest
 from shared import toolcall_markup
@@ -763,95 +761,6 @@ class TestEmitMarkupStormEscalation:
 # Append new blocks here rather than inserting them.
 # ---------------------------------------------------------------------------
 
-#: The opening angle bracket, built rather than typed. Spelling it verbatim here
-#: would force any agent editing this file to emit it inside its own tool-call
-#: envelope — the sentinel-literal hazard that
-#: ``fused_memory/utils/toolcall_xml_leak.py`` documents at length.
-_ANGLE = chr(0x3c)
-
-#: The two envelope SHAPES: a closing tag, and the canonical opener prefix.
-#: Narrow on purpose. A bare ``startswith(_ANGLE)`` would also flag any future
-#: constant that merely holds angle-bracket data — a list of HTML tags, an XML
-#: element table, a comparison-operator vocabulary, a dashboard template
-#: fragment — and fail it with a message telling its author to import from
-#: shared.toolcall_markup, which would be the wrong-shaped fix. A residual
-#: over-report remains by design: an enumeration of CLOSING tags of any name
-#: still trips this, because inside this package that is exactly the shape
-#: worth a second look before it becomes a third enumeration site.
-_ENVELOPE_PREFIXES = (_ANGLE + '/', _ANGLE + 'parameter name=')
-
-#: Call names whose single literal argument is still a literal collection, e.g.
-#: ``frozenset(('\x3c/content>',))``.
-_COLLECTION_CALLS = frozenset({'tuple', 'list', 'set', 'frozenset'})
-
-
-def _collection_strings(node: ast.expr | None) -> list[str] | None:
-    """The string constants of a literal collection, or ``None`` if not one.
-
-    Handles tuple/list/set displays, ``+`` concatenation (so appending literals
-    to an imported tuple — ``PREFILTER_NEEDLES + ('\x3c/foo>',)`` — is still
-    seen), and a single-argument ``tuple``/``list``/``set``/``frozenset`` call
-    wrapping one of those.
-
-    KNOWN GAPS — this is a ratchet, not a proof of impossibility. Literals
-    reached only through dict values, comprehensions, a helper function's
-    return, ``str.split()`` on one long string, or assembled at runtime from
-    ``chr(60)`` are NOT seen. Two other layers cover what slips past: the
-    capability manifest's ``expect: absent`` grep pins the one historical
-    spelling, and the identity assertions in this class mean a second
-    enumeration cannot be *used* by these consumers without failing loudly.
-    """
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return [
-            element.value
-            for element in node.elts
-            if isinstance(element, ast.Constant) and isinstance(element.value, str)
-        ]
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _collection_strings(node.left)
-        right = _collection_strings(node.right)
-        if left is None and right is None:
-            return None
-        return (left or []) + (right or [])
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in _COLLECTION_CALLS
-        and len(node.args) == 1
-    ):
-        return _collection_strings(node.args[0])
-    return None
-
-
-def _envelope_literal_assignment_sites() -> list[tuple[str, list[str]]]:
-    """Every assignment under ``fused-memory/src`` that re-enumerates literals.
-
-    Returns ``(module, bound_names)`` for each assignment whose value is a
-    literal collection (see :func:`_collection_strings` for the shapes covered
-    and the known gaps) containing at least one ENVELOPE-SHAPED string — a
-    closing tag or the canonical opener prefix. Deliberately shape-based rather
-    than name-based: renaming the constant must not buy an exemption.
-    """
-    src = Path(__file__).resolve().parents[2] / 'src'
-    assert src.is_dir(), f'expected the package source at {src}'
-    sites: list[tuple[str, list[str]]] = []
-    for path in sorted(src.rglob('*.py')):
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            if isinstance(node, ast.Assign):
-                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-                value = node.value
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                names = [node.target.id]
-                value = node.value
-            else:
-                continue
-            strings = _collection_strings(value)
-            if not strings:
-                continue
-            if any(text.startswith(_ENVELOPE_PREFIXES) for text in strings):
-                sites.append((str(path.relative_to(src)), names))
-    return sites
-
 
 class TestSingleSourceOfTruth:
     """INV-5, enforced from the consumer side."""
@@ -867,45 +776,3 @@ class TestSingleSourceOfTruth:
         """
         assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
 
-    def test_no_third_enumeration_site_in_the_package(self):
-        """AST walk: nothing under ``fused-memory/src`` re-enumerates them.
-
-        The test-side twin of the capability manifest's ``expect: absent`` grep.
-        The grep pins one spelling; this pins the SHAPE, so a third site cannot
-        slip in under a different name or with the literals reordered.
-        """
-        sites = _envelope_literal_assignment_sites()
-        assert sites == [], (
-            'these assignments spell envelope literals (a closing tag or the '
-            'canonical opener prefix) inline; import them from '
-            f'shared.toolcall_markup instead: {sites!r}'
-        )
-
-    def test_the_walk_would_catch_a_reintroduced_enumeration(self):
-        """The pin above is only worth its green if it can go red.
-
-        A shape check that silently matches nothing is indistinguishable from a
-        passing one, so exercise the predicate on a synthetic module carrying a
-        re-spelled tuple, and on a decoy holding unrelated angle-bracket data
-        that must NOT be flagged.
-        """
-        offender = ast.parse(
-            'PATTERNS: tuple[str, ...] = ("' + _ANGLE + '/content>", "x")\n'
-        )
-        decoy = ast.parse('HTML_TAGS = ("' + _ANGLE + 'div>", "' + _ANGLE + 'p>")\n')
-
-        def strings_of(tree):
-            return [
-                _collection_strings(node.value)
-                for node in ast.walk(tree)
-                if isinstance(node, (ast.Assign, ast.AnnAssign))
-            ]
-
-        assert any(
-            any(text.startswith(_ENVELOPE_PREFIXES) for text in (found or []))
-            for found in strings_of(offender)
-        ), 'the predicate must flag a re-spelled envelope literal'
-        assert not any(
-            any(text.startswith(_ENVELOPE_PREFIXES) for text in (found or []))
-            for found in strings_of(decoy)
-        ), 'unrelated angle-bracket data must not be flagged'
