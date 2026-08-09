@@ -269,13 +269,14 @@ def _reify_guard_vector(flag: str) -> list[str]:
     return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
-def _tracked_file_paths(repo_root: Path) -> list[str] | None:
-    """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout.
+def _tracked_entries(repo_root: Path) -> tuple[list[str], list[str]] | None:
+    """``(non_gitlink_paths, gitlink_paths)`` for *repo_root*, or None if not a checkout.
 
-    Uses ``git ls-files -s`` (not plain ``ls-files``) specifically so the mode
-    column is available: entries with mode ``160000`` are submodule gitlinks and
-    are dropped.  See the GITLINK EXCLUSION note above for why that filter is
-    load-bearing rather than cosmetic.
+    ``git ls-files -s`` (not plain ``ls-files``) is what makes the mode column
+    available.  Mode ``160000`` means a submodule gitlink; those entries are
+    returned SEPARATELY rather than discarded, because the sweeps need them to
+    prove the exclusion is doing real work.  See the GITLINK EXCLUSION note
+    above for why the filter is load-bearing rather than cosmetic.
     """
     result = subprocess.run(
         ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
@@ -285,6 +286,7 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
     if result.returncode != 0:
         return None
     paths: list[str] = []
+    gitlinks: list[str] = []
     for entry in result.stdout.split('\0'):
         if not entry:
             continue
@@ -293,9 +295,16 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
         if not path:
             continue
         if meta.split(' ', 1)[0] == '160000':
-            continue
-        paths.append(path)
-    return paths
+            gitlinks.append(path)
+        else:
+            paths.append(path)
+    return paths, gitlinks
+
+
+def _tracked_file_paths(repo_root: Path) -> list[str] | None:
+    """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout."""
+    entries = _tracked_entries(repo_root)
+    return None if entries is None else entries[0]
 
 
 class TestNormalizeLock:
@@ -691,28 +700,42 @@ class TestExtensionlessFilenames:
         a newly-added tracked file changes the correct answer without any test
         vector changing, so whichever suite runs must be able to see it.
 
-        Gitlink mount points (``graphiti``, ``mem0``) are excluded by
-        _tracked_file_paths and must NOT be admitted; that exclusion is asserted
-        below so this cannot pass vacuously.
+        Gitlink mount points are excluded by _tracked_file_paths and must NOT be
+        admitted; that exclusion is asserted below.  The gitlink set is DERIVED
+        from git's own mode column rather than hardcoded, which matters in both
+        directions: hardcoding ``('graphiti', 'mem0')`` made the assertion
+        vacuously true for the reify parametrization (reify vendors no
+        submodules), and would have gone red for no real defect if dark-factory
+        ever de-vendored them.  A repo with no submodules now skips the
+        sub-assertion explicitly instead of passing it silently — so read this
+        guard as non-vacuous exactly where gitlinks actually exist, which today
+        is the dark-factory parametrization.
         """
         if not repo_root.is_dir():
             pytest.skip(f'{repo} checkout not present at {repo_root}')
-        paths = _tracked_file_paths(repo_root)
-        if paths is None:
+        entries = _tracked_entries(repo_root)
+        if entries is None:
             pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        paths, gitlinks = entries
         assert paths, f'git ls-files returned no tracked paths for {repo_root}'
 
         # The gitlink filter must be doing real work, not passing vacuously.
-        for gitlink in ('graphiti', 'mem0'):
-            assert gitlink not in paths, (
-                f'{gitlink!r} is a submodule mount point (mode 160000) and must '
-                f'be filtered out by _tracked_file_paths; admitting it would let '
-                f'a task declare an entire vendored submodule as its lock charter'
+        if gitlinks:
+            overlap = sorted(set(gitlinks) & set(paths))
+            assert not overlap, (
+                f'{overlap!r} appear as BOTH mode-160000 gitlinks and ordinary '
+                f'tracked paths in {repo}; _tracked_entries must partition the '
+                f'corpus, and admitting a submodule mount point would let a task '
+                f'declare an entire vendored submodule as its lock charter'
             )
-            assert not is_file_path(gitlink), (
-                f'{gitlink!r} is a submodule mount point and must stay a '
-                f'DIRECTORY — see the GITLINK EXCLUSION note on the corpus'
-            )
+            for gitlink in gitlinks:
+                assert not is_file_path(gitlink), (
+                    f'{gitlink!r} is a submodule mount point (mode 160000) and '
+                    f'must stay a DIRECTORY — see the GITLINK EXCLUSION note on '
+                    f'the corpus.  Admitting it would make an entire vendored '
+                    f'submodule declarable as a lock charter, strictly worse '
+                    f'than the bug #3248 fixed.'
+                )
 
         unknown: dict[str, str] = {}
         for path in paths:
