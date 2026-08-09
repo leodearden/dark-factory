@@ -1367,7 +1367,7 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
     event_r1_started = asyncio.Event()
     event_r2_started = asyncio.Event()
 
-    async def _side_effect(http_client, url, tool, arguments):
+    async def _side_effect(http_client, url, tool, arguments, **kwargs):
         root = arguments.get('project_root', '')
         if root == str(r1):
             event_r1_started.set()

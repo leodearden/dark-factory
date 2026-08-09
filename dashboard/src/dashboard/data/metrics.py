@@ -114,6 +114,13 @@ async def fan_out_list_tickets(
                         url,
                         'list_tickets',
                         {'project_root': root_str, 'status': 'pending', 'limit': effective_limit},
+                        # Per-HTTP-request budget: bounds connect/read/write AND
+                        # pool acquisition on the shared client, which otherwise
+                        # ran to mcp_tool_call's 10s default regardless of the
+                        # sampler's own deadline. The enclosing wait_for stays —
+                        # a cold session is three posts, so this layer alone
+                        # would permit roughly 3x timeout.
+                        timeout=timeout,
                     ),
                     timeout=timeout,
                 )
