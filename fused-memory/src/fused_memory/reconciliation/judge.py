@@ -112,6 +112,11 @@ _UNPARSEABLE_VERDICT_CODE = 'unparseable_judge_response'
 # 'code' marker existed and so cannot be identified any other way.
 _UNPARSEABLE_ISSUE_PREFIX = 'Judge response could not be parsed'
 
+# Severities counted as "non-ok" by _check_error_trends' streak and count
+# gates. One spelling for both gates so they cannot independently drift on
+# what counts as evidence of trouble.
+_NON_OK_SEVERITIES = ('moderate', 'serious')
+
 
 def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
     """True iff *verdict* is a fabricated stand-in for a review that never
@@ -1025,13 +1030,22 @@ Review this run and provide your verdict as JSON.
         if len(windowed) < consecutive_required:
             return
         if not all(
-            v.severity in ('moderate', 'serious')
+            v.severity in _NON_OK_SEVERITIES
             for v in windowed[:consecutive_required]
         ):
             return
 
+        # Phantom non-ok verdicts (task 3070) are fabricated placeholders for
+        # a review that never happened — they carry no evidence either way,
+        # so they must not inflate the count gate. The exclusion is
+        # deliberately restricted to non-ok severities: a phantom is only
+        # ever severity=serious (see is_phantom_verdict), so this can never
+        # drop an ok/minor verdict from the ordering and un-break a streak
+        # (that would be a fail-open change, and belongs to the streak gate
+        # above, not here).
         non_ok_in_window = [
-            v for v in windowed if v.severity in ('moderate', 'serious')
+            v for v in windowed
+            if v.severity in _NON_OK_SEVERITIES and not is_phantom_verdict(v)
         ]
         if len(non_ok_in_window) < self.config.halt_trend_moderate_count:
             return
