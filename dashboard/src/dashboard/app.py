@@ -410,9 +410,15 @@ async def lifespan(app: FastAPI):
     ``app.state`` stays assigned for request handlers and for tests that swap
     ``app.state.config``; it is simply not the shutdown path's source of truth.
     """
-    http_client = httpx.AsyncClient(follow_redirects=True)
-    app.state.http_client = http_client
+    # Config first: the shared client's pool bound is DERIVED from it (see
+    # _build_http_limits above). DashboardConfig.from_env() has no dependency
+    # on the client, so evaluating it first is safe.
     app.state.config = DashboardConfig.from_env()
+    http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=_build_http_limits(app.state.config),
+    )
+    app.state.http_client = http_client
     pool = DbPool()
     app.state.db = pool
     app.state.start_time = time.monotonic()
