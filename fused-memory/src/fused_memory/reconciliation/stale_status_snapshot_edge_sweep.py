@@ -163,8 +163,8 @@ Design decisions (captured in plan.json):
   residual above.
 - The plural enumeration is required to be the copula's SUBJECT, via TWO
   remedies that are BOTH necessary: plural agreement on the copula
-  (``_PLURAL_COPULA_ALT``) and a rejection of a preceding preposition
-  (``_ENUM_PREP_PREFIX_RE``). Adjacency of the marker to the
+  (``_PLURAL_COPULA_ALT``) and a rejection of a preposition governing the
+  enumeration (``_ENUM_PREP_WORDS``). Adjacency of the marker to the
   copula does NOT establish subjecthood — that was the defect: in "The
   merge of tasks A and B is blocked" the plural NP is a preposition's
   complement and the MERGE is what is blocked, yet the fact would be
@@ -176,12 +176,16 @@ Design decisions (captured in plan.json):
   negative lookbehinds pinned immediately before '\\btasks\\b', which a
   single intervening determiner defeated wholesale ("Reviews for the
   tasks A and B are pending"); it now runs in Python against the
-  preceding text, which also covers a multi-space/newline gap. Two
-  residuals in OPPOSITE directions, and the first is the forbidden one:
-  an unlisted preposition slips through and OVER-selects (the vocabulary
-  was widened once already, for exactly this reason — see
+  preceding text. The gap between the preposition and the list noun is
+  an OPEN class (quantifiers, adjectives, possessives — "Statuses of
+  quite a few tasks A and B are pending"), so it is neither enumerated
+  nor bounded: the guard rejects a listed preposition anywhere in the
+  enumeration's CLAUSE (``_enumeration_is_prepositional_complement``).
+  Two residuals in OPPOSITE directions, and the first is the forbidden
+  one: an unlisted preposition slips through and OVER-selects (the
+  vocabulary was widened once already, for exactly this reason — see
   ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
-  directly preceded by a listed word is missed, which is the fail-safe
+  sharing a clause with a listed word is missed, which is the fail-safe
   direction. Note ``_COPULA_ALT`` is untouched and still shared by the
   other paths; only this one narrows. (amendment, reviewer_comprehensive
   correctness-precision finding, task 3079)
@@ -622,35 +626,53 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 #
 # So the check now lives in PYTHON, applied to the text preceding the match
 # (see extract_snapshot_edge_task_ids). Being freed from the fixed-width
-# constraint buys three things at once: an optional determiner may sit
-# between the preposition and the list noun; the gap may be a multi-space or
-# newline run rather than exactly one space (a second defect the lookbehind
-# form had); and the hand-computed per-width alternations (and their
-# arithmetic comments) disappear, so the vocabulary is now one flat list.
+# constraint buys the arbitrary gap between the preposition and the list noun,
+# the multi-space/newline run the lookbehind form also mishandled, and the
+# disappearance of the hand-computed per-width alternations, so the vocabulary
+# is now one flat list.
+#
+# SECOND CORRECTION (amendment, reviewer_comprehensive correctness-precision
+# finding, task 3079): that freedom was FIRST spent on a hard-coded six-word
+# determiner slot — '\s+(?:the|these|those|all|our|its)?\s*$'. The slot was a
+# second, undocumented CLOSED vocabulary and it failed exactly the way the
+# lookbehind had, one word over: any intervening word outside those six
+# defeated every preposition in the list at once.
+#
+#     'Statuses of some tasks 1020 and 1030 are pending.'        -> {1020, 1030}
+#     'Notes about a few tasks 1020 and 1030 are pending.'       -> {1020, 1030}
+#     "Reviews of Leo's tasks 1020 and 1030 are pending."        -> {1020, 1030}
+#     'Blockers for downstream tasks 1020 and 1030 are pending.' -> {1020, 1030}
+#
+# The gap is an OPEN class — quantifiers, bare adjectives, possessives,
+# determiner stacks, participles — so no word list can close it. The review
+# suggested bounding the slot instead (up to two arbitrary words). That is the
+# same liability with a number substituted for a list: 'Statuses of quite a few
+# tasks 1020 and 1030 are pending' is three words and would over-select again.
+# So the gap is left UNBOUNDED and the guard is scoped by CLAUSE: reject when a
+# listed preposition appears anywhere between the last strong punctuation break
+# and the enumeration. Every case the two forms disagree on is one the clause
+# form REJECTS and the bounded form admits — the divergence is entirely in the
+# fail-safe under-selection direction, and it closes the intervening-word class
+# outright rather than moving its boundary.
 #
 # '\b'-anchoring is retained, which is what keeps 'Migration tasks' /
 # 'Verification tasks' matching — the 'on' inside 'Migration' is not
-# '\b'-preceded. Matching is against a prefix slice ending at the match
-# start, with '$' anchoring, so cost is bounded by the prefix scan the regex
-# engine already does.
+# '\b'-preceded. Matching is against a prefix slice ending at the match start,
+# so cost is bounded by the prefix scan the regex engine already does.
 #
-# Residuals, in BOTH directions — and the vocabulary one points the WRONG
-# way. CORRECTION (amendment, reviewer_comprehensive correctness-precision
-# finding, task 3079): this note previously called the whole residual
-# "fail-safe under-selection". That is wrong for half of it and is what made
-# the gap read as acceptable. An UNLISTED preposition does not cause a miss —
-# the guard simply fails to fire, the plural path matches, and the ids are
-# selected: OVER-selection, the direction this module forbids, since the
-# sweep would then invalidate a still-true edge the moment any named id goes
-# terminal. Only the second residual is fail-safe: a genuine subject-position
-# enumeration directly preceded by a LISTED word is missed. So the closed
-# vocabulary below is a liability, not a safety margin, and it was widened
-# (from/by/under/within/around/through/via/during/concerning) after the
-# initial list was found to admit exactly the shapes it exists to refuse:
-#
-#     'Dependencies from tasks 1020 and 1030 are blocked.'   -> {1020, 1030}
-#     'Failures within tasks 1020 and 1030 are blocked.'     -> {1020, 1030}
-#     'Reviews by tasks 1020 and 1030 are pending.'          -> {1020, 1030}
+# ONE residual now, and it points the WRONG way: the preposition vocabulary is
+# still a closed list, so an UNLISTED preposition does not cause a miss — the
+# guard simply fails to fire, the plural path matches, and the ids are
+# selected. That is OVER-selection, the direction this module forbids, since
+# the sweep would then invalidate a still-true edge the moment any named id
+# goes terminal. (CORRECTION, amendment, task 3079: an earlier note called
+# this "fail-safe under-selection", which is what made the gap read as
+# acceptable.) So the list is a liability, not a safety margin, and it was
+# widened once already — from/by/under/within/around/through/via/during/
+# concerning — after the initial list was found to admit exactly the shapes it
+# exists to refuse ('Dependencies from tasks 1020 and 1030 are blocked.').
+# The converse residual IS fail-safe: a genuine subject-position enumeration
+# sharing a clause with a listed preposition is missed.
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the
 # vocabulary has ONE source of truth: the regression test parametrizes
@@ -662,11 +684,36 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
     'around', 'during', 'through', 'via', 'concerning',
 )
 
-_ENUM_PREP_PREFIX_RE: re.Pattern[str] = re.compile(
-    r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')'
-    r'\s+(?:the|these|those|all|our|its)?\s*$',
+# Strong punctuation ends the span a preposition can govern, so the guard
+# looks no further back than the last one. This is what keeps 'Reviews for
+# X. Tasks 1020 and 1030 are pending.' selected — the enumeration opens a NEW
+# sentence and really is its copula's subject. COMMA is deliberately absent:
+# it does not reliably end prepositional government ('Statuses of the
+# following, tasks 1020 and 1030, are pending' is still a complement), so
+# treating it as a break would move that shape into over-selection, whereas
+# omitting it can only ever cost under-selection. NEWLINE is absent for the
+# same reason and is load-bearing: a fact wrapped mid-phrase ('Reviews for
+# the\n  tasks 1020 and 1030 are pending.') is one clause, and counting the
+# wrap as a break re-opened that very over-selection — caught by the
+# multi-space/newline regression case the lookbehind rewrite left behind.
+_CLAUSE_BREAK_RE: re.Pattern[str] = re.compile(r'[.;:!?()\[\]{}"“”]')
+
+_ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
+    r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')\b',
     re.IGNORECASE,
 )
+
+
+def _enumeration_is_prepositional_complement(prefix: str) -> bool:
+    """Does a listed preposition govern the enumeration at ``prefix``'s end?
+
+    ``prefix`` is the fact text preceding a ``PLURAL_ENUM_SNAPSHOT_RE`` match.
+    True means the enumeration is a preposition's complement, not the copula's
+    subject, and the match must be discarded. See ``_ENUM_PREP_WORDS`` for the
+    full argument and the residual. (task 3079)
+    """
+    clause = _CLAUSE_BREAK_RE.split(prefix)[-1]
+    return _ENUM_PREP_WORD_RE.search(clause) is not None
 
 # Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
 # 3079). Before this, such an edge yielded NO ids at all — not merely the
@@ -866,9 +913,10 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
         # ('Reviews of the tasks A and B are pending' — the REVIEWS are
         # pending). Lives here rather than as an in-pattern lookbehind
         # because Python lookbehind is fixed-width, and a fixed offset is
-        # defeated by a single intervening determiner. See
-        # _ENUM_PREP_PREFIX_RE.
-        if _ENUM_PREP_PREFIX_RE.search(fact[: enum.start()]):
+        # defeated by a single intervening determiner — while the words that
+        # may sit in that gap are an open class no bound can cover. See
+        # _ENUM_PREP_WORDS.
+        if _enumeration_is_prepositional_complement(fact[: enum.start()]):
             continue
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
 

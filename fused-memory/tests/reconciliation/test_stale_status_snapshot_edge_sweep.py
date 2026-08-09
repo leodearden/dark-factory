@@ -753,6 +753,27 @@ class TestExtractSnapshotEdgeTaskIds:
             # multi-space / newline gap before the list noun — the other
             # defect the fixed-offset lookbehind could not see
             'Reviews for  the\n  tasks 1020 and 1030 are pending.',
+            # NON-DETERMINER intervening words. The determiner cases above
+            # were first fixed with a six-word slot
+            # ('the|these|those|all|our|its'), which was a second closed
+            # vocabulary and failed the same way one word over. The gap is an
+            # OPEN class, so one case per class it admits — quantifier, bare
+            # adjective, possessive, determiner stack, participle — plus the
+            # THREE-word gaps that a merely-bounded slot (the review's
+            # suggested '{0,2} arbitrary words') would still admit, which is
+            # why the guard is clause-scoped and unbounded instead.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            'Statuses of some tasks 1020 and 1030 are pending.',
+            'Dependencies for both tasks 1020 and 1030 are blocked.',
+            'Notes about a few tasks 1020 and 1030 are pending.',
+            'Reviews of all the tasks 1020 and 1030 are pending.',
+            'Notes on remaining tasks 1020 and 1030 are pending.',
+            'Statuses of open tasks 1020 and 1030 are pending.',
+            'Blockers for downstream tasks 1020 and 1030 are pending.',
+            "Reviews of Leo's tasks 1020 and 1030 are pending.",
+            'Statuses of quite a few tasks 1020 and 1030 are pending.',
+            'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.',
             # HYPHENATED negation / past-exit reaching the marker through
             # _COMPOUND_PREFIX rather than the closed-class adverb slot
             'Tasks 1020 and 1030 are un-blocked.',
@@ -852,6 +873,17 @@ class TestExtractSnapshotEdgeTaskIds:
             ('The tasks 1020 and 1030 are blocked.', {1020, 1030}),
             # 'remain' must survive the copula narrowing to plural agreement
             ('Tasks 1020 and 1030 remain pending.', {1020, 1030}),
+            # CLAUSE SCOPE. The preposition guard is unbounded within a
+            # clause, so these pin the other edge of it: strong punctuation
+            # ends the span a preposition governs, and an enumeration opening
+            # a new sentence/clause really is its own copula's subject even
+            # though a listed preposition appears earlier in the fact. Without
+            # a clause reset the guard would swallow the whole prefix and
+            # disable the plural path for any multi-sentence fact. (amendment,
+            # reviewer_comprehensive correctness-precision finding, task 3079)
+            ('Reviews for the branch are done. Tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
+            ('Blocked on review; tasks 1020 and 1030 are pending.', {1020, 1030}),
         ],
     )
     def test_plural_enumeration_subject_positives_survive_precision_guards(
