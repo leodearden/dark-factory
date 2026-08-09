@@ -26,6 +26,22 @@ parsed-input column before this corpus existed. Two checks in the replay are
 non-circular by construction and are the load-bearing ones: the D5 structural
 invariant, and re-deriving the collection predicate over every stored value.
 
+HOW IT READS THE ARCHIVE
+------------------------
+Through ``legibility.inventory.iter_json_lines``, THE low-level streaming
+transcript reader, rather than a reader rolled here. That buys the documented
+line/file split — a corrupt LINE degrades silently, an unreadable FILE raises
+``OSError`` and is skipped, counted and logged (:class:`WalkReport`) — with one
+answer to "which exceptions mean unreadable", not a second copy of it.
+
+An earlier version gated each line on a cheap ``'tool_use' in line`` substring
+check before ``json.loads``. That is incompatible with the canonical reader,
+which parses every line, and it was MEASURED not to matter for a tool that runs
+once per snapshot: over 40 files / 17.1 MB / 5670 lines, prefilter-only was
+0.16s against 0.78s parsing every line (4.9x), and a full run over the live
+5703-file archive takes 1m35s wall (32s CPU). Roughly 80 seconds, once. Do not
+reintroduce the prefilter to buy them back.
+
 Run it as::
 
     uv run --project shared python tests/toolcall_markup_corpus_extract.py \\
@@ -45,8 +61,9 @@ is standard JSON, decoded transparently by ``json.loads``.
 from __future__ import annotations
 
 import argparse
-import gzip
+import dataclasses
 import json
+import logging
 import re
 import sys
 from collections.abc import Collection, Iterator, Sequence
@@ -57,7 +74,28 @@ _SRC = Path(__file__).resolve().parents[1] / 'src'
 if str(_SRC) not in sys.path:  # pragma: no cover — bare-interpreter bootstrap
     sys.path.insert(0, str(_SRC))
 
+# `legibility` is a namespace package under repo-root scripts/ — no __init__.py,
+# installed nowhere, and not on shared's pytest `pythonpath`. This insert is the
+# only way the canonical reader imports at all, so it runs at module scope
+# rather than under a __main__ guard. Idempotent and guarded — the idiom is
+# copied verbatim from fused-memory/scripts/memory_eval_transcript_corpus.py,
+# the other cross-package consumer of the same reader.
+#
+# No layering cycle: scripts/legibility/inventory.py is stdlib-only and imports
+# nothing from `shared`.
+_SCRIPTS_ROOT = Path(__file__).resolve().parents[2] / 'scripts'
+if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_ROOT))
+
+# The `# type: ignore[reportMissingImports]` is not a defect being papered over:
+# this resolves at RUNTIME via the insert above, but pyright is invoked from
+# shared/ whose extraPaths cannot see repo-root scripts/. Same situation, same
+# idiom, as memory_eval_transcript_corpus.py's.
+from legibility.inventory import iter_json_lines  # type: ignore[reportMissingImports]  # noqa: E402
+
 from shared.toolcall_markup import repair  # noqa: E402
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # The collection predicate — PRD section 2, line 35, verbatim.
@@ -74,19 +112,6 @@ _PREDICATE_INVOKE_TAIL = re.compile(r'\x3c/invoke>\s*$')
 _PREDICATE_MISCLOSE_THEN_OPENER = re.compile(
     r'\x3c/[A-Za-z_]\w*>\s*\x3cparameter\s+name="[^"]+">'
 )
-
-#: Cheap substring gate applied before ``json.loads``. The archive is 551 MB, so
-#: most lines must be rejected without parsing.
-#:
-#: It gates on ``tool_use`` rather than on an envelope literal DELIBERATELY. A
-#: literal gate would be a superset of the collection predicate but NOT of what
-#: this module needs: ``schema_params`` is the union of keys a tool was seen to
-#: be called with, and the overwhelming majority of that evidence comes from
-#: CLEAN calls, whose lines contain no envelope literal at all. Gating on the
-#: literal starves the schema union, and every specimen whose dropped parameter
-#: was never observed then fails schema validation and is mis-recorded as
-#: unrepairable. Gating on ``tool_use`` is a strict superset of both needs.
-_PREFILTER = 'tool_use'
 
 #: Repaired values keep at most this many characters of lead-in. Applied
 #: unconditionally BY RULE rather than "if it looks big", so the output is
@@ -162,49 +187,65 @@ class Candidate(NamedTuple):
     value: str
 
 
+@dataclasses.dataclass
+class WalkReport:
+    """What one archive walk actually managed to read.
+
+    The archive is live-written AND concurrently pruned by
+    ``scripts/gc_agent_transcripts.py``, so a half-written or half-removed leaf
+    is an expected state, not a theoretical one. Skipping it silently would let
+    the corpus shrink without anyone noticing, which is the degradation the
+    project's loud-over-silent norm exists to prevent — hence a count and the
+    offending paths, not just a shrug.
+    """
+
+    #: Every ``.jsonl.gz`` the recursive walk found.
+    files_walked: int = 0
+    #: Those it read to the end. ``files_walked - files_read == len(unreadable)``.
+    files_read: int = 0
+    #: ``(path, "ExceptionType: message")`` per unreadable file, walk order.
+    unreadable: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+
+
 def iter_tool_use_blocks(path: Path) -> Iterator[dict[str, Any]]:
     """Yield the ``tool_use`` blocks of one gzipped transcript, streaming.
 
-    Malformed lines are skipped rather than aborting the walk: the archive is
-    551 MB of live-written data and one truncated tail line must not cost the
-    other 5200 files. Every skip here is STRUCTURAL — a shape check on
-    already-parsed JSON — except the unavoidable ``json.JSONDecodeError``, which
-    is isolated in :func:`_loads_or_none` so the handler covers exactly the
-    parse and cannot swallow a bug anywhere else in the walk.
+    Delegates the read to ``legibility.inventory.iter_json_lines`` — THE
+    low-level streaming transcript reader, already gz-transparent — rather than
+    re-rolling one here. Everything this function still does is a STRUCTURAL
+    shape check on already-parsed JSON.
+
+    That reader's contract, which callers here depend on: a blank or corrupt
+    LINE degrades silently, an unreadable FILE raises ``OSError``. The split is
+    the accounting :class:`WalkReport` needs — a truncated trailing line, which
+    every fire-and-forget writer eventually produces, must not inflate the
+    unreadable-file count into a false alarm. All four unreadable-file shapes
+    arrive as ``OSError`` because ``inventory.as_unreadable_file_error``
+    normalizes them at the reader seam.
+
+    Note this reads under STRICT UTF-8. The hand-rolled predecessor passed
+    ``errors='replace'``, which does not skip anything — it turns a corrupt byte
+    into U+FFFD and lets the record through, so a replacement character would be
+    committed to the corpus as if it were real harness output.
+
+    The caller must consume this generator inside its own ``except OSError``;
+    the raise happens lazily, at read time, not at call time.
     """
-    with gzip.open(path, 'rt', encoding='utf-8', errors='replace') as handle:
-        for line in handle:
-            if _PREFILTER not in line:
-                continue
-            record = _loads_or_none(line)
-            if not isinstance(record, dict):
-                continue
-            message = record.get('message')
-            if not isinstance(message, dict):
-                continue
-            content = message.get('content')
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'tool_use':
-                    yield block
-
-
-def _loads_or_none(line: str) -> object:
-    """Parse one transcript line, or return ``None`` for a malformed one.
-
-    Isolated into three lines so the ``except`` covers exactly the parse and
-    nothing else — a broad handler wrapped around the walk would swallow real
-    bugs and is the silent-fallthrough signature the shared ratchet flags.
-    """
-    try:
-        return json.loads(line)
-    except json.JSONDecodeError:
-        return None
+    for record in iter_json_lines(path):
+        message = record.get('message')
+        if not isinstance(message, dict):
+            continue
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                yield block
 
 
 def iter_candidates(
     root: Path | str,
+    report: WalkReport | None = None,
 ) -> Iterator[tuple[Candidate | None, str, tuple[str, ...]]]:
     """Yield ``(candidate_or_None, tool, observed_keys)`` for every tool_use block.
 
@@ -214,9 +255,31 @@ def iter_candidates(
     much schema evidence as a corrupted one, and in practice contributes almost
     all of it (a dropped parameter is by definition absent from the corrupted
     call's own key set, so only clean calls can testify that it exists).
+
+    An unreadable file is SKIPPED, logged at WARNING and recorded in *report*
+    rather than aborting the walk. The handler is deliberately narrow — plain
+    ``except OSError``, around the per-file consumption only — and deliberately
+    NOT widened to also catch ``EOFError``/``zlib.error``/``UnicodeDecodeError``:
+    ``inventory.as_unreadable_file_error`` is the ONE answer to "which
+    exceptions mean an unreadable file", and a second answer at each call site
+    is precisely what INV-5 forbids. This task, of all tasks, must not write one.
     """
+    report = report if report is not None else WalkReport()
     for path in iter_transcript_files(root):
-        for block in iter_tool_use_blocks(path):
+        report.files_walked += 1
+        try:
+            # Materialized per FILE, not per archive: the raise is lazy, so the
+            # handler has to wrap the consumption, and this is the same shape
+            # memory_eval_transcript_corpus.py uses. Peak memory stays bounded
+            # by one transcript's tool_use blocks.
+            blocks = list(iter_tool_use_blocks(path))
+        except OSError as exc:
+            detail = f'{type(exc).__name__}: {exc}'
+            report.unreadable.append((str(path), detail))
+            _LOG.warning('skipping unreadable transcript %s (%s)', path, detail)
+            continue
+        report.files_read += 1
+        for block in blocks:
             tool = block.get('name')
             arguments = block.get('input')
             block_id = block.get('id')
@@ -338,7 +401,7 @@ def build_record(candidate: Candidate, schema_params: Sequence[str]) -> dict[str
     }
 
 
-def extract(root: Path | str) -> list[dict[str, Any]]:
+def extract(root: Path | str, report: WalkReport | None = None) -> list[dict[str, Any]]:
     """Walk *root* and return the corpus, deduped and in a stable total order.
 
     Two passes over one streamed walk: candidates are collected while the
@@ -347,10 +410,13 @@ def extract(root: Path | str) -> list[dict[str, Any]]:
     really does appear in more than one file (resumed sessions, re-archival) —
     and the order is by that id, which is a stable total order because ids are
     unique.
+
+    Pass a :class:`WalkReport` to learn what the walk could and could not read;
+    unreadable files are skipped either way, and logged at WARNING either way.
     """
     candidates: dict[str, Candidate] = {}
     observed: dict[str, set[str]] = {}
-    for matched, tool, keys in iter_candidates(root):
+    for matched, tool, keys in iter_candidates(root, report):
         observed.setdefault(tool, set()).update(keys)
         if matched is not None:
             candidates.setdefault(matched.tool_use_id, matched)
@@ -425,12 +491,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
-    records = extract(args.archive_root)
+    report = WalkReport()
+    records = extract(args.archive_root, report)
+
+    for path, detail in report.unreadable:
+        print(f'skipped unreadable transcript {path} ({detail})', file=sys.stderr)
+    if report.files_read == 0:
+        # LOUD, one level in from the zero-files-walked guard above: files WERE
+        # found, so that guard passed, and without this one an archive whose
+        # every leaf is half-written would overwrite the committed corpus with
+        # an empty file and exit 0.
+        print(
+            f'ERROR: all {report.files_walked} transcript files under '
+            f'{args.archive_root} were unreadable — nothing written',
+            file=sys.stderr,
+        )
+        return 1
+
     write_corpus(records, args.out)
     repaired = sum(1 for r in records if r['expected_outcome'] == OUTCOME_REPAIRED)
     truncated = sum(1 for r in records if r['truncated'])
     print(
-        f'walked {walked} transcript files under {args.archive_root}\n'
+        f'walked {report.files_walked} transcript files under {args.archive_root} '
+        f'({report.files_read} read, {len(report.unreadable)} unreadable)\n'
         f'wrote {len(records)} specimens to {args.out} '
         f'({repaired} repaired, {len(records) - repaired} unrepairable, '
         f'{truncated} truncated, {args.out.stat().st_size} bytes)',
