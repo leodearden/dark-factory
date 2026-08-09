@@ -778,6 +778,21 @@ class TestExtractSnapshotEdgeTaskIds:
             # _COMPOUND_PREFIX rather than the closed-class adverb slot
             'Tasks 1020 and 1030 are un-blocked.',
             'Tasks 1020 and 1030 are previously-blocked.',
+            # NON-SENTENCE-FINAL punctuation between the preposition and the
+            # list noun. Each of these over-selected while the clause-break
+            # class still contained ':', the paren/bracket family and the
+            # quote family: the break truncated the backward scan short of
+            # the governing preposition, so the guard saw a clause with no
+            # preposition in it and admitted the match. A colon typically
+            # INTRODUCES the complement its preposition governs, and a
+            # parenthetical or quoted aside is an interpolation inside the
+            # clause rather than a new one — neither ends government, so
+            # neither may be a break. (amendment, reviewer_comprehensive
+            # correctness-precision finding, task 3079)
+            'Statuses of the following: tasks 1020 and 1030 are pending.',
+            'Reviews of the following (still open): tasks 1020 and 1030 are pending.',
+            'Statuses of the "next" tasks 1020 and 1030 are pending.',
+            'Blockers for the merge lane [df] tasks 1020 and 1030 are pending.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
@@ -936,6 +951,13 @@ class TestExtractSnapshotEdgeTaskIds:
             ('Reviews for the branch are done. Tasks 1020 and 1030 are pending.',
              {1020, 1030}),
             ('Blocked on review; tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # ...and the other edge of narrowing the break class to
+            # sentence-final punctuation: a colon-preambled genuine snapshot
+            # is unaffected, because the longer clause it now scans still
+            # contains no listed preposition for the guard to fire on.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            ('Note: tasks 1020 and 1030 are pending.', {1020, 1030}),
         ],
     )
     def test_plural_enumeration_subject_positives_survive_precision_guards(
@@ -949,6 +971,45 @@ class TestExtractSnapshotEdgeTaskIds:
         precision guards above they pin the fix from both directions.
         """
         assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # 'of' inside a date stamp — the shape the finding's own
+            # motivating fact carries ("... is pending as of 2026-07-14...")
+            'As of 2026-08-09, tasks 1020 and 1030 are pending.',
+            # 'in' inside a location-scoping preamble
+            'In the merge queue, tasks 1020 and 1030 are pending.',
+            # 'for' inside a cycle-scoping preamble
+            'For this cycle, tasks 1020 and 1030 are pending.',
+        ],
+    )
+    def test_adverbial_preamble_is_a_documented_under_selection(self, fact):
+        """Cost of the clause-scoped guard, pinned rather than left implicit.
+
+        (amendment, reviewer_comprehensive correctness-recall finding, task
+        3079)
+
+        The guard rejects when a listed preposition appears ANYWHERE between
+        the last sentence-final break and the enumeration, and a comma is
+        deliberately not a break (it does not end prepositional government).
+        Together those mean an ordinary sentence-initial ADVERBIAL PREAMBLE —
+        a date stamp, a location or a cycle scope, all common in this repo's
+        memory corpus — shares the clause with its own preposition and
+        suppresses a genuine subject-position snapshot behind it.
+
+        This is the fail-safe under-selection direction, so it is documented
+        behaviour rather than a defect: the edge is simply not retired this
+        cycle and the next sweep (or Stage 2) sees it again. It is pinned
+        here so the recall cost is VISIBLE and intentional — if the guard
+        widens further, these cases are where it shows up, and if the real
+        edge corpus ever makes the cost matter, this is the test that has to
+        be renegotiated first. Deliberately NOT fixed speculatively:
+        tightening the guard means measuring against the actual edge set,
+        and every candidate tightening trades back toward the unrecoverable
+        over-selection direction.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
 
     def test_plural_enumeration_needs_two_or_more_ids(self):
         """A plural head over a single id is not an enumeration. (task 3079)

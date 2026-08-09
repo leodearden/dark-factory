@@ -198,6 +198,10 @@ Design decisions (captured in plan.json):
   quite a few tasks A and B are pending"), so it is neither enumerated
   nor bounded: the guard rejects a listed preposition anywhere in the
   enumeration's CLAUSE (``_enumeration_is_prepositional_complement``).
+  Only SENTENCE-FINAL punctuation ends that clause — a colon, comma,
+  bracket, quote or line wrap does not end prepositional government, and
+  admitting any of them as a break re-opens the over-selection outright
+  (see ``_CLAUSE_BREAK_CHARS``).
   Two residuals in OPPOSITE directions, and the first is the forbidden
   one: an unlisted preposition slips through and OVER-selects (the
   vocabulary was widened once already, for exactly this reason — see
@@ -699,8 +703,26 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # widened once already — from/by/under/within/around/through/via/during/
 # concerning — after the initial list was found to admit exactly the shapes it
 # exists to refuse ('Dependencies from tasks 1020 and 1030 are blocked.').
+#
 # The converse residual IS fail-safe: a genuine subject-position enumeration
-# sharing a clause with a listed preposition is missed.
+# sharing a clause with a listed preposition is missed. Its main real-world
+# class is the sentence-initial ADVERBIAL PREAMBLE, since a comma does not end
+# the clause:
+#
+#     'As of 2026-08-09, tasks 1020 and 1030 are pending.'      -> set()
+#     'In the merge queue, tasks 1020 and 1030 are pending.'    -> set()
+#
+# Date-stamped and scope-setting preambles are common in this corpus — the
+# finding's own motivating fact carries one ("... is pending as of
+# 2026-07-14...") — so this is a real recall cost on the plural path, not a
+# hypothetical one. It is pinned by
+# test_adverbial_preamble_is_a_documented_under_selection so the cost stays
+# visible and cannot widen unnoticed. Deliberately not tightened on
+# speculation: every candidate tightening (requiring a plural/capitalized head
+# before the preposition, or stopping the backward scan at a comma when no
+# preposition follows it) trades back toward the unrecoverable over-selection
+# direction, so it needs measurement against the real edge corpus first.
+# (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the
 # vocabulary has ONE source of truth: the regression test parametrizes
@@ -712,19 +734,39 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
     'around', 'during', 'through', 'via', 'concerning',
 )
 
-# Strong punctuation ends the span a preposition can govern, so the guard
-# looks no further back than the last one. This is what keeps 'Reviews for
-# X. Tasks 1020 and 1030 are pending.' selected — the enumeration opens a NEW
-# sentence and really is its copula's subject. COMMA is deliberately absent:
-# it does not reliably end prepositional government ('Statuses of the
-# following, tasks 1020 and 1030, are pending' is still a complement), so
-# treating it as a break would move that shape into over-selection, whereas
-# omitting it can only ever cost under-selection. NEWLINE is absent for the
-# same reason and is load-bearing: a fact wrapped mid-phrase ('Reviews for
-# the\n  tasks 1020 and 1030 are pending.') is one clause, and counting the
-# wrap as a break re-opened that very over-selection — caught by the
-# multi-space/newline regression case the lookbehind rewrite left behind.
-_CLAUSE_BREAK_RE: re.Pattern[str] = re.compile(r'[.;:!?()\[\]{}"“”]')
+# SENTENCE-FINAL punctuation ends the span a preposition can govern, so the
+# guard looks no further back than the last one. This is what keeps 'Reviews
+# for X. Tasks 1020 and 1030 are pending.' selected — the enumeration opens a
+# NEW sentence and really is its copula's subject.
+#
+# The class is deliberately minimal — '.', ';', '!', '?' and nothing else —
+# because the two directions are not symmetric. Omitting a character can only
+# LENGTHEN the scanned clause, so it can only ever cost under-selection (the
+# fail-safe direction); including one that does not actually end prepositional
+# government truncates the scan and re-opens the over-selection this guard
+# exists to close, which is unrecoverable. So a character earns a place here
+# only by ending a sentence.
+#
+# Excluded on that rule, each verified over-selecting when it was treated as a
+# break (amendment, reviewer_comprehensive correctness-precision finding, task
+# 3079):
+#
+#     ':'          'Statuses of the following: tasks 1020 and 1030 are pending.'
+#     '(' ')'      'Reviews of the following (still open): tasks 1020 and 1030
+#                   are pending.'
+#     '"' '“' '”'  'Statuses of the "next" tasks 1020 and 1030 are pending.'
+#     ','          'Statuses of the following, tasks 1020 and 1030, are pending.'
+#     newline      'Reviews for  the\n  tasks 1020 and 1030 are pending.'
+#
+# A colon after a governing preposition no more ends that preposition's
+# government than a comma does — it typically introduces the very complement
+# the preposition governs — and a parenthetical or quoted aside is an
+# interpolation INSIDE the clause, not a new one. The comma and newline
+# exclusions are load-bearing for the same reason and predate this narrowing.
+# Colon-preambled genuine snapshots are unaffected ('Note: tasks 1020 and 1030
+# are pending.' still extracts): they carry no listed preposition, so the
+# longer clause gives the guard nothing to fire on.
+_CLAUSE_BREAK_CHARS = '.;!?'
 
 _ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
     r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')\b',
@@ -740,8 +782,18 @@ def _enumeration_is_prepositional_complement(prefix: str) -> bool:
     subject, and the match must be discarded. See ``_ENUM_PREP_WORDS`` for the
     full argument and the residual. (task 3079)
     """
-    clause = _CLAUSE_BREAK_RE.split(prefix)[-1]
-    return _ENUM_PREP_WORD_RE.search(clause) is not None
+    # Scan backwards for the last clause break and search from there, rather
+    # than splitting the whole prefix into clauses and keeping only the last:
+    # this runs once per plural match, and the extractor itself runs once per
+    # valid edge over the whole group's edge set, so the module treats
+    # extractor cost as a liveness property (see the module docstring).
+    # ``rfind`` is a C-level reverse scan and ``search(..., pos)`` needs no
+    # slice; '\b' at ``pos`` still sees the preceding character, and every
+    # break char is non-word, so this is exactly equivalent to searching the
+    # sliced clause. (amendment, reviewer_comprehensive efficiency finding,
+    # task 3079)
+    cut = max(prefix.rfind(char) for char in _CLAUSE_BREAK_CHARS)
+    return _ENUM_PREP_WORD_RE.search(prefix, cut + 1) is not None
 
 # Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
 # 3079). Before this, such an edge yielded NO ids at all — not merely the
