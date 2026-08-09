@@ -58,7 +58,7 @@ any future reconciliation sweep without import cycles.
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from fused_memory.utils.canonical_labels import Referent, scan_content
 
@@ -98,16 +98,27 @@ class CrossProjectRef:
 
 @dataclass(frozen=True)
 class CrossProjectRefScan:
-    """The result of scanning one episode body."""
+    """The result of scanning one episode body.
+
+    Frozen for the same reason :class:`CrossProjectRef` is: a scan is
+    evidence for destructive graph surgery, not a mutable accumulator.
+
+    The two fields are TUPLES rather than lists, which is what makes that
+    claim true. ``frozen=True`` only blocks attribute REBINDING, so list
+    fields would leave ``scan.refs.append(...)`` wide open — a consumer could
+    quietly add a ref the scanner refused to infer and the frozen-ness would
+    not notice. Tuples also make the scan hashable, which a frozen dataclass
+    holding lists silently is not.
+    """
 
     #: Refs safe to act on, in first-seen order, de-duplicated on
     #: (project_id, task_number).
-    refs: list[CrossProjectRef] = field(default_factory=list)
+    refs: tuple[CrossProjectRef, ...] = ()
     #: Refs whose task number ALSO appears as a bare 'task N' mention in the
     #: same content. Such content is genuinely ambiguous about which facts
     #: belong to the foreign task and which to the local one, so the consumer
     #: must refuse to split it and say so loudly rather than guess.
-    ambiguous: list[CrossProjectRef] = field(default_factory=list)
+    ambiguous: tuple[CrossProjectRef, ...] = ()
 
 
 def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
@@ -165,6 +176,6 @@ def find_cross_project_task_refs(
     """
     scan = scan_content(content, group_id=group_id, known_project_ids=known_project_ids)
     return CrossProjectRefScan(
-        refs=_foreign_refs(scan.refs),
-        ambiguous=_foreign_refs(scan.ambiguous),
+        refs=tuple(_foreign_refs(scan.refs)),
+        ambiguous=tuple(_foreign_refs(scan.ambiguous)),
     )
