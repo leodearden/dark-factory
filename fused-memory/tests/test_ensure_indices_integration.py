@@ -23,8 +23,8 @@ The three boundary tests, all MEASURED 2026-08-09 before implementation:
    no missing, no extra.  That exactness is what makes ``already_present ==
    expected_total`` reachable on a re-run; it was not safe to assume, since this
    PRD exists because that round-trip was silently wrong.
-3. **Idempotent re-run** → 0 statements, ``created == []``,
-   ``already_present == expected_total``, ``failed == []``.
+3. **Idempotent re-run** → 0 statements, ``created == ()``,
+   ``already_present == expected_total``, ``failed == ()``.
 
 Plus the absent-graph case: ``CALL db.indexes()`` against a graph KEY that was
 never written raises ``Invalid graph operation on empty key``, and the CREATE
@@ -236,13 +236,13 @@ class TestBoundary3IdempotentRerun:
 
         first = await live_backend.ensure_indices(group_id=name)
         await await_index_operational(graph)
-        assert first.failed == []
+        assert first.failed == ()
 
         second = await live_backend.ensure_indices(group_id=name)
 
-        assert second.created == []
-        assert second.failed == []
-        assert second.statements == []
+        assert second.created == ()
+        assert second.failed == ()
+        assert second.statements == ()
         assert second.already_present == second.expected_total
         assert second.changed is False
 
