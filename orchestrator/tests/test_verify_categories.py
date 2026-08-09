@@ -178,7 +178,10 @@ class TestCategoryPolicyGoldenRows:
         # another host's PASS — see TestIndeterminateExclusionsAreAdjudicated
         # .test_excludes_env_transient for the residual that forced this.
         assert row.verdict_indeterminate is False
-        assert row.archive is False
+        # task 3683: flipped False -> True. A separate field from the
+        # verdict_indeterminate amendment above — see
+        # TestEnvTransientArchivesForHumanTriage.
+        assert row.archive is True
         assert row.preexisting_probe is False
 
     def test_none_row(self):
@@ -274,16 +277,32 @@ class TestDerivedRegistriesByteIdentity:
         ]
 
     def test_archive_deny_list_matches_legacy_set(self):
-        """The legacy set MINUS semaphore_timeout, removed deliberately by
-        task 3679 (that category terminates in a blocking human escalation,
-        so its log is the only triage artifact — see
-        TestSemaphoreTimeoutArchivesForHumanTriage). Every other member is
-        still the legacy value; this stays a byte-for-byte pin so an
-        UNINTENDED archive-policy change still reds here."""
+        """The legacy set MINUS the members removed deliberately, in order:
+
+          * semaphore_timeout (task 3679) — that category terminates in a
+            blocking human escalation, so its log is the only triage artifact
+            (see TestSemaphoreTimeoutArchivesForHumanTriage).
+          * disk_full (task 3683) — same terminus, reached through the
+            identical category-agnostic retry windows (see
+            TestDiskFullArchivesForHumanTriage).
+          * pytest_internalerror (task 3683) — likewise; the sweep retry that
+            justified its exclusion is the one fail-OPEN arm and does not
+            cover the three that escalate (see
+            TestPytestInternalerrorArchivesForHumanTriage).
+          * env_transient (task 3683) — likewise; its ENV_SERIAL retry is a
+            single bounded re-run that fires only for a failing TEST leg (see
+            TestEnvTransientArchivesForHumanTriage).
+
+        No is_infra_transient member remains — the invariant
+        ``INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST == frozenset()``,
+        enforced at import time by ``_assert_infra_transient_rows_archive``.
+
+        Every other member is still the legacy value; this stays a
+        byte-for-byte pin so an UNINTENDED archive-policy change still reds
+        here."""
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'pytest_internalerror', 'env_transient', 'disk_full',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
@@ -311,6 +330,13 @@ class TestShouldArchive:
     reproduces the legacy _should_archive_category decision for every
     category — proving the endswith('_error') heuristic can be deleted
     without changing behavior for any of the 12 known categories.
+
+    pytest_internalerror and env_transient have since been ADJUDICATED away
+    from the legacy value rather than drifting from it (task 3683): both are
+    infra-transient categories that terminate in a blocking human escalation,
+    so the archived log is that human's only triage artifact — see
+    TestPytestInternalerrorArchivesForHumanTriage and
+    TestEnvTransientArchivesForHumanTriage.
     """
 
     @pytest.mark.parametrize(
@@ -323,8 +349,8 @@ class TestShouldArchive:
             ('tree_sitter_generate_error', True),
             ('flock_error', True),
             ('npm_error', True),
-            ('pytest_internalerror', False),
-            ('env_transient', False),
+            ('pytest_internalerror', True),
+            ('env_transient', True),
             ('test_failure', False),
             ('unknown_test_failure', True),
             ('passed', False),
@@ -550,11 +576,13 @@ class TestCrossModulePreexistingSingleSourced:
 # serial re-run cannot fix a host condition) ranked just below INFRA_TIMEOUT
 # and above every code-fault category.
 #
-# The pair no longer shares an ARCHIVE policy (task 3679): DISK_FULL keeps
-# archive=False, SEMAPHORE_TIMEOUT is now archive=True. See
-# TestSemaphoreTimeoutArchivesForHumanTriage for the grounding — with
-# retry_kind=NONE, SEMAPHORE_TIMEOUT surfaces to a human rather than
-# self-clearing, and the archived log is that human's only triage artifact.
+# The pair shares an ARCHIVE policy again: task 3679 flipped
+# SEMAPHORE_TIMEOUT to archive=True, and task 3683's audit found the same
+# grounding applies verbatim to DISK_FULL and flipped it too. See
+# TestSemaphoreTimeoutArchivesForHumanTriage and
+# TestDiskFullArchivesForHumanTriage — with retry_kind=NONE both surface to a
+# human rather than self-clearing, and the archived log is that human's only
+# triage artifact.
 #
 # RED today: neither member/row exists yet, so every test below fails on
 # the local ``from orchestrator.verify_categories import FailureCategory``
@@ -567,8 +595,10 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
     """DISK_FULL / SEMAPHORE_TIMEOUT are new FailureCategory members with an
     env_transient-family CATEGORY_POLICY row.
 
-    The two rows are identical EXCEPT for ``archive`` (task 3679):
-    SEMAPHORE_TIMEOUT is archive=True, DISK_FULL remains archive=False.
+    The two rows are identical again, ``archive`` included: task 3679 flipped
+    SEMAPHORE_TIMEOUT to archive=True, and task 3683 found the same grounding
+    holds for DISK_FULL — both are retry_kind=NONE infra-transient rows whose
+    bounded retry windows terminate in a blocking human escalation.
     """
 
     def test_disk_full_value_and_policy(self):
@@ -576,13 +606,13 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
         assert FailureCategory.DISK_FULL.value == 'disk_full'
         row = CATEGORY_POLICY[FailureCategory.DISK_FULL]
         assert row.is_infra_transient is True
-        assert row.archive is False
+        assert row.archive is True
         assert row.preexisting_probe is False
         assert row.retry_kind == RetryKind.NONE
 
     def test_semaphore_timeout_value_and_policy(self):
-        """archive=True since task 3679 — the one field where this row no
-        longer matches its DISK_FULL sibling (see the class docstring)."""
+        """archive=True since task 3679 — matched by its DISK_FULL sibling
+        since task 3683 (see the class docstring)."""
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
         assert FailureCategory.SEMAPHORE_TIMEOUT.value == 'semaphore_timeout'
         row = CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT]
@@ -606,10 +636,14 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
 
     Also pins the invariant that should survive a future policy edit: a
     category that is infra-transient but can still surface to a human must
-    not be in ``ARCHIVE_DENY_LIST``. Asserted for SEMAPHORE_TIMEOUT
-    specifically and deliberately NOT broadened to every infra-transient
-    category — DISK_FULL, PYTEST_INTERNALERROR and ENV_TRANSIENT keep their
-    current rows, which this task does not adjudicate.
+    not be in ``ARCHIVE_DENY_LIST``. Task 3679 asserted that for
+    SEMAPHORE_TIMEOUT specifically and deliberately did NOT broaden it,
+    leaving DISK_FULL, PYTEST_INTERNALERROR and ENV_TRANSIENT unadjudicated.
+    That scope caveat is SUPERSEDED: task 3683 audited all three, found every
+    one of them reaches a human by the same category-agnostic paths, flipped
+    them, and turned the invariant into the unconditional import-time rule
+    ``is_infra_transient`` ⇒ ``archive`` — see
+    TestAssertInfraTransientRowsArchive.
 
     RED today: the row is ``archive=False``, so all four assertions fail.
     """
@@ -634,6 +668,260 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
         mirrors TestShouldArchiveCategoryDelegatesToTable's style."""
         from orchestrator import verify
         assert verify._should_archive_category('semaphore_timeout') is True
+
+
+class TestDiskFullArchivesForHumanTriage:
+    """task 3683: DISK_FULL must archive its verify log.
+
+    Same grounding as its SEMAPHORE_TIMEOUT sibling above, reached through the
+    identical code path. DISK_FULL is ``retry_kind=NONE`` — no in-verify serial
+    re-run is attempted — and every consumer that retries it does so on FLAT
+    ``in INFRA_TRANSIENT_CATEGORIES`` set membership with no per-category
+    branch, so it cannot be structurally exempt from any of them:
+
+      * workflow.py:9020 retries any infra-transient VerifyResult for
+        ``config.verify_infra_retry_max_attempts`` (default 5) attempts. On
+        exhaustion workflow.py:9060-9067 stamps ``escalate_to_human=True`` /
+        ``category='infra_issue'``, which short-circuits the steward L0 at
+        workflow.py:14436 and files ``Escalation(severity='blocking', level=1,
+        suggested_action='manual_intervention')`` (:14791).
+      * merge_queue.py:3134 terminates post-merge verify with a
+        TRANSIENT_INFRA_REASON_PREFIX blocked outcome → workflow.py:10305 →
+        the same blocking L1.
+      * verify.py:7255's isolated-confirm gate consumes one of
+        ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` per infra-transient hit → a red-main
+        blocking L1 at harness.py:11325.
+
+    Archival is decided PER ATTEMPT from the category alone
+    (verify.py:1902), inside the retry loop, with no knowledge of whether this
+    is the exhausting attempt — so ``archive=False`` discards the log on the
+    attempt that hands the incident to a human too, leaving that human with
+    only a truncated ``failure_report()``.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:174), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.DISK_FULL].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.DISK_FULL not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('disk_full') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('disk_full') is True
+
+
+class TestPytestInternalerrorArchivesForHumanTriage:
+    """task 3683: PYTEST_INTERNALERROR must archive its verify log.
+
+    This class exists to REBUT the rationale previously pinned in
+    ``test_verify.py::TestShouldArchiveCategory`` — "The sweep already retries
+    on this category (returns None sentinel); archiving it would create
+    spurious human-triage artifacts for transient crashes." That is true of
+    exactly ONE arm: the FIRST-PASS main-tip sweep (verify.py:7062/:7141),
+    which returns a ``None`` sentinel, retries next tick indefinitely and never
+    escalates. It is the only fail-OPEN consumer, and it is an ADDITIONAL path,
+    not an exemption from the three that terminate in front of a human:
+
+      * workflow.py:9020 — retries any infra-transient VerifyResult for
+        ``config.verify_infra_retry_max_attempts`` (default 5) attempts, then
+        stamps ``escalate_to_human=True`` / ``category='infra_issue'``
+        (:9060-9067), which short-circuits the steward L0 at :14436 and files
+        ``Escalation(severity='blocking', level=1)`` at :14791.
+      * merge_queue.py:2761/:3134 — post-merge verify, bounded retry budget,
+        then a TRANSIENT_INFRA_REASON_PREFIX blocked outcome →
+        workflow.py:10305 → the same blocking L1.
+      * verify.py:7255 — the isolated-confirm gate, where an infra-transient
+        hit CONSUMES one of ``_SWEEP_CONFIRM_MAX_ATTEMPTS = 2``; two of them
+        convert the result into a blocking red-main L1 at harness.py:11325.
+
+    Each of those tests flat ``in INFRA_TRANSIENT_CATEGORIES`` membership with
+    no per-category branch, so PYTEST_INTERNALERROR cannot be structurally
+    exempt from any of them. "Spurious artifacts for transient crashes" is the
+    cost; a human holding a blocking infra_issue with nothing but a truncated
+    ``failure_report()`` is what archive=False bought instead. Archive growth
+    is bounded independently by ``_prune_archive``'s retention.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:237), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.PYTEST_INTERNALERROR].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.PYTEST_INTERNALERROR not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('pytest_internalerror') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('pytest_internalerror') is True
+
+
+class TestEnvTransientArchivesForHumanTriage:
+    """task 3683: ENV_TRANSIENT must archive its verify log.
+
+    ENV_TRANSIENT is the ONLY one of the three categories this task
+    adjudicates with a non-NONE ``retry_kind`` (``RetryKind.ENV_SERIAL``), so
+    it is the only one where "it self-clears before it reaches anyone" is even
+    arguable. It does not hold, for two independent reasons:
+
+      1. The ENV_SERIAL retry is a SINGLE bounded re-run — "retrying test
+         command once, forced serial" (verify.py:5221-5233). Once it is spent,
+         a still-ENV_TRANSIENT result surfaces exactly like a retry_kind=NONE
+         row.
+      2. Per task 3367 the gate is ``category == ENV_TRANSIENT and
+         attempt.test.cmd is not None and attempt.test.rc != 0``
+         (verify.py:5220-5223), so a LINT or TYPE leg classified ENV_TRANSIENT
+         gets ZERO retries and is "reported directly ... and infra-transient at
+         the merge lane". Since 3367 there are three ToolKind-INDEPENDENT
+         ENV_TRANSIENT producers (a broken ``_merge-verify`` worktree, restart
+         collateral, a mis-resolved pyright interpreter — esc-3359-1), so this
+         is a live path, not a corner case.
+
+    Past the retry it shares the family terminus: workflow.py:9020 retries it
+    on flat ``in INFRA_TRANSIENT_CATEGORIES`` membership for
+    ``config.verify_infra_retry_max_attempts`` (default 5) attempts and, on
+    exhaustion, stamps ``escalate_to_human=True`` / ``category='infra_issue'``
+    (:9060-9067) → blocking level-1 ``Escalation`` at :14791. Corroborated by
+    merge_queue.py:3134 → workflow.py:10305 and by verify.py:7255 →
+    harness.py:11325.
+
+    RED today: the row is ``archive=False`` (verify_categories.py:258), so all
+    four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.ENV_TRANSIENT].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.ENV_TRANSIENT not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('env_transient') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives."""
+        from orchestrator import verify
+        assert verify._should_archive_category('env_transient') is True
+
+
+class TestAssertInfraTransientRowsArchive:
+    """task 3683: ``is_infra_transient`` ⇒ ``archive``, enforced at import
+    time as a reusable, unit-testable guard.
+
+    The three classes above adjudicate three specific rows. This is the
+    durable part: the rule holds UNCONDITIONALLY, so it needs no
+    ``human_reachable`` field and no per-category branch. Every consumer that
+    retries an infra-transient result does so on flat ``in
+    INFRA_TRANSIENT_CATEGORIES`` set membership (workflow.py:9020,
+    merge_queue.py:2761, verify.py:7255), so no member can be structurally
+    exempt from any of them, and each of those windows is BOUNDED and
+    terminates in a blocking level-1 ``infra_issue`` escalation on exhaustion.
+    An infra-transient row that does not archive therefore discards the only
+    triage artifact its human gets beyond a truncated ``failure_report()``.
+
+    Modelled on ``_validate_exhaustive`` and ``_assert_sentinels_disjoint``:
+    the guard takes ``policy`` as a PARAMETER, so a synthetic table exercises
+    it directly instead of requiring a real import crash.
+
+    RED today: ``_assert_infra_transient_rows_archive`` does not exist yet.
+    """
+
+    def _row(self, *, archive: bool, is_infra_transient: bool):
+        """Build a row from the REAL CategoryPolicy dataclass.
+
+        All six fields are required (the dataclass has no defaults on
+        purpose), so a synthetic row cannot drift from the real row shape.
+        """
+        from orchestrator.verify_categories import CategoryPolicy, RetryKind
+        return CategoryPolicy(
+            severity_rank=0,
+            archive=archive,
+            preexisting_probe=False,
+            is_infra_transient=is_infra_transient,
+            verdict_indeterminate=False,
+            retry_kind=RetryKind.NONE,
+        )
+
+    def test_infra_transient_row_without_archive_raises_and_names_it(self):
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_infra_transient_rows_archive
+
+        class _Synth(StrEnum):
+            BAD = 'synthetic_bad_row'
+            GOOD = 'synthetic_good_row'
+
+        policy = {
+            _Synth.BAD: self._row(archive=False, is_infra_transient=True),
+            _Synth.GOOD: self._row(archive=True, is_infra_transient=True),
+        }
+        # Naming the offender matters: a future author hitting this at import
+        # time must learn WHICH row to fix, not just that something is wrong.
+        with pytest.raises(AssertionError, match='synthetic_bad_row'):
+            _assert_infra_transient_rows_archive(policy)
+
+    def test_ordinary_archive_false_rows_do_not_trip_the_guard(self):
+        """The guard must not over-fire on non-infra archive=False rows —
+        compile_error/test_failure/passed are legitimately not archived."""
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_infra_transient_rows_archive
+
+        class _Synth(StrEnum):
+            INFRA = 'synthetic_infra_row'
+            CODE_FAULT = 'synthetic_code_fault_row'
+
+        policy = {
+            _Synth.INFRA: self._row(archive=True, is_infra_transient=True),
+            _Synth.CODE_FAULT: self._row(archive=False, is_infra_transient=False),
+        }
+        _assert_infra_transient_rows_archive(policy)
+
+    def test_real_module_import_satisfies_its_own_guard(self):
+        # Importing the real module must succeed — its shipped table already
+        # satisfies the guard (this is it firing at import time).
+        import orchestrator.verify_categories as vc
+
+        vc._assert_infra_transient_rows_archive(vc.CATEGORY_POLICY)
+
+    def test_no_infra_transient_category_is_archive_denied(self):
+        """The human-legible form of the same invariant, asserted against the
+        DERIVED registries rather than the rows — after task 3683 the two sets
+        are disjoint, and the guard is what keeps them that way."""
+        from orchestrator.verify_categories import (
+            ARCHIVE_DENY_LIST,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+        assert frozenset() == INFRA_TRANSIENT_CATEGORIES & ARCHIVE_DENY_LIST
 
 
 class TestEnvironmentalCategoriesOutrankCodeFaults:
