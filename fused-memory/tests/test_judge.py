@@ -738,10 +738,12 @@ class TestIsPhantomVerdict:
     Judge._parse_verdict's except-block fallback when the judge output
     could not be parsed), as opposed to a genuine judge finding.
 
-    This step covers only the structured-marker branch
-    (``code == 'unparseable_judge_response'``, the shape written for every
-    run after task 2947 landed). The legacy unmarked shape (pre-2947 rows)
-    is added by a later step.
+    Two shapes must be recognised: the structured-marker shape
+    (``code == 'unparseable_judge_response'``, written for every run after
+    task 2947 landed) and the legacy unmarked shape (pre-2947 rows, which
+    carry no ``code`` key at all — identified instead by severity=serious +
+    exactly one finding + an ``issue`` starting with the fixed parse-failure
+    prefix).
     """
 
     def test_marked_unparseable_finding_is_phantom(self):
@@ -800,6 +802,118 @@ class TestIsPhantomVerdict:
             reviewed_at=datetime.now(UTC),
             severity=VerdictSeverity.ok,
             findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_unmarked_shape_e87d8e4a_is_phantom(self):
+        """Real e87d8e4a (2026-07-20) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='e87d8e4a',
+            reviewed_at=datetime(2026, 7, 20, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+                'recommendation': (
+                    'This verdict was not a real review — the judge output was '
+                    'unparseable. Investigate the judge LLM/CLI output before '
+                    'trusting subsequent verdicts.'
+                ),
+            }],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_unmarked_shape_09d14a75_is_phantom(self):
+        """Real 09d14a75 (2026-07-22) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='09d14a75',
+            reviewed_at=datetime(2026, 7, 22, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+                'recommendation': (
+                    'This verdict was not a real review — the judge output was '
+                    'unparseable. Investigate the judge LLM/CLI output before '
+                    'trusting subsequent verdicts.'
+                ),
+            }],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_shape_with_moderate_severity_is_not_phantom(self):
+        """The fabrication path only ever emits severity=serious — a
+        moderate verdict carrying the same single finding must not match,
+        or the filter could start dropping genuine moderate evidence."""
+        verdict = JudgeVerdict(
+            run_id='run-moderate-lookalike',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.moderate,
+            findings=[{
+                'issue': (
+                    'Judge response could not be parsed: Expecting value: '
+                    'line 1 column 1 (char 0)'
+                ),
+                'severity': 'serious',
+                'recommendation': (
+                    'This verdict was not a real review — the judge output was '
+                    'unparseable. Investigate the judge LLM/CLI output before '
+                    'trusting subsequent verdicts.'
+                ),
+            }],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_with_two_findings_is_not_phantom(self):
+        """Two findings, only one of which carries the parse-failure issue
+        text, must not match — the single-finding conjunct is what
+        separates this from the genuine five-finding bc9459b8 row."""
+        verdict = JudgeVerdict(
+            run_id='run-two-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': (
+                        'Judge response could not be parsed: Expecting value: '
+                        'line 1 column 1 (char 0)'
+                    ),
+                    'severity': 'serious',
+                    'recommendation': 'This verdict was not a real review …',
+                },
+                {
+                    'issue': 'A second, genuine content finding',
+                    'severity': 'serious',
+                    'recommendation': 'Fix the second issue',
+                },
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_unrelated_prose_mentioning_parsing_is_not_phantom(self):
+        """A single serious finding whose issue text merely mentions parsing
+        somewhere in unrelated prose — but does not START WITH the
+        parse-failure prefix — must not match. Pins that the check is a
+        startswith, not a substring containment test."""
+        verdict = JudgeVerdict(
+            run_id='run-unrelated-prose',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Note: the historical "Judge response could not be parsed" '
+                    'error seen in an earlier run was traced to a logging '
+                    'artifact, not a genuine content problem.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'No action needed — logging bug, already fixed',
+            }],
         )
         assert is_phantom_verdict(verdict) is False
 
