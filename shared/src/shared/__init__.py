@@ -139,6 +139,28 @@ _SYMBOL_MODULE: dict[str, str] = {
 }
 
 
+#: Submodules reachable as package attributes (`import shared; shared.locking`).
+#: A behaviour-PRESERVATION set, not a wish list: it is precisely the set the
+#: pre-lazy eager block bound, so `shared.usage_gate` keeps working while
+#: `shared.psi` keeps raising AttributeError exactly as it did before. An
+#: unrestricted fallback would silently widen the public surface; an empty one
+#: would silently narrow it. Widening it later must be an explicit edit.
+_LAZY_SUBMODULES: frozenset[str] = frozenset(
+    {
+        'agent_result',
+        'async_sqlite_base',
+        'cli_invoke',
+        'config_models',
+        'cost_store',
+        'locking',
+        'mcp_idempotency',
+        'safe_io',
+        'sqlite_sync_base',
+        'usage_gate',
+    }
+)
+
+
 def __getattr__(name: str) -> object:
     """PEP 562 lazy attribute access — import the owning submodule on demand.
 
@@ -147,9 +169,21 @@ def __getattr__(name: str) -> object:
     and a typo'd `from shared import ...`, expect to see.
     """
     module_name = _SYMBOL_MODULE.get(name)
-    if module_name is None:
+    if module_name is not None:
+        value = getattr(importlib.import_module(f'shared.{module_name}'), name)
+    elif name in _LAZY_SUBMODULES:
+        value = importlib.import_module(f'shared.{name}')
+    else:
         raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
-    return getattr(importlib.import_module(f'shared.{module_name}'), name)
+    # Cache into the module dict so subsequent lookups bypass __getattr__
+    # entirely, rather than paying an importlib lookup per access.
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Report the whole public surface, not merely what has been resolved yet."""
+    return sorted({*globals(), *_SYMBOL_MODULE, *_LAZY_SUBMODULES})
 
 
 # Static list literal, deliberately NOT derived from _SYMBOL_MODULE: ruff needs
