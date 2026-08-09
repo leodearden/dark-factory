@@ -3541,6 +3541,8 @@ class TestMarkBlockedStewardOutcomeRouting:
         """
         from escalation.pins import PinClass, classify_pins
         from escalation.server import create_server
+        from fastmcp.tools.function_tool import FunctionTool
+
         from orchestrator.workflow import _is_gating_escalation
 
         workflow, scheduler, queue = await self._build(
@@ -3549,8 +3551,12 @@ class TestMarkBlockedStewardOutcomeRouting:
         task_id = task_assignment.task_id
 
         # The steward re-escalates through the real MCP tool, as it would.
+        # ``get_tool`` is typed ``Tool | None`` and the base ``Tool`` declares
+        # no ``.fn``, so narrow to ``FunctionTool`` before the standard
+        # ``tool.fn`` unit-test call (test_merge_queue.py:11854's convention).
         server = create_server(queue)
         blocker = await server.get_tool('escalate_blocker')
+        assert isinstance(blocker, FunctionTool)
         filed = await blocker.fn(
             task_id=task_id,
             agent_role='steward',

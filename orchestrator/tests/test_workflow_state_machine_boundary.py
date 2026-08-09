@@ -1017,7 +1017,15 @@ class TestStewardOutcomeRouting:
         for ANY kwargs, which would make a level-scoped assertion vacuous.
         """
 
-        def _stub(task_id, status=None, level=None, **kwargs):
+        def _stub(
+            task_id: str,
+            status: str | None = None,
+            level: int | None = None,
+            **kwargs: Any,
+        ) -> list:
+            if level is None:
+                # The real method's level-less query spans every level.
+                return [esc for recs in by_level.values() for esc in recs]
             return list(by_level.get(level, []))
 
         return _stub
