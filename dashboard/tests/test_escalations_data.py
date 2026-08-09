@@ -1307,8 +1307,10 @@ class TestFetchPinsRecovery:
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_pins_recovery(client, _pins_urls(8100))
 
-        assert result['proj8100'] == {'esc-new': ['3543']}
-        assert 'esc-old' not in result['proj8100']
+        annotated = result['proj8100']
+        assert annotated is not None  # a successful read, not the UNKNOWN state
+        assert annotated == {'esc-new': ['3543']}
+        assert 'esc-old' not in annotated
 
     async def test_non_list_annotation_is_omitted(self):
         """A malformed `pins_recovery` (not a list) is dropped, not coerced."""

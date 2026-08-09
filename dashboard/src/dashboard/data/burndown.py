@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -145,7 +145,7 @@ def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
     return counts
 
 
-def _count_zones(tasks: list[Mapping[str, Any]], now: datetime) -> dict[str, int]:
+def _count_zones(tasks: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, int]:
     """Count shaped task rows by display zone, splitting ``in_progress``.
 
     Returns the six :data:`_ZONE_KEYS` counts plus :data:`_SPLIT_KEYS`
