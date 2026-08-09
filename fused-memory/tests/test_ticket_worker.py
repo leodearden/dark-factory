@@ -498,7 +498,7 @@ async def test_worker_curator_failure_degrades_to_create(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await asyncio.sleep(0.2)
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # tm.add_task MUST have been called (fallback to create)
     taskmaster.add_task.assert_called_once()
@@ -565,8 +565,13 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # Let the worker drain
-        await asyncio.sleep(0.2)
+        # Let the worker drain. The negative task_created assertion below
+        # is safe against this barrier even though _journal runs *after*
+        # the terminal write: on the failure path the emission is guarded
+        # by `status == 'created'` (task_interceptor.py:3806 / 4184), so no
+        # event is ever built for a 'failed' ticket. There is no window in
+        # which the event exists but has not yet been journalled.
+        await _poll_ticket_resolved(ticket_store, ticket_id, what='the failing ticket')
 
     # Ticket must be terminal with status='failed'
     row = await ticket_store.get(ticket_id)
