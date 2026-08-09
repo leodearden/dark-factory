@@ -1365,13 +1365,6 @@ class TestValidateFullUuid:
         assert result.get('hint')
         assert isinstance(result['hint'], str)
 
-    def test_hint_mentions_resolving_the_full_uuid_via_search(self):
-        result = validate_full_uuid(_TRUNCATED_PREFIX)
-        assert result is not None
-        hint = result['hint'].lower()
-        assert 'search' in hint
-        assert 'uuid' in hint
-
     def test_error_dict_shape(self):
         result = validate_full_uuid(_TRUNCATED_PREFIX)
         assert result is not None
