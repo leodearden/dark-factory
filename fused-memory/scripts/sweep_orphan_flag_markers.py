@@ -140,6 +140,20 @@ from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_i
 MARKER_SOURCE: str = 'stage1_flag_marker'
 MARKER_KIND: str = 'stage1_flag_marker'
 
+# The ADJACENT population this script censuses but never deletes (task 3897).
+# Deliberately mirrors ``task_knowledge_sync._FLAG_FOR_STAGE2_ENUM_FILTERS``
+# by value rather than importing it, for the same reason already recorded for
+# the local ``_assume_utc`` copy below: this script's pure predicates stay
+# decoupled from the heavier reconciliation-stage module.
+#
+# The boolean ``True`` is load-bearing. Qdrant payload filters are
+# type-sensitive: the string variant ``{'flag_for_stage2': 'true'}`` matches 0
+# records against live dark_factory (the same drift
+# ``task_knowledge_sync._FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS`` exists to
+# detect). A str/bool slip here would silently reintroduce the very
+# zero-matching blind spot the cross-check exists to detect.
+FLAG_FOR_STAGE2_FILTERS: dict = {'flag_for_stage2': True}
+
 logger = logging.getLogger('sweep_orphan_flag_markers')
 
 
@@ -226,6 +240,48 @@ def classify_marker_task_id(tid: Any) -> str:
     if len(components) >= 2 and all(part.strip().isdigit() for part in components):
         return 'comma_joined'
     return 'null_or_invalid'
+
+
+def enumeration_blind_spot(enumerated_count: int, adjacent_count: int) -> bool:
+    """Did this sweep's enumeration filter fail to see a population that exists?
+
+    Distinguishes the two very different situations that both render as
+    ``0 swept``:
+
+    - "swept nothing because there was nothing" — a true no-op, the healthy
+      steady state, reported as ``False``;
+    - "swept nothing because the enumeration filter cannot see the
+      population" — a BLIND SPOT, reported as ``True``.
+
+    Task 3897 exists because this script cannot currently tell them apart.
+    It enumerates on ``{'source': MARKER_SOURCE}``, which matches 0 records
+    in both ``dark_factory`` and ``reify`` (measured 2026-08-09), while the
+    adjacent ``FLAG_FOR_STAGE2_FILTERS`` relay pool holds 61 and 80 records
+    respectively. Because ``before.total_source`` is therefore always 0,
+    :func:`backlog_verdict` holds unconditionally and forever — a
+    ``task_kind='deterministic'`` gate that structurally cannot fail — and
+    the nightly timer prints ``orphan_count: 0`` as a clean bill of health
+    issued against a pool it never looked at.
+
+    An adjacent population merely being non-empty is NOT a blind spot: the
+    two pools are distinct, and both being non-empty is normal. Only the
+    combination "I saw nothing" + "something is there" is diagnostic.
+
+    Pure, sync, no I/O.
+
+    Args:
+        enumerated_count: What this script's own enumeration filter matched
+            (``before.total_source``).
+        adjacent_count: What the adjacent ``FLAG_FOR_STAGE2_FILTERS`` census
+            probe matched. Callers must pass a real observed int — never a
+            placeholder for an unknown/failed probe, since an unobserved
+            population must never be asserted as a blind spot (see
+            :func:`run`'s ``probe_failed`` handling).
+
+    Returns:
+        ``True`` iff ``enumerated_count == 0 and adjacent_count > 0``.
+    """
+    return enumerated_count == 0 and adjacent_count > 0
 
 
 def _assume_utc(dt: datetime) -> datetime:
