@@ -2201,9 +2201,24 @@ class TestGate2TaskKindForwardingIsBehaviorPreserving:
         """SCOPE PIN — rules 2 and 3 are blocked-only, so an ordinary
         in-progress task under the bare lock is still protected from a
         recon-stage status write. The plumbing does not make the lock
-        universally ignorable."""
+        universally ignorable.
+
+        The task carries a FRESH claimant heartbeat (task 2964). Before that
+        task, this fixture had no claimant at all and the rejection rested on
+        the bare lock alone; that shape is now exactly what the in-progress
+        corroboration gate downgrades — an uncorroborated in-progress task is
+        the killed-by-fleet-redeploy case, and Gate 2 must agree with the
+        renderer and let the write through. A genuinely dispatched in-progress
+        task always has a claimant_run_id and a heartbeat the orchestrator
+        keeps fresh, so this is the realistic shape for what the pin is
+        actually about: that task_kind rules 2/3 do not reach a non-blocked
+        task. The uncorroborated counterpart is pinned by
+        TestGate2CorroborationInterceptorPlumbing.
+        """
         taskmaster.get_task = AsyncMock(return_value={
             'id': '999', 'status': 'in-progress', 'title': 'T',
+            'claimant_run_id': 'run-999',
+            'heartbeat_at': _heartbeat(_FRESH_HEARTBEAT),
             'metadata': {'task_kind': 'normal'},
         })
         self._force_orchestrator_live(monkeypatch)
