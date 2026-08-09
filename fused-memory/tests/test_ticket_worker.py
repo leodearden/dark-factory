@@ -1059,7 +1059,17 @@ async def test_worker_post_create_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        await asyncio.sleep(0.2)
+        await _poll_ticket_resolved(ticket_store, ticket_id)
+        # The ticket is terminalised *before* the worker journals the
+        # task_created event, so close that narrow window with a short
+        # second bounded poll on the emission itself — a genuine
+        # regression (event never emitted) still fails fast, in ~2s
+        # rather than the full 10s.
+        await poll_until(
+            lambda: journal_calls,
+            timeout=2.0,
+            message='ticket resolved but no journal event was emitted',
+        )
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
