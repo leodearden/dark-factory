@@ -11,9 +11,11 @@ import contextlib
 import json
 import logging
 import random
+import re
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
@@ -61,24 +63,121 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
 #
+# REINSTATEMENT NOW TAKES TWO EDITS, NOT ONE (task 3586). Re-adding names here
+# is no longer sufficient, because _classify_failure checks its payload-derived
+# permanent rule BEFORE the transient one: a self-referential not-found dies at
+# attempt 1 whatever this set says. That rule could itself mis-fire under the
+# very topology that would justify reinstatement — attempt 1 creates the
+# episodic node and then fails downstream; attempt 2's by-uuid lookup
+# (routing_='r') lands on a lagging follower and raises NodeNotFoundError naming
+# the item's OWN uuid, which is genuinely transient but reads as the permanent
+# proof. Disabling it means passing identity_payload_keys={} to
+# DurableWriteQueue, and that is a CODE CHANGE today, not a config edit: the
+# kwarg is deliberately not a QueueConfig field (see
+# DEFAULT_IDENTITY_PAYLOAD_KEYS below) and MemoryService's construction site
+# (memory_service.py:1190) does not pass it. Whoever reinstates the budget must
+# wire that kwarg through in the same change, or the reinstatement is a no-op
+# for exactly the failures it was meant to cover.
+#
 # ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
 # above argues the stronger claim. Dropping these names only returns them to
 # the plain max_attempts (5) ceiling, so a permanently-unsatisfiable write
 # still spends five backend round-trips plus exponential backoff proving what
-# attempt 1 already showed. Making it terminal on the first attempt is task
-# 3586 (payload-aware classifier: _handle_failure already holds the whole
-# QueueItem and passes none of it to _is_transient, and the 'dead' outcome
-# plus the on_terminal hook below are the machinery it would reuse). If
-# 3586's payload discrimination proves too fine-grained, a blunter terminal
-# counterpart to this set — matched the same way, checked first — is the
-# cheaper fallback. Either shape is 3586's call; 3585 deliberately changed
-# only WHICH errors get the extended budget.
+# attempt 1 already showed. 3585 deliberately changed only WHICH errors get
+# the extended budget.
+#
+# MAKING IT TERMINAL ON ATTEMPT 1 LANDED SEPARATELY, as task 3586: see
+# _classify_failure below, which took the payload-aware route rather than the
+# blunter "terminal error names" counterpart 3585 offered as a fallback. It
+# does NOT act on this set or on any name list — it fires only when the
+# not-found names the very uuid the operation exists to create, a proof derived
+# from the item's own payload. So the two mechanisms stay independent: editing
+# the names here cannot switch the permanent rule on or off, and 3586's rule is
+# checked FIRST precisely so re-adding a name here cannot hand a
+# provably-doomed write the extended budget back.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
     'ConnectionResetError',
     'ServerDisconnectedError',
     'OperationalError',
+})
+
+# graphiti_core's not-found message format, pinned to 0.28.2:
+#   errors.py:54-59  NodeNotFoundError(uuid) -> f'node {uuid} not found'
+#   errors.py:22-27  EdgeNotFoundError(uuid) -> f'edge {uuid} not found'
+#
+# The uuid is recovered by PARSING because those exceptions expose no .uuid
+# attribute, no group_id and no node label — the message is the only carrier.
+# This module deliberately does not import graphiti_core (the same independence
+# rationale as DEFAULT_TRANSIENT_ERROR_NAMES' name-based matching above), so the
+# format is encoded here as a regex and pinned against the real class in
+# tests/test_durable_queue_selfref_classifier.py, which builds its expectation
+# from str(NodeNotFoundError(u)) rather than a copied literal.
+#
+# FAIL-OPEN INVARIANT. The pattern is fully anchored, so any message that is not
+# EXACTLY this shape returns None, which routes the caller back to the ordinary
+# retry policy. An upstream reword therefore degrades to today's retry
+# behaviour and NEVER to permanent failure — the asymmetry that matters, since a
+# missed permanent failure costs a few extra retries while a false one discards
+# a write. fused-memory's own unrelated NodeNotFoundError
+# (backends/graphiti_client.py:219) is a live instance of this: none of its
+# messages match, so all of them fail open.
+#
+# ANCHORED WITH \Z, NOT $. Python's $ also matches immediately before a single
+# trailing newline, so 'node <uuid> not found\n' would match and be read as
+# PROOF of permanent failure — the fail-CLOSED direction the invariant above
+# forbids. \Z matches only at the true end of the string. graphiti_core's
+# f-strings emit no trailing newline today, so this costs nothing and closes the
+# one hole in the "fully anchored" claim rather than leaving it merely asserted.
+_NOT_FOUND_MESSAGE_RE = re.compile(r'^(?:node|edge) (\S+) not found\Z')
+
+
+def _parse_not_found_uuid(message: str) -> str | None:
+    """Return the uuid named by a graphiti_core not-found message, else None.
+
+    None means "this is not a message I recognise" — the caller must fall back
+    to its ordinary policy rather than draw any conclusion from the absence.
+    """
+    match = _NOT_FOUND_MESSAGE_RE.match(message)
+    return match.group(1) if match else None
+
+
+# operation -> the payload key holding THE UUID THAT OPERATION CREATES.
+#
+# Deliberately NOT "any uuid appearing in the payload". A payload may
+# legitimately REFERENCE other nodes' uuids, and a not-found naming one of those
+# is genuinely retryable: the node may live in a different graph (for FalkorDB
+# the group_id IS the database, and graphiti's by-uuid lookup Cypher carries no
+# group_id predicate), or a concurrent write creating it may still be in flight.
+# Those keep their full retry budget. Only the uuid this operation exists to
+# CREATE licenses the conclusion that retrying cannot possibly help.
+#
+# Verified vocabulary (the queue has exactly four operation strings, dispatched
+# by MemoryService._execute_durable_write at memory_service.py:1402-1410):
+#   add_episode           — 'uuid' is minted by the producer as its OWN fresh
+#                           identity (memory_service.py:2516), stamped onto the
+#                           payload (:2534) and forwarded to the backend
+#                           (:2248). The self-referential case.
+#   add_memory_graphiti   — no 'uuid' key at all.
+#   mem0_classify_and_add — no uuid key.
+#   mem0_add              — legacy, no live producer.
+# ('_write_op_id' / '_causation_id' are write-journal ids, not graph uuids.)
+#
+# COUPLING TO TASK 3561, which is in flight and changes exactly this key: its
+# fix stops handing graphiti a caller-minted uuid (passing None so the library
+# takes its CREATE branch rather than its LOAD branch). If it lands and the key
+# disappears, this rule simply falls open and every add_episode failure returns
+# to the ordinary policy — which is correct. This classifier is the generic
+# safety net for the NEXT operation that references its own not-yet-created
+# uuid, not a fix for that one instance.
+#
+# Not a QueueConfig field: the config surface exists for operator tuning,
+# whereas this is a fact about the payload vocabulary that an operator has no
+# basis to retune. It is overridable via the constructor only — the test seam,
+# and the property that keeps this a generic component.
+DEFAULT_IDENTITY_PAYLOAD_KEYS: Mapping[str, str] = MappingProxyType({
+    'add_episode': 'uuid',
 })
 
 # -- Schema ------------------------------------------------------------------
@@ -165,6 +264,7 @@ class DurableWriteQueue:
         write_timeout_seconds: float = 120.0,
         transient_max_attempts: int | None = None,
         transient_error_names: Iterable[str] | None = None,
+        identity_payload_keys: Mapping[str, str] | None = None,
         on_terminal: TerminalHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
@@ -182,6 +282,12 @@ class DurableWriteQueue:
         self._transient_error_names = (
             frozenset(transient_error_names) if transient_error_names is not None
             else DEFAULT_TRANSIENT_ERROR_NAMES
+        )
+        # An explicit map REPLACES the default rather than extending it, so a
+        # caller can express "no operation has a self-identity" as {}.
+        self._identity_payload_keys: Mapping[str, str] = (
+            dict(identity_payload_keys) if identity_payload_keys is not None
+            else DEFAULT_IDENTITY_PAYLOAD_KEYS
         )
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
@@ -463,6 +569,68 @@ class DurableWriteQueue:
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
 
+    def _identity_uuid(self, item: QueueItem) -> str | None:
+        """The uuid *item*'s operation exists to CREATE, or None if it has none.
+
+        Fails open at every step — an unmapped operation, an unparseable or
+        non-dict payload, or a missing/None/non-str/empty value all yield None,
+        which returns the caller to its ordinary retry policy. None means "no
+        identity could be established", never "no identity exists".
+        """
+        key = self._identity_payload_keys.get(item.operation)
+        if key is None:
+            return None
+        try:
+            payload = item.parsed_payload()
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[str, int]:
+        """Classify *exc* for *item* and return (classification, attempts_limit).
+
+        The three outcomes:
+
+        * ``('permanent', 1)`` — a not-found naming THIS item's own identity
+          uuid. When the missing node is the node this operation exists to
+          create, no number of retries can succeed; that is derived from local
+          state, not guessed from an error type. A limit of 1 (rather than a
+          separate boolean) keeps ``died = new_attempts >= limit`` a single
+          uniform expression at the call site, and also correctly re-kills an
+          item arriving with ``attempts > 0``. That case is produced by
+          ``_recover_in_flight``: crash recovery flips ``in_flight`` back to
+          ``pending`` while PRESERVING the attempt count. (``replay_dead`` is
+          not that path — it explicitly zeroes ``attempts``. What it does supply
+          is re-execution of the identical poison payload, which is how the
+          esc-3561-3 item accumulated 55 attempts across successive replays:
+          five per replay, from a counter reset each time.)
+        * ``('transient', transient_max_attempts)`` — the existing name-based
+          policy, unchanged.
+        * ``('normal', item.max_attempts)`` — everything else, today's default.
+
+        PERMANENT IS CHECKED FIRST, DELIBERATELY. ``transient_error_names`` is
+        operator-tunable and task 3585 removed the not-found family only from
+        the DEFAULT set — config validation still permits an operator to add
+        names back. Were transient checked first, re-adding 'NodeNotFoundError'
+        would hand a provably-doomed self-referential write the extended budget,
+        resurrecting the very loop this classifier exists to kill. A proof
+        derived from the payload outranks a guess about a class name.
+
+        Both gates fail open independently: an unrecognised message shape and an
+        unresolvable identity each fall through to the ordinary policy.
+        """
+        identity = self._identity_uuid(item)
+        if identity is not None and _parse_not_found_uuid(str(exc)) == identity:
+            return ('permanent', 1)
+        if self._is_transient(exc):
+            return ('transient', self._transient_max_attempts)
+        return ('normal', item.max_attempts)
+
     async def _handle_failure(
         self, item: QueueItem, exc: Exception
     ) -> tuple[str, str | None] | None:
@@ -475,7 +643,7 @@ class DurableWriteQueue:
         assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
-        limit = self._transient_max_attempts if self._is_transient(exc) else item.max_attempts
+        classification, limit = self._classify_failure(item, exc)
         died = new_attempts >= limit
         if died:
             await self._db.execute(
@@ -483,9 +651,16 @@ class DurableWriteQueue:
                 "WHERE id = ?",
                 (new_attempts, error_msg, item.id),
             )
+            # operation / group_id / classification are what a triager needs
+            # first, and the log line is all that survives once the queue row is
+            # deleted — after that, get_dead_items can no longer supply them.
+            # The classification separates "doomed from attempt 1" from
+            # "exhausted its budget", which the attempt count alone cannot when
+            # max_attempts is 1.
             logger.warning(
-                'Item %d dead-lettered after %d attempts: %s',
-                item.id, new_attempts, error_msg,
+                'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
+                item.id, item.operation, item.group_id, new_attempts,
+                classification, error_msg,
             )
         else:
             delay = min(
@@ -499,9 +674,13 @@ class DurableWriteQueue:
                 "next_retry_at = ?, error = ? WHERE id = ?",
                 (new_attempts, next_retry, error_msg, item.id),
             )
+            # Kept symmetrical with the dead-letter line above so a retry storm
+            # is attributable to an operation and a project without a second
+            # lookup.
             logger.info(
-                'Item %d retry %d/%d in %.1fs: %s',
-                item.id, new_attempts, limit, delay, error_msg,
+                'Item %d (%s, group_id=%s) retry %d/%d in %.1fs [%s]: %s',
+                item.id, item.operation, item.group_id, new_attempts, limit,
+                delay, classification, error_msg,
             )
         await self._db.commit()
         return ('dead', error_msg) if died else None
