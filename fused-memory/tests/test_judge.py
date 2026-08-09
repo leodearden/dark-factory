@@ -1137,6 +1137,92 @@ async def test_error_trend_phantom_serious_alone_does_not_halt(mock_journal):
 
 
 @pytest.mark.asyncio
+async def test_error_trend_phantom_does_not_complete_consecutive_streak(mock_journal):
+    """A trailing phantom serious verdict must not hold the
+    consecutive-most-recent streak gate open. Once the phantom is excluded
+    from the evidence entirely, the true newest three verdicts are
+    moderate, moderate, ok — the ok breaks the streak.
+
+    The genuine (non-phantom) non-ok count is 6 (>= halt_trend_moderate_count
+    =5), so the count gate alone is met honestly here — this test isolates
+    the streak gate. Fails after step-6: that fix only reaches the count
+    gate (non_ok_in_window); the streak gate still reads the phantom's raw
+    severity='serious' off the unfiltered ``windowed`` list and treats it as
+    real non-ok evidence, incorrectly keeping the streak open.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    phantom_finding = {
+        'issue': 'Judge response could not be parsed: boom',
+        'severity': 'serious',
+        'code': 'unparseable_judge_response',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+    # oldest -> newest: moderate x4, ok, moderate x2, phantom-serious
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'moderate', 'moderate', 'ok', 'moderate',
+         'moderate', 'serious'],
+        findings_by_index={7: [phantom_finding]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_minor_still_breaks_streak(mock_journal):
+    """Regression guard: a phantom-SHAPED verdict whose severity is 'minor'
+    must still break the consecutive-most-recent streak, exactly like any
+    other minor verdict.
+
+    The phantom-verdict exclusion is scoped to non-ok severities only (see
+    the design rationale in _check_error_trends) — it must never remove a
+    minor/ok verdict from the ordering, or a streak could close over it and
+    make halts MORE likely, a fail-open change outside this task's ask.
+    Expected green both before and after the phantom-exclusion fix.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Looks phantom-shaped (single finding, parse-failure issue prefix) but
+    # is severity='minor' — is_phantom_verdict's legacy branch requires
+    # severity=serious, so this does not even classify as phantom; and even
+    # if it did, 'minor' is not a _NON_OK_SEVERITIES member and must stay in
+    # the ordering either way.
+    phantom_shaped_minor_finding = {
+        'issue': (
+            'Judge response could not be parsed: Expecting value: '
+            'line 1 column 1 (char 0)'
+        ),
+        'severity': 'minor',
+        'recommendation': 'Manual review recommended',
+    }
+    verdicts = _make_verdicts(
+        ['moderate'] * 7 + ['minor'],
+        findings_by_index={7: [phantom_shaped_minor_finding]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
 async def test_grace_cycles_suppress_trend_check(mock_journal):
     """After unhalt seeds grace, trend check is skipped until grace is consumed."""
     config = _make_judge_config(
