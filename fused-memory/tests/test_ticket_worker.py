@@ -212,23 +212,8 @@ async def test_worker_processes_create_decision(
         )
         ticket_id = result['ticket']
 
-        async def _ticket_resolved() -> bool:
-            row = await ticket_store.get(ticket_id)
-            return row is not None and row['status'] != 'pending'
-
-        # Bounded poll for the worker to resolve the ticket rather than a
-        # fixed sleep, which flakes under `-n auto` CPU oversubscription when
-        # the worker is scheduled late (observed: status still 'pending').
-        # Same cause and same fix as the oversize-ticket test below.  Waiting
-        # on 'pending' clearing rather than on 'created' directly keeps a
-        # genuine regression loud: a ticket resolved to 'failed' leaves the
-        # poll immediately and trips the status assertion below with the real
-        # status, instead of burning the whole timeout first.
-        await poll_until(
-            _ticket_resolved,
-            timeout=10.0,
-            message='worker did not resolve the create-decision ticket',
-        )
+        # Let the worker drain the queue
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
@@ -287,7 +272,7 @@ async def test_worker_processes_drop_decision(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await asyncio.sleep(0.1)
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # tm.add_task must NOT have been called
     taskmaster.add_task.assert_not_called()
