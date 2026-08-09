@@ -7241,10 +7241,18 @@ class _RerunOutcome(StrEnum):
     needs the distinction to map an infra-sentinel re-run to
     ``FlakeVerdict.unconfirmable`` rather than mislabelling it as a real red.
 
-    PRECEDENCE, when attempts disagree: ``passed`` (a pass anywhere is proof the
-    group can run green) > ``failed`` (a genuine red observed anywhere is real
-    evidence) > ``unconfirmable`` (we never actually got a verdict). So
-    ``unconfirmable`` means EVERY attempt was uninformative, never "some were".
+    PRECEDENCE WITHIN ONE GROUP, when that group's attempts disagree:
+    ``passed`` (a pass anywhere is proof the group can run green) > ``failed``
+    (a genuine red observed anywhere is real evidence) > ``unconfirmable`` (we
+    never actually got a verdict). So a group's ``unconfirmable`` means EVERY
+    attempt on THAT group was uninformative, never "some were".
+
+    ACROSS GROUPS, ``confirm_isolated_rerun_verdict`` applies the same relative
+    order to the two non-pass outcomes — a ``failed`` group outranks an
+    ``unconfirmable`` one, which is why an unconfirmable group does NOT
+    short-circuit the groups still to run — with ONE deliberate difference:
+    ``passed`` is conjunctive there rather than disjunctive. Every group must
+    confirm green, so one group's pass never rescues another group's red.
     """
 
     passed = 'passed'  # some attempt ran and PASSED — a confirmed flake for this group
@@ -7295,10 +7303,9 @@ async def _run_isolated_confirm_group_observation(
     ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*, preserving WHAT
     was observed.
 
-    The source of truth for this family; ``_run_isolated_confirm_group_outcome``
-    and ``_run_isolated_confirm_group`` are progressively lossier shims over it,
-    each kept because it has real callers that must not observe the others'
-    detail. This is also the ``main_probe`` call-site engine
+    The source of truth for this family; ``_run_isolated_confirm_group`` is the
+    one lossier shim over it, kept only because its single legacy caller wants
+    a bool. This is also the ``main_probe`` call-site engine
     (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY to name an
     ``infra_transient_rerun:<category>`` reason.
 
@@ -7353,24 +7360,6 @@ async def _run_isolated_confirm_group_observation(
     )
 
 
-async def _run_isolated_confirm_group_outcome(
-    worktree: Path,
-    config: 'OrchestratorConfig',
-    module_config: ModuleConfig,
-) -> _RerunOutcome:
-    """Which of the three outcomes the bounded isolated re-run observed.
-
-    A shim over ``_run_isolated_confirm_group_observation`` that drops the
-    observed category/passed detail — kept as its own name because the outcome
-    alone is what ``_run_isolated_confirm_group``'s bool is derived from and
-    what the outcome-level tests pin. Never raises.
-    """
-    observation = await _run_isolated_confirm_group_observation(
-        worktree, config, module_config,
-    )
-    return observation.outcome
-
-
 async def _run_isolated_confirm_group(
     worktree: Path,
     config: 'OrchestratorConfig',
@@ -7388,14 +7377,17 @@ async def _run_isolated_confirm_group(
     transient error on one attempt doesn't abort the remaining attempts).
     Never raises.
 
-    A lossy shim over ``_run_isolated_confirm_group_outcome``, which is the
+    A lossy shim over ``_run_isolated_confirm_group_observation``, which is the
     outcome-preserving source of truth: both ``failed`` and ``unconfirmable``
-    flatten to ``False`` here, deliberately, so this function's three existing
-    callers observe no behaviour change at all.
+    flatten to ``False`` here, deliberately, so the ONE remaining caller —
+    ``confirm_main_tip_failure_is_real`` — observes no behaviour change at all.
+    (The merge gate and the main probe were the other two callers before they
+    became thin wrappers over ``confirm_isolated_rerun_verdict``, which consumes
+    the observation directly and must NOT lose the distinction.)
     """
-    return await _run_isolated_confirm_group_outcome(
+    return (await _run_isolated_confirm_group_observation(
         worktree, config, module_config,
-    ) is _RerunOutcome.passed
+    )).outcome is _RerunOutcome.passed
 
 
 def _group_node_ids_by_subproject(
@@ -8177,6 +8169,23 @@ async def confirm_isolated_rerun_verdict(
         # generous-timeout isolated re-run in the SAME worktree (INV-3 — the
         # discriminator judges the tree it was handed and never mints another).
         # ALL groups must confirm green.
+        #
+        # CROSS-GROUP PRECEDENCE extends _RerunOutcome's within-group rule: a
+        # genuine red observed in ANY group is real evidence and outranks "we
+        # could not re-run" observed in another, so an `unconfirmable` group is
+        # REMEMBERED and the remaining groups are still re-run rather than
+        # short-circuiting. Short-circuiting on it would make the recorded
+        # verdict depend on `groups` iteration order — i.e. on which subproject
+        # prefix happens to come first — so the same failing result could be
+        # labelled `unconfirmable` or `fails_in_isolation` run to run, and a
+        # run where one group hit an infra sentinel while another was genuinely
+        # red would report the "some groups were uninformative" case the
+        # doctrine forbids. Both verdicts still map to None at today's
+        # wrappers; what this buys is an HONEST verdict for ε's ledger row and
+        # θ's class-1 unconfirmable rate. A `failed` group still returns at
+        # once: no later group can outrank it, so there is nothing to gain by
+        # continuing and a full re-run's cost to lose.
+        unconfirmable_observation: _RerunObservation | None = None
         for prefix, group_node_ids in groups.items():
             mc = mc_by_prefix[prefix]
             scoped_cmd = _with_pytest_timeout_str(
@@ -8189,30 +8198,37 @@ async def confirm_isolated_rerun_verdict(
                 mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
             )
             observation = await policy.engine(worktree, config, scoped_mc)
-            # Groups are evaluated IN ORDER and the FIRST non-pass
-            # short-circuits, preserving today's early `return None` — a later
-            # group's verdict cannot rescue an earlier one, so there is nothing
-            # to gain by continuing and a full re-run's cost to lose.
-            if observation.outcome is not _RerunOutcome.passed:
-                if policy.log_group_not_confirmed is not None:
-                    policy.log_group_not_confirmed(prefix, observation)
-                if observation.outcome is _RerunOutcome.unconfirmable:
-                    # We could not RE-RUN, which is not evidence the test is
-                    # red. Reporting this as `fails_in_isolation` would launder
-                    # an infrastructure failure into a verdict about the code.
-                    return _observe(
-                        FlakeVerdict.unconfirmable, node_ids,
-                        call_site=coerced_site, runner=runner,
-                        reason=(
-                            f'infra_transient_rerun:'
-                            f'{observation.category or "unknown"}'
-                        ),
-                        now=now,
-                    )
+            if observation.outcome is _RerunOutcome.passed:
+                continue
+            if policy.log_group_not_confirmed is not None:
+                policy.log_group_not_confirmed(prefix, observation)
+            if observation.outcome is not _RerunOutcome.unconfirmable:
+                # A genuine red anywhere is decisive — return at once,
+                # preserving today's early `return None`.
                 return _observe(
                     FlakeVerdict.fails_in_isolation, node_ids,
                     call_site=coerced_site, runner=runner, now=now,
                 )
+            # We could not RE-RUN this group, which is not evidence the test is
+            # red. Reporting it as `fails_in_isolation` would launder an
+            # infrastructure failure into a verdict about the code — so hold it
+            # and let the remaining groups speak first (see the precedence note
+            # above). FIRST unconfirmable group wins the named category: only
+            # reached when NO group was genuinely red, and one host-level
+            # sentinel is as good an explanation as the next.
+            if unconfirmable_observation is None:
+                unconfirmable_observation = observation
+
+        if unconfirmable_observation is not None:
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason=(
+                    f'infra_transient_rerun:'
+                    f'{unconfirmable_observation.category or "unknown"}'
+                ),
+                now=now,
+            )
 
         policy.log_success(node_ids, worktree)
         return _observe(

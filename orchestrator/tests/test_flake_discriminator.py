@@ -147,18 +147,22 @@ _INFRA_CATEGORY = 'pytest_internalerror'
 
 
 class TestRunIsolatedConfirmGroupOutcome:
-    """`_run_isolated_confirm_group_outcome` -> `_RerunOutcome` (3-valued).
+    """`_run_isolated_confirm_group_observation().outcome` -> `_RerunOutcome`
+    (3-valued).
 
     RED today: neither `_RerunOutcome` nor
-    `_run_isolated_confirm_group_outcome` exists.
+    `_run_isolated_confirm_group_observation` exists.
+
+    Pins the OUTCOME off the observation directly — the source of truth — so no
+    pass-through layer has to exist merely to give these assertions a name.
     """
 
     def _run(self, verify_module, config, tmp_path):
         return asyncio.run(
-            verify_module._run_isolated_confirm_group_outcome(
+            verify_module._run_isolated_confirm_group_observation(
                 tmp_path, config, _module_config('orchestrator'),
             )
-        )
+        ).outcome
 
     def test_any_attempt_passing_yields_passed_and_short_circuits(
         self, tmp_path: Path,
@@ -274,10 +278,11 @@ class TestRunIsolatedConfirmGroupOutcome:
 class TestRunIsolatedConfirmGroupBackCompat:
     """`_run_isolated_confirm_group` still returns a plain `bool`.
 
-    `confirm_main_tip_failure_is_real` and
-    `_sweep_failure_reproduces_in_isolation` still consume it and must not
+    Its ONE remaining caller, `confirm_main_tip_failure_is_real`, must not
     observe the S2 refactor at all: True iff `passed`, False for BOTH `failed`
-    and `unconfirmable`.
+    and `unconfirmable`. (The merge gate and the main probe were the other two
+    callers before they became thin wrappers over the discriminator, which
+    consumes the observation directly.)
     """
 
     def _run(self, verify_module, config, tmp_path):
@@ -311,7 +316,7 @@ class TestRunIsolatedConfirmGroupBackCompat:
 
     def test_infra_sentinel_returns_false_not_true(self, tmp_path: Path) -> None:
         """`unconfirmable` must NOT leak out of the bool shim as a pass — that
-        would newly suppress reds at the three legacy call sites."""
+        would newly suppress reds at the legacy call site."""
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
@@ -1196,6 +1201,107 @@ class TestConfirmIsolatedRerunVerdictMainProbe:
             )
 
         assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
+        commands = [c.args[2].test_command for c in rv.await_args_list]
+        assert any(FAILED_ID in cmd for cmd in commands), commands
+        assert any(OTHER_ID in cmd for cmd in commands), commands
+
+    @staticmethod
+    def _per_group_results(infra_prefix: str):
+        """A `run_verification` stub keyed on the SCOPED GROUP rather than on
+        the call index, so the stub itself encodes no group ordering — the
+        cross-group tests below must hold whichever order the grouping yields.
+        """
+        def _fake(_worktree, _config, module_config, **_kwargs):
+            if module_config.prefix == infra_prefix:
+                return _result(False, category=_INFRA_CATEGORY)
+            return _result(False)
+
+        return _fake
+
+    def test_unconfirmable_group_never_outranks_a_genuine_red_elsewhere(
+        self, tmp_path: Path,
+    ) -> None:
+        """CROSS-GROUP PRECEDENCE: one group hits an infra sentinel while
+        another is genuinely red -> `fails_in_isolation`, in BOTH orderings.
+
+        An `unconfirmable` group must not short-circuit the groups still to
+        run. Short-circuiting would make the recorded verdict depend on
+        `_group_node_ids_by_subproject`'s prefix ordering, and would report
+        "we could not tell" for a run that DID observe a real red — the "some
+        groups were uninformative" case `_RerunOutcome`'s precedence doctrine
+        forbids. Both verdicts still map to None at today's wrappers; the
+        verdict itself is what ε records and θ counts.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(
+            tmp_path,
+            'orchestrator/tests/test_x.py',
+            'fused-memory/tests/test_q.py',
+        )
+        config = _make_config(tmp_path)
+        module_configs = [
+            _module_config('orchestrator'), _module_config('fused-memory'),
+        ]
+
+        commands_per_run: list[list[str]] = []
+        for infra_prefix in ('orchestrator', 'fused-memory'):
+            rv = AsyncMock(side_effect=self._per_group_results(infra_prefix))
+            with patch.object(verify_module, 'run_verification', rv):
+                s = self._run(
+                    verify_module, config, module_configs,
+                    _failing_result(TWO_GROUP_TEST_OUTPUT), tmp_path,
+                )
+
+            assert s.verdict is FlakeVerdict.fails_in_isolation, (
+                f'infra_prefix={infra_prefix!r} gave {s.verdict} '
+                f'(reason={s.unconfirmable_reason!r}) — a genuine red observed '
+                f'in ANY group outranks "could not re-run" in another'
+            )
+            commands_per_run.append(
+                [c.args[2].test_command for c in rv.await_args_list]
+            )
+
+        assert any(
+            any(FAILED_ID in cmd for cmd in cmds)
+            and any(OTHER_ID in cmd for cmd in cmds)
+            for cmds in commands_per_run
+        ), (
+            f'In the ordering that re-runs the infra-sentinel group FIRST, the '
+            f'remaining group must still be re-run — that is the only way its '
+            f'genuine red can be observed at all; got {commands_per_run!r}'
+        )
+
+    def test_every_group_unconfirmable_is_unconfirmable_naming_the_category(
+        self, tmp_path: Path,
+    ) -> None:
+        """The other half of the precedence rule: `unconfirmable` survives only
+        when NO group was genuinely red — and every group is still re-run."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(
+            tmp_path,
+            'orchestrator/tests/test_x.py',
+            'fused-memory/tests/test_q.py',
+        )
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(False, category=_INFRA_CATEGORY))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config,
+                [_module_config('orchestrator'), _module_config('fused-memory')],
+                _failing_result(TWO_GROUP_TEST_OUTPUT), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason is not None
+        assert s.unconfirmable_reason.startswith('infra_transient_rerun:'), (
+            s.unconfirmable_reason
+        )
+        assert _INFRA_CATEGORY in s.unconfirmable_reason, s.unconfirmable_reason
         commands = [c.args[2].test_command for c in rv.await_args_list]
         assert any(FAILED_ID in cmd for cmd in commands), commands
         assert any(OTHER_ID in cmd for cmd in commands), commands
