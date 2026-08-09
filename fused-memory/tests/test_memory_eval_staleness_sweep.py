@@ -59,11 +59,6 @@ def _mod() -> types.ModuleType:
     return _load_module()
 
 
-def _source() -> str:
-    """The script's own text, for the INV-5 single-parser assertions."""
-    return SCRIPT_PATH.read_text(encoding='utf-8')
-
-
 class TestPinnedVocabulary:
     """The metric ids and eval_id are a contract with leaf α, not free choice."""
 
@@ -176,22 +171,44 @@ class TestPointerTargets:
         refs = m.pointer_targets(_record(content='the successor says X', supersedes=UUID_A))
         assert refs[0].source_content == 'the successor says X'
 
-    def test_the_script_imports_the_one_sanctioned_parser(self):
-        """INV-5 / D7, and this task's delivered_checks grep."""
-        source = _source()
-        assert 'normalize_supersedes' in source
-        assert 'from fused_memory.memory_metadata import normalize_supersedes' in source
+    def test_every_pointer_key_is_parsed_by_the_one_sanctioned_helper(self, monkeypatch):
+        """INV-5 / D7, asserted as a CALL rather than as a substring.
 
-    def test_the_script_defines_no_second_pointer_parser(self):
-        """No local re-implementation, and exactly one import site.
+        The spy delegates to the real helper, so ``pointer_targets`` still
+        returns correct refs and this test cannot pass against a stub that
+        merely swallowed the values. No rename, re-spelling or annotated
+        copy-paste of a local parser can defeat it — which is precisely what a
+        sweep over the script's own text could not promise: the module
+        docstring names the helper on purpose, so a substring check for it was
+        satisfied by prose and would have passed with every call site deleted.
 
-        Asserted on code shapes rather than on prose: the module docstring
-        NAMES the 3112 failure mode on purpose, so a banned-substring sweep
-        over the whole file would constrain wording rather than behaviour.
+        The patch lands BECAUSE the script's import is function-local (inside
+        ``pointer_targets``, ``# noqa: PLC0415``) and therefore re-resolves the
+        module attribute on every call. If that import is ever hoisted to
+        module level it would bind at import time and silently no-op this spy;
+        patch the SCRIPT module's own attribute instead.
         """
-        source = _source()
-        assert 'def normalize_supersedes' not in source
-        assert source.count('import normalize_supersedes') == 1
+        m = _mod()
+        from fused_memory import memory_metadata  # noqa: PLC0415
+
+        real = memory_metadata.normalize_supersedes
+        seen: list[Any] = []
+
+        def _spy(value: Any) -> list[Any]:
+            seen.append(value)
+            return real(value)
+
+        monkeypatch.setattr(memory_metadata, 'normalize_supersedes', _spy)
+        refs = m.pointer_targets(
+            _record(supersedes=UUID_A, parent_id=UUID_B, corrects=[UUID_C]),
+        )
+
+        # All three keys, each value handed over untouched — not just the one
+        # D7 names, because parent_id and corrects carry the same ambiguity.
+        assert seen == [UUID_A, UUID_B, [UUID_C]]
+        assert [(r.key, r.target) for r in refs] == [
+            ('supersedes', UUID_A), ('parent_id', UUID_B), ('corrects', UUID_C),
+        ]
 
 
 class TestDanglingCensus:
@@ -471,21 +488,17 @@ class TestTaskTerminalStaleness:
         assert obs.entries_referencing_terminal == 0
         assert obs.records == ()
 
-    def test_the_live_state_judgement_is_delegated_to_task_filter(self):
+    def test_the_helper_is_actually_called(self, monkeypatch):
         """INV-5, and the helper carries the mandatory cheap-prefilter ordering.
 
         ``POINT_IN_TIME_CHECK_RE``'s two lookaheads under ``re.DOTALL`` are
         quadratic in content length; the helper prefilters with the
         lookahead-free ``LIVE_TASK_STATUS_RE``, which is what keeps a
         corpus-scale scan tractable. Re-deriving either regex here would drop
-        that ordering silently.
+        that ordering silently — so the delegation is asserted by patching the
+        real predicate and observing the call, not by grepping the script for
+        a regex name it would no longer be spelling.
         """
-        source = _source()
-        assert 'frames_live_task_status_as_current_fact' in source
-        assert 'LIVE_TASK_STATUS_RE = ' not in source
-        assert 'POINT_IN_TIME_CHECK_RE = ' not in source
-
-    def test_the_helper_is_actually_called(self, monkeypatch):
         m = _mod()
         from fused_memory.reconciliation import task_filter  # noqa: PLC0415
 
