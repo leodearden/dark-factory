@@ -11915,6 +11915,135 @@ class TestIntegrityGateInputParityWithRenderer:
         assert stranded == []
         assert len(suppressed) >= 1
 
+    # ----- pure_gate (task 3751 rule 5 -> this consumer) -----
+    #
+    # The last remaining harness-vs-renderer input gap. Task 3751 wired
+    # `pure_gate` into _render_live_workflow_section AND into
+    # recon_write_policy.check(), but not into this gate — so a cited PENDING
+    # deterministic PURE GATE still disagreed with Live-Workflow Signals, the
+    # same class of divergence this task exists to close.
+
+    @classmethod
+    def _pure_gate_task(cls, **overrides) -> dict:
+        """Task 3845's verified real metadata shape: `always_escalates` with NO
+        `before_done`, in status `pending`.
+
+        Such a task's ENTIRE run is "file one born-at-L2 escalation, stamp
+        gate_escalated_at, set blocked" — no script, no systemd, no git_ops — so
+        it never acquires a worktree or branch and the bare project-wide lock is
+        never task-specific evidence for it.
+        """
+        fields = {
+            'status': 'pending',
+            'metadata': {'task_kind': 'deterministic', 'always_escalates': True},
+        }
+        fields.update(overrides)
+        return cls._cited_task(**fields)
+
+    @pytest.mark.asyncio
+    async def test_pending_pure_gate_cited_task_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a cited pending deterministic PURE GATE is not suppressed by
+        the bare project-wide orchestrator lock.
+
+        The fake reports not-live ONLY for task_kind='deterministic' AND
+        pure_gate is True, so this passes only if the harness forwards BOTH. A
+        pre-fix call site passes no `pure_gate` kwarg at all.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert ('deterministic', True) in received, (
+            f'Expected the gate to forward task_kind="deterministic" AND '
+            f'pure_gate=True for the pending pure gate; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for the cited pending pure gate'
+        )
+        assert suppressed == []
+
+    @pytest.mark.asyncio
+    async def test_before_done_deterministic_cited_task_is_still_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """NARROWING — a deterministic task WITH a truthy `before_done` forwards
+        pure_gate=False, so detector rule 5 stays inert and the lock keeps
+        protecting it while it may be mid-deploy inside DeterministicRunner (a
+        blocking script run leaves no git evidence, and the task's status stays
+        'pending' throughout)."""
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+            }),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [('deterministic', False)], (
+            f'Expected pure_gate=False for a deterministic task WITH before_done; '
+            f'got {received!r}'
+        )
+        assert stranded == []
+        assert len(suppressed) >= 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata', [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    async def test_malformed_metadata_forwards_pure_gate_false(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, metadata,
+    ):
+        """FAIL-SAFE — an absent or non-Mapping metadata blob forwards
+        pure_gate=False (toward live), relying on is_pure_gate_metadata's own
+        documented non-Mapping -> False contract rather than a guard at the call
+        site. Only POSITIVE evidence of the pure-gate shape suppresses the lock.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return True
+
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(status='pending', metadata=metadata),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [(None, False)], (
+            f'Expected task_kind=None, pure_gate=False for metadata={metadata!r}; '
+            f'got {received!r}'
+        )
+
 
 @pytest.mark.asyncio
 async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_normal_cited_task(
