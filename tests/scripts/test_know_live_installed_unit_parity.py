@@ -8,10 +8,17 @@ module exists BECAUSE that rule is correct for a general parity checker but
 cannot answer the one question task 3642 needs answered: has THIS host's
 installed unit, and its systemd --user manager, actually been reconciled
 with the committed template. scripts/check_orchestrator_unit_parity.py (a
-registry-driven installed-vs-committed gate) is confirmed absent from main —
-its commits live only on the unmerged task/3424 branch — so there is no
-portable checker this module could instead exercise against a fixture. A
-future run on a host with the unit installed and reconciled gets a live
+registry-driven installed-vs-committed gate) has since LANDED on main — task
+3424, picked up here when this branch was rebased onto it — and setup-host.sh
+now runs it as a pre-install gate. That does not make this module redundant,
+and the two answer different questions: the checker compares two FILES for
+symmetric equality, so it is silent about the MANAGER layer below (an install
+without a daemon-reload passes it), and it is a script an operator must run
+rather than an assertion the suite enforces. What it does retire is the older
+claim here that no portable checker existed to exercise against a fixture —
+one now does, and drift-logic coverage of it belongs in its own fixture-based
+suite (tests/scripts/test_check_orchestrator_unit_parity.py), not here. A
+run on a host with the unit installed and reconciled gets a live
 green answer about ITS install; a fresh checkout or CI runner with no
 installed unit, no user D-Bus session, or a pre-254 systemd that has never
 heard of RestartSteps= degrades to a skip (see the guards below), never a
