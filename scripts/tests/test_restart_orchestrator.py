@@ -17,7 +17,8 @@ SCRIPT = Path(__file__).parent.parent / "restart-orchestrator.sh"
 # A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
 # `orchestrator-fake*` name by task 3799, which audited this whole fake-systemctl
 # family. The name flows SCRIPT -> fake -> assertion, not fixture -> script:
-# restart-orchestrator.sh:30 HARDCODES `SERVICE="orchestrator-dark-factory.service"`
+# restart-orchestrator.sh's SERVICE constant HARDCODES the value
+# "orchestrator-dark-factory.service"
 # with no env override, `_make_fake_systemctl` below takes no unit argument at
 # all, and this constant exists so `test_invokes_systemctl_restart_on_correct_unit`
 # can assert the script targeted the right unit. A synthetic name here would make

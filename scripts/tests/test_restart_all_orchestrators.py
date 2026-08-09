@@ -258,7 +258,8 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     THE CONSEQUENCE of it being unset, which is what this pins: this file's
     _run_script sets ORCH_FLEET_DIR per call, but the defect class is "a spawner
-    that forgets" -- and restart-all-orchestrators.sh:109 and drain_check.py:32
+    that forgets" -- and restart-all-orchestrators.sh's FLEET_DIR default and
+    drain_check.DEFAULT_FLEET_DIR
     both resolve their fleet dir from `${ORCH_FLEET_DIR:-...}`, so an unset (or
     EMPTY -- `${VAR:-...}` treats those identically) value falls through to the
     machine-global /home/leo/src/dark-factory/data/fleet. A test-spawned drain

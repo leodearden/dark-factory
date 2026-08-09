@@ -16,7 +16,8 @@ restart of whatever unit name the fixture handed it.  A SYNTHETIC name makes
 that worst case a no-op against a unit that does not exist.
 
 DEFECT B — ``ORCH_FLEET_DIR`` was unset for the whole suite, so
-``scripts/restart-all-orchestrators.sh:109`` and ``scripts/drain_check.py:32``
+``scripts/restart-all-orchestrators.sh``'s ``FLEET_DIR`` default and
+``drain_check.DEFAULT_FLEET_DIR``
 both fell through to their machine-global default,
 ``/home/leo/src/dark-factory/data/fleet``.  That directory is a CROSS-PROJECT
 rendezvous dir — measured 2026-08-07 and re-measured 2026-08-09 holding live
@@ -123,8 +124,9 @@ class TestNonSyntheticUnitNames:
 
     def test_the_bare_fake_literal_stays_legal(self) -> None:
         """``orchestrator-fake.service`` — with NO hyphenated stem — is already
-        in use at ``tests/scripts/test_restart_all_orchestrators.py:34`` and the
-        prefix rule is chosen specifically to keep it legal.
+        in use as ``tests/scripts/test_restart_all_orchestrators.py``'s
+        ``UNIT_NAME`` and the prefix rule is chosen specifically to keep it
+        legal.
 
         Pinned explicitly so a later "tighten it to require a hyphen" cannot
         silently invalidate the one good literal that predates this task.
@@ -260,8 +262,9 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     """``ORCH_FLEET_DIR`` must point somewhere hermetic for the WHOLE session.
 
     THE CONSEQUENCE of it being unset, which is what this pins and why the
-    assertion messages say it out loud: ``restart-all-orchestrators.sh:109`` and
-    ``drain_check.py:32`` both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``,
+    assertion messages say it out loud: ``restart-all-orchestrators.sh``'s
+    ``FLEET_DIR`` default and ``drain_check.DEFAULT_FLEET_DIR``
+    both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``,
     so an unset (or EMPTY — ``${VAR:-…}`` treats those identically) value falls
     through to the machine-global ``/home/leo/src/dark-factory/data/fleet``.  A
     test-spawned drain gate then reads five other projects' LIVE production

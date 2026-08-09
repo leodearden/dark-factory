@@ -88,7 +88,8 @@ exactly that reason).  This module is the one place BOTH already import.
 FOURTH DEFENCE — a test run can never reach the LIVE fleet directory.
 
 Task 3799.  ``ORCH_FLEET_DIR`` was unset for the whole suite, so
-``scripts/restart-all-orchestrators.sh:109`` and ``scripts/drain_check.py:32``
+``scripts/restart-all-orchestrators.sh``'s ``FLEET_DIR`` default and
+``drain_check.DEFAULT_FLEET_DIR``
 both fell through to their machine-global default,
 ``/home/leo/src/dark-factory/data/fleet``.  That is a CROSS-PROJECT rendezvous
 directory — measured 2026-08-07 and re-measured 2026-08-09 holding live
@@ -1090,9 +1091,9 @@ def _df_no_leaked_drain_processes():
 # modelled. Containment comes from the name not existing as an installed unit,
 # not from it being unenumerable.
 #
-# Deliberately keeps the bare `orchestrator-fake.service` literal at
-# tests/scripts/test_restart_all_orchestrators.py:34 legal — it predates this
-# task and is the precedent the prefix was chosen around.
+# Deliberately keeps the bare `orchestrator-fake.service` literal in
+# tests/scripts/test_restart_all_orchestrators.py's UNIT_NAME legal — it
+# predates this task and is the precedent the prefix was chosen around.
 SYNTHETIC_UNIT_PREFIX = 'orchestrator-fake'
 
 
@@ -1201,7 +1202,8 @@ LIVE_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
 def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     """Point ``ORCH_FLEET_DIR`` at a tmp dir for this whole session (task 3799).
 
-    ``scripts/restart-all-orchestrators.sh:109`` and ``scripts/drain_check.py:32``
+    ``scripts/restart-all-orchestrators.sh``'s ``FLEET_DIR`` default and
+    ``drain_check.DEFAULT_FLEET_DIR``
     both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``, defaulting to
     :data:`LIVE_FLEET_DIR`.  With the var unset — its state in this environment
     before this fixture — a test-spawned drain gate READS five other projects'
@@ -1294,9 +1296,10 @@ def leaked_fleet_heartbeat_reason(names: list[str]) -> str | None:
         f'Those names start with {SYNTHETIC_UNIT_PREFIX!r}, so they are provably '
         'test fixtures — no production orchestrator can produce one.\n'
         'Mechanism: a spawner let ORCH_FLEET_DIR fall through to the '
-        'machine-global default at restart-all-orchestrators.sh:109 / '
-        'drain_check.py:32, so its heartbeat write (or the drain gate it drove) '
-        'landed in the CROSS-PROJECT rendezvous directory that seven projects\' '
+        "machine-global default in restart-all-orchestrators.sh's FLEET_DIR / "
+        'drain_check.DEFAULT_FLEET_DIR, so its heartbeat write (or the drain '
+        'gate it drove) landed in the CROSS-PROJECT rendezvous directory that '
+        'seven projects\' '
         'orchestrators use to decide the real fleet\'s drain state.\n'
         'Fix: let df_pytest_isolation._df_fleet_dir_redirect cover the spawner '
         '(bind it in that rootdir\'s conftest), or set ORCH_FLEET_DIR explicitly '
@@ -1317,7 +1320,7 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
     independent readings ~5 minutes apart (mtimes 19:43:46-19:44:05, then
     19:48:16-19:48:23): SIX of the seven live unit heartbeat files moved between
     them, because the running orchestrators rewrite their heartbeat roughly every
-    30s (``orchestrator/src/orchestrator/harness.py:9804``).  An untouched-content
+    30s (``orchestrator.harness``'s ``write_heartbeat`` call).  An untouched-content
     guard would therefore fail on essentially every run in every checkout, and
     its failures would be indistinguishable from a real leak — a false-positive
     generator, strictly worse than no guard, and the same "green and useless"
