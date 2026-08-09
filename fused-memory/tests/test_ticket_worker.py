@@ -363,7 +363,7 @@ async def test_worker_processes_combine_decision(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await asyncio.sleep(0.2)
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # _execute_combine was called (confirms write_lock path was taken)
     assert len(execute_combine_calls) == 1, (
@@ -437,7 +437,7 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await asyncio.sleep(0.2)
+        await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # curator.curate must NOT have been called (short-circuit)
     mock_curator.curate.assert_not_called()
