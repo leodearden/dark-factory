@@ -147,10 +147,17 @@ class ProvenanceConflictSink:
       records rather than the memo, so it holds on a process that did not
       itself file the conflict. It shares ``should_skip``'s invalidation
       semantics: a resolved escalation leaves ``get_by_task(...,
-      status='pending')`` and so releases, and a moved-on ``reopen_at``
-      releases too. A released hold does NOT mean "flip to done" — the
-      escalation is still pending, so the caller's any-level pin veto then
-      catches it and the task dispatches instead.
+      status='pending')`` (and is skipped defensively even if an unfiltered
+      read hands one over anyway), and a moved-on ``reopen_at`` releases
+      too. A released hold does NOT mean "flip to done" — the escalation is
+      still pending, so the caller's any-level pin veto then catches it and
+      the task dispatches instead.
+    - ``note_hold_observed`` / ``clear_hold_observed`` — log-streak
+      bookkeeping for that hold. Unlike a veto that ABSTAINS (the task
+      dispatches and stops being a candidate), a hold re-fires on every tick
+      until the arbitration ends, so its caller logs loudly only on a
+      ``(task_id, reopen_at)`` TRANSITION and quietly on the repeats (INV-4:
+      storm escape is ``dedupe_count``, never log spam).
 
     ``escalation_queue`` is a late-bindable public attribute: the harness
     constructs this sink before its ``EscalationQueue`` exists (the merge
@@ -163,6 +170,9 @@ class ProvenanceConflictSink:
         self.escalation_queue = escalation_queue
         # task_id -> (reopen_at, evidence_commit, escalation_id | None)
         self._memo: dict[str, tuple[str, str, str | None]] = {}
+        # task_id -> the reopen_at whose hold was last LOGGED loudly (None
+        # when the caller had none); see note_hold_observed/clear_hold_observed.
+        self._hold_logged: dict[str, str | None] = {}
 
     def record(
         self,
@@ -295,7 +305,7 @@ class ProvenanceConflictSink:
 
     def arbitration_pending(
         self,
-        records: Iterable[Any] | None,
+        pending_records: Iterable[Any] | None,
         *,
         reopen_at: str | object = _UNKNOWN_REOPEN,
     ) -> bool:
@@ -310,10 +320,24 @@ class ProvenanceConflictSink:
         path; this is the correctness backstop underneath it.
 
         Takes ALREADY-READ records rather than doing its own ``get_by_task``
-        so the caller pays for exactly one store read.  ``records=None`` (an
-        unreadable store) returns ``False``: that disposition belongs to the
-        caller, which already treats a failed read as ``store_unavailable``
-        (see the already-landed dispatch gate's try/except).
+        so the caller pays for exactly one store read.
+        ``pending_records=None`` (an unreadable store) returns ``False``:
+        that disposition belongs to the caller, which already treats a failed
+        read as ``store_unavailable`` (see the already-landed dispatch gate's
+        try/except).
+
+        PRECONDITION, named in the parameter: pass the rows of
+        ``get_by_task(task_id, status='pending')``.  A resolved record must
+        RELEASE the hold — that is how an operator ends an arbitration, and it
+        is the same release arm ``should_skip`` gets from
+        ``_escalation_pending``'s ``esc.status == 'pending'`` check.  Records
+        whose ``status`` is present and not ``'pending'`` are therefore
+        skipped defensively here too, so a caller that hands over an
+        unfiltered ``get_by_task(task_id)`` (which also scans the archive
+        tier) cannot turn a long-resolved conflict into a permanent
+        withhold — precisely the wedge the reopen_at arm below exists to
+        avoid.  A record with no ``status`` attribute at all is treated as
+        pending, keeping the ambiguity-holds asymmetry below.
 
         Shares :meth:`should_skip`'s reopen_at INVALIDATION ARM, comparing
         the caller's value against the one ``record()`` serialised into the
@@ -335,10 +359,18 @@ class ProvenanceConflictSink:
         comparison, so incidental ISO-8601 spelling drift between the stored
         and caller-supplied strings cannot masquerade as a moved-on value.
         """
-        if not records:
+        if not pending_records:
             return False
-        for record in records:
+        for record in pending_records:
             if getattr(record, 'category', None) != PROVENANCE_CONFLICT_CATEGORY:
+                continue
+            if getattr(record, 'status', 'pending') != 'pending':
+                # Defence in depth for the PENDING precondition above: only
+                # a still-open arbitration binds the task, so a resolved /
+                # dismissed row released it (mirrors _escalation_pending's
+                # `esc.status == 'pending'`).  Cheap enough to be worth not
+                # depending on every present and future caller having
+                # remembered `status='pending'` on its read.
                 continue
             if reopen_at is _UNKNOWN_REOPEN:
                 return True
@@ -351,6 +383,49 @@ class ProvenanceConflictSink:
             if not isinstance(recorded, str) or _reopen_at_matches(reopen_at, recorded):
                 return True
         return False
+
+    def note_hold_observed(
+        self, task_id: str, *, reopen_at: str | object = _UNKNOWN_REOPEN,
+    ) -> bool:
+        """Register an :meth:`arbitration_pending` hold; True on a TRANSITION.
+
+        INV-4 ("storm escape is ``dedupe_count``, never log spam") applied to
+        the hold's log line.  The any-level pin veto does not need this — it
+        ABSTAINS, so the task dispatches and stops being a gate candidate —
+        but a hold repeats on EVERY dispatch tick for as long as the
+        arbitration stands, and on a cold-memo process it short-circuits
+        before ``record()`` and so never re-warms anything that would quiet
+        it.  A caller logging it unconditionally at INFO would emit one line
+        per scheduler tick, indefinitely, until a human resolved the L2.
+
+        So the caller logs LOUDLY (INFO) only when this returns True — the
+        first observation of a given ``(task_id, reopen_at)`` — and quietly
+        (DEBUG) on the repeats.  A moved-on ``reopen_at`` is a genuinely new
+        hold state and is loud again, which is exactly the transition an
+        operator wants to see.
+
+        Advisory per-process state, deliberately: losing it on a restart
+        costs one extra INFO line per contested task, which is the right side
+        to fail on.  :meth:`clear_hold_observed` prunes it when the hold
+        releases, so it stays bounded by the count of CURRENTLY-held tasks
+        rather than every task ever contested in this process (the same
+        resource_management discipline ``should_skip``'s memo carries).
+        """
+        key = reopen_at if isinstance(reopen_at, str) else None
+        if task_id in self._hold_logged and self._hold_logged[task_id] == key:
+            return False
+        self._hold_logged[task_id] = key
+        return True
+
+    def clear_hold_observed(self, task_id: str) -> None:
+        """Drop *task_id*'s hold-log state — the arbitration no longer binds.
+
+        Called by a caller whose :meth:`arbitration_pending` came back False,
+        so a hold that returns later announces itself loudly again instead of
+        being silently folded into a stale streak, and so
+        :meth:`note_hold_observed`'s dict cannot grow monotonically.
+        """
+        self._hold_logged.pop(task_id, None)
 
     def _escalation_pending(self, escalation_id: str | None) -> bool:
         """True when *escalation_id* is still open (or unverifiable).

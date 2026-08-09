@@ -422,6 +422,9 @@ class TestAlreadyLandedDispatchGateAnyLevelVeto:
         cast(MagicMock, h._escalation_queue).get_by_task.assert_called_with(
             '42', status='pending',
         )
+        # "Neither layer costs an extra store read": the durable arbitration
+        # hold and this veto both decide from the SAME single read.
+        assert cast(MagicMock, h._escalation_queue).get_by_task.call_count == 1
 
     async def test_open_l0_only_vetoes_flip(self, mock_orch_config) -> None:
         """An L0-ONLY open escalation also vetoes the flip.
@@ -482,7 +485,10 @@ class TestAlreadyLandedDispatchGateAnyLevelVeto:
             r.getMessage() for r in caplog.records
             if r.name == 'orchestrator.harness'
         ]
-        assert any('esc-42-9' in m and '42' in m for m in messages), messages
+        # ``'task 42'``, not ``'42'``: the bare id is already a substring of
+        # ``'esc-42-9'``, so asserting on it verified nothing about task
+        # attribution — a line that dropped the task entirely would pass.
+        assert any('esc-42-9' in m and 'task 42' in m for m in messages), messages
 
     async def test_info_severity_only_does_not_veto(
         self, mock_orch_config,
@@ -555,8 +561,11 @@ class TestAlreadyLandedDispatchGateAnyLevelVeto:
             r.getMessage() for r in caplog.records
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
+        # ``'task 42'``, not ``'42'``: the bare id is satisfied by any message
+        # merely mentioning an escalation id or the queue dir path, so the
+        # task-attribution half of this assertion could never fail.
         assert any(
-            '42' in m and ('store' in m.lower() or 'read' in m.lower())
+            'task 42' in m and ('store' in m.lower() or 'read' in m.lower())
             for m in messages
         ), messages
 
@@ -1186,6 +1195,111 @@ class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
             'write attempt at all'
         )
 
+    async def test_repeated_hold_logs_info_once_then_debug(
+        self, mock_orch_config, tmp_path, caplog,
+    ) -> None:
+        """The hold is loud ONCE, then quiet (amendment,
+        reviewer_comprehensive observability_log_volume).
+
+        The any-level veto does not need this — it abstains, so the task
+        dispatches and stops being a gate candidate.  The hold does: it
+        re-fires on every dispatch tick for as long as the arbitration
+        stands, and on this (cold-memo) path it short-circuits above
+        ``_mark_in_progress_done``, so nothing ever re-warms ``should_skip``
+        to quiet it.  Unconditional INFO would be one line per scheduler
+        tick, indefinitely, until a human resolved the L2 — the log spam
+        INV-4 forbids.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            assert await h._already_landed_dispatch_gate('42') is True
+            assert await h._already_landed_dispatch_gate('42') is True
+            assert await h._already_landed_dispatch_gate('42') is True
+
+        held = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness'
+            and 'under provenance arbitration' in r.getMessage()
+        ]
+        assert len(held) == 3, [r.getMessage() for r in held]
+        assert [r.levelno for r in held] == [
+            logging.INFO, logging.DEBUG, logging.DEBUG,
+        ], [(r.levelname, r.getMessage()) for r in held]
+        assert 'task 42' in held[0].getMessage()
+
+    async def test_hold_released_then_returning_is_loud_again(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Quieting the repeats must not silence a hold that RETURNS.
+
+        The streak state is dropped whenever the hold does not bind (here:
+        the operator resolves the arbitration), so a later conflict on the
+        same task announces itself at INFO rather than being folded into a
+        stale streak.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        foreign_sink = ProvenanceConflictSink(escalation_queue=h._escalation_queue)
+        escalation_id = foreign_sink.record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        assert escalation_id is not None
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is True
+        assert h._provenance_conflict_sink.note_hold_observed(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is False, 'the first tick must have registered the streak'
+
+        # The operator arbitrates: the hold releases, and the streak state
+        # goes with it on the next tick that observes the release.
+        h._escalation_queue.resolve(escalation_id, 'operator arbitrated')
+        await h._already_landed_dispatch_gate('42')
+
+        assert h._provenance_conflict_sink.note_hold_observed(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is True, 'a returning hold must be loud again, not silently folded'
+
     async def test_moved_on_reopen_at_dispatches_instead_of_flipping(
         self, mock_orch_config, tmp_path,
     ) -> None:
@@ -1282,8 +1396,11 @@ class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
             r.getMessage() for r in caplog.records
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
+        # ``'task 42'``, not ``'42'``: the bare id is satisfied by any message
+        # merely mentioning an escalation id or the queue dir path, so the
+        # task-attribution half of this assertion could never fail.
         assert any(
-            '42' in m and ('store' in m.lower() or 'read' in m.lower())
+            'task 42' in m and ('store' in m.lower() or 'read' in m.lower())
             for m in messages
         ), messages
 

@@ -10273,7 +10273,12 @@ class Harness:
            any-level veto.  It cannot be ordered below it: that veto returns
            ``False``, i.e. "dispatch normally", and the task's own pending
            ``provenance_conflict`` record is exactly the kind of record it
-           vetoes on — so a contested task would DISPATCH.
+           vetoes on — so a contested task would DISPATCH.  Unlike that veto
+           (which abstains, so the task dispatches and stops being a
+           candidate), this hold re-fires every tick until the arbitration
+           ends, so it is logged at INFO only on a ``(task_id, reopen_at)``
+           transition and at DEBUG on the repeats — INV-4, via the sink's
+           ``note_hold_observed`` / ``clear_hold_observed`` streak state.
 
         Layer 2 exists because layer 1's memo is empty on any process that
         did not itself file the conflict: after a fleet-redeploy/watchdog
@@ -10395,7 +10400,21 @@ class Harness:
             if self._provenance_conflict_sink.arbitration_pending(
                 rows, reopen_at=metadata.get('reopen_at'),
             ):
-                logger.info(
+                # INV-4 ("storm escape is dedupe_count, never log spam"): the
+                # hold re-fires on EVERY dispatch tick for as long as the
+                # arbitration stands — and on a cold-memo process it
+                # short-circuits above `_mark_in_progress_done`, so nothing
+                # ever re-warms `should_skip` to quiet it.  Logging it
+                # unconditionally at INFO would therefore emit one line per
+                # tick, indefinitely, until a human resolved the L2.  Loud on
+                # the (task, reopen_at) TRANSITION, quiet on the repeats; task
+                # beta (3535) replaces both with the structured
+                # `recovery_vetoed` emission plus its streak dedup.
+                first_observation = self._provenance_conflict_sink.note_hold_observed(
+                    task_id, reopen_at=metadata.get('reopen_at'),
+                )
+                logger.log(
+                    logging.INFO if first_observation else logging.DEBUG,
                     'already-landed dispatch gate: task %s is under provenance '
                     'arbitration (pending provenance_conflict escalation at '
                     'reopen_at=%s) — withholding it from dispatch rather than '
@@ -10405,6 +10424,12 @@ class Harness:
                     metadata.get('reopen_at'),
                 )
                 return True
+
+            # The hold does not bind this task (any more): drop its log-streak
+            # state so a hold that returns later announces itself loudly again
+            # rather than being folded into a stale streak — and so the sink's
+            # streak dict stays bounded by currently-held tasks.
+            self._provenance_conflict_sink.clear_hold_observed(task_id)
 
             if pinned.vetoes_done_flip:
                 logger.info(
