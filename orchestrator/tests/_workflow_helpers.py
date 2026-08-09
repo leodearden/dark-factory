@@ -1224,9 +1224,11 @@ def same_module_siblings(lock_depth: int) -> tuple[str, str]:
     if lock_depth < 1:
         raise ValueError(
             f'same_module_siblings requires lock_depth >= 1; got {lock_depth}. '
-            'At depth < 1 the shared package prefix is empty and the returned '
-            'paths normalize to DIFFERENT modules, so the "same module, '
-            'different file" guarantee cannot be honoured.'
+            'At depth < 1 the shared package prefix is empty, so both paths '
+            "normalize to '' and files_to_modules DROPS them entirely — the "
+            'module list is [], not two modules. The callers\' same-module '
+            'precondition would then pass VACUOUSLY on two empty sets while '
+            'the workflow under test holds no module lock at all.'
         )
     package = '/'.join(f'p{i}' for i in range(lock_depth))
     return f'{package}/e.py', f'{package}/f.py'
