@@ -340,6 +340,55 @@ class TestSuccessorPointerItems:
         m = _mod()
         assert m.successor_pointer_items([], {}) == []
 
+    def test_two_content_less_sources_do_not_collapse_into_one_item(self):
+        """An empty content hashes to ONE key, so a collision is not "one fact".
+
+        ``fetch_pointer_records`` normalises content to ``''`` when no payload
+        key yields a string, and ``content_key('')`` is a constant. Two
+        DIFFERENT sources with unreadable content citing the same target would
+        therefore share an item_key, and the AND fold would hand a resolving
+        edge the broken edge's ``passed=False`` — a healthy edge reported
+        failing, in the metric whose whole purpose is per-edge grandfathering
+        in leaf alpha. Worse, alpha persists item_keys, so a key that means
+        two different edges poisons the ratchet permanently.
+        """
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', '', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-2', '', supersedes=UUID_A)),
+        ]
+        items = m.successor_pointer_items(refs, {UUID_A: True})
+        # Unkeyable, so absent (this leaf's zero-exposure posture) — never
+        # merged into a single item whose verdict belongs to neither source.
+        assert items == []
+
+    def test_a_content_less_edge_never_drags_a_keyable_one_down(self):
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', '', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-2', 'real words', supersedes=UUID_A)),
+        ]
+        items = m.successor_pointer_items(refs, {UUID_A: True})
+        assert [item.passed for item in items] == [True]
+
+    def test_content_less_supersedes_edges_are_disclosed_not_silently_dropped(self):
+        """Skipped is fine; SILENTLY skipped is the thing this leaf forbids."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record('rec-1', '', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-2', '   ', supersedes=UUID_B)),
+            *m.pointer_targets(_record('rec-3', 'real words', supersedes=UUID_A)),
+            # Other keys are not tripwired at all, so they are not "skipped".
+            *m.pointer_targets(_record('rec-4', '', corrects=UUID_C)),
+        ]
+        unkeyable = m.unkeyable_successor_refs(refs)
+        assert [(ref.source_id, ref.key) for ref in unkeyable] == [
+            ('rec-1', 'supersedes'), ('rec-2', 'supersedes'),
+        ]
+        # The edges the census still counts are unchanged — only the tripwire
+        # declines them, so nothing that was measured becomes unmeasured.
+        assert m.dangling_census(refs, {UUID_A: True}).examined == 4
+
 
 class TestSupersededSurfacing:
     """Both-present-only exposure over corpus-discovered (successor, superseded) pairs."""
@@ -726,6 +775,7 @@ class TestBuildSeries:
             'procedural_knowledge_scanned',
             'pointer_refs_malformed',
             'pointer_targets_unique_reads',
+            'successor_edges_unkeyable',
             'surfacing_pairs_observed',
             'task_terminal_entry_task_pairs',
             'pointers_supersedes_examined',
@@ -742,6 +792,9 @@ class TestBuildSeries:
         )
         assert counts['pointer_targets_unique_reads'] == len(
             m.unique_pointer_targets(_full_refs()),
+        )
+        assert counts['successor_edges_unkeyable'] == len(
+            m.unkeyable_successor_refs(_full_refs()),
         )
         assert counts['surfacing_pairs_observed'] == len(inputs['surfacing'].records)
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
@@ -1674,6 +1727,55 @@ class TestReport:
         # different fixes, so a dangling count must not merge them.
         assert 'malformed_pointers' in sections
         assert 'not-a-uuid' in sections['malformed_pointers'].text
+
+    def test_content_less_successor_edges_get_their_own_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        double = _ServiceDouble(scrolls={'procedural_knowledge': [
+            _raw_point('rec-blank', {'supersedes': [UUID_A]}),
+        ]})
+        sections = self._sections(monkeypatch, tmp_path, double)
+        # The edge is real and the census counts it; only the TRIPWIRE
+        # declines it, because an empty content cannot produce a key that
+        # distinguishes this source from any other content-less one.
+        assert 'unkeyable_successor_edges' in sections
+        assert 'rec-blank' in sections['unkeyable_successor_edges'].text
+
+    def test_a_keyable_run_produces_no_unkeyable_disclosure(
+        self, monkeypatch, tmp_path,
+    ):
+        sections = self._sections(monkeypatch, tmp_path, _seeded_double())
+        assert 'unkeyable_successor_edges' not in sections
+
+    def test_the_staleness_detail_does_not_assert_per_task_liveness(
+        self, monkeypatch, tmp_path,
+    ):
+        """The analysis is per ENTRY; the report must not claim per TASK.
+
+        ``frames_live_task_status_as_current_fact`` judges the WHOLE content
+        and never establishes which referenced task the live-status framing
+        was about. For "task 4802 (which motivated this) landed; task 5000
+        status=in-progress", counting the entry is right — it does frame live
+        state and does reference a terminal task — but rendering "claims task
+        4802 is live" states something the analysis did not establish, in an
+        operator-facing report whose entire premise is honest disclosure.
+        """
+        double = _ServiceDouble(scrolls={'procedural_knowledge': [
+            _raw_point('rec-mixed', {
+                'data': 'task 4802 (which motivated this) landed; '
+                        'task 5000 status=in-progress claimant_run_id=abc',
+            }),
+        ]})
+        sections = self._sections(
+            monkeypatch, tmp_path, double, taskmaster_statuses={'4802': 'done'},
+        )
+        text = sections['task_terminal_staleness'].text
+        # Still fully attributed — the operator gets entry, task and status.
+        assert 'rec-mixed' in text
+        assert '4802' in text
+        assert 'done' in text
+        # But not as a claim about 4802's liveness, which was never measured.
+        assert 'claims task 4802 is live' not in text
 
     def test_the_unresolved_targets_are_named_not_just_counted(
         self, monkeypatch, tmp_path,

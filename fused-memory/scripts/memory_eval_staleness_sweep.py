@@ -87,7 +87,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -398,6 +398,29 @@ def _tripwire_item_key(ref: PointerRef) -> str:
     return f'{TRIPWIRE_ITEM_PREFIX}{content_key(ref.source_content)}-{target_digest}'
 
 
+def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
+    """The ``supersedes`` refs whose source carries no content to key on.
+
+    ``fetch_pointer_records`` normalises ``content`` to ``''`` when none of
+    ``_CONTENT_KEYS`` yields a string, and :func:`content_key` of an empty
+    string is a CONSTANT. Every content-less source therefore hashes to the
+    same value, so two DIFFERENT sources citing one target would share an
+    item_key — which :func:`successor_pointer_items` would then fold with
+    ``and``, handing a resolving edge the broken edge's verdict and reporting
+    a healthy edge as failing.
+
+    Reported here, and disclosed in ``corpus.counts``, for the same reason
+    :func:`malformed_pointer_refs` exists: the edges are real and the census
+    still counts them; it is only the per-edge TRIPWIRE that cannot express
+    them, and a family that quietly shrinks is exactly what this leaf's
+    disclosure posture forbids.
+    """
+    return [
+        ref for ref in refs
+        if ref.key == 'supersedes' and not ref.source_content.strip()
+    ]
+
+
 def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool]) -> list:
     """One :class:`shared.memory_eval_metrics.TripwireItem` per ``supersedes`` edge.
 
@@ -415,12 +438,23 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
     written twice, which is one corpus fact, not two — and the schema rejects
     a tripwire whose ``n`` disagrees with its item count, so the collapse has
     to happen here rather than being discovered at emit time.
+
+    That "same claim written twice" reading holds ONLY where the content is
+    real. Edges named by :func:`unkeyable_successor_refs` — an empty source
+    content, which hashes to a constant — are skipped rather than collapsed:
+    there, a shared key means two unrelated sources, and folding them would
+    report a healthy edge as failing AND put a key meaning two different edges
+    into leaf α's persisted grandfather set, where it would misdirect the
+    ratchet for every future run. The skipped count is disclosed in
+    ``corpus.counts`` and named in the report; ``dangling-pointers`` still
+    counts those edges, so nothing measured becomes unmeasured.
     """
     from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
 
     by_key: dict[str, bool] = {}
+    skipped = set(unkeyable_successor_refs(refs))
     for ref in refs:
-        if ref.key != 'supersedes':
+        if ref.key != 'supersedes' or ref in skipped:
             continue
         target = ref.target if isinstance(ref.target, str) else None
         passed = bool(target is not None and resolution.get(target, False))
@@ -649,6 +683,21 @@ def terminal_staleness(records: list[dict], terminal_task_ids) -> StalenessObser
     terminal tasks is one chance to be stale. The detail still names every
     (entry, task) pair, because that is what an operator has to go and fix.
 
+    The judgement is ENTRY-scoped, and the report's wording is bounded by that
+    on purpose. The predicate reads the whole content and never establishes
+    which referenced task the live-status framing was about, so an entry like
+    "task 4802 landed; task 5000 status=in-progress" is correctly counted (it
+    frames live state AND references a terminal task) while "4802 is claimed
+    live" would be a statement this analysis did not make — hence the report
+    says the entry *frames live task state and references* task 4802.
+    Attributing per clause is NOT a free tightening: the point-in-time
+    exemption in ``frames_live_task_status_as_current_fact`` is
+    document-scoped, so an entry whose "as of <date>" sits in a different
+    clause from its ``status=`` marker is exempt today and would start firing
+    under per-clause evaluation. That is a change to what the metric MEASURES,
+    which belongs to a task that can move leaf α's baseline with it, not to
+    the report renderer.
+
     Terminal is ``shared.task_statuses.TERMINAL`` — ``done`` and ``cancelled``
     only. ``deferred`` is NOT terminal, and an entry asserting live state for
     a deferred task is not making a false claim.
@@ -769,10 +818,18 @@ def _disclosure_counts(
     :func:`unique_pointer_targets` excludes them: no read is ever issued for
     one. They stay disclosed under ``pointer_refs_malformed``, so nothing that
     was visible becomes invisible — it simply stops being counted as a read.
+
+    ``successor_edges_unkeyable`` is the tripwire's own narrowing: supersedes
+    edges whose source has no content all hash alike, so they are skipped
+    rather than folded into one item (see :func:`unkeyable_successor_refs`).
+    Without this row the tripwire's ``n`` would shrink with no way for a
+    consumer to tell a corpus with fewer supersession edges from one whose
+    edges stopped being keyable.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
         'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
+        'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
         'surfacing_pairs_observed': len(surfacing.records),
         'task_terminal_entry_task_pairs': len(staleness.records),
     }
@@ -1258,6 +1315,7 @@ def sweep_report_sections(
     staleness: StalenessObservation,
     scan_stats: dict[str, dict[str, int]],
     terminal_join: TerminalTaskJoin,
+    refs: Sequence[PointerRef] = (),
 ) -> tuple[ReportSection, ...]:
     """The report, decomposed — one block per family, then the disclosures.
 
@@ -1266,6 +1324,13 @@ def sweep_report_sections(
     zero-exposure datapoint in leaf α's baseline window is worse than a gap),
     and without a section saying so the absence would read to a human as a
     clean result.
+
+    *refs* is the run's full ref list, needed because one disclosure — the
+    supersedes edges the tripwire could not key — is about refs that RESOLVED
+    and so appear in neither ``census.unresolved_refs`` nor ``tripwire_items``.
+    Naming them, rather than only counting them, is the same rule the
+    unresolved and malformed disclosures follow: a bare total tells an
+    operator something was narrowed but not which record to go and look at.
     """
     from shared.memory_eval_metrics import render_report  # noqa: PLC0415
 
@@ -1336,8 +1401,13 @@ def sweep_report_sections(
         f'  of those, asserting live state:      {staleness.stale}',
         *_elided(
             [
-                f'    {record.record_id} claims task {record.task_id} is live '
-                f'(actually {record.status})'
+                # Deliberately NOT "claims task N is live". The predicate
+                # judges the whole entry and never establishes WHICH of the
+                # tasks it names the live-status framing was about, so naming
+                # one of them as the subject of the claim would state
+                # something this run did not measure. See terminal_staleness.
+                f'    {record.record_id} frames live task state and references '
+                f'task {record.task_id} ({record.status})'
                 for record in staleness.records[:_MAX_NAMED]
             ],
             len(staleness.records),
@@ -1364,6 +1434,24 @@ def sweep_report_sections(
                 for category in truncated
             ),
             '  These families describe a CAPPED SAMPLE, not the whole corpus.',
+        )))
+
+    unkeyable = unkeyable_successor_refs(list(refs))
+    if unkeyable:
+        sections.append(ReportSection('unkeyable_successor_edges', (
+            '',
+            'DISCLOSURE — supersedes edges the tripwire could not key:',
+            # An empty source content hashes to a constant, so these cannot be
+            # told apart by item_key. Skipped rather than folded (which would
+            # report a healthy edge as failing); still counted by
+            # dangling-pointers, so the edge itself is not lost.
+            *_elided(
+                [
+                    f'  {ref.source_id} -> {ref.target!r} (source has no content)'
+                    for ref in unkeyable[:_MAX_NAMED]
+                ],
+                len(unkeyable),
+            ),
         )))
 
     malformed = malformed_pointer_refs(census.unresolved_refs)
@@ -1561,6 +1649,7 @@ async def run_sweep(
         staleness=staleness,
         scan_stats=scan_stats,
         terminal_join=terminal_join,
+        refs=refs,
     )
     report = join_report_sections(sections)
 
