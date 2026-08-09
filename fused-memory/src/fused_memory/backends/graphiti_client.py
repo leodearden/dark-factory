@@ -3119,7 +3119,11 @@ class GraphitiBackend:
           the loop it replaces lets one rejection take down everything after it,
           and ``falkordb_driver.py``'s ``execute_query`` swallows the error so
           nothing in the logs says so.
-        * **Raises only on an unreachable driver.**
+        * **Raises only on an unreachable driver.**  A graph that does not exist
+          yet carries zero indices and is provisioned from scratch — measured, the
+          CREATE statements auto-create the key, so this is self-healing.  Absence
+          is decided STRUCTURALLY (``group_id not in await client.list_graphs()``),
+          never by matching FalkorDB's error wording (D2).
         * **RANGE indices are issued PER-PROPERTY**, never as upstream's composite
           form — measured: the composite is rejected wholesale with
           ``Attribute 'uuid' is already indexed`` when any listed property already
@@ -3148,7 +3152,31 @@ class GraphitiBackend:
             recording what was created, what was already there, what failed, and
             the statements actually issued.
         """
-        actual = normalize_index_records(await self.list_indices(group_id=group_id))
+        try:
+            actual = normalize_index_records(await self.list_indices(group_id=group_id))
+        except Exception:
+            # A graph KEY that has never been written does not exist yet, and
+            # `CALL db.indexes()` against it fails.  MEASURED 2026-08-09, the
+            # error is `redis.exceptions.ResponseError: Invalid graph operation
+            # on empty key` -- recorded here for the next reader, but deliberately
+            # NOT depended on.  D2: no correctness property may rest on FalkorDB's
+            # error WORDING; that is the same class of load-bearing sentinel that
+            # made the composite rejection invisible in the first place.
+            #
+            # The decision is made STRUCTURALLY instead, and that also preserves
+            # the "raises only on an unreachable driver" clause for free: an
+            # unreachable driver makes list_graphs() raise too, so the original
+            # error propagates rather than being misread as "zero indices" --
+            # which would issue every statement against a graph that may already
+            # be fully provisioned.
+            #
+            # The RAW client's list_graphs() is used, not GraphitiBackend's, which
+            # filters `default_db` / `*_db` and would misclassify those names as
+            # absent.
+            if group_id in await self._require_falkor_client().list_graphs():
+                raise
+            actual = set()
+
         expected = expected_index_set()
         missing = expected - actual
         already_present = len(expected & actual)
@@ -3164,16 +3192,37 @@ class GraphitiBackend:
                 await graph.query(statement)
             except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
                 failed.extend((spec, str(exc)) for spec in specs)
+                # Emitted HERE rather than reconstructed from `failed` afterwards
+                # because `failed` is keyed by IndexSpec, and a fulltext spec's
+                # statement is upstream's verbatim string, which cannot be derived
+                # back from the spec.  Both facts are in scope only inside the
+                # loop (D7: the absorb must never be silent).
+                logger.warning(
+                    'Index provisioning statement failed on graph %r: %s | statement: %s',
+                    group_id, exc, statement,
+                )
             else:
                 created.extend(specs)
 
-        return IndexProvisionResult(
+        result = IndexProvisionResult(
             created=created,
             already_present=already_present,
             failed=failed,
             expected_total=len(expected),
             statements=statements,
         )
+
+        # Nothing is logged when nothing changed: a no-op must never emit a line
+        # an operator would read as "provisioned" (INV-2).  That false-positive is
+        # exactly what the deleted DEBUG `Ensured indices on graph` line was.
+        if result.changed:
+            logger.info(
+                'Provisioned indices on graph %r: created=%d already_present=%d '
+                'failed=%d expected_total=%d',
+                group_id, len(result.created), result.already_present,
+                len(result.failed), result.expected_total,
+            )
+        return result
 
     @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
