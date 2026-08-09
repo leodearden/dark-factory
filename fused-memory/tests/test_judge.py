@@ -733,6 +733,35 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
 # --- is_phantom_verdict tests ---
 
 
+def _legacy_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the pre-2947 unmarked
+    shape: severity=serious, no 'code' key at all — the only signal
+    is_phantom_verdict has for a row written before task 2947's structured
+    marker existed. One spelling, reused by every test that needs this
+    shape so a future change to the fabricated payload needs one edit, not
+    one per call site."""
+    return {
+        'issue': (
+            'Judge response could not be parsed: Expecting value: '
+            'line 1 column 1 (char 0)'
+        ),
+        'severity': 'serious',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+
+
+def _marked_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the post-2947
+    structured-marker shape: the legacy shape plus the 'code':
+    'unparseable_judge_response' marker, mirroring how _parse_verdict
+    actually derives one from the other in production."""
+    return {**_legacy_phantom_finding(), 'code': 'unparseable_judge_response'}
+
+
 class TestIsPhantomVerdict:
     """is_phantom_verdict(verdict) — True iff *verdict* is a fabricated
     stand-in for a review that never happened (built by
@@ -754,19 +783,7 @@ class TestIsPhantomVerdict:
             run_id='run-marked',
             reviewed_at=datetime.now(UTC),
             severity=VerdictSeverity.serious,
-            findings=[{
-                'issue': (
-                    'Judge response could not be parsed: Expecting value: '
-                    'line 1 column 1 (char 0)'
-                ),
-                'severity': 'serious',
-                'code': 'unparseable_judge_response',
-                'recommendation': (
-                    'This verdict was not a real review — the judge output was '
-                    'unparseable. Investigate the judge LLM/CLI output before '
-                    'trusting subsequent verdicts.'
-                ),
-            }],
+            findings=[_marked_phantom_finding()],
         )
         assert is_phantom_verdict(verdict) is True
 
@@ -812,18 +829,7 @@ class TestIsPhantomVerdict:
             run_id='e87d8e4a',
             reviewed_at=datetime(2026, 7, 20, tzinfo=UTC),
             severity=VerdictSeverity.serious,
-            findings=[{
-                'issue': (
-                    'Judge response could not be parsed: Expecting value: '
-                    'line 1 column 1 (char 0)'
-                ),
-                'severity': 'serious',
-                'recommendation': (
-                    'This verdict was not a real review — the judge output was '
-                    'unparseable. Investigate the judge LLM/CLI output before '
-                    'trusting subsequent verdicts.'
-                ),
-            }],
+            findings=[_legacy_phantom_finding()],
         )
         assert is_phantom_verdict(verdict) is True
 
@@ -833,18 +839,7 @@ class TestIsPhantomVerdict:
             run_id='09d14a75',
             reviewed_at=datetime(2026, 7, 22, tzinfo=UTC),
             severity=VerdictSeverity.serious,
-            findings=[{
-                'issue': (
-                    'Judge response could not be parsed: Expecting value: '
-                    'line 1 column 1 (char 0)'
-                ),
-                'severity': 'serious',
-                'recommendation': (
-                    'This verdict was not a real review — the judge output was '
-                    'unparseable. Investigate the judge LLM/CLI output before '
-                    'trusting subsequent verdicts.'
-                ),
-            }],
+            findings=[_legacy_phantom_finding()],
         )
         assert is_phantom_verdict(verdict) is True
 
@@ -856,18 +851,7 @@ class TestIsPhantomVerdict:
             run_id='run-moderate-lookalike',
             reviewed_at=datetime.now(UTC),
             severity=VerdictSeverity.moderate,
-            findings=[{
-                'issue': (
-                    'Judge response could not be parsed: Expecting value: '
-                    'line 1 column 1 (char 0)'
-                ),
-                'severity': 'serious',
-                'recommendation': (
-                    'This verdict was not a real review — the judge output was '
-                    'unparseable. Investigate the judge LLM/CLI output before '
-                    'trusting subsequent verdicts.'
-                ),
-            }],
+            findings=[_legacy_phantom_finding()],
         )
         assert is_phantom_verdict(verdict) is False
 
@@ -880,14 +864,7 @@ class TestIsPhantomVerdict:
             reviewed_at=datetime.now(UTC),
             severity=VerdictSeverity.serious,
             findings=[
-                {
-                    'issue': (
-                        'Judge response could not be parsed: Expecting value: '
-                        'line 1 column 1 (char 0)'
-                    ),
-                    'severity': 'serious',
-                    'recommendation': 'This verdict was not a real review …',
-                },
+                _legacy_phantom_finding(),
                 {
                     'issue': 'A second, genuine content finding',
                     'severity': 'serious',
@@ -1098,37 +1075,15 @@ async def test_error_trend_phantom_serious_alone_does_not_halt(mock_journal):
     )
     judge = Judge(config=config, journal=mock_journal)
 
-    marked_finding = {
-        'issue': 'Judge response could not be parsed: boom',
-        'severity': 'serious',
-        'code': 'unparseable_judge_response',
-        'recommendation': (
-            'This verdict was not a real review — the judge output was '
-            'unparseable. Investigate the judge LLM/CLI output before '
-            'trusting subsequent verdicts.'
-        ),
-    }
-    legacy_finding = {
-        'issue': (
-            'Judge response could not be parsed: Expecting value: '
-            'line 1 column 1 (char 0)'
-        ),
-        'severity': 'serious',
-        'recommendation': (
-            'This verdict was not a real review — the judge output was '
-            'unparseable. Investigate the judge LLM/CLI output before '
-            'trusting subsequent verdicts.'
-        ),
-    }
     verdicts = _make_verdicts(
         ['serious'] * 6,
         findings_by_index={
-            0: [marked_finding],
-            1: [legacy_finding],
-            2: [marked_finding],
-            3: [legacy_finding],
-            4: [marked_finding],
-            5: [legacy_finding],
+            0: [_marked_phantom_finding()],
+            1: [_legacy_phantom_finding()],
+            2: [_marked_phantom_finding()],
+            3: [_legacy_phantom_finding()],
+            4: [_marked_phantom_finding()],
+            5: [_legacy_phantom_finding()],
         },
     )
     await judge._check_error_trends('proj', verdicts)
@@ -1159,21 +1114,48 @@ async def test_error_trend_phantom_does_not_complete_consecutive_streak(mock_jou
     )
     judge = Judge(config=config, journal=mock_journal)
 
-    phantom_finding = {
-        'issue': 'Judge response could not be parsed: boom',
-        'severity': 'serious',
-        'code': 'unparseable_judge_response',
-        'recommendation': (
-            'This verdict was not a real review — the judge output was '
-            'unparseable. Investigate the judge LLM/CLI output before '
-            'trusting subsequent verdicts.'
-        ),
-    }
     # oldest -> newest: moderate x4, ok, moderate x2, phantom-serious
     verdicts = _make_verdicts(
         ['moderate', 'moderate', 'moderate', 'moderate', 'ok', 'moderate',
          'moderate', 'serious'],
-        findings_by_index={7: [phantom_finding]},
+        findings_by_index={7: [_marked_phantom_finding()]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_count_gate_excludes_phantoms_when_streak_passes_honestly(
+    mock_journal,
+):
+    """Isolates the COUNT gate from the streak gate. The three most-recent
+    verdicts are genuinely moderate, so the consecutive-most-recent streak
+    gate passes honestly and needs no phantom-exclusion help at all — but
+    the non-ok COUNT only reaches halt_trend_moderate_count=5 if the two
+    oldest phantom-serious verdicts are counted alongside the three
+    moderates. This is the primary failure mode task 3070 exists to fix
+    (phantoms inflating the count), and it would stay green even if the
+    exclusion were miswired to affect only the streak slice — unlike
+    test_error_trend_phantom_does_not_complete_consecutive_streak above,
+    which isolates the streak gate the same way in reverse.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: phantom-serious, phantom-serious, moderate x3
+    verdicts = _make_verdicts(
+        ['serious', 'serious', 'moderate', 'moderate', 'moderate'],
+        findings_by_index={
+            0: [_marked_phantom_finding()],
+            1: [_marked_phantom_finding()],
+        },
     )
     await judge._check_error_trends('proj', verdicts)
 
@@ -1205,18 +1187,13 @@ async def test_error_trend_phantom_minor_still_breaks_streak(mock_journal):
     # is severity='minor' — is_phantom_verdict's legacy branch requires
     # severity=serious, so this does not even classify as phantom; and even
     # if it did, 'minor' is not a _NON_OK_SEVERITIES member and must stay in
-    # the ordering either way.
-    phantom_shaped_minor_finding = {
-        'issue': (
-            'Judge response could not be parsed: Expecting value: '
-            'line 1 column 1 (char 0)'
-        ),
-        'severity': 'minor',
-        'recommendation': 'Manual review recommended',
-    }
+    # the ordering either way. The finding-level 'severity' key inside
+    # _legacy_phantom_finding() says 'serious', but is_phantom_verdict never
+    # reads it — only verdict.severity (set to 'minor' below via
+    # _make_verdicts) and the finding's 'issue'/'code' matter.
     verdicts = _make_verdicts(
         ['moderate'] * 7 + ['minor'],
-        findings_by_index={7: [phantom_shaped_minor_finding]},
+        findings_by_index={7: [_legacy_phantom_finding()]},
     )
     await judge._check_error_trends('proj', verdicts)
 
@@ -1243,21 +1220,14 @@ async def test_error_trend_logs_structured_record_when_phantoms_excluded(
     )
     judge = Judge(config=config, journal=mock_journal)
 
-    marked_finding = {
-        'issue': 'Judge response could not be parsed: boom',
-        'severity': 'serious',
-        'code': 'unparseable_judge_response',
-        'recommendation': (
-            'This verdict was not a real review — the judge output was '
-            'unparseable. Investigate the judge LLM/CLI output before '
-            'trusting subsequent verdicts.'
-        ),
-    }
     # oldest -> newest: moderate, moderate, phantom-serious, phantom-serious
     # (run-2, run-3 per _make_verdicts' f'run-{i}' naming).
     verdicts = _make_verdicts(
         ['moderate', 'moderate', 'serious', 'serious'],
-        findings_by_index={2: [marked_finding], 3: [marked_finding]},
+        findings_by_index={
+            2: [_marked_phantom_finding()],
+            3: [_marked_phantom_finding()],
+        },
     )
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
@@ -1275,6 +1245,10 @@ async def test_error_trend_logs_structured_record_when_phantoms_excluded(
     assert getattr(record, 'project_id', None) == 'proj'
     assert getattr(record, 'excluded_count', None) == 2
     assert set(getattr(record, 'excluded_run_ids', [])) == {'run-2', 'run-3'}
+    # The two moderates (run-0, run-1) are the only genuine evidence left
+    # after excluding the two phantoms — pins that remaining_verdicts
+    # describes the surviving evidence, not e.g. the pre-exclusion total.
+    assert getattr(record, 'remaining_verdicts', None) == 2
 
 
 @pytest.mark.asyncio
@@ -1313,26 +1287,13 @@ class TestPhantomVerdictAnchors:
         persisted issue text; the marked shape additionally carries the
         structured code key task 2947 started stamping.
         """
-        legacy_finding = {
-            'issue': (
-                'Judge response could not be parsed: Expecting value: '
-                'line 1 column 1 (char 0)'
-            ),
-            'severity': 'serious',
-            'recommendation': (
-                'This verdict was not a real review — the judge output was '
-                'unparseable. Investigate the judge LLM/CLI output before '
-                'trusting subsequent verdicts.'
-            ),
-        }
-        marked_finding = {**legacy_finding, 'code': 'unparseable_judge_response'}
         anchors = [
-            ('e87d8e4a', datetime(2026, 7, 20, tzinfo=UTC), legacy_finding),
-            ('09d14a75', datetime(2026, 7, 22, tzinfo=UTC), legacy_finding),
-            ('d741ffe3', datetime(2026, 7, 23, tzinfo=UTC), marked_finding),
-            ('33581299', datetime(2026, 7, 23, tzinfo=UTC), marked_finding),
-            ('ad861d89', datetime(2026, 7, 24, tzinfo=UTC), marked_finding),
-            ('c7d84e9f', datetime(2026, 7, 25, tzinfo=UTC), marked_finding),
+            ('e87d8e4a', datetime(2026, 7, 20, tzinfo=UTC), _legacy_phantom_finding()),
+            ('09d14a75', datetime(2026, 7, 22, tzinfo=UTC), _legacy_phantom_finding()),
+            ('d741ffe3', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('33581299', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('ad861d89', datetime(2026, 7, 24, tzinfo=UTC), _marked_phantom_finding()),
+            ('c7d84e9f', datetime(2026, 7, 25, tzinfo=UTC), _marked_phantom_finding()),
         ]
         return [
             JudgeVerdict(
@@ -1344,12 +1305,11 @@ class TestPhantomVerdictAnchors:
             for run_id, reviewed_at, finding in anchors
         ]
 
-    def test_all_six_anchor_rows_classify_as_phantom(self):
-        for verdict in self._anchor_verdicts():
-            assert is_phantom_verdict(verdict) is True, (
-                f'{verdict.run_id} (reviewed_at={verdict.reviewed_at}) '
-                f'expected to classify as phantom'
-            )
+    # Per-row phantom classification for these six shapes is already pinned
+    # by TestIsPhantomVerdict (the marked and legacy-unmarked cases). The
+    # two tests below are what that class does NOT cover: the trend gates'
+    # behavior over a realistic window of exactly these six rows, and that
+    # a genuine severity=serious row still counts toward a halt.
 
     @pytest.mark.asyncio
     async def test_trend_window_of_exactly_the_six_anchors_does_not_halt(
@@ -1381,10 +1341,15 @@ class TestPhantomVerdictAnchors:
         self, mock_journal,
     ):
         """The one real severity=serious row in the live DB (bc9459b8, 5
-        substantive findings, no code key) must NOT classify as phantom,
-        and must still count as genuine non-ok evidence toward a halt when
-        paired with genuine moderates — the fix must not become a back
-        door for suppressing a real halt."""
+        substantive findings, no code key) must still count as genuine
+        non-ok evidence toward a halt when paired with genuine moderates —
+        the fix must not become a back door for suppressing a real halt.
+        (That bc9459b8's shape classifies as non-phantom is already pinned
+        at the unit level by
+        TestIsPhantomVerdict.test_genuine_serious_with_five_findings_and_no_code_is_not_phantom;
+        the halt assertion below is the stronger, behavioral proof of the
+        same property — if this verdict were mistakenly excluded as
+        phantom, the halt below would not fire.)"""
         genuine = JudgeVerdict(
             run_id='bc9459b8',
             reviewed_at=datetime.now(UTC),
@@ -1398,7 +1363,6 @@ class TestPhantomVerdictAnchors:
                 for i in range(5)
             ],
         )
-        assert is_phantom_verdict(genuine) is False
 
         config = _make_judge_config(
             halt_on_judge_serious=True,
