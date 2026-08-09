@@ -933,6 +933,123 @@ class TestRun:
             'missing/unparseable created_at' in record.message for record in caplog.records
         )
 
+    # -----------------------------------------------------------------
+    # cross_check census block (task 3897)
+    #
+    # run() issues a THIRD count_memories_by_metadata call — the
+    # flag_for_stage2 census probe — between the two `before` counts and
+    # the scroll. Mock ordering for these tests is therefore:
+    #     [before_source, before_kind, flag_for_stage2_probe, (after_source,
+    #      after_kind on --apply)]
+    # -----------------------------------------------------------------
+
+    _BLIND_SPOT_MSG = 'flag_for_stage2'
+
+    def _blind_spot_warnings(self, caplog) -> list:
+        """Return the WARNING records that are the blind-spot warning."""
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'sweep_orphan_flag_markers'
+            and self._BLIND_SPOT_MSG in r.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cross_check_reports_blind_spot_on_live_dark_factory_shape(self, caplog):
+        """The live 2026-08-09 dark_factory shape: the source enumeration
+        matches 0 while 61 flag_for_stage2 records exist -> blind_spot True.
+
+        This is the exact false all-clear task 3897 exists to make loud:
+        before.total_source == 0 makes backlog_verdict hold unconditionally,
+        so without this block the run reads as a clean bill of health.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[0, 0, 61])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        }
+
+        # The probe must use the boolean-typed adjacent filter and the same
+        # project as the sweep — a probe against a different project would
+        # compare two unrelated populations.
+        probe_call = memory_service.count_memories_by_metadata.call_args_list[2]
+        assert probe_call.kwargs['filters'] == {'flag_for_stage2': True}
+        assert probe_call.kwargs['project_id'] == 'dark_factory'
+
+        warnings = self._blind_spot_warnings(caplog)
+        assert warnings, (
+            'Expected a blind-spot WARNING, got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+        # The warning must name BOTH counts, or an operator cannot tell how
+        # large the unseen population is.
+        text = warnings[0].getMessage()
+        assert '0' in text and '61' in text
+
+    @pytest.mark.asyncio
+    async def test_cross_check_no_blind_spot_when_enumeration_sees_its_pool(self, caplog):
+        """A non-zero source enumeration is not a blind spot, even when an
+        adjacent flag_for_stage2 population also exists.
+
+        Both pools being non-empty is the healthy steady state; warning here
+        would make the signal noise.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3, 61])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'), _member('v2'), _member('v3'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': 61,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_cross_check_true_no_op_is_not_a_blind_spot(self, caplog):
+        """Nothing enumerated AND nothing adjacent is a genuine no-op.
+
+        This is the case that must stay silent, or every clean run warns and
+        operators learn to ignore the warning.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[0, 0, 0])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 0,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
 
 # ===========================================================================
 # Tests: targeted correction (--delete-ids)
