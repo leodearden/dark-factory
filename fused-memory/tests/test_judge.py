@@ -1296,6 +1296,125 @@ async def test_error_trend_no_log_when_no_phantoms_excluded(mock_journal, caplog
     assert excluded == []
 
 
+class TestPhantomVerdictAnchors:
+    """Acceptance regression (expected green on arrival, following the
+    precedent of task 3067's commit 17ce3e3124): the six dated rows named
+    in task 3070's evidence table (a read-only inspection of the live
+    judge_verdicts table), reconstructed with their verbatim persisted
+    findings payloads rather than a guessed approximation of them.
+    """
+
+    @staticmethod
+    def _anchor_verdicts() -> list[JudgeVerdict]:
+        """The six phantom rows dated in the task's evidence table: the
+        pre-2947 unmarked legacy shape (e87d8e4a 07-20, 09d14a75 07-22) and
+        the post-2947 code-marked shape (d741ffe3 / 33581299 07-23,
+        ad861d89 07-24, c7d84e9f 07-25). Both shapes share the same
+        persisted issue text; the marked shape additionally carries the
+        structured code key task 2947 started stamping.
+        """
+        legacy_finding = {
+            'issue': (
+                'Judge response could not be parsed: Expecting value: '
+                'line 1 column 1 (char 0)'
+            ),
+            'severity': 'serious',
+            'recommendation': (
+                'This verdict was not a real review — the judge output was '
+                'unparseable. Investigate the judge LLM/CLI output before '
+                'trusting subsequent verdicts.'
+            ),
+        }
+        marked_finding = {**legacy_finding, 'code': 'unparseable_judge_response'}
+        anchors = [
+            ('e87d8e4a', datetime(2026, 7, 20, tzinfo=UTC), legacy_finding),
+            ('09d14a75', datetime(2026, 7, 22, tzinfo=UTC), legacy_finding),
+            ('d741ffe3', datetime(2026, 7, 23, tzinfo=UTC), marked_finding),
+            ('33581299', datetime(2026, 7, 23, tzinfo=UTC), marked_finding),
+            ('ad861d89', datetime(2026, 7, 24, tzinfo=UTC), marked_finding),
+            ('c7d84e9f', datetime(2026, 7, 25, tzinfo=UTC), marked_finding),
+        ]
+        return [
+            JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=reviewed_at,
+                severity=VerdictSeverity.serious,
+                findings=[finding],
+            )
+            for run_id, reviewed_at, finding in anchors
+        ]
+
+    def test_all_six_anchor_rows_classify_as_phantom(self):
+        for verdict in self._anchor_verdicts():
+            assert is_phantom_verdict(verdict) is True, (
+                f'{verdict.run_id} (reviewed_at={verdict.reviewed_at}) '
+                f'expected to classify as phantom'
+            )
+
+    @pytest.mark.asyncio
+    async def test_trend_window_of_exactly_the_six_anchors_does_not_halt(
+        self, mock_journal,
+    ):
+        """A trend window containing exactly the six dated phantom rows —
+        the real shape of the live judge_verdicts table before this fix,
+        which independently satisfies both the streak gate (all six are
+        severity=serious) and the count gate (6 >= a count of 5) on raw
+        severity alone — must not halt."""
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=5,
+            halt_trend_consecutive_required=3,
+            # Wide enough to span the anchors' real dated timestamps from
+            # "now" without the window gate discarding them — this test is
+            # about the phantom filter, not the window gate.
+            halt_trend_window_hours=24.0 * 365,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+
+        await judge._check_error_trends('proj', self._anchor_verdicts())
+
+        assert not judge.is_halted('proj')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_bc9459b8_is_not_phantom_and_still_counts_toward_halt(
+        self, mock_journal,
+    ):
+        """The one real severity=serious row in the live DB (bc9459b8, 5
+        substantive findings, no code key) must NOT classify as phantom,
+        and must still count as genuine non-ok evidence toward a halt when
+        paired with genuine moderates — the fix must not become a back
+        door for suppressing a real halt."""
+        genuine = JudgeVerdict(
+            run_id='bc9459b8',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+        assert is_phantom_verdict(genuine) is False
+
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=3,
+            halt_trend_consecutive_required=3,
+            halt_trend_window_hours=24.0,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+        verdicts = [*_make_verdicts(['moderate', 'moderate']), genuine]
+
+        await judge._check_error_trends('proj', verdicts)
+
+        assert judge.is_halted('proj')
+        mock_journal.set_halt.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_grace_cycles_suppress_trend_check(mock_journal):
     """After unhalt seeds grace, trend check is skipped until grace is consumed."""
