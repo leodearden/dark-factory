@@ -33,7 +33,7 @@ class TestDeleteMemoryIdAlias:
         """Mock MemoryService for tool registration."""
         svc = AsyncMock()
         svc.delete_memory = AsyncMock(
-            return_value={'status': 'deleted', 'store': 'mem0', 'id': 'm1'}
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': '00000000-0000-4000-8000-00000000000a'}
         )
         return svc
 
@@ -47,11 +47,11 @@ class TestDeleteMemoryIdAlias:
         """Calling with `id` delegates to memory_service.delete_memory(memory_id=...)."""
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'
         assert call_kwargs.get('store') == 'mem0'
         assert call_kwargs.get('project_id') == 'dark_factory'
 
@@ -60,11 +60,11 @@ class TestDeleteMemoryIdAlias:
         """Backward compat: memory_id alone still calls the service correctly."""
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'memory_id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'
 
     @pytest.mark.asyncio
     async def test_neither_id_nor_memory_id_returns_validation_error(
@@ -106,8 +106,8 @@ class TestDeleteMemoryIdAlias:
         """
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'id': 'm1', 'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'id': '00000000-0000-4000-8000-00000000000a', 'memory_id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'

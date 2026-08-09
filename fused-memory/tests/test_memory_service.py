@@ -1299,7 +1299,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_graphiti(self, service):
         result = await service.delete_memory(
-            memory_id='abc-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000001', store='graphiti', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'graphiti'
@@ -1307,7 +1307,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_mem0(self, service):
         result = await service.delete_memory(
-            memory_id='xyz-456', store='mem0', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000002', store='mem0', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'mem0'
@@ -1318,9 +1318,11 @@ class TestDeleteMemory:
         because search returns edge UUIDs."""
         service.graphiti.remove_edge = AsyncMock()
         await service.delete_memory(
-            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000003', store='graphiti', project_id='test'
         )
-        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123', group_id='test')
+        service.graphiti.remove_edge.assert_called_once_with(
+            '00000000-0000-4000-8000-000000000003', group_id='test'
+        )
         service.graphiti.remove_episode.assert_not_called()
 
 
@@ -2626,7 +2628,7 @@ class TestSearchDeleteRoundtrip:
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
         from _fm_helpers import MockEdge, MockNode
 
-        edge_uuid = 'edge-roundtrip-uuid-42'
+        edge_uuid = '00000000-0000-4000-8000-000000000042'
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Payment gateway depends on billing API',

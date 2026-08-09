@@ -112,9 +112,10 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution. \
+IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+structured `ValidationError` that names the malformed id and tells you how to resolve the \
+real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
+are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
 **Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
