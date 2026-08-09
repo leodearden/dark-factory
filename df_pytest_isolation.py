@@ -85,6 +85,23 @@ copies of this harness could only ever be kept in step by a cross-checking
 test (``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` exists for
 exactly that reason).  This module is the one place BOTH already import.
 
+WHICH ROOTDIRS THE LEAK GUARD IS WIRED INTO, and why the rest are deliberately
+not.  Nine conftests import from this module; the two sibling defences above are
+in all nine, while ``_df_no_leaked_drain_processes`` is wired only into the ROOT
+conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
+exactly the two rootdirs that spawn the drain script — and they are the two the
+incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
+``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
+as their own pytest sessions from their own venvs, so the root conftest does not
+reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
+an absent token, so those sessions report all-clear unconditionally rather than
+falsely.  That is a real gap, not a proof of safety: ``orchestrator`` is the one
+to watch, since ``orchestrator/src/orchestrator/service_restart.py`` is the
+PRODUCTION caller of the drain script and its tests today only assert on config
+strings.  Widening the wiring is a mechanical edit to those seven files and is
+out of task 3798's locked scope; until then, read a green subproject run as
+"unmeasured", never as "no leak".
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -103,6 +120,7 @@ import math
 import os
 import signal
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -481,6 +499,10 @@ def _df_deploy_clocks_unwritten():
 # write end of the pipe is closed and the drain returns in milliseconds.
 _POST_KILL_DRAIN_SECS = 10
 
+# How long to wait for a child we have already SIGKILLed and stopped draining.
+# Short: it has been killed, so this is a reap, not a wait for work to finish.
+_ABANDONED_CHILD_REAP_SECS = 5
+
 
 # ---------------------------------------------------------------------------
 # The wait-proving grace (task 3798, fix (c))
@@ -497,6 +519,13 @@ WAIT_PROOF_GRACE_FLOOR_SECS = 30
 
 # The other side of the invariant: how long a poller that ESCAPES its kill may
 # live before its own grace expires and it exits.
+#
+# DECLARATIVE — nothing computes from it. It is the budget every value
+# wait_proof_grace_secs() returns is checked against (in the tests, which is
+# where a violation can be caught before it ships), and the number to move if
+# that budget ever needs to change. Do not add an assertion on its magnitude:
+# comparing this literal to another literal in the same file cannot fail except
+# when someone edits it, which the tests here would catch anyway.
 LEAK_SELF_TERMINATION_CEILING_SECS = 90
 
 
@@ -659,9 +688,34 @@ def run_in_new_session(
             # Give up on the output rather than on the timeout: the caller
             # asked for a bound and gets one.
             p.kill()
+            _release_abandoned_child(p)
             out, err = ('', '') if text else (b'', b'')
         raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def _release_abandoned_child(p: subprocess.Popen) -> None:
+    """Reap *p* and close its pipes after a drain we gave up on.
+
+    Reachable only from :func:`run_in_new_session`'s last-resort branch, where
+    the bounded second ``communicate()`` itself timed out. Nothing has waited on
+    the child there and nothing has closed the two pipe fds ``Popen`` opened for
+    it, so without this they survive until ``Popen.__del__`` runs — a
+    ``ResourceWarning`` plus two leaked descriptors PER OCCURRENCE, inside the
+    one module whose whole subject is spawn hygiene. And this is precisely the
+    branch taken when something is STILL holding those pipes, i.e. the one most
+    likely to repeat within a single run.
+
+    Every step is best-effort and swallowed: the caller is already on its way to
+    raising ``TimeoutExpired``, and replacing a legible timeout with a cleanup
+    error would hide the thing the caller actually needs to see.
+    """
+    with contextlib.suppress(Exception):
+        p.wait(timeout=_ABANDONED_CHILD_REAP_SECS)
+    for stream in (p.stdout, p.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
 
 
 def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
@@ -681,6 +735,87 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         p.kill()
+
+
+# ---------------------------------------------------------------------------
+# Shared probes for the containment tests (task 3798)
+# ---------------------------------------------------------------------------
+#
+# Three test modules prove "a timeout reaches the grandchild too", one per
+# spawner plus this module's own. They need the same three things: a script that
+# forks a survivor, a way to learn that survivor's pid, and a way to wait for it
+# to die. Those live HERE for exactly the reason `run_in_new_session` does —
+# `tests/scripts/` and `scripts/tests/` cannot import each other's test modules,
+# so a copy in each is a copy that can only be kept in step by hand. Centralising
+# the spawn while leaving its probes triplicated would just move the "which of
+# the copies did I fix" hazard (task 3336;
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim) one function over.
+#
+# The PIPE-HOLDING variant is deliberately NOT here: it is a probe for this
+# module's own bounded drain and has exactly one caller.
+
+# PIPE-CLOSING: the background child redirects its stdio away from the pipes it
+# inherited, so nothing holds their write ends open. That is load-bearing for
+# the two tests that drive the REAL spawners — it makes their assertions depend
+# only on "is the grandchild alive", never on what a spawner does after its
+# kill. Requires LEAK_PIDFILE in the child env.
+PIPE_CLOSING_LEAKER_SRC = '''\
+sleep 300 >/dev/null 2>&1 &
+echo $! > "$LEAK_PIDFILE"
+echo MAIN_UP
+sleep 300
+'''
+
+
+def read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
+    """Poll until the leaker has recorded its grandchild's pid, then return it.
+
+    Polls rather than reading once: the file is created by a ``>`` redirection
+    and filled by a separate write, so a single read can catch it empty.
+
+    Fails the calling test if the pid never appears, and says so in those terms
+    — a harness that never spawned proves nothing either way about containment,
+    and must not be mistaken for a leak that was cleaned up.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = Path(pidfile).read_text().strip()
+        except OSError:
+            text = ''
+        if text.isdigit():
+            return int(text)
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f'the leaker never recorded a pid in {pidfile} within {timeout}s '
+                f'(last read: {text!r}); the harness is broken, which says nothing '
+                'either way about process-group containment.',
+                pytrace=False,
+            )
+        time.sleep(0.05)
+
+
+def pid_is_gone(pid: int) -> bool:
+    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # Alive and owned by someone else — a pid the kernel already recycled.
+        return False
+    return False
+
+
+def wait_pid_gone(pid: int, *, timeout: float = 3.0) -> bool:
+    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if pid_is_gone(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +899,33 @@ def leaked_drain_processes(
     return leaks
 
 
+def _still_the_drain(
+    pid: int, *, proc_root: str | os.PathLike[str] = Path('/proc'),
+) -> bool:
+    """Whether *pid* is STILL a live drain-script process, re-read right now.
+
+    Called immediately before signalling, never inferred from an earlier sweep.
+    A pid captured during a ``/proc`` scan is stale the instant that scan ends:
+    the process can exit and the kernel can hand its number to something
+    unrelated before the signal lands. Signalling a recycled pid is task 845's
+    failure, recorded in ``shared/src/shared/proc_group.py`` — reached there via
+    ``os.getpgid`` rather than a scan, but the staleness is identical and what
+    it took out was the user's entire ``systemd --user`` login session.
+
+    Checks the MARKER only, deliberately, so both callers can share it: the
+    fixture already established the token during its sweep, while the end-to-end
+    test's reaper is looking at a NESTED session's process and cannot know that
+    session's token at all. The marker is in any case the property that makes a
+    process worth killing — a recycled pid that is somehow also running the
+    drain script is a leak on its own terms.
+    """
+    try:
+        cmdline = (Path(proc_root) / str(pid) / 'cmdline').read_bytes()
+    except OSError:
+        return False
+    return DRAIN_SCRIPT_CMDLINE_MARKER.encode() in cmdline
+
+
 def leaked_drain_process_reason(leaks: list[tuple[int, str]]) -> str | None:
     """Explain which drain processes this run leaked, or ``None`` if it did not.
 
@@ -826,6 +988,23 @@ def _df_no_leaked_drain_processes():
     A failure raised in teardown surfaces as a run-level ERROR with a non-zero
     exit code even when every test passed.  That is the intended loudness: the
     damage is to the box, not to any one test's result.
+
+    KNOWN LIMIT, and it is a real one: this is a BACKSTOP, not the defence.  The
+    sweep happens exactly once, at session teardown, so it can only see leaks
+    still ALIVE at that moment.  :func:`wait_proof_grace_secs` — landed in the
+    same task — caps a leaked poller's life at
+    :data:`LEAK_SELF_TERMINATION_CEILING_SECS`, so on a multi-minute suite a
+    process leaked early self-terminates long before teardown and this guard
+    reports all-clear.  The effective detection window is roughly the last
+    ``LEAK_SELF_TERMINATION_CEILING_SECS`` of a run.  That interaction is
+    deliberate and the right trade — a leak that dies in 90s is not the
+    incident; the 27.8h survivor that outlived pytest's tmpdir GC and restarted
+    REAL units was — but it means a green run is NOT proof that nothing leaked.
+    :func:`run_in_new_session` is the primary defence, and the two behavioural
+    tests that drive the real spawners are what actually pin it.  Making
+    detection continuous (sampling from ``pytest_runtest_teardown``) would close
+    the window at the cost of a /proc sweep per test across ~90 spawning files
+    times every xdist worker; it has not been measured and is not in scope here.
     """
     token = uuid.uuid4().hex
     prior = os.environ.get(LEAK_TOKEN_ENV)
@@ -843,6 +1022,11 @@ def _df_no_leaked_drain_processes():
         reason = leaked_drain_process_reason(leaks)
         if reason is not None:
             for pid, _cmdline in leaks:
+                # Re-read /proc before signalling: the sweep above is already
+                # in the past, and a pid that exited since then may have been
+                # recycled onto something unrelated.
+                if not _still_the_drain(pid):
+                    continue
                 # The pid, never os.killpg(pid, ...): a leaked process is by
                 # definition one whose spawner did NOT put it in a session of
                 # its own, so its pid is not necessarily a pgid and signalling
