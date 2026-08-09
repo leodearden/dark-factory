@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import FakeMetadataBackend
 
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -35,6 +36,8 @@ class _Fixture:
     invoke_called: list[bool]
     event_emit: MagicMock
     build_architect_prompt: AsyncMock
+    # Opt-in merge-faithful backend (task 3579); None unless the test passed one.
+    metadata_backend: FakeMetadataBackend | None = None
 
 
 def _make(
@@ -55,6 +58,7 @@ def _make(
     task_metadata: dict | None = None,
     modules: list[str] | None = None,
     create_plan_files_on_disk: bool = True,
+    metadata_backend: FakeMetadataBackend | None = None,
 ) -> _Fixture:
     if plan_files is None:
         plan_files = ['mod_a/file.py']
@@ -123,6 +127,22 @@ def _make(
     scheduler.set_task_status = AsyncMock()
     scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
     scheduler.update_task = update_task
+    if metadata_backend is not None:
+        # Keep the MagicMock scheduler (so every other auto-mocked attribute
+        # still works) but route the three metadata-bearing methods through the
+        # merge-faithful backend, seeded from the same blob the workflow starts
+        # with in memory — as production is at dispatch time.
+        metadata_backend.blob = {
+            **dict(task_metadata or {}), **metadata_backend.blob,
+        }
+        metadata_backend.blast_radius_result = blast_radius_grants
+        handle_blast_radius_expansion = AsyncMock(
+            side_effect=metadata_backend.handle_blast_radius_expansion,
+        )
+        update_task = AsyncMock(side_effect=metadata_backend.update_task)
+        scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+        scheduler.update_task = update_task
+        scheduler.get_task = AsyncMock(side_effect=metadata_backend.get_task)
 
     get_main_sha = AsyncMock(return_value=new_main_sha)
     get_changed_files = AsyncMock(return_value=changed_files)
@@ -171,6 +191,7 @@ def _make(
         invoke_called=invoke_called,
         event_emit=event_emit,
         build_architect_prompt=briefing.build_architect_prompt,
+        metadata_backend=metadata_backend,
     )
 
 

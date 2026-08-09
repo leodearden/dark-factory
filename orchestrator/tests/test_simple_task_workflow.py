@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import FakeMetadataBackend
 from shared.cli_invoke import AgentResult
 
 from orchestrator.artifacts import TaskArtifacts
@@ -25,6 +26,8 @@ class _Fixture:
     update_task: AsyncMock
     invocation_count: list[int]
     event_emit: MagicMock
+    # Opt-in merge-faithful backend (task 3579); None unless the test passed one.
+    metadata_backend: FakeMetadataBackend | None = None
 
 
 def _make_result(
@@ -62,6 +65,8 @@ def _make(
     write_unactionable: bool = False,
     blast_radius_grants: bool = True,
     task_metadata: dict | None = None,
+    modules: list[str] | None = None,
+    metadata_backend: FakeMetadataBackend | None = None,
 ) -> _Fixture:
     worktree.mkdir(parents=True, exist_ok=True)
     project_root.mkdir(parents=True, exist_ok=True)
@@ -69,15 +74,20 @@ def _make(
     artifacts = TaskArtifacts(worktree)
     artifacts.init(task_id, 'Document foo', 'd', base_commit='base123')
 
+    # `files` first so a caller-supplied task_metadata CAN override it (task
+    # 3579 needs to seed a dispatch-time files list); the three existing
+    # task_metadata= callers pass routing/complexity only, never files.
+    task_md = {'files': ['mod_a/foo.py'], **(task_metadata or {})}
+
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {
         'id': task_id,
         'title': 'Document foo',
         'description': 'Add a docstring to foo.',
-        'metadata': {**(task_metadata or {}), 'files': ['mod_a/foo.py']},
+        'metadata': task_md,
     }
-    assignment.modules = ['mod_a']
+    assignment.modules = list(modules) if modules is not None else ['mod_a']
 
     _spec = pydantic_spec(OrchestratorConfig)
     config = MagicMock(spec_set=_spec)
@@ -96,6 +106,20 @@ def _make(
     scheduler.set_task_status = AsyncMock()
     scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
     scheduler.update_task = update_task
+    if metadata_backend is not None:
+        # Keep the MagicMock scheduler (so every other auto-mocked attribute
+        # still works) but route the three metadata-bearing methods through the
+        # merge-faithful backend, seeded from the same blob the workflow starts
+        # with in memory — as production is at dispatch time.
+        metadata_backend.blob = {**dict(task_md), **metadata_backend.blob}
+        metadata_backend.blast_radius_result = blast_radius_grants
+        handle_blast_radius_expansion = AsyncMock(
+            side_effect=metadata_backend.handle_blast_radius_expansion,
+        )
+        update_task = AsyncMock(side_effect=metadata_backend.update_task)
+        scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+        scheduler.update_task = update_task
+        scheduler.get_task = AsyncMock(side_effect=metadata_backend.get_task)
 
     git_ops = MagicMock()
     git_ops.is_ancestor = AsyncMock(return_value=True)
@@ -145,6 +169,7 @@ def _make(
         update_task=update_task,
         invocation_count=invocation_count,
         event_emit=event_emit,
+        metadata_backend=metadata_backend,
     )
 
 
