@@ -15,11 +15,6 @@ exists to end, reintroduced one layer up.
 
 from __future__ import annotations
 
-import importlib
-from types import ModuleType
-
-import pytest
-from _cross_account_evidence import PAIR_OVERRIDE_VAR
 from _oauth_accounts import (
     ALL_TOKEN_LETTERS,
     FLEET_TOKEN_LETTERS,
@@ -34,51 +29,6 @@ def _env(*letters: str, **extra: str) -> dict[str, str]:
     environ = {f'CLAUDE_OAUTH_TOKEN_{ch}': f'tok-{ch.lower()}' for ch in letters}
     environ.update(extra)
     return environ
-
-
-@pytest.fixture
-def reload_module_under_env(monkeypatch):
-    """Reload a consumer module under a controlled fake environ.
-
-    Yields ``reload(module_name, **tokens)`` -> the reloaded module.  Every
-    ``CLAUDE_OAUTH_TOKEN_*`` letter and the pair-override var are cleared first,
-    so the machine's real ``.env`` (which has A..G all set) cannot leak in and
-    make these assertions environment-dependent.  Neither the letter set nor the
-    override var name is restated here: both are imported from the module that
-    owns them, so this fixture cannot become the next drifting copy.
-
-    Generalised from ``test_cross_account_evidence.py``'s
-    ``reload_integration_module``, which is pinned to the pair-selection concern;
-    one fixture here serves ``test_usage_gate``, ``test_cli_invoke_integration``
-    and ``test_startup_completion_fixtures``.  That original still exists, and
-    only because collapsing the two means hoisting this one into ``conftest.py``
-    — outside task 3700's lock set, so filed as follow-up rather than done here.
-
-    Reloading mutates the module object other collected items may hold, so on
-    teardown the real environment is restored (``monkeypatch.undo()`` FIRST,
-    since this fixture finalises BEFORE monkeypatch's own teardown) and every
-    module touched is reloaded once more under it — no reload side effect
-    escapes to other collected items.
-    """
-    reloaded: list[ModuleType] = []
-
-    def _reload(module_name: str, **tokens: str) -> ModuleType:
-        module = importlib.import_module(module_name)
-        if module not in reloaded:
-            reloaded.append(module)
-        for ch in ALL_TOKEN_LETTERS:
-            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
-        monkeypatch.delenv(PAIR_OVERRIDE_VAR, raising=False)
-        for name, value in tokens.items():
-            monkeypatch.setenv(name, value)
-        return importlib.reload(module)
-
-    try:
-        yield _reload
-    finally:
-        monkeypatch.undo()
-        for module in reloaded:
-            importlib.reload(module)
 
 
 class TestLetterSets:
