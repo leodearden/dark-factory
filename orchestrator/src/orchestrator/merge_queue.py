@@ -10187,6 +10187,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
+    #
+    # TASK-3206 SWEEP OUTCOME (recorded here so the evidence behind the §5.3
+    # ADVISORY verdict is discoverable from the code, not only from the task
+    # record — cf. the task-3204 sweep note convention).
+    #
+    # Swept `ε=1890 §5.3 guard` across all SEVEN orchestrator-* units over the
+    # full journald retention window.  4 hits, all on orchestrator-reify, all
+    # verify_depth=1; ZERO hits on the other six units.  Every hit classified,
+    # ZERO unexplained:
+    #   class (b) — `_remerge`-by-construction (2 hits):
+    #       2026-08-07 02:36:52  task 6063  base 4485bf77 / expected d8081962
+    #       2026-08-07 12:11:29  task 6067  base e2aeeb7e / expected 42847642
+    #     each preceded seconds earlier by "dead-base straggler at dispatch —
+    #     re-merging".  ELIMINATED BY CONSTRUCTION from this task onward via
+    #     the PRD §5.3 re-merge carve-out (`remerge_recovery`).
+    #   class (a) — task-3082 stranded/phantom finalize head (2 hits):
+    #       2026-08-08 00:09:07  task 5687  base 9d08d3d3 / expected 95908e44
+    #       2026-08-08 01:35:00  task 5830  base 2b903602 / expected 95908e44
+    #     same phantom expected-tip across 86 minutes; in BOTH the item's base
+    #     was the LIVE MAIN TIP and 5687 subsequently PASSED and LANDED.
+    #   class (c) — stale `_last_known_main_sha` false positives: ZERO, and
+    #     structurally excluded: the dispatch guard uses its OWN freshly-
+    #     fetched get_main_sha() and writes it into the cache, so task 2357's
+    #     defect only ever reached the snapshot surface, never that call site.
+    #   class (d) — genuine §5.3 violations: ZERO.
+    # Zero hits fleet-wide in the ~31h after task 3082 landed (e85124dd31,
+    # 2026-08-08 06:55).
+    #
+    # CONSEQUENCE FOR THE NEXT SWEEP: with class (b) gone by construction and
+    # class (c) structurally excluded, ANY future hit is either class (a) (a
+    # 3082-style phantom head) or a genuine class (d) — a materially sharper
+    # signal than the 4-hour journal archaeology this classification required.
+    #
+    # The verdict itself (guard STAYS ADVISORY) lives in PRD §5.3/§10 and in
+    # _warn_if_verify_base_not_frozen_tip's docstring.  Note that class (a) is
+    # evidence the frozen-prefix DEFINITION below is the weak point — a
+    # finalize head whose verify is dead still counts as frozen — but
+    # tightening it is deliberately a SEPARATE task, not folded in here.
 
     def _frozen_inflight_entries(self) -> list[InflightEntry]:
         """Return ordered list of frozen InflightEntry objects (ε=1890).
