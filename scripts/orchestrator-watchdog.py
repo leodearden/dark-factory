@@ -894,10 +894,11 @@ def _atomic_write_json(path: str, payload: dict) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         if tmp_path is not None:
-            try:
+            # Best-effort cleanup: if the temp file cannot be removed there is
+            # nothing further to do, and raising here would mask *exc* (the
+            # actual write failure) that the log line below reports.
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
         log(f"_atomic_write_json: failed to write {path}: {exc!r}")
         return False
 

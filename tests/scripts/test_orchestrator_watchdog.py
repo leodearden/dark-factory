@@ -1304,7 +1304,7 @@ def test_newest_watched_commit_epoch_timeout_returns_none(
 # _JournalLog.warning() fail-soft swallow tests (follow-up from esc-2032-2)
 #
 # _JournalLog.warning() routes through the module-level log() helper and is
-# itself wrapped in `try/except Exception: pass` so a journald-write failure
+# itself wrapped in `contextlib.suppress(Exception)` so a journald-write failure
 # can never convert a probe's return-None contract into a raised exception.
 # These tests monkeypatch log() to raise, then force each probe into its
 # broad-except branch (where logger.warning(...) is actually invoked) and
@@ -6192,9 +6192,9 @@ def test_fm_liveness_streak_path_default(monkeypatch: pytest.MonkeyPatch) -> Non
     """
     monkeypatch.delenv("FM_LIVENESS_STREAK", raising=False)
     wdog = _load_watchdog()
-    assert wdog.FM_LIVENESS_STREAK_PATH == os.path.join(
+    assert os.path.join(
         wdog.REPO_DIR, "data", "fused-memory", "fm_liveness_streak.json"
-    )
+    ) == wdog.FM_LIVENESS_STREAK_PATH
 
 
 def test_fm_liveness_streak_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6212,9 +6212,9 @@ def test_fm_liveness_restart_clock_path_default(monkeypatch: pytest.MonkeyPatch)
     """FM_LIVENESS_RESTART_CLOCK_PATH defaults under REPO_DIR/data/fused-memory."""
     monkeypatch.delenv("FM_LIVENESS_RESTART_CLOCK", raising=False)
     wdog = _load_watchdog()
-    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH == os.path.join(
+    assert os.path.join(
         wdog.REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
-    )
+    ) == wdog.FM_LIVENESS_RESTART_CLOCK_PATH
 
 
 def test_fm_liveness_restart_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6295,7 +6295,7 @@ def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
     wdog = _load_watchdog()
     worst_observed_instance_lifetime_secs = 3180  # 53 min
     assert (
-        wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS > worst_observed_instance_lifetime_secs
+        worst_observed_instance_lifetime_secs < wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
     ), (
         f"FM_LIVENESS_RESTART_MIN_INTERVAL_SECS="
         f"{wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS} does not exceed the "
@@ -7074,7 +7074,7 @@ def test_record_fm_liveness_failure_persists_across_module_instances(
     monkeypatch.setenv("FM_LIVENESS_STREAK", str(streak_path))
 
     mod_a = _load_watchdog()
-    assert mod_a.FM_LIVENESS_STREAK_PATH == str(streak_path)
+    assert str(streak_path) == mod_a.FM_LIVENESS_STREAK_PATH
     assert mod_a._record_fm_liveness_failure("wedged") == 1
     assert json.loads(streak_path.read_text())["count"] == 1
 
