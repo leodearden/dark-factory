@@ -636,6 +636,34 @@ _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )
 
+# The four tools of the ``mcp__verdict-tools__`` server
+# (``orchestrator/src/orchestrator/mcp/verdict_tools.py:175-233``; prefix
+# registered at ``orchestrator/src/orchestrator/agents/roles.py:23``).  Calling
+# one writes the role's whole deliverable to ``verdicts/<role>.json``, so the
+# session is by construction not waiting on anything (task 3639).  The set is
+# explicit rather than a ``submit_*`` prefix rule: ``submit_task`` is called
+# mid-session to file follow-up work while a background command is genuinely
+# still running — exactly the abandonment task 2761 exists to catch — and
+# ``confirm_plan`` is excluded on the same reasoning.
+_TERMINAL_SUBMISSION_TOOLS = frozenset({
+    'submit_review_verdict', 'submit_completion_verdict',
+    'submit_triage', 'submit_merge_disposition',
+})
+
+
+def _tool_base_name(name: object) -> str:
+    """Return the segment of an MCP tool *name* after the last ``__``.
+
+    ``mcp__verdict-tools__submit_review_verdict`` → ``submit_review_verdict``;
+    a bare name passes through unchanged; a non-``str`` yields ``''``.  Matching
+    on the trailing segment keeps the terminal-submission set robust to the
+    server being renamed or the tool being exposed unprefixed, without
+    loosening WHICH names qualify.
+    """
+    if not isinstance(name, str):
+        return ''
+    return name.rsplit('__', 1)[-1]
+
 # Captures the output-file path from the CLI's background-launch tool_result
 # sentence: "... Output is being written to: /tmp/.../tasks/<id>.output. You
 # will be notified ...".  The trailing ``\.?`` strips the sentence-terminating
@@ -716,7 +744,11 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
       * a tool_use of ANY kind whose input references the background task's id
         or output-file path, as recorded in the launch's tool_result
         (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
-        written to: <path>`` sentence).
+        written to: <path>`` sentence);
+      * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
+        matched on the segment after the last ``__``) — calling one writes the
+        role's whole deliverable to ``verdicts/<role>.json``, so the session has
+        finished its job and cannot still be waiting on anything.
 
     Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
     final background-management action was a launch never followed by a
@@ -793,7 +825,9 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
                 if isinstance(inp, dict) and inp.get('run_in_background'):
                     last_launch_idx = pos
                     continue
-            elif name in _BACKGROUND_REAP_TOOLS:
+            elif name in _BACKGROUND_REAP_TOOLS or (
+                _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
+            ):
                 last_reap_idx = pos
                 continue
             # Branch order is load-bearing: launch → named reap tool →
