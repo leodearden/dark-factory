@@ -3473,3 +3473,48 @@ class TestProbeLiveOneMetrics:
         assert 'metrics' in proj
         assert proj['metrics']['retries_per_landing'] == 1.5
         assert proj['metrics']['drift_at_detection']['last'] == 3
+
+
+class TestProbeLiveOneTimeoutBudget:
+    """The live-queue probe's budget must reach client.post, not just wait_for.
+
+    Twin of ``test_merge_halt.TestProbeOneTimeoutBudget``. ``timeout=`` on
+    ``client.post`` also governs **pool acquisition** on the shared client,
+    so without threading, a probe on a 2.0s budget could still block for
+    httpx's 10s default waiting on a free connection slot.
+
+    AsyncMock rather than MockTransport deliberately: MockTransport never
+    surfaces the ``timeout`` kwarg to its handler.
+    """
+
+    @staticmethod
+    def _cold_session_responses(inner: dict, url: str) -> list[httpx.Response]:
+        responses = [
+            _init_response(),
+            httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
+            _mcp_response(inner),
+        ]
+        for resp in responses:
+            resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
+        return responses
+
+    @pytest.mark.asyncio
+    async def test_budget_reaches_every_post(self, _clean_live_sessions):
+        from unittest.mock import AsyncMock
+
+        from dashboard.data.merge_queue import _probe_live_one
+
+        url = 'http://127.0.0.1:8200'
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = self._cold_session_responses(
+            _snapshot([]), url,
+        )
+
+        result = await _probe_live_one(mock_client, url, 0.05)
+
+        assert result['reachable'] is True, f'probe should have succeeded: {result}'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [0.05, 0.05, 0.05], (
+            f"the probe budget must reach every post, not httpx's 10s "
+            f'default, got {timeouts}'
+        )
