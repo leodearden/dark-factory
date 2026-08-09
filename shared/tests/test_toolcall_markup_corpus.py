@@ -591,6 +591,179 @@ class TestExtractorRobustness:
 
 
 # ---------------------------------------------------------------------------
+# Unreadable FILES (step 16/17). Distinct from the corrupt LINES above, and the
+# split between the two is a contract, not an implementation detail.
+# ---------------------------------------------------------------------------
+
+#: One well-formed transcript, gzipped, as raw bytes — the base every
+#: corruption below is derived from, so each case differs in exactly one way.
+_GOOD_GZ_BYTES = gzip.compress(
+    (
+        json.dumps(_tool_use('toolu_good', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT}))
+        + '\n'
+    ).encode('utf-8')
+)
+
+#: A transcript carrying a raw non-UTF-8 byte INSIDE a tool_use argument. Under
+#: ``errors='replace'`` this decodes to a U+FFFD and parses, so the specimen
+#: enters the corpus with a replacement character standing in for real harness
+#: output. Strict decoding is what makes it an unreadable FILE instead.
+_UNDECODABLE_GZ_BYTES = gzip.compress(
+    json.dumps(
+        _tool_use('toolu_undecodable', 'submit_task', {'title': 'PLACEHOLDER', 'description': _TOTAL_DRIFT})
+    ).encode('utf-8').replace(b'PLACEHOLDER', b't\xff') + b'\n'
+)
+
+#: The four shapes ``legibility.inventory.as_unreadable_file_error`` normalizes:
+#: bad magic (gzip.BadGzipFile), a truncated stream (EOFError), a corrupt body
+#: (zlib.error), and an undecodable byte (UnicodeDecodeError). All four are what
+#: a fire-and-forget writer produces when a unit is killed mid-write or a file
+#: is read while still being compressed — the archive is live-written AND
+#: concurrently pruned by scripts/gc_agent_transcripts.py, so these are expected
+#: states, not theoretical ones.
+_UNREADABLE_SHAPES = {
+    'truncated_stream': _GOOD_GZ_BYTES[:-5],
+    'bad_magic': b'plain text that was never gzipped at all\n',
+    'corrupt_body': (
+        _GOOD_GZ_BYTES[:12] + bytes([_GOOD_GZ_BYTES[12] ^ 0xFF]) + _GOOD_GZ_BYTES[13:]
+    ),
+    'undecodable_byte': _UNDECODABLE_GZ_BYTES,
+}
+
+
+class TestUnreadableFilesAreSkippedAndCounted:
+    """An unreadable transcript must be SKIPPED and REPORTED, never fatal.
+
+    Measured first-hand before this class was written: three of the four shapes
+    below abort the whole walk today (``EOFError``, ``gzip.BadGzipFile``,
+    ``zlib.error``) because gzip decompresses LAZILY at read time, so the
+    failure lands outside every existing handler. The fourth is worse than
+    fatal — ``errors='replace'`` silently turns a corrupt byte into U+FFFD and
+    commits it to the corpus as if it were real harness output.
+
+    One bad leaf must not cost the other 5688 files, and a run that loses files
+    must be distinguishable from a clean one.
+    """
+
+    @pytest.mark.parametrize('shape', sorted(_UNREADABLE_SHAPES))
+    def test_a_bad_leaf_does_not_cost_the_good_leaf_beside_it(self, tmp_path, shape):
+        root = tmp_path / 'agent-transcripts'
+        _write_transcript(
+            _archive_leaf(root, '2474', 'good'),
+            [_tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})],
+        )
+        bad = _archive_leaf(root, '2475', 'bad')
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(_UNREADABLE_SHAPES[shape])
+
+        records = extract.extract(root)
+
+        assert [r['tool_use_id'] for r in records] == ['toolu_01']
+
+    def test_an_undecodable_byte_is_skipped_not_silently_replaced(self, tmp_path):
+        """(d) A U+FFFD inside a stored specimen would be a fabricated value.
+
+        The corpus is evidence about what the harness really emitted. A
+        replacement character committed as if it were harness output is exactly
+        the fabrication the D5 invariant exists to rule out on the repair side,
+        so the honest answer is to count the FILE as unreadable and drop it.
+        """
+        root = tmp_path / 'agent-transcripts'
+        bad = _archive_leaf(root, '2474', 'bad')
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(_UNDECODABLE_GZ_BYTES)
+        _write_transcript(
+            _archive_leaf(root, '2475', 'good'),
+            [_tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})],
+        )
+
+        records = extract.extract(root)
+
+        assert [r['tool_use_id'] for r in records] == ['toolu_01']
+        assert not any('�' in json.dumps(record) for record in records)
+
+    @pytest.mark.parametrize('shape', sorted(_UNREADABLE_SHAPES))
+    def test_the_skip_is_counted_and_names_the_path(self, tmp_path, shape):
+        """(e) LOUD, not silent — a run that loses files says which ones.
+
+        A skip nobody can see is the silent degradation the shared ratchet and
+        the project's loud-over-silent norm both exist to prevent: the corpus
+        would just quietly shrink.
+        """
+        root = tmp_path / 'agent-transcripts'
+        _write_transcript(
+            _archive_leaf(root, '2474', 'good'),
+            [_tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})],
+        )
+        bad = _archive_leaf(root, '2475', 'bad')
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(_UNREADABLE_SHAPES[shape])
+
+        report = extract.WalkReport()
+        extract.extract(root, report=report)
+
+        assert report.files_walked == 2
+        assert report.files_read == 1
+        assert [path for path, _ in report.unreadable] == [str(bad)]
+        # the normalized message survives, so the disclosed skip still says
+        # WHICH shape it was rather than just that something went wrong
+        assert report.unreadable[0][1]
+
+    def test_the_skip_is_also_logged_at_warning(self, tmp_path, caplog):
+        root = tmp_path / 'agent-transcripts'
+        bad = _archive_leaf(root, '2474', 'bad')
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(_UNREADABLE_SHAPES['truncated_stream'])
+
+        with caplog.at_level('WARNING'):
+            extract.extract(root)
+
+        assert any(str(bad) in record.getMessage() for record in caplog.records)
+
+    def test_a_run_with_zero_readable_files_is_loud_and_writes_nothing(self, tmp_path):
+        """(e) An all-unreadable archive must not emit an empty corpus.
+
+        Same failure shape the existing zero-files-walked guard covers, one
+        level in: files were found, so that guard passes, and without this one
+        the run would overwrite the committed corpus with an empty file and
+        exit 0.
+        """
+        root = tmp_path / 'agent-transcripts'
+        for index, data in enumerate(sorted(_UNREADABLE_SHAPES.values())):
+            leaf = _archive_leaf(root, '247' + str(index), 'bad')
+            leaf.parent.mkdir(parents=True, exist_ok=True)
+            leaf.write_bytes(data)
+        out = tmp_path / 'corpus.jsonl'
+
+        assert extract.main(['--archive-root', str(root), '--out', str(out)]) == 1
+        assert not out.exists()
+
+    def test_a_corrupt_trailing_line_is_not_an_unreadable_file(self, tmp_path):
+        """(f) The line/file split, pinned from the side that must NOT alarm.
+
+        Every fire-and-forget writer eventually produces a truncated trailing
+        line. Counting that as an unreadable file would inflate the alarm until
+        nobody reads it, which is how a real loss gets missed.
+        """
+        root = tmp_path / 'agent-transcripts'
+        leaf = _archive_leaf(root, '2474', 'aaaa')
+        leaf.parent.mkdir(parents=True, exist_ok=True)
+        good = json.dumps(
+            _tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})
+        )
+        with gzip.open(leaf, 'wt', encoding='utf-8') as handle:
+            handle.write(good + '\n')
+            handle.write('{"type": "assistant", "tool_use": truncated mid-writ')
+
+        report = extract.WalkReport()
+        records = extract.extract(root, report=report)
+
+        assert [r['tool_use_id'] for r in records] == ['toolu_01']
+        assert report.files_read == 1
+        assert report.unreadable == []
+
+
+# ---------------------------------------------------------------------------
 # The committed-corpus replay contract (step 9/10, boundary row B13).
 # ---------------------------------------------------------------------------
 
