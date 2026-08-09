@@ -575,13 +575,21 @@ class IndexProvisionResult:
     waits for that, deliberately — establishing serving is task ε's canary, and a
     barrier added inside provisioning would be an easy, plausible-looking "fix"
     for a flaky downstream test that quietly changes this contract.
+
+    The three sequence fields are TUPLES, not lists, and that pairs with
+    ``frozen=True`` rather than decorating it.  ``frozen`` only blocks attribute
+    REBINDING: with ``list`` fields ``result.created.append(...)`` mutates a
+    value object that advertises itself as immutable, and the generated
+    ``__hash__`` raises ``TypeError: unhashable type: 'list'`` the first time a
+    downstream consumer puts a result in a set or dict.  δ and ε hold onto these
+    records as an audit trail, so the immutability has to actually hold.
     """
 
-    created: list[IndexSpec]
+    created: tuple[IndexSpec, ...]
     already_present: int
-    failed: list[tuple[IndexSpec, str]]
+    failed: tuple[tuple[IndexSpec, str], ...]
     expected_total: int
-    statements: list[str]
+    statements: tuple[str, ...]
 
     @property
     def changed(self) -> bool:

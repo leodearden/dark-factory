@@ -963,24 +963,46 @@ class TestIndexProvisionResult:
     def test_constructs_with_the_contract_field_types(self):
         spec = ('Entity', 'NODE', 'name', 'RANGE')
         result = IndexProvisionResult(
-            created=[spec],
+            created=(spec,),
             already_present=2,
-            failed=[(spec, 'boom')],
+            failed=((spec, 'boom'),),
             expected_total=38,
-            statements=['CREATE INDEX FOR (n:Entity) ON (n.name)'],
+            statements=('CREATE INDEX FOR (n:Entity) ON (n.name)',),
         )
-        assert result.created == [spec]
+        assert result.created == (spec,)
         assert result.already_present == 2
-        assert result.failed == [(spec, 'boom')]
+        assert result.failed == ((spec, 'boom'),)
         assert result.expected_total == 38
-        assert result.statements == ['CREATE INDEX FOR (n:Entity) ON (n.name)']
+        assert result.statements == ('CREATE INDEX FOR (n:Entity) ON (n.name)',)
+
+    def test_the_frozen_guarantee_actually_holds(self):
+        """``frozen=True`` with ``list`` fields is cosmetic — pin that it is not.
+
+        ``frozen`` only blocks attribute REBINDING, so a ``list`` field leaves the
+        record mutable through ``.append()`` and makes the generated ``__hash__``
+        raise ``TypeError: unhashable type: 'list'``.  This class exists to be an
+        auditable record that δ/ε hold onto, so both properties are asserted:
+        hashable, and no in-place mutation route.
+        """
+        spec = ('Entity', 'NODE', 'name', 'RANGE')
+        result = IndexProvisionResult(
+            created=(spec,), already_present=0, failed=(),
+            expected_total=38, statements=('CREATE INDEX FOR (n:Entity) ON (n.name)',),
+        )
+
+        assert len({result, result}) == 1, 'a frozen record must be hashable'
+        for field in (result.created, result.failed, result.statements):
+            assert not hasattr(field, 'append'), (
+                f'{field!r} is mutable in place; frozen=True does not stop '
+                'result.created.append(...)'
+            )
 
     @pytest.mark.parametrize(
         ('created', 'failed', 'expected'),
         [
-            ([('Entity', 'NODE', 'name', 'RANGE')], [], True),
-            ([], [(('Entity', 'NODE', 'name', 'RANGE'), 'boom')], True),
-            ([], [], False),
+            ((('Entity', 'NODE', 'name', 'RANGE'),), (), True),
+            ((), ((('Entity', 'NODE', 'name', 'RANGE'), 'boom'),), True),
+            ((), (), False),
         ],
         ids=['created-only', 'failed-only', 'neither'],
     )
@@ -998,7 +1020,7 @@ class TestIndexProvisionResult:
             already_present=0,
             failed=failed,
             expected_total=38,
-            statements=[],
+            statements=(),
         )
         assert result.changed is expected
 

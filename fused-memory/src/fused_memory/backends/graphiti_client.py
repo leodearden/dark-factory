@@ -31,7 +31,9 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
+    IndexHeaderShapeError,
     IndexProvisionResult,
+    IndexRecordShapeError,
     IndexSpec,
     expected_index_set,
     normalize_index_records,
@@ -364,6 +366,12 @@ class GraphitiBackend:
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
+        # Guards ensure_indices' read-diff-write critical section, one Lock per
+        # graph.  Deliberately SEPARATE from _identity_locks: asyncio.Lock is not
+        # reentrant, and task γ's first-write choke point calls ensure_indices
+        # from a write path that may already hold _identity_lock_for(group_id) —
+        # reusing that lock would deadlock rather than serialize.
+        self._index_provision_locks: dict[str, asyncio.Lock] = {}
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
@@ -3150,11 +3158,28 @@ class GraphitiBackend:
           the loop it replaces lets one rejection take down everything after it,
           and ``falkordb_driver.py``'s ``execute_query`` swallows the error so
           nothing in the logs says so.
-        * **Raises only on an unreachable driver.**  A graph that does not exist
-          yet carries zero indices and is provisioned from scratch — measured, the
-          CREATE statements auto-create the key, so this is self-healing.  Absence
-          is decided STRUCTURALLY (``group_id not in await client.list_graphs()``),
-          never by matching FalkorDB's error wording (D2).
+        * **Absorbing a per-statement failure is the ONLY absorb.**  Everything
+          else fails CLOSED and propagates — see ``Raises`` below.  In particular
+          an unreachable driver raises rather than reading as "zero indices".  A
+          graph that does not exist yet DOES carry zero indices and is provisioned
+          from scratch — measured, the CREATE statements auto-create the key, so
+          this is self-healing.  Absence is decided STRUCTURALLY
+          (``group_id not in await client.list_graphs()``), never by matching
+          FalkorDB's error wording (D2).
+        * **Serialized per graph.**  The read-diff-write section runs under a
+          per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
+          in-process registry separate from ``_identity_locks``; see ``__init__``
+          for why reusing the identity lock would deadlock).  Without it two
+          concurrent calls for one graph both observe the same pre-write ``actual``
+          and both issue the whole plan, so the loser collects ~30
+          ``Attribute '...' is already indexed`` rejections into ``failed`` —
+          indistinguishable from a genuine provisioning failure, and exactly the
+          signal task δ's drift detector keys on.  γ's first-write choke point is
+          the concurrent case by construction.
+          RESIDUAL, deliberately not solved here: the lock is per PROCESS.  Two
+          fused-memory processes provisioning one graph still produce that
+          signature, and a caller seeing a ``failed`` list that is entirely
+          ``already indexed`` errors should re-read before concluding drift.
         * **RANGE indices are issued PER-PROPERTY**, never as upstream's composite
           form — measured: the composite is rejected wholesale with
           ``Attribute 'uuid' is already indexed`` when any listed property already
@@ -3197,9 +3222,61 @@ class GraphitiBackend:
             An :class:`~fused_memory.backends.falkor_indices.IndexProvisionResult`
             recording what was created, what was already there, what failed, and
             the statements actually issued.
+
+        Raises:
+            PathShapedProjectIdError: *group_id* is path-shaped — raised by
+                ``@_canonicalize_group_args`` before any DB call.
+            IndexHeaderShapeError: ``CALL db.indexes()`` came back with columns α
+                cannot resolve by name (FalkorDB changed its result shape).  α
+                fails closed on purpose and β must NOT re-read that as "absent":
+                provisioning against an index state that was never determined is
+                the silent-fail-soft class this PRD removes (INV-4).
+            IndexRecordShapeError: a record projected to the wrong shape — same
+                fail-closed rationale.
+            UnparsedIndexStatementError: ``expected_index_set()`` could not parse
+                a statement graphiti emitted, i.e. an upgrade changed the
+                index-statement syntax.  Loud by design: a silently-shrunk
+                expected set under-reports what is missing.
+            ValueError: ``plan_index_statements`` was handed a spec whose shape it
+                refuses to guess a statement for.
+            Exception: whatever the driver raises when it is unreachable, from
+                either the diff read or the ``list_graphs()`` existence probe.
+
+            All five are DELIBERATE fail-closed raises, distinct from the
+            per-statement failures absorbed into ``failed``.  A caller wiring this
+            into a write path (task γ) must guard for them; a caller that treats
+            "it returned" as "indices exist" is reading the contract wrong either
+            way — see the INV-6 note above.
+        """
+        # See the "Serialized per graph" contract bullet: the diff read and the
+        # writes it plans must not interleave with another call for this graph.
+        lock = self._index_provision_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._index_provision_locks[group_id] = lock
+        async with lock:
+            return await self._ensure_indices_locked(group_id)
+
+    async def _ensure_indices_locked(self, group_id: str) -> IndexProvisionResult:
+        """``ensure_indices``' body, run under that graph's provisioning lock.
+
+        Split out rather than inlined under ``async with`` so the critical section
+        is named: everything here is read-diff-write and MUST NOT be called
+        without the lock held.  *group_id* is already canonical — the caller is
+        decorated, this is not.
         """
         try:
-            actual = normalize_index_records(await self.list_indices(group_id=group_id))
+            records = await self.list_indices(group_id=group_id)
+        except (IndexHeaderShapeError, IndexRecordShapeError):
+            # α fails CLOSED when FalkorDB's result shape is not what it can
+            # project.  That must never be absorbed by the absent-graph branch
+            # below: a shape error on a graph missing from list_graphs() (a raced
+            # first write, a concurrently-deleted scratch key) would otherwise be
+            # read as `actual = set()` and issue the whole plan against a graph
+            # whose real index state was never determined (INV-4).  Re-raised
+            # ahead of the broad handler, which is scoped to "the key does not
+            # exist yet" and nothing else.
+            raise
         except Exception:
             # A graph KEY that has never been written does not exist yet, and
             # `CALL db.indexes()` against it fails.  MEASURED 2026-08-09, the
@@ -3209,8 +3286,8 @@ class GraphitiBackend:
             # error WORDING; that is the same class of load-bearing sentinel that
             # made the composite rejection invisible in the first place.
             #
-            # The decision is made STRUCTURALLY instead, and that also preserves
-            # the "raises only on an unreachable driver" clause for free: an
+            # The decision is made STRUCTURALLY instead, which also keeps the
+            # unreachable-driver raise for free: an
             # unreachable driver makes list_graphs() raise too, so the original
             # error propagates rather than being misread as "zero indices" --
             # which would issue every statement against a graph that may already
@@ -3221,7 +3298,13 @@ class GraphitiBackend:
             # absent.
             if group_id in await self._require_falkor_client().list_graphs():
                 raise
-            actual = set()
+            records = []
+
+        # Normalized OUTSIDE the try on purpose: normalize_index_records raises
+        # IndexRecordShapeError, another of α's fail-closed errors, and inside the
+        # try it would be caught by the broad handler and silently become
+        # `actual = set()` on any graph that happens not to be in list_graphs().
+        actual = normalize_index_records(records)
 
         expected = expected_index_set()
         missing = expected - actual
@@ -3251,11 +3334,11 @@ class GraphitiBackend:
                 created.extend(specs)
 
         result = IndexProvisionResult(
-            created=created,
+            created=tuple(created),
             already_present=already_present,
-            failed=failed,
+            failed=tuple(failed),
             expected_total=len(expected),
-            statements=statements,
+            statements=tuple(statements),
         )
 
         # Nothing is logged when nothing changed: a no-op must never emit a line

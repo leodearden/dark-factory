@@ -161,7 +161,7 @@ class TestBoundary1TrapState:
         result = await live_backend.ensure_indices(group_id=name)
         await await_index_operational(graph)
 
-        assert result.failed == [], f'provisioning the trap state failed: {result.failed}'
+        assert result.failed == (), f'provisioning the trap state failed: {result.failed}'
 
         actual = normalize_index_records(await live_backend.list_indices(group_id=name))
         missing_after = [
@@ -217,7 +217,7 @@ class TestBoundary2VirginGraph:
         result = await live_backend.ensure_indices(group_id=name)
         await await_index_operational(graph)
 
-        assert result.failed == [], f'provisioning a virgin graph failed: {result.failed}'
+        assert result.failed == (), f'provisioning a virgin graph failed: {result.failed}'
         assert result.already_present == 0
         assert len(result.created) == result.expected_total == len(expected)
 
@@ -263,6 +263,6 @@ class TestAbsentGraphLive:
         result = await live_backend.ensure_indices(group_id=name)
         await await_index_operational(graph)
 
-        assert result.failed == [], f'provisioning an absent graph failed: {result.failed}'
+        assert result.failed == (), f'provisioning an absent graph failed: {result.failed}'
         assert result.already_present == 0
         assert len(result.created) == result.expected_total == len(expected)

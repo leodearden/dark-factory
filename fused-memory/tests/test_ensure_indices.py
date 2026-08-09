@@ -35,29 +35,29 @@ fire-and-forgets.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import redis.exceptions
-from test_falkor_indices import LIVE_HEADER
+
+# ``_TRAP_PRESENT`` — the trap state esc-3375-1 protected as evidence — is
+# IMPORTED, not restated: it had one definition per suite, and a future change to
+# what the trap contains would have had to be made twice or the two suites would
+# silently disagree about what they were testing (INV-5: single home).
+from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import (
+    IndexHeaderShapeError,
+    IndexRecordShapeError,
     IndexSpec,
     expected_index_set,
+    parse_index_statement,
     plan_index_statements,
 )
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
-from fused_memory.utils.validation import PathShapedProjectIdError
-
-_PATH_SHAPED = '-home-leo-src-x'
-
-#: The trap state esc-3375-1 protected as evidence: exactly two range indices.
-_TRAP_PRESENT: set[IndexSpec] = {
-    ('Entity', 'NODE', 'uuid', 'RANGE'),
-    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
-}
 
 
 def _rows_for(specs: set[IndexSpec]) -> list[list]:
@@ -131,9 +131,9 @@ class TestEnsureIndicesDiff:
 
         result = await backend.ensure_indices(group_id='test')
 
-        assert result.created == []
-        assert result.failed == []
-        assert result.statements == []
+        assert result.created == ()
+        assert result.failed == ()
+        assert result.statements == ()
         assert result.already_present == result.expected_total == len(expected)
         assert result.changed is False
         assert _issued(graph) == []
@@ -153,9 +153,9 @@ class TestEnsureIndicesDiff:
 
         planned = [statement for statement, _specs in plan_index_statements(missing)]
         assert _issued(graph) == planned
-        assert result.statements == planned
+        assert result.statements == tuple(planned)
         assert result.already_present == len(_TRAP_PRESENT)
-        assert result.failed == []
+        assert result.failed == ()
         assert len(result.created) == result.expected_total - len(_TRAP_PRESENT)
         assert set(result.created) == missing
         assert result.changed is True
@@ -173,7 +173,7 @@ class TestEnsureIndicesDiff:
         result = await backend.ensure_indices(group_id='test')
 
         assert result.already_present == 0
-        assert result.failed == []
+        assert result.failed == ()
         assert len(result.created) == result.expected_total == len(expected)
         assert set(result.created) == expected
 
@@ -261,7 +261,7 @@ class TestPerStatementFailureIsolation:
 
         result = await backend.ensure_indices(group_id='test')
 
-        assert result.created == []
+        assert result.created == ()
         assert len(result.failed) == len(expected)
         assert result.changed is True
 
@@ -297,26 +297,154 @@ class TestNoOperationalBarrier:
         )
 
 
+class _StatefulGraph:
+    """A graph double whose ``db.indexes()`` reflects the CREATEs it has accepted.
+
+    The plain ``make_graph_mock`` returns a FIXED row set, so a second concurrent
+    call sees the same pre-write state no matter what the first one did — which
+    makes the race under test invisible.  This double closes that: each accepted
+    statement is folded back into the reported index set through α's own parser,
+    so the read side is a real function of the write side.
+
+    Both methods ``await asyncio.sleep(0)``, and that is LOAD-BEARING, not
+    decoration: an ``AsyncMock`` resolves without ever suspending, so two gathered
+    calls would run strictly one-after-the-other and the test would pass against
+    an unserialized implementation.  The explicit yield is what lets the two
+    interleave at all.
+    """
+
+    def __init__(self, present: set[IndexSpec]):
+        self.present = set(present)
+        self.issued: list[str] = []
+
+    @staticmethod
+    def _result(rows):
+        result = MagicMock()
+        result.result_set = rows
+        result.header = LIVE_HEADER
+        return result
+
+    async def ro_query(self, statement, *args, **kwargs):
+        await asyncio.sleep(0)
+        return self._result(_rows_for(self.present))
+
+    async def query(self, statement, *args, **kwargs):
+        await asyncio.sleep(0)
+        self.issued.append(statement)
+        self.present |= set(parse_index_statement(statement))
+        return self._result([])
+
+
+class TestConcurrentProvisioningIsSerialized:
+    """Read-diff-write is not atomic by itself — two callers for ONE graph race.
+
+    Unserialized, both observe the same pre-write ``actual`` and both issue the
+    whole plan; the loser collects ~30 ``Attribute '...' is already indexed``
+    rejections into ``failed`` and logs a WARNING for each.  That is
+    indistinguishable from a genuine provisioning failure, and it is precisely the
+    signal task δ's drift detector keys on — so the noise would land in the one
+    place it is most expensive.  γ's first-write choke point makes the concurrent
+    case the NORMAL case, not a corner.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_calls_for_one_graph_do_not_both_issue_the_plan(
+        self, mock_config, make_backend,
+    ):
+        expected = expected_index_set()
+        planned = plan_index_statements(expected - _TRAP_PRESENT)
+        graph = _StatefulGraph(_TRAP_PRESENT)
+        backend = make_backend(mock_config)
+        _wire(backend, graph)
+
+        first, second = await asyncio.gather(
+            backend.ensure_indices(group_id='test'),
+            backend.ensure_indices(group_id='test'),
+        )
+
+        # No statement is issued twice: the loser read state the winner had
+        # already written, so its diff was empty.
+        assert graph.issued == [statement for statement, _specs in planned]
+
+        winner, loser = sorted((first, second), key=lambda r: -len(r.statements))
+        assert list(winner.statements) == graph.issued
+        assert winner.failed == () and loser.failed == (), (
+            'a serialized pair must produce no "already indexed" rejections at '
+            f'all: {winner.failed!r} / {loser.failed!r}'
+        )
+        assert loser.statements == ()
+        assert loser.changed is False
+        assert loser.already_present == loser.expected_total == len(expected)
+
+    @pytest.mark.asyncio
+    async def test_the_provisioning_lock_is_per_graph_and_not_the_identity_lock(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Separate registry, keyed canonically — reusing the identity lock deadlocks.
+
+        ``asyncio.Lock`` is not reentrant, and γ calls ``ensure_indices`` from a
+        write path that may already hold ``_identity_lock_for(group_id)``; sharing
+        one lock between the two would hang that call rather than serialize it.
+        """
+        graph = make_graph_mock(_rows_for(expected_index_set()), header=LIVE_HEADER)
+        backend = make_backend(mock_config)
+        _wire(backend, graph)
+
+        await backend.ensure_indices(group_id='My-Project')
+        await backend.ensure_indices(group_id='my_project')
+
+        assert set(backend._index_provision_locks) == {'my_project'}, (
+            'the lock must be keyed on the CANONICAL id, or two spellings of one '
+            'graph take two different locks and do not serialize'
+        )
+        assert (
+            backend._index_provision_locks['my_project']
+            is not backend._identity_lock_for('my_project')
+        ), 'the provisioning lock must not be the write-time-identity lock'
+
+
 class TestGroupArgCanonicalization:
-    """The ``@_canonicalize_group_args`` seam (PRD seam S4).
+    """The ``@_canonicalize_group_args`` seam (PRD seam S4), POSITIVE form.
 
     Correctness, not hygiene: the CREATE statements resolve a FalkorDB graph KEY
     through ``_graph_for(group_id)``.  The inner ``list_indices`` call being
     decorated does not cover it — the diff read and the writes resolve the key
     independently.
+
+    The NEGATIVE form (a path-shaped group_id rejected before any DB call) is not
+    restated here: ``test_graphiti_group_arg_canonicalization.py``'s sweep table
+    is its authoritative home and already carries an ``ensure_indices`` entry,
+    complete with the "no driver calls, no client calls" assertions.  Duplicating
+    it here bought a second place to update and no coverage.  What the sweep does
+    NOT cover is this — the WRITE-path key resolution.
     """
 
     @pytest.mark.asyncio
-    async def test_path_shaped_group_id_is_rejected_before_any_db_call(
-        self, mock_config, make_backend,
+    async def test_the_write_path_resolves_the_CANONICAL_graph_key(
+        self, mock_config, make_backend, make_graph_mock,
     ):
+        """Every ``_get_graph`` call this run makes asks for the canonical key.
+
+        Asserted over the WHOLE call list, not just the first: a regression that
+        canonicalized only the read path (removing the outer decorator while
+        ``list_indices`` stays decorated) would point the diff read at
+        ``my_project`` and the CREATEs at ``My-Project`` — two different FalkorDB
+        graphs — and every other test in this module would stay green, since they
+        all pass an already-canonical id.
+        """
+        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         backend = make_backend(mock_config)
+        _wire(backend, graph)
 
-        with pytest.raises(PathShapedProjectIdError) as excinfo:
-            await backend.ensure_indices(group_id=_PATH_SHAPED)
+        result = await backend.ensure_indices(group_id='My-Project')
 
-        assert _PATH_SHAPED in str(excinfo.value)
-        assert backend._driver.method_calls == []
+        assert result.statements, 'the trap state must have produced writes to place'
+        assert backend._driver._get_graph.call_args_list == [
+            call('my_project')
+        ] * backend._driver._get_graph.call_count, (
+            'ensure_indices resolved a non-canonical graph key: '
+            f'{backend._driver._get_graph.call_args_list!r}'
+        )
 
 
 #: MEASURED 2026-08-09: what ``CALL db.indexes()`` raises against a graph KEY that
@@ -357,7 +485,7 @@ class TestAbsentGraph:
         result = await backend.ensure_indices(group_id='test')
 
         assert result.already_present == 0
-        assert result.failed == []
+        assert result.failed == ()
         assert len(result.created) == result.expected_total == len(expected_index_set())
 
 
@@ -400,7 +528,51 @@ class TestUnreachableDriverPropagates:
             side_effect=redis.exceptions.ConnectionError('down')
         )
 
-        with pytest.raises(Exception):  # noqa: B017 - any propagation, none absorbed
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await backend.ensure_indices(group_id='test')
+
+        assert _issued(graph) == []
+
+
+class TestAlphaShapeErrorsFailClosed:
+    """α's two fail-closed errors must never be absorbed by the absent-graph branch.
+
+    ``IndexHeaderShapeError`` (FalkorDB changed its result columns) and
+    ``IndexRecordShapeError`` (a record projected to the wrong shape) exist
+    precisely so an index state that could NOT be determined is never reported as
+    a determined one.  Both tests point ``list_graphs()`` at a listing WITHOUT the
+    graph, i.e. straight down the absorbing branch — a handler broad enough to
+    catch them there would read the graph as carrying zero indices and issue the
+    entire plan against a graph whose real state was never read (INV-4), which is
+    the silent-fail-soft class the PRD exists to remove.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_header_propagates_rather_than_reading_as_absent(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        graph = make_graph_mock([], header=[[1, 'surprise']])
+        backend = make_backend(mock_config)
+        _wire(backend, graph)
+        _with_graph_listing(backend, ['some_other_graph'])  # absorbing branch
+
+        with pytest.raises(IndexHeaderShapeError):
+            await backend.ensure_indices(group_id='test')
+
+        assert _issued(graph) == [], 'nothing may be written on an undetermined state'
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_record_propagates_rather_than_reading_as_absent(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The normalize step is outside the absent-graph ``try`` — pinned here."""
+        malformed = [['Entity', [], {}, {}, 'english', [], 'NODE', 'OPERATIONAL', {}]]
+        graph = make_graph_mock(malformed, header=LIVE_HEADER)
+        backend = make_backend(mock_config)
+        _wire(backend, graph)
+        _with_graph_listing(backend, ['some_other_graph'])  # absorbing branch
+
+        with pytest.raises(IndexRecordShapeError):
             await backend.ensure_indices(group_id='test')
 
         assert _issued(graph) == []
@@ -461,11 +633,19 @@ class TestStructuredLogging:
         ]
         assert infos, 'a run that provisioned something must say so at INFO'
         message = '\n'.join(infos)
-        for count in (
-            len(result.created), result.already_present,
-            len(result.failed), result.expected_total,
+        # Asserted as FORMATTED FRAGMENTS, not as bare digit-strings: `created=36
+        # ... failed=0` and a regression that transposed the two in the logger's
+        # argument list emit the same four numbers, so a positionally-blind
+        # `str(count) in message` check would wave the transposition through.
+        for fragment in (
+            f'created={len(result.created)}',
+            f'already_present={result.already_present}',
+            f'failed={len(result.failed)}',
+            f'expected_total={result.expected_total}',
         ):
-            assert str(count) in message
+            assert fragment in message, (
+                f'expected {fragment!r} in the INFO line, got: {message!r}'
+            )
 
     @pytest.mark.asyncio
     async def test_an_unchanged_run_claims_nothing(
@@ -480,7 +660,13 @@ class TestStructuredLogging:
             result = await backend.ensure_indices(group_id='test')
 
         assert result.changed is False
-        assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+        # Filtered to THIS module's logger: caplog's handler sits on the root
+        # logger, so an unrelated library emitting one INFO record during the
+        # call would otherwise fail this spuriously.
+        assert [
+            r for r in caplog.records
+            if r.name == self._LOGGER and r.levelno >= logging.INFO
+        ] == []
 
     @pytest.mark.asyncio
     async def test_the_deliberate_no_op_claims_nothing_at_any_level(
