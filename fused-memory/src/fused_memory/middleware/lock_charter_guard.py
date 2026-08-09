@@ -20,7 +20,7 @@ equivalent *by construction*: same allowlist, same strip/segment/ext
 algorithm.
 
 The drift-guard test in ``tests/test_lock_charter_guard.py`` pins
-``sorted(CODE_EXTENSIONS)`` to the shared α/γ canonical vector printed by
+``sorted(FILE_EXTENSIONS)`` to the shared α/γ canonical vector printed by
 ``lock-charter-guard.sh --list-extensions``, so divergence is caught at CI
 time.
 
@@ -38,7 +38,7 @@ Extension allowlist rationale (reify PRD §11 Q2):
 
 ## Predicate canonical location
 
-The α/γ shared predicate (``CODE_EXTENSIONS``, ``is_file_path``,
+The α/γ shared predicate (``FILE_EXTENSIONS``, ``is_file_path``,
 ``directory_locks``) is canonical in ``shared.locking`` so that
 ``orchestrator.scheduler`` (α) can import it without a
 ``fused_memory`` → ``orchestrator`` cross-package edge (no-cross-package-edge
@@ -54,7 +54,7 @@ tests:
 
 - ``tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins this copy against ``_CANONICAL_EXTENSIONS``)
-- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
   (pins the ``shared.locking`` copy against the same canonical vector)
 """
 
@@ -76,36 +76,35 @@ logger = logging.getLogger(__name__)
 _DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
 # ---------------------------------------------------------------------------
-# Canonical extension allowlist — kept in sync with shared.locking.CODE_EXTENSIONS.
+# Canonical extension allowlist — kept in sync with shared.locking.FILE_EXTENSIONS.
 # Drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
 #
-# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
-# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
-# TOKENS whose presence after the last dot of a path's final segment is evidence
-# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# NAMING — the contract.  This is the set of recognised FILE-EXTENSION TOKENS
+# whose presence after the last dot of a path's final segment is evidence that
+# the segment names a FILE rather than a DIRECTORY — which is all any caller
 # (is_file_path, directory_locks, strip_directory_locks,
-# module_charter.derive_modules) relies on.  Its non-code members are therefore
-# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
-# typed service template example python-version gitignore gitkeep gitmodules
-# gitattributes npmrc envrc conf.
-# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
-# "is this code?".  That misreading of the name is exactly what let the list sit
-# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
-# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
-# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
-# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
-# dedicated follow-up rather than done half-way here.
+# module_charter.derive_modules) relies on.  It is NOT a code-file allowlist, so
+# its non-code members are correct and load-bearing: png svg ico icns log lock
+# diff golden manifest timer typed service template example python-version
+# gitignore gitkeep gitmodules gitattributes npmrc envrc conf.
+# ADMISSION RULE: judge a candidate addition by "does a real tracked file end in
+# this?", NEVER by "is this code?".  Reading this list's former, CODE_-prefixed
+# name as if it meant "code" is exactly what let it sit at a 22-extension
+# undercount until #3117 — the history this rule exists to prevent repeating,
+# and the reason the name now says FILE.
+# Renamed to FILE_EXTENSIONS by #3248, the dedicated follow-up #3117 deferred
+# that rename to.
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    'CODE_EXTENSIONS',
+    'FILE_EXTENSIONS',
     'is_file_path',
     'directory_locks',
     'extract_files',
     'lock_charter_error',
 ]
 
-CODE_EXTENSIONS: frozenset[str] = frozenset({
+FILE_EXTENSIONS: frozenset[str] = frozenset({
     'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
@@ -133,7 +132,7 @@ def is_file_path(path: str) -> bool:
        Empty segment (path was all slashes) → directory → return False.
     3. If the segment contains no ``.`` → extension-less → return False.
     4. ext = substring after the last ``.`` in the segment.
-       Return ``ext in CODE_EXTENSIONS`` (case-sensitive, matching α's
+       Return ``ext in FILE_EXTENSIONS`` (case-sensitive, matching α's
        ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
     """
     # Strip all trailing slashes.
@@ -166,7 +165,7 @@ def is_file_path(path: str) -> bool:
     #                  rule: that rule would make '.worktrees' (the whole
     #                  worktree pool) declarable as a lock charter.
     # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
-    return ext in CODE_EXTENSIONS
+    return ext in FILE_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
