@@ -75,12 +75,37 @@ isolation is also a HAZARD control: ``FalkorDriver.__init__`` fire-and-forgets
 that could pull a driver into scope risks creating indices merely by being
 imported — destroying esc-3375-1's protected evidence (the current absence of
 indices).  Importing this module performs zero I/O.
+
+β's pure planner, and why RANGE and FULLTEXT are treated asymmetrically
+----------------------------------------------------------------------
+Task 3707 (β) adds :class:`IndexProvisionResult`, :func:`range_create_statement`
+and :func:`plan_index_statements` here rather than in ``graphiti_client`` — same
+zero-I/O reason, plus it makes D1's "β never issues the upstream composite"
+guarantee assertable without a live graph.
+
+MEASURED 2026-08-09 against a seeded trap-state scratch graph (an ``Entity(uuid)``
+and a ``RELATES_TO(uuid)`` range index already present):
+
+* Upstream's composite ``CREATE INDEX FOR (n:Entity) ON (n.uuid, n.group_id,
+  n.name, n.created_at)`` is rejected WHOLESALE with ``Attribute 'uuid' is
+  already indexed``.  One already-present property loses all four.  Worse, that
+  rejection is swallowed by ``falkordb_driver.py``'s ``execute_query``, so the
+  loss is silent — this is the defect the whole PRD exists to remove.
+* The same trap state provisioned per-property: 24 RANGE + 4 verbatim FULLTEXT =
+  28 statements, **0 failures**, and all 11 previously-lost range fields present
+  afterwards.  Per-property converges to an identical index state while degrading
+  one property at a time.
+* The 4 FULLTEXT statements were measured to succeed VERBATIM against that same
+  trap state, so decomposing them would be unmeasured churn against a form that
+  already works.  Hence: RANGE is synthesized per-property, FULLTEXT is issued
+  exactly as upstream emits it.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
@@ -492,3 +517,115 @@ def normalize_index_records(records) -> set[IndexSpec]:
     :func:`expected_index_set`; duplicates arriving from two records collapse.
     """
     return {spec for record in records for spec in normalize_index_record(record)}
+
+
+# --- β: the PURE provisioning planner (task 3707) --------------------------
+#
+# Everything below is zero-I/O by construction: it turns a set of MISSING specs
+# into the statements that would create them.  Issuing those statements is
+# GraphitiBackend.ensure_indices' job, and the split is what lets the "never the
+# upstream composite" guarantee be a unit test.
+
+
+@dataclass(frozen=True)
+class IndexProvisionResult:
+    """What one :meth:`GraphitiBackend.ensure_indices` run actually did.
+
+    The PRD contract names four fields; ``statements`` is a fifth, added because
+    two obligations need it and neither is served by the other four.  Boundary
+    test 1 asserts that no COMPOSITE statement appears in the issued-statement
+    log, and D7 requires the WARNING to name each failed STATEMENT — which cannot
+    be reconstructed from an ``IndexSpec``, since a fulltext spec's statement is
+    upstream's verbatim ``CALL db.idx.fulltext.createNodeIndex(...)`` string.
+    Carrying it is also straight INV-2: emit the facts the caller actually has.
+
+    Invariants, all exact rather than approximate:
+
+    * ``created`` ⊆ ``missing`` — a statement is paired with only the specs it was
+      issued FOR, so a fulltext statement re-covering already-present properties
+      on a partially-provisioned graph does not inflate ``created``.
+    * ``len(created) + len(failed) == len(missing)`` — every missing spec ends up
+      in exactly one of the two.
+    * ``already_present + len(missing) == expected_total``.
+
+    Accounting is PER-SPEC on both sides, not per-statement: that is what makes
+    ``len(created) == expected_total`` a clean equality on a virgin graph
+    (measured: 38 specs from 30 statements, because the 4 fulltext statements
+    cover 12 specs between them).
+
+    LOAD-BEARING (INV-6): a spec landing in ``created`` means its CREATE was
+    ACCEPTED, **not** that the index is serving.  ``CREATE`` returns in 0.5-2.0 ms
+    while the index reaches ``OPERATIONAL`` up to 594.5 ms later.  Nothing here
+    waits for that, deliberately — establishing serving is task ε's canary, and a
+    barrier added inside provisioning would be an easy, plausible-looking "fix"
+    for a flaky downstream test that quietly changes this contract.
+    """
+
+    created: list[IndexSpec]
+    already_present: int
+    failed: list[tuple[IndexSpec, str]]
+    expected_total: int
+    statements: list[str]
+
+    @property
+    def changed(self) -> bool:
+        """Whether this run did anything worth logging (D7's INFO-on-change key).
+
+        A FAILURE counts as changed on purpose: a run that tried and could not
+        provision must never be indistinguishable from a run that found nothing
+        to do.
+        """
+        return bool(self.created or self.failed)
+
+
+def range_create_statement(spec: IndexSpec) -> str:
+    """Build the D1 PER-PROPERTY range CREATE statement for one spec.
+
+    Deliberately single-property.  The upstream composite form is rejected
+    wholesale when ANY listed property is already indexed (measured:
+    ``Attribute 'uuid' is already indexed``), and ``falkordb_driver.py``'s
+    ``execute_query`` swallows that rejection — so a 4-property statement loses
+    all 4 properties silently, and the 7-property ``RELATES_TO`` one loses all 7.
+    One property per statement degrades one property at a time and converges to
+    an identical index state (measured).
+
+    No ``IF NOT EXISTS`` is emitted: it is a FalkorDB **syntax error**, not a
+    missing nicety.  Idempotence comes from the caller diffing first
+    (:func:`plan_index_statements` over ``expected - actual``), never from a
+    tolerated re-create.
+
+    Args:
+        spec: A RANGE :data:`IndexSpec`.
+
+    Returns:
+        A statement that :func:`parse_index_statement` round-trips back to
+        exactly ``[spec]`` — pinned per-spec over the whole expected set, so this
+        form cannot drift away from α's parser.
+
+    Raises:
+        ValueError: *spec* is not a RANGE index. FULLTEXT is never synthesized
+            here — D1 issues it byte-verbatim from
+            ``get_fulltext_indices(GraphProvider.FALKORDB)``, a form measured to
+            succeed against the same trap state that rejects the composite range.
+    """
+    label, entity_type, prop, index_type = spec
+    if index_type != 'RANGE':
+        raise ValueError(
+            f'range_create_statement() got index_type {index_type!r} for {spec!r}, '
+            'but only RANGE is synthesized here. FULLTEXT statements are issued '
+            'byte-verbatim from get_fulltext_indices(GraphProvider.FALKORDB) '
+            '(PRD D1): the node-side form is a CALL carrying a 33-word stopwords '
+            'map, and it was measured to succeed as-is against the trap state '
+            'that rejects the composite range form. Rebuilding it here would be '
+            'unmeasured churn against a form that already works.'
+        )
+    if entity_type == 'NODE':
+        return f'CREATE INDEX FOR (n:{label}) ON (n.{prop})'
+    if entity_type == 'RELATIONSHIP':
+        return f'CREATE INDEX FOR ()-[e:{label}]-() ON (e.{prop})'
+    raise ValueError(
+        f'range_create_statement() got entity_type {entity_type!r} for {spec!r}, '
+        f'expected one of {sorted(_VALID_ENTITY_TYPES)}. Refusing to guess the '
+        'statement shape: a wrong guess creates an index on the wrong thing, '
+        'which the diff then reports as permanently missing.'
+    )
