@@ -808,7 +808,12 @@ def backlog_verdict(after_total_source: int, max_backlog: int) -> int:
     return 0 if after_total_source <= max_backlog else 1
 
 
-def _resolve_check_exit_code(report: dict, max_backlog: int) -> int:
+def _resolve_check_exit_code(
+    report: dict,
+    max_backlog: int,
+    *,
+    fail_on_blind_spot: bool = False,
+) -> int:
     """Resolve --check's exit code from a sweep report.
 
     Extracted from :func:`main` (task 2596 amendment, reviewer_comprehensive
@@ -818,16 +823,32 @@ def _resolve_check_exit_code(report: dict, max_backlog: int) -> int:
     ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
     invocation, which never populates ``'after'``).
 
+    Task 3897 adds the optional blind-spot escalation. It is OPT-IN so the
+    already-wired ``scripts/fused-memory-flag-marker-check.sh`` predicate
+    keeps its exact current contract: by default a blind spot is loud in the
+    log and in the report, but does not by itself change the exit code.
+
     Pure, sync, no I/O.
 
     Args:
         report: The dict returned by :func:`run`.
         max_backlog: Ceiling forwarded to :func:`backlog_verdict`.
+        fail_on_blind_spot: When ``True``, an OBSERVED enumeration blind spot
+            (``report['cross_check']['blind_spot']``) resolves to ``1``
+            regardless of the backlog verdict. A failed probe never triggers
+            this — ``blind_spot`` is ``False`` whenever the adjacent
+            population could not be observed (see :func:`run`), so the gate
+            escalates on observed divergence only and a transient backend
+            blip cannot flap a deterministic ``before_done`` predicate.
 
     Returns:
         ``0`` if the resolved count holds, else ``1`` — see
         :func:`backlog_verdict`.
     """
+    # .get chains throughout: a report shape without a 'cross_check' block
+    # (e.g. one cached from before task 3897) must resolve, not raise.
+    if fail_on_blind_spot and report.get('cross_check', {}).get('blind_spot'):
+        return 1
     after = report.get('after', report['before'])
     return backlog_verdict(after['total_source'], max_backlog)
 
@@ -968,6 +989,23 @@ def _build_parser() -> argparse.ArgumentParser:
             '--delete-ids/--terminal-drain first to clear it.'
         ),
     )
+    parser.add_argument(
+        '--fail-on-blind-spot', dest='fail_on_blind_spot',
+        action='store_true', default=False,
+        help=(
+            'Escalate a detected enumeration blind spot (this sweep matched '
+            "0 records while an adjacent {'flag_for_stage2': True} "
+            'population is non-empty) to exit 1, so a before_done predicate '
+            'can gate on it. OFF by default: that pool is a HEALTHY rolling '
+            '14-day window drained by the in-cycle collector '
+            '_sweep_stale_mem0_flag_for_stage2_markers (task 2966), so a '
+            'gate wired to fail on its mere non-emptiness would fail '
+            'forever — the same footgun documented above for --max-backlog 0 '
+            'against undated markers. Without this flag the blind spot is '
+            'still reported: loudly in the log and in the JSON report\'s '
+            'cross_check block.'
+        ),
+    )
     return parser
 
 
@@ -1054,7 +1092,10 @@ def main() -> int:
     print(json.dumps(report, indent=2))
 
     if args.check:
-        return _resolve_check_exit_code(report, args.max_backlog)
+        return _resolve_check_exit_code(
+            report, args.max_backlog,
+            fail_on_blind_spot=args.fail_on_blind_spot,
+        )
 
     return 0
 
