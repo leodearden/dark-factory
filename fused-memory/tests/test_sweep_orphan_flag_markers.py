@@ -1050,6 +1050,139 @@ class TestRun:
         }
         assert not self._blind_spot_warnings(caplog)
 
+    # -----------------------------------------------------------------
+    # cross_check probe is fail-safe (task 3897)
+    #
+    # The census probe is a DIAGNOSTIC. It must never abort the sweep, never
+    # alter the delete set, and never assert a blind spot it did not
+    # actually observe. Mirrors the posture of
+    # task_knowledge_sync._warn_on_flag_for_stage2_type_drift.
+    # -----------------------------------------------------------------
+
+    def _members_for_failsafe(self) -> list[dict]:
+        """Two orphans + one valid member — a delete set the probe must not perturb."""
+        return [_member('v1'), _orphan('o1'), _orphan('o2')]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_raise_and_marks_probe_failed(self, caplog):
+        """A raising census probe degrades to 'unknown', never a crash.
+
+        blind_spot must be False, not True: an unobserved population is not
+        an observed blind spot, and a diagnostic that invents findings when
+        it fails is worse than one that stays silent.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[3, 1, RuntimeError('qdrant down')]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=self._members_for_failsafe()
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+        # A failed probe must carry a stack trace, or a genuine wiring bug is
+        # indistinguishable in the journal from a transient backend blip.
+        failed_probe_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.exc_info is not None
+        ]
+        assert failed_probe_records, (
+            'Expected a WARNING with exc_info for the failed probe, got: '
+            f'{[(r.message, r.exc_info) for r in caplog.records]}'
+        )
+        assert 'RuntimeError' in caplog.text and 'qdrant down' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_leaves_delete_set_identical(self):
+        """The delete set is byte-identical with and without a probe failure.
+
+        This is the contract that makes the probe safe to add to a script
+        whose --apply path performs irreversible deletes.
+        """
+        async def _run(probe_outcome):
+            memory_service = AsyncMock()
+            memory_service.count_memories_by_metadata = AsyncMock(
+                side_effect=[3, 1, probe_outcome]
+            )
+            memory_service.get_memories_by_metadata = AsyncMock(
+                return_value=self._members_for_failsafe()
+            )
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            return await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        healthy = await _run(61)
+        broken = await _run(RuntimeError('qdrant down'))
+
+        assert healthy['orphan_ids'] == broken['orphan_ids'] == ['o1', 'o2']
+        assert healthy['orphan_count'] == broken['orphan_count'] == 2
+        # Everything except the cross_check block itself is untouched.
+        assert (
+            {k: v for k, v in healthy.items() if k != 'cross_check'}
+            == {k: v for k, v in broken.items() if k != 'cross_check'}
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_return', [None, object(), '61', 3.5])
+    async def test_non_int_probe_return_is_treated_as_a_failed_probe(self, bad_return):
+        """An unexpected return shape degrades to 'unknown' rather than
+        crashing on the `> 0` comparison inside enumeration_blind_spot.
+
+        Note '61' (a str) and 3.5 (a float) are included deliberately: both
+        would either raise or silently misbehave under a naive comparison.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[0, 0, bad_return]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_bool_probe_return_is_treated_as_a_failed_probe(self):
+        """`True` is an int subclass in Python, so an isinstance(x, int)
+        guard alone would let a boolean through and report
+        flag_for_stage2_total: True — a nonsense census. Guard against it
+        explicitly."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[0, 0, True]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check']['probe_failed'] is True
+        assert report['cross_check']['flag_for_stage2_total'] is None
+        assert report['cross_check']['blind_spot'] is False
+
 
 # ===========================================================================
 # Tests: targeted correction (--delete-ids)
