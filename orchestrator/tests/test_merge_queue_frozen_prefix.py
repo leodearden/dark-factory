@@ -1321,17 +1321,71 @@ class TestRemergeReturnPathParity:
     paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
     void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
     dead-base-straggler and Mechanism-2 sites).  That is only true while EVERY
-    return path stamps the marker — a sixth return path added later without it
-    would silently escape the PRD §5.3 carve-out and start crying wolf again
-    at both §5.3 surfaces.  This test fails the moment that happens.
+    exit stamps the marker — an exit that escaped it would silently escape the
+    PRD §5.3 carve-out and start crying wolf again at both §5.3 surfaces.
 
-    Static (AST) rather than behavioural on purpose: driving all five paths
-    through real `classify_and_merge` outcomes would need five distinct git
-    failure environments, and would still only cover the paths the harness
-    happened to reach.  The AST walk covers them by construction.
+    MADE TRUE BY CONSTRUCTION, not pinned by shape (review remediation).  The
+    body's many early returns live in `_remerge_inner`; `_remerge` itself is a
+    wrapper with ONE exit that stamps the marker on whatever came back.  So
+    the test below is BEHAVIOURAL — it feeds `_remerge` an arbitrary unmarked
+    item (both union arms) and asserts the stamp — and holds for return paths
+    that do not exist yet.  It replaces an AST walk that asserted `_remerge`
+    contained exactly five `return <Ctor>(...)` nodes each with a literal
+    `remerge_recovery=True` keyword: that pinned implementation shape (a
+    harmless extract-a-local refactor turned it red) while still being unable
+    to catch a path returning a pre-built item.  Do not reinstate it.
     """
 
-    def test_every_remerge_return_path_sets_the_marker(self) -> None:
+    @pytest.mark.asyncio
+    async def test_remerge_stamps_the_marker_on_every_exit(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Whatever `_remerge_inner` returns, `_remerge` returns it MARKED.
+
+        Covers both arms of the item union — `_remerge` can return either —
+        and, because the stamp is unconditional at the single exit, covers
+        every present and future return path inside the body.
+        """
+        import unittest.mock as mock
+
+        worker = _make_worker(git_ops)
+
+        for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
+            _, unmarked = _make_fake_item(
+                f't-recovery-{label}', base_sha='real-main',
+                merge_commit=merge_commit, config=config, git_repo=git_repo,
+            )
+            assert unmarked.remerge_recovery is False, 'fixture must start unmarked'
+
+            # Patch on the INSTANCE, not the class: an instance attribute is
+            # not re-bound, so `_item`'s default survives the call.
+            async def _body(_req: object, _mono: object, _item=unmarked) -> SpeculativeItem:
+                return _item
+
+            with mock.patch.object(worker, '_remerge_inner', _body):
+                out = await worker._remerge(unmarked.request, None)
+
+            assert out.remerge_recovery is True, (
+                f'§5.3 CARVE-OUT ESCAPE (task 3206): _remerge returned an '
+                f'UNMARKED {label} item. The single-exit chokepoint must stamp '
+                f'remerge_recovery on whatever the body returns — an unmarked '
+                f'recovery item re-introduces the class-(b) false positives at '
+                f'BOTH §5.3 surfaces. See PRD §5.3.'
+            )
+            # The stamp must be the ONLY difference: dataclasses.replace copies
+            # every other field, so a recovery item is otherwise byte-identical.
+            assert dataclasses.replace(out, remerge_recovery=False) == unmarked, (
+                f'_remerge altered the {label} item beyond the §5.3 marker'
+            )
+
+    def test_remerge_has_a_single_exit(self) -> None:
+        """The chokepoint above is only load-bearing while `_remerge` has ONE exit.
+
+        Deliberately the whole of the structural check (see the class
+        docstring): not what the exits construct, only that there is exactly
+        one, so no path can bypass the stamp.  If you need another return in
+        `_remerge`, put it in `_remerge_inner` instead.
+        """
         import ast
         import inspect
         import textwrap
@@ -1339,49 +1393,14 @@ class TestRemergeReturnPathParity:
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
-        tree = ast.parse(src)
+        returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
 
-        returns = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
-        ]
-
-        # Guards the guard: if _remerge is ever restructured so its item
-        # construction no longer happens inline at `return X(...)`, this count
-        # assertion fails loudly rather than the test vacuously passing.
-        assert len(returns) == 5, (
-            f'expected _remerge to have exactly 5 item-constructing return '
-            f'paths (PRD §5.3 names all five consumers); found {len(returns)}. '
-            f'If a path was added or removed, update the PRD §5.3 carve-out '
-            f'and this pin together.'
+        assert len(returns) == 1, (
+            f'_remerge must have exactly ONE exit — it is the single chokepoint '
+            f'that stamps the §5.3 remerge_recovery marker (task 3206); found '
+            f'{len(returns)}. Move the new return into _remerge_inner, or the '
+            f'marker stops holding by construction.'
         )
-
-        for node in returns:
-            call = node.value
-            assert isinstance(call, ast.Call)
-            ctor = getattr(call.func, 'id', None) or getattr(call.func, 'attr', None)
-            assert ctor in {'RealMergeItem', 'DecidedItem'}, (
-                f'unexpected _remerge return constructor {ctor!r} at line '
-                f'{node.lineno} of _remerge'
-            )
-            marker = [
-                kw for kw in call.keywords
-                if kw.arg == 'remerge_recovery'
-            ]
-            assert marker, (
-                f'§5.3 CARVE-OUT ESCAPE (task 3206): the {ctor} returned at '
-                f'line {node.lineno} of _remerge does not set '
-                f'remerge_recovery. Every _remerge return path must stamp it — '
-                f'_remerge is the single producer covering all five consumer '
-                f'sites, so an unmarked path re-introduces the class-(b) false '
-                f'positives at BOTH §5.3 surfaces. See PRD §5.3.'
-            )
-            value = marker[0].value
-            assert isinstance(value, ast.Constant) and value.value is True, (
-                f'remerge_recovery must be the literal True on the {ctor} '
-                f'returned at line {node.lineno} of _remerge, got: '
-                f'{ast.dump(value)}'
-            )
 
     def test_marker_defaults_false_on_both_item_variants(self) -> None:
         """Only `_remerge` may produce recovery items.

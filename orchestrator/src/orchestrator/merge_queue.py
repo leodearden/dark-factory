@@ -14676,6 +14676,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     ) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation.
 
+        SINGLE EXIT — the §5.3 carve-out chokepoint (task 3206).  The merge
+        itself runs in :meth:`_remerge_inner`, which owns every early return;
+        this wrapper is the ONE place ``remerge_recovery=True`` is stamped, so
+        the marker holds BY CONSTRUCTION for every present and future exit of
+        the recovery path (a new return added to the body cannot escape it) —
+        rather than by N keyword arguments an N+1'th path could forget.
+
+        §5.3 RE-MERGE CARVE-OUT: items returned here are exempt from the
+        verify-base⊄frozen-tip guard at BOTH surfaces
+        (:meth:`_warn_if_verify_base_not_frozen_tip`,
+        :meth:`_verify_base_frozen_tip_violations`).  ``base_sha=actual_main``
+        and ``speculative=False`` in the body are ADJUDICATED and must NOT be
+        changed to stack on ``frozen_prefix_tip()``.  PRD §5.3 is the canonical
+        write-up — grounds, five consumer sites, and measured evidence.
+        """
+        item = await self._remerge_inner(req, started_monotonic)
+        return dataclasses.replace(item, remerge_recovery=True)
+
+    async def _remerge_inner(
+        self,
+        req: MergeRequest,
+        started_monotonic: float | None,
+    ) -> SpeculativeItem:
+        """Body of :meth:`_remerge` — call that, never this (task 3206).
+
+        Split out purely so ``_remerge`` has a single exit at which the §5.3
+        ``remerge_recovery`` marker is stamped.  Items returned HERE are
+        deliberately unmarked, so calling this directly yields a recovery item
+        the §5.3 carve-out does not cover.
+
         task-1724: skip_verify is unconditionally False on every success path —
         the merge gate always runs before advance_main regardless of pre_rebased
         or tree-SHA equality.  The force_verify/prev_skip_verify/prev_merge_tree
@@ -14687,32 +14717,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         to ``_do_merge``/``_merger_loop``.  This is an intentional behaviour
         GAIN documented in classify_and_merge's docstring and task 1995's design
         decisions: _remerge previously ran none of those guards.  The
-        speculation-race retry below — this method's one truly unique behaviour
+        speculation-race retry below — this path's one truly unique behaviour
         — stays here, re-driving classify_and_merge a second time against a
         freshly-read main SHA (which also means the retry now gets its own
         full guard pass, including drop-guard).
-
-        §5.3 RE-MERGE CARVE-OUT (task 3206, PRD §5.3): every item returned
-        here carries ``remerge_recovery=True``.  This method is the SINGLE
-        PRODUCER of recovery items for all five consumer paths (_verifier_loop
-        head-failure cascade, _void_and_remerge INV-3 void, _finalize_inflight
-        RUNNER_UNAVAILABLE, and _dispatch_item's dead-base-straggler and
-        Mechanism-2/chain-invalidation sites), so setting the marker on all
-        five return paths below covers every site with no per-consumer edit.
-        Both §5.3 surfaces (:meth:`_warn_if_verify_base_not_frozen_tip` and
-        :meth:`_verify_base_frozen_tip_violations`) honour it, so they cannot
-        silently disagree.
-
-        ``base_sha=actual_main`` and ``speculative=False`` are ADJUDICATED and
-        must NOT be changed to stack on ``frozen_prefix_tip()``: (i) the
-        dead-base-straggler consumer exists to ESCAPE a base known dead, and
-        the frozen tip can itself be that dead/phantom commit — stacking on it
-        is a churn loop; (ii) ``speculative=False`` is load-bearing for
-        SpecPermit release symmetry (LATE-ARRIVAL ATTACH SYMMETRY note above,
-        ``item_permit`` in ``_dispatch_item``), so a non-main base with
-        ``speculative=False`` would be an internally inconsistent item and
-        flipping the flag risks a double-release; (iii) INV-3's adoption-time
-        void backstops the residual soundness gap.
         """
         actual_main = await self._git_ops.get_main_sha()
         result = await classify_and_merge(
@@ -14731,7 +14739,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 base_sha=actual_main, speculative=False,
                 merged_branch_tip=result.branch_tip,  # γ2: parity with merger loop
                 started_monotonic=started_monotonic,
-                remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 1/5)
             )
 
         # ── Speculation-race retry ─────────────────────────────────────────────
@@ -14799,7 +14806,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     base_sha=retry_main, speculative=False,
                     merged_branch_tip=retry.branch_tip,  # γ2: parity with merger loop
                     started_monotonic=started_monotonic,
-                    remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 2/5)
                 )
 
             # Retry Decided.  classify_and_merge already emitted whichever
@@ -14818,7 +14824,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     immediate_outcome=retry.outcome,
                     failure_diagnostic=retry_diag,
                     started_monotonic=started_monotonic,
-                    remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 3/5)
                 )
 
             # Retry non-conflict failure — combine μ diagnostics for BOTH attempts
@@ -14843,7 +14848,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
                 failure_diagnostic=combined_diag,
                 started_monotonic=started_monotonic,
-                remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 4/5)
             )
         # ── END speculation-race retry ─────────────────────────────────────────
 
@@ -14856,7 +14860,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             immediate_outcome=result.outcome,
             failure_diagnostic=result.outcome.failure_diagnostic,
             started_monotonic=started_monotonic,
-            remerge_recovery=True,  # task 3206 §5.3 carve-out (return path 5/5)
         )
 
     def _resolve_or_drop_abandoned(
