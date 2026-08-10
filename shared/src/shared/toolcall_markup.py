@@ -33,21 +33,19 @@ clauses with ``strict=True``.
 earliest-position scan of the UNION, which is what the boundary middleware
 consumes.
 
-## Staged API — :func:`repair` and :func:`detect` have no production caller YET
+## Staged API — the consumer of :func:`repair` and :func:`detect`
 
-This is task ALPHA of a staged PRD, and it deliberately ships an API ahead of
-its consumer. Task **3689** (``shared/src/shared/mcp_markup_middleware.py``,
-``MarkupGuardMiddleware``, contract C2) is the filed follow-up that wires
-:func:`detect` and :func:`repair` at the FastMCP boundary; task **3690**
-registers that middleware on all four servers. Until 3689 lands, the only
-callers of ``repair``/``detect``/``Repair``/``closer_for``/
-:data:`ENVELOPE_LITERALS` are this package's own tests and the committed
-specimen corpus. That is intentional staging, NOT dead code — do not let a
-dead-code sweep delete it, and check 3689/3690 before concluding otherwise.
-The three names that DO have production callers today are
-:data:`MCP_MARKUP_PATTERNS` (``markup_tripwire``) and
-:data:`PARAMETER_CLOSER_NAMES` / :data:`PREFILTER_NEEDLES`
-(``toolcall_xml_leak``).
+This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
+consumer. That consumer has since landed —
+:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, task **3689**,
+contract C2) wires :func:`detect` and :func:`repair` at the FastMCP boundary,
+and is a pure boundary layer over them, contributing policy, facts and the
+storm escape but no parsing of its own. Task **3690** registers that middleware
+on the servers.
+
+Until 3690 lands, the middleware is CONSTRUCTED only by its own tests, so a
+dead-code sweep can still misread this chain as unreachable. It is intentional
+staging — check 3690 before concluding otherwise.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
