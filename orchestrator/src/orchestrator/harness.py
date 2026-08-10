@@ -13331,7 +13331,12 @@ class Harness:
                 # the R3 grace window has a defined endpoint; subsequent polls
                 # pass restamp=False to avoid extending it indefinitely.
                 at_crossing = count == threshold
-                result = self.hard_cancel_workflow(task_id, restamp=at_crossing)
+                # task 3172: name the source.  Without this the synthetic
+                # TaskReport falls through to 'cancelled_unattributed' and a
+                # runs.db query cannot separate a watcher kill from a drain.
+                result = self.hard_cancel_workflow(
+                    task_id, restamp=at_crossing, reason='terminal_status_cancel',
+                )
                 if at_crossing:
                     # Log the WARNING exactly once at the threshold crossing so
                     # a still-draining task is not re-warned every 30 s.
@@ -14632,7 +14637,15 @@ class Harness:
                         'within %d polls — escalating to hard_cancel_workflow',
                         action, task_id, max_polls,
                     )
-                    self.hard_cancel_workflow(task_id)
+                    # task 3172: carry the ACTION into the reason so restart /
+                    # park / abandon stay separable in runs.db.  Stamping it
+                    # here (rather than reverse-inferring from
+                    # _action_teardown_tasks) is what keeps park attributable:
+                    # park writes target_status='blocked', so _should_stamp is
+                    # False and park leaves no teardown marker to infer from.
+                    self.hard_cancel_workflow(
+                        task_id, reason=f'action_teardown:{action}',
+                    )
         finally:
             if _should_stamp:
                 # Decrement the suppression refcount once the kill window closes (step-12).
