@@ -1245,12 +1245,16 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('20')
 
+        # ``created_at`` travels from the row's ``timestamp`` (task 3535), so
+        # a veto site can age a hold without a second store read.
         assert report.open_escalations == [
             EscalationRef(
                 id='esc-20-1', level=1, category='scope_violation', severity='blocking',
+                created_at=rows[0].timestamp,
             ),
             EscalationRef(
                 id='esc-20-2', level=0, category='cleanup_needed', severity='info',
+                created_at=rows[1].timestamp,
             ),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
@@ -1534,3 +1538,150 @@ class TestRecoveryFor:
         assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
         assert report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
+
+
+# ---------------------------------------------------------------------------
+# task 3535 (beta) — the store-correctness THIRD state, and the ages source.
+#
+# The canonical WHY for the emission mechanism these fields feed lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationRefCreatedAt:
+    """``created_at`` is the only ages source available at the veto site."""
+
+    def test_created_at_defaults_to_none_meaning_unknown(self):
+        """Defaulted, so every existing construction site keeps working."""
+        ref = EscalationRef(id='esc-1', level=1)
+        assert ref.created_at is None
+
+    def test_created_at_is_carried_verbatim(self):
+        ref = EscalationRef(id='esc-1', level=1, created_at='2026-08-10T12:00:00+00:00')
+        assert ref.created_at == '2026-08-10T12:00:00+00:00'
+
+
+class TestTruthReportStoreUnavailable:
+    """The third state closes the KNOWN GAP the docstrings hand to this task."""
+
+    def test_escalation_store_unavailable_defaults_to_false(self):
+        report = TruthReport(
+            db_status='in-progress',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            worktree_present=False,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+        assert report.escalation_store_unavailable is False
+
+
+@pytest.mark.asyncio
+class TestResolveOpenEscalationsThirdState:
+    """"no open records" and "could not read the store" must be distinguishable.
+
+    A false ``[]`` routes a genuinely-pinned strand into the plain revert
+    branch — the esc-3163 collapse ``classify_pins(records=None)`` exists to
+    make impossible.
+    """
+
+    async def test_absent_queue_is_unavailable_not_empty(self):
+        resolver = _make_ground_truth()  # escalation_queue defaults to None
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True, (
+            'an absent queue means the read was never PERFORMED — it is not '
+            'evidence that the task carries no open escalation'
+        )
+
+    async def test_a_read_that_succeeds_with_no_rows_is_available(self):
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is False
+
+    @pytest.mark.parametrize(
+        'exc', [OSError('disk gone'), RuntimeError('queue wedged')],
+    )
+    async def test_a_raising_read_degrades_loudly_without_propagating(self, exc, caplog):
+        """A store fault must never abort the whole ground-truth sweep.
+
+        Same degradation shape as the plan.lock and deploy-state resolvers in
+        this class, and logged at WARNING so the outage is visible.
+        """
+        import logging
+
+        queue = MagicMock()
+        queue.get_by_task = MagicMock(side_effect=exc)
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.task_ground_truth'):
+            report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True
+        assert any('3535' in r.getMessage() for r in caplog.records), (
+            'the outage must name the task it degraded'
+        )
+
+    async def test_created_at_is_populated_from_the_row_timestamp(self):
+        """So a veto site can age a hold without a second store read."""
+        row = Escalation(
+            id='esc-3535-1', task_id='3535', agent_role='implementer',
+            severity='blocking', category='risk_identified', summary='s', level=1,
+        )
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[row]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations[0].created_at == row.timestamp
+
+
+@pytest.mark.asyncio
+class TestStoreUnavailableChangesNoDisposition:
+    """ZERO-DISPOSITION-CHANGE regression pin (task 3535's whole contract)."""
+
+    async def test_store_unavailable_off_main_strand_still_reverts_to_pending(self):
+        """The fold that must NOT happen.
+
+        Folding ``escalation_store_unavailable`` into ``_shape``'s table key
+        would flip this shape from REVERT_TO_PENDING to LEAVE — a genuine
+        disposition change during a store outage, and precisely what tasks
+        delta/eta own behind the operator flip.  Emission-before-behavior means
+        the third state becomes VISIBLE now while the decision stays put.
+        """
+        task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha='deadbeef', marker_sha=None)
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(  # no escalation_queue => store unavailable
+            git_ops=git_ops, scheduler=scheduler,
+        )
+
+        report, action = await resolver.recovery_for('3535')
+
+        assert report.escalation_store_unavailable is True
+        assert action == RecoveryAction.REVERT_TO_PENDING, (
+            'a store outage must not silently start pinning strands'
+        )
+
+    def test_shape_output_ignores_the_new_flag_entirely(self):
+        """``_shape``'s key must be byte-identical with the flag either way."""
+        from orchestrator.task_ground_truth import _shape
+
+        base = {
+            'db_status': 'in-progress',
+            'live_claimant': None,
+            'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            'worktree_present': False,
+            'open_escalations': [],
+            'deploy_phase': None,
+        }
+        available = TruthReport(**base, escalation_store_unavailable=False)
+        unavailable = TruthReport(**base, escalation_store_unavailable=True)
+
+        assert _shape(available) == _shape(unavailable)
+        assert classify_recovery(available) == classify_recovery(unavailable)
