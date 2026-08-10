@@ -2006,6 +2006,87 @@ class TestStage1CycleSummaryRemediationBackstop:
         )
 
 
+# ---------------------------------------------------------------------------
+# Task 3732: harness-level backstop for the STAGE 2 cycle_summary write —
+# the arm missing from _ensure_stage1_cycle_summary's Stage-1-only coverage.
+#
+# Deliberately NARROWER than Stage 1's: both arms are hard-gated on the
+# task_knowledge_sync key being PRESENT in run.stage_reports, so a run whose
+# Stage 2 never produced a report can never have a row synthesized for it
+# (there is no Stage-2 analogue of Stage 1's arm 1 raise-path synthesis).
+#
+# RED — no _ensure_stage2_cycle_summary yet.
+# ---------------------------------------------------------------------------
+
+
+class TestStage2CycleSummaryHarnessBackstop:
+    """run_full_cycle's finally block recovers a Stage 2 cycle_summary ledger
+    row whose in-stage write failed — but never fabricates one for a cycle
+    whose Stage 2 did not run."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _stage2_report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=9,
+            tokens_used=900,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage2_completed_but_ledger_write_failed_triggers_recovery(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The write-recovered arm: Stage 2 COMPLETED and returned a real
+        report while its own in-stage ledger upsert failed transiently — the
+        report carries the explicit failure signal
+        (stats['stage2_cycle_summary_ledger_written'] == 0). This is the arm
+        that closes the confirmed genuine Stage 2 write gaps, and it must
+        re-attempt with the REAL report (the upsert is idempotent on its
+        5-part identity, so a re-attempt cannot duplicate)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(return_value=True),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args.args[2] is stage2_report, (
+            'the re-attempt must reuse the REAL Stage 2 report (honest '
+            'llm_calls/tokens), not a zeroed synthesis'
+        )
+        assert mock_write.await_args.args[2].llm_calls == 9
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is True
+        assert 'stage2_cycle_summary_degraded_backstop' not in stage2_report.stats, (
+            'the write-recovered arm must never stamp the degraded-synth marker — '
+            'the two arms self-identify with distinct markers'
+        )
+
+
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
     """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
