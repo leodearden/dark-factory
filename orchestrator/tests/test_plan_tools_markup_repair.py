@@ -508,3 +508,134 @@ class TestRepairPlanFieldsTrailing:
             impl = getattr(plan_tools, '_' + fact['tool'], None)
             assert callable(impl), f'{fact["tool"]!r} is not a plan_tools function'
             assert fact['param'] in _tool_params(impl)
+
+
+# ---------------------------------------------------------------------------
+# step-5 — refusal is byte-identical and LOUD; never a partial or guessed fix.
+# ---------------------------------------------------------------------------
+
+#: DOUBLY CORRUPTED ``reuse[].how``: the recovered tail itself carries a second
+#: mis-close, so the recovered value's own boundary would be a guess. Alpha's
+#: ``_parse_tail`` refuses this by construction (PRD boundary row B5).
+_DOUBLY_CORRUPT_HOW = (
+    'Reuse prose that was cut short.' + _close('how') + '\n'
+    + _open_param('what') + 'the absorbed value' + _close('description')
+    + ' and then still more leftover text.'
+)
+
+
+class TestRepairPlanFieldsRefuses:
+    """``repair()`` declines -> the field is left EXACTLY as it was.
+
+    This is task 3685's open reject-vs-sanitize question, answered. There is NO
+    trailing-only sanitize fallback, because the declining population is
+    dominated by plans that legitimately QUOTE the sentinels in prose.
+    """
+
+    def test_prose_false_positive_is_left_byte_identical(self):
+        """Worktree 2939's shape: a plan ABOUT the leak, quoting the sentinels.
+
+        A trailing-only sanitize contract would mutilate this authored text —
+        the same class of silent-wrong-value damage the PRD exists to end.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired['design_decisions'][0]['decision'] == PROSE_QUOTED
+        # Nothing was shaved off the end: all three quoted sentinels survive.
+        for quoted in (_close('description'), _close('parameter'), _open_param('x')):
+            assert quoted in repaired['design_decisions'][0]['decision']
+        assert len(facts) == 1
+        fact = facts[0]
+        assert fact['outcome'] == 'unrepairable'
+        # The residue stays VISIBLE: the detected pattern is reported.
+        assert fact['pattern'] == detect(PROSE_QUOTED) == _close('description')
+        assert fact['recovered_params'] == []
+        assert fact['misclose'] is None
+        assert fact['collection'] == 'design_decisions'
+        assert fact['index'] == 0
+        assert fact['field'] == 'decision'
+        assert fact['tool'] == 'add_design_decision'
+
+    def test_doubly_corrupted_value_is_left_byte_identical(self):
+        plan = corrupt_plan()
+        plan['reuse'][0]['how'] = _DOUBLY_CORRUPT_HOW
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired['reuse'][0]['how'] == _DOUBLY_CORRUPT_HOW
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'unrepairable'
+        assert facts[0]['pattern'] == detect(_DOUBLY_CORRUPT_HOW)
+        assert facts[0]['recovered_params'] == []
+        assert facts[0]['field'] == 'how'
+
+    def test_refusal_never_partially_repairs_the_sibling_fields(self):
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        before = dict(_all_strings(plan))
+
+        repaired, _facts = plan_tools._repair_plan_fields(plan)
+
+        assert dict(_all_strings(repaired)) == before
+
+    def _mixed_plan(self) -> dict:
+        """One repairable field and one refusing field, in the same record."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+        plan['reuse'][0]['how'] = _DOUBLY_CORRUPT_HOW
+        plan['reuse'][1]['how'] = TRAILING_HOW
+        return plan
+
+    def test_is_deterministic_across_repeated_runs(self):
+        first_plan, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
+        second_plan, second_facts = plan_tools._repair_plan_fields(self._mixed_plan())
+
+        assert first_plan == second_plan
+        assert first_facts == second_facts
+        assert {f['outcome'] for f in first_facts} == {'repaired', 'unrepairable'}
+
+    def test_converges__second_pass_repairs_nothing_and_still_refuses(self):
+        """Idempotent CONVERGENCE, not oscillation.
+
+        Feeding the result back must leave the already-repaired fields alone
+        (zero further 'repaired' facts) while still reporting the residue that
+        was, and remains, unrepairable.
+        """
+        once, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
+        twice, second_facts = plan_tools._repair_plan_fields(once)
+
+        assert twice == once
+        assert [f for f in second_facts if f['outcome'] == 'repaired'] == []
+        assert (
+            [f for f in second_facts if f['outcome'] == 'unrepairable']
+            == [f for f in first_facts if f['outcome'] == 'unrepairable']
+        )
+
+    @pytest.mark.parametrize('value', [None, 42, 3.5, [], {}, True])
+    def test_non_str_values_produce_no_fact_and_no_crash(self, value):
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = value
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert facts == []
+        assert repaired['design_decisions'][0]['rationale'] == value
+
+    def test_missing_field_and_non_dict_item_produce_no_fact_and_no_crash(self):
+        plan = corrupt_plan()
+        del plan['design_decisions'][0]['rationale']
+        del plan['analysis']
+        plan['reuse'].append('not a dict at all')
+        plan['steps'] = 'not a list at all'
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert facts == []
+        assert 'rationale' not in repaired['design_decisions'][0]
+        assert 'analysis' not in repaired
+        assert repaired['reuse'][-1] == 'not a dict at all'
+        assert repaired['steps'] == 'not a list at all'
