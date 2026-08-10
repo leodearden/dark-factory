@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2266,10 +2267,15 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         # item_merge_wt() assert_never.  Production's _remerge re-merges THIS
         # request into a FRESH _merge-<uuid>, so this is also the faithful shape.
         # It registers nothing in the ledger, so any entry left at the end is a
-        # stranded RU'd worktree and nothing else.
+        # stranded RU'd worktree and nothing else.  A DISTINCT merge_result:
+        # the re-merge produces a new merge commit, and the RU'd item's old one
+        # was just passed to _record_dead_base.  (Reaching for
+        # entry.item.merge_result would also be a union-typed read —
+        # InflightEntry.item is RealMergeItem | DecidedItem and only the former
+        # carries merge_result.)
         remerged = RealMergeItem(
             request=entry.item.request,
-            merge_result=entry.item.merge_result,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
             merge_wt=tmp_path / '_merge-new',
             base_sha='base456',
             speculative=False,
@@ -2355,7 +2361,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         remerged = RealMergeItem(
             request=entry.item.request,
-            merge_result=entry.item.merge_result,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
             merge_wt=new_wt,
             base_sha='base456',
             speculative=False,
@@ -2363,7 +2369,10 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
             await worker._finalize_inflight(entry)
 
-        cleaned = [c.args[0] for c in worker._git_ops.cleanup_merge_worktree.await_args_list]
+        cleaned = [
+            c.args[0] for c
+            in cast(AsyncMock, worker._git_ops.cleanup_merge_worktree).await_args_list
+        ]
         assert cleaned == [old_wt], (
             f'expected exactly one disk reclamation of the RU\'d worktree; got {cleaned}'
         )
@@ -2400,7 +2409,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         remerged = RealMergeItem(
             request=entry.item.request,
-            merge_result=entry.item.merge_result,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
             merge_wt=tmp_path / '_merge-new',
             base_sha='base456',
             speculative=False,
@@ -2409,7 +2418,10 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
             await worker._finalize_inflight(entry)
 
         worker._git_ops.release_spec_lane.assert_awaited_once_with(lane, warm=True)
-        cleaned = [c.args[0] for c in worker._git_ops.cleanup_merge_worktree.await_args_list]
+        cleaned = [
+            c.args[0] for c
+            in cast(AsyncMock, worker._git_ops.cleanup_merge_worktree).await_args_list
+        ]
         assert lane not in cleaned, 'a pool-owned _spec- lane must never be removed from disk'
         # ...and either way it leaves the ledger (task 3148 invariant).
         assert lane not in worker._owned_merge_worktrees
