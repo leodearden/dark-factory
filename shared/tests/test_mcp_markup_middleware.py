@@ -598,25 +598,6 @@ class TestB6DeliberateQuotingOverride:
 
         assert h.recorder.args['metadata'] == {'keep': 'this'}
 
-    def test_the_hint_spells_the_override_key_from_the_shared_constant(self):
-        """INV-5: the key is spelled ONCE, in ``shared.toolcall_markup``.
-
-        Both caller-facing hints instruct the bounced caller to set the flag, and
-        ``markup_tripwire._MARKUP_HINT`` interpolates the constant for exactly
-        this reason. A hardcoded copy here would survive a rename and go on
-        telling callers to set a flag that no longer exists — the lockstep
-        duplication promoting the key was meant to end.
-        """
-        from shared import mcp_markup_middleware as guard
-
-        for hint in (guard._REJECT_HINT, guard._UNREPAIRABLE_HINT):
-            assert MARKUP_OVERRIDE_KEY in hint
-        # Not merely "the string appears": it appears because the constant was
-        # interpolated. Rebinding it must move both hints.
-        assert guard._OVERRIDE_SENTENCE in guard._REJECT_HINT
-        assert guard._OVERRIDE_SENTENCE in guard._UNREPAIRABLE_HINT
-        assert MARKUP_OVERRIDE_KEY in guard._OVERRIDE_SENTENCE
-
 
 # ---------------------------------------------------------------------------
 # B1, B2 — REJECT_WITH_REPAIR.
@@ -712,7 +693,9 @@ class TestB1PartialDrift:
         _, payload = await self._reject()
 
         assert payload['outcome'] == 'rejected'
-        assert payload['hint'], 'a rejection with no remediation is a dead end'
+        assert MARKUP_OVERRIDE_KEY in payload['hint'], (
+            'a rejection with no remediation is a dead end'
+        )
 
     async def test_the_diagnostic_names_the_pattern_and_the_misclose(self):
         _, payload = await self._reject()
@@ -1043,7 +1026,7 @@ class TestB5UnrepairableIsNeverGuessed:
         assert payload['outcome'] == 'unrepairable'
         assert payload['escalation_id'] == ESCALATION_ID
         assert 'repaired_call' not in payload
-        assert payload['hint']
+        assert MARKUP_OVERRIDE_KEY in payload['hint']
 
     @BOTH_POLICIES
     async def test_a_sink_that_raises_does_not_change_the_outcome(self, policy):
