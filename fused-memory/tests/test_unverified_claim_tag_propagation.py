@@ -150,3 +150,64 @@ class TestAddEpisodeEnqueuesTheFlag:
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
         assert payload['unverified_claim'] is False
+
+
+class TestMem0HalfCarriesTheTag:
+    """The five false artefacts in the incident were EDGES derived from the
+    episode. The Mem0 half rides its own payload channel, so the tag has to be
+    copied onto each per-edge item explicitly — mirroring `planned`."""
+
+    @pytest.mark.asyncio
+    async def test_every_derived_fact_payload_carries_the_flag(self, service):
+        result = MagicMock()
+        result.edges = [MagicMock(fact='the fix has been applied')]
+        service._refresh_entity_summaries_from_result = AsyncMock()
+
+        await service._dual_write_callback(
+            'dual_write_episode', result,
+            {'project_id': 'dark_factory', 'unverified_claim': True},
+        )
+
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert batch
+        assert all(item['payload']['unverified_claim'] is True for item in batch)
+
+    @pytest.mark.asyncio
+    async def test_tagged_fact_is_stamped_on_the_mem0_record(self, service):
+        service.classifier = MagicMock()
+        classification = MagicMock()
+        classification.primary = MagicMock(value='observations_and_summaries')
+        classification.secondary = None
+        classification.confidence = 0.9
+        service.classifier.classify = AsyncMock(return_value=classification)
+
+        from fused_memory.services.memory_service import MEM0_PRIMARY
+
+        classification.primary = next(iter(MEM0_PRIMARY))
+
+        await service._execute_mem0_classify_and_add(
+            {'fact_text': 'the fix has been applied', 'project_id': 'dark_factory',
+             'unverified_claim': True},
+        )
+
+        metadata = service.mem0.add.call_args[1]['metadata']
+        assert metadata['unverified_claim'] is True
+
+    @pytest.mark.asyncio
+    async def test_untagged_fact_carries_no_key_at_all(self, service):
+        service.classifier = MagicMock()
+        classification = MagicMock()
+        from fused_memory.services.memory_service import MEM0_PRIMARY
+
+        classification.primary = next(iter(MEM0_PRIMARY))
+        classification.secondary = None
+        classification.confidence = 0.9
+        service.classifier.classify = AsyncMock(return_value=classification)
+
+        await service._execute_mem0_classify_and_add(
+            {'fact_text': 'an ordinary note', 'project_id': 'dark_factory'},
+        )
+
+        metadata = service.mem0.add.call_args[1]['metadata']
+        # Absent, not present-and-False: no existing record shape changes.
+        assert 'unverified_claim' not in metadata
