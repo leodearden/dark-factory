@@ -1279,3 +1279,171 @@ class TestCascadeCitationPreflight:
         assert result['cascade_size'] == 1
         assert [b['memory_id'] for b in result['blocked']] == [DOOMED]
         service.delete_memory.assert_not_awaited()
+
+
+class TestCascadeCitationRepointPass:
+    """The ALLOW half: a cascade whose citations CAN be satisfied (task 3197).
+
+    The pre-flight only proves refusals. What makes the cascade usable is
+    that both escapes — ``replacement_memory_id`` and
+    ``allow_dangling_citations`` — apply to the whole set, and that the
+    repoint writes still land strictly before the delete.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        # Deepest-first, exactly as the cascade will destroy them.
+        return _make_service(descendants=[GRANDCHILD, CHILD])
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1501', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1502', 'pending', {'cited': GRANDCHILD}),
+            _task('1503', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_blocked_descendant_is_named_in_one_refusal(
+        self, mcp_server, mock_service,
+    ):
+        """(a) One refusal, not N.
+
+        Refusing at the first cited descendant would cost the caller one
+        refuse-fix-retry round trip per cited record, each re-paying a full
+        enumeration — the gate's own "never left to re-derive the
+        enumeration by hand" principle, one level up.
+        """
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['memory_id'] for b in result['blocked']] == [GRANDCHILD, CHILD]
+        assert result['cascade_size'] == 3
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_every_repoint_in_the_set_lands_before_the_delete(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(b) THE ordering guarantee, extended to the cascade set.
+
+        A descendant repointed AFTER the delete — or not at all — leaves a
+        live task addressing a record the cascade already destroyed, which is
+        the identical window the single-record gate closes.
+        """
+        order: list[str] = []
+
+        async def _record_update(**kwargs):
+            order.append(f'repoint:{kwargs["task_id"]}')
+            return {'success': True}
+
+        async def _record_delete(**kwargs):
+            order.append('delete')
+            return {'status': 'deleted', 'store': 'mem0', 'id': DOOMED}
+
+        interceptor.update_task = AsyncMock(side_effect=_record_update)
+        mock_service.delete_memory = AsyncMock(side_effect=_record_delete)
+
+        await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert order.count('delete') == 1
+        assert order[-1] == 'delete'
+        # BOTH cited descendants were repointed strictly before it.
+        assert set(order[:-1]) == {'repoint:1501', 'repoint:1502'}
+
+    @pytest.mark.asyncio
+    async def test_repoint_stats_reach_the_wire_keyed_per_record(
+        self, mcp_server, mock_service,
+    ):
+        """(c) Which descendants were rewritten, not one anonymous blob.
+
+        A cascade touches N records; collapsing their outcomes into a single
+        unkeyed stats dict would leave the caller unable to tell which
+        descendant's citations were rewritten.
+        """
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        per_id = result['cascade_citation_repoint']
+        assert set(per_id) == {CHILD, GRANDCHILD}
+        assert per_id[CHILD]['citation_repoint']['stage1_citations_repointed'] == 1
+        assert (
+            per_id[GRANDCHILD]['citation_repoint']['stage1_citation_repoint_failures']
+            == 0
+        )
+
+    @pytest.mark.asyncio
+    async def test_override_covers_the_whole_cascade_and_warns_once_per_record(
+        self, mcp_server, mock_service, interceptor, caplog,
+    ):
+        """(d) The escape is a property of stated INTENT, over one subtree.
+
+        Scoping it per-record would make cascade unusable the moment any
+        descendant were cited — back to N individual deletes, defeating the
+        opt-in. And the WARNING must fire exactly once per record: the
+        scan-only pre-flight visits every id too, so a dry run that logged
+        would double-count the one signal an operator audits the escape by.
+        """
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server,
+                cascade=True,
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
+
+        per_id = result['cascade_citation_repoint']
+        assert set(per_id) == {CHILD, GRANDCHILD}
+        assert per_id[CHILD]['dangled_citation_count'] == 1
+        assert [c['task_id'] for c in per_id[CHILD]['dangled_citations']] == ['1501']
+        assert [c['task_id'] for c in per_id[GRANDCHILD]['dangled_citations']] == ['1502']
+
+        overrides = [
+            r for r in caplog.records
+            if 'allow_dangling_citations' in r.getMessage()
+        ]
+        assert len(overrides) == 2  # one per cited record, not two per record
+        logged = {
+            m for r in overrides for m in (CHILD, GRANDCHILD) if m in r.getMessage()
+        }
+        assert logged == {CHILD, GRANDCHILD}
+
+    @pytest.mark.asyncio
+    async def test_uncited_cascade_pays_for_no_writes(self, mock_service):
+        """(e) The repoint pass must not manufacture writes.
+
+        Nothing in the set is cited, so both passes find nothing and the
+        cascade costs the task DB exactly zero mutations.
+        """
+        interceptor = _make_interceptor([
+            _task('1511', 'pending', {'cited': SURVIVOR}),
+            _task('1512', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        interceptor.update_task.assert_not_awaited()
