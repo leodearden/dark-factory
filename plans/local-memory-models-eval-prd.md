@@ -436,12 +436,12 @@ decision rule per axis, and the survivor rule for the screening funnel. Candidat
 missing a matching `preregistration_sha` are invalid by schema.
 **Constraint on that survivor rule (authored 2026-08-10, task 3804; per Leo's 2026-08-06 drop
 ruling — the ruling date and the authoring date are different and are kept apart deliberately):** it
-MUST be authored against the **three-arm** LLM slate (authoritative: `scripts/local-model-serving/
-arms.yaml`; for what the narrowing does to the cap, see the consequence note at the candidate slate
-— not restated here), MUST NOT presume a 4 → 3 narrowing, and MUST state explicitly whether the ≤3
-cap binds at all given three candidates — so η reports a substantive result rather than a vacuous
-"all candidates survived". This constrains *how* ζ writes the rule; it does not pre-empt *what* the
-rule says.
+MUST be authored against the **three-arm** LLM slate (authoritative:
+`scripts/local-model-serving/arms.yaml`; for what the narrowing does to the cap, see the consequence
+note at the candidate slate — not restated here), MUST NOT presume a 4 → 3 narrowing, and MUST state
+explicitly whether the ≤3 cap binds at all given three candidates — so η reports a substantive result
+rather than a vacuous "all candidates survived". This constrains *how* ζ writes the rule; it does not
+pre-empt *what* the rule says.
 
 **Failure/storm rule (INV-4)**: the replay engine aborts an arm run after 5 consecutive item
 failures with a structured error record (arm, item ids, error class) — no silent absorb-and-continue;
