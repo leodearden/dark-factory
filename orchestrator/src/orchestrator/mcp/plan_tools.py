@@ -15,8 +15,12 @@ harness mis-closed an argument — a trailing mis-close, or a whole sibling
 parameter absorbed into the value before it.  Every entry point that opens
 an existing plan goes through :func:`_read_plan_repaired`, which repairs
 what it can, writes the result back through :func:`_atomic_write_plan`
-(PRD contract C3: a concurrent reader never observes a partial file), and
-reports every repair and every refusal on the response's ``markup_repairs``
+(PRD contract C3, scoped to THAT write: a concurrent reader never
+observes a partial *repair* write-back — the tools' own mutation write
+still goes through ``TaskArtifacts.write_plan``, which is truncate-then-
+write, and closing that window needs a change to ``TaskArtifacts`` that
+is out of this module's scope), and reports every repair and every
+refusal on the response's ``markup_repairs``
 key.  No fleet quiesce is needed: the next tool call an agent makes fixes
 its own plan.  ``shared.toolcall_markup`` is the SINGLE owner of the
 literal set and of every accept/refuse decision (INV-5) — this module
@@ -42,10 +46,11 @@ import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -176,12 +181,24 @@ class _PlanField(NamedTuple):
     or a bare ``str`` over the ``files`` list. Both are silent-wrong-value
     corruption of the plan artifact, which is the damage class this surface
     exists to end.
+
+    ``also_written_by`` names the OTHER tools that write this same field, and
+    exists so the structured fact does not overstate its own precision. The
+    ``tool`` a fact reports is the collection's SCHEMA OWNER — the call whose
+    parameter vocabulary ``repair()`` validates against — which is not always
+    the call that produced the corruption: ``replace_plan_step`` also writes
+    ``steps[].description`` AND ``prerequisites[].description`` (its lookup loop
+    spans both collections), and ``update_plan_metadata`` also writes
+    ``analysis``. Naming only the owner would send whoever triages a fact to the
+    wrong call site; naming the alternates alongside it keeps the diagnosis
+    honest without pretending the fact can identify the writer it cannot see.
     """
 
     collection: str | None
     field: str
     schema_params: tuple[str, ...]
     target_keys: Mapping[str, str]
+    also_written_by: tuple[str, ...]
 
 
 def _params_of(fn: Callable[..., Any]) -> tuple[str, ...]:
@@ -229,6 +246,14 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
     {'what': 'what', 'where': 'where', 'how': 'how'}
 )
 
+#: The OTHER tools that write a given field, per row of the table below. Each
+#: entry is machine-checked to name a real plan-tools entry point that actually
+#: takes that parameter
+#: (``TestRepairableFieldTable::test_every_alternate_writer_is_a_real_tool_taking_that_field``),
+#: so an alternate cannot drift into a prose label.
+_REPLACE_STEP_ALSO: tuple[str, ...] = ('replace_plan_step',)
+_UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
+
 #: THE declared enumeration of the repairable surface. Adding a prose field to
 #: the plan schema means ADDING A ROW HERE — nothing infers the surface.
 #:
@@ -250,40 +275,66 @@ _REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...]
 def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
     """Construct :data:`_REPAIRABLE_PLAN_FIELDS`; see its docs above."""
     return (
-        _PlanField(None, 'title', _params_of(_create_plan), _CREATE_PLAN_TARGETS),
-        _PlanField(None, 'analysis', _params_of(_create_plan), _CREATE_PLAN_TARGETS),
+        _PlanField(None, 'title', _params_of(_create_plan), _CREATE_PLAN_TARGETS, ()),
+        _PlanField(
+            None,
+            'analysis',
+            _params_of(_create_plan),
+            _CREATE_PLAN_TARGETS,
+            _UPDATE_METADATA_ALSO,
+        ),
         _PlanField(
             'prerequisites',
             'description',
             _params_of(_add_prerequisite),
             _ADD_PREREQUISITE_TARGETS,
+            _REPLACE_STEP_ALSO,
         ),
         _PlanField(
-            'steps', 'description', _params_of(_add_plan_step), _ADD_PLAN_STEP_TARGETS
+            'steps',
+            'description',
+            _params_of(_add_plan_step),
+            _ADD_PLAN_STEP_TARGETS,
+            _REPLACE_STEP_ALSO,
         ),
         _PlanField(
             'design_decisions',
             'decision',
             _params_of(_add_design_decision),
             _ADD_DESIGN_DECISION_TARGETS,
+            (),
         ),
         _PlanField(
             'design_decisions',
             'rationale',
             _params_of(_add_design_decision),
             _ADD_DESIGN_DECISION_TARGETS,
+            (),
         ),
-        _PlanField('reuse', 'what', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
-        _PlanField('reuse', 'where', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
-        _PlanField('reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
+        _PlanField(
+            'reuse', 'what', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
+        ),
+        _PlanField(
+            'reuse', 'where', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
+        ),
+        _PlanField(
+            'reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
+        ),
     )
 
-#: The MCP tool that AUTHORED each collection, for the structured fact's
-#: ``tool`` field (contract C2's name, verbatim). 1:1 with ``collection``
-#: because each collection has exactly one writing tool; asserted callable via
+#: The collection's SCHEMA OWNER — the tool whose parameter vocabulary defines
+#: the collection's fields, and which ``repair()`` validates a recovery against.
+#: Reported as the structured fact's ``tool`` (contract C2's name, verbatim).
+#:
+#: NOT "the only tool that writes this collection", which would be false of this
+#: module: ``replace_plan_step`` also writes ``description`` on both ``steps``
+#: and ``prerequisites`` items, and ``update_plan_metadata`` also writes
+#: ``analysis``. A fact therefore carries ``also_written_by`` beside ``tool``
+#: (see :class:`_PlanField`) so a triager is not sent to a call site the
+#: corruption may never have passed through. Asserted callable via
 #: ``getattr(plan_tools, '_' + tool)`` by the repair tests, so the label cannot
 #: drift into prose.
-_COLLECTION_TOOL: dict[str | None, str] = {
+_COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
     None: 'create_plan',
     'prerequisites': 'add_prerequisite',
     'steps': 'add_plan_step',
@@ -345,6 +396,14 @@ def _repair_one_field(
     handed to ``repair()``, whose accept-time disjointness condition (PRD
     boundary row B9) does the refusing. One mechanism, per INV-5.
 
+    THE ONE HOLE B9 CANNOT COVER IS THE FIELD ITSELF. ``supplied`` must exclude
+    ``record.field`` — repair() is repairing that parameter, so declaring it
+    already-supplied would refuse every candidate — which means a tail that
+    RE-DECLARES the field being repaired passes the disjointness check. Writing
+    it back would overwrite the ``clean_value`` just recovered and leave the
+    stub in place of the authored prose. The redeclaration is therefore declined
+    and reported on ``declined_params``; the authored value always wins.
+
     A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The repairable surface
     distinguishes the TOOL's parameter vocabulary (``schema_params``) from the
     PLAN's key vocabulary (``target_keys``), and for three parameters they
@@ -395,7 +454,8 @@ def _repair_one_field(
     )
     if result is None:
         return {
-            'tool': _COLLECTION_TOOL[record.collection],
+            'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
+            'also_written_by': list(record.also_written_by),
             'param': record.field,
             'pattern': pattern,
             # No mis-close was VALIDATED — every candidate was rejected — so
@@ -403,6 +463,7 @@ def _repair_one_field(
             'misclose': None,
             'outcome': 'unrepairable',
             'recovered_params': [],
+            'declined_params': [],
             'collection': record.collection,
             'index': index,
             'field': record.field,
@@ -412,7 +473,22 @@ def _repair_one_field(
     # Every recovered value is a verbatim slice of the absorbing field (D5,
     # guaranteed by construction in ``repair``), and every target here was
     # proven a hole by the ``supplied`` set above.
+    written: list[str] = []
+    declined: list[str] = []
     for name, recovered_value in result.recovered.items():
+        if name == record.field:
+            # THE TAIL RE-DECLARED THE FIELD BEING REPAIRED. ``supplied``
+            # deliberately excludes ``record.field`` (repair() is repairing it,
+            # so calling it already-supplied would refuse every candidate), and
+            # repair()'s B9 disjointness check therefore ACCEPTS a tail that
+            # recovers that same name — e.g. authored prose, a mis-closed
+            # </rationale>, then a stub <parameter name="rationale">. Writing it
+            # would overwrite the ``clean_value`` set one line above and silently
+            # destroy the authored prose: a verbatim slice, so D5 still holds,
+            # but the surviving text would be the STUB. The authored value wins;
+            # the redeclaration is declined and reported.
+            declined.append(name)
+            continue
         key = record.target_keys.get(name)
         if key is None:
             # Unreachable while ``supplied`` holds every non-target: repair()
@@ -426,53 +502,96 @@ def _repair_one_field(
                 record.collection,
                 record.field,
             )
+            declined.append(name)
             continue
         holder[key] = recovered_value
+        written.append(name)
     return {
-        'tool': _COLLECTION_TOOL[record.collection],
+        'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
+        'also_written_by': list(record.also_written_by),
         'param': record.field,
         'pattern': result.pattern,
         'misclose': result.misclose,
         'outcome': 'repaired',
-        'recovered_params': sorted(result.recovered),
+        # What was recovered AND WRITTEN, versus what the tail declared and this
+        # walk refused to write. Splitting them is what keeps a declined
+        # recovery visible instead of reading as a successful one.
+        'recovered_params': sorted(written),
+        'declined_params': sorted(declined),
         'collection': record.collection,
         'index': index,
         'field': record.field,
     }
 
 
-def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
-    """Repair every declared prose field of *plan*; return ``(plan, facts)``.
+def _walk_repairable(plan: dict) -> Iterator[tuple[dict[str, Any], int | None, _PlanField]]:
+    """Every ``(holder, index, record)`` the declared table addresses in *plan*.
 
-    PURE with respect to the caller and to the filesystem: the input is
-    deep-copied, so the returned document is the only thing that changed, and
-    nothing here writes to disk. Persisting the result is
-    :func:`_read_plan_repaired`'s decision, not this pass's.
-
-    The surface walked is :data:`_REPAIRABLE_PLAN_FIELDS` — the DECLARED table
-    — never an inferred walk of the plan dict. Non-dict items in a collection
-    are skipped, mirroring the ``isinstance(item, dict)`` guards the mutation
+    The surface walked is :data:`_REPAIRABLE_PLAN_FIELDS` — the DECLARED table —
+    never an inferred walk of the plan dict. Non-dict items in a collection are
+    skipped, mirroring the ``isinstance(item, dict)`` guards the mutation
     helpers already use, so the walk stays total for adversarial plan shapes.
-    """
-    repaired = copy.deepcopy(plan)
-    facts: list[dict[str, Any]] = []
 
+    Shared by the prefilter scan and the repair pass so the two can never
+    disagree about WHICH fields are in scope — one enumeration, two readers.
+    """
     for record in _REPAIRABLE_PLAN_FIELDS:
         if record.collection is None:
-            fact = _repair_one_field(repaired, None, record)
-            if fact is not None:
-                facts.append(fact)
+            yield plan, None, record
             continue
-
-        items = repaired.get(record.collection)
+        items = plan.get(record.collection)
         if not isinstance(items, list):
             continue
         for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            fact = _repair_one_field(item, index, record)
-            if fact is not None:
-                facts.append(fact)
+            if isinstance(item, dict):
+                yield item, index, record
+
+
+def _carries_markup(plan: dict) -> bool:
+    """True when ANY declared field of *plan* trips :func:`detect`.
+
+    The cheap prefilter over the whole document, run before anything is copied.
+    ``detect`` is a substring scan; a deep copy of a plan is tens of KB of
+    analysis prose plus every step description, and on the overwhelmingly common
+    clean path that copy would be pure waste.
+    """
+    for holder, _index, record in _walk_repairable(plan):
+        value = holder.get(record.field)
+        if isinstance(value, str) and detect(value) is not None:
+            return True
+    return False
+
+
+def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
+    """Repair every declared prose field of *plan*; return ``(plan, facts)``.
+
+    NEVER MUTATES THE INPUT, and never touches the filesystem. Persisting the
+    result is :func:`_read_plan_repaired`'s decision, not this pass's.
+
+    THE COPY IS LAZY. A clean plan is returned AS-IS — the same object, not a
+    copy — because nothing was going to change in it. Only once
+    :func:`_carries_markup` finds a hit does the document get deep-copied and
+    re-walked, so the copy is paid on the rare corrupted read rather than on
+    every plan-tools call in the fleet. The no-mutation contract is unaffected:
+    on the returned-as-is path this function writes nothing at all. Callers that
+    intend to mutate what they get back must therefore own a fresh document —
+    which :func:`_read_plan_repaired`'s callers do, since ``read_plan`` parses
+    the file anew on every call.
+
+    The prefilter runs ``detect`` a second time on the values that DO trip it
+    (once here, once inside :func:`_repair_one_field`). That is deliberate: the
+    duplicate pass is paid only on the corrupted path, where the walk is about
+    to call ``repair()`` anyway, and it buys skipping the copy on the clean one.
+    """
+    if not _carries_markup(plan):
+        return plan, []
+
+    repaired = copy.deepcopy(plan)
+    facts: list[dict[str, Any]] = []
+    for holder, index, record in _walk_repairable(repaired):
+        fact = _repair_one_field(holder, index, record)
+        if fact is not None:
+            facts.append(fact)
 
     return repaired, facts
 
@@ -496,6 +615,35 @@ def _verify_plan_json(path: Path) -> None:
         json.load(handle)
 
 
+def _target_file_mode(target: Path) -> int:
+    """The permission bits *target* must carry AFTER the replace.
+
+    ``tempfile.mkstemp`` forces 0600 and ``os.replace`` carries that mode onto
+    the target, so without this the FIRST repair write-back would silently
+    narrow plan.json from whatever ``TaskArtifacts._write_json`` created it as
+    (0666 & ~umask, typically 0644) to owner-only — an invisible, permanent
+    mutation of a file the lock charter and the merge gate both read, performed
+    as a side effect of a READ. Today every consumer runs as the same uid, so it
+    would break nothing and go unnoticed until a sandboxed reader with a
+    different uid, or a group-readable operator workflow, touched the artifact.
+
+    An existing target's own mode is preserved verbatim. For a target that does
+    not exist yet the answer is what ``path.write_text`` would have produced,
+    which keeps a fresh atomic write byte- AND mode-identical to
+    ``TaskArtifacts.write_plan``. Reading the umask requires setting it (the
+    only interface the OS offers) and restoring it immediately; plan-tools is a
+    single-threaded stdio subprocess and this runs on the rare repair path, so
+    the restored-in-two-statements window is not a real exposure — but it is why
+    this is a named helper rather than an inline dance.
+    """
+    try:
+        return stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        current = os.umask(0)
+        os.umask(current)
+        return 0o666 & ~current
+
+
 def _atomic_write_plan(path: Path, plan: dict) -> None:
     """Write *plan* to *path* atomically. Returns ``None``; raises on failure.
 
@@ -504,13 +652,29 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
     ``TaskArtifacts._write_json``, which is ``path.write_text`` —
     truncate-then-write, precisely the window B12 forbids. The byte format is
     reproduced exactly (``_schema_version`` stamp, ``json.dumps(indent=2)``
-    plus a trailing newline) so a repair write-back cannot churn formatting.
+    plus a trailing newline) so a repair write-back cannot churn formatting, and
+    the target's existing permission bits are carried across the swap (see
+    :func:`_target_file_mode`) so an atomic write is invisible in every respect
+    except its content.
+
+    THE GUARANTEE IS SCOPED TO THIS WRITE, and the scope is a real limit rather
+    than a formality. A plan-tools CALL typically repairs on the way in through
+    :func:`_read_plan_repaired` (atomic, here) and then persists its own mutation
+    microseconds later through ``artifacts.write_plan`` — which is still
+    ``path.write_text``, i.e. torn-readable. So "no reader ever sees a partial
+    plan.json" holds for the repair write-back, NOT for a plan-tools call taken
+    as a whole. Closing that second window means making ``TaskArtifacts``
+    itself write atomically, which is out of this task's module scope (its
+    design decision 4 scopes atomicity to the write no agent asked for — the
+    repair — precisely because converting ``_write_json`` would change the
+    durability semantics of ~20 unrelated artifact writers); it is filed as
+    follow-up work rather than half-done here.
 
     Order: RESOLVE the target, serialize, write to a temp file in the resolved
-    target's own directory, flush, fsync, VERIFY it re-parses, and only then
-    ``os.replace``. Any failure unlinks the temp and leaves the original
-    byte-identical, then raises :class:`PlanWriteError` naming the path — loud,
-    never a silent skip.
+    target's own directory, flush, fsync, restore the mode, VERIFY it re-parses,
+    and only then ``os.replace``. Any failure unlinks the temp and leaves the
+    original byte-identical, then raises :class:`PlanWriteError` naming the path
+    — loud, never a silent skip.
 
     RESOLVING FIRST IS LOAD-BEARING TWICE OVER, which is why it is the first
     statement rather than an incidental normalisation.
@@ -540,6 +704,7 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
 
     plan['_schema_version'] = PLAN_SCHEMA_VERSION
     payload = json.dumps(plan, indent=2) + '\n'
+    mode = _target_file_mode(target)
 
     fd, tmp_name = tempfile.mkstemp(
         dir=target.parent, prefix='.plan.json.', suffix='.tmp'
@@ -550,6 +715,10 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        # Before the swap, never after: the replaced file must already carry the
+        # right bits, or a reader between the two calls sees the 0600 mkstemp
+        # forced — a window with the same shape as the torn read B12 forbids.
+        os.chmod(tmp_path, mode)
         _verify_plan_json(tmp_path)
         os.replace(tmp_path, target)
     except Exception as exc:
@@ -573,6 +742,82 @@ _MARKUP_FACT_EVENT = 'plan_markup_repaired'
 #: distinct from the fact event: the repair itself succeeded and was served, so
 #: folding the two would make a delivery failure look like a detection outcome.
 _MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
+
+#: Refusals already reported by THIS process, keyed by locator plus a hash of
+#: the refusing value. Process-local, and that is exactly the right scope: the
+#: orchestrator spawns one plan-tools subprocess per agent invocation, so "once
+#: per process" is "once per agent session".
+#:
+#: WHY A REPAIRED FACT IS NEVER MEMOIZED AND A REFUSAL ALWAYS IS: a repair
+#: CONVERGES — the field is fixed on disk, so the next read emits nothing. A
+#: refusal never converges. A plan that legitimately QUOTES the sentinels in
+#: prose (worktree 2939, a plan about this very leak) refuses on every single
+#: call, forever. An architect making ~50 plan-tool calls against it would
+#: otherwise get 50xN identical warning lines and 50xN identical facts fed back
+#: into its context, each reading like a NEW detection and none of them
+#: actionable. The first report is what keeps the residue visible; the 50th is
+#: pure amplification of a fact already delivered.
+#:
+#: Bounded by the number of DISTINCT refusals a process sees (a handful per
+#: plan), and keyed on the value's hash so an EDITED field reports again rather
+#: than being suppressed by a stale locator.
+_REPORTED_REFUSALS: set[tuple[str, str | None, int | None, str, int]] = set()
+
+
+def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
+    """The value a *fact* is about, re-read from *plan* through its locators.
+
+    Kept OUT of the fact itself: a fact is attached to the tool response, and
+    echoing a whole corrupted prose field back into the caller's context is the
+    amplification this memo exists to avoid. The locators are enough to find it.
+    """
+    try:
+        collection = fact['collection']
+        holder = plan if collection is None else plan[collection][fact['index']]
+        return holder.get(fact['field'])
+    except (KeyError, IndexError, TypeError, AttributeError):
+        # A locator that no longer resolves cannot be memoized safely — report
+        # it every time rather than suppress on a key that means nothing.
+        return None
+
+
+def _report_markup_facts(
+    plan_path: Path, plan: dict, facts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Log every fact; return the ones worth surfacing to the caller.
+
+    INV-2: the WHOLE log message is a single-line JSON payload under a stable
+    event name, so no consumer regex-scrapes a value out of prose.
+
+    A refusal already reported by this process is logged at DEBUG instead of
+    WARNING and is dropped from the returned list — see
+    :data:`_REPORTED_REFUSALS` for why a refusal is the one outcome that never
+    converges on its own. Dropping it makes a repeat call's response converge to
+    the clean shape (no ``markup_repairs`` key at all), which is the same
+    convergence a successful repair gets for free.
+    """
+    reportable: list[dict[str, Any]] = []
+    for fact in facts:
+        payload = json.dumps({
+            'event': _MARKUP_FACT_EVENT,
+            'path': str(plan_path),
+            **fact,
+        })
+        if fact['outcome'] == 'unrepairable':
+            key = (
+                str(plan_path),
+                fact['collection'],
+                fact['index'],
+                fact['field'],
+                hash(_fact_value(plan, fact)),
+            )
+            if key in _REPORTED_REFUSALS:
+                logger.debug(payload)
+                continue
+            _REPORTED_REFUSALS.add(key)
+        logger.warning(payload)
+        reportable.append(fact)
+    return reportable
 
 
 def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, Any]]]:
@@ -599,6 +844,13 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     raises exactly what ``read_plan`` already raises. This surface adds no new
     failure mode to a path every tool depends on.
 
+    A REFUSAL IS REPORTED ONCE PER PROCESS, not once per call. The returned
+    facts are the REPORTABLE ones: a refusal this process has already reported
+    for the same field and the same value is logged at DEBUG and left out, so a
+    plan that can never be repaired stops re-announcing itself on every call.
+    See :data:`_REPORTED_REFUSALS`. Repairs are never suppressed — they converge
+    on their own, because the next read finds the field already fixed.
+
     AND A WRITE-BACK FAILURE NEVER WITHHOLDS THE REPAIR. It is logged loudly
     and the in-memory repaired plan is still returned, because the alternative
     — refusing to serve a plan because its repair could not be persisted —
@@ -614,20 +866,15 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
         return repaired, facts
 
     plan_path = artifacts.root / 'plan.json'
-    for fact in facts:
-        logger.warning(
-            json.dumps({
-                'event': _MARKUP_FACT_EVENT,
-                'path': str(plan_path),
-                **fact,
-            })
-        )
+    reportable = _report_markup_facts(plan_path, repaired, facts)
 
     if not any(fact['outcome'] == 'repaired' for fact in facts):
         # Every fact was a refusal: nothing in the document changed, so there
         # is nothing to persist. This is what keeps a plan that legitimately
         # QUOTES the sentinels in prose (worktree 2939) byte-stable forever.
-        return repaired, facts
+        # Decided over ALL facts, never the reported subset — a suppressed
+        # repeat must not be able to flip a write decision.
+        return repaired, reportable
 
     try:
         _atomic_write_plan(plan_path, repaired)
@@ -648,7 +895,7 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
                 ],
             })
         )
-    return repaired, facts
+    return repaired, reportable
 
 
 def _with_markup_repairs(

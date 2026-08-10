@@ -30,6 +30,7 @@ import inspect
 import json
 import logging
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Iterator, Mapping
@@ -262,6 +263,17 @@ def _tool_params(fn) -> tuple[str, ...]:
 #: artifact that the lock charter and the merge gate both consume.
 _NON_PROSE_PARAMS = frozenset({'task_id', 'files', 'prereq_id', 'step_id', 'step_type'})
 
+#: The tool name a fact reports as ``tool`` for each collection — its SCHEMA
+#: OWNER, spelled independently of the module's own mapping so the two cannot
+#: drift together.
+_COLLECTION_SCHEMA_TOOL_NAME = {
+    None: 'create_plan',
+    'prerequisites': 'add_prerequisite',
+    'steps': 'add_plan_step',
+    'design_decisions': 'add_design_decision',
+    'reuse': 'add_reuse_item',
+}
+
 
 def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     """Build a plan through the REAL writers; return the keys they actually wrote.
@@ -410,6 +422,52 @@ class TestRepairableFieldTable:
             assert record.field in record.target_keys
             assert record.target_keys[record.field] == record.field
 
+    def test_every_alternate_writer_is_a_real_tool_taking_that_field(self):
+        """``also_written_by`` must name real call sites, not prose labels.
+
+        The fact's ``tool`` is the collection's SCHEMA OWNER, which is not always
+        the call that produced the corruption — ``replace_plan_step`` also writes
+        ``description`` on steps AND prerequisites, ``update_plan_metadata`` also
+        writes ``analysis``. An alternate that named no real entry point, or one
+        that does not take the field at all, would send a triager somewhere the
+        corruption could not have come from: a diagnostic that reads as precision
+        while pointing at nothing.
+        """
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            assert isinstance(record.also_written_by, tuple)
+            owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
+            for name in record.also_written_by:
+                impl = getattr(plan_tools, '_' + name, None)
+                assert callable(impl), f'{name!r} is not a plan_tools function'
+                assert record.field in _tool_params(impl), (
+                    f'{record.collection}.{record.field} names {name!r} as an '
+                    f'alternate writer, but it takes no {record.field!r} '
+                    f'parameter — it cannot write that field'
+                )
+                assert name != owner, (
+                    f'{name!r} is the schema owner, already reported as `tool`'
+                )
+
+    def test_the_known_multi_writer_fields_declare_their_alternates(self):
+        """The three fields with a second writer, pinned by behaviour above.
+
+        Read off the module under test at review time and re-derivable from the
+        signatures: ``_replace_plan_step`` walks BOTH ``prerequisites`` and
+        ``steps`` looking for its ``step_id``, so it writes ``description`` on
+        either; ``_update_plan_metadata`` writes top-level ``analysis``. A row
+        that quietly lost its alternate would go back to overstating the fact.
+        """
+        alternates = {
+            (r.collection, r.field): set(r.also_written_by)
+            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
+        }
+        assert alternates[('steps', 'description')] == {'replace_plan_step'}
+        assert alternates[('prerequisites', 'description')] == {'replace_plan_step'}
+        assert alternates[(None, 'analysis')] == {'update_plan_metadata'}
+        # title has no second writer: update_plan_metadata does not take one.
+        assert alternates[(None, 'title')] == set()
+        assert 'title' not in _tool_params(plan_tools._update_plan_metadata)
+
     def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
         """Identifiers, enums and lists may never receive a recovered string.
 
@@ -492,11 +550,16 @@ class TestRepairPlanFieldsTrailing:
         assert facts == [
             {
                 'tool': 'add_design_decision',
+                # add_design_decision is the ONLY writer of this field, so the
+                # fact claims no alternates. Where a field has more than one
+                # writer the fact says so rather than overstating its precision.
+                'also_written_by': [],
                 'param': 'rationale',
                 'pattern': _INVOKE_CLOSER,
                 'misclose': _close('rationale'),
                 'outcome': 'repaired',
                 'recovered_params': [],
+                'declined_params': [],
                 'collection': 'design_decisions',
                 'index': 0,
                 'field': 'rationale',
@@ -608,6 +671,52 @@ class TestRepairPlanFieldsTrailing:
 
         assert facts == []
         assert repaired == plan
+
+    def test_a_clean_plan_is_never_deep_copied(self, monkeypatch):
+        """The copy is paid on the corrupted path only, not on every read.
+
+        Every plan-tools call in the fleet goes through this pass, and the
+        overwhelming majority of plans are clean. A plan carries tens of KB of
+        analysis prose plus every step description, so an unconditional
+        ``deepcopy`` before any detection has run would be the single most
+        expensive thing this surface does on the path where it does nothing.
+        """
+        plan = corrupt_plan()
+        copies: list = []
+        real_deepcopy = copy.deepcopy
+        monkeypatch.setattr(
+            plan_tools.copy,
+            'deepcopy',
+            lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
+        )
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert facts == []
+        assert copies == [], 'a clean plan was deep-copied for nothing'
+        assert repaired is plan, (
+            'nothing changed, so the same document is handed back — the '
+            'no-mutation contract holds because this path writes nothing'
+        )
+
+    def test_a_corrupted_plan_is_still_copied_before_it_is_touched(self, monkeypatch):
+        """The laziness must not leak into mutating the caller's document."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+        copies: list = []
+        real_deepcopy = copy.deepcopy
+        monkeypatch.setattr(
+            plan_tools.copy,
+            'deepcopy',
+            lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
+        )
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert len(facts) == 1
+        assert copies == [plan]
+        assert repaired is not plan
+        assert plan['design_decisions'][0]['rationale'] == TRAILING_RATIONALE
 
     @pytest.mark.parametrize(
         ('collection', 'index', 'field', 'poisoned'),
@@ -850,6 +959,44 @@ class TestRepairPlanFieldsAbsorbedSibling:
         assert item['rationale'] == _RATIONALE_PROSE
         assert facts[0]['outcome'] == 'repaired'
         assert facts[0]['recovered_params'] == ['rationale']
+
+    def test_a_tail_redeclaring_the_repaired_field_never_displaces_it(self):
+        """The one hole ``repair()``'s B9 check structurally cannot cover.
+
+        ``supplied`` must EXCLUDE the field being repaired — repair() is
+        repairing that parameter, so calling it already-supplied would refuse
+        every candidate — which means a tail that re-declares that same name
+        passes the disjointness test and comes back in ``recovered``. Writing it
+        would overwrite the ``clean_value`` just recovered, leaving the STUB
+        where the authored prose was: a verbatim slice, so D5 still holds, and
+        silent authored-text loss all the same. The authored value wins, and the
+        redeclaration is reported rather than dropped in silence.
+        """
+        authored = 'The authored rationale, all of it.'
+        plan = corrupt_plan(
+            design_decisions=[{
+                'decision': 'A decision.',
+                'rationale': (
+                    authored + _close('rationale') + '\n'
+                    + _open_param('rationale') + 'stub'
+                ),
+            }],
+        )
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['rationale'] == authored, (
+            'the stub from the tail displaced the authored prose'
+        )
+        assert detect(item['rationale']) is None
+        assert item['decision'] == 'A decision.'
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'repaired'
+        # Nothing was WRITTEN from the tail; the redeclaration is declined, and
+        # says so, so the case cannot read as a successful sibling recovery.
+        assert facts[0]['recovered_params'] == []
+        assert facts[0]['declined_params'] == ['rationale']
 
     def test_never_overwrites_a_non_blank_authored_sibling(self):
         """The invariant: fill a hole, NEVER overwrite authored text.
@@ -1210,6 +1357,34 @@ class TestAtomicWritePlan:
             atomic_target.read_bytes()
             == (artifacts.root / 'plan.json').read_bytes()
         )
+        # ...and the same PERMISSIONS. mkstemp forces 0600 and os.replace
+        # carries the temp's mode onto the target, so a fresh atomic write would
+        # otherwise land at 0600 where the existing writer lands at 0666 & ~umask
+        # — a difference invisible in the content the parity check above compares.
+        assert (
+            stat.S_IMODE(atomic_target.stat().st_mode)
+            == stat.S_IMODE((artifacts.root / 'plan.json').stat().st_mode)
+        )
+
+    @pytest.mark.parametrize('mode', [0o644, 0o664, 0o600])
+    def test_the_targets_existing_mode_survives_the_replace(self, plan_dir, mode):
+        """A repair is a READ. It must not narrow the file's permissions.
+
+        Every plan.json in the fleet was created by ``TaskArtifacts._write_json``
+        (``path.write_text``, so 0666 & ~umask — typically 0644). ``mkstemp``
+        forces 0600 and ``os.replace`` carries that mode across, so without an
+        explicit restore the FIRST repair write-back would permanently narrow the
+        artifact to owner-only as a side effect of reading it. Nothing breaks
+        while every consumer shares a uid, which is exactly why it would go
+        unnoticed until a sandboxed reader or a group-readable operator workflow
+        touched it.
+        """
+        target = plan_dir / 'plan.json'
+        target.chmod(mode)
+
+        plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert stat.S_IMODE(target.stat().st_mode) == mode
 
     def test_verification_failure_leaves_the_original_untouched(self, plan_dir, monkeypatch):
         target = plan_dir / 'plan.json'
@@ -1374,6 +1549,11 @@ MARKUP_FACT_EVENT = 'plan_markup_repaired'
 FACT_LOG_KEYS = frozenset({
     'tool', 'param', 'pattern', 'misclose', 'outcome', 'recovered_params',
     'collection', 'index', 'field', 'path',
+    # This surface's own additions: the OTHER tools that write the field (so the
+    # single ``tool`` does not overstate its precision) and any recovered name
+    # the walk refused to write (so a declined recovery cannot read as a
+    # successful one).
+    'also_written_by', 'declined_params',
 })
 
 
@@ -1391,6 +1571,21 @@ def _fact_payloads(caplog) -> list[dict]:
             continue
         payloads.append(json.loads(record.getMessage()))
     return payloads
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_refusal_memo():
+    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+
+    The memo is process-local by design (one plan-tools subprocess per agent
+    invocation, so "once per process" is "once per session"), which under pytest
+    means one set shared by every test in the run. Clearing it here keeps the
+    suite order-independent instead of making a later test depend on whether an
+    earlier one happened to report the same locator.
+    """
+    plan_tools._REPORTED_REFUSALS.clear()
+    yield
+    plan_tools._REPORTED_REFUSALS.clear()
 
 
 def _seed_mixed_plan(artifacts) -> dict:
@@ -1510,6 +1705,98 @@ class TestReadPlanRepaired:
         assert [f['outcome'] for f in facts] == ['unrepairable']
         assert writes == []
         assert plan_path.read_bytes() == before_bytes
+
+    # -- a refusal is reported ONCE, not on every call ---------------------
+
+    def test_a_repeat_refusal_is_not_re_reported(self, plan_artifacts, caplog):
+        """A refusal never converges, so it must not re-announce itself forever.
+
+        A plan that legitimately QUOTES the sentinels in prose (worktree 2939 —
+        a plan ABOUT this leak) refuses on every read, for the life of the plan.
+        Left unguarded, an architect making ~50 plan-tool calls against it gets
+        50 identical warning lines and 50 identical facts fed back into its
+        context, each reading like a NEW detection and none actionable. The
+        first report keeps the residue visible; the rest are amplification.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+
+        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+            _, first = plan_tools._read_plan_repaired(plan_artifacts)
+            first_warnings = len(_fact_payloads(caplog))
+            _, second = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in first] == ['unrepairable']
+        assert first_warnings == 1
+        assert second == [], (
+            'the repeat refusal must drop out of the response too, so a second '
+            'call converges to the clean shape instead of re-reporting'
+        )
+        # Still exactly one WARNING; the repeat went to DEBUG, not to silence.
+        assert len(_fact_payloads(caplog)) == 1
+        debug_payloads = [
+            json.loads(r.getMessage())
+            for r in caplog.records
+            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+        ]
+        assert [p['field'] for p in debug_payloads] == ['decision']
+
+    def test_the_response_omits_markup_repairs_entirely_on_a_repeat(
+        self, plan_artifacts
+    ):
+        """The convergence is user-observable through a real tool call."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+
+        first = plan_tools._add_design_decision(plan_artifacts, 'D.', 'R.')
+        second = plan_tools._add_design_decision(plan_artifacts, 'D2.', 'R2.')
+
+        assert [f['outcome'] for f in first['markup_repairs']] == ['unrepairable']
+        assert 'markup_repairs' not in second
+
+    def test_an_edited_refusing_value_is_reported_again(self, plan_artifacts):
+        """The memo is keyed on the VALUE, not just the locator.
+
+        Suppressing on the locator alone would silence a genuinely NEW refusal
+        the moment it landed in a field that had refused before — a stale key
+        hiding a fresh fact.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+        _, first = plan_tools._read_plan_repaired(plan_artifacts)
+        _, repeat = plan_tools._read_plan_repaired(plan_artifacts)
+
+        plan['design_decisions'][0]['decision'] = 'Different prose. ' + PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+        _, after_edit = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in first] == ['unrepairable']
+        assert repeat == []
+        assert [f['outcome'] for f in after_edit] == ['unrepairable']
+
+    def test_a_repair_is_never_memoized(self, plan_artifacts, caplog):
+        """Only refusals are suppressed — a repair converges on its own.
+
+        The second read finds the field already fixed and emits nothing, so
+        there is no repetition to suppress; memoizing repairs too would only
+        risk hiding a field that got RE-corrupted between calls.
+        """
+        _seed_mixed_plan(plan_artifacts)
+        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+            _, first = plan_tools._read_plan_repaired(plan_artifacts)
+        assert sorted(f['outcome'] for f in first) == ['repaired', 'unrepairable']
+
+        # Re-corrupt the same field and read again: reported afresh.
+        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+        plan_artifacts.write_plan(on_disk)
+
+        _, again = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in again] == ['repaired']
 
     # -- the structured fact (INV-2) --------------------------------------
 
