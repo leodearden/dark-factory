@@ -63,7 +63,9 @@ from typing import Any
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.toolcall_markup import detect
 
 # ---------------------------------------------------------------------------
 # Envelope-literal builders (same spelling as tests/test_toolcall_markup.py).
@@ -450,3 +452,157 @@ class TestB6DeliberateQuotingOverride:
         assert h.recorder.args['description'] == quoted
         assert json.loads(h.recorder.args['metadata']) == {'keep': 'this'}
         assert h.facts == []
+
+
+# ---------------------------------------------------------------------------
+# B1, B2 — REJECT_WITH_REPAIR.
+# ---------------------------------------------------------------------------
+
+
+def _reject_payload(excinfo) -> dict[str, Any]:
+    """The rejection payload, parsed off the ToolError.
+
+    Measured: a ``json.dumps`` payload raised from ``on_call_tool``
+    round-trips to the caller BYTE-INTACT, which is what lets ``repaired_call``
+    survive the boundary at all.
+    """
+    return json.loads(str(excinfo.value))
+
+
+class TestB1PartialDrift:
+    """The description absorbed the next parameter's opener, unterminated.
+
+    ``…\\x3c/description>`` + newline + ``\\x3cparameter name="priority">low`` —
+    the harness mis-closed one parameter and the caller's ``priority`` was
+    swallowed by the value of ``description``.
+    """
+
+    DESCRIPTION = (
+        'Do the thing.'
+        + _closer('description')
+        + '\n'
+        + _canonical_opener('priority')
+        + 'low'
+    )
+
+    async def _reject(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('submit_task', {'title': 'A task', 'description': self.DESCRIPTION})
+        return h, _reject_payload(excinfo)
+
+    async def test_the_tool_never_ran(self):
+        h, _ = await self._reject()
+
+        assert h.recorder.calls == [], (
+            'REJECT_WITH_REPAIR must write NOTHING — the tool body never runs, '
+            'which is why the middleware raises rather than short-circuiting '
+            'with a middleware-authored ToolResult'
+        )
+
+    async def test_the_error_is_machine_readable(self):
+        _, payload = await self._reject()
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['tool'] == 'submit_task'
+        assert payload['field'] == 'description'
+
+    async def test_the_repaired_description_is_the_prefix_only(self):
+        _, payload = await self._reject()
+
+        assert payload['repaired_call']['description'] == 'Do the thing.'
+
+    async def test_no_repaired_value_still_trips_the_detector(self):
+        """The load-bearing one. A repaired_call carrying residue would be
+        rejected all over again on retry — and would have silently dropped the
+        arguments hiding in that residue."""
+        _, payload = await self._reject()
+
+        for name, value in payload['repaired_call'].items():
+            if isinstance(value, str):
+                assert detect(value) is None, f'{name} still carries envelope markup'
+
+    async def test_the_swallowed_parameter_is_recovered(self):
+        _, payload = await self._reject()
+
+        assert payload['repaired_call']['priority'] == 'low'
+        assert payload['recovered_params'] == ['priority']
+
+    async def test_repaired_call_is_the_COMPLETE_argument_map(self):
+        """So the retry is mechanical: resubmit repaired_call verbatim.
+
+        A payload carrying only the repaired field would make the caller
+        reassemble the rest by hand — and an agent reassembling by hand is
+        exactly how the swallowed arguments get lost for good.
+        """
+        _, payload = await self._reject()
+
+        assert payload['repaired_call'] == {
+            'title': 'A task',
+            'description': 'Do the thing.',
+            'priority': 'low',
+        }
+
+    async def test_the_payload_names_the_outcome_and_how_to_act(self):
+        """The rejected caller must be able to act without reading the PRD."""
+        _, payload = await self._reject()
+
+        assert payload['outcome'] == 'rejected'
+        assert payload['hint'], 'a rejection with no remediation is a dead end'
+
+    async def test_the_diagnostic_names_the_pattern_and_the_misclose(self):
+        _, payload = await self._reject()
+
+        assert payload['matched_pattern'] == _closer('description')
+        assert payload['misclose'] == _closer('description')
+
+
+class TestB2TotalDrift:
+    """PRD section 2.1's first specimen shape — the parser fell back to
+    ``\\x3c/invoke>`` and the description absorbed THREE parameters, in the
+    blended dialect (a name-echoing opener, plus a stray ``"`` on the metadata
+    tags) that task 3688's tolerance exists to support.
+    """
+
+    DESCRIPTION = (
+        'Fix it.'
+        + _closer('description')
+        + '\n' + _opener('priority') + 'medium' + _closer('priority')
+        + '\n' + _opener('agent_id') + 'claude-x' + _closer('agent_id')
+        + '\n' + '\x3cmetadata">' + '{"source": "probe"}' + '\x3c/metadata">'
+        + '\n' + INVOKE_CLOSER
+    )
+
+    async def _reject(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('submit_task', {'title': 'A task', 'description': self.DESCRIPTION})
+        return h, _reject_payload(excinfo)
+
+    async def test_all_three_swallowed_parameters_are_recovered(self):
+        _, payload = await self._reject()
+
+        assert payload['repaired_call'] == {
+            'title': 'A task',
+            'description': 'Fix it.',
+            'priority': 'medium',
+            'agent_id': 'claude-x',
+            'metadata': '{"source": "probe"}',
+        }
+
+    async def test_recovered_params_names_all_three(self):
+        _, payload = await self._reject()
+
+        assert sorted(payload['recovered_params']) == ['agent_id', 'metadata', 'priority']
+
+    async def test_the_tool_never_ran(self):
+        h, _ = await self._reject()
+
+        assert h.recorder.calls == []
+
+    async def test_the_invoke_closer_is_not_left_in_any_value(self):
+        _, payload = await self._reject()
+
+        for name, value in payload['repaired_call'].items():
+            if isinstance(value, str):
+                assert detect(value) is None, f'{name} still carries envelope markup'
