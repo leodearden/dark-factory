@@ -3606,7 +3606,11 @@ def create_mcp_server(
                 reports success while every citation still addresses a
                 destroyed entry. Copy the value from the search/consolidation
                 result rather than reconstructing it.
-            cascade: Delete this record's CHILDREN too (default False). The
+            cascade: Delete this record's CHILDREN too (default False).
+                ``store='mem0'`` only — ``metadata.parent_id`` is a Mem0
+                payload key, so a graphiti edge has no children and the
+                combination is REJECTED (``ValidationError``) rather than
+                silently downgraded to a plain delete. The
                 WHOLE cascade is refused — nothing deleted, nothing repointed
                 — if any record it would destroy still has live task citers
                 and neither escape was given
@@ -3654,6 +3658,33 @@ def create_mcp_server(
         if store not in _VALID_STORES:
             return {
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
+                'error_type': 'ValidationError',
+            }
+        # `cascade` is MEM0-ONLY, and an unhonourable request is REFUSED rather
+        # than tolerated as a no-op (task 3197 review). A graphiti edge has no
+        # `metadata.parent_id`, so nothing here or in the service could recurse:
+        # the caller got a bare {'status': 'deleted'} for a delete they asked to
+        # cascade, while the reconciliation event recorded `cascade: True` with
+        # an empty child list — an audit trail claiming a cascade was requested
+        # and satisfied when nothing recursive ran. Same posture as the
+        # ignored_override / ignored_replacement_memory_id reporting below:
+        # never drop a caller's instruction in silence.
+        #
+        # The service raises ValueError on the same combination; the check is
+        # repeated here — one rule, two enforcement points, exactly as the
+        # `validate_full_uuid` guard below — because `mcp_tool_errors` flattens
+        # an exception to {'error', 'error_type'} and this envelope names the
+        # remedy. Position mirrors the service's: after the store check, before
+        # the id-shape check, so both layers report a bad store first.
+        if cascade and store != 'mem0':
+            return {
+                'error': (
+                    f'cascade=True is not supported for store={store!r}: '
+                    'parent/child links are the Mem0 payload key '
+                    f'metadata.parent_id, so a {store} record has no children '
+                    'to cascade to. Retry without cascade if a plain delete of '
+                    'this record is what was meant.'
+                ),
                 'error_type': 'ValidationError',
             }
         # A truncated id (e.g. an 8-char hex prefix read out of a search-result

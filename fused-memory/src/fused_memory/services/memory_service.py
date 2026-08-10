@@ -4500,9 +4500,30 @@ class MemoryService:
                 ``cascade`` was not requested — or a child SURVIVED a
                 requested cascade, in which case the parent is left in
                 place too.
+            ValueError: ``cascade=True`` was combined with a non-Mem0
+                store, which no store branch can honour.
         """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        # `cascade` is MEM0-ONLY, and an unhonourable request is refused
+        # rather than dropped. The graphiti arm has no `metadata.parent_id`
+        # to recurse on, so tolerating the flag there meant a plain delete
+        # returning a bare {'status': 'deleted'} — while the `memory_deleted`
+        # event still carried `cascade: True` with an empty child list,
+        # recording a cascade as requested-and-satisfied when nothing
+        # recursive ever ran. Refusing keeps the audit trail unable to lie
+        # (loud-over-silent-degradation).
+        #
+        # Placed with the store check and BEFORE `require_full_uuid` so this
+        # layer and the MCP boundary agree on precedence: store validity,
+        # then store/cascade compatibility, then id shape.
+        if cascade and source != SourceStore.mem0:
+            raise ValueError(
+                f'cascade=True is not supported for store={store!r}: parent/child '
+                'links are the Mem0 payload key metadata.parent_id, so a '
+                f'{store} record has no children to cascade to. Retry without '
+                'cascade if a plain delete of this record is what was meant.'
+            )
         require_full_uuid(memory_id, field_name='memory_id')
 
         write_op_id = str(uuid_mod.uuid4())

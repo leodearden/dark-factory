@@ -187,6 +187,45 @@ class TestDeleteMemoryCascadeTool:
         assert 'cascade' in parsed['error']
 
     @pytest.mark.asyncio
+    async def test_cascade_on_a_graphiti_store_is_refused_not_ignored(
+        self, mcp_server, mock_service
+    ):
+        """`cascade` is Mem0-only, and an unhonourable request is REFUSED.
+
+        A graphiti edge has no `metadata.parent_id`, so no layer could
+        recurse. Tolerating the flag returned a bare `{'status': 'deleted'}`
+        for a delete the caller asked to cascade — and the reconciliation
+        event still recorded `cascade: True` with an empty child list, an
+        audit trail claiming a cascade was requested and satisfied when
+        nothing recursive ran.
+        """
+        parsed = _parse_result(await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'memory_id': _PARENT_ID, 'store': 'graphiti',
+             'project_id': 'dark_factory', 'cascade': True},
+        ))
+
+        assert parsed['error_type'] == 'ValidationError'
+        assert 'graphiti' in parsed['error']
+        # The message names WHY, so the caller learns the rule rather than
+        # just that they broke one.
+        assert 'metadata.parent_id' in parsed['error']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_delete_without_cascade_is_untouched(
+        self, mcp_server, mock_service
+    ):
+        """The rejection is scoped to the FLAG, not to the store: a plain
+        graphiti delete keeps working exactly as before."""
+        await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'memory_id': _PARENT_ID, 'store': 'graphiti', 'project_id': 'dark_factory'},
+        )
+        mock_service.delete_memory.assert_awaited_once()
+        assert mock_service.delete_memory.call_args.kwargs['cascade'] is False
+
+    @pytest.mark.asyncio
     async def test_prologue_still_runs_before_the_service_call(
         self, mcp_server, mock_service
     ):

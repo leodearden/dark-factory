@@ -1643,16 +1643,29 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_graphiti_cascade_enumerates_nothing(self, interceptor):
-        """(d) The gate is Mem0-scoped — and so is the service's own child
-        gate, because parent_id is a Mem0 payload key. Walking a tree whose
-        result would be discarded is pure cost."""
+    async def test_graphiti_cascade_is_refused_and_enumerates_nothing(
+        self, interceptor
+    ):
+        """(d) The gate is Mem0-scoped — and so is the whole cascade, because
+        parent_id is a Mem0 payload key. Walking a tree whose result would be
+        discarded is pure cost, so nothing is enumerated and no task DB is
+        read.
+
+        And the request is REFUSED rather than quietly downgraded to a plain
+        delete: no layer could honour it, and the tolerated no-op still
+        emitted a `memory_deleted` event carrying `cascade: True` with an
+        empty child list — an audit trail recording a cascade that never
+        ran.
+        """
         service = _make_service(descendants=[CHILD])
         mcp_server = self._server(service, interceptor)
 
         result = await _call_delete(mcp_server, cascade=True, store='graphiti')
 
-        assert result['status'] == 'deleted'
+        assert result['error_type'] == 'ValidationError'
+        assert 'cascade' in result['error']
+        assert 'parent_id' in result['error']
+        service.delete_memory.assert_not_awaited()
         service.list_descendant_ids.assert_not_awaited()
         interceptor.get_tasks.assert_not_awaited()
 

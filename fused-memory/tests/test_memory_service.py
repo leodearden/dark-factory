@@ -11820,6 +11820,30 @@ class TestDeleteMemoryCascade:
         service.mem0.scroll_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_cascade_on_a_graphiti_delete_is_refused(self, service):
+        """A request no store branch can honour is refused, not dropped.
+
+        `parent_id` is a Mem0 payload key, so the graphiti arm has nothing
+        to recurse on. Tolerating the flag deleted the edge and reported
+        plain success — while `log_write_op` and the `memory_deleted` event
+        still carried `cascade: True` with an empty `cascaded_child_ids`,
+        recording a cascade as requested-and-satisfied when nothing
+        recursive ever ran.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+
+        with pytest.raises(ValueError, match='cascade'):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='graphiti', project_id='test',
+                cascade=True,
+            )
+
+        service.graphiti.remove_edge.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_cascade_defaults_to_false(self, service):
         """The destructive path is opt-IN. A caller that never heard of this
         contract gets the refusal, not a silent recursive delete."""
