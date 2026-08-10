@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 

@@ -28,6 +28,7 @@ from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
 from shared.task_metadata import RoutingState
+from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
     archive_task_transcripts,
     durable_archive_path,
@@ -11441,17 +11442,106 @@ class Harness:
         if self._escalation_queue is None:
             return
 
+        threshold = self.config.orphan_l0_timeout_secs
+        strands = self._snapshot_stale_l0_strands(threshold)
+
         resolution = (
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
         count = self._escalation_queue.dismiss_all_pending(
-            resolution, strand_age_secs=self.config.orphan_l0_timeout_secs
+            resolution, strand_age_secs=threshold
         )
         if count:
             logger.info(
                 f'Dismissed {count} stale L0 escalation(s) from prior run; '
                 f'L1 escalations preserved across restart'
             )
+
+        # Telemetry is strictly secondary to the dismissal above: a failure
+        # here must never abort startup (the _file_reblock_guard_l2 precedent).
+        try:
+            self._report_stale_l0_strands(strands)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f'Failed to report stale L0 strand telemetry: {e}')
+
+    def _snapshot_stale_l0_strands(self, threshold_secs: float) -> list[dict[str, Any]]:
+        """Per-record detail for the L0s about to be swept as strands.
+
+        Taken BEFORE ``dismiss_all_pending`` because the sweep returns only an
+        int, and the whole point of task 3172 is the per-record detail.  Safe
+        to read here: this runs at startup step 1c, immediately after
+        ``_lifecycle.start_all()``, with no dispatched workflows yet, so the
+        queue is single-writer.
+
+        ``workflow_blocked`` is DERIVED from the record's own severity, not
+        from harness runtime state: at this point the process has just
+        restarted and ``_escalation_events`` is empty, so nothing runtime
+        survives.  ``escalate_blocker`` files ``severity='blocking'`` and the
+        filing workflow then genuinely parks on its escalation event;
+        ``escalate_info`` files ``severity='info'`` and the agent continues.
+        Severity is therefore the durable, already-persisted proxy for "a
+        workflow slot was waiting on this".
+        """
+        if self._escalation_queue is None:
+            return []
+
+        strands: list[dict[str, Any]] = []
+        try:
+            now = datetime.now(UTC)
+            for esc in self._escalation_queue.get_pending():
+                if esc.level != 0:
+                    continue
+                # fallback=datetime.max — same sentinel direction as the queue
+                # side, so an unparseable timestamp is never mistaken for a
+                # maximally stale strand.  A parse failure logs a WARNING.
+                parsed, ok = parse_timestamp_or_warn(
+                    esc.timestamp,
+                    fallback=datetime.max.replace(tzinfo=UTC),
+                    context=f'_dismiss_stale_escalations:{esc.id}',
+                )
+                if not ok:
+                    continue
+                age_secs = (now - parsed.astimezone(UTC)).total_seconds()
+                if age_secs < threshold_secs:
+                    continue
+                strands.append({
+                    'escalation_id': esc.id,
+                    'task_id': esc.task_id,
+                    'pending_secs': round(age_secs),
+                    'severity': esc.severity,
+                    'workflow_blocked': esc.severity != 'info',
+                    'category': esc.category,
+                    'agent_role': esc.agent_role,
+                    'resolution_class': 'stale-strand',
+                })
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f'Failed to snapshot stale L0 strands: {e}')
+        return strands
+
+    def _report_stale_l0_strands(self, strands: list[dict[str, Any]]) -> None:
+        """Emit one event per swept strand and file the aggregate escalation.
+
+        No-op when nothing was stranded — an ordinary restart that sweeps only
+        seconds-old L0s stays quiet.
+        """
+        if not strands:
+            return
+
+        if self.event_store:
+            for strand in strands:
+                self.event_store.emit(
+                    EventType.stale_l0_strand_dismissed,
+                    task_id=strand['task_id'],
+                    data={k: v for k, v in strand.items() if k != 'task_id'},
+                )
+
+        max_age = max(s['pending_secs'] for s in strands)
+        logger.warning(
+            f'Dismissed {len(strands)} STALE-STRAND L0 escalation(s) at startup '
+            f'(max pending {max_age}s); these had been waiting far longer than '
+            f'the {self.config.orphan_l0_timeout_secs:.0f}s strand threshold and '
+            f'are NOT ordinary restart artifacts'
+        )
 
     def _rehydrate_merge_halt(self) -> str | None:
         """Restore merge-halt state from preserved L1 escalations after restart.
