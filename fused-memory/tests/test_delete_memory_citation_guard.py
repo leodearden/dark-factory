@@ -31,10 +31,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import DescendantScan
 
 # Doomed duplicate and its surviving replacement — both canonical 36-char UUIDs.
 DOOMED = '2531b4d8-1111-4aaa-8bbb-000000000001'
 SURVIVOR = '9f3ac071-3333-4eee-8fff-000000000003'
+# A child of DOOMED: destroyed by `cascade=True`, so it has to pass the gate
+# on its own account (task 3197). Before the pre-flight it never did — the
+# cascade recursed inside the SERVICE, below the tool layer the gate lives at.
+CHILD = '7a4e15c2-4444-4bbb-8ccc-000000000004'
+GRANDCHILD = 'c0ffee11-5555-4ddd-8eee-000000000005'
 
 RECON_AGENT = 'recon-stage-memory_consolidator'
 PROJECT_ROOT = '/tmp/root'
@@ -53,7 +59,7 @@ def _task(task_id, status, metadata):
     return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
 
 
-def _make_service(resolvable=(SURVIVOR,)):
+def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False):
     """MemoryService whose awaited children are EXPLICIT AsyncMocks.
 
     Required by tests/test_check_bare_magicmock_config.py and
@@ -62,6 +68,10 @@ def _make_service(resolvable=(SURVIVOR,)):
 
     ``get_memory_by_id`` models the real Mem0 point read: the full record for a
     resolvable id, ``None`` on a genuine miss (memory_service.py:3339-3375).
+
+    ``list_descendant_ids`` is the read-only enumeration the cascade
+    pre-flight gates on (task 3197): what a ``cascade=True`` delete WOULD
+    destroy, deepest-first, plus whether that answer is complete.
     """
     svc = AsyncMock()
     svc.delete_memory = AsyncMock(
@@ -74,6 +84,9 @@ def _make_service(resolvable=(SURVIVOR,)):
         return None
 
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
+    svc.list_descendant_ids = AsyncMock(
+        return_value=DescendantScan(ids=list(descendants), truncated=truncated),
+    )
     return svc
 
 
@@ -1112,3 +1125,157 @@ class TestReplacementMustResolveAndDiffer:
         assert result['status'] == 'deleted'
         service.get_memory_by_id.assert_not_awaited()
         interceptor.get_tasks.assert_not_awaited()
+
+
+class TestCascadeCitationPreflight:
+    """A cascaded child delete must pass the citation gate too (task 3197).
+
+    The cascade recurses inside ``MemoryService.delete_memory`` — BELOW the
+    tool layer where this gate lives — so before the pre-flight a
+    ``cascade=True`` delete destroyed every descendant without any of them
+    being scanned for live citers. One gated record, N ungated ones,
+    reported as a success: precisely the dangling pointers this gate exists
+    to prevent, reintroduced by the opt-in added to close the orphan half of
+    the same lifecycle rule.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service(descendants=[CHILD])
+
+    @pytest.fixture
+    def interceptor(self):
+        # The citer points at the CHILD, not at the delete's target. Nothing
+        # in the single-record path would ever have looked at it.
+        return _make_interceptor([
+            _task('1401', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1402', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cited_descendant_refuses_the_whole_cascade(
+        self, mcp_server, mock_service,
+    ):
+        """(a) THE LEAF SIGNAL. Nothing is deleted — not the child, not the
+        parent.
+
+        A cascade is one operation with one stated intent. Deleting the
+        uncited half and refusing the rest would leave the caller with a
+        partially-destroyed subtree they never asked for and cannot infer
+        the shape of.
+        """
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_blocking_descendant_and_its_citers(
+        self, mcp_server,
+    ):
+        """(b) Actionable from the wire response alone.
+
+        The caller has to learn WHICH descendant blocked and WHY without a
+        second lookup — the gate's own principle ("never left to re-derive
+        the enumeration by hand"), applied to the cascade set.
+        """
+        result = await _call_delete(mcp_server, cascade=True)
+
+        blocked = result['blocked']
+        assert [b['memory_id'] for b in blocked] == [CHILD]
+        assert blocked[0]['error_type'] == 'CitationRepointRequired'
+        citers = blocked[0]['citing_tasks']
+        assert [c['task_id'] for c in citers] == ['1401']
+        assert citers[0]['status'] == 'pending'
+        assert citers[0]['paths'] == ['mem0_canonical_entry']
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_cascade_target_and_size(self, mcp_server):
+        """(c) The envelope says what operation was refused, not just what
+        blocked it — the target id and how many records were in scope."""
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['memory_id'] == DOOMED
+        assert result['cascade_size'] == 2  # the child plus the target itself
+
+    @pytest.mark.asyncio
+    async def test_uncited_cascade_proceeds(self, mock_service):
+        """(d) The gate did not become a blanket cascade ban.
+
+        Nothing in the set is cited, so the whole cascade runs — and the
+        flag reaches the service verbatim.
+        """
+        interceptor = _make_interceptor([
+            _task('1411', 'pending', {'cited': SURVIVOR}),
+            _task('1412', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        assert mock_service.delete_memory.call_args.kwargs['cascade'] is True
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_cascade_delete_keeps_the_single_record_envelope(
+        self, mock_service,
+    ):
+        """(e) The aggregate shape is scoped to the cascade path.
+
+        Every existing caller of the plain delete keeps today's exact
+        envelope; the new error type is additive, not a rewrite of the wire
+        contract.
+        """
+        interceptor = _make_interceptor([
+            _task('1421', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server)
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        assert 'blocked' not in result
+        assert [c['task_id'] for c in result['citing_tasks']] == ['1421']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_childless_cascade_still_reports_the_aggregate_shape(self):
+        """(f) The error type keys on the FLAG the caller passed, not on
+        corpus state they cannot see.
+
+        Whether the tree happened to have children this time is invisible to
+        the caller, so branching the wire contract on it would force every
+        cascade error handler to handle both shapes anyway.
+        """
+        service = _make_service(descendants=[])
+        interceptor = _make_interceptor([
+            _task('1431', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+        mcp_server = create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['cascade_size'] == 1
+        assert [b['memory_id'] for b in result['blocked']] == [DOOMED]
+        service.delete_memory.assert_not_awaited()
