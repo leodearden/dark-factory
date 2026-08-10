@@ -1443,6 +1443,28 @@ def create_mcp_server(
         'named descendants individually first — each then pays its own gate — '
         'and retry the cascade once they are clear.'
     )
+    # (task 3197) The scan-incomplete refusals need their OWN hint. Reusing
+    # _CASCADE_GATE_HINT above told the caller to read blocked[] — a key that
+    # envelope does not carry — and to retry with replacement_memory_id or
+    # allow_dangling_citations, neither of which unlocks anything here:
+    # _cascade_enumerate refuses BEFORE either escape is ever consulted. A
+    # hint that prescribes a retry into an identical refusal is worse than no
+    # hint, because it reads as a way out and is not one. Its closing advice
+    # ("delete the NAMED descendants individually") is likewise unusable on
+    # the truncated arm, where the whole point is that they were not all named.
+    _CASCADE_SCAN_INCOMPLETE_HINT = (
+        'nothing was deleted. This is a VISIBILITY failure, not a citation '
+        'failure: the cascade set could not be fully enumerated, so no claim '
+        'about its citations was ever made. replacement_memory_id and '
+        "metadata={'allow_dangling_citations': True} do NOT unlock this "
+        'refusal — both are consulted only once the set is known, so a retry '
+        'carrying either returns this same error. If scan_error is present '
+        'the enumeration RAISED: retry once the memory store is reachable. '
+        'If truncated is true the subtree is larger than one scroll page: '
+        'cascade it from the LEAVES up in smaller subtrees — each pays its '
+        'own gate — until what remains fits, or raise the descendant scan '
+        'limit.'
+    )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
     # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
@@ -1951,7 +1973,7 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'scan_error': str(exc),
                 'scan_error_type': type(exc).__name__,
-                'hint': _CASCADE_GATE_HINT,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
             }, []
 
         if scan.truncated:
@@ -1966,7 +1988,7 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'cascade_size': len(scan.ids) + 1,
                 'truncated': True,
-                'hint': _CASCADE_GATE_HINT,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
             }, []
 
         return None, [*scan.ids, memory_id]

@@ -1574,6 +1574,52 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_scan_incomplete_hint_never_prescribes_a_retry_into_itself(
+        self, interceptor
+    ):
+        """Both scan-incomplete arms must carry a hint that can ACTUALLY be acted on.
+
+        ``hint`` is a field of the structured tool response, so this is
+        behaviour rather than prose. The citation-gate hint is wrong here in
+        three separate ways: it points at ``blocked[]`` (a key this envelope
+        does not carry), and it offers ``replacement_memory_id`` and
+        ``allow_dangling_citations`` — neither of which unlocks anything,
+        because ``_cascade_enumerate`` refuses BEFORE either escape is ever
+        consulted. A caller who follows it retries into an identical refusal.
+        That is the same retry-into-the-same-wall failure the
+        ``ignored_override`` hint deliberately guards against.
+        """
+        raised = _make_service()
+        raised.list_descendant_ids = AsyncMock(
+            side_effect=RuntimeError('qdrant scroll failed'),
+        )
+        truncated = _make_service(descendants=[CHILD], truncated=True)
+
+        for service in (raised, truncated):
+            result = await _call_delete(
+                self._server(service, interceptor), cascade=True
+            )
+            hint = result['hint']
+
+            # Not the citation-gate hint: none of its remedies apply.
+            assert 'blocked[]' not in hint
+            assert 'allow_dangling_citations' not in hint or 'NOT unlock' in hint
+            # It must SAY the escapes are inert rather than list them as exits.
+            assert 'NOT unlock' in hint
+            # And it must name what this refusal actually is.
+            assert 'VISIBILITY' in hint
+
+        # Arm-specific remedies, not one generic shrug.
+        raised_hint = (
+            await _call_delete(self._server(raised, interceptor), cascade=True)
+        )['hint']
+        assert 'reachable' in raised_hint
+        truncated_hint = (
+            await _call_delete(self._server(truncated, interceptor), cascade=True)
+        )['hint']
+        assert 'LEAVES up' in truncated_hint
+
+    @pytest.mark.asyncio
     async def test_descendant_scan_failure_blocks_the_cascade(self):
         """(c) The per-id fail-closed arm reaches the aggregate.
 
