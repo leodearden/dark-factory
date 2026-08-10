@@ -9,6 +9,20 @@ update an existing plan without recreating it from scratch.  All writes
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
+plan.json is also REPAIRED LAZILY ON READ.  Live plans in the fleet carry
+MCP tool-call envelope markup that leaked into their prose fields when the
+harness mis-closed an argument — a trailing mis-close, or a whole sibling
+parameter absorbed into the value before it.  Every entry point that opens
+an existing plan goes through :func:`_read_plan_repaired`, which repairs
+what it can, writes the result back through :func:`_atomic_write_plan`
+(PRD contract C3: a concurrent reader never observes a partial file), and
+reports every repair and every refusal on the response's ``markup_repairs``
+key.  No fleet quiesce is needed: the next tool call an agent makes fixes
+its own plan.  ``shared.toolcall_markup`` is the SINGLE owner of the
+literal set and of every accept/refuse decision (INV-5) — this module
+enumerates only WHICH plan fields are prose (``_REPAIRABLE_PLAN_FIELDS``),
+never what corruption looks like.
+
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
     <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
@@ -505,6 +519,27 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     return repaired, facts
 
 
+def _with_markup_repairs(
+    response: dict[str, Any], facts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Attach ``markup_repairs`` to *response* — only when there is one to make.
+
+    ABSENT on the clean path, not empty and not null. The overwhelming majority
+    of calls repair nothing, and those responses must stay byte-identical to
+    what every existing caller and every existing assertion already sees; an
+    always-present key would be a silent contract change dressed as a
+    diagnostic.
+
+    Purely additive when it does fire, so a documented envelope keeps its
+    documented keys — including :func:`_mark_step_committed`'s Contract A1
+    ``{ok, step_id, status}``, whose divergence from its siblings is
+    contractual and must not be "aligned" by anything passing through here.
+    """
+    if facts:
+        response['markup_repairs'] = facts
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Standalone implementation functions (testable without MCP transport)
 # ---------------------------------------------------------------------------
@@ -529,6 +564,10 @@ def _create_plan(
                 'full analysis via update_plan_metadata(analysis=...).'
             ),
         }
+    # DELIBERATELY NOT hooked to _read_plan_repaired: this overwrites plan.json
+    # wholesale, so there is no existing document to repair on the way in.
+    # Guarding these INBOUND arguments against envelope markup is the write-time
+    # middleware's job, not this read-time surface's — don't "fix" the omission.
     files = _coerce_files(files)
     plan = {
         'task_id': task_id,
@@ -550,7 +589,7 @@ def _add_plan_step(
     step_type: str,
     description: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
@@ -562,7 +601,10 @@ def _add_plan_step(
         if isinstance(s, dict)
     }
     if step_id in existing_ids:
-        return {'status': 'error', 'message': f'Step {step_id!r} already exists in plan.'}
+        return _with_markup_repairs(
+            {'status': 'error', 'message': f'Step {step_id!r} already exists in plan.'},
+            markup_facts,
+        )
 
     plan.setdefault('steps', []).append({
         'id': step_id,
@@ -572,7 +614,10 @@ def _add_plan_step(
         'commit': None,
     })
     artifacts.write_plan(plan)
-    return {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])}
+    return _with_markup_repairs(
+        {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
+        markup_facts,
+    )
 
 
 def _add_prerequisite(
@@ -580,7 +625,7 @@ def _add_prerequisite(
     prereq_id: str,
     description: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
@@ -591,7 +636,10 @@ def _add_prerequisite(
         if isinstance(s, dict)
     }
     if prereq_id in existing_ids:
-        return {'status': 'error', 'message': f'Prerequisite {prereq_id!r} already exists.'}
+        return _with_markup_repairs(
+            {'status': 'error', 'message': f'Prerequisite {prereq_id!r} already exists.'},
+            markup_facts,
+        )
 
     plan.setdefault('prerequisites', []).append({
         'id': prereq_id,
@@ -601,7 +649,7 @@ def _add_prerequisite(
         'tests': [],
     })
     artifacts.write_plan(plan)
-    return {'status': 'ok', 'prereq_id': prereq_id}
+    return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
 def _add_design_decision(
@@ -609,7 +657,7 @@ def _add_design_decision(
     decision: str,
     rationale: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
@@ -618,7 +666,10 @@ def _add_design_decision(
         'rationale': rationale,
     })
     artifacts.write_plan(plan)
-    return {'status': 'ok', 'total_decisions': len(plan['design_decisions'])}
+    return _with_markup_repairs(
+        {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
+        markup_facts,
+    )
 
 
 def _add_reuse_item(
@@ -627,7 +678,7 @@ def _add_reuse_item(
     where: str,
     how: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
@@ -637,7 +688,9 @@ def _add_reuse_item(
         'how': how,
     })
     artifacts.write_plan(plan)
-    return {'status': 'ok', 'total_reuse': len(plan['reuse'])}
+    return _with_markup_repairs(
+        {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
+    )
 
 
 def _mark_step_done(
@@ -645,18 +698,26 @@ def _mark_step_done(
     step_id: str,
     commit_sha: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     for collection in ('prerequisites', 'steps'):
         for item in plan.get(collection, []):
             if isinstance(item, dict) and item.get('id') == step_id:
+                # The repair write-back has already landed, so the re-read
+                # inside update_step_status picks up the repaired document.
                 artifacts.update_step_status(step_id, 'done', commit=commit_sha)
-                return {
-                    'status': 'ok',
-                    'step_id': step_id,
-                    'new_status': 'done',
-                    'commit': commit_sha,
-                }
-    return {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'}
+                return _with_markup_repairs(
+                    {
+                        'status': 'ok',
+                        'step_id': step_id,
+                        'new_status': 'done',
+                        'commit': commit_sha,
+                    },
+                    markup_facts,
+                )
+    return _with_markup_repairs(
+        {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+        markup_facts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +730,7 @@ def _update_plan_metadata(
     files: list[str] | str | None = None,
     analysis: str | None = None,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
@@ -678,17 +739,20 @@ def _update_plan_metadata(
     if analysis is not None:
         plan['analysis'] = analysis
     artifacts.write_plan(plan)
-    return {
-        'status': 'ok',
-        'files': len(plan.get('files', [])),
-    }
+    return _with_markup_repairs(
+        {
+            'status': 'ok',
+            'files': len(plan.get('files', [])),
+        },
+        markup_facts,
+    )
 
 
 def _remove_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
@@ -697,15 +761,26 @@ def _remove_plan_step(
         for i, item in enumerate(items):
             if isinstance(item, dict) and item.get('id') == step_id:
                 if item.get('status') == 'done':
-                    return {
-                        'status': 'error',
-                        'message': f'Step {step_id!r} has status "done" and cannot be removed.',
-                    }
+                    return _with_markup_repairs(
+                        {
+                            'status': 'error',
+                            'message': (
+                                f'Step {step_id!r} has status "done" and cannot be removed.'
+                            ),
+                        },
+                        markup_facts,
+                    )
                 items.pop(i)
                 artifacts.write_plan(plan)
-                return {'status': 'ok', 'removed': step_id, 'collection': collection}
+                return _with_markup_repairs(
+                    {'status': 'ok', 'removed': step_id, 'collection': collection},
+                    markup_facts,
+                )
 
-    return {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'}
+    return _with_markup_repairs(
+        {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+        markup_facts,
+    )
 
 
 def _replace_plan_step(
@@ -714,7 +789,7 @@ def _replace_plan_step(
     step_type: str,
     description: str,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
@@ -722,34 +797,50 @@ def _replace_plan_step(
         for item in plan.get(collection, []):
             if isinstance(item, dict) and item.get('id') == step_id:
                 if item.get('status') == 'done':
-                    return {
-                        'status': 'error',
-                        'message': f'Step {step_id!r} has status "done" and cannot be replaced.',
-                    }
+                    return _with_markup_repairs(
+                        {
+                            'status': 'error',
+                            'message': (
+                                f'Step {step_id!r} has status "done" and cannot be replaced.'
+                            ),
+                        },
+                        markup_facts,
+                    )
                 item['type'] = step_type
                 item['description'] = description
                 artifacts.write_plan(plan)
-                return {'status': 'ok', 'replaced': step_id}
+                return _with_markup_repairs(
+                    {'status': 'ok', 'replaced': step_id}, markup_facts
+                )
 
-    return {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'}
+    return _with_markup_repairs(
+        {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+        markup_facts,
+    )
 
 
 def _confirm_plan(
     artifacts: TaskArtifacts,
 ) -> dict[str, Any]:
-    plan = artifacts.read_plan()
+    plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
     if not plan.get('steps'):
-        return {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
+        return _with_markup_repairs(
+            {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'},
+            markup_facts,
+        )
     if not plan.get('files'):
-        return {
-            'status': 'error',
-            'message': (
-                'Plan has no files — cannot confirm. Call create_plan (or '
-                'update_plan_metadata) with a non-empty files list first.'
-            ),
-        }
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    'Plan has no files — cannot confirm. Call create_plan (or '
+                    'update_plan_metadata) with a non-empty files list first.'
+                ),
+            },
+            markup_facts,
+        )
 
     now = datetime.now(UTC).isoformat()
     # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
@@ -763,12 +854,15 @@ def _confirm_plan(
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
-    return {
-        'status': 'ok',
-        'finalized': True,
-        'steps': len(plan['steps']),
-        'files': len(plan.get('files', [])),
-    }
+    return _with_markup_repairs(
+        {
+            'status': 'ok',
+            'finalized': True,
+            'steps': len(plan['steps']),
+            'files': len(plan.get('files', [])),
+        },
+        markup_facts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -964,13 +1058,23 @@ def _mark_step_committed(
                 'is not on this branch'
             ),
         }
+    # This is the one hooked entry point that does NOT read the plan itself —
+    # ``artifacts.mark_step_committed`` reaches disk on its own. Repairing here
+    # first means the write-back has already landed when the delegate re-reads,
+    # so its mutation applies to the repaired document rather than racing it.
+    _, markup_facts = _read_plan_repaired(artifacts)
     if not artifacts.mark_step_committed(step_id, sha):
-        return {
-            'ok': False,
-            'status': 'error',
-            'message': f'Step {step_id!r} not found in plan.',
-        }
-    return {'ok': True, 'step_id': step_id, 'status': 'done'}
+        return _with_markup_repairs(
+            {
+                'ok': False,
+                'status': 'error',
+                'message': f'Step {step_id!r} not found in plan.',
+            },
+            markup_facts,
+        )
+    return _with_markup_repairs(
+        {'ok': True, 'step_id': step_id, 'status': 'done'}, markup_facts
+    )
 
 
 # ---------------------------------------------------------------------------
