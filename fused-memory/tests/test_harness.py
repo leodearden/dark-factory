@@ -2270,6 +2270,97 @@ class TestStage2CycleSummaryHarnessBackstop:
             'row — synthesizing one would fabricate a cycle that did not happen'
         )
 
+    # -- degraded-synth arm --------------------------------------------------
+    #
+    # The one remaining shape where Stage 2 demonstrably produced a report yet
+    # no faithful re-attempt is possible: the entry survives only as a plain
+    # dict. run.stage_reports is typed dict[str, StageReport | dict], and
+    # journal.py reconstructs StageReport(**v) only when
+    # isinstance(v, dict) and 'stage' in v — so an adopted/resumed run can
+    # carry one. A row is honest (Stage 2 ran); its real numbers are not
+    # recoverable, so the row is zeroed and self-identifies.
+
+    @staticmethod
+    def _run_with_stage2_entry(entry, **extra_reports) -> ReconciliationRun:
+        """A run carrying *entry* under the Stage 2 key.
+
+        The backstop reads only run.stage_reports and run.run_type and keys
+        its write on the run_id it is handed, so it is invoked directly here
+        rather than through a driver — the plain-dict entry shape cannot be
+        produced by a live in-process stage.run() at all (it arises from a
+        journal round-trip on an adopted/resumed run).
+        """
+        run = ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='test-trigger',
+            started_at=datetime.now(UTC),
+        )
+        run.stage_reports['task_knowledge_sync'] = entry
+        run.stage_reports.update(extra_reports)
+        return run
+
+    @pytest.mark.asyncio
+    async def test_unusable_dict_report_writes_degraded_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Uses a REAL ledger store (no patch) so the persisted row itself is
+        the assertion target."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry({'items_flagged': []})
+        anchor = datetime(2026, 8, 10, 9, 0, 0, tzinfo=UTC)
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', anchor,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None, (
+            'a Stage 2 that ran but survives only as an unusable dict must still '
+            'leave an honest, degraded ledger row'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 0
+        assert payload['tokens_used'] == 0
+        assert payload['items_flagged_count'] == 0
+        assert payload['stats'].get('stage2_cycle_summary_degraded_backstop') is True, (
+            'the synthesized row MUST self-identify — a consumer summing '
+            'llm_calls/tokens has to be able to filter it out or it undercounts'
+        )
+        assert 'stage2_cycle_summary_write_recovered_backstop' not in payload['stats'], (
+            'the degraded arm must never stamp the write-recovered marker'
+        )
+        assert datetime.fromisoformat(payload['started_at']) == anchor, (
+            "the anchor must be the cycle's own start, not a fabricated stage start"
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_arm_stamps_error_breadcrumb(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """When the run already carries an _error record, the degraded arm
+        stamps its outcome there — the same place operators already look for
+        a failed cycle's diagnosis (mirrors the Stage 1 arm's breadcrumb)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry(
+            {'items_flagged': []}, _error={'error_type': 'RuntimeError'},
+        )
+
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', datetime.now(UTC),
+        )
+
+        assert run.stage_reports['_error']['stage2_cycle_summary_backstop_written'] is True
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
