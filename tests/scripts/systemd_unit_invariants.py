@@ -19,7 +19,6 @@ pyproject.toml addopts) deliberately does not.
 import pathlib
 import re
 
-
 # ---------------------------------------------------------------------------
 # Restart backoff
 #

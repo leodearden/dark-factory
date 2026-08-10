@@ -32,8 +32,13 @@ file being written. The escaped form is byte-identical at runtime.
 """
 from __future__ import annotations
 
-import pytest
+import importlib
+import re
 
+import pytest
+from shared import toolcall_markup
+
+from fused_memory.utils import toolcall_xml_leak
 from fused_memory.utils.toolcall_xml_leak import (
     LEAK_TAIL,
     LeakHit,
@@ -322,3 +327,70 @@ class TestCleanTextAndNearMisses:
     def test_a_continuation_alone_is_not_a_leak(self) -> None:
         assert find_toolcall_xml_leak('body\n' + _open_param('priority') + 'low') == []
         assert find_toolcall_xml_leak('body\n' + _CLOSE_INVOKE) == []
+
+
+# ---------------------------------------------------------------------------
+# (G) INV-5 — the enumeration lives in shared.toolcall_markup, and moving it
+#     there changed no behaviour.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSourceOfTruth:
+    def test_prefilter_needles_is_the_shared_object(self) -> None:
+        """IDENTITY, not equality — a copied tuple would re-open the drift.
+
+        ``==`` is satisfied by a tuple re-spelled here with the same value, and
+        a re-spelled tuple is exactly how this list and ``markup_tripwire``'s
+        write-time list drifted apart while both were documented as the single
+        source of truth. Identity is the one assertion a duplicate cannot pass.
+        """
+        assert toolcall_xml_leak.PREFILTER_NEEDLES is toolcall_markup.PREFILTER_NEEDLES
+
+    def test_prefilter_needles_order_is_load_bearing(self) -> None:
+        """``tests/test_mem0_client.py`` zips this against the Qdrant clauses
+        with ``strict=True``, so the ORDER is part of the contract, not just the
+        membership. Pinned from the consumer side because that is where a
+        reorder would actually break.
+        """
+        expected = tuple(
+            toolcall_markup.closer_for(name)
+            for name in toolcall_markup.PARAMETER_CLOSER_NAMES
+        )
+        assert list(toolcall_xml_leak.PREFILTER_NEEDLES) == list(expected)
+
+    def test_leak_tail_pattern_string_is_unchanged(self) -> None:
+        """BEHAVIOUR PRESERVED: the regex is now BUILT from the shared name
+        tuple rather than re-spelled, which would otherwise make it a third
+        enumeration site. Pinning the compiled pattern string proves the
+        rewrite is byte-for-byte the same detector — the only evidence that
+        matters for a consolidation that must change nothing.
+        """
+        assert toolcall_xml_leak.LEAK_TAIL.pattern == (
+            r'\x3c/(?:description|parameter|details|content)>'
+            r'\s+'
+            r'(\x3c(?:parameter\s+name="[^"]*">|/invoke>).*)$'
+        )
+        assert toolcall_xml_leak.LEAK_TAIL.flags & re.DOTALL
+
+    def test_leak_tail_stays_a_module_level_compiled_object(self) -> None:
+        """``scripts/tests/test_scan_task_toolcall_leaks.py`` asserts
+        ``scan_task_toolcall_leaks.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL``,
+        so LEAK_TAIL must be one compiled object bound in the module dict.
+
+        ``LEAK_TAIL is LEAK_TAIL`` would NOT pin that: it is a tautology for a
+        plain attribute, and even a module-level ``__getattr__`` recomputing
+        ``re.compile(SAME_PATTERN, re.DOTALL)`` per access satisfies it, since
+        ``re`` memoises compiled patterns by ``(pattern, flags)`` in
+        ``re._cache`` (verified: two such calls return the same object). What
+        actually excludes a recomputing shim is membership in ``vars()`` — a
+        module ``__getattr__`` fires only for names ABSENT from the module
+        dict — plus identity across a second, independent import path.
+        """
+        assert isinstance(toolcall_xml_leak.LEAK_TAIL, re.Pattern)
+        assert 'LEAK_TAIL' in vars(toolcall_xml_leak), (
+            'LEAK_TAIL must be bound in the module dict, not synthesised by a '
+            'module-level __getattr__ — a per-access rebuild would break the '
+            'cross-module `is` in scripts/tests/test_scan_task_toolcall_leaks.py'
+        )
+        reimported = importlib.import_module('fused_memory.utils.toolcall_xml_leak')
+        assert reimported.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL

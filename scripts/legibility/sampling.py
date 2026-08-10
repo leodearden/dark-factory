@@ -34,11 +34,11 @@ import logging
 import math
 import re
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable, Sequence
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
 # — must run BEFORE the `legibility.*` imports below, since a direct script

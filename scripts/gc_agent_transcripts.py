@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Retention GC sweep over the gzipped agent-transcript archive.
+"""Retention GC sweep over the agent-transcript archive.
 
 Task 2731 (δ of plans/agent-transcript-archival-prd.md). The α producer hook
-(:mod:`shared.transcript_archive`, task 2742) gzips each finished agent
+(:mod:`shared.transcript_archive`, task 2742) copies each finished agent
 session's transcripts to a durable archive root outside the per-task worktree,
-laid out as ``<root>/<task_id>/<enc>/<session_id>.jsonl.gz`` with each ``.gz``
-carrying the SOURCE transcript's mtime (mirrored via ``os.utime``). Nothing
+laid out as ``<root>/<task_id>/<enc>/<session_id>.jsonl`` with each archived
+copy carrying the SOURCE transcript's mtime (mirrored via ``os.utime``). Nothing
 prunes that tree, so it grows without bound; this sweep is the δ consumer that
 enforces α's ``retention.*`` config knobs (``max_age_days`` / ``max_task_dirs``)
 to keep archive disk bounded.
@@ -13,11 +13,11 @@ to keep archive disk bounded.
 Retention model
 ---------------
 Each immediate child dir of ``<root>`` is one per-task archive dir. Its
-retention "age" is the newest ``.gz`` mtime among its descendants (recursive),
-falling back to the dir's own mtime when it holds no files — because α mirrors
-the source transcript mtime onto each ``.gz``, that newest mtime is the real
-time the task's most recent agent session last wrote, and is stable across
-re-archival.
+retention "age" is the newest ``.jsonl`` mtime among its descendants
+(recursive), falling back to the dir's own mtime when it holds no files —
+because α mirrors the source transcript mtime onto each archived copy, that
+newest mtime is the real time the task's most recent agent session last wrote,
+and is stable across re-archival.
 
 A task dir is pruned when it fails EITHER bound (union):
 
@@ -219,10 +219,10 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
 
     Each immediate child DIR of *root* is one per-task archive dir. Its
     reported mtime is the NEWEST descendant file mtime (recursive), which —
-    because α mirrors the source transcript mtime onto each ``.gz`` — measures
-    the task's most recent agent-session activity. A task dir holding no files
-    falls back to its own directory mtime. Stray non-directory entries directly
-    under *root* are skipped.
+    because α mirrors the source transcript mtime onto each archived copy —
+    measures the task's most recent agent-session activity. A task dir holding
+    no files falls back to its own directory mtime. Stray non-directory entries
+    directly under *root* are skipped.
 
     Returns ``[]`` when *root* is absent or is not a directory (so a missing or
     empty archive is a clean no-op). Output is sorted by task-dir path for
@@ -249,10 +249,10 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
             _warn_stat_skip('archive entry', child, err)
             continue
 
-        # Newest descendant FILE mtime, guarding EVERY per-file stat: a .gz can
-        # vanish (or briefly become unreadable) between the rglob walk and the
-        # stat call. A failed file is skipped LOUDLY; the remaining readable
-        # files still set the dir's age.
+        # Newest descendant FILE mtime, guarding EVERY per-file stat: an
+        # archived transcript can vanish (or briefly become unreadable) between
+        # the rglob walk and the stat call. A failed file is skipped LOUDLY;
+        # the remaining readable files still set the dir's age.
         file_mtimes: list[float] = []
         for descendant in child.rglob('*'):
             try:
@@ -341,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='gc_agent_transcripts.py',
         description=(
-            'Retention GC sweep over the gzipped agent-transcript archive '
+            'Retention GC sweep over the agent-transcript archive '
             '(age/count cap, best-effort, LOUD).'
         ),
     )

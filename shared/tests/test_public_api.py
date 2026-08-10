@@ -30,12 +30,14 @@ class TestTopLevelImports:
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            is_cli_invocation_rejected,
             is_timed_out_with_progress,
             is_zero_output_timeout,
             load_json_or_warn,
             modules_conflict,
             normalize_lock,
             read_transcript_records,
+            require_non_blank_prompt,
         )
 
         assert AgentResult is not None
@@ -43,6 +45,13 @@ class TestTopLevelImports:
         assert invoke_with_cap_retry is not None
         assert is_zero_output_timeout is not None
         assert is_timed_out_with_progress is not None
+        # esc-3118-1 (task 3143): the pre-first-turn transport rejection predicate
+        # and the non-blank-prompt precondition are consumed OUT of package (the
+        # orchestrator's sandboxed claude path calls the latter), so they must be
+        # importable from the blessed top-level surface rather than reached for
+        # inside the submodule.
+        assert is_cli_invocation_rejected is not None
+        assert require_non_blank_prompt is not None
         assert count_transcript_turns is not None
         assert read_transcript_records is not None
         assert UsageGate is not None
@@ -87,10 +96,12 @@ class TestModuleLevelAll:
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_cli_invocation_rejected',
             'is_server_error_status',
             'is_timed_out_with_progress',
             'is_zero_output_timeout',
             'read_transcript_records',
+            'require_non_blank_prompt',
             'transcript_exists',
         }
 
@@ -138,7 +149,8 @@ class TestModuleLevelAll:
             'normalize_lock',
             'files_to_modules',
             'modules_conflict',
-            'CODE_EXTENSIONS',
+            'FILE_EXTENSIONS',
+            'EXTENSIONLESS_FILENAMES',
             'is_file_path',
             'directory_locks',
             'strip_directory_locks',

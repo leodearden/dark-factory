@@ -65,6 +65,15 @@ for _rel in ('orchestrator/src', 'shared/src', 'escalation/src'):
     _p = str(_REPO_ROOT / _rel)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# scripts/ itself: implicit on sys.path[0] when run standalone (Python adds the
+# main script's own dir), and explicit via scripts/tests/conftest.py under
+# pytest — but not guaranteed when this module is imported as a library from
+# elsewhere, so make it explicit here too (idempotent).
+_p = str(_REPO_ROOT / 'scripts')
+if _p not in sys.path:
+    sys.path.insert(0, _p)
+
+from _eval_results_io import load_results_from_dir  # noqa: E402
 
 # β1's (task 3631) v2 hard-fixture pool. Absent until β1 lands — which is why
 # :func:`resolve_fixture_paths` fails LOUDLY rather than falling back.
@@ -810,66 +819,6 @@ def filter_campaign_results(
     return kept, dropped
 
 
-def _load_results_from_dir(results_dir: Path) -> list[Any]:
-    """Load every persisted ``EvalResult`` JSON in *results_dir*.
-
-    Filters each loaded dict to the known dataclass fields, mirroring
-    ``runner.load_results``, so a cell persisted before a field existed still
-    loads instead of raising on an unexpected keyword.
-
-    TWO LOUD FAILURES, both because this path is aimed by default at the SHARED
-    packaged results dir holding cells written by many campaigns over time:
-
-    * A MISSING DIR exits naming it. ``Path.glob`` returns EMPTY for a
-      nonexistent dir rather than raising, so without this check a plain typo
-      falls through to :func:`_load_campaign_results`'s zero-survivors branch and
-      gets diagnosed as contamination ("the dir predates this campaign or belongs
-      to another one") when the real problem is the path. Mirrors
-      :func:`resolve_fixture_paths`, which already applies exactly this rule to
-      the other input path.
-    * A MALFORMED FILE exits NAMING THE FILE. One truncated or partial write
-      among hundreds of cells would otherwise take down the whole re-analysis
-      with a bare ``JSONDecodeError`` traceback naming neither the offending file
-      nor the dir — unactionable. Failing loudly rather than skipping is
-      deliberate: a silently skipped cell shifts every count in the report, and
-      this driver's whole thesis is that γ1's calibration is COMPUTED from a
-      pool whose membership is known exactly.
-
-    KNOWN DUPLICATION (deliberate, recorded rather than hidden): the load-and-
-    filter body is a near-verbatim sibling of ``scripts/run_judge_ofat_pilot.py``
-    ``_load_results_from_dir``, which does NOT carry the hardening above. The two
-    copies can now drift. Extracting a shared ``scripts/`` helper would mean
-    editing that sibling script, which is outside this task's locked module set,
-    so it is filed as a follow-up instead of done here.
-    """
-    from orchestrator.evals.runner import EvalResult
-
-    results_dir = Path(results_dir)
-    if not results_dir.is_dir():
-        raise SystemExit(
-            f'Error: results dir not found (or is not a directory): {results_dir}\n'
-            '  This is a path problem, not a contamination problem: Path.glob returns '
-            'empty for a nonexistent dir rather than raising, so without this check the '
-            'typo would be reported downstream as "no in-campaign cells found".'
-        )
-    known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-    results = []
-    for path in sorted(results_dir.glob('*.json')):
-        try:
-            data = json.loads(path.read_text())
-            results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-        except (ValueError, OSError, TypeError, AttributeError) as e:
-            raise SystemExit(
-                f'Error: could not load persisted eval cell {path}: '
-                f'{type(e).__name__}: {e}\n'
-                '  Expected a JSON object shaped like EvalResult.to_dict(). A truncated '
-                'or partial write in the shared packaged results dir is the usual cause. '
-                'The file is named rather than skipped: dropping a cell silently would '
-                'shift every count in the report.'
-            ) from e
-    return results
-
-
 def _load_campaign_results(
     results_dir: Path, candidates: list[Any], fixture_paths: list[Path],
 ) -> tuple[list[Any], dict[str, Any]]:
@@ -884,8 +833,13 @@ def _load_campaign_results(
     measured nothing" and "you pointed at the wrong directory" must not share a
     shape — and the latter is by far the likelier cause, given the shared
     packaged results dir this path is aimed at by default.
+
+    The missing-dir / malformed-file hardening lives in the shared
+    :func:`_eval_results_io.load_results_from_dir` (task 3743), not here — it
+    used to be a private copy in this module, near-verbatim duplicated in
+    ``scripts/run_judge_ofat_pilot.py``.
     """
-    loaded = _load_results_from_dir(results_dir)
+    loaded = load_results_from_dir(results_dir)
     candidate_names = {c.name for c in candidates}
     fixture_stems = {p.stem for p in fixture_paths}
     kept, dropped = filter_campaign_results(loaded, candidate_names, fixture_stems)

@@ -23,7 +23,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 import run_fable_trial_v2_campaign as mod
 
 
@@ -283,7 +282,11 @@ def test_apply_budgets_overrides_only_the_named_candidate():
     # dataclasses.replace, not in-place mutation: the module-level
     # ARCHITECT_EVAL_CONFIGS entries stay byte-unchanged for every other caller.
     assert [(c.name, c.max_budget_usd) for c in cands] == before
-    assert all(a is not b for a, b in zip(cands, out) if a.name == 'architect-opus-max')
+    # strict=True is not incidental: apply_budgets is a comprehension over
+    # `candidates`, so a length change would be a contract break, not a zip quirk.
+    assert all(
+        a is not b for a, b in zip(cands, out, strict=True) if a.name == 'architect-opus-max'
+    )
 
 
 def test_budget_for_unselected_candidate_exits():

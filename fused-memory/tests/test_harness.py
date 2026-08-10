@@ -11661,6 +11661,413 @@ async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_ci
     )
 
 
+# ---------------------------------------------------------------------------
+# Integrity-escalation gate: corroboration + pure_gate input parity (task 2964)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityGateInputParityWithRenderer:
+    """The integrity-escalation gate must pass the SAME detector inputs as the
+    render-time Live-Workflow Signals section.
+
+    Three consumers compute liveness from one detector. Before task 2964 they
+    disagreed about what to feed it:
+
+    | consumer                       | status | task_kind | pure_gate | corroborated |
+    |--------------------------------|--------|-----------|-----------|--------------|
+    | _render_live_workflow_section   |  yes   |    yes    |    yes    |     yes      |
+    | recon_write_policy Gate 2       |  yes   |    yes    |    yes    |  NO -> yes   |
+    | this integrity gate             |  yes   |    yes    |  NO->yes  |  NO -> yes   |
+
+    Two remaining input gaps are closed here: `corroborated` (the in-progress
+    fleet-redeploy false positive, task 2963) and `pure_gate` (task 3751 wired
+    the renderer and the policy gate but not this one). After both, all three
+    consumers pass the identical status/task_kind/pure_gate/corroborated tuple.
+
+    Fail-safe direction at THIS consumer is unchanged and is the opposite
+    OUTCOME from Gate 2's — but each is its own pre-existing posture: any
+    corroboration error leaves corroborated=None, the detector gate stays inert,
+    and the escalation is still SUPPRESSED. This is never a new silencing path;
+    only an explicit corroborated=False lets a stranded escalation through.
+    """
+
+    _TASK_ID = '599'
+
+    @staticmethod
+    def _heartbeat(delta: timedelta) -> str:
+        """ISO heartbeat stamped *delta* from now (negative = past).
+
+        Stale/fresh margins are set against live_workflow_detector's
+        DEFAULT_HEARTBEAT_TTL (10 minutes) with enough slack that real-clock
+        drift during the test can never flip the verdict.
+        """
+        return (datetime.now(UTC) + delta).isoformat()
+
+    @classmethod
+    def _cited_task(cls, **overrides) -> dict:
+        """A killed-in-progress cited task: durable claimant, STALE heartbeat.
+
+        A killed workflow's `claimant_run_id` PERSISTS — heartbeat freshness,
+        not the claimant's presence, separates a live pipeline from a stranded
+        one. No routing metadata, and `_run_gate` stubs the other two
+        corroboration inputs to their empty forms (see there), so none of the
+        three corroborating signals can fire.
+        """
+        task = {
+            'id': int(cls._TASK_ID),
+            'title': 'Killed in-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': cls._heartbeat(timedelta(minutes=-30)),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        task.update(overrides)
+        return task
+
+    @staticmethod
+    async def _run_gate(
+        *, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, cited_task, fake_is_live,
+    ) -> tuple[list, list]:
+        """Drive _run_remediation_pass's persistence-gated live-workflow gate once.
+
+        Verbatim reuse of the setup
+        test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_cited_task
+        uses: _make_test_harness + an EscalationQueue(tmp_path / 'esc'),
+        taskmaster.get_tasks seeding remediation_tree with *cited_task*, the
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD persistence-seeding loop, and a
+        stage-3 stub returning the actionable finding.
+
+        Returns ``(stranded_escalations, suppression_records)``.
+        """
+        import uuid as _uuid
+
+        from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+        import fused_memory.reconciliation.harness as harness_module
+        from fused_memory.reconciliation.harness import (
+            _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = esc_queue
+
+        actionable_finding = _make_finding_with_cited_task(str(cited_task['id']))
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [cited_task]
+        }
+
+        monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', fake_is_live)
+
+        # Pin the two on-disk corroboration inputs to their empty forms. Every
+        # case in this class rests on "no scheduler/orchestrator signal can
+        # corroborate" — but _make_test_harness hard-codes project_root to the
+        # shared, pytest-unmanaged /tmp/test-project, so leaving these real would
+        # make the premise depend on that directory happening not to exist on the
+        # machine. A stale /tmp/test-project/data/orchestrator/scheduler_state.json
+        # dropped by any other process or developer would flip `corroborated` and
+        # break test_uncorroborated_in_progress_cited_task_escalates for reasons
+        # having nothing to do with the code under test. Stub values mirror the
+        # real absent-file returns exactly: read_scheduler_state's empty skeleton
+        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # for an absent/unparseable lock.
+        monkeypatch.setattr(
+            harness_module, 'read_scheduler_state',
+            lambda _root: {
+                'queue': [], 'parks': {}, 'park_stacks': {},
+                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
+                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
+                'snapshot_at': None,
+            },
+        )
+        monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
+
+        n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+        base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+        for i in range(n_seed):
+            rid = str(_uuid.uuid4())
+            run = ReconciliationRun(
+                id=rid,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='buffer_size:1',
+                started_at=base_time + timedelta(minutes=i),
+                events_processed=1,
+                status=RunStatus.running,
+            )
+            await journal.start_run(run)
+            await journal.update_run_stage_reports(
+                rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+            )
+            await journal.complete_run(rid, 'completed')
+
+        await event_buffer.push(_make_event())
+
+        async def s3_returns_finding(
+            events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2],
+        ):
+            return StageReport(
+                stage=_s.stage_id,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[actionable_finding],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        harness.stages[2].run = s3_returns_finding
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        stranded = [
+            e for e in esc_queue.get_pending()
+            if e.category == 'recon_integrity_issue'
+            and 'Persistently unresolved' in e.summary
+        ]
+        suppressed = [
+            r for r in caplog.records
+            if r.getMessage()
+            == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+        ]
+        return stranded, suppressed
+
+    # ----- corroboration (task 2963 -> this consumer) -----
+
+    @pytest.mark.asyncio
+    async def test_uncorroborated_in_progress_cited_task_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a killed-but-lingering in-progress cited task no longer
+        silences its stranded-work escalation.
+
+        The fake reports live for EVERYTHING except corroborated=False, so this
+        passes only if the harness actually forwards the real verdict. A pre-fix
+        call site passes no `corroborated` kwarg at all — kw.get('corroborated')
+        is None, the task reads as live, and the escalation is suppressed
+        forever while the renderer has already stopped listing it.
+        """
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert False in received, (
+            f'Expected is_workflow_live_for_task to receive corroborated=False '
+            f'for the stale-heartbeat in-progress task; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for the uncorroborated '
+            'in-progress cited task; got none'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_cited_task_is_still_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """DIFFERENTIAL — a genuinely live workflow is still protected. The ONLY
+        difference from the case above is heartbeat freshness."""
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(
+                heartbeat_at=self._heartbeat(timedelta(seconds=-5)),
+            ),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [True], (
+            f'Expected corroborated=True for the fresh-heartbeat task; got {received!r}'
+        )
+        assert stranded == [], (
+            f'Expected the escalation to be SUPPRESSED for a live workflow; got '
+            f'{[e.summary for e in stranded]}'
+        )
+        assert len(suppressed) >= 1, 'Expected a suppression log for the live task'
+
+    @pytest.mark.asyncio
+    async def test_non_in_progress_cited_task_gets_corroborated_none(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """INERT — the gate is in-progress-only, mirroring the renderer's
+        `task.get('status') == 'in-progress'` guard. Every other status keeps its
+        exact pre-2964 verdict, which for a blocked cited task under the bare
+        lock is: suppressed."""
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(status='blocked'),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [None], (
+            f'Expected corroborated=None for a non-in-progress cited task; '
+            f'got {received!r}'
+        )
+        assert stranded == []
+        assert len(suppressed) >= 1
+
+    # ----- pure_gate (task 3751 rule 5 -> this consumer) -----
+    #
+    # The last remaining harness-vs-renderer input gap. Task 3751 wired
+    # `pure_gate` into _render_live_workflow_section AND into
+    # recon_write_policy.check(), but not into this gate — so a cited PENDING
+    # deterministic PURE GATE still disagreed with Live-Workflow Signals, the
+    # same class of divergence this task exists to close.
+
+    @classmethod
+    def _pure_gate_task(cls, **overrides) -> dict:
+        """Task 3845's verified real metadata shape: `always_escalates` with NO
+        `before_done`, in status `pending`.
+
+        Such a task's ENTIRE run is "file one born-at-L2 escalation, stamp
+        gate_escalated_at, set blocked" — no script, no systemd, no git_ops — so
+        it never acquires a worktree or branch and the bare project-wide lock is
+        never task-specific evidence for it.
+        """
+        fields = {
+            'status': 'pending',
+            'metadata': {'task_kind': 'deterministic', 'always_escalates': True},
+        }
+        fields.update(overrides)
+        return cls._cited_task(**fields)
+
+    @pytest.mark.asyncio
+    async def test_pending_pure_gate_cited_task_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a cited pending deterministic PURE GATE is not suppressed by
+        the bare project-wide orchestrator lock.
+
+        The fake reports not-live ONLY for task_kind='deterministic' AND
+        pure_gate is True, so this passes only if the harness forwards BOTH. A
+        pre-fix call site passes no `pure_gate` kwarg at all.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert ('deterministic', True) in received, (
+            f'Expected the gate to forward task_kind="deterministic" AND '
+            f'pure_gate=True for the pending pure gate; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for the cited pending pure gate'
+        )
+        assert suppressed == []
+
+    @pytest.mark.asyncio
+    async def test_before_done_deterministic_cited_task_is_still_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """NARROWING — a deterministic task WITH a truthy `before_done` forwards
+        pure_gate=False, so detector rule 5 stays inert and the lock keeps
+        protecting it while it may be mid-deploy inside DeterministicRunner (a
+        blocking script run leaves no git evidence, and the task's status stays
+        'pending' throughout)."""
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+            }),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [('deterministic', False)], (
+            f'Expected pure_gate=False for a deterministic task WITH before_done; '
+            f'got {received!r}'
+        )
+        assert stranded == []
+        assert len(suppressed) >= 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata', [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    async def test_malformed_metadata_forwards_pure_gate_false(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, metadata,
+    ):
+        """FAIL-SAFE — an absent or non-Mapping metadata blob forwards
+        pure_gate=False (toward live), relying on is_pure_gate_metadata's own
+        documented non-Mapping -> False contract rather than a guard at the call
+        site. Only POSITIVE evidence of the pure-gate shape suppresses the lock.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return True
+
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(status='pending', metadata=metadata),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [(None, False)], (
+            f'Expected task_kind=None, pure_gate=False for metadata={metadata!r}; '
+            f'got {received!r}'
+        )
+
+
 @pytest.mark.asyncio
 async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_normal_cited_task(
     journal,
@@ -12620,7 +13027,17 @@ class TestHarnessReconcileStatusCorrection:
         assert add_kwargs['category'] == 'observations_and_summaries'
         assert add_kwargs['project_id'] == 'test-project'
         assert add_kwargs['metadata']['kind'] == 'project_status_correction'
-        assert add_kwargs['metadata']['supersedes'] == 'af698512-stale-memory'
+        # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs, written
+        # list-shaped at the source. Asserted on the PRE-service metadata dict
+        # so a migrated writer is distinguishable from one relying on the
+        # scalar->list coercion in validate_memory_metadata(). Exact list
+        # equality is the contract: exactly one superseded predecessor
+        # (`latest['id']`) is recorded per correction — not membership.
+        supersedes = add_kwargs['metadata']['supersedes']
+        assert isinstance(supersedes, list), (
+            f'PRD D2: supersedes is a list of full UUIDs, got {type(supersedes).__name__}'
+        )
+        assert supersedes == ['af698512-stale-memory']
         assert add_kwargs['metadata']['task_count_done'] == 114
         assert add_kwargs['metadata']['task_count_total'] == 124
         assert sorted(add_kwargs['metadata']['active_tasks']) == live_active

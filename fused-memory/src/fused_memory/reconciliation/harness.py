@@ -23,6 +23,7 @@ from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ReconciliationEvent,
@@ -79,8 +80,13 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    is_pure_gate_metadata,
+    is_workflow_live_for_task,
+)
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.orchestrator_detector import orchestrator_started_at
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1164,7 +1170,35 @@ class ReconciliationHarness:
             live = diff['live']
             corrected_metadata = {
                 'kind': 'project_status_correction',
-                'supersedes': latest['id'],
+                # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs.  The
+                # shape contract, the read tolerance for the legacy scalar, and
+                # the writer/reader map all live in ONE place —
+                # `memory_metadata.normalize_supersedes`'s docstring — rather
+                # than being restated here.  Written list-shaped at the source
+                # rather than leaning on the service-seam coercion in
+                # validate_memory_metadata().  Exactly one predecessor is
+                # recorded: `latest` is the single max()-by-created_at memory
+                # being superseded.  Do NOT widen to every deleted duplicate —
+                # the queried set is deleted for pool-capping (task 1938
+                # amendment), a different relation from supersession.
+                #
+                # EXPECTED-DANGLING POINTER (deliberate; pre-dates the list
+                # migration and is unchanged by it).  `latest` is a member of
+                # the `memories` set deleted below, so this id does NOT resolve
+                # via `get_memory_by_id` once this branch returns.  That is
+                # intended: the pool cap requires the corrected predecessor to
+                # go away, and `supersedes` is kept as an audit trace of WHICH
+                # record was corrected, not as a live pointer.  Consequence for
+                # the eval program's E4 dangling-pointer census
+                # (docs/prds/memory-eval-program.md §γ, which resolves
+                # `supersedes` targets via `get_memory_by_id`): 100% of this
+                # writer's edges are dangling BY DESIGN, so E4 must allowlist
+                # `kind=project_status_correction` rather than report a census
+                # spike.  Making the target resolvable would mean keeping
+                # `latest` alive, which reopens the unbounded-pool bug — i.e.
+                # not a documentation-only change, which is why this leaf
+                # records the invariant instead of "fixing" it.
+                'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
                 'active_tasks': live['active_tasks'],
@@ -1177,7 +1211,7 @@ class ReconciliationHarness:
                 f"active={len(live['active_tasks'])}."
             )
             # Add-then-delete: guarantees at least one correct memory always exists
-            # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+            # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
             # is still the most-recent, so next cycle's max()-by-created_at selection
             # ignores any stale leftover and self-heals.  Once add_memory lands, the
             # supersede has effectively happened regardless of delete outcomes below
@@ -3799,28 +3833,34 @@ class ReconciliationHarness:
             else await self._fetch_filtered_task_tree(project_root)
         )
 
-        # Task 2031/2067: {str(task_id): status} and {str(task_id): task_kind} maps
-        # derived from remediation_tree in a single pass, used by the live-workflow
-        # gate below so never-dispatched cited tasks (deferred/done/cancelled) drop
-        # the project-wide orchestrator_live signal instead of being suppressed by
-        # it, and so BLOCKED cited tasks that are deterministic (never acquire a
+        # Task 2031/2067: a {str(task_id): task dict} map derived from
+        # remediation_tree in a single pass, used by the live-workflow gate below
+        # so never-dispatched cited tasks (deferred/done/cancelled) drop the
+        # project-wide orchestrator_live signal instead of being suppressed by it,
+        # and so BLOCKED cited tasks that are deterministic (never acquire a
         # worktree/branch of their own — routed to DeterministicRunner) do too —
-        # which status_by_id alone cannot express since 'blocked' is deliberately
-        # not in ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may
-        # legitimately auto-unblock mid-pipeline). remediation_tree is always a
-        # valid FilteredTaskTree (degrades to empty on fetch failure), so this is
-        # safe. Built together (rather than as two separate comprehensions) so the
-        # two maps are guaranteed key-identical from one iteration of the source
-        # lists.
-        # Coverage caveat: active_tasks is uncapped (deferred/blocked — the cited
-        # cases — always resolve), but done_tasks/cancelled_tasks are capped at
-        # MAX_DONE_TASKS_RETAINED=30 / MAX_CANCELLED_TASKS_RETAINED=15
-        # (task_filter.py). A cited done/cancelled task outside those caps, or one
-        # with an untracked status, is simply absent here and status_by_id.get(tid)
-        # / task_kind_by_id.get(tid) fall back to None below — the pre-2031
-        # status-blind behavior for that one id, not a new failure mode.
-        status_by_id: dict[str, str | None] = {}
-        task_kind_by_id: dict[str, str | None] = {}
+        # which status alone cannot express since 'blocked' is deliberately not in
+        # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+        # auto-unblock mid-pipeline). remediation_tree is always a valid
+        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+        #
+        # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
+        # scalar maps into this one: the gate now also needs `metadata` (for
+        # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
+        # corroboration), which no scalar map can express. Keying the whole dict
+        # subsumes all of them from the same single pass at no extra cost, and
+        # keeps every derived value guaranteed to come from ONE task snapshot.
+        #
+        # Coverage caveat (unchanged, restated for the consolidated map): active_
+        # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
+        # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
+        # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
+        # done/cancelled task outside those caps, or one with an untracked status,
+        # is simply absent here and task_by_id.get(tid) falls back to None below —
+        # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
+        # status-blind, fail-safe-toward-live values for that one id, not a new
+        # failure mode.
+        task_by_id: dict[str, dict] = {}
         for t in (
             list(remediation_tree.active_tasks)
             + list(remediation_tree.done_tasks)
@@ -3828,10 +3868,22 @@ class ReconciliationHarness:
         ):
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
-            tid = str(t.get('id'))
-            status_by_id[tid] = t.get('status')
-            _metadata = t.get('metadata')
-            task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
+            task_by_id[str(t.get('id'))] = t
+
+        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
+        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
+        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
+        # so it must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
+        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
+        # a fresh now() there would age a heartbeat that was fresh when read past the
+        # TTL purely because the pass was slow, reporting corroborated=False for a
+        # task that is in fact live and filing a spurious stranded-work escalation.
+        # Pinning the clock to the read makes the verdict "was there a fresh
+        # per-task signal in the snapshot we hold" — evaluable, and biased toward
+        # suppression (the fail-safe direction) rather than toward escalating.
+        # task_by_id's own staleness is pre-existing and orthogonal.
+        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 
@@ -4060,6 +4112,36 @@ class ReconciliationHarness:
                         )
                         # resolved_fps stays empty → no suppressions → fail-open
 
+                # Task 2964: read the two per-project corroboration inputs ONCE,
+                # HERE — immediately before the live-workflow gate that consumes
+                # them, not at the top of the pass. They are freshness signals, and
+                # the top of the pass is minutes of LLM stage work away from this
+                # point: a task the scheduler picked up (or parked) mid-pass would
+                # read as uncorroborated from a t0 snapshot and the gate would file
+                # a stranded-work escalation for a task that is in fact live. The
+                # renderer's identical hoist (_render_live_workflow_section in
+                # reconciliation/stages/task_knowledge_sync.py) is safe at the top of
+                # its call only because its read-to-use gap is microseconds; this
+                # one's is not, so the read moves to the use.
+                #
+                # Both are constant for this project_root over the gate loop below,
+                # and both are wrapped fail-safe → None: a None simply means that
+                # corroborating signal cannot fire (corroboration_for_task tolerates
+                # None inputs and never raises on them), which leaves the verdict
+                # biased toward "not corroborated" — the direction that lets a
+                # stranded escalation through only when nothing at all vouches for
+                # the task. read_scheduler_state already returns an empty skeleton
+                # for an absent/invalid file; orchestrator_started_at returns None
+                # for an absent or unparseable lock.
+                try:
+                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                except Exception:
+                    _sched_state = None
+                try:
+                    _orch_started: datetime | None = orchestrator_started_at(project_root)
+                except Exception:
+                    _orch_started = None
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -4071,11 +4153,11 @@ class ReconciliationHarness:
                         # escalate.  Guard detector errors as not-live (fail toward escalating
                         # rather than toward silencing a genuine stranded-work escalation).
                         # Task 2031: cited tasks in a never-dispatched status
-                        # (deferred/done/cancelled, via status_by_id above) drop the
+                        # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
                         # behind an unrelated live orchestrator still escalates.
                         # Task 2067: extends this to a BLOCKED cited task that is
-                        # deterministic (via task_kind_by_id above) — it never
+                        # deterministic (via task_by_id above) — it never
                         # acquires a worktree/branch of its own, so the bare
                         # orchestrator lock is not task-specific evidence for it
                         # either, and a stranded deterministic deploy still escalates.
@@ -4087,6 +4169,24 @@ class ReconciliationHarness:
                         # loop) still escalates instead of being suppressed
                         # indefinitely. A blocked normal task WITH genuine
                         # per-task evidence is unaffected and still suppresses.
+                        # Task 2964: forwards `corroborated` for IN-PROGRESS cited
+                        # tasks. This consumer previously diverged from the
+                        # render-time Live-Workflow Signals section for exactly the
+                        # killed-but-lingering in-progress shape: a fleet redeploy
+                        # kills the workflow, but the git worktree registration
+                        # lingers and the restarted orchestrator re-acquires the
+                        # project-wide lock, so both signals keep asserting liveness
+                        # with no recent commit. Post-2963 the renderer downgrades
+                        # that to indeterminate and drops the task, while this gate
+                        # still read it as live and silenced the stranded-work
+                        # escalation indefinitely. The fail-safe direction here is
+                        # UNCHANGED: any assembly error, a non-in-progress status,
+                        # or an absent task_by_id entry all leave corroborated=None,
+                        # the detector's gate stays inert, and the escalation is
+                        # still suppressed — this is never a new silencing path.
+                        # Only an explicit corroborated=False (nothing at all
+                        # vouches for the task) now lets a stranded escalation
+                        # through.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -4101,11 +4201,53 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
+                            _task = task_by_id.get(tid)
+                            _metadata = _task.get('metadata') if _task else None
+                            _status = _task.get('status') if _task else None
+                            # In-progress-only, mirroring the renderer's
+                            # `task.get('status') == 'in-progress'` guard so all
+                            # three consumers gate corroboration identically.
+                            corroborated: bool | None = None
+                            if _status == 'in-progress' and _task is not None:
+                                try:
+                                    corroborated = corroboration_for_task(
+                                        _task, tid,
+                                        # The snapshot's own clock, NOT now() — see
+                                        # the _tasks_snapshot_at comment above: the
+                                        # heartbeat being aged came from that same
+                                        # read, and the 10-minute TTL is comparable
+                                        # to a remediation pass.
+                                        now=_tasks_snapshot_at,
+                                        scheduler_state=_sched_state,
+                                        orchestrator_started_at=_orch_started,
+                                    )
+                                except Exception as _corr_exc:
+                                    logger.debug(
+                                        'corroboration_for_task error for task %s; '
+                                        'leaving the gate inert: %s',
+                                        tid, _corr_exc,
+                                    )
                             try:
                                 if is_workflow_live_for_task(
                                     tid, project_root,
-                                    status=status_by_id.get(tid),
-                                    task_kind=task_kind_by_id.get(tid),
+                                    status=_status,
+                                    task_kind=(
+                                        _metadata.get('task_kind')
+                                        if isinstance(_metadata, dict) else None
+                                    ),
+                                    # Task 3751 rule 5 (pending + deterministic +
+                                    # pure gate). is_pure_gate_metadata's own
+                                    # non-Mapping -> False contract is the guard,
+                                    # so an absent or malformed blob degrades
+                                    # toward live with no extra check here. This
+                                    # completes the input parity: this consumer,
+                                    # recon_write_policy Gate 2 and
+                                    # _render_live_workflow_section now all pass
+                                    # the identical status/task_kind/pure_gate/
+                                    # corroborated tuple — the invariant task 2964
+                                    # exists to establish.
+                                    pure_gate=is_pure_gate_metadata(_metadata),
+                                    corroborated=corroborated,
                                 ):
                                     any_live = True
                                     break

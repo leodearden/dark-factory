@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -103,6 +104,7 @@ from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
     canonicalize_project_id,
+    validate_full_uuid,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -432,6 +434,16 @@ Conventions:
   rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
   is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
   rationale live in fused_memory/server/markup_tripwire.py.
+- A store='mem0' delete_memory is REFUSED (error_type=CitationRepointRequired) while a live
+  (non-terminal) task still cites the entry in its metadata — dispatch follows those pointers,
+  and the delete is irreversible. This is a property of the RECORD, not of who is deleting, so
+  it applies to every caller. The refusal names each citing task and path. Retry with
+  replacement_memory_id=<the surviving entry's full 36-char UUID> and the citers are repointed
+  before the delete runs; that is the answer for a consolidation, which has a survivor by
+  definition. Only for a plain drop with NO survivor to repoint to, pass
+  metadata={'allow_dangling_citations': True} — literal boolean True only, same as above. The
+  override is recorded at WARNING and the response names every citation it strands. An
+  unreadable task DB fails CLOSED (CitationScanFailed), override or not.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -1358,6 +1370,39 @@ def create_mcp_server(
         'back to the superseded duplicates this consolidation is collapsing. '
         'Terminal (done/cancelled) citers are reported, never rewritten.'
     )
+    # (task 3624) The escape is advertised on the CitationRepointRequired
+    # refusal ONLY, which is why this is a separate constant rather than a
+    # sentence appended to the shared one. The CitationReplacement* refusals
+    # reuse _CITATION_REPOINT_HINT unchanged: a caller who typo'd, truncated or
+    # hallucinated a survivor UUID demonstrably HAS a survivor, so their fix is
+    # "copy the correct UUID" and offering a one-flag bypass there would invite
+    # exactly the stranded-pointer incident this gate closes. The same logic
+    # bounds who should take it at all — a consolidation delete has a survivor
+    # by definition, so the escape is never right for one, and the sentence
+    # says so rather than leaving the Stage-1 agent to infer it.
+    _CITATION_REPOINT_REQUIRED_HINT = (
+        _CITATION_REPOINT_HINT
+        + ' If there is no surviving entry to repoint to — a plain drop rather '
+          'than a consolidation, which replacement_memory_id cannot express — '
+          "pass metadata={'allow_dangling_citations': True} to accept dangling "
+          'these citations deliberately; the override is recorded at WARNING '
+          'and the response names every citer it strands. A consolidation '
+          'delete has a survivor by definition, so name it instead: taking the '
+          'escape there strands exactly the live pointers this gate exists to '
+          'protect.'
+    )
+    # (task 3624) Appended to whichever refusal a caller gets when they DID send
+    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # strictness degrades silently into a dead end: the value is dropped, the
+    # ordinary refusal comes back, and its hint instructs them to pass the very
+    # flag they believe they just passed — a retry loop for an LLM caller.
+    _IGNORED_DANGLING_OVERRIDE_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED and this refusal stands. Only '
+        'a literal True counts (the same rule as allow_near_duplicate and '
+        "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
+        'irreversible delete. Resend it as JSON true if you meant to override.'
+    )
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
         'repointing to it would rewrite every live citation to address a '
@@ -1457,6 +1502,7 @@ def create_mcp_server(
         project_id: str,
         agent_id: str | None,
         replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
 
@@ -1467,13 +1513,37 @@ def create_mcp_server(
         ``_taskmaster_configured and project_id in _kp`` precondition — but the
         opposite failure posture, deliberately (see below).
 
-        Scoped to consolidation deletes only: a ``recon-stage-*`` ``agent_id``
-        AND ``store == 'mem0'``. The recon-stage predicate mirrors the
-        ``recon_write_policy`` call-site idiom (``task_interceptor.py:893``,
-        :3953) and bounds the blast radius to the path the incident came from,
-        so an interactive delete pays no extra ``get_tasks`` read. The mem0
-        scoping mirrors ``verify_cited_memories``' own: the incident's
-        citations were Mem0 entry UUIDs.
+        Scoped to the RECORD, not to the caller (task 3624): ``store == 'mem0'``
+        and a scannable registered project. "Will this delete dangle a live
+        pointer?" is a property of the entry and the task DB, so an identical
+        delete is gated identically no matter who issues it — including a caller
+        with no ``agent_id`` at all. The original scoping added a
+        ``recon-stage-*`` ``agent_id`` predicate to bound the blast radius; that
+        left the interactive path — how the 25-gate consolidation batch of task
+        3524 is actually driven — landing unguarded, stranding exactly the
+        pointers this gate exists to protect, and it made an unidentified caller
+        the LEAST guarded one. The mem0 scoping mirrors
+        ``verify_cited_memories``' own: the incident's citations were Mem0 entry
+        UUIDs.
+
+        ``allow_dangling_citations`` is the deliberate escape, for a caller with
+        no surviving entry to repoint to — a plain drop rather than a
+        consolidation, which ``replacement_memory_id`` cannot express. It is a
+        property of stated intent, not of identity, so it is available to every
+        caller. It is checked AFTER the scan, not as an early-out, for two
+        reasons: it must be able to NAME what it dangles (the WARNING it emits
+        reuses ``citing_tasks``, and an override that lands silently is the same
+        class of defect as the gate that never ran), and that ordering keeps the
+        fail-closed posture below intact — an override plus an unreadable task
+        DB is still ``CitationScanFailed``, because the flag means "I accept
+        dangling the citers you just showed me" and with nothing enumerated
+        there is nothing to knowingly accept. Cost: an override pays the one
+        ``get_tasks`` read. The trace is the point — and it is returned to the
+        caller (``dangled_citations`` / ``dangled_citation_count``, plus
+        ``ignored_replacement_memory_id`` when one was supplied and dropped) as
+        well as logged, because an MCP caller never sees the server's log
+        stream and a bare ``{'status': 'deleted'}`` would be silent to the very
+        session this escape exists to serve.
 
         Why here and not in ``MemoryConsolidator.run()``: the consolidator
         never deletes from Python — the Stage-1 LLM agent calls this very tool
@@ -1509,8 +1579,6 @@ def create_mcp_server(
         refused delete is retried next cycle; a silently permitted one
         manufactures the L2.
         """
-        if not isinstance(agent_id, str) or not agent_id.startswith('recon-stage-'):
-            return None, None
         if store != 'mem0':
             return None, None
         if not _taskmaster_configured or project_id not in _kp:
@@ -1555,6 +1623,55 @@ def create_mcp_server(
             for c in live_citers
         ]
 
+        # The deliberate escape, placed HERE rather than as an early-out at the
+        # top of the gate on purpose: it must be able to name what it dangles.
+        # An early return before the scan would be cheaper but structurally
+        # unable to enumerate anything, which is the silent-override defect
+        # this whole gate argues against. The placement also preserves the
+        # fail-CLOSED posture for free — the scan-error return above precedes
+        # it, so an override plus an unreadable task DB is still
+        # CitationScanFailed. That is the right semantics: the flag means "I
+        # accept dangling the citers you just showed me", and with nothing
+        # enumerated there is nothing to knowingly accept.
+        if allow_dangling_citations:
+            # An override that lands SILENTLY is the same class of defect as the
+            # gate that never ran, so record what is being knowingly dangled —
+            # reusing the enumeration above so the trace and the rejection's
+            # citing_tasks name the same citers the same way. A replacement
+            # supplied alongside the flag is contradictory ("repoint them" vs
+            # "dangle them"); the override wins, and the dropped argument is
+            # named rather than discarded in silence.
+            ignored_replacement = (
+                '' if replacement_memory_id is None
+                else f'; replacement_memory_id {replacement_memory_id} was '
+                     'supplied but NOT used'
+            )
+            logger.warning(
+                'citation gate: allow_dangling_citations override by %s — deleting '
+                '%s, leaving %d live citation(s) dangling: %s%s',
+                agent_id,
+                memory_id,
+                len(citing_tasks),
+                citing_tasks,
+                ignored_replacement,
+            )
+            # ...and report the same enumeration to the CALLER, not just to the
+            # server log. The caller this escape exists to serve drives a
+            # consolidation batch over MCP and never sees the orchestrator's log
+            # stream, so a bare {'status': 'deleted'} would make the override
+            # silent from the only vantage point that matters to them. This
+            # rides the same (None, stats) success channel the repoint path uses
+            # — merged into the tool result by delete_memory — and names the
+            # citers with the same shape the refusal reports in citing_tasks, so
+            # "refused" and "overridden" are diffable rather than two vocabularies.
+            dangled: dict[str, Any] = {
+                'dangled_citations': citing_tasks,
+                'dangled_citation_count': len(citing_tasks),
+            }
+            if replacement_memory_id is not None:
+                dangled['ignored_replacement_memory_id'] = replacement_memory_id
+            return None, dangled
+
         if replacement_memory_id is None:
             return {
                 'error': (
@@ -1565,7 +1682,12 @@ def create_mcp_server(
                 'error_type': 'CitationRepointRequired',
                 'memory_id': memory_id,
                 'citing_tasks': citing_tasks,
-                'hint': _CITATION_REPOINT_HINT,
+                # The ONE refusal that advertises the escape: this caller has
+                # named no survivor and may genuinely have none. The
+                # CitationReplacement* refusals below keep the plain hint —
+                # they were reached BY naming a survivor, so the fix is to
+                # correct that value, not to bypass the gate.
+                'hint': _CITATION_REPOINT_REQUIRED_HINT,
             }, None
 
         # A forwarding pointer is only a pointer if it is a concrete id. This
@@ -1736,7 +1858,21 @@ def create_mcp_server(
         ``repoint_task_citations`` MUST agree on this definition: they read the
         same snapshot, and a disagreement surfaces as a gate demanding a repoint
         that the sweep then reports zero work for.
+
+        COST, and why the snapshot is deliberately NOT cached (task 3624).
+        Broadening the gate to every caller means every mem0 delete pays one
+        full ``get_tasks`` read plus an O(tasks x metadata-nodes) walk, so a
+        25-delete consolidation batch pays it 25 times with no reuse. A
+        per-batch or short-TTL snapshot cache would collapse that and is
+        refused on purpose: this is the LAST read before an irreversible
+        delete, and a task that begins citing the doomed id after the snapshot
+        was taken would be invisible to it — trading the gate's fail-closed
+        guarantee for a race, on precisely the operation whose harm motivated
+        the gate. The cost is made OBSERVABLE instead: each scan reports its
+        task count and duration at DEBUG, so a project large enough for this to
+        matter surfaces as a measurement rather than as a hunch.
         """
+        started = time.perf_counter()
         tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
         tasks = (tasks_data or {}).get('tasks') or []
         found: list[dict[str, Any]] = []
@@ -1755,6 +1891,17 @@ def create_mcp_server(
                 'paths': paths,
                 'terminal': status in INACTIVE_TASK_STATUSES,
             })
+        # DEBUG, not INFO: this now runs on EVERY mem0 delete, so it is the
+        # common path and must not be chatty by default. It is the only place
+        # the broadened gate's per-delete cost is measurable.
+        logger.debug(
+            'citation gate: scanned %d task(s) for citations of %s in %.1f ms '
+            '(%d citer(s) found)',
+            len(tasks),
+            memory_id,
+            (time.perf_counter() - started) * 1000,
+            len(found),
+        )
         return found
 
     @mcp.tool()
@@ -1783,8 +1930,9 @@ def create_mcp_server(
         Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately. :mod:`fused_memory.server.markup_tripwire` holds the
-        authoritative pattern list and the rationale — it is deliberately the
-        only place in the package that enumerates the literals.
+        write-time pattern list and the rationale; the literals themselves are
+        enumerated once, in :mod:`shared.toolcall_markup`, and nothing in this
+        package spells them.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -1973,9 +2121,10 @@ def create_mcp_server(
         each one that lands is a permanent corpus specimen. Strip the fragment
         and resubmit. If you are quoting such markup DELIBERATELY (documenting
         the leak itself), set metadata={'allow_mcp_markup': True}.
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -3010,11 +3159,15 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
-        **Consolidation deletes** (a ``recon-stage-*`` caller deleting a
-        ``store='mem0'`` duplicate in favour of a survivor) additionally pass
-        through the citation-repoint gate: task metadata still citing the
+        **Every ``store='mem0'`` delete** passes through the citation-repoint
+        gate, whoever issues it (task 3624): task metadata still citing the
         doomed entry is repointed to *replacement_memory_id* BEFORE the delete
-        runs, and the delete is refused outright if that cannot be done. See
+        runs, and the delete is refused outright if that cannot be done. The
+        gate keys on the record, not the caller — "will this dangle a live
+        pointer?" does not depend on who asked. An uncited entry is unaffected:
+        the scan finds nothing live and the delete proceeds. A delete with no
+        surviving entry to repoint to needs
+        ``metadata={'allow_dangling_citations': True}``. See
         ``_citation_repoint_gate``.
 
         Args:
@@ -3026,7 +3179,14 @@ def create_mcp_server(
                 memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs (may contain _causation_id for
+                recon). Set {'allow_dangling_citations': True} to accept
+                dangling live task citations deliberately, for a drop with no
+                surviving entry to repoint to; only a LITERAL ``True`` counts,
+                the override is recorded at WARNING with every citer it strands,
+                and it does not unlock the fail-closed ``CitationScanFailed``
+                path. The flag is write-time-only and is never forwarded to the
+                store.
             replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
                 this delete supersedes one duplicate in favour of another.
                 Required for a consolidation delete whose id is still cited by a
@@ -3072,14 +3232,70 @@ def create_mcp_server(
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
                 'error_type': 'ValidationError',
             }
+        # A truncated id (e.g. an 8-char hex prefix read out of a search-result
+        # snippet) used to produce a fully confirming {'status': 'deleted'},
+        # because both backends treat a miss as "already deleted".  The service
+        # now raises on it too; the check is repeated here — delegating to the
+        # same shared predicate, so there is no second copy of the rule — because
+        # ``mcp_tool_errors`` flattens an exception to {'error', 'error_type'}
+        # and would drop the ``hint`` that tells the caller how to obtain the
+        # real id.
+        #
+        # Position is load-bearing in three directions: AFTER the project_id
+        # prologue (canonicalization stays the first project_id operation),
+        # AFTER the conflict/presence checks (so the more specific "which arg"
+        # errors still win and ``resolved_id`` is non-None), and AFTER the
+        # store check but BEFORE ``_citation_repoint_gate`` — that gate mutates
+        # live task metadata ahead of an irreversible delete, so a malformed id
+        # must never get far enough to drive a repoint.
+        #
+        # Only ``resolved_id`` is validated here.  ``replacement_memory_id`` is
+        # the gate's own argument, answered by its distinct
+        # ``CitationReplacementInvalid``/``NotFound`` contract; the two share
+        # the shape predicate, not the error envelope.
+        #
+        # The label follows the argument the caller actually supplied: telling
+        # someone who passed the documented ``id`` alias that "memory_id must
+        # be a full 36-character UUID" names a parameter they never sent.
+        if err := validate_full_uuid(
+            resolved_id, field_name='memory_id' if memory_id is not None else 'id'
+        ):
+            return err
         causation_id, source, _ = _extract_causation(metadata, agent_id)
+        # Same write-time override idiom as add_memory's allow_near_duplicate
+        # (see below in this module): read off the RAW envelope, and only a
+        # LITERAL True counts — a truthy 'yes' must not unlock an irreversible
+        # delete.
+        override_supplied = (
+            isinstance(metadata, dict) and 'allow_dangling_citations' in metadata
+        )
+        raw_override = (
+            metadata.get('allow_dangling_citations') if isinstance(metadata, dict) else None
+        )
+        allow_dangling_citations = raw_override is True
         # Repoint live task-metadata citations BEFORE the irreversible delete.
         # Order is the whole point: a rejection here never reaches the service
         # call, so the dangling-pointer window is closed rather than moved.
         rejection, repoint_stats = await _citation_repoint_gate(
             resolved_id, store, project_id, agent_id, replacement_memory_id,
+            allow_dangling_citations=allow_dangling_citations,
         )
         if rejection:
+            # The `is True` strictness above is right, but dropping a
+            # non-conforming value in SILENCE is not: the caller would get back
+            # a refusal whose hint tells them to pass the flag they believe they
+            # just passed, and would retry into the same wall. Name the value
+            # that was ignored instead (loud-over-silent-degradation). A literal
+            # False is a deliberate "no", not a malformed yes, so it is honoured
+            # without comment — this fires only for a non-boolean value.
+            if override_supplied and not isinstance(raw_override, bool):
+                rejection = {
+                    **rejection,
+                    'ignored_override': {'allow_dangling_citations': raw_override},
+                    'hint': ' '.join(
+                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
+                    ),
+                }
             return rejection
         result = await memory_service.delete_memory(
             memory_id=resolved_id,
@@ -5373,9 +5589,10 @@ def create_mcp_server(
         stored as medium). Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately (e.g. filing a task ABOUT the leak).
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             project_root: Absolute path to project root

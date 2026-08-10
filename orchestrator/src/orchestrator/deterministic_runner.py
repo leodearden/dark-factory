@@ -266,8 +266,11 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    this, the other is a machine step that does), so a task carrying both
    takes the act-then-ask path with the marker unread. That combination is a
    task-authoring defect and is logged as a WARNING on every dispatch rather
-   than being silently ignored; write-time rejection belongs in
-   ``shared.task_metadata``.
+   than being silently ignored. It is ALSO rejected at write time by
+   ``shared.task_metadata``'s cross-field validator (task 3369), so it can no
+   longer land through the ``submit_task``/``update_task`` boundary; this
+   WARNING is retained as the defence-in-depth backstop for records that did
+   not pass through it.
 
    Both rung-(ii) checks fail CLOSED: a truthy-but-not-``True`` marker still
    trips the guard, and a non-``str`` or blank stamp is not proof. An
@@ -307,7 +310,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.task_metadata import DoneProvenance
+from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
 
 from orchestrator import systemd_inspect
 from orchestrator.deploy_state import (
@@ -400,8 +403,7 @@ OPERATIONAL_LLM_NEEDS_LANE_TOKEN: str = 'operational_llm_needs_lane'
 # operational_mode) is the precise signal to key on.
 OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 
-# Task 3341: the human-curator-gate contract, as two bare orchestrator-side
-# literals in the same metadata-key-as-literal convention as the key above.
+# Task 3341: the human-curator-gate contract — a marker key plus a stamp key.
 #
 # `human_curator_gate` marks a pure deterministic gate whose resolution requires
 # human CONTENT adjudication, not merely a closed escalation record.  It is
@@ -415,6 +417,16 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # CONTENT", the stamp says "a human did".  Task 3181 is the incident where the
 # runner had the first and inferred the second from a closed escalation record.
 #
+# SINGLE SOURCE (task 3369): the MARKER's spelling is imported from
+# `shared.task_metadata` (see the import block above) rather than restated as a
+# local literal.  That module's `_deterministic_invariants` validator now reads
+# the key too — to reject the marker alongside a non-null `before_done` at the
+# write boundary — so a second definition would put two spellings of one key in
+# the two modules that both act on it, which is exactly the drift a named
+# constant exists to prevent.  The STAMP keeps a bare literal because `shared`
+# offers no constant to import: it names the stamp only inside
+# `_BLESSED_METADATA_KEYS`, with no validator reading it.
+#
 # NAMING (reviewer amendment): the stamp is `human_curator_adjudicated_at`, NOT
 # `curator_adjudicated_at`.  The bare `curator_*` metadata namespace is already
 # owned by a different subsystem — `curator_action` / `curator_justification` /
@@ -423,7 +435,6 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # curator would invite a reader of the Tier-A list, or a census consumer
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
-HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
@@ -2298,18 +2309,28 @@ class DeterministicRunner:
         # judgement closes this", while a `before_done` action is a machine step
         # that closes it.  The two are contradictory, so the rung-two guard below
         # lives only on the pure-gate resume path.  But the marker is LLM-authored
-        # (reconciliation Stage 2) and `shared.task_metadata` blesses the key with
-        # no shape or co-occurrence validation, so a misauthored task CAN carry
-        # both — and would then take the act-then-ask path with the marker never
-        # read.  Say so LOUDLY rather than degrading silently (repo norm), on
-        # every dispatch of such a task and before any branch consumes it.
+        # (reconciliation Stage 2), so a misauthored task CAN carry both — and
+        # would then take the act-then-ask path with the marker never read.  Say
+        # so LOUDLY rather than degrading silently (repo norm), on every dispatch
+        # of such a task and before any branch consumes it.
         #
         # Deliberately a WARNING and not a block: the defect is in task
         # AUTHORING, and hard-failing here would strand a deploy that may have
         # no curator semantics at all — trading a silent fail-open for a silent-
-        # to-the-author fail-closed.  The durable fix is write-time validation in
-        # `shared.task_metadata` (rejecting the marker alongside a non-null
-        # before_done), which is outside this task's locked modules.
+        # to-the-author fail-closed.
+        #
+        # Task 3369 landed the durable fix: `shared.task_metadata` now REJECTS
+        # the marker alongside a non-null before_done at write time, so this
+        # combination can no longer reach us through the fused-memory
+        # submit_task/update_task boundary.  This WARNING is deliberately KEPT
+        # at WARNING level as defence-in-depth, because three routes still reach
+        # the runner without passing that boundary: `task_metadata.enforce` is a
+        # RED-TIER restart-only flag (a restart into warn-mode leaves this as the
+        # only remaining signal), records written before the validator existed,
+        # and any writer that does not go through SqliteTaskBackend (operator
+        # hand-edit, direct sqlite write, a future backend).  Downgrading it
+        # would delete the signal in exactly the configurations where it is the
+        # last one standing.
         # Pinned by test_curator_marker_on_a_non_pure_gate_is_loud.
         if before_done is not None and _is_human_curator_gate(metadata):
             logger.warning(

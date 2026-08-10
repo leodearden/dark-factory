@@ -781,7 +781,60 @@ class TestMaybeEscalateStalledGateBacklog:
         assert '645' in combined
         assert 'run-xyz' in combined
         assert stamp in combined  # the gate_escalated_at value
-        assert '49' in combined  # age indicator (~49h)
+
+        # The summary must state a live-truthful anchor (the gate_escalated_at
+        # stamp) plus the static, never-staling threshold fact — not a
+        # filing-time-computed elapsed-hours figure that goes stale while the
+        # escalation sits open (task 3520). Naming the threshold alongside the
+        # anchor keeps a compact-drain (summary-only) read legible without a
+        # mental diff against "now".
+        assert 'has awaited a human decision since' in submitted.summary
+        assert stamp in submitted.summary
+        assert 'past the 48h gate-backlog threshold' in submitted.summary
+        # Concrete negative (not a shape-based regex): pins that the stale,
+        # filing-time-computed age (49h, from hours_ago=49 above) never leaks
+        # into the summary. Scoped to `summary`, not `combined` — the detail
+        # block legitimately retains a filing-time hours value
+        # (age_hours_at_filing), and the summary now legitimately names the
+        # static 48h threshold, so a shape regex over `\d+h` would false-
+        # positive on that intentional, truthful content.
+        assert '49' not in submitted.summary
+
+        # The filing-time age is still retained in detail, but relabeled
+        # `age_hours_at_filing` so it no longer reads as a live counter.
+        assert 'age_hours_at_filing: 49.0' in submitted.detail
+        assert 'age_hours:' not in submitted.detail
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stamp_uses_threshold_summary_and_at_filing_label(self):
+        """(a2) unparseable gate_escalated_at → fallback summary; detail still relabeled."""
+        queue = self._make_queue(has_open_l1_return=False)
+        task = _gate_task_record(645, hours_ago=49)
+        task['metadata']['gate_escalated_at'] = 'not-a-timestamp'
+        task_by_id = {'645': task}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='autopilot_video',
+            run_id='run-xyz',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == ['645']
+        queue.submit.assert_called_once()
+        submitted = queue.submit.call_args[0][0]
+
+        # The out-of-scope fallback branch is unchanged: it still names the
+        # threshold, not a computed age, and never echoes the unparseable
+        # stamp as if it were a trustworthy anchor.
+        assert 'beyond the 48h gate-backlog threshold' in submitted.summary
+        assert 'not-a-timestamp' not in submitted.summary
+
+        # The relabel applies to the "unknown" fallback value too.
+        assert 'age_hours_at_filing: unknown' in submitted.detail
+        assert 'age_hours:' not in submitted.detail
 
     @pytest.mark.asyncio
     async def test_skips_when_open_gate_backlog_l1_exists(self):

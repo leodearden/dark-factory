@@ -66,10 +66,10 @@ import tomllib
 from typing import Any
 
 import pytest
-
-from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
+
+from orchestrator import verify, verify_cmd, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -453,15 +453,41 @@ def test_scripts_diff_is_lint_gated() -> None:
     gated in production.
 
     NOTE on (2) — written in the lock_depth-AGNOSTIC form, never pinning a
-    literal such as ``derive_modules(...) == ['scripts']``. The pydantic Field
-    default for ``lock_depth`` is 2, but the EFFECTIVE value is 4: the
-    package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` ships
-    ``lock_depth: 4`` and is layered over the Field default on every load. At
-    depth 4, ``derive_modules([SAMPLE_TOUCHED_FILE], 4)`` returns the full
-    path — 3 path components is below the depth-4 truncation threshold — so
-    ``normalize_lock`` leaves it whole. What matters is that each derived key
-    RESOLVES back to this config. Task 3350's sibling guard hit this exact trap
-    and documented it; pinning the literal would re-encode a falsified constant.
+    literal such as ``derive_modules(...) == ['scripts']``. Three layers stack
+    here and they do not agree: the pydantic Field default, the
+    package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` layered
+    over it on every load, and THIS project's ``dark-factory-orchestrator
+    .yaml`` overriding both — the last of which is what the autouse config
+    binding resolves. The conclusion does not turn on which value that is:
+    what matters is that each derived key RESOLVES back to this config. Task
+    3350's sibling guard hit this exact trap and documented it; pinning the
+    literal would re-encode a falsified constant.
+
+        CORRECTED IN PLACE (task 3866): this note used to assert "the
+        EFFECTIVE value is 4" and reason "at depth 4", which stopped being
+        true when this project moved lock_depth 4 -> 12. Recorded rather than
+        silently rewritten, because the note exists precisely to document a
+        falsified constant — and for the same reason the repair states the
+        invariant instead of naming 12, which would only queue up the next
+        correction. Read the number from ``cfg.lock_depth`` if you ever need
+        it; do not assert it in prose.
+
+        CORRECTED AGAIN (task 3866, review repair): that first repair did
+        assert one in prose. Replacing the constant, it claimed
+        ``SAMPLE_TOUCHED_FILE`` is "below the truncation threshold at every
+        layer, so ``derive_modules(...)`` returns the full path whole
+        regardless" — false at the smallest of the three layers this note
+        enumerates. MEASURED:
+        ``normalize_lock('scripts/tests/test_census_trigger.py', 2)`` ->
+        ``'scripts/tests'``, truncated, not whole; depths 3 / 4 / 12 return
+        it whole. A 3-component path survives only at ``lock_depth >= 3``,
+        and the pydantic Field default is 2. Deleted rather than re-scoped to
+        ``>= 3``: a resolved lock key is itself a depth assertion in prose,
+        so the paragraph above already forbade it, and the ``>= 3`` form
+        would still be hostage to ``SAMPLE_TOUCHED_FILE`` staying 3
+        components. The load-bearing sentence — each derived key must RESOLVE
+        back to this config, which is what the assertions check — is
+        depth-invariant and stands unchanged.
     """
     discovered = _discovered()
 

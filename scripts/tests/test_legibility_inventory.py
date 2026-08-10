@@ -17,21 +17,20 @@ mechanics).
 """
 from __future__ import annotations
 
-import gzip
 import importlib.util
-import io
 import json
+import logging
 import re
 import subprocess
-import zlib
 from collections.abc import Callable
 from datetime import date as dt_date
 from functools import lru_cache
 from pathlib import Path
 
 import pytest
+from legibility import digest
+from legibility import inventory as mod
 
-from legibility import digest, inventory as mod
 from orchestrator import session_registry
 
 # Repo root from scripts/tests/ — the same parents[2] derivation
@@ -80,61 +79,12 @@ REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Corruption scaffolding — a gz payload plus the two damage shapes a
-# fire-and-forget archive writer really produces (a write interrupted by a
-# killed unit, or a file read while it is still being compressed). Kept local
-# to this file rather than hoisted into conftest: scripts/tests/conftest.py is
-# sys.path bootstrap only, and each test module here already carries its own
-# write helpers.
+# Corruption scaffolding — the damage a fire-and-forget archive writer really
+# produces on a plain ``.jsonl`` corpus (a write interrupted by a killed unit,
+# or a flipped stored byte). Kept local to this file rather than hoisted into
+# conftest: scripts/tests/conftest.py is sys.path bootstrap only, and each test
+# module here already carries its own write helpers.
 # ---------------------------------------------------------------------------
-
-def _gz_payload(n_records: int = 200) -> bytes:
-    """Serialize a multi-record JSONL body — the payload the helpers below
-    compress and then damage. Deliberately many padded records so a cut at the
-    halfway mark lands mid-stream rather than inside the 10-byte header."""
-    return ''.join(
-        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
-        for i in range(n_records)
-    ).encode('utf-8')
-
-
-def _write_truncated_gz(path: Path) -> Path:
-    """Write the first half of a valid gz stream — the interrupted-write shape.
-
-    Decompression reaches the end of the bytes before the end-of-stream marker
-    and raises ``EOFError``, which is NOT an ``OSError``.
-    """
-    blob = gzip.compress(_gz_payload())
-    path.write_bytes(blob[: len(blob) // 2])
-    return path
-
-
-def _write_corrupt_body_gz(path: Path) -> Path:
-    """Write a gz whose DEFLATE body is damaged, so decompression raises
-    ``zlib.error`` — a THIRD distinct shape, and also not an ``OSError``.
-
-    Where a flipped byte lands decides which failure gzip reports: many flips
-    still decode and only trip the trailing checksum (``gzip.BadGzipFile``,
-    already an ``OSError``), a few truncate the bit stream (``EOFError``), and
-    only a flip that makes the DEFLATE stream itself unparseable raises
-    ``zlib.error``. So this probes for the first flip position that produces
-    that shape rather than assuming any particular byte does. The probe runs
-    against STDLIB ``gzip`` — never the reader under test — so the helper
-    stays valid both before and after the reader normalizes its exceptions.
-    """
-    blob = gzip.compress(_gz_payload())
-    for index in range(10, len(blob)):
-        candidate = bytearray(blob)
-        candidate[index] ^= 0xFF
-        try:
-            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
-        except zlib.error:
-            path.write_bytes(bytes(candidate))
-            return path
-        except Exception:
-            continue  # a different corruption shape — keep probing
-    raise AssertionError('no single-byte flip produced a zlib.error body')
-
 
 _UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
 """A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8.
@@ -145,31 +95,15 @@ would yield record 0 and skip record 1) instead of silently passing.
 """
 
 
-def _write_undecodable_gz(path: Path) -> Path:
-    """Write a STRUCTURALLY VALID gz whose payload is not valid UTF-8.
-
-    The FOURTH shape, and the one the three helpers above structurally CANNOT
-    reach: each damages the gzip container, so a probe that decompresses in
-    BINARY mode (``gzip.GzipFile(...).read()``, as ``_write_corrupt_body_gz``
-    does) can see them. This file decompresses perfectly. The failure happens
-    one layer up — when the reader's ``encoding='utf-8'`` text wrapper meets
-    byte 0xFF and raises ``UnicodeDecodeError``, which is a ``ValueError``
-    subclass and therefore escapes an ``except OSError`` degrade path no
-    matter how the gzip shapes are normalized. A single flipped byte in
-    stored archive data produces exactly this.
-    """
-    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
-    return path
-
-
 def _write_undecodable_plain(path: Path) -> Path:
-    """The same bad byte in a PLAIN ``.jsonl`` — no gzip layer involved.
+    """Write a plain ``.jsonl`` whose payload is not valid UTF-8.
 
-    Pins the half of the decode shape that has no gzip analogue at all: both
-    reader branches open under strict ``encoding='utf-8'``, so an
-    uncompressed transcript is equally able to abort a walk. This is why the
-    normalized message says "undecodable transcript bytes" rather than
-    labelling it a gzip-stream failure.
+    The reader opens under strict ``encoding='utf-8'``, so a single flipped
+    stored byte makes byte 0xFF meet the text wrapper and raise
+    ``UnicodeDecodeError`` — a ``ValueError`` subclass, which therefore
+    escapes an ``except OSError`` degrade path unless the reader normalizes
+    it. This is why the normalized message says "undecodable transcript
+    bytes" rather than labelling it a compression failure.
     """
     path.write_bytes(_UNDECODABLE_BODY)
     return path
@@ -429,21 +363,6 @@ def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '
     return session_path
 
 
-def _write_session_gz(
-    dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'
-):
-    """Gzip sibling of :func:`_write_session`: write a ``<sid>.jsonl.gz``
-    fixture in the archived-fleet-transcript format (shared.transcript_archive)."""
-    dir_path.mkdir(parents=True, exist_ok=True)
-    session_path = dir_path / f'{session_id}.jsonl.gz'
-    lines = [
-        {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
-    ]
-    with gzip.open(session_path, 'wt', encoding='utf-8') as f:
-        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
-    return session_path
-
-
 class TestIsMember:
     """is_member uses Path.is_relative_to path-component semantics."""
 
@@ -520,45 +439,6 @@ class TestSessionCwd:
         assert mod.session_cwd(tmp_path / 'does-not-exist.jsonl') is None
 
 
-class TestGzAwareReader:
-    """The single low-level reader (``iter_json_lines``, via
-    ``_session_cwd_and_date`` / ``session_cwd``) transparently reads
-    gzip-compressed ``.jsonl.gz`` transcripts — the archived fleet-transcript
-    format (shared.transcript_archive) — keeping byte-parity for plain
-    ``.jsonl`` and degrading a corrupt ``.gz`` to ``(None, None)`` rather than
-    raising (gzip.BadGzipFile subclasses OSError, so it flows through the
-    existing ``except OSError`` degrade path)."""
-
-    def test_session_cwd_reads_gz(self, tmp_path):
-        gz_path = _write_session_gz(tmp_path, 'sess', MAIN_CWD)
-        assert mod.session_cwd(gz_path) == MAIN_CWD
-
-    def test_session_cwd_and_date_reads_gz(self, tmp_path):
-        gz_path = _write_session_gz(
-            tmp_path, 'sess', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
-        )
-        cwd, session_date = mod._session_cwd_and_date(gz_path)
-        assert cwd == WORKTREE_CWD
-        assert session_date == dt_date(2026, 7, 13)
-
-    def test_plain_jsonl_parity(self, tmp_path):
-        # A plain .jsonl still reads exactly as before (no gz branch taken).
-        plain_path = _write_session(
-            tmp_path, 'sess', MAIN_CWD, timestamp='2026-07-13T10:00:00.000Z'
-        )
-        cwd, session_date = mod._session_cwd_and_date(plain_path)
-        assert cwd == MAIN_CWD
-        assert session_date == dt_date(2026, 7, 13)
-
-    def test_corrupt_gz_degrades_to_none(self, tmp_path):
-        # Raw non-gzip bytes under a .jsonl.gz name: gzip raises BadGzipFile
-        # (an OSError subclass) on first read, which _session_cwd_and_date's
-        # `except OSError` maps to (None, None) — no raise.
-        corrupt = tmp_path / 'corrupt.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
-        assert mod.session_cwd(corrupt) is None
-
-
 class TestPublicIterJsonLines:
     """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
 
@@ -595,130 +475,51 @@ class TestPublicIterJsonLines:
         path.write_text(self._lines(), encoding='utf-8')
         assert list(mod.iter_json_lines(path)) == self.RECORDS
 
-    def test_gz_round_trips_identically(self, tmp_path):
-        gz_path = tmp_path / 'session.jsonl.gz'
-        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
-            f.write(self._lines())
-        assert list(mod.iter_json_lines(gz_path)) == self.RECORDS
-
-    def test_plain_and_gz_yield_the_same_records(self, tmp_path):
-        plain = tmp_path / 'session.jsonl'
-        plain.write_text(self._lines(), encoding='utf-8')
-        gz_path = tmp_path / 'session.jsonl.gz'
-        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
-            f.write(self._lines())
-        assert list(mod.iter_json_lines(plain)) == list(mod.iter_json_lines(gz_path))
-
-    def test_corrupt_gz_raises_oserror(self, tmp_path):
-        # The documented file-level contract the corpus extractor's coverage
-        # accounting depends on: an unreadable FILE raises OSError
-        # (gzip.BadGzipFile subclasses it), so `except OSError` counts one
-        # parse failure — as distinct from the corrupt LINES above, which are
-        # skipped silently and must NOT inflate that count.
-        corrupt = tmp_path / 'corrupt.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip at all\n')
-        with pytest.raises(OSError):
-            list(mod.iter_json_lines(corrupt))
-
 
 class TestIterJsonLinesCorruptionShapes:
-    """ALL FOUR corruption shapes must raise ``OSError`` at the FILE level.
+    """The file-level corruption shape must raise ``OSError``.
 
-    ``test_corrupt_gz_raises_oserror`` above covers only bad MAGIC, which
-    happens to be an ``OSError`` already (``gzip.BadGzipFile``). Measured, the
-    other three shapes are not::
+    With the gzip container gone, the container-damage shapes (bad magic,
+    truncated stream, corrupt body) are gone with it, and one shape survives::
 
-        truncated stream  -> EOFError            ("ended before the end-of-stream marker")
-        corrupt body      -> zlib.error          ("Error -3 while decompressing data")
         undecodable byte  -> UnicodeDecodeError  ("codec can't decode byte 0xff")
 
-    None derives from ``OSError``, so all escape every consumer's documented
-    ``except OSError`` degrade path — ``sampling.py``,
+    It does not derive from ``OSError``, so unnormalized it escapes every
+    consumer's documented ``except OSError`` degrade path — ``sampling.py``,
     ``check_transcript_persistence.py``, and the cross-package corpus
-    extractor alike — and abort the whole walk with a traceback. All are
-    exactly what a fire-and-forget archive writer produces on a killed unit or
-    a flipped stored byte, and the archive is live fleet runtime state, so
-    none is a theoretical shape.
+    extractor alike — and aborts the whole walk with a traceback. A flipped
+    stored byte in live fleet runtime state produces exactly it, so it is not
+    a theoretical shape.
 
-    The fourth is worth calling out separately, because a fix aimed at the
-    gzip LAYER misses it: the container decompresses cleanly and the fault is
-    at the strict ``encoding='utf-8'`` text wrapper one level up, so it is
-    reachable on a plain ``.jsonl`` too, and being a ``ValueError`` rather
-    than anything gzip raises it survives an
-    ``except (EOFError, zlib.error)`` widening.
-
-    These tests pin the contract the docstring already advertises: one
+    These tests pin the contract the reader's docstring advertises: one
     documented degrade path covers every way a FILE can be unreadable.
     """
 
-    def test_truncated_gz_raises_oserror(self, tmp_path):
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        with pytest.raises(OSError):
-            list(mod.iter_json_lines(truncated))
-
-    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-        with pytest.raises(OSError):
-            list(mod.iter_json_lines(corrupt))
-
-    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
-        # The reason string is what a coverage-reporting caller puts in its
-        # disclosed `examples` list, so an operator must be able to tell a
-        # half-written transcript from a corrupted one without re-reading the
-        # file. Normalizing to a single TYPE must not flatten them to a single
-        # MESSAGE.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-
-        with pytest.raises(OSError) as truncated_exc:
-            list(mod.iter_json_lines(truncated))
-        with pytest.raises(OSError) as corrupt_exc:
-            list(mod.iter_json_lines(corrupt))
-
-        assert str(truncated_exc.value) != str(corrupt_exc.value)
-        assert 'end-of-stream' in str(truncated_exc.value)
-        assert 'decompressing' in str(corrupt_exc.value)
-
-    def test_undecodable_gz_raises_oserror(self, tmp_path):
-        # The FOURTH shape. The gz container is intact — the payload simply
-        # is not UTF-8 — so this arrives as UnicodeDecodeError, a ValueError
-        # subclass that no `except (EOFError, zlib.error)` tuple can catch and
-        # no `except OSError` consumer can see. Un-normalized it aborts a
-        # whole-archive walk over one flipped byte, which is the exact class
-        # of failure the three tests above exist to prevent.
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
-        with pytest.raises(OSError):
-            list(mod.iter_json_lines(undecodable))
-
     def test_undecodable_plain_jsonl_raises_oserror(self, tmp_path):
-        # Same byte, no gzip layer: the plain branch opens with the same
-        # strict encoding, so this shape is reachable there too and must
-        # normalize identically.
+        # The one surviving file-level shape: the reader opens under strict
+        # utf-8, so a bad byte aborts the read and must normalize to OSError.
         undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
         with pytest.raises(OSError):
             list(mod.iter_json_lines(undecodable))
 
-    def test_the_decode_shape_is_distinguishable_from_the_gzip_shapes(self, tmp_path):
-        # Same rule as the two-shape test above, extended: the disclosed
-        # reason must not call an encoding fault a gzip-stream fault, since
-        # that would send an operator to audit the compressor rather than the
-        # bytes. The offending byte stays in the message.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+    def test_the_decode_shape_names_the_offending_byte(self, tmp_path):
+        # With the gzip container gone this is the ONE file-level shape left,
+        # so the disclosed reason can no longer be triaged by contrast. What
+        # has to survive is the actionable detail: the offending byte, which
+        # is what sends an operator to the right place in the file rather than
+        # to audit a compressor that is no longer in the picture.
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
 
-        with pytest.raises(OSError) as truncated_exc:
-            list(mod.iter_json_lines(truncated))
         with pytest.raises(OSError) as undecodable_exc:
             list(mod.iter_json_lines(undecodable))
 
         message = str(undecodable_exc.value)
-        assert message != str(truncated_exc.value)
         assert 'gzip' not in message
         assert '0xff' in message.lower()
 
-    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
+    def test_corrupt_line_in_a_valid_file_still_degrades_silently(self, tmp_path):
         # The other half of the split, and the one a too-broad fix would
-        # destroy: a well-formed gz whose LAST line is a half-written record
+        # destroy: a well-formed transcript whose LAST line is half-written
         # (the line-level analogue of a truncated file) still yields every
         # parseable record and still does NOT raise. If the file-level wrap
         # swallowed the parse loop as well, this read would start raising and
@@ -732,9 +533,8 @@ class TestIterJsonLinesCorruptionShapes:
             + json.dumps(good[1]) + '\n'
             + '{"type": "assistant", "message": {"content": "cut mid-writ'
         )
-        path = tmp_path / 'trailing-partial.jsonl.gz'
-        with gzip.open(path, 'wt', encoding='utf-8') as f:
-            f.write(body)
+        path = tmp_path / 'trailing-partial.jsonl'
+        path.write_text(body, encoding='utf-8')
 
         assert list(mod.iter_json_lines(path)) == good
 
@@ -844,40 +644,40 @@ class TestEnumerateSessions:
 class TestEnumerateArchiveRoots:
     """enumerate_sessions additionally walks agent_transcript_roots — the
     archived fleet-transcript tree written by shared.transcript_archive in
-    the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl.gz``
-    (+ a plain ``.jsonl`` variant) — recursively, gated solely by
-    :func:`is_member` on each session's REAL cwd. The empty-roots path is
-    byte-identical to today (the archive loop simply does not execute).
+    the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl``
+    — recursively, gated solely by :func:`is_member` on each session's REAL
+    cwd. The empty-roots path is byte-identical to today (the archive loop
+    simply does not execute).
     """
 
     TARGET_DATE = dt_date(2026, 7, 13)
     WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
 
     def _build_archive(self, root: Path) -> Path:
-        # Production nested layout: <archive>/<task_id>/<enc>/<sid>.jsonl(.gz)
+        # Production nested layout: <archive>/<task_id>/<enc>/<sid>.jsonl
         enc_dir = root / '2573' / self.WT_ENC
-        _write_session_gz(
-            enc_dir, 'gz-session', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z'
+        _write_session(
+            enc_dir, 'archived-session', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z'
         )
         _write_session(
             enc_dir, 'plain-session', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
         )
         # A non-member cockpit cwd under its own task-id/enc dir: is_member
         # is false, so it is excluded even though it is inside the archive.
-        _write_session_gz(
+        _write_session(
             root / '9999' / '-home-leo-src-dark-factory-cockpit',
             'cockpit-session', COCKPIT_CWD, timestamp='2026-07-13T09:30:00.000Z',
         )
         return root
 
-    def test_enumerates_gz_and_plain_archive_sessions(self, tmp_path):
+    def test_enumerates_nested_archive_sessions(self, tmp_path):
         archive = self._build_archive(tmp_path / 'archive')
         records = mod.enumerate_sessions(
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
         assert {r.path.name for r in records} == {
-            'gz-session.jsonl.gz', 'plain-session.jsonl',
+            'archived-session.jsonl', 'plain-session.jsonl',
         }
 
     def test_archive_record_fields(self, tmp_path):
@@ -886,11 +686,11 @@ class TestEnumerateArchiveRoots:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        gz = next(r for r in records if r.path.name == 'gz-session.jsonl.gz')
-        assert gz.encoded_dir == self.WT_ENC
-        assert gz.cwd == WORKTREE_CWD
-        assert gz.date == self.TARGET_DATE
-        assert gz.size_bytes == gz.path.stat().st_size
+        archived = next(r for r in records if r.path.name == 'archived-session.jsonl')
+        assert archived.encoded_dir == self.WT_ENC
+        assert archived.cwd == WORKTREE_CWD
+        assert archived.date == self.TARGET_DATE
+        assert archived.size_bytes == archived.path.stat().st_size
 
     def test_non_member_cockpit_session_excluded(self, tmp_path):
         archive = self._build_archive(tmp_path / 'archive')
@@ -898,7 +698,7 @@ class TestEnumerateArchiveRoots:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert 'cockpit-session.jsonl.gz' not in {r.path.name for r in records}
+        assert 'cockpit-session.jsonl' not in {r.path.name for r in records}
 
     def test_empty_agent_transcript_roots_is_byte_identical(self, tmp_path):
         # A tree with BOTH a projects-root session and a populated archive.
@@ -924,6 +724,79 @@ class TestEnumerateArchiveRoots:
             agent_transcript_roots=[tmp_path / 'does-not-exist'],
         )
         assert records == []
+
+
+class TestResidualGzIsAnnounced:
+    """The archive walk only enumerates ``*.jsonl``, so anything still gzipped
+    is not skipped-with-a-reason — it is not seen at all.
+
+    That window is real and accepted: the destructive migration sweep is a
+    human-operated step (OPERATIONS.md §13), so between this merge and the
+    operator's run the corpus under-reports. What is NOT acceptable is the gap
+    being invisible, since its duration is bounded only by someone remembering.
+    So the walk counts what it cannot see and says so — a count, never a read,
+    and it disappears on its own once the migration has run.
+    """
+
+    TARGET_DATE = dt_date(2026, 7, 13)
+    WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
+    LOGGER = 'legibility.inventory'
+
+    def _archive_with_residue(self, tmp_path: Path, *, residual: int) -> Path:
+        root = tmp_path / 'archive'
+        enc_dir = root / '2573' / self.WT_ENC
+        _write_session(
+            enc_dir, 'migrated-session', WORKTREE_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        for i in range(residual):
+            # NOT valid gzip on purpose: the count must never open these, so
+            # bytes no decompressor would accept are the honest fixture.
+            (enc_dir / f'un-migrated-{i}.jsonl.gz').write_bytes(b'not gzip either')
+        return root
+
+    def _enumerate(self, tmp_path: Path, archive: Path):
+        return mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+
+    def test_residual_gz_is_counted_and_announced_once(self, tmp_path, caplog):
+        archive = self._archive_with_residue(tmp_path, residual=2)
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            records = self._enumerate(tmp_path, archive)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        message = warnings[0].getMessage()
+        assert '2' in message
+        assert '.jsonl.gz' in message
+        # Actionable on its own: it names the fix, not just the symptom.
+        assert 'migrate_transcript_archive_gunzip.py' in message
+        # And the residue costs nothing else: the migrated session still lands.
+        assert {r.path.name for r in records} == {'migrated-session.jsonl'}
+
+    def test_a_fully_migrated_archive_says_nothing(self, tmp_path, caplog):
+        archive = self._archive_with_residue(tmp_path, residual=0)
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            self._enumerate(tmp_path, archive)
+
+        # The signal is self-clearing — an operator who ran the sweep must not
+        # keep being told about a gap that no longer exists.
+        assert [r.getMessage() for r in caplog.records] == []
+
+    def test_count_residual_gz_never_opens_a_file(self, tmp_path):
+        # The fixtures are undecompressable, so a count that tried to read
+        # them would raise rather than answer. No gzip branch comes back.
+        archive = self._archive_with_residue(tmp_path, residual=3)
+        assert mod.count_residual_gz(archive) == 3
+
+    def test_count_residual_gz_on_an_absent_root_is_zero(self, tmp_path):
+        # Same posture as the walk itself: an archive root that does not exist
+        # yet is normal (the tree is git-ignored), not an error.
+        assert mod.count_residual_gz(tmp_path / 'does-not-exist') == 0
 
 
 class TestEnumerateSessionsInRange:
@@ -1019,8 +892,8 @@ class TestArchiveEncPrefilter:
     ``<enc>`` is skipped WITHOUT a gz-decompress. :func:`is_member` on the
     real cwd remains the SOLE membership authority for lossy false-positives
     (e.g. a ``-cockpit`` sibling that string-startswith the prefix). ``<enc>``
-    is ``parts[1]`` for BOTH the main (``<task>/<enc>/<sid>.jsonl.gz``) and
-    subagent (``<task>/<enc>/<sid>/subagents/agent-*.jsonl.gz``) layouts —
+    is ``parts[1]`` for BOTH the main (``<task>/<enc>/<sid>.jsonl``) and
+    subagent (``<task>/<enc>/<sid>/subagents/agent-*.jsonl``) layouts —
     never ``session_path.parent.name`` (== ``'subagents'`` for the subagent
     variant, which would wrongly drop every subagent transcript)."""
 
@@ -1048,7 +921,7 @@ class TestArchiveEncPrefilter:
         # excluded AND its path is never passed to the reader — skipped without
         # a gz-decompress by the cheap <enc> pre-filter.
         archive = tmp_path / 'archive'
-        _write_session_gz(
+        _write_session(
             archive / '2573' / self.OTHER_ENC, 'foreign', self.OTHER_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1057,14 +930,14 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        foreign_path = archive / '2573' / self.OTHER_ENC / 'foreign.jsonl.gz'
+        foreign_path = archive / '2573' / self.OTHER_ENC / 'foreign.jsonl'
         assert records == []
         assert foreign_path not in opened
 
     def test_member_enc_kept_and_opened(self, tmp_path, monkeypatch):
         # (b) A member <enc> is kept AND its path WAS passed to the reader.
         archive = tmp_path / 'archive'
-        member_path = _write_session_gz(
+        member_path = _write_session(
             archive / '2573' / self.WT_ENC, 'member', WORKTREE_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1073,7 +946,7 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert {r.path.name for r in records} == {'member.jsonl.gz'}
+        assert {r.path.name for r in records} == {'member.jsonl'}
         assert member_path in opened
 
     def test_lossy_cockpit_false_positive_is_opened_then_is_member_rejected(
@@ -1085,7 +958,7 @@ class TestArchiveEncPrefilter:
         # The pre-filter is a superset filter; is_member is the sole authority.
         archive = tmp_path / 'archive'
         cockpit_enc = mod.encode_cwd(COCKPIT_CWD)
-        cockpit_path = _write_session_gz(
+        cockpit_path = _write_session(
             archive / '9999' / cockpit_enc, 'cockpit', COCKPIT_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1098,14 +971,14 @@ class TestArchiveEncPrefilter:
         assert cockpit_path in opened
 
     def test_subagent_layout_member_kept_and_opened(self, tmp_path, monkeypatch):
-        # (d) Subagent layout: <archive>/<task>/<enc>/<sid>/subagents/agent-x.jsonl.gz.
+        # (d) Subagent layout: <archive>/<task>/<enc>/<sid>/subagents/agent-x.jsonl.
         # <enc> is parts[1] (the member WT_ENC), NOT parent.name (== 'subagents',
         # which never encoded-prefix-matches a cwd and would drop EVERY subagent
         # transcript). The member subagent file is kept + opened, and its
         # encoded_dir is the real <enc>, not 'subagents'.
         archive = tmp_path / 'archive'
         sub_dir = archive / '2573' / self.WT_ENC / 'cafe-sid' / 'subagents'
-        sub_path = _write_session_gz(
+        sub_path = _write_session(
             sub_dir, 'agent-x', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z',
         )
         opened = self._install_open_spy(monkeypatch)
@@ -1113,7 +986,7 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert {r.path.name for r in records} == {'agent-x.jsonl.gz'}
+        assert {r.path.name for r in records} == {'agent-x.jsonl'}
         assert sub_path in opened
-        record = next(r for r in records if r.path.name == 'agent-x.jsonl.gz')
+        record = next(r for r in records if r.path.name == 'agent-x.jsonl')
         assert record.encoded_dir == self.WT_ENC

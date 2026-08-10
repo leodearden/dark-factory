@@ -13,26 +13,25 @@ the commit path is genuinely exercised without risking main.
 from __future__ import annotations
 
 import contextlib
-import gzip
 import json
 import logging
 import subprocess
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from legibility import (
     census_trigger,
     codebook,
-    config as config_mod,
     digest,
     nightly,
     trickle_state,
 )
+from legibility import (
+    config as config_mod,
+)
 from legibility.config import load_config
-
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -215,33 +214,6 @@ def _write_quiet_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def _write_transcript_gz(
-    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-1',
-) -> None:
-    """Gzip variant of :func:`_write_transcript` — the on-disk form of an
-    archived fleet session (``shared.transcript_archive`` writes
-    ``<sid>.jsonl.gz``). Same nonzero-confusion content, gzip-compressed."""
-    lines = [
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
-        },
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {
-                'role': 'user',
-                'content': [
-                    {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True,
-                     'content': 'No such file or directory'},
-                ],
-            },
-        },
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
-        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
-
-
 # ---------------------------------------------------------------------------
 # step-3/4: select_scored_records (+ the stratified sampler)
 # ---------------------------------------------------------------------------
@@ -262,12 +234,12 @@ def test_select_scored_records_includes_matching_session(tmp_path):
     assert record.stratum
 
 
-def test_select_scored_records_reads_gz_archive_root(tmp_path):
+def test_select_scored_records_reads_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
-    # -> gz-read (iter_json_lines) -> classify (encoded worktree parent dir).
+    # -> read (iter_json_lines) -> classify (encoded worktree parent dir).
     # An archived role transcript at the production nested layout
-    # <archive>/<task_id>/<enc>/<sid>.jsonl.gz is enumerated ALONGSIDE an
+    # <archive>/<task_id>/<enc>/<sid>.jsonl is enumerated ALONGSIDE an
     # (empty) ~/.claude/projects tree and classified 'orchestrated-task'.
     main_cwd = '/home/leo/src/dark-factory'
     worktree_cwd = '/home/leo/src/dark-factory/.worktrees/2573'
@@ -276,16 +248,17 @@ def test_select_scored_records_reads_gz_archive_root(tmp_path):
         tmp_path, project_id='dark_factory', cwd_prefixes=[main_cwd],
         agent_transcript_roots=['archive'],
     ))
-    gz_path = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl.gz'
-    _write_transcript_gz(
-        gz_path, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
+    archived = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl'
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(
+        archived, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
     )
     empty_projects_root = tmp_path / 'projects'  # never created — projects tree absent
 
     scored = nightly.select_scored_records(cfg, empty_projects_root, date(2026, 7, 13))
 
     assert len(scored) == 1
-    assert scored[0].session.path == gz_path
+    assert scored[0].session.path == archived
     assert scored[0].stratum == 'orchestrated-task'
 
 
@@ -620,7 +593,7 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
         poster=lambda url, envelope: None,
@@ -1058,7 +1031,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     before_log = subprocess.run(
@@ -1165,7 +1138,7 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1200,7 +1173,7 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1276,7 +1249,7 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1357,7 +1330,7 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1405,7 +1378,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A single selected session whose invoke fails to parse -> 1/1 failed ->
@@ -1469,7 +1442,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid matching invoke -> the merge/dump genuinely happens; only the
@@ -1534,7 +1507,7 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid-but-empty judgment ("coded fine, found nothing") -- a genuine
@@ -1610,7 +1583,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         coder_calls.append(prompt)
         return 'not valid json'
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     result = nightly.run_nightly(
@@ -1962,7 +1935,7 @@ class TestRunNightlyRecordsTrickleState:
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=invoke,
             status_fetcher=None,
             poster=poster if poster is not None else (lambda url, envelope: None),
@@ -2168,7 +2141,7 @@ class _NightRunner:
             config_path=self.config_path,
             projects_root=self.projects_root,
             target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),

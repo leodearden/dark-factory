@@ -18,9 +18,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
 from legibility import config as mod
+from pydantic import ValidationError
 
 MINIMAL_YAML = textwrap.dedent("""\
     project_id: dark_factory

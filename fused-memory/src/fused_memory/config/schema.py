@@ -284,18 +284,13 @@ class QueueConfig(BaseModel):
     # test_config_schema.py::
     # TestQueueConfigTransientErrorFields::test_transient_error_names_matches_durable_queue_default.
     #
-    # 1936's original wording gave "graphiti_core's NodeNotFoundError — a
-    # graph-visibility race" as the example. That premise was refuted by the
-    # esc-3561-3 investigation (2026-08-03) and the example has been replaced
-    # here to stop propagating it. The authoritative caveat, including the
-    # topology assumption that would make it defensible again, lives beside
-    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py; task 3585 owns the
-    # removal itself.
+    # Task 3585 removed the not-found family (NodeNotFoundError,
+    # EdgeNotFoundError, EdgesNotFoundError) from this default. The evidence
+    # and the reinstatement condition live in exactly one place — beside
+    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py — so the two copies of
+    # the LIST never grow two divergent copies of the ARGUMENT.
     transient_max_attempts: int = Field(default=12)
     transient_error_names: list[str] = Field(default_factory=lambda: [
-        'NodeNotFoundError',
-        'EdgeNotFoundError',
-        'EdgesNotFoundError',
         'TimeoutError',
         'ConnectionError',
         'ConnectionResetError',

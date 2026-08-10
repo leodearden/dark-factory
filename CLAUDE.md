@@ -220,4 +220,4 @@ directly, not just interactive agents.
   stage/judge prompt sources), `RECONCILIATION_PLAN.md`
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
-- **Design invariants**: `docs/legibility/design-invariants.md` — five checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2

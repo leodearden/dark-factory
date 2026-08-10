@@ -117,6 +117,10 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+# Return channel for drain_await_fresh -- never declare 'local' anywhere
+# (full contract and incident rationale live in drain_await_fresh's own
+# docstring, task 3852).
+_DRAIN_VERDICT=""
 
 DRAIN_ENABLED=0
 for arg in "$@"; do
@@ -227,25 +231,73 @@ drain_check_verdict() {
 drain_await_fresh() {
     # $1 = unit name.  Waits up to DRAIN_UNKNOWN_GRACE_SECS for a stale or
     # absent heartbeat to become fresh (idle or busy), re-polling every
-    # DRAIN_POLL_INTERVAL_SECS.  Prints the resulting verdict to stdout ONLY
-    # -- idle or busy if a fresh reading appeared before the grace elapsed,
-    # or the original stale/absent verdict if the grace elapsed with no
-    # fresh reading (fail-toward-convergence: the caller proceeds with the
-    # restart).  Emits no journal lines itself, so it is safe to call via
-    # command substitution from anywhere in drain_gate.
+    # DRAIN_POLL_INTERVAL_SECS.  Contract: sets the module-global
+    # _DRAIN_VERDICT to the resulting verdict -- idle or busy if a fresh
+    # reading appeared before the grace elapsed, or the original
+    # stale/absent verdict if the grace elapsed with no fresh reading
+    # (fail-toward-convergence: the caller proceeds with the restart) --
+    # returns 0, and prints nothing to stdout.
+    #
+    # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
+    # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
+    # substitution (`verdict="$(drain_await_fresh "$unit")"`). Command
+    # substitution runs this function's poll loop inside a forked
+    # subshell; a SIGKILL of the top-level script pid does not reach that
+    # subshell, so it survives, reparents to systemd --user, and keeps
+    # forking one `python3 drain_check.py` per DRAIN_POLL_INTERVAL_SECS
+    # for up to DRAIN_UNKNOWN_GRACE_SECS more -- an orphan observed
+    # running for ~27.8h in the wild before being manually reaped (task
+    # 3852).
+    #
+    # The reset below (before anything else, including the BASH_SUBSHELL
+    # check) and that check itself are this function's own two-part guard
+    # of the contract above; drain_gate's _drain_validate_verdict is a
+    # further, independent backstop -- see that function for why it is
+    # still needed even with this guard in place (task 3852).
+    _DRAIN_VERDICT=""
+    if [[ ${BASH_SUBSHELL:-0} -ne 0 ]]; then
+        echo "BUG(task 3852): drain_await_fresh must run in the main shell, not a subshell (BASH_SUBSHELL=$BASH_SUBSHELL); its poll loop would survive a kill of the top-level script pid" >&2
+        return 1
+    fi
     local unit="$1"
-    local verdict grace_start elapsed_grace
-    verdict="$(drain_check_verdict "$unit")"
+    local grace_start elapsed_grace
+    _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     grace_start=$SECONDS
-    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
+    while [[ "$_DRAIN_VERDICT" == "stale" || "$_DRAIN_VERDICT" == "absent" ]]; do
         elapsed_grace=$((SECONDS - grace_start))
         if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
             break
         fi
         sleep "$DRAIN_POLL_INTERVAL_SECS"
-        verdict="$(drain_check_verdict "$unit")"
+        _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     done
-    printf '%s\n' "$verdict"
+    return 0
+}
+
+_drain_validate_verdict() {
+    # $1 = unit name (for the error message only), $2 = verdict to check.
+    # Defensive backstop, independent of drain_await_fresh's own guard
+    # (task 3852): drain_gate must never branch on a verdict that is not
+    # one of the four tokens drain_check_verdict can produce -- mirroring
+    # the token-whitelist coercion drain_check_verdict already applies to
+    # its own python3 subprocess output. It earns its keep even with
+    # drain_await_fresh's BASH_SUBSHELL guard in place because that guard
+    # can be silently defeated: combining the declaration with the
+    # command substitution, e.g. `local verdict="$(drain_await_fresh
+    # "$unit")"`, makes bash report the exit status of `local` (always 0)
+    # rather than the subshell's, so `set -e` never sees the failure
+    # (shellcheck SC2155) and the run would otherwise continue on
+    # whatever verdict resulted. Aborting loudly here on any unrecognized
+    # value is the alternative to drain_gate silently falling through
+    # into its busy-defer branch (withholding a restart for up to
+    # FORCE_FIRE_AFTER_SECS) for a unit that was actually stale/absent.
+    case "$2" in
+        idle|busy|stale|absent) ;;
+        *)
+            echo "BUG(task 3852): drain_await_fresh produced verdict '$2' for unit $1" >&2
+            exit 1
+            ;;
+    esac
 }
 
 drain_gate() {
@@ -274,7 +326,9 @@ drain_gate() {
     #   indefinitely.
     local unit="$1"
     local verdict start_secs elapsed
-    verdict="$(drain_await_fresh "$unit")"
+    drain_await_fresh "$unit"
+    verdict="$_DRAIN_VERDICT"
+    _drain_validate_verdict "$unit" "$verdict"
 
     if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
         echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
@@ -303,7 +357,9 @@ drain_gate() {
         if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
             # Stopped heartbeating mid-defer -- apply the shorter bounded
             # grace instead of continuing to wait out the full busy grace.
-            verdict="$(drain_await_fresh "$unit")"
+            drain_await_fresh "$unit"
+            verdict="$_DRAIN_VERDICT"
+            _drain_validate_verdict "$unit" "$verdict"
             if [[ "$verdict" == "idle" ]]; then
                 echo "resuming restart of ${unit}: drained"
                 return 0

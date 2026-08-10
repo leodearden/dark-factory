@@ -284,6 +284,12 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   what lets the reaper join a decision back to the right per-queue id namespace instead of matching
   an unrelated same-named escalation. Stored normalized, so any spelling of the same directory
   works. Omitting it files a queue-less record — see the reaper caveat below.
+  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  "this record's owning queue was investigated and could not be determined". You never write it;
+  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
+  falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
+  the reaper refuses to close it at all.
 - The verb always files `state=open` and prints the filed id on success for your own cross-link
   (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
   raised, so filing a decision can never crash the watch loop or block the park itself.
@@ -315,7 +321,18 @@ here is skipped outright, so your reaper can never close the recon watcher's dec
 your own same-named escalations. A decision filed **without** `--escalations-dir` — every record
 predating that flag — falls back to project-only scoping and therefore has **no** such protection:
 it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
-pass the flag when filing.
+pass the flag when filing. Task 3640 then **back-filled** the pre-existing open population, so
+that unprotected set is now drained rather than merely shrinking as new records are filed — but
+only for records that existed at back-fill time. A decision you file today without the flag lands
+straight back in it.
+
+A decision stamped `<unknown>` is **refused**, not closed: its owning queue was investigated and
+could not be determined, so *no* reaper may close it and it stays a visible cockpit row until a
+human closes it. The reaper never defaults to closing on doubt — that direction is deliberate,
+since an over-held decision is a triageable row while a falsely-closed one is invisible.
+If unstamped open records ever reappear, the re-runnable remedy is
+`scripts/backfill_decision_queue_stamp.py` (dry-run by default; `--verify` exits non-zero while
+any open record still lacks a stamp).
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
