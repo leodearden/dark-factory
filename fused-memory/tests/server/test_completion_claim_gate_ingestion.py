@@ -414,3 +414,253 @@ class TestNoClaimPathIsUntouched:
         )
         assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
         assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
+
+
+# A well-formed sha that no throwaway repo will contain.
+_ABSENT_SHA = 'deadbee' + 'f' * 33
+
+
+def _assert_tagged(result, mock_service, *, ref):
+    """The whole fail-safe contract in one place: ingested, tagged, and the flag
+    says WHAT WAS OBSERVED rather than merely that something went wrong.
+    """
+    assert 'error' not in result, f'The gate must never reject; got: {result!r}'
+    mock_service.add_episode.assert_awaited_once()
+    kwargs = _service_kwargs(mock_service)
+    assert kwargs.get('unverified_claim') is True, (
+        f'An unresolvable authority must TAG, not pass; got kwargs: {kwargs!r}'
+    )
+    claims = (result.get('unverified_claim') or {}).get('claims') or []
+    assert [c for c in claims if c.get('ref') == ref], (
+        f'Expected a flagged claim naming {ref!r}; got: {result!r}'
+    )
+    entry = next(c for c in claims if c.get('ref') == ref)
+    assert entry.get('status') in {'mismatch', 'unverifiable'}, (
+        f'A tagged claim is either contradicted or unchecked; got: {entry!r}'
+    )
+    assert entry.get('observed'), (
+        f'The flag must name what was observed, never just that it failed; got: {entry!r}'
+    )
+    return entry
+
+
+class TestUnresolvableAuthoritiesTag:
+    """FAIL-SAFE CONTRACT, and the deliberate INVERSION of
+    _premature_completion_block's fail-open.
+
+    That gate rejects a write, so an infra hiccup must not bounce a legitimate
+    one. This gate only labels, so its costs are asymmetric the other way: a
+    spurious tag is one extra source_description prefix, while a missed tag is
+    another batch of false Graphiti edges like esc-5603-1's five. Every
+    unresolvable authority therefore lands on 'unverifiable' and is TAGGED.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_interceptor_unconfigured_tags(self):
+        """No task_interceptor at all → the live status cannot be read. The 2824
+        gate fails OPEN here; this one tags.
+        """
+        mock_service = _episode_service()
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref='5422')
+        assert entry.get('status') == 'unverifiable', (
+            f'An unreadable authority is unchecked, not contradicted; got: {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_project_absent_from_known_projects_tags(self):
+        """An empty registry puts the tool in permissive mode (the write is
+        accepted) but leaves the claimed project's root unresolvable — so the
+        status read cannot be scoped and the claim is tagged, never passed.
+        """
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'done'}, known_projects={})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref='5422')
+        assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_raising_tags(self):
+        mock_service = _episode_service()
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(side_effect=RuntimeError('taskmaster down'))
+        task_interceptor.get_ticket_row = AsyncMock(return_value=None)
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref='5422')
+        assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'statuses',
+        [
+            pytest.param({'5422': 'unknown'}, id='unknown-sentinel'),
+            pytest.param({}, id='absent-from-map'),
+        ],
+    )
+    async def test_unknown_or_absent_status_tags(self, statuses):
+        """`unknown` is get_statuses' documented sentinel for a NULL/absent DB
+        status. It is not a live status, so it can neither confirm nor
+        contradict — which under this gate's inverted fail direction means
+        tagged, exactly where the 2824 gate deliberately passes.
+        """
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses=statuses)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref='5422')
+        assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    async def test_get_ticket_row_raising_tags(self):
+        mock_service = _episode_service()
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_ticket_row = AsyncMock(side_effect=RuntimeError('tickets.db locked'))
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _TICKET_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        assert entry.get('status') == 'unverifiable', (
+            f'A registry that could not be consulted is UNVERIFIABLE, never a '
+            f'false accusation that the ticket does not exist; got: {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ticket_store_unconfigured_tags(self):
+        """The real get_ticket_row returns None (never raises) when no ticket
+        store is configured. The tools layer cannot tell that from "no such
+        ticket" — both are non-verified, so both tag.
+        """
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _TICKET_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        _assert_tagged(result, mock_service, ref=_TICKET_ID)
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_commit_probe_tags(self, tmp_path):
+        """The claimed project's root is not a git repository, so commit
+        existence cannot be answered at all → tagged as unverifiable, NOT
+        reported as "the writer named a commit that does not exist".
+        """
+        mock_service = _episode_service()
+        server = _server(
+            mock_service,
+            statuses={},
+            known_projects={_PROJECT_ID: str(tmp_path)},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': f'the de-flake fix landed in commit {_ABSENT_SHA}',
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref=_ABSENT_SHA)
+        assert entry.get('status') == 'unverifiable', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    async def test_gate_defect_never_breaks_the_write(self, caplog, monkeypatch):
+        """The gate is advisory machinery bolted onto the write path. A defect
+        INSIDE it must degrade to "no tag", never to a failed ingestion — the
+        write is the thing the caller actually asked for.
+        """
+        import fused_memory.server.tools as tools_mod
+
+        monkeypatch.setattr(
+            tools_mod,
+            'extract_completion_claims',
+            MagicMock(side_effect=RuntimeError('gate exploded')),
+        )
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'in-progress'})
+
+        with caplog.at_level(logging.DEBUG):
+            result = await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': _APPLIED_CONTENT,
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        assert 'error' not in result, (
+            f'A gate defect must not fail the write; got: {result!r}'
+        )
+        mock_service.add_episode.assert_awaited_once()
+        assert 'unverified_claim' not in _service_kwargs(mock_service), (
+            f'A gate that could not run tags nothing; got: {_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+        assert [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR and 'completion_claim_gate' in r.getMessage()
+        ], (
+            'The swallowed defect must still be loud in the logs — a silent '
+            f'except is how a gate quietly stops gating; got: {caplog.text!r}'
+        )
