@@ -52,13 +52,40 @@ def _resolve_reify_root(start: Path | None = None) -> Path | None:
     every worktree — which is where orchestrator verify runs. Do not "fix"
     this back to a fixed parents[N] index.
 
-    Walks the ancestors of `start` (default __file__), nearest first, and
-    returns the first ancestor `a` for which `a / 'reify' / _REIFY_GUARD_RELPATH`
-    is a file, or None if no ancestor has it. Nearest-first is load-bearing: it
-    reaches /home/leo/src before /home/leo and /, so a stray higher-up `reify`
-    directory (e.g. a bare one with no scripts/lock-charter-guard.sh inside)
-    cannot shadow the real sibling checkout.
+    Resolution order:
+      1. The REIFY_ROOT env var, if set (empty/whitespace-only counts as
+         unset — the exported-but-empty shell accident, `export REIFY_ROOT=`).
+         Honored VERBATIM, even when the path does not exist on disk: a silent
+         fallthrough to a discovered checkout would make a typo'd REIFY_ROOT
+         look like it worked while actually checking a DIFFERENT repo than the
+         operator named — the same silently-wrong-answer class this task
+         exists to remove. A bad override must surface downstream as a skip
+         naming the bad path, not a lucky-but-wrong discovery.
+      2. Otherwise, the nearest ancestor `a` of `start` (default __file__),
+         nearest first, for which `a / 'reify' / _REIFY_GUARD_RELPATH` is a
+         file. Nearest-first is load-bearing: it reaches /home/leo/src before
+         /home/leo and /, so a stray higher-up `reify` directory (e.g. a bare
+         one with no scripts/lock-charter-guard.sh inside) cannot shadow the
+         real sibling checkout.
+      3. Otherwise None.
+
+    The module-level constants below (_REIFY_REPO_ROOT, _REIFY_GUARD_SCRIPT)
+    are evaluated at IMPORT time, so REIFY_ROOT must be exported BEFORE pytest
+    starts to steer them — a mid-session `monkeypatch.setenv` only affects
+    direct `_resolve_reify_root()` calls (which is exactly what the
+    TestResolveReifyRoot cases above do; they never touch the constants).
+
+    REIFY_ROOT is the same env-var name `orchestrator/tests/test_verify_role_
+    integration.py` uses for its `REIFY_VERIFY_SH` (see that file's module
+    docstring), so one `export REIFY_ROOT=...` steers every reify-dependent
+    test in dark-factory. This call site deliberately substitutes ancestor
+    discovery for that file's machine-specific `/home/leo/src/reify` default,
+    since discovery works for any side-by-side checkout on any machine.
     """
+    override = os.environ.get(_REIFY_ROOT_ENV, '').strip()
+    if override:
+        return Path(override).resolve()
+
     for ancestor in Path(start or __file__).resolve().parents:
         if (ancestor / 'reify' / _REIFY_GUARD_RELPATH).is_file():
             return ancestor / 'reify'
@@ -341,7 +368,7 @@ class TestResolveReifyRoot:
         Not this step's RED signal (see plan step 3); included here because it
         is cheap and guards against the two call sites re-diverging later.
         """
-        assert _REIFY_REPO_ROOT == _resolve_reify_root()
+        assert _resolve_reify_root() == _REIFY_REPO_ROOT
         if _REIFY_REPO_ROOT is not None:
             assert _REIFY_GUARD_SCRIPT == _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH
 
