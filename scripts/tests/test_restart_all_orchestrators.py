@@ -28,11 +28,11 @@ import pytest
 # directory. Functions only -- importing one of that module's FIXTURES into a
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
-    LIVE_FLEET_DIR,
     PIPE_CLOSING_LEAKER_SRC,
     assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    fleet_dir_redirect_violation_reason,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -269,34 +269,24 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     This directory's OWN proof. tests/scripts/test_fleet_dir_isolation.py has
     the mirror: the two roots are wired separately (this one does not load the
     repo-root conftest at all), so a green test in one says nothing about the
-    other.
+    other. Only the WIRING differs between the two copies, so only the wiring is
+    duplicated -- the comparison and its messages live once, in
+    df_pytest_isolation.fleet_dir_redirect_violation_reason, for the same reason
+    deploy_clock_snapshot is imported above rather than re-implemented here. Two
+    copies of the assertion body had already drifted in message text before they
+    were a day old.
 
     Takes the redirect from the fixture BY NAME rather than reading os.environ
     bare, so deleting the fixture fails collection with a message naming
     `_df_fleet_dir_redirect` instead of passing off a leftover env var.
     """
     value = os.environ.get("ORCH_FLEET_DIR")
-    assert value, (
-        f"ORCH_FLEET_DIR is {value!r}. Unset AND empty both fall through the "
-        f"script's ${{VAR:-...}} default to the machine-global {LIVE_FLEET_DIR}, "
-        "so a test-spawned drain gate reads other projects' LIVE production "
-        "heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect."
-    )
+    reason = fleet_dir_redirect_violation_reason(value, tmp_path_factory.getbasetemp())
+    assert reason is None, reason
 
-    resolved = Path(value).resolve()
-    basetemp = tmp_path_factory.getbasetemp().resolve()
-    assert resolved.is_relative_to(basetemp), (
-        f"ORCH_FLEET_DIR={resolved} is outside this run's basetemp {basetemp}."
-    )
-
-    live = LIVE_FLEET_DIR.resolve()
-    assert resolved != live and not resolved.is_relative_to(live), (
-        f"ORCH_FLEET_DIR={resolved} is the live fleet dir {live} (or inside it). "
-        "That directory is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous dir holding "
-        "seven projects' live orchestrator heartbeats."
-    )
-
-    assert Path(_df_fleet_dir_redirect).resolve() == resolved
+    # The genuinely per-root half: this proves THIS rootdir's conftest bound the
+    # fixture that set the variable checked above.
+    assert Path(_df_fleet_dir_redirect).resolve() == Path(value or "").resolve()
 
 
 # ---------------------------------------------------------------------------

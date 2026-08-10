@@ -128,6 +128,29 @@ strings.  Widening the wiring is a mechanical edit to those seven files and is
 out of task 3798's locked scope; until then, read a green subproject run as
 "unmeasured", never as "no leak".
 
+THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
+rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
+for ``_df_no_leaked_drain_processes``, whose hazard is a forked poll loop, but it
+covers only the READ direction of the fleet dir.  ``orchestrator/tests/`` is the
+rootdir of the fleet heartbeat's PRODUCER — ``Harness._write_merge_heartbeat``
+calls ``fleet_heartbeat.resolve_fleet_dir()``, which reads bare ``os.environ`` —
+so an orchestrator test that drives the run loop without setting
+``ORCH_FLEET_DIR`` writes a heartbeat straight into the machine-global
+cross-project directory, and with a REAL unit name that
+``_df_no_synthetic_heartbeats_in_live_fleet`` is deliberately blind to.
+
+Accepted as latent, not safe, on a MEASURED basis: every producer call site in
+``orchestrator/tests/`` today takes an explicit env — both heartbeat-writing
+tests (``test_harness_merge_heartbeat.py``) ``monkeypatch.setenv`` the var first,
+and ``test_fleet_heartbeat.py``'s ``delenv`` case only computes a path and writes
+nothing.  So there is no live leak to fix, and wiring those two fixtures into
+``orchestrator/tests/conftest.py`` is a file outside task 3799's locked scope.
+What would invalidate this: the FIRST orchestrator test that writes a heartbeat
+without an explicit ``ORCH_FLEET_DIR``.  Wire the two fixtures there rather than
+patching that one test — the defect class is "a spawner that forgets", and this
+paragraph exists because the producer's rootdir is where the next forgetful one
+will be written.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -150,8 +173,53 @@ import time
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Shared test-support plumbing for the liveness pins below
+# ---------------------------------------------------------------------------
+
+# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
+# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
+# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
+# are accepted, and neither-found is an explicit failure rather than a skipped
+# assertion — a private-API pin that silently stops finding its target is worse
+# than no pin, because it still reads as coverage.
+_FIXTURE_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
+
+
+def fixture_marker(fixture: object) -> Any:
+    """Return pytest's fixture marker for *fixture*, whatever this pytest calls it.
+
+    Lives HERE rather than in one test module because each of this module's
+    suite-wide defences needs the same "is it really session-scoped and autouse"
+    pin, and the two test roots (``tests/scripts/`` and ``scripts/tests/``)
+    cannot import each other's test modules — this module is the one place both
+    already import.  ``tests/scripts/test_deploy_clock_isolation.py`` still
+    carries a private copy that predates this; de-duplicating it onto this
+    symbol is a one-line edit in a file outside task 3799's locked scope.
+
+    ``Any``, not ``object``, is the honest annotation and is load-bearing for the
+    type gate: the two :data:`_FIXTURE_MARKER_ATTRS` spellings hang DIFFERENT
+    private classes off the fixture, neither of which pytest exports, so there is
+    no real static type covering both — and ``object`` makes every ``.scope`` /
+    ``.autouse`` read at the call site a ``reportAttributeAccessIssue``.  Do not
+    "tighten" this back to ``object``; pin the attributes with assertions
+    instead, as the callers do.
+    """
+    for attr in _FIXTURE_MARKER_ATTRS:
+        marker = getattr(fixture, attr, None)
+        if marker is not None:
+            return marker
+    pytest.fail(
+        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
+        f'{_FIXTURE_MARKER_ATTRS}. pytest moved its private fixture API again — '
+        'find the new spelling and add it, do NOT delete this assertion.',
+        pytrace=False,
+    )
+
 
 _CEILING_ENV = 'GIT_CEILING_DIRECTORIES'
 
@@ -1197,6 +1265,65 @@ _FLEET_DIR_ENV = 'ORCH_FLEET_DIR'
 # reason. The cross-tier pin is what keeps the four copies honest.
 LIVE_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
 
+# What a heartbeat file is CALLED, both mid-write and after.
+# `orchestrator.fleet_heartbeat.write_heartbeat` writes `<unit>.json.tmp` and
+# then `os.replace`s it onto `<unit>.json`, so a writer killed between the two
+# leaves ONLY the residue. Both spellings are evidence of the same leak; a
+# tuple (not a bare `.json`) so `str.endswith` takes them in one call and the
+# two rules are visibly one decision.
+HEARTBEAT_SUFFIXES = ('.json', '.json.tmp')
+
+
+def fleet_dir_redirect_violation_reason(
+    value: str | None,
+    basetemp: str | os.PathLike[str],
+) -> str | None:
+    """Explain why *value* is not an acceptable ``ORCH_FLEET_DIR`` redirect.
+
+    ``None`` when the redirect is sound: a non-empty path, inside this run's
+    *basetemp*, and neither the live fleet dir nor anything under it.
+
+    THE RULE LIVES HERE, not in the tests, because BOTH test roots must prove
+    their own wiring and each therefore has its own copy of the test function.
+    Two copies of a ~20-line assertion body drift — these two already had, at
+    birth, in the text of the basetemp message.  Each root keeps the one-line
+    test (which is what proves ITS conftest binding is real) and shares the
+    comparison and the messages, exactly as ``scripts/tests/`` already reuses
+    :func:`deploy_clock_snapshot` rather than re-implementing it.
+
+    Ordered most-specific-first: a value pointing AT the live dir is reported as
+    that, not as the generic "outside basetemp" it also happens to be.
+    """
+    if not value:
+        return (
+            f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through '
+            "the script's ${VAR:-…} default to the machine-global "
+            f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other '
+            "projects' LIVE production heartbeats. "
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    resolved = Path(value).resolve()
+    live = LIVE_FLEET_DIR.resolve()
+    if resolved == live or resolved.is_relative_to(live):
+        return (
+            f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or '
+            'inside it). That directory is a MACHINE-GLOBAL, CROSS-PROJECT '
+            "rendezvous dir holding seven projects' live orchestrator "
+            'heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    basetemp = Path(basetemp).resolve()
+    if not resolved.is_relative_to(basetemp):
+        return (
+            f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp '
+            f'{basetemp}. The redirect must land in pytest tmp space, or the '
+            'suite is writing heartbeats somewhere that outlives it. '
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    return None
+
 
 @pytest.fixture(scope='session', autouse=True)
 def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
@@ -1258,6 +1385,14 @@ def synthetic_heartbeats_in(fleet_dir: str | os.PathLike[str]) -> list[str]:
     every ~30s, so anything keyed on "did it change" fires constantly, while
     nothing in production can produce an ``orchestrator-fake*`` name.
 
+    ``.json.tmp`` COUNTS TOO.  ``orchestrator.fleet_heartbeat.write_heartbeat``
+    is a write-then-``os.replace`` atomic writer whose intermediate file is
+    ``<unit>.json.tmp``, so a test-spawned writer killed between the two — the
+    orphan/timeout scenario task 3798 established as this family's hazard model
+    — leaves the residue and never the final name.  That residue is just as
+    attributable and just as much operator debris; reporting all-clear on it
+    would blind the guard to precisely the interrupted-writer case.
+
     NEVER RAISES.  A missing directory, an unreadable one, a path that is not a
     directory at all — every one of them is an empty result.  This runs in
     SESSION TEARDOWN, where an exception would mask whatever the run was
@@ -1273,7 +1408,8 @@ def synthetic_heartbeats_in(fleet_dir: str | os.PathLike[str]) -> list[str]:
     return sorted(
         entry.name
         for entry in entries
-        if entry.name.startswith(SYNTHETIC_UNIT_PREFIX) and entry.name.endswith('.json')
+        if entry.name.startswith(SYNTHETIC_UNIT_PREFIX)
+        and entry.name.endswith(HEARTBEAT_SUFFIXES)
     )
 
 

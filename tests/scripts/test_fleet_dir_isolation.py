@@ -33,10 +33,16 @@ forgets:
   ``non_synthetic_unit_names`` / ``assert_synthetic_units``), which is what
   makes a leaked fixture heartbeat SELF-IDENTIFYING;
 * a session-scoped autouse fixture redirecting ``ORCH_FLEET_DIR`` away from the
-  live checkout; and
+  live checkout, and the shared rule it is judged by
+  (``fleet_dir_redirect_violation_reason``);
 * the pure helpers behind the live-fleet leak guard (``synthetic_heartbeats_in``
   / ``leaked_fleet_heartbeat_reason``), directly testable without a nested
-  pytest run.
+  pytest run;
+* that BOTH fixtures are actually armed in the process running this file —
+  defined, shaped session/autouse, and registered by a conftest binding — since
+  every pure-helper test above stays green against a dead defence; and
+* what a violation DOES to a run, through a real nested pytest session: the
+  process exits non-zero even though every one of its tests passed.
 
 Shaped like ``test_deploy_clock_isolation.py``, ``test_drain_process_leak_isolation.py``
 and ``test_basetemp_git_isolation.py`` — the modules covering this repo's other
@@ -49,6 +55,7 @@ NOTHING here writes to, or asserts the content of, the real
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -63,15 +70,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
+import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     LIVE_FLEET_DIR,
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
+    fixture_marker,
+    fleet_dir_redirect_violation_reason,
     leaked_fleet_heartbeat_reason,
     non_synthetic_unit_names,
     synthetic_heartbeats_in,
     synthetic_unit,
 )
+
+# NOT `from df_pytest_isolation import _df_...`. Importing a FIXTURE into a test
+# module binds it as a module-scoped fixture that SHADOWS the conftest's — which
+# would make the liveness tests below resolve their own import and pass even with
+# the conftest wiring removed, i.e. exactly the dead defence they exist to
+# detect. Reach them through the module instead.
+_REDIRECT_NAME = '_df_fleet_dir_redirect'
+_GUARD_NAME = '_df_no_synthetic_heartbeats_in_live_fleet'
 
 _FLEET_DIR_ENV = 'ORCH_FLEET_DIR'
 
@@ -248,12 +266,24 @@ def test_df_pytest_isolation_stays_stdlib_and_pytest_only() -> None:
     dies at COLLECTION, before any assertion could run.  A ``hasattr`` loop over
     the same names lived here until it was found to be unfailable, and only
     pinned spelling a rename would have to edit twice.
+
+    An ALLOWLIST, not a denylist of the three first-party roots this task
+    happened to care about.  The constraint is "the stdlib and pytest", so a
+    regression that added ``import yaml`` or ``import psutil`` is the same defect
+    and would break collection in the same venvs — a denylist would have waved
+    both through.  The baseline is captured AFTER ``import pytest``, which makes
+    "and whatever pytest itself needs" (``pluggy``, ``iniconfig``, …) fall out of
+    the measurement instead of having to be enumerated and maintained here.
     """
     probe = '\n'.join((
         'import sys',
+        # Baseline AFTER importing the one permitted third-party dep, so its own
+        # transitive imports are covered without naming them.
+        'import pytest',
+        'allowed = {m.split(".")[0] for m in sys.modules}',
+        'allowed |= set(sys.stdlib_module_names) | {"df_pytest_isolation"}',
         'import df_pytest_isolation',
-        'roots = {"drain_check", "orchestrator", "shared"}',
-        'leaked = sorted(m for m in sys.modules if m.split(".")[0] in roots)',
+        'leaked = sorted({m.split(".")[0] for m in sys.modules} - allowed)',
         'if leaked:',
         '    sys.exit("df_pytest_isolation pulled in: " + ", ".join(leaked))',
     ))
@@ -297,33 +327,91 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     This is the ``tests/`` root's own proof.  ``scripts/tests/`` has its own copy
     (``test_restart_all_orchestrators.py``), because the two roots are wired
-    separately and a green test in one says nothing about the other.
+    separately and a green test in one says nothing about the other.  Only the
+    WIRING differs between the two copies, so only the wiring is duplicated: the
+    comparison and its messages live once, in
+    ``df_pytest_isolation.fleet_dir_redirect_violation_reason``, whose own cases
+    are unit-tested below.  Two copies of the assertion body had already drifted
+    in message text before they were a day old.
     """
     value = os.environ.get(_FLEET_DIR_ENV)
-    assert value, (
-        f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through the '
-        "script's ${VAR:-…} default to the machine-global "
-        f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other projects\' '
-        'LIVE production heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+    reason = fleet_dir_redirect_violation_reason(
+        value, tmp_path_factory.getbasetemp(),
     )
+    assert reason is None, reason
 
-    resolved = Path(value).resolve()
-    basetemp = tmp_path_factory.getbasetemp().resolve()
-    assert resolved.is_relative_to(basetemp), (
-        f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp {basetemp}. '
-        'The redirect must land in pytest tmp space, or the suite is writing '
-        'heartbeats somewhere that outlives it.'
-    )
+    # The fixture's yielded value IS the redirect, not a parallel path. This is
+    # the part that is genuinely per-root: it proves THIS rootdir's conftest
+    # bound the fixture that set the variable checked above.
+    assert Path(_df_fleet_dir_redirect).resolve() == Path(value or '').resolve()
 
-    live = LIVE_FLEET_DIR.resolve()
-    assert resolved != live and not resolved.is_relative_to(live), (
-        f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or inside it). '
-        'That directory is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous dir holding '
-        "seven projects' live orchestrator heartbeats."
-    )
 
-    # The fixture's yielded value IS the redirect, not a parallel path.
-    assert Path(_df_fleet_dir_redirect).resolve() == resolved
+class TestFleetDirRedirectViolationReason:
+    """The shared rule behind both roots' one-line redirect tests."""
+
+    def test_a_redirect_inside_basetemp_is_clean(self, tmp_path: Path) -> None:
+        assert fleet_dir_redirect_violation_reason(
+            str(tmp_path / 'fleet-dir0'), tmp_path,
+        ) is None
+
+    def test_an_unset_redirect_is_a_violation(self, tmp_path: Path) -> None:
+        """``None`` is the state this environment was in before task 3799."""
+        reason = fleet_dir_redirect_violation_reason(None, tmp_path)
+        assert reason is not None
+        assert str(LIVE_FLEET_DIR) in reason
+
+    def test_an_empty_redirect_is_a_violation(self, tmp_path: Path) -> None:
+        """``${VAR:-…}`` treats empty and unset IDENTICALLY, so this must too —
+        an empty value falls through to the machine-global default just as an
+        absent one does.
+        """
+        reason = fleet_dir_redirect_violation_reason('', tmp_path)
+        assert reason is not None
+        assert str(LIVE_FLEET_DIR) in reason
+
+    def test_a_redirect_outside_basetemp_is_a_violation(self, tmp_path: Path) -> None:
+        """Outside pytest tmp space means the suite writes somewhere that
+        outlives it — nothing GCs a directory pytest did not create.
+        """
+        outside = tmp_path / 'elsewhere'
+        reason = fleet_dir_redirect_violation_reason(
+            str(outside), tmp_path / 'basetemp',
+        )
+        assert reason is not None
+        # The RESOLVED spelling, which is what the message prints: pytest's
+        # tmp root can sit behind a symlink, and pinning the unresolved form
+        # would make this hostage to that rather than to the rule.
+        assert str(outside.resolve()) in reason
+
+    def test_the_live_fleet_dir_itself_is_a_violation(self, tmp_path: Path) -> None:
+        """Reported as THE LIVE DIR, not as the generic "outside basetemp" it
+        also is: most-specific-first, so the message names the actual hazard.
+        """
+        reason = fleet_dir_redirect_violation_reason(str(LIVE_FLEET_DIR), tmp_path)
+        assert reason is not None
+        assert 'CROSS-PROJECT' in reason
+
+    def test_a_path_inside_the_live_fleet_dir_is_a_violation(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subdirectory is still inside the cross-project rendezvous dir, and
+        a drain gate pointed there still writes into production state.
+        """
+        reason = fleet_dir_redirect_violation_reason(
+            str(LIVE_FLEET_DIR / 'sub'), tmp_path,
+        )
+        assert reason is not None
+        assert 'CROSS-PROJECT' in reason
+
+    def test_every_reason_names_the_remedy(self, tmp_path: Path) -> None:
+        """The remedy SYMBOL, not a ``<file>:<line>`` pointer (those went stale
+        inside the very commit series that wrote them).  Asserted for all three
+        branches at once so a new branch cannot ship without one.
+        """
+        for value in (None, str(LIVE_FLEET_DIR), str(tmp_path / 'elsewhere')):
+            reason = fleet_dir_redirect_violation_reason(value, tmp_path / 'basetemp')
+            assert reason is not None, value
+            assert '_df_fleet_dir_redirect' in reason, value
 
 
 class TestSyntheticHeartbeatsIn:
@@ -389,8 +477,34 @@ class TestSyntheticHeartbeatsIn:
     def test_it_ignores_non_json_files(self, tmp_path: Path) -> None:
         """A heartbeat is ``<unit>.json``; anything else in that directory is
         not one, and reporting it would send the reader after the wrong file.
+
+        Paired deliberately with the ``.json.tmp`` case below: the two suffix
+        rules are one decision, and pinning only the exclusion would let a
+        "tighten it back to a bare .json" edit pass.
         """
         (tmp_path / f'{synthetic_unit("reify")}.txt').write_text('')
+        assert synthetic_heartbeats_in(tmp_path) == []
+
+    def test_it_reports_the_atomic_writer_s_tmp_residue(self, tmp_path: Path) -> None:
+        """``write_heartbeat`` writes ``<unit>.json.tmp`` and then ``os.replace``s
+        it into place, so a writer KILLED between the two — the orphan/timeout
+        scenario task 3798 measured — leaves only the residue.  It is exactly as
+        attributable as the final file, and missing it would blind the guard to
+        the one leak shape this family's own hazard model predicts.
+        """
+        (tmp_path / f'{synthetic_unit("reify")}.json.tmp').write_text('{}')
+
+        assert synthetic_heartbeats_in(tmp_path) == [
+            f'{synthetic_unit("reify")}.json.tmp',
+        ]
+
+    def test_a_real_unit_s_tmp_residue_is_still_ignored(self, tmp_path: Path) -> None:
+        """The tmp suffix widens WHICH FILES count, never WHOSE.  A production
+        writer's own interrupted write is genuine production churn, and
+        reporting it would resurrect exactly the false-positive generator this
+        guard was reshaped to avoid.
+        """
+        (tmp_path / 'orchestrator-reify.service.json.tmp').write_text('{}')
         assert synthetic_heartbeats_in(tmp_path) == []
 
 
@@ -425,10 +539,173 @@ class TestLeakedFleetHeartbeatReason:
         assert str(LIVE_FLEET_DIR) in reason
 
 
-def test_no_stray_environment_assumptions() -> None:
-    """This module must not depend on the live box's env to be meaningful.
+class TestBothFixturesAreLiveInThisRun:
+    """The two fixtures are WIRED, not merely defined.
 
-    A canary: the tests above are all pure-function tests, so nothing here may
-    quietly start reading ``ORCH_FLEET_DIR`` and passing for the wrong reason.
+    Everything above tests pure functions against ``tmp_path`` dirs; all of it
+    would stay green if neither fixture were ever loaded by any conftest — the
+    ``# noqa: F401`` bindings in ``conftest.py`` and ``scripts/tests/conftest.py``
+    could be deleted and only this class would notice.  That is the difference
+    between a wired defence and a dead one, and a silently-dead guard is the
+    exact failure mode this whole task family exists to prevent.
+
+    The redirect has a second, independent liveness proof —
+    ``test_fleet_dir_is_redirected_away_from_the_live_checkout`` requests it BY
+    NAME — but its SHAPE does not: a function-scoped or non-autouse variant
+    would keep that test green while protecting nothing.  Shaped after
+    ``test_deploy_clock_isolation.py::TestGuardIsLiveInThisRun``.
     """
-    assert os.environ.get('ORCH_FLEET_DIR') != ''
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_exists(self, name: str) -> None:
+        assert hasattr(df_pytest_isolation, name), (
+            f'df_pytest_isolation defines no {name}; the pure helpers above '
+            'protect nothing on their own.'
+        )
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_is_session_scoped_and_autouse(self, name: str) -> None:
+        """Both properties pinned STRUCTURALLY, not inferred from behaviour.
+
+        Function scope would miss writes from module-/session-scoped fixtures,
+        which is where expensive subprocess setup tends to live, and would
+        re-point ``ORCH_FLEET_DIR`` at a fresh directory per test so a spawner
+        and its own teardown could disagree about where its heartbeats went.
+        Without ``autouse`` nothing would ever request either one.
+        """
+        marker = fixture_marker(getattr(df_pytest_isolation, name))
+
+        assert marker.scope == 'session', f'{name} scope is {marker.scope!r}'
+        assert marker.autouse is True, f'{name} must be autouse — nothing requests it'
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:
+        """The conftest binding is real WIRING, not a dormant definition.
+
+        pytest only collects fixtures bound into a conftest's namespace, which is
+        why this module's fixtures are imported there under
+        ``# noqa: F401 — the binding IS the wiring``.  Deleting that import
+        breaks nothing visible except this assertion.
+        """
+        try:
+            request.getfixturevalue(name)
+        except pytest.FixtureLookupError:
+            pytest.fail(
+                f'{name} is not registered for this rootdir. Wire the test-root '
+                'conftest to import it from df_pytest_isolation '
+                '(`# noqa: F401 — the binding IS the wiring`); without that, this '
+                'whole suite runs with no live-fleet defence.',
+                pytrace=False,
+            )
+
+
+# ---------------------------------------------------------------------------
+# The leak guard's FAILURE contract, exercised through a real nested pytest run.
+#
+# Everything above pins the helpers, the markers and the registration; none of it
+# pins what a violation actually DOES to the run. A refactor that warned instead
+# of failing, or moved the check into a fixture nobody requests, would leave every
+# test in this file green while the defence emitted nothing an exit code could
+# carry. Only a nested run can observe "the process exits non-zero even though
+# every test passed", because a fixture cannot fail its own session.
+#
+# The nested session's LIVE_FLEET_DIR is repointed at its own tmp tree, so this
+# never reads or writes the real directory — a test that touched it would BE the
+# defect under guard.
+# ---------------------------------------------------------------------------
+
+# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
+# without it pytest walks up looking for an inifile and would inherit this repo's
+# addopts (`--import-mode=importlib -m 'not smoke ...'`).
+_NESTED_INI = '[pytest]\n'
+
+# The name a leaked fixture heartbeat would carry. Built with the real builder,
+# so a change to SYNTHETIC_UNIT_PREFIX moves the nested harness with it.
+_NESTED_HEARTBEAT = f'{synthetic_unit("nested")}.json'
+
+_NESTED_CONFTEST = f'''\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import df_pytest_isolation
+
+# Repoint the guard at THIS tmp tree before binding it. The fixture reads the
+# module global at call time, so this is what keeps the nested run away from the
+# real machine-global fleet directory.
+df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'
+df_pytest_isolation.LIVE_FLEET_DIR.mkdir(parents=True, exist_ok=True)
+
+from df_pytest_isolation import {_GUARD_NAME}  # noqa: F401
+'''
+
+
+def _nested_test_source(*, leaks: bool) -> str:
+    """Source for the nested test module — which PASSES either way."""
+    body = (
+        (
+            "    fleet = Path(__file__).resolve().parent / 'fleet'\n"
+            f'    (fleet / {_NESTED_HEARTBEAT!r}).write_text("{{}}")\n'
+        )
+        if leaks
+        else '    pass\n'
+    )
+    return (
+        'from pathlib import Path\n'
+        '\n'
+        '\n'
+        'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is to machine-global state, not to this result."""\n'
+        + body
+    )
+
+
+def _nested_run(tmp_path: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp tree."""
+    root = tmp_path / ('leaking' if leaks else 'clean')
+    root.mkdir()
+    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
+    (root / 'pytest.ini').write_text(_NESTED_INI)
+    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
+    (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
+    return subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+
+
+class TestTheGuardFailsTheRunEndToEnd:
+    """A leak must cost the RUN, not merely log something."""
+
+    def test_a_leaked_heartbeat_fails_a_session_whose_tests_all_passed(
+        self, tmp_path: Path,
+    ) -> None:
+        result = _nested_run(tmp_path, leaks=True)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a run that leaked a synthetic heartbeat into the fleet dir exited 0 '
+            f'— the guard is inert. stdout={result.stdout!r}'
+        )
+        assert '1 passed' in combined, (
+            'the nested TEST must still pass, or this proves nothing about a '
+            f'green suite being caught. output={combined!r}'
+        )
+        # The LEAKED FILENAME, which is DATA the guard was handed — not a phrase
+        # from its prose, which it stays free to improve.
+        assert _NESTED_HEARTBEAT in combined, combined
+
+    def test_the_same_harness_without_the_leak_exits_zero(self, tmp_path: Path) -> None:
+        """Non-vacuity control: the identical nested tree, minus the write.
+
+        Without it the failure above could be any nested-harness breakage — a bad
+        ini, an unimportable module, a missing pytest.
+        """
+        result = _nested_run(tmp_path, leaks=False)
+
+        assert result.returncode == 0, (
+            f'the control run failed for an unrelated reason: '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert _NESTED_HEARTBEAT not in result.stdout
