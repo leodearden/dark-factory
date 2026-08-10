@@ -167,3 +167,17 @@ class TestFilingDispatchExtraction:
     )
     def test_non_refs_yield_nothing(self, text):
         assert _extract(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'the follow-up will be filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+            'the follow-up is supposed to be filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+            'the follow-up has not been filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+        ],
+    )
+    def test_filing_negation_and_aspiration_yields_nothing(self, text):
+        """The imported strippers have no arm for the filing vocabulary, so the
+        supplementary ones must cover it — otherwise the negation hole the
+        strippers exist to close reopens for exactly the new family."""
+        assert _extract(text) == []

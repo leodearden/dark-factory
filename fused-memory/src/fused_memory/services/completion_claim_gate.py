@@ -58,6 +58,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'APPLIED_WORK_RE',
+    'COMMIT_REF_RE',
+    'FILING_DISPATCH_RE',
+    'TICKET_REF_RE',
     'CompletionClaim',
     'extract_completion_claims',
 ]
@@ -92,6 +95,50 @@ _APPLIED_ANY_FORM: str = (
     r'appl(?:y|ied|ies|ying)|patch(?:ed|es|ing)?|deploy(?:ed|s|ing)?'
 )
 
+# The esc-3085-1 scope extension: a claim that work was FILED/DISPATCHED
+# somewhere ("re-filed into dark_factory's tree as ticket tkt_...") is the same
+# failure shape as a claim that it landed — it asserts a durable artefact
+# exists, and the incident's artefact did not.
+#
+# Unlike the applied family these verbs match BARE, with no copula guard.
+# Instance (2)'s own wording forces it: "...and re-filed into ..." has no
+# copula before the verb. The looser guard is affordable here because a filing
+# claim still needs a concrete ref in the same clause to become a claim at all,
+# and "task N filed <ticket>" is a filing claim about that ticket either way —
+# the transitive reading that motivates task_filter's copula guard for
+# applied/resolved does not produce a WRONG subject here.
+_FILING_ANY_FORM: str = (
+    r're[-\s]?fil(?:e|ed|es|ing)|fil(?:e|ed|es|ing)|submit(?:ted|s|ting)?|'
+    r'queu(?:e|ed|es|ing)|dispatch(?:ed|es|ing)?|cancel(?:l?ed|s|l?ing)?|'
+    r'clos(?:e|ed|es|ing)'
+)
+
+FILING_DISPATCH_RE: re.Pattern[str] = re.compile(
+    r'\b(?:'
+    r're[-\s]?filed|filed|submitted|queued|dispatched|cancell?ed|'
+    # "closed as <state>" only — a bare "closed" describes non-task things far
+    # too often (task_filter drops it from TERMINAL_OUTCOME_RE for exactly this
+    # reason), and the "as" is what marks a dispatch outcome.
+    r'closed\s+as'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# `tkt_` + the 26-char Crockford-base32 body minted by
+# ticket_store._new_ticket_id. The bounded body length is load-bearing: it is
+# what makes a bare "filed as ticket tkt_" (no id) produce no claim rather than
+# a claim about an empty ref that no authority could ever resolve.
+TICKET_REF_RE: re.Pattern[str] = re.compile(r'(\btkt_[0-9A-Za-z]{20,32}\b)')
+
+# A commit sha is 7-40 hex chars — a shape that ordinary English words hit by
+# accident ("deadbeef", "added", "facade"). An explicit commit/sha cue is
+# therefore REQUIRED, so a hex-looking word is never mistaken for a sha and
+# sent to a git probe.
+COMMIT_REF_RE: re.Pattern[str] = re.compile(
+    r'\b(?:commit|sha|merge[-\s]commit)\b\s*[:=]?\s*[`\'"]?([0-9a-f]{7,40})\b',
+    re.IGNORECASE,
+)
+
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
     # bare past-tense/participle completion words that read as a completion of
@@ -104,23 +151,26 @@ APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Supplementary strippers: the delta vocabulary above, in the SAME shape as the
-# task_filter originals (each swallows the verb it governs, so removing the span
-# removes the completion evidence). The modal/filler prefixes are copied from
-# FUTURE_ASPIRATIONAL_RE deliberately — a narrower prefix here would leave
-# "task N's fix is supposed to be applied next week" reading as a completion.
-_NEGATED_APPLIED_RE: re.Pattern[str] = re.compile(
+# Supplementary strippers: the delta vocabulary above (BOTH families), in the
+# SAME shape as the task_filter originals (each swallows the verb it governs, so
+# removing the span removes the completion evidence). The modal/filler prefixes
+# are copied from FUTURE_ASPIRATIONAL_RE deliberately — a narrower prefix here
+# would leave "the follow-up is supposed to be filed as tkt_X next week" reading
+# as an accomplished filing.
+_EXTENSION_ANY_FORM: str = _APPLIED_ANY_FORM + r'|' + _FILING_ANY_FORM
+
+_NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
     r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
-    r'(?:' + _APPLIED_ANY_FORM + r')\b',
+    r'(?:' + _EXTENSION_ANY_FORM + r')\b',
     re.IGNORECASE,
 )
-_ASPIRATIONAL_APPLIED_RE: re.Pattern[str] = re.compile(
+_ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
     r'\b(?:will|going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
     r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
     r'supposed\s+to|needs?\s+to|to\s+be|should|would|shall)\b'
     r'(?:\s+(?:be|been|get|soon|also|now|already|just|then|finally|'
     r'eventually|not|yet|still)){0,3}'
-    r'\s+(?:' + _APPLIED_ANY_FORM + r')\b',
+    r'\s+(?:' + _EXTENSION_ANY_FORM + r')\b',
     re.IGNORECASE,
 )
 
@@ -152,9 +202,9 @@ def _strip_exemptions(clause: str) -> str:
     preserved, which is why refs are extracted from the ORIGINAL clause.
     """
     de_exempted = NEGATED_TERMINAL_RE.sub(' ', clause)
-    de_exempted = _NEGATED_APPLIED_RE.sub(' ', de_exempted)
+    de_exempted = _NEGATED_EXTENSION_RE.sub(' ', de_exempted)
     de_exempted = FUTURE_ASPIRATIONAL_RE.sub(' ', de_exempted)
-    return _ASPIRATIONAL_APPLIED_RE.sub(' ', de_exempted)
+    return _ASPIRATIONAL_EXTENSION_RE.sub(' ', de_exempted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,26 +266,60 @@ def extract_completion_claims(
 
     for clause, offset in _iter_clauses(text):
         de_exempted = _strip_exemptions(clause)
-        if not APPLIED_WORK_RE.search(de_exempted):
+        if APPLIED_WORK_RE.search(de_exempted):
+            kind: ClaimKind = 'applied_work'
+        elif FILING_DISPATCH_RE.search(de_exempted):
+            kind = 'filing_dispatch'
+        else:
+            continue
+
+        subject, refs = _refs_in_clause(clause)
+        if subject is None:
             continue
 
         span = (offset, offset + len(clause))
-        for ref in _ordered_unique(TASK_REF_RE.findall(clause)):
-            key = ('applied_work', 'task', ref, default_project_id)
+        # A ticket id is a globally unique primary key in one shared
+        # tickets.db, so a ticket claim carries no project at all — that is
+        # precisely what let instance (2) (a reify writer claiming a
+        # dark_factory ticket) be adjudicated correctly.
+        project_id = None if subject == 'ticket' else default_project_id
+        for ref in refs:
+            key = (kind, subject, ref, project_id)
             if key in seen:
                 continue
             seen.add(key)
             claims.append(
                 CompletionClaim(
-                    kind='applied_work',
-                    subject='task',
+                    kind=kind,
+                    subject=subject,
                     ref=ref,
-                    project_id=default_project_id,
+                    project_id=project_id,
                     span=span,
                 )
             )
 
     return claims
+
+
+def _refs_in_clause(clause: str) -> tuple[ClaimSubject | None, list[str]]:
+    """Return the MOST SPECIFIC ref family named in *clause*.
+
+    Precedence is ticket > commit > task, and it is deliberately exclusive: a
+    clause naming both ("task 5638 ... re-filed as ticket tkt_X") is one claim
+    about the ticket, not two. The most specific ref is the one the claim is
+    actually asserting into existence, and it is checked against the cheapest,
+    most exact authority — a primary-key lookup rather than a status read.
+    """
+    tickets = _ordered_unique(TICKET_REF_RE.findall(clause))
+    if tickets:
+        return 'ticket', tickets
+    commits = _ordered_unique(COMMIT_REF_RE.findall(clause))
+    if commits:
+        return 'commit', commits
+    tasks = _ordered_unique(TASK_REF_RE.findall(clause))
+    if tasks:
+        return 'task', tasks
+    return None, []
 
 
 def _ordered_unique(values: list[str]) -> list[str]:
