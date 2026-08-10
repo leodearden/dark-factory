@@ -94,7 +94,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -105,6 +105,7 @@ __all__ = [
     'LeaveReason',
     'Observation',
     'RecoverySite',
+    'RecoverySweepTally',
     'RecoveryVetoStreakTracker',
     'build_recovery_payload',
     'emit_recovery_event',
@@ -865,3 +866,74 @@ def resolve_recovery_veto_streak_escalation(
         '%d-observation streak broke', task_id, recovered_streak,
     )
     return True
+
+
+@dataclass
+class RecoverySweepTally:
+    """One reconcile pass's aggregate recovery picture.
+
+    Feeds the sweep summary log line, which is the PER-SWEEP half of this
+    mechanism's cadence: :func:`should_emit_event` deliberately keeps the event
+    store quiet for an unchanged hold (INV-4), so without this line a fleet in
+    which every candidate is held would produce neither an event row nor a
+    journal line after the first sweep.  One aggregate line per sweep costs a
+    fraction of one row per task per tick and is what an operator actually
+    reads.
+
+    Deliberately a plain value object passed DOWN as an optional keyword rather
+    than hidden mutable harness state: the accumulator is then testable on its
+    own, and every existing caller of the per-task reconciler keeps working
+    untouched.
+
+    ``held`` counts vetoes (a record actively held something back); ``left``
+    counts non-veto fall-throughs, keyed by reason.  Same discriminator as the
+    ``recovery_vetoed`` / ``recovery_left`` event types, so the line and the
+    rows can be read against each other.
+    """
+
+    held: int = 0
+    #: The ids that did the holding, de-duplicated, in first-seen order.
+    pinning_ids: list[str] = field(default_factory=list)
+    #: LeaveReason spelling -> count, for every NON-veto fall-through.
+    left: dict[str, int] = field(default_factory=dict)
+    #: Dispositions that went ahead UNCHANGED while the store was unreadable.
+    store_unavailable: int = 0
+
+    def record(
+        self,
+        reason: LeaveReason | str | None,
+        escalation_ids: Any = (),
+    ) -> None:
+        """Fold one held/left task into the tally."""
+        if reason is None:
+            return
+        if str(reason) == LeaveReason.escalation_pinned:
+            self.held += 1
+            for esc_id in _flatten_ids(escalation_ids):
+                if esc_id not in self.pinning_ids:
+                    self.pinning_ids.append(esc_id)
+            return
+        key = str(reason)
+        self.left[key] = self.left.get(key, 0) + 1
+
+    def record_store_unavailable(self) -> None:
+        """Note a disposition taken on an unreadable store.
+
+        Counted only where the sweep ACTED anyway — a store-unavailable LEAVE
+        already appears under ``left``, and counting it twice would overstate
+        how often the fleet decided on incomplete information.
+        """
+        self.store_unavailable += 1
+
+    def render(self) -> str:
+        """The operator-facing fragment appended to the sweep summary."""
+        held = f'held={self.held}'
+        if self.pinning_ids:
+            held += f' ({", ".join(self.pinning_ids)})'
+        left = f'left={sum(self.left.values())}'
+        if self.left:
+            breakdown = ', '.join(
+                f'{reason}={count}' for reason, count in sorted(self.left.items())
+            )
+            left += f' ({breakdown})'
+        return f'{held}; {left}; store-unavailable={self.store_unavailable}'

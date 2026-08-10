@@ -94,6 +94,7 @@ from orchestrator.recovery_emission import (
     LeaveReason,
     Observation,
     RecoverySite,
+    RecoverySweepTally,
     RecoveryVetoStreakTracker,
     build_recovery_payload,
     emit_recovery_event,
@@ -4865,6 +4866,9 @@ class Harness:
         reverted = 0
         marked_done = 0
         stale_conflicts = 0
+        # One tally per PASS (task 3535) — see RecoverySweepTally for why the
+        # summary below is no longer gated on something having moved.
+        tally = RecoverySweepTally()
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
         if resolver_failed(statuses, err):
             if err is not None:
@@ -4911,7 +4915,7 @@ class Harness:
 
             try:
                 outcome = await self._reconcile_one_stranded(
-                    tid, status, mid_run=mid_run,
+                    tid, status, mid_run=mid_run, tally=tally,
                 )
             except SetTaskStatusRejected as exc:
                 # Persistence layer refused our write — escalate directly
@@ -4947,13 +4951,22 @@ class Harness:
                 # reverted+marked_done "changed" total below.
                 stale_conflicts += 1
 
-        if reverted or marked_done or stale_conflicts:
-            logger.info(
-                '%s: %d stranded task(s) reverted to pending; '
-                '%d marked done (branch already on main); '
-                '%d held on provenance conflict (done_evidence_stale)',
-                log_prefix, reverted, marked_done, stale_conflicts,
-            )
+        # UNCONDITIONAL (task 3535, part 2).  This used to be gated on
+        # `if reverted or marked_done or stale_conflicts`, so the one sweep
+        # shape an operator most needs to see — every candidate vetoed, nothing
+        # moved — was the one shape that left no journal line at all.  The three
+        # legacy counters keep their wording verbatim (existing greps depend on
+        # it); the tally is APPENDED.  INFO, not WARNING: a quiet fleet
+        # reporting held=0 left=0 is not an incident.
+        logger.info(
+            '%s: %d stranded task(s) reverted to pending; '
+            '%d marked done (branch already on main); '
+            '%d held on provenance conflict (done_evidence_stale); %s',
+            log_prefix, reverted, marked_done, stale_conflicts, tally.render(),
+        )
+        # Deliberately NOT `+ tally.held`: the caller uses this to decide
+        # whether the main loop keeps running, and counting holds as progress
+        # would make a fully-stuck fleet look busy forever.
         return reverted + marked_done
 
     def _resolve_task_worktree(self, tid: str) -> Path:
@@ -5395,6 +5408,7 @@ class Harness:
 
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
+        tally: RecoverySweepTally | None = None,
     ) -> str | None:
         """Reconcile a single stranded task. Returns 'marked_done', 'reverted', or None.
 
@@ -5544,8 +5558,16 @@ class Harness:
                 shape=recovery_shape_str(report),
                 records=report.open_escalations,
                 store_unavailable=report.escalation_store_unavailable,
+                tally=tally,
             )
             emitted_recovery = True
+        elif tally is not None and report.escalation_store_unavailable:
+            # The sweep ACTED while the store was unreadable — the disposition
+            # is unchanged (the flag is deliberately not folded into _shape),
+            # but an operator should be able to see that a pass decided on
+            # incomplete information.  A store-unavailable LEAVE is already
+            # counted under `left`, hence the elif rather than a second fold.
+            tally.record_store_unavailable()
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
             # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
@@ -9559,6 +9581,7 @@ class Harness:
         shape: str,
         records: Sequence[EscalationRef] | None = None,
         store_unavailable: bool = False,
+        tally: RecoverySweepTally | None = None,
     ) -> Observation | None:
         """DESCRIBE one already-reached recovery disposition — never change it.
 
@@ -9588,10 +9611,18 @@ class Harness:
         try/except: telemetry must never be able to disturb a recovery sweep.
         """
         try:
+            if reason is None or reason is LeaveReason.live_claimant:
+                return None
+
+            # The per-sweep TALLY is folded BEFORE the kill switch: the summary
+            # log line and the event rows serve different audiences, and
+            # silencing a noisy event detector must not also blind the sweep's
+            # own operational line.
+            if tally is not None:
+                tally.record(reason, records or ())
+
             cfg = getattr(self.config, 'recovery_emission', None)
             if cfg is None or not cfg.enabled:
-                return None
-            if reason is None or reason is LeaveReason.live_claimant:
                 return None
 
             # getattr-tolerant: several narrow-scope test harnesses build a

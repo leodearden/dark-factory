@@ -2941,7 +2941,10 @@ async def test_mid_run_live_claimant_not_shortcut_by_driver_guard(harness: Harne
 
     changed = await harness._reconcile_stranded_in_progress(mid_run=True)
 
-    spy.assert_awaited_once_with('70', 'in-progress', mid_run=True)
+    # tally=ANY: task 3535 threads an OPTIONAL per-pass accumulator down to
+    # the per-task reconciler.  This assertion is about the driver NOT
+    # short-circuiting a live-claimant task, not about the accumulator.
+    spy.assert_awaited_once_with('70', 'in-progress', mid_run=True, tally=ANY)
     assert changed == 0
     harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
@@ -4177,14 +4180,13 @@ class TestWithheldTrainMemberHasRecoveryEdge:
 # would drift, and this suite asserts against the same shapes that one does.
 # ---------------------------------------------------------------------------
 
+from shared.deploy_state import DeployPhase  # noqa: E402
 from test_recovery_emission_wiring import (  # noqa: E402
     _bind_reports,
     _live_claimant,
     _ref,
     _report,
 )
-
-from shared.deploy_state import DeployPhase  # noqa: E402
 
 from orchestrator.config import RecoveryEmissionConfig  # noqa: E402
 from orchestrator.task_ground_truth import BranchStateKind  # noqa: E402
