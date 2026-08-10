@@ -43,6 +43,80 @@ not counted as G1 consumers of anything here.
 >     decisions) — so someone or something else brought it in line first. No follow-up task is filed
 >     for this: the fix a follow-up would have requested is already done.
 
+> **Amendment 2026-08-10 (task 3804)** — **the LLM candidate slate is THREE arms, not four.**
+> Leo dropped **Mistral-Small-3.2-24B** on 2026-08-06 (esc-3713-10, follow-up from task 3713/LME-α)
+> after live measurement proved it unservable on this host. `scripts/local-model-serving/arms.yaml`
+> is the **authoritative slate**; this PRD is the narrative record of it. Remaining arms: Qwen3.5-9B,
+> Phi-4 14B, and the MoE stretch arm (Gemma-4-26B-A4B-it QAT).
+>
+> **Consequence, stated at the top so it cannot be missed:** η's screening funnel narrows
+> **3 → at most 3**, so the **≤3 cap's selectivity is exactly nil** — three candidates against a cap
+> of three eliminate nobody by ranking. The funnel's **absolute gates remain fully live** and can
+> still drop arms (conformance smoke, VRAM fit under the measured ~16.4 GiB, Phi-4's 16K context
+> fit, ζ's throughput floor), so η may still return fewer than three survivors — it just can no
+> longer return fewer *because of the cap*. **Whether that warrants re-opening the slate is Leo's
+> call: surfaced here, deliberately not decided.** See the consequence note at the candidate slate.
+>
+> **Single-sourcing, so a future slate change is a two-site edit and not a six-site one:** the
+> canonical statements of the three-arm slate and its funnel consequence are exactly **two** — this
+> banner and the consequence note at the candidate slate. Every other site in this document (the
+> approach sketch, D6, the Contract survivor-rule constraint, η's decomposition row) now
+> **cross-references** them rather than restating them, and carries only what is locally its own (a
+> count, or a MUST addressed to ζ). If Leo re-opens the slate, edit those two places. Tasks 3719 and
+> 3720 hold their own copies out of necessity — a task record cannot cross-reference a file section —
+> and are listed under the dispositions below, which is where a future editor should look for them.
+>
+> Applied corrections (2026-08-10, task 3804) — all in `plans/`, documentation/record only:
+> - **This PRD**: the candidate-slate table (Mistral row struck through and annotated, **kept** as
+>   evidence of what was commissioned, plus a footnote closing the already-fixed quant defect and
+>   stating the re-admission condition); the funnel prose in §Sketch of approach; D6; D10's
+>   Consequence bullet (arm count corrected, and the surviving `~6, ~9` estimates **marked stale —
+>   not refreshed**, which stays task 3973's pass); the Contract §Pre-registration clause
+>   constraining ζ's survivor rule; α's and η's rows in the decomposition plan; the research appendix.
+> - **`plans/local-memory-models-eval-prd.capability-manifest.md`** — η's `All four arms servable …
+>   PASS` row: that verdict was **falsified** by α's own gate (one arm proved unservable), and the
+>   row now says so rather than being quietly renumbered.
+> - **`plans/local-memory-models-eval-prd.capability-manifest.yaml`** — η's `title:` realigned to
+>   task 3720's live title; `task_id`, `capabilities`, `binding`, `verdict` and every
+>   `delivered_check` left byte-identical (machine-consumed contracts).
+>
+> Cross-check dispositions (whole 3713–3725 batch re-read at correction time; each states what was
+> actually checked):
+> - Task 3719 (LME-ζ, pending) — **corrected**: the two four-arm sentences in its reasoning-mode
+>   block fixed, and the three-arm constraint on the survivor rule appended to its item 4. Its
+>   "gemma-4 extracts all four **probe entities**" / "finds all four **entities**" sentences count
+>   probe entities, not arms, and were deliberately left byte-identical.
+> - Task 3720 (LME-η, pending) — **already correct**, no edit; its description already carries the
+>   drop and the selectivity flag.
+> - Task 3721 (LME-θ, pending) — **checked, clean**: zero four-arm or Mistral assertions.
+> - Task 3722 (LME-ι, pending) — its "all four" counts the four **embedding** arms, which this
+>   LLM-axis ruling does not touch; that sentence was **correctly left alone**. A *different* defect
+>   in the same record **was** fixed: its pointer `(PRD line 136)` for the qwen3-embedding-4b
+>   batch-job constraint. That pointer was **correct when authored** — at `0cf6de56ac` (2026-08-05)
+>   line 136 was exactly the Qwen3-Embedding-4B row — and was already broken by task 3748's banner on
+>   2026-08-06 (it landed on a table separator, then on prose); this amendment's banner pushed it
+>   further, onto an unrelated `SEMAPHORE_LIMIT` paragraph. Replaced with the stable locator
+>   "PRD §Candidate slate, the Qwen3-Embedding-4B row"; the rest of that description was verified
+>   **byte-identical** afterwards, including its `PRD-MARKER:` delivered-check string. This is the
+>   same defect class as task 3973's item 2 (arms.yaml's "line 127" pointer) and the same lesson task
+>   3748 learned when it rejected a README heading as a pin — fixed at source here rather than
+>   deferred, since it is a one-field edit.
+> - Tasks 3715 (β), 3716 (γ), 3717 (δ), 3718 (ε), 3723 (λ), 3725 (μ) — **checked, clean**.
+> - Task 3713 (LME-α, `done`) — **deliberately NOT edited.** Its enumeration of the original four
+>   dense arms is the historical record of what α was commissioned to serve — the same evidence
+>   argument that keeps the struck-through table row, and the same disposition task 3748 took.
+>
+> Known-remaining drift, named so it is not mistaken for an oversight: the **"Est. VRAM" column is
+> stale** against arms.yaml's measured figures (Qwen3.5-9B listed ~6GB, **measured 11.21 GiB**) —
+> marked inline at both points of use (the arm table and D10's Consequence bullet) so the deferral is
+> visible where the number is read, not only here. That is the 3748 drift class, not slate
+> composition; out of scope here and filed as **task 3973** (from ticket
+> `tkt_0RS9PDHN212E4G1ZW924MMCV75`). Cite the **task** id: it resolves via `get_task` like every other
+> task reference in this document, whereas a `tkt_` id is a `submit_task` receipt that may resolve to
+> `combined` under a different id and is not addressable. Task 3973 is **wired to depend on this
+> task** (`dependencies: [3804]`, added 2026-08-10), so that sequencing is enforced by the scheduler
+> rather than only asserted in prose.
+
 ## Goal
 
 Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
@@ -121,10 +195,12 @@ Two eval axes, strictly isolated, all replay on **throwaway scratch graphs** (ne
 funnel-shaped to keep Leo's full candidate slate affordable:
 
 **LLM axis** (embedder held fixed at the incumbent): replay a committed episode corpus per arm
-through the real `GraphitiBackend` construction path onto scratch graphs. Funnel: all four
-candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
+through the real `GraphitiBackend` construction path onto scratch graphs. Funnel: all three
+remaining candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
 whisper-writer, prompt-length fit, throughput floor); at most three advance to **full corpus
-replay** under realistic concurrency on the busy box. Client-class parity: **every** arm — incumbent
+replay** under realistic concurrency on the busy box (was four candidates — Mistral-Small-3.2-24B
+was dropped 2026-08-06; what the narrowing does to the cap is stated once, at the consequence note
+at the candidate slate). Client-class parity: **every** arm — incumbent
 included — runs via `OpenAIGenericClient`, and a one-off control quantifies the
 `OpenAIClient → OpenAIGenericClient` delta on the incumbent itself, so the client-class change is
 measured, not confounded.
@@ -158,9 +234,51 @@ llama.cpp only, see hazard):
 | Arm | Size / quant | Est. VRAM | Basis (cited in research appendix) |
 |---|---|---|---|
 | Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
-| Mistral-Small-3.2-24B | dense, AWQ | ~14GB | mature quant ecosystem; release targeted stronger function calling |
+| ~~Mistral-Small-3.2-24B~~ **DROPPED 2026-08-06** | ~~dense, AWQ~~ | ~~`~14GB`~~ | **Dropped by α after live measurement (Leo's ruling, esc-3713-10): a vision-language model whose quantized repo's tokenizer encodes vLLM's startup `[IMG]` probe to zero image tokens against a text count of one, so the engine never reaches weight loading.** Original basis: mature quant ecosystem; release targeted stronger function calling |
 | Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
 | MoE stretch: ~~Qwen3.6-35B-A3B or~~ **Gemma-4-26B-A4B-it (QAT)** | ~~GGUF IQ4/Q4~~ **`UD-Q4_K_XL`** | ~~≈17GB (Qwen IQ4 — real, but 16.51 GiB of weights before KV, so it does not fit the measured 16.4 GiB)~~ → **13.27 GiB, fits** (α step 22, Open Q3; `task/3713` @ `a161c2858b`, not yet on `main`) | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
+
+*Reading the **Est. VRAM** column: those are 2026-08-05 research-time **estimates**, and at least one
+is stale against measured reality — Qwen3.5-9B is listed `~6GB` here, but
+`scripts/local-model-serving/arms.yaml` records a **measured 11.21 GiB** (vLLM-reported, 2026-08-06).
+Refreshing this column is **task 3973**, sequenced after this correction (it depends on 3804); this
+pass deliberately corrected only slate composition, so read every figure in the column as an
+estimate, not a measurement.*
+
+The struck-through row above is **kept** rather than deleted: it is the record of what was
+commissioned, and deleting it would erase the fact that the slate narrowed. Two facts about the
+dropped arm, so no reader re-litigates a closed defect (authoritative record:
+`scripts/local-model-serving/arms.yaml`, the `mistral-small-3.2-24b — DROPPED FROM THE SLATE`
+block):
+
+- *The declared quant was wrong, and that defect is **fixed and verified**, separately.* `awq` →
+  `compressed-tensors`, read from the downloaded weights' own `config.json`; vLLM 0.26 then accepted
+  the model and resolved `max_model_len` 16384. The arm still never reached weight loading, for the
+  unrelated tokenizer reason above — the card never moved (7212 → 7221 MiB). Do not reopen the quant
+  question; it is closed.
+- *Re-admission needs a different quantized repo (or an upstream tokenizer fix) — **not** a flag that
+  suppresses the multimodal path.* Suppressing it would mean the eval measured a model configured
+  differently from the one this PRD costed.
+
+> **Consequence for η's screening funnel — the LLM slate is THREE arms, not four.** The remaining
+> arms are **Qwen3.5-9B**, **Phi-4 14B**, and the **MoE stretch arm (Gemma-4-26B-A4B-it QAT)**.
+> Two things follow, and both matter for reading η's report:
+>
+> 1. **The ≤3 cap's selectivity is now exactly nil.** The funnel narrows 3 → at most 3: three
+>    candidates against a cap of three can eliminate nobody *by ranking*. The cap no longer binds.
+> 2. **The funnel's absolute gates remain fully live and can still drop arms** — schema-conformance
+>    smoke, VRAM fit under the measured ~16.4 GiB (D10), Phi-4's 16K context fit (Open Q2 already
+>    reserves "drop the arm if it doesn't fit with margin"), and ζ's pre-registered throughput
+>    floor. So η may still legitimately return **fewer than three** survivors; it just can no longer
+>    return fewer *because of the cap*. Do not read "3 → at most 3" as "everything survives by
+>    construction".
+>
+> **Whether the nil cap selectivity warrants re-opening the slate — a different Mistral quant repo,
+> or another candidate entirely — is Leo's call. It is surfaced here and deliberately not decided.**
+> One fact bearing on that call, stated as a fact and **not** as a recommendation: this PRD's own
+> research appendix already named **gpt-oss-20b** as the reserve, "screened out only if slate must
+> shrink". The slate has now shrunk, so that pre-existing conditional has **fired**. Naming it is
+> surfacing, not selecting; no replacement candidate is chosen anywhere in this correction.
 
 Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
 incumbent `text-embedding-3-small` runs as its own arm):
@@ -190,7 +308,9 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
    LLM involved.
 5. **Two retrieval configurations** on the embedding axis; *with-indices is primary* (future prod);
    the current-prod embedding-only configuration is reported alongside, with the confound stated.
-6. **Funnel**: LLM axis screens all 4, replays ≤3. Embedding axis runs all arms in full.
+6. **Funnel**: LLM axis screens all 3 (was 4 — Mistral-Small-3.2-24B dropped 2026-08-06), replays
+   ≤3; for what the narrowed slate does to the cap's selectivity see the consequence note at the
+   candidate slate (canonical — not restated here). Embedding axis runs all arms in full.
 7. **Dims are a free variable**: the backfill is forced regardless, so candidates are compared at
    their native/MRL-best dims, not forced to 1536. (Mixed dims break cosine — but cutover atomicity
    is the follow-up PRD's problem; this eval only quantifies re-embed throughput to inform it.)
@@ -215,9 +335,15 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
     - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
       it implies is corrected.
     - **Consequence** (not a decision — see Open Q3): on a **weights-only** basis — the same basis
-      that disqualifies the MoE arm below — the three dense LLM arms (~6, ~9, ~14 GiB) and all
+      that disqualifies the MoE arm below — the two remaining dense LLM arms (~6, ~9 GiB — the
+      ~14 GiB Mistral-Small-3.2-24B arm was dropped 2026-08-06, see the candidate slate) and all
       embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
-      Qwen3.6-35B-A3B at IQ4) does not. **Runtime fit is stricter and separate**: vLLM's paged KV
+      Qwen3.6-35B-A3B at IQ4) does not. **Caveat on the `~6, ~9` figures, marked here at the point of
+      use:** they are the 2026-08-05 research-time estimates, and the `~6` is known-wrong —
+      arms.yaml records Qwen3.5-9B at a **measured 11.21 GiB**, ~5 GiB above the estimate this
+      sentence's "fits" conclusion leans on. Refreshing the Est. VRAM figures is **task 3973**'s pass,
+      deliberately not this one's (both would edit this paragraph); until it lands, treat the
+      conclusion as resting on stale inputs. **Runtime fit is stricter and separate**: vLLM's paged KV
       cache can balloon well past the weights figure (α's README, `RESOLVED alongside: the pooling
       arms' KV balloon` — a 0.6B embedding arm declared at 2.0 GiB weights measured 16.2 GiB resident
       before `--kv-cache-memory` / `_memory_share_for` bounded it), so "fits" for the dense arms is
@@ -309,6 +435,14 @@ artifacts (e.g. margin_m = max(2·σ_control(m), floor_m) with each floor justif
 per-metric pass/fail direction, the latency envelope (p95 < 120s with stated headroom factor), the
 decision rule per axis, and the survivor rule for the screening funnel. Candidate-arm artifacts
 missing a matching `preregistration_sha` are invalid by schema.
+**Constraint on that survivor rule (authored 2026-08-10, task 3804; per Leo's 2026-08-06 drop
+ruling — the ruling date and the authoring date are different and are kept apart deliberately):** it
+MUST be authored against the **three-arm** LLM slate (authoritative:
+`scripts/local-model-serving/arms.yaml`; for what the narrowing does to the cap, see the consequence
+note at the candidate slate — not restated here), MUST NOT presume a 4 → 3 narrowing, and MUST state
+explicitly whether the ≤3 cap binds at all given three candidates — so η reports a substantive result
+rather than a vacuous "all candidates survived". This constrains *how* ζ writes the rule; it does not
+pre-empt *what* the rule says.
 
 **Failure/storm rule (INV-4)**: the replay engine aborts an arm run after 5 consecutive item
 failures with a structured error record (arm, item ids, error class) — no silent absorb-and-continue;
@@ -337,13 +471,13 @@ manifest at decompose time.
 
 | # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: α resolved the verdict's subject in favour of arm-footprint-vs-free (esc-3713-6, step 23), pinned to `task/3713` @ `b3745f5a5c` — not yet on `main`, so confirm against the branch tip and α's README when judging this signal. | — |
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: α resolved the verdict's subject in favour of arm-footprint-vs-free (esc-3713-6, step 23), pinned to `task/3713` @ `b3745f5a5c` — not yet on `main`, so confirm against the branch tip and α's README when judging this signal. NOTE: α also **dropped the Mistral-Small-3.2-24B arm** on live measurement (Leo, 2026-08-06, esc-3713-10) — the substrate refused an arm it cannot serve, before the eval could attribute numbers to it; see the candidate slate. | — |
 | **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
 | **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
 | **ε** | Arm-runner harness: ArmSpec + scratch-guard, replay engine over the real `GraphitiBackend` construction path onto `evalmem_*` graphs, MetricsRecord emission (importing `shared.memory_eval_metrics`), instrument-validation checks, INV-4 abort rule; boundary tests above | `fused-memory/scripts` + harness module, tests | normal | all boundary-test rows green in CI, including the observed scratch-guard rejection | β, γ, δ |
 | **ζ** | Controls + pre-registration: incumbent GenericClient replay ×2 (one graph frozen as the embedding reference), OpenAIClient control pair, margin derivation, commit `plans/local-memory-models-eval-preregistration.md` | harness runs + `plans/` | normal | pre-registration doc committed with finite derived margins AND control MetricsRecords committed; git history shows it predates every candidate-arm artifact | ε |
-| **η** | LLM screening: all 4 candidates × small subset — conformance smoke, VRAM fit, prompt-length fit (Phi-4's 16K vs measured longest graphiti prompt), throughput floor; survivor selection per the pre-registered rule | harness runs | normal | committed screening report naming survivors (≤3) with per-candidate evidence | α, ε, ζ |
+| **η** | LLM screening: all 3 remaining candidates × small subset (was 4; see the candidate slate for the drop and what it does to the cap) — conformance smoke, VRAM fit, prompt-length fit (Phi-4's 16K vs measured longest graphiti prompt), throughput floor; survivor selection per the pre-registered rule | harness runs | normal | committed screening report naming survivors (≤3) with per-candidate evidence — the report must also name the dropped arm and state whether the ≤3 cap bound at all, so the narrowed slate is legible rather than silent | α, ε, ζ |
 | **θ** | LLM full arm runs + comparison report: survivors × full corpus, realistic concurrency (fan-out ≤20) on the busy box in transient units; report vs pre-registered margins incl. cost/availability quantification | harness runs + `plans/` | normal | committed LLM-axis comparison report; every arm artifact embeds preregistration_sha + code_sha (schema-enforced) | ζ, η |
 | **ι** | Embedding arms: re-embed the frozen reference graph + one Mem0 replica collection per candidate (and incumbent-as-arm), build with-indices and embedding-only variants, run known-item + transcript-query probes, measure query-latency and re-embed throughput; report | harness runs + `plans/` | normal | committed embedding-axis comparison report covering both index configurations, with the current-prod confound stated | α, β, ζ |
 | **λ** | Synthesis: apply pre-registered rules; write two decision records (committed to `plans/` + `add_memory` `decisions_and_rationale`); raise the operator gate for Leo's ruling; name the follow-up PRD(s) the verdicts warrant | `plans/`, memory | normal | **leaf** — two committed decision records; the operator-gate escalation resolved by Leo referencing them | θ, ι |
@@ -406,8 +540,12 @@ graphiti `OpenAIGenericClient` + `structured_output_mode` — getzep/graphiti PR
 local-endpoint rough edges — issues #912, #1116 (api_base ignored → silent fallback to
 api.openai.com; re-verified against our own plumbing in β), #868, #1074.
 LLM candidates: Qwen3.5-9B official HF card (IFEval 91.5, BFCL-V4 66.1); Mistral-Small-3.2 release
-notes; Phi-4 SOB score arXiv:2604.25359; gpt-oss-20b model card arXiv:2508.10925 (screened out only
-if slate must shrink — Leo selected the four above); 3090 throughput: tfriedel/qwen3.6-rtx3090-lab
+notes (retained: this appendix records what was researched on 2026-08-05, not which arms are live —
+the Mistral arm was dropped 2026-08-06, see the candidate slate); Phi-4 SOB score arXiv:2604.25359;
+gpt-oss-20b model card arXiv:2508.10925 (reserve candidate, screened out only if the slate must
+shrink — Leo selected four arms on 2026-08-05; the slate is now three after the 2026-08-06 drop, so
+this condition has **fired**. Whether to admit a reserve is Leo's call, surfaced at the candidate
+slate and not decided here); 3090 throughput: tfriedel/qwen3.6-rtx3090-lab
 (single-source, treated as directional).
 Embedders: Qwen3-Embedding family (0.6B/4B/8B — **no 2B**) QwenLM GitHub + HF cards, MTEB(eng,v2)
 70.70/74.60; granite-embedding-english-r2 arXiv:2508.21085 (Fig.1 composite 59.5; 144 docs/s H100);
