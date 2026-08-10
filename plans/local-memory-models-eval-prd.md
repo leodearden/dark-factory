@@ -158,9 +158,24 @@ llama.cpp only, see hazard):
 | Arm | Size / quant | Est. VRAM | Basis (cited in research appendix) |
 |---|---|---|---|
 | Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
-| Mistral-Small-3.2-24B | dense, AWQ | ~14GB | mature quant ecosystem; release targeted stronger function calling |
+| ~~Mistral-Small-3.2-24B~~ **DROPPED 2026-08-06** | ~~dense, AWQ~~ | ~~`~14GB`~~ | **Dropped by α after live measurement (Leo's ruling, esc-3713-10): a vision-language model whose quantized repo's tokenizer encodes vLLM's startup `[IMG]` probe to zero image tokens against a text count of one, so the engine never reaches weight loading.** Original basis: mature quant ecosystem; release targeted stronger function calling |
 | Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
 | MoE stretch: ~~Qwen3.6-35B-A3B or~~ **Gemma-4-26B-A4B-it (QAT)** | ~~GGUF IQ4/Q4~~ **`UD-Q4_K_XL`** | ~~≈17GB (Qwen IQ4 — real, but 16.51 GiB of weights before KV, so it does not fit the measured 16.4 GiB)~~ → **13.27 GiB, fits** (α step 22, Open Q3; `task/3713` @ `a161c2858b`, not yet on `main`) | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
+
+The row above is **kept, struck through** rather than deleted: it is the record of what was
+commissioned, and deleting it would erase the fact that the slate narrowed. Two facts about the
+dropped arm, so no reader re-litigates a closed defect (authoritative record:
+`scripts/local-model-serving/arms.yaml`, the `mistral-small-3.2-24b — DROPPED FROM THE SLATE`
+block):
+
+- *The declared quant was wrong, and that defect is **fixed and verified**, separately.* `awq` →
+  `compressed-tensors`, read from the downloaded weights' own `config.json`; vLLM 0.26 then accepted
+  the model and resolved `max_model_len` 16384. The arm still never reached weight loading, for the
+  unrelated tokenizer reason above — the card never moved (7212 → 7221 MiB). Do not reopen the quant
+  question; it is closed.
+- *Re-admission needs a different quantized repo (or an upstream tokenizer fix) — **not** a flag that
+  suppresses the multimodal path.* Suppressing it would mean the eval measured a model configured
+  differently from the one this PRD costed.
 
 Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
 incumbent `text-embedding-3-small` runs as its own arm):
