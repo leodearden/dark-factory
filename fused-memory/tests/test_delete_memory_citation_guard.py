@@ -1447,3 +1447,123 @@ class TestCascadeCitationRepointPass:
 
         assert result['status'] == 'deleted'
         interceptor.update_task.assert_not_awaited()
+
+
+class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
+    """The pre-flight refuses what it cannot see, and skips what it need not.
+
+    Fail-closed for the same reason the gate already refuses on an unreadable
+    task DB or an unresolvable replacement: "unknown" must not be read as
+    "safe" immediately before an irreversible destruction — and gating only
+    the visible subset of a cascade would be strictly worse than the bug this
+    fixes, because it would destroy unchecked records while REPORTING that
+    they were verified.
+    """
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([_task('1601', 'pending', {'unrelated': 'nothing'})])
+
+    def _server(self, service, interceptor=None, known_projects=KNOWN_PROJECTS):
+        return create_mcp_server(
+            service,
+            task_interceptor=interceptor,
+            known_projects=known_projects,
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncated_enumeration_refuses_the_cascade(self, interceptor):
+        """(a) The gate could not SEE the whole set, so it cannot prove the
+        set is safe.
+
+        A read-only walk cannot page past _CHILD_SCAN_LIMIT — the cascade
+        only ever sees the next page because deleting the previous one made
+        it visible. Gating the visible subset would clear a cascade over
+        records nobody checked.
+        """
+        service = _make_service(descendants=[CHILD], truncated=True)
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationScanIncomplete'
+        assert result['memory_id'] == DOOMED
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enumeration_error_refuses_with_the_same_shape(self, interceptor):
+        """(b) A raised enumeration is the same "unknown", not a traceback and
+        never an optimistic fall-through."""
+        service = _make_service()
+        service.list_descendant_ids = AsyncMock(
+            side_effect=RuntimeError('qdrant scroll failed'),
+        )
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationScanIncomplete'
+        assert result['scan_error_type'] == 'RuntimeError'
+        assert 'qdrant scroll failed' in result['scan_error']
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_descendant_scan_failure_blocks_the_cascade(self):
+        """(c) The per-id fail-closed arm reaches the aggregate.
+
+        The first scan (the descendant, deepest-first) cannot be read, so
+        that id's CitationScanFailed rides the blocked list and the whole
+        cascade is refused — an unreadable citation state for ONE record in
+        the set is enough.
+        """
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(
+            side_effect=[RuntimeError('task db unreachable'), {'tasks': []}],
+        )
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['memory_id'] for b in result['blocked']] == [CHILD]
+        assert result['blocked'][0]['error_type'] == 'CitationScanFailed'
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_cascade_enumerates_nothing(self, interceptor):
+        """(d) The gate is Mem0-scoped — and so is the service's own child
+        gate, because parent_id is a Mem0 payload key. Walking a tree whose
+        result would be discarded is pure cost."""
+        service = _make_service(descendants=[CHILD])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, cascade=True, store='graphiti')
+
+        assert result['status'] == 'deleted'
+        service.list_descendant_ids.assert_not_awaited()
+        interceptor.get_tasks.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_project_enumerates_nothing(self, interceptor):
+        """(e) No live task DB to scan -> today's behaviour, unchanged."""
+        service = _make_service(descendants=[CHILD])
+        mcp_server = self._server(service, interceptor, known_projects=None)
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['status'] == 'deleted'
+        service.list_descendant_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_task_interceptor_enumerates_nothing(self):
+        """(f) The baseline construction with no interceptor at all keeps
+        working exactly as before, cascade or no cascade."""
+        service = _make_service(descendants=[CHILD])
+        mcp_server = create_mcp_server(service)
+
+        result = await _call_delete(mcp_server, cascade=True)
+
+        assert result['status'] == 'deleted'
+        service.list_descendant_ids.assert_not_awaited()
+        service.delete_memory.assert_awaited_once()
