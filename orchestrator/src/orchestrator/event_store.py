@@ -531,6 +531,51 @@ class EventType(StrEnum):
     #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
     sandbox_applied = 'sandbox_applied'
 
+    # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
+    # D5; spec docs/task-escalation-state-spec.md S6/E12; task beta 3535).  The
+    # canonical WHY lives in orchestrator/src/orchestrator/recovery_emission.py
+    # (module docstring) — every other site carries a pointer, never a copy.
+    #
+    # Both members share ONE payload key vocabulary:
+    #   {task_id, site, shape, reason, escalation_ids, ages_secs, measured_at,
+    #    store_unavailable, streak}
+    #   site           — a RecoverySite member naming WHICH veto/LEAVE site
+    #                    spoke (the deterministic-recon pair deliberately use
+    #                    two distinct labels so their duplication is countable).
+    #   shape          — the pipe-joined 5-tuple task_ground_truth._shape keys
+    #                    the _RECOVERY table on, rendered by render_shape.
+    #   reason         — the closed LeaveReason vocabulary: escalation_pinned,
+    #                    escalation_store_unavailable, unmapped_shape,
+    #                    live_claimant, deploy_phase_in_flight,
+    #                    provenance_arbitration.
+    #   escalation_ids — the open records that held it, bucketed by
+    #                    escalation.pins.classify_pins
+    #                    ({dead_l0, queue_handoff, non_pinning}).
+    #   ages_secs      — {escalation_id: seconds}, a MAPPING (join by id, never
+    #                    by position); an unparseable timestamp maps to null
+    #                    rather than dropping the id.
+    # task_id is ALSO a first-class column, so these rows stay joinable against
+    # task_completed / escalation_created.
+    #
+    # The discriminator between the two:
+    #   recovery_vetoed — an open escalation (or an unreadable store) actively
+    #     vetoed a recovery / redispatch / done-flip that would OTHERWISE have
+    #     been taken.  Something was held back.
+    #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
+    #     unmapped shape, an in-flight deploy phase, or escalation_store_
+    #     unavailable.  Nothing was held back by a record; the site simply had
+    #     no mapped action (or could not read the store to find out).
+    #
+    # Read these as STATE, not as a rate.  Emission is signature-transition-
+    # gated (new-or-changed (site, task_id) veto signature, plus exactly once at
+    # the streak threshold crossing) rather than one row per observation,
+    # because two of the sites run per dispatch TICK and unconditional emission
+    # would storm the store (INV-4).  Per-sweep cadence is carried by the
+    # reconcile sweep's always-logged summary line instead.  The ABSENCE of
+    # these rows for a stranded task is therefore meaningful: nothing held it.
+    recovery_vetoed = 'recovery_vetoed'
+    recovery_left = 'recovery_left'
+
 
 class EventStore:
     """Append-only SQLite event store.
