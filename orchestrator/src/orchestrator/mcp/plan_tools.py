@@ -196,11 +196,25 @@ def _repair_one_field(
     *holder* is the plan dict itself for a top-level record, or one item of
     ``plan[record.collection]`` otherwise. ``None`` means nothing to report:
     the value is absent, is not a str, or carries no envelope literal at all.
+
+    THE CONTRACT IS BINARY. ``repair()`` validates -> the field becomes
+    ``clean_value``. ``repair()`` declines -> the field is left BYTE-IDENTICAL
+    and the refusal is reported as an ``'unrepairable'`` fact so the residue
+    stays visible. There is deliberately NO fallback that strips the trailing
+    bit anyway, and that is not caution for its own sake: measured across the
+    28 corrupted live plans, the declining population is dominated by plans
+    that legitimately QUOTE the sentinels in prose — worktree 2939's plan is a
+    plan ABOUT this leak, so its decision/rationale fields discuss the closing
+    and opening tags in ordinary sentences. A trailing-only sanitize would
+    silently mutilate that authored text, which is the same class of
+    silent-wrong-value damage this whole PRD exists to end. Never partial,
+    never guessed.
     """
     value = holder.get(record.field)
     if not isinstance(value, str):
         return None
-    if detect(value) is None:
+    pattern = detect(value)
+    if pattern is None:
         # The cheap prefilter, and the overwhelmingly common path: no literal
         # anywhere in the value, so repair() is never called.
         return None
@@ -212,7 +226,19 @@ def _repair_one_field(
         supplied=frozenset(),
     )
     if result is None:
-        return None
+        return {
+            'tool': _COLLECTION_TOOL[record.collection],
+            'param': record.field,
+            'pattern': pattern,
+            # No mis-close was VALIDATED — every candidate was rejected — so
+            # naming one here would be a guess dressed up as a diagnostic.
+            'misclose': None,
+            'outcome': 'unrepairable',
+            'recovered_params': [],
+            'collection': record.collection,
+            'index': index,
+            'field': record.field,
+        }
 
     holder[record.field] = result.clean_value
     return {
