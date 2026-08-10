@@ -2151,6 +2151,125 @@ class TestStage2CycleSummaryHarnessBackstop:
             'it falsely True'
         )
 
+    # -- no-fire boundaries -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_happy_path_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 2's own in-stage write succeeded (stat == 1) — there is
+        nothing to recover and the backstop must stay silent."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=1)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_stat_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """A Stage 2 report with no stage2_cycle_summary_ledger_written key at
+        all (the shape every stubbed-Stage-2 test in this file uses via
+        _mock_stage_run, and the shape BaseStage returns when the agent died
+        before recon_report.complete) must not be treated as a write failure —
+        only the explicit 0 is a failure signal. Keeps every existing stubbed
+        harness test in this file green."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recon_ledger_unwired_does_not_fire(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """recon_ledger_enabled=False is a supported production config whose
+        stat is ALWAYS 0 — firing there would re-attempt, and WARNING, every
+        single cycle for no reason."""
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stage2_never_ran_synthesizes_nothing(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """THE CORE SAFETY TEST — the cycle dies in Stage 1, so no
+        task_knowledge_sync key is ever recorded in run.stage_reports and
+        Stage 2 demonstrably never ran. The backstop must write nothing at
+        all: no re-attempt, and no cycle_summary row in the real ledger.
+
+        This is the regression lock on 'never fabricate a cycle that did not
+        happen' — the reason this method has no analogue of Stage 1's arm 1
+        raise-path synthesis."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write, pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
+
+        mock_write.assert_not_awaited()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        assert 'task_knowledge_sync' not in recent[0].stage_reports, (
+            'precondition: Stage 2 never produced a report on this cycle'
+        )
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=recent[0].id,
+        )
+        assert record is None, (
+            'a run whose Stage 2 never ran must leave NO Stage 2 cycle_summary '
+            'row — synthesizing one would fabricate a cycle that did not happen'
+        )
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
