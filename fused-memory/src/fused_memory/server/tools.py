@@ -1966,18 +1966,106 @@ def create_mcp_server(
 
         if not blocked:
             return None
-        return {
-            'error': (
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            blocked,
+            error=(
                 f'{len(blocked)} of the {len(cascade_ids)} record(s) a cascade '
                 f'delete of {memory_id} would destroy still have live task '
                 'citations. Nothing was deleted.'
             ),
+        )
+
+    def _cascade_gate_rejection(
+        memory_id: str,
+        cascade_size: int,
+        blocked: list[dict[str, Any]],
+        *,
+        error: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """ONE envelope shape for every cascade-gate refusal.
+
+        The error type keys on the FLAG the caller passed, not on corpus
+        state they cannot see: whether the tree happened to have children
+        this time is invisible to them, so branching the wire contract on it
+        would force every cascade error handler to handle both shapes
+        anyway. ``blocked[0]`` still carries the verbatim per-id rejection,
+        so nothing the single-record envelope reported is lost.
+        """
+        return {
+            'error': error,
             'error_type': 'CascadeCitationGateRejected',
             'memory_id': memory_id,
-            'cascade_size': len(cascade_ids),
+            'cascade_size': cascade_size,
             'blocked': blocked,
             'hint': _CASCADE_GATE_HINT,
+            **extra,
         }
+
+    async def _cascade_citation_repoint_pass(
+        cascade_ids: list[str],
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The MUTATING second pass, after the pre-flight cleared the set.
+
+        Runs the gate in normal mode over the same deepest-first sequence,
+        merging each record's stats under ITS OWN id: a cascade touches N
+        records, and one anonymous stats blob would leave the caller unable
+        to tell which descendant's citations were rewritten.
+
+        Two residuals this two-pass design does NOT close, stated rather than
+        left for a later reader to discover:
+
+        1. A rejection HERE (a repoint sweep that fails, or a citer written
+           between the two passes) still returns before the service call, so
+           nothing is deleted — but ids EARLIER in the sequence may already
+           have been repointed. That is not a dangling pointer: those
+           citations now address the verified-live ``replacement_memory_id``
+           while the original record still exists. A retry converges,
+           because a repointed id no longer has live citers. The already-
+           repointed ids are named on the refusal rather than left implicit.
+        2. The service's cascade re-reads its children LIVE, so a child
+           written between this pass and the cascade is deleted without
+           having passed the gate. That is the same write-after-scan race the
+           single-record path already accepts — and accepts deliberately,
+           which is why ``_scan_task_citations`` refuses to cache its
+           snapshot: caching would trade the fail-closed guarantee for a race
+           on the one operation whose harm motivated the gate.
+        """
+        per_id: dict[str, Any] = {}
+        for target in cascade_ids:
+            rejection, stats = await _citation_repoint_gate(
+                target,
+                store,
+                project_id,
+                agent_id,
+                replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+            )
+            if rejection:
+                return _cascade_gate_rejection(
+                    cascade_ids[-1],
+                    len(cascade_ids),
+                    [rejection],
+                    error=(
+                        f'A record in the cascade of {cascade_ids[-1]} could not '
+                        'be cleared on the repoint pass, so the delete was '
+                        'refused. Nothing was deleted.'
+                    ),
+                    # Honest residual: these were rewritten before the
+                    # refusal. They point at the verified-live replacement,
+                    # not at a destroyed record, and a retry is idempotent.
+                    repointed_before_refusal=sorted(per_id),
+                ), None
+            if stats:
+                per_id[target] = stats
+        return None, ({'cascade_citation_repoint': per_id} if per_id else None)
 
     async def _scan_task_citations(
         project_root: str, memory_id: str
@@ -3445,7 +3533,14 @@ def create_mcp_server(
                 replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
             )
-        if rejection is None:
+        if rejection is None and cascade_ids:
+            # The pre-flight proved the whole set is clearable; now clear it,
+            # in the same deepest-first order, before the delete runs.
+            rejection, repoint_stats = await _cascade_citation_repoint_pass(
+                cascade_ids, store, project_id, agent_id, replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+            )
+        elif rejection is None:
             rejection, repoint_stats = await _citation_repoint_gate(
                 resolved_id, store, project_id, agent_id, replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
