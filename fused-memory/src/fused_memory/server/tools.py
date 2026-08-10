@@ -1971,6 +1971,63 @@ def create_mcp_server(
 
         return None, [*scan.ids, memory_id]
 
+    def _cascade_replacement_outside_set(
+        cascade_ids: list[str],
+        memory_id: str,
+        replacement_memory_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Refuse naming a survivor that this same cascade destroys.
+
+        The single-record gate's self-repoint check
+        (``replacement_memory_id == memory_id``) is the degenerate case of
+        this one, but it cannot generalise to the cascade on its own for a
+        structural reason: the pre-flight applies that gate PER ID, and each
+        per-id run returns early at ``not live_citers`` — strictly before the
+        comparison. So an UNCITED descendant named as the replacement is never
+        compared to anything. The pre-flight clears it, the target's own
+        citers are then repointed TO it, and the service destroys it moments
+        later, with the tombstone ledger recording it as the survivor. That
+        reports success while manufacturing the dangling pointer the gate
+        exists to prevent.
+
+        Hence a set-membership test, not a per-id one, and placed BEFORE the
+        pre-flight: it is never coherent to forward a citation to a record
+        this call destroys, so the answer cannot depend on which members
+        happen to be cited today. It is also total and free — no I/O, and it
+        holds for an entirely uncited cascade, where every per-id path
+        short-circuits.
+
+        The refusal reuses ``_cascade_gate_rejection`` so the wire shape stays
+        uniform, carrying the single-record ``CitationReplacementInvalid``
+        error_type in ``blocked[0]`` exactly as the per-id refusals do.
+        """
+        if replacement_memory_id is None or replacement_memory_id not in cascade_ids:
+            return None
+
+        is_target = replacement_memory_id == memory_id
+        role = 'the id being deleted' if is_target else 'a descendant of it'
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            [{
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is '
+                    f'{role}, so this cascade would destroy the very record '
+                    'the citations were forwarded to. Nothing was deleted.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'hint': _CITATION_REPOINT_HINT,
+            }],
+            error=(
+                f'replacement_memory_id {replacement_memory_id!r} is itself '
+                f'scheduled for destruction by this cascade delete of '
+                f'{memory_id}. Nothing was deleted.'
+            ),
+            replacement_memory_id=replacement_memory_id,
+        )
+
     async def _cascade_citation_preflight(
         cascade_ids: list[str],
         memory_id: str,
@@ -3497,11 +3554,13 @@ def create_mcp_server(
                 id is refused (``CitationReplacementNotFound``) rather than
                 written into every citation, which would strand them exactly as
                 the delete itself would;
-                (3) it must not be the id being deleted
-                (``CitationReplacementInvalid``) — a self-repoint reports
-                success while every citation still addresses the destroyed
-                entry. Copy the value from the search/consolidation result
-                rather than reconstructing it.
+                (3) it must not be any record THIS call destroys
+                (``CitationReplacementInvalid``) — the id being deleted, or,
+                under ``cascade=True``, any descendant in the cascade set.
+                Forwarding citations to a record the same call destroys
+                reports success while every citation still addresses a
+                destroyed entry. Copy the value from the search/consolidation
+                result rather than reconstructing it.
             cascade: Delete this record's CHILDREN too (default False). The
                 WHOLE cascade is refused — nothing deleted, nothing repointed
                 — if any record it would destroy still has live task citers
@@ -3613,6 +3672,10 @@ def create_mcp_server(
             rejection, cascade_ids = await _cascade_enumerate(
                 resolved_id, project_id
             )
+            if rejection is None:
+                rejection = _cascade_replacement_outside_set(
+                    cascade_ids, resolved_id, replacement_memory_id,
+                )
             if rejection is None:
                 rejection = await _cascade_citation_preflight(
                     cascade_ids, resolved_id, store, project_id, agent_id,

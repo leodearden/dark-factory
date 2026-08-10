@@ -1448,6 +1448,72 @@ class TestCascadeCitationRepointPass:
         assert result['status'] == 'deleted'
         interceptor.update_task.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_replacement_inside_the_cascade_set_is_refused(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(f) The survivor may not be a record THIS cascade destroys.
+
+        The single-record gate already refuses a self-repoint
+        (``replacement_memory_id == memory_id``), but in the cascade that
+        comparison is made per-id and only AFTER the ``not live_citers``
+        early-out. So an UNCITED descendant named as the replacement is never
+        compared to anything: the pre-flight short-circuits on it, the target's
+        own citers are then happily repointed to it, and the service deletes it
+        moments later. The call reports success while manufacturing exactly the
+        dangling pointer the gate exists to prevent — worse than the pre-gate
+        state, because the citation and the tombstone ledger now BOTH address a
+        record destroyed by the same call.
+
+        Keeping a child and cascade-dropping its parent is a plausible
+        consolidation shape, not a contrived one, so this is reachable the
+        moment ``parent_id`` children exist.
+        """
+        # CHILD is uncited and resolvable: it sails through the early-out.
+        mock_service.get_memory_by_id = AsyncMock(
+            return_value={'id': CHILD, 'content': 'the survivor', 'metadata': {}},
+        )
+        interceptor.get_tasks = AsyncMock(return_value={'tasks': [
+            _task('9001', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ]})
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=CHILD,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        blocked = result['blocked']
+        assert [b['error_type'] for b in blocked] == ['CitationReplacementInvalid']
+        assert blocked[0]['replacement_memory_id'] == CHILD
+        # Nothing was destroyed and nothing was rewritten: a refused cascade
+        # must have changed nothing, the pre-flight's own atomicity property.
+        mock_service.delete_memory.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replacement_equal_to_the_cascade_target_is_refused(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(g) The degenerate case: the target itself named as the survivor.
+
+        The single-record gate catches this only when the target has live
+        citers. Under ``cascade=True`` the guard is the same membership test —
+        the target is the last element of the cascade set — so it holds
+        whether or not anything cites it.
+        """
+        interceptor.get_tasks = AsyncMock(return_value={'tasks': [
+            _task('9002', 'pending', {'unrelated': 'nothing'}),
+        ]})
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=DOOMED,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['blocked'][0]['error_type'] == 'CitationReplacementInvalid'
+        mock_service.delete_memory.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
+
 
 class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
     """The pre-flight refuses what it cannot see, and skips what it need not.
