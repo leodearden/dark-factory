@@ -35,7 +35,16 @@ dependencies = [
     # reportMissingImports and would break any consumer importing the module.
     # The module is deliberately NOT re-exported from shared/__init__, so
     # `import shared` still does not pull fastmcp. See task 3689.
-    "fastmcp>=2.0",
+    #
+    # >=3.2, NOT the >=2.0 that escalation/ and orchestrator/ declare: this is
+    # the first module in the workspace to depend on a 3.x-only import path.
+    # `fastmcp.tools.base` exists only after tool.py was renamed to base.py,
+    # and `fastmcp.server.middleware.Middleware` did not exist before 2.9 — so
+    # any resolution under 3.2 breaks `import shared.mcp_markup_middleware`
+    # outright rather than degrading. 3.2.2 is what every substrate fact in
+    # that module's docstring was measured against and what uv.lock already
+    # resolves, so the floor now names the API actually validated.
+    "fastmcp>=3.2",
 ]
 
 [project.optional-dependencies]
