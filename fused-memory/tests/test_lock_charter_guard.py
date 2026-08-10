@@ -618,8 +618,9 @@ def test_extensionless_drift_guard():
 
 
 @pytest.mark.skipif(
-    not _REIFY_GUARD_SCRIPT.is_file(),
-    reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    _REIFY_GUARD_SCRIPT is None or not _REIFY_GUARD_SCRIPT.is_file(),
+    reason='reify checkout not discoverable (standalone checkout; cross-repo drift '
+    'check skipped) — set REIFY_ROOT to override',
 )
 def test_extensionless_drift_guard_vs_reify_script():
     """Tier-2 (cross-source): EXTENSIONLESS_FILENAMES must match --list-extensionless.
@@ -791,6 +792,38 @@ _DF_REPO_ROOT = Path(__file__).parents[2]
 # reify call sites share one layout-independent resolution.
 
 
+def _skip_unless_checkout(repo: str, repo_root: Path | None) -> Path:
+    """Skip unless *repo_root* names a real checkout directory; else return it.
+
+    ONE reachability precondition for all three reify-parametrized sweeps
+    below, for the same reason ``_tracked_entries`` is one parse: three copies
+    of this guard would let the sweeps drift on what "the reify checkout is
+    missing" means, and a sweep that forgot the ``None`` arm would raise
+    ``AttributeError`` at the point it was supposed to skip.
+
+    The two arms are deliberately distinct, and the distinction is the whole
+    point of task 3843:
+
+    ``None`` — discovery MISS.  ``_resolve_reify_root`` walked every ancestor
+    and none carried ``reify/scripts/lock-charter-guard.sh``, with REIFY_ROOT
+    unset.  That is the legitimate standalone-checkout case.
+
+    set-but-absent — an operator's REIFY_ROOT names a path that is not there.
+    Honored verbatim rather than silently falling back to discovery, so the
+    skip reason NAMES the bad path and a typo is self-evident instead of
+    resolving to a different repo than the operator asked for.
+    """
+    if repo_root is None:
+        pytest.skip(
+            f'{repo} checkout not discoverable (_resolve_reify_root found no '
+            f'ancestor with reify/scripts/lock-charter-guard.sh); set REIFY_ROOT '
+            f'to override'
+        )
+    if not repo_root.is_dir():
+        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    return repo_root
+
+
 def _tracked_entries(repo_root: Path) -> tuple[list[str], list[str]] | None:
     """``(non_gitlink_paths, gitlink_paths)`` for *repo_root*, or None if not a checkout.
 
@@ -897,14 +930,7 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | Non
     design — the escape hatch is ``files=[]``, i.e. declaring NO charter at all,
     which is exactly the silent under-locking #3248 fixes.
     """
-    if repo_root is None:
-        pytest.skip(
-            f'{repo} checkout not discoverable (_resolve_reify_root found no '
-            f'ancestor with reify/scripts/lock-charter-guard.sh); set REIFY_ROOT '
-            f'to override'
-        )
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    repo_root = _skip_unless_checkout(repo, repo_root)
     paths = _tracked_file_paths(repo_root)
     if paths is None:
         pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
@@ -954,8 +980,7 @@ def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_roo
     is why admitting a generic basename is a cross-project commitment — see the
     CROSS-PROJECT SCOPE note on the EXTENSIONLESS_FILENAMES vector.
     """
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    repo_root = _skip_unless_checkout(repo, repo_root)
     paths = _tracked_file_paths(repo_root)
     if paths is None:
         pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
@@ -1006,8 +1031,7 @@ def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: P
     passing it silently — so read this guard as non-vacuous exactly where
     gitlinks actually exist, which today is the dark-factory parametrization.
     """
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    repo_root = _skip_unless_checkout(repo, repo_root)
     entries = _tracked_entries(repo_root)
     if entries is None:
         pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
