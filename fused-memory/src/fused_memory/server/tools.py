@@ -79,6 +79,7 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
     is_proposed_resolution_framing,
 )
+from fused_memory.server.grouped_read import group_search_results
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
@@ -3247,7 +3248,32 @@ def create_mcp_server(
                 session_id=session_id,
                 include_planned=include_planned,
             )
-            response: dict[str, Any] = {'results': [r.model_dump() for r in results]}
+            # Grouping lives in server/grouped_read.py and is applied HERE, at
+            # the MCP boundary — never inside MemoryService.search.  Pushing it
+            # down a layer would strip amendment/sighting rows from
+            # reconciliation/mem0_dedup.py::find_prior_memories, whose
+            # per-record task_id/kind post-filter iterates raw service results,
+            # hiding duplicates from the dedup detector and candidates from the
+            # near-duplicate write guard (task 3129 / PRD V2 bullet 4).
+            #
+            # degraded/failed_stores/failure_diagnostics are read BELOW off
+            # `results` (the SearchResults object), never off the grouped list —
+            # that metadata does not survive a list transform.
+            try:
+                grouped_results = await group_search_results(
+                    memory_service, project_id, results
+                )
+            except Exception:
+                # A grouping fault must never turn a working search into an
+                # error dict; degrade to the ungrouped list and say so loudly.
+                logger.warning(
+                    'search: grouped read FAILED for project=%s; returning ungrouped results',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                grouped_results = [r.model_dump() for r in results]
+            response: dict[str, Any] = {'results': grouped_results}
             # Fault-only loudness: surface degraded/failed_stores only when the
             # search was degraded (a selected store timed out or raised).  Uses
             # getattr so a plain list return (back-compat callers) is harmless.
