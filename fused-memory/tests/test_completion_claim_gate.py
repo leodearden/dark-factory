@@ -93,3 +93,77 @@ class TestAppliedWorkExtraction:
     def test_clause_scoping_keeps_ref_and_phrasing_together(self):
         """A ref in one clause and phrasing in another is not a claim."""
         assert _extract('task 5422 is under review. the other fix has been applied') == []
+
+
+# The verbatim text from esc-3085-1 instance (2): a reify-authored claim that
+# a task was re-filed into ANOTHER project's tree as a ticket that did not
+# exist. Neither the phrasing family nor the ticket subject was covered before.
+_INSTANCE_2 = (
+    'reify task 5638 was reported unactionable and re-filed into '
+    "dark_factory's task tree as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376"
+)
+
+
+class TestFilingDispatchExtraction:
+    """The esc-3085-1 scope extension: filing/dispatch phrasing, and the
+    ticket / commit subjects alongside tasks."""
+
+    def test_instance_2_extracts_as_a_ticket_filing_claim(self):
+        claims = _extract(_INSTANCE_2)
+
+        assert len(claims) == 1, claims
+        claim = claims[0]
+        assert claim.kind == 'filing_dispatch'
+        # Ticket beats task: the tkt_ id is the more specific authority, and it
+        # is the one that was actually false in the incident.
+        assert claim.subject == 'ticket'
+        assert claim.ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    @pytest.mark.parametrize(
+        'phrasing',
+        [
+            'was filed as',
+            'was re-filed as',
+            'was refiled as',
+            'was submitted as',
+            'was queued as',
+            'was dispatched as',
+            'was cancelled as',
+            'was closed as duplicate of',
+        ],
+    )
+    def test_filing_dispatch_family_each_yields_a_ticket_claim(self, phrasing):
+        text = f'the follow-up {phrasing} ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+        claims = _extract(text)
+
+        assert len(claims) == 1, f'{text!r} -> {claims!r}'
+        assert claims[0].kind == 'filing_dispatch'
+        assert claims[0].subject == 'ticket'
+        assert claims[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    def test_commit_sha_claim_resolves_to_the_commit_subject(self):
+        claims = _extract('the de-flake fix landed in commit 7bbcd5d815')
+
+        assert len(claims) == 1, claims
+        assert claims[0].kind == 'applied_work'
+        assert claims[0].subject == 'commit'
+        assert claims[0].ref == '7bbcd5d815'
+
+    def test_commit_beats_task_but_ticket_beats_commit(self):
+        """Subject precedence is ticket > commit > task, per clause."""
+        task_and_commit = _extract('task 5422 was merged as commit 7bbcd5d815')
+        assert [(c.subject, c.ref) for c in task_and_commit] == [('commit', '7bbcd5d815')]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            # Hex-looking word with no commit/sha/merge cue anchoring it.
+            'the deadbeef fixture was applied',
+            # A `tkt_` prefix with no body is not a ticket id.
+            'the follow-up was filed as ticket tkt_',
+            # Filing phrasing with no ref at all.
+            'the follow-up was filed as a ticket',
+        ],
+    )
+    def test_non_refs_yield_nothing(self, text):
+        assert _extract(text) == []
