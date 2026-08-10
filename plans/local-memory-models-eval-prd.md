@@ -57,6 +57,15 @@ not counted as G1 consumers of anything here.
 > longer return fewer *because of the cap*. **Whether that warrants re-opening the slate is Leo's
 > call: surfaced here, deliberately not decided.** See the consequence note at the candidate slate.
 >
+> **Single-sourcing, so a future slate change is a two-site edit and not a six-site one:** the
+> canonical statements of the three-arm slate and its funnel consequence are exactly **two** — this
+> banner and the consequence note at the candidate slate. Every other site in this document (the
+> approach sketch, D6, the Contract survivor-rule constraint, η's decomposition row) now
+> **cross-references** them rather than restating them, and carries only what is locally its own (a
+> count, or a MUST addressed to ζ). If Leo re-opens the slate, edit those two places. Tasks 3719 and
+> 3720 hold their own copies out of necessity — a task record cannot cross-reference a file section —
+> and are listed under the dispositions below, which is where a future editor should look for them.
+>
 > Applied corrections (2026-08-10, task 3804) — all in `plans/`, documentation/record only:
 > - **This PRD**: the candidate-slate table (Mistral row struck through and annotated, **kept** as
 >   evidence of what was commissioned, plus a footnote closing the already-fixed quant defect and
@@ -80,7 +89,17 @@ not counted as G1 consumers of anything here.
 >   drop and the selectivity flag.
 > - Task 3721 (LME-θ, pending) — **checked, clean**: zero four-arm or Mistral assertions.
 > - Task 3722 (LME-ι, pending) — its "all four" counts the four **embedding** arms, which this
->   LLM-axis ruling does not touch; **correctly left alone**.
+>   LLM-axis ruling does not touch; that sentence was **correctly left alone**. A *different* defect
+>   in the same record **was** fixed: its pointer `(PRD line 136)` for the qwen3-embedding-4b
+>   batch-job constraint. That pointer was **correct when authored** — at `0cf6de56ac` (2026-08-05)
+>   line 136 was exactly the Qwen3-Embedding-4B row — and was already broken by task 3748's banner on
+>   2026-08-06 (it landed on a table separator, then on prose); this amendment's banner pushed it
+>   further, onto an unrelated `SEMAPHORE_LIMIT` paragraph. Replaced with the stable locator
+>   "PRD §Candidate slate, the Qwen3-Embedding-4B row"; the rest of that description was verified
+>   **byte-identical** afterwards, including its `PRD-MARKER:` delivered-check string. This is the
+>   same defect class as task 3973's item 2 (arms.yaml's "line 127" pointer) and the same lesson task
+>   3748 learned when it rejected a README heading as a pin — fixed at source here rather than
+>   deferred, since it is a one-field edit.
 > - Tasks 3715 (β), 3716 (γ), 3717 (δ), 3718 (ε), 3723 (λ), 3725 (μ) — **checked, clean**.
 > - Task 3713 (LME-α, `done`) — **deliberately NOT edited.** Its enumeration of the original four
 >   dense arms is the historical record of what α was commissioned to serve — the same evidence
@@ -179,8 +198,8 @@ through the real `GraphitiBackend` construction path onto scratch graphs. Funnel
 remaining candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
 whisper-writer, prompt-length fit, throughput floor); at most three advance to **full corpus
 replay** under realistic concurrency on the busy box (was four candidates — Mistral-Small-3.2-24B
-was dropped 2026-08-06, so the ≤3 cap no longer binds while the absolute screening gates still do;
-see the consequence note at the candidate slate). Client-class parity: **every** arm — incumbent
+was dropped 2026-08-06; what the narrowing does to the cap is stated once, at the consequence note
+at the candidate slate). Client-class parity: **every** arm — incumbent
 included — runs via `OpenAIGenericClient`, and a one-off control quantifies the
 `OpenAIClient → OpenAIGenericClient` delta on the incumbent itself, so the client-class change is
 measured, not confounded.
@@ -289,8 +308,8 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
 5. **Two retrieval configurations** on the embedding axis; *with-indices is primary* (future prod);
    the current-prod embedding-only configuration is reported alongside, with the confound stated.
 6. **Funnel**: LLM axis screens all 3 (was 4 — Mistral-Small-3.2-24B dropped 2026-08-06), replays
-   ≤3 — the ≤3 cap is now non-binding; the absolute screening gates still are. Embedding axis runs
-   all arms in full.
+   ≤3; for what the narrowed slate does to the cap's selectivity see the consequence note at the
+   candidate slate (canonical — not restated here). Embedding axis runs all arms in full.
 7. **Dims are a free variable**: the backfill is forced regardless, so candidates are compared at
    their native/MRL-best dims, not forced to 1536. (Mixed dims break cosine — but cutover atomicity
    is the follow-up PRD's problem; this eval only quantifies re-embed throughput to inform it.)
@@ -457,7 +476,7 @@ manifest at decompose time.
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
 | **ε** | Arm-runner harness: ArmSpec + scratch-guard, replay engine over the real `GraphitiBackend` construction path onto `evalmem_*` graphs, MetricsRecord emission (importing `shared.memory_eval_metrics`), instrument-validation checks, INV-4 abort rule; boundary tests above | `fused-memory/scripts` + harness module, tests | normal | all boundary-test rows green in CI, including the observed scratch-guard rejection | β, γ, δ |
 | **ζ** | Controls + pre-registration: incumbent GenericClient replay ×2 (one graph frozen as the embedding reference), OpenAIClient control pair, margin derivation, commit `plans/local-memory-models-eval-preregistration.md` | harness runs + `plans/` | normal | pre-registration doc committed with finite derived margins AND control MetricsRecords committed; git history shows it predates every candidate-arm artifact | ε |
-| **η** | LLM screening: all 3 remaining candidates × small subset (was 4 — Mistral-Small-3.2-24B dropped 2026-08-06) — conformance smoke, VRAM fit, prompt-length fit (Phi-4's 16K vs measured longest graphiti prompt), throughput floor; survivor selection per the pre-registered rule | harness runs | normal | committed screening report naming survivors (≤3) with per-candidate evidence — the report must also name the dropped arm and state whether the ≤3 cap bound at all, so the narrowed slate is legible rather than silent | α, ε, ζ |
+| **η** | LLM screening: all 3 remaining candidates × small subset (was 4; see the candidate slate for the drop and what it does to the cap) — conformance smoke, VRAM fit, prompt-length fit (Phi-4's 16K vs measured longest graphiti prompt), throughput floor; survivor selection per the pre-registered rule | harness runs | normal | committed screening report naming survivors (≤3) with per-candidate evidence — the report must also name the dropped arm and state whether the ≤3 cap bound at all, so the narrowed slate is legible rather than silent | α, ε, ζ |
 | **θ** | LLM full arm runs + comparison report: survivors × full corpus, realistic concurrency (fan-out ≤20) on the busy box in transient units; report vs pre-registered margins incl. cost/availability quantification | harness runs + `plans/` | normal | committed LLM-axis comparison report; every arm artifact embeds preregistration_sha + code_sha (schema-enforced) | ζ, η |
 | **ι** | Embedding arms: re-embed the frozen reference graph + one Mem0 replica collection per candidate (and incumbent-as-arm), build with-indices and embedding-only variants, run known-item + transcript-query probes, measure query-latency and re-embed throughput; report | harness runs + `plans/` | normal | committed embedding-axis comparison report covering both index configurations, with the current-prod confound stated | α, β, ζ |
 | **λ** | Synthesis: apply pre-registered rules; write two decision records (committed to `plans/` + `add_memory` `decisions_and_rationale`); raise the operator gate for Leo's ruling; name the follow-up PRD(s) the verdicts warrant | `plans/`, memory | normal | **leaf** — two committed decision records; the operator-gate escalation resolved by Leo referencing them | θ, ι |
