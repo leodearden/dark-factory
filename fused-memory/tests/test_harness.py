@@ -2483,6 +2483,146 @@ class TestStage2CycleSummaryRemediationBackstop:
 
         mock_write.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_backstop_failure_is_contained_on_the_remediation_driver(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The same containment contract on the second driver: a raising
+        Stage 2 backstop must not escape the finally (this call would
+        otherwise propagate RuntimeError out of _invoke_remediation), and the
+        persistence step that follows it must still run.
+
+        Asserts awaited-at-least-once rather than awaited-once: unlike
+        run_full_cycle, this driver persists stage reports at several points,
+        so the finally's call is not the only one."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        )
+        _mock_stage_run(harness.stages[2])
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ):
+            await self._invoke_remediation(harness)
+
+        harness.journal.update_run_stage_reports.assert_awaited()
+
+
+class TestStage2CycleSummaryBackstopFailureContainment:
+    """The new Stage 2 arm inherits Stage 1's safety contract verbatim: it is
+    awaited unshielded in a finally, so an escaping exception would replace
+    whatever exception is already propagating AND skip the
+    update_run_stage_reports call that follows. It must also never be able to
+    starve the pre-existing Stage 1 arm (task 3732)."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _report(stage_id, **stats) -> StageReport:
+        return StageReport(
+            stage=stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=3,
+            tokens_used=300,
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_mask_original_exception_or_skip_persistence(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 2 completes with a failed write (so the backstop FIRES), then
+        Stage 3 raises. The Stage 2 writer also raises. The original Stage 3
+        exception must still propagate, and update_run_stage_reports must
+        still be awaited — an unguarded backstop failure in a finally would
+        both replace the real exception and skip that persistence step.
+
+        Patches the WRITER, not the method: the method's own
+        `except BaseException` swallow IS the contract under test."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._report(
+                StageId.task_knowledge_sync, stage2_cycle_summary_ledger_written=0,
+            )
+        )
+        harness.stages[2].run = AsyncMock(side_effect=RuntimeError('stage3 exploded'))
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write, pytest.raises(RuntimeError, match='stage3 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        mock_write.assert_awaited_once()
+        harness.journal.update_run_stage_reports.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stage2_failure_does_not_starve_the_stage1_arm(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Ordering lock: BOTH arms fire on the same cycle, with the Stage 2
+        writer raising and Stage 1's writer real. The Stage 1 row must STILL
+        land — proving the new call sits after the Stage 1 arm and cannot
+        prevent it from running."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(
+            return_value=self._report(
+                StageId.memory_consolidator, stage1_cycle_summary_ledger_written=0,
+            )
+        )
+        harness.stages[1].run = AsyncMock(
+            return_value=self._report(
+                StageId.task_knowledge_sync, stage2_cycle_summary_ledger_written=0,
+            )
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='memory_consolidator', run_id=run.id,
+        )
+        assert record is not None, (
+            "a Stage 2 backstop fault must never starve Stage 1's arm — the "
+            'Stage 1 row must still be written'
+        )
+        assert json.loads(record.payload_json)['stats'].get(
+            'stage1_cycle_summary_write_recovered_backstop'
+        ) is True
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
