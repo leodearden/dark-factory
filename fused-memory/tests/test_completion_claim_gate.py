@@ -17,8 +17,12 @@ from __future__ import annotations
 import pytest
 
 from fused_memory.services.completion_claim_gate import (
+    UNRESOLVABLE,
+    UNVERIFIED_CLAIM_TAG,
     CompletionClaim,
+    build_unverified_flag,
     extract_completion_claims,
+    verify_claims,
 )
 
 _KNOWN = frozenset({'reify', 'dark_factory'})
@@ -234,3 +238,173 @@ class TestCrossProjectRefResolution:
         assert len(claims) == 1
         assert claims[0].subject == 'ticket'
         assert claims[0].project_id is None
+
+
+def _verify(claims, *, task=None, ticket=None, commit=None):
+    """Run verify_claims with probes that fail loudly if an unexpected one is
+    consulted — the short-circuit contract is part of what is under test."""
+
+    def _unexpected(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError(f'probe called unexpectedly: {args} {kwargs}')
+
+    return verify_claims(
+        claims,
+        task_status_probe=task or _unexpected,
+        ticket_probe=ticket or _unexpected,
+        commit_probe=commit or _unexpected,
+    )
+
+
+class TestVerifyClaims:
+    """Tri-state probes -> {verified, mismatch, unverifiable}.
+
+    The fail direction is INVERTED relative to _premature_completion_block and
+    make_source_and_history_probe: those REJECT or DROP, so an unresolvable
+    authority must fail OPEN there. This gate only LABELS, so an unresolvable
+    authority must land on 'unverifiable' and get TAGGED.
+    """
+
+    def _task_claim(self, project_id='reify'):
+        return CompletionClaim(
+            kind='applied_work', subject='task', ref='5422',
+            project_id=project_id, span=(0, 40),
+        )
+
+    def test_live_task_status_contradicting_the_claim_is_a_mismatch(self):
+        verdicts = _verify([self._task_claim()], task=lambda ref, project: 'in-progress')
+
+        assert len(verdicts) == 1
+        assert verdicts[0].status == 'mismatch'
+        assert verdicts[0].observed == 'in-progress'
+
+    def test_terminal_task_status_verifies_the_claim(self):
+        verdicts = _verify([self._task_claim()], task=lambda ref, project: 'done')
+
+        assert verdicts[0].status == 'verified'
+        assert verdicts[0].observed == 'done'
+
+    @pytest.mark.parametrize('probed', [None, 'unknown'])
+    def test_unresolvable_task_status_is_unverifiable_not_verified(self, probed):
+        verdicts = _verify([self._task_claim()], task=lambda ref, project: probed)
+
+        assert verdicts[0].status == 'unverifiable'
+        assert verdicts[0].observed
+
+    def test_task_probe_receives_the_claims_resolved_project(self):
+        seen = []
+
+        def probe(ref, project):
+            seen.append((ref, project))
+            return 'done'
+
+        _verify([self._task_claim(project_id='dark_factory')], task=probe)
+        assert seen == [('5422', 'dark_factory')]
+
+    def _ticket_claim(self):
+        return CompletionClaim(
+            kind='filing_dispatch', subject='ticket',
+            ref='tkt_0RRRC5AASJ9Z630VP4PCN9H376', project_id=None, span=(0, 120),
+        )
+
+    def test_absent_ticket_is_a_mismatch_naming_the_absent_id(self):
+        """esc-3085-1 instance (2): the claimed ticket did not exist."""
+        verdicts = _verify([self._ticket_claim()], ticket=lambda ref: None)
+
+        assert verdicts[0].status == 'mismatch'
+        assert 'tkt_0RRRC5AASJ9Z630VP4PCN9H376' in verdicts[0].observed
+
+    def test_present_ticket_verifies_and_surfaces_its_owning_project(self):
+        row = {'ticket_id': 'tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+               'project_id': 'dark_factory', 'status': 'resolved'}
+        verdicts = _verify([self._ticket_claim()], ticket=lambda ref: row)
+
+        assert verdicts[0].status == 'verified'
+        assert 'dark_factory' in verdicts[0].observed
+
+    def test_unreachable_ticket_registry_is_unverifiable(self):
+        verdicts = _verify([self._ticket_claim()], ticket=lambda ref: UNRESOLVABLE)
+
+        assert verdicts[0].status == 'unverifiable'
+        assert verdicts[0].observed
+
+    def _commit_claim(self):
+        return CompletionClaim(
+            kind='applied_work', subject='commit', ref='7bbcd5d815',
+            project_id='dark_factory', span=(0, 44),
+        )
+
+    @pytest.mark.parametrize(
+        ('probed', 'expected'),
+        [(True, 'verified'), (False, 'mismatch'), (None, 'unverifiable')],
+    )
+    def test_commit_probe_is_tri_state(self, probed, expected):
+        verdicts = _verify([self._commit_claim()], commit=lambda ref, project: probed)
+
+        assert verdicts[0].status == expected
+
+    def test_no_claims_consults_no_probe_at_all(self):
+        """The cheap textual extractor short-circuits before any authority read."""
+        assert _verify([]) == []
+
+
+class TestBuildUnverifiedFlag:
+    _TEXT = (
+        "task 5422's de-flake fix has been applied. "
+        'the follow-up was filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+    )
+
+    def _mixed_verdicts(self):
+        claims = extract_completion_claims(
+            self._TEXT, default_project_id='reify', known_project_ids=_KNOWN,
+        )
+        assert len(claims) == 2, claims
+        return verify_claims(
+            claims,
+            task_status_probe=lambda ref, project: 'in-progress',
+            ticket_probe=lambda ref: None,
+            commit_probe=lambda ref, project: None,
+        )
+
+    def test_flag_reports_every_non_verified_claim_with_its_observed_state(self):
+        flag = build_unverified_flag(self._mixed_verdicts(), text=self._TEXT)
+
+        assert flag is not None
+        assert flag['tag'] == UNVERIFIED_CLAIM_TAG
+        assert len(flag['claims']) == 2
+
+        by_ref = {entry['ref']: entry for entry in flag['claims']}
+        task_entry = by_ref['5422']
+        assert task_entry['subject'] == 'task'
+        assert task_entry['project_id'] == 'reify'
+        assert task_entry['status'] == 'mismatch'
+        # INV-2: the flag records what was actually OBSERVED, not just a verdict.
+        assert task_entry['observed'] == 'in-progress'
+        # The claim quotes itself so a reader never has to re-derive the span.
+        assert 'has been applied' in task_entry['text']
+        assert task_entry['span'] == [
+            *extract_completion_claims(
+                self._TEXT, default_project_id='reify', known_project_ids=_KNOWN,
+            )[0].span
+        ]
+
+        ticket_entry = by_ref['tkt_0RRRC5AASJ9Z630VP4PCN9H376']
+        assert ticket_entry['subject'] == 'ticket'
+        assert ticket_entry['project_id'] is None
+        assert ticket_entry['status'] == 'mismatch'
+
+    def test_verified_verdicts_are_omitted_from_the_flag(self):
+        claims = extract_completion_claims(
+            "task 5422's fix has been applied",
+            default_project_id='reify', known_project_ids=_KNOWN,
+        )
+        verdicts = verify_claims(
+            claims,
+            task_status_probe=lambda ref, project: 'done',
+            ticket_probe=lambda ref: None,
+            commit_probe=lambda ref, project: None,
+        )
+
+        assert build_unverified_flag(verdicts, text='x') is None
+
+    def test_no_verdicts_yields_no_flag(self):
+        assert build_unverified_flag([], text='') is None
