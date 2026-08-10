@@ -49,6 +49,7 @@ from orchestrator.recovery_emission import (
     LeaveReason,
     RecoverySite,
     RecoveryVetoStreakTracker,
+    as_ageable_records,
     build_recovery_payload,
     emit_recovery_event,
     escalation_ages_secs,
@@ -646,42 +647,6 @@ def _delivered_checks_descriptor_digest(checks: list | None) -> str:
             'utf-8'
         )
     ).hexdigest()
-
-
-@dataclass(frozen=True)
-class _AgeableEscalation:
-    """One escalation row, adapted to the surface the age helper reads.
-
-    ``recovery_emission.escalation_ages_secs`` reads ``.id`` and
-    ``.created_at`` — the names ``task_ground_truth.EscalationRef`` carries,
-    because that is the record shape the reconcile-sweep site holds.  An
-    ``escalation.models.Escalation`` (what ``get_by_task`` actually returns)
-    spells its creation time ``timestamp`` instead.  Normalising HERE, at the
-    one site that holds the other shape, keeps the helper's "records expose
-    ``.id`` and ``.created_at``" contract single-valued rather than teaching
-    it two spellings and a precedence between them.
-    """
-
-    id: str
-    created_at: str | None
-
-
-def _ageable_escalations(rows: Sequence[Any] | None) -> list[_AgeableEscalation]:
-    """Adapt ``get_by_task`` rows for :func:`escalation_ages_secs`.
-
-    Total and never raises — this feeds telemetry inside a dispatch tick, and
-    a corrupt row must cost at most its own age, never the whole sweep.
-    """
-    adapted: list[_AgeableEscalation] = []
-    for row in rows or ():
-        try:
-            adapted.append(_AgeableEscalation(
-                id=str(row.id),
-                created_at=getattr(row, 'created_at', None) or getattr(row, 'timestamp', None),
-            ))
-        except Exception:  # noqa: BLE001 — a corrupt row must not abort a tick
-            logger.debug('recovery emission: skipping an unreadable escalation row')
-    return adapted
 
 
 class McpSessionLike(Protocol):
@@ -6180,7 +6145,7 @@ class Scheduler:
                     reason=reason,
                     escalation_ids=buckets,
                     ages_secs=escalation_ages_secs(
-                        _ageable_escalations(rows), now=now,
+                        as_ageable_records(rows), now=now,
                     ),
                     store_unavailable=store_unavailable or pins.store_unavailable,
                     streak=streak,

@@ -102,11 +102,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'RECOVERY_VETO_STREAK_SENTINEL_PREFIX',
+    'AgeableRecord',
     'LeaveReason',
     'Observation',
     'RecoverySite',
     'RecoverySweepTally',
     'RecoveryVetoStreakTracker',
+    'as_ageable_records',
     'build_recovery_payload',
     'emit_recovery_event',
     'emit_recovery_veto_streak_escalation',
@@ -289,6 +291,47 @@ def escalation_ages_secs(
             reference = reference.replace(tzinfo=UTC)
         ages[rec_id] = round(max(0.0, (reference - created).total_seconds()), 3)
     return ages
+
+
+@dataclass(frozen=True)
+class AgeableRecord:
+    """One escalation record reduced to what :func:`escalation_ages_secs` reads."""
+
+    id: str
+    created_at: str | None
+
+
+def as_ageable_records(records: Any) -> list[AgeableRecord]:
+    """Normalise any escalation record shape to ``.id`` + ``.created_at``.
+
+    :func:`escalation_ages_secs` reads ``created_at`` — the name
+    ``task_ground_truth.EscalationRef`` carries, because that is the shape the
+    reconcile-sweep site holds.  An ``escalation.models.Escalation`` (what
+    ``EscalationQueue.get_by_task`` returns, and what the scheduler and the
+    deterministic-recon sites hold) spells the same fact ``timestamp``.
+
+    Normalising in ONE shared place rather than at each site is the whole
+    point of this module: a per-site copy is how the same predicate ends up
+    hand-rolled five slightly-different ways.  Keeping it here — instead of
+    teaching ``escalation_ages_secs`` two field names and a precedence between
+    them — also keeps that helper's record contract single-valued.
+
+    Total and never raises: this feeds telemetry inside recovery sweeps, so a
+    corrupt record costs at most its own age, never the pass.
+    """
+    adapted: list[AgeableRecord] = []
+    for record in records or ():
+        try:
+            adapted.append(AgeableRecord(
+                id=str(record.id),
+                created_at=(
+                    getattr(record, 'created_at', None)
+                    or getattr(record, 'timestamp', None)
+                ),
+            ))
+        except Exception:  # noqa: BLE001 — a corrupt record must not abort a sweep
+            logger.debug('recovery emission: skipping an unreadable escalation record')
+    return adapted
 
 
 def _jsonable(value: Any) -> Any:

@@ -96,9 +96,11 @@ from orchestrator.recovery_emission import (
     RecoverySite,
     RecoverySweepTally,
     RecoveryVetoStreakTracker,
+    as_ageable_records,
     build_recovery_payload,
     emit_recovery_event,
     escalation_ages_secs,
+    render_shape,
     should_emit_event,
 )
 from orchestrator.repo_paths import (
@@ -9574,12 +9576,12 @@ class Harness:
 
     def _emit_recovery_disposition(
         self,
-        task_id: str,
+        task_id: str | None,
         *,
         site: RecoverySite,
         reason: LeaveReason | None,
         shape: str,
-        records: Sequence[EscalationRef] | None = None,
+        records: Sequence[Any] | None = None,
         store_unavailable: bool = False,
         tally: RecoverySweepTally | None = None,
     ) -> Observation | None:
@@ -9606,9 +9608,17 @@ class Harness:
         veto answer stays with the caller's own untouched predicate (rewiring
         that is task eta / 3541).
 
+        ``task_id=None`` is a PROCESS-scoped notice with no single subject —
+        "this whole site has no escalation queue to read".  With no subject
+        there is no per-subject signature to track, so it is latched PER SITE
+        instead of tracked: emitted once per process per site, so silencing
+        one site's notice never silences another's.
+
         Returns the :class:`Observation` (so a caller can charge the streak
-        alarm) or ``None`` when nothing was recorded.  Wholly wrapped in
-        try/except: telemetry must never be able to disturb a recovery sweep.
+        alarm) or ``None`` when nothing was recorded — including every
+        process-scoped notice, which never charges a per-task streak.  Wholly
+        wrapped in try/except: telemetry must never be able to disturb a
+        recovery sweep.
         """
         try:
             if reason is None or reason is LeaveReason.live_claimant:
@@ -9639,7 +9649,7 @@ class Harness:
             # never collapsed into "no records", which would read as a task
             # with nothing holding it.
             pins = classify_pins(
-                task_id,
+                task_id or '',
                 None if store_unavailable else list(records or ()),
                 live_claimant=False,
             )
@@ -9648,17 +9658,31 @@ class Harness:
                 'queue_handoff': list(pins.queue_handoff),
                 'non_pinning': list(pins.non_pinning),
             }
-            signature = '|'.join((
-                str(reason), shape,
-                ','.join(sorted(i for ids in buckets.values() for i in ids)),
-            ))
-            observation = tracker.observe(site, task_id, signature)
-            if not should_emit_event(
-                observation, threshold=cfg.veto_streak_threshold,
-            ):
-                # A quiet repeat of a hold already on record.  Still OBSERVED
-                # (the streak above kept climbing) — just not re-stated.
-                return observation
+
+            observation = None
+            if task_id is None:
+                latched = getattr(self, '_recovery_process_notices', None)
+                if latched is None:
+                    latched = set()
+                    self._recovery_process_notices = latched
+                if str(site) in latched:
+                    return None
+                latched.add(str(site))
+                streak = 1
+            else:
+                signature = '|'.join((
+                    str(reason), shape,
+                    ','.join(sorted(i for ids in buckets.values() for i in ids)),
+                ))
+                observation = tracker.observe(site, task_id, signature)
+                if not should_emit_event(
+                    observation, threshold=cfg.veto_streak_threshold,
+                ):
+                    # A quiet repeat of a hold already on record.  Still
+                    # OBSERVED (the streak above kept climbing) — just not
+                    # re-stated.
+                    return observation
+                streak = observation.streak
 
             now = datetime.now(UTC)
             emit_recovery_event(
@@ -9679,9 +9703,15 @@ class Harness:
                     shape=shape,
                     reason=reason,
                     escalation_ids=buckets,
-                    ages_secs=escalation_ages_secs(records, now=now),
+                    # Normalised centrally: this adapter is handed both
+                    # EscalationRefs (created_at) and raw Escalation rows
+                    # (timestamp), and a per-site copy of that reconciliation
+                    # is exactly the duplication this module exists to end.
+                    ages_secs=escalation_ages_secs(
+                        as_ageable_records(records), now=now,
+                    ),
                     store_unavailable=store_unavailable or pins.store_unavailable,
-                    streak=observation.streak,
+                    streak=streak,
                     now=now,
                 ),
             )
@@ -12567,8 +12597,12 @@ class Harness:
     ) -> None:
         """Recover a task-2059-shaped stranded deterministic task (Source A).
 
-        Dedup-guarded: skips (logging) when a pending escalation already
-        exists for *tid* — self-dedupes across sweep passes once filed.
+        Dedup-guarded: skips when a pending escalation already exists for
+        *tid* — self-dedupes across sweep passes once filed.  That skip logs
+        (unchanged) AND emits a structured ``recovery_vetoed`` naming the
+        pinning records (task 3535); the sweep's Source-A deploy branch
+        implements the same predicate and emits under its own site label, so
+        the duplication is measurable until task eta (3541) collapses it.
         Re-validates live systemd health for the deploy's target unit and
         RE-FILES a single L1 escalation — this method NEVER calls
         ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
@@ -12582,12 +12616,37 @@ class Harness:
             A human must inspect the unit before the task can be resumed.
         """
         if self._escalation_queue is None:
+            self._emit_recovery_disposition(
+                None,
+                site=RecoverySite.deterministic_recon_deploy,
+                reason=LeaveReason.escalation_store_unavailable,
+                shape=render_shape(None, None, None, None, None),
+                store_unavailable=True,
+            )
             return
-        if self._escalation_queue.get_by_task(tid, status='pending'):
+        _dedup_rows = self._escalation_queue.get_by_task(tid, status='pending')
+        if _dedup_rows:
             logger.info(
                 'Deterministic-recon-sweep: task %s already has a pending '
                 'escalation — skipping strand recovery (dedup)',
                 tid,
+            )
+            # The log line above stays the HUMAN record and the event below is
+            # the machine-readable one; neither replaces the other.  This
+            # predicate is duplicated verbatim in _run_deterministic_recon_
+            # sweep's Source-A deploy branch, which emits under its own
+            # RecoverySite.deterministic_recon_sweep label — task eta (3541)
+            # owns collapsing the pair, and until then BOTH deliberately speak
+            # so the duplication is measurable rather than assumed.
+            self._emit_recovery_disposition(
+                tid,
+                site=RecoverySite.deterministic_recon_deploy,
+                reason=LeaveReason.escalation_pinned,
+                shape=render_shape(
+                    'blocked', None, None, True,
+                    (metadata.get('deploy_state') or {}).get('phase'),
+                ),
+                records=_dedup_rows,
             )
             return
 
@@ -12938,6 +12997,16 @@ class Harness:
         and does not abort the rest of the pass.
         """
         if self._escalation_queue is None:
+            # Was a bare `return`: a fleet whose queue never materialised swept
+            # nothing, forever, and said nothing about it.  PROCESS-scoped and
+            # latched per site, so this never becomes one row per pass.
+            self._emit_recovery_disposition(
+                None,
+                site=RecoverySite.deterministic_recon_sweep,
+                reason=LeaveReason.escalation_store_unavailable,
+                shape=render_shape(None, None, None, None, None),
+                store_unavailable=True,
+            )
             return
 
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
@@ -12969,7 +13038,27 @@ class Harness:
                 if _is_deploy:
                     # Deploy strand: dedup on the pending queue, then re-file an
                     # L1 whose category depends on live systemd unit health.
-                    if self._escalation_queue.get_by_task(tid, status='pending'):
+                    _deploy_rows = self._escalation_queue.get_by_task(
+                        tid, status='pending',
+                    )
+                    if _deploy_rows:
+                        # Was a completely SILENT `continue`.  Twin of the
+                        # identical predicate at the head of
+                        # _recover_stranded_deterministic_task, which emits
+                        # under RecoverySite.deterministic_recon_deploy; task
+                        # eta (3541) owns collapsing the pair, and until then
+                        # BOTH deliberately emit so the duplication is
+                        # measurable rather than assumed.
+                        self._emit_recovery_disposition(
+                            tid,
+                            site=RecoverySite.deterministic_recon_sweep,
+                            reason=LeaveReason.escalation_pinned,
+                            shape=render_shape(
+                                'blocked', None, None, True,
+                                (metadata.get('deploy_state') or {}).get('phase'),
+                            ),
+                            records=_deploy_rows,
+                        )
                         continue
                     await self._recover_stranded_deterministic_task(tid, task, metadata)
                     recovered_this_pass.add(tid)
@@ -12983,6 +13072,12 @@ class Harness:
                     # landed / lost across a restart) re-fires.  This also
                     # self-dedupes across passes: once re-filed, the next pass
                     # sees the pending record and skips.
+                    #
+                    # DELIBERATELY silent (task 3535): PRD D3 names this
+                    # archive-inclusive role-scoped check as one of the
+                    # predicates that stays separate and documented, so
+                    # emitting here would blur a boundary drawn on purpose.
+                    # Its silence is asserted by a test, not accidental.
                     if self._escalation_queue.get_by_task(
                         tid, agent_role=DETERMINISTIC_AGENT_ROLE,
                     ):
