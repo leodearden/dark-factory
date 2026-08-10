@@ -1675,28 +1675,56 @@ def create_mcp_server(
 
         Never rejects and never mutates the write — the caller only stamps the
         tag and echoes the flag.
+
+        DELIBERATE INVERSION, do not "fix" it into a fail-open: every
+        unresolvable authority above is mapped onto a MISSING map key, which the
+        probes below turn into None, which verify_claims turns into
+        'unverifiable', which tags. The sibling gate two definitions up
+        (_premature_completion_block, task 2824) does the opposite and is right
+        to — it REJECTS, so a transient status-read failure bouncing a
+        legitimate write is worse than the stale claim it would have caught.
+        Here the costs run the other way: a spurious tag is one extra
+        source_description prefix on an episode that is kept regardless, while a
+        missed tag is another batch of false extracted edges (reify esc-5603-1:
+        five, from one sentence). The argument is written out in full in
+        completion_claim_gate.verify_claims' docstring.
+
+        Total containment: the gate is advisory machinery bolted onto the write
+        path, so no defect in it may ever cost the caller their ingestion. The
+        exception is logged at ERROR rather than swallowed quietly — a silent
+        except is how a gate stops gating without anyone noticing.
         """
-        claims = extract_completion_claims(
-            content,
-            default_project_id=project_id,
-            known_project_ids=set(_kp),
-        )
-        if not claims:
+        try:
+            claims = extract_completion_claims(
+                content,
+                default_project_id=project_id,
+                known_project_ids=set(_kp),
+            )
+            if not claims:
+                return None
+            statuses = await _claim_task_statuses(claims, project_id)
+            tickets = await _claim_ticket_rows(claims)
+            commits = await _claim_commit_presence(claims, project_id)
+            # The three probes are pure lookups over the maps resolved above:
+            # verify_claims is sync (so it stays unit-testable with no I/O), and
+            # the authorities are async, so the awaiting happens here and the
+            # adjudication there. A MISSING key is the unresolvable signal in
+            # every map.
+            verdicts = verify_claims(
+                claims,
+                task_status_probe=lambda ref, pid: statuses.get((pid, ref)),
+                ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE),
+                commit_probe=lambda ref, pid: commits.get((pid, ref)),
+            )
+            return build_unverified_flag(verdicts, text=content)
+        except Exception:
+            logger.exception(
+                'completion_claim_gate: verification raised for agent_id=%r '
+                'project_id=%r — the episode is ingested UNTAGGED; the gate is '
+                'advisory and must never cost a caller their write',
+                agent_id, project_id,
+            )
             return None
-        statuses = await _claim_task_statuses(claims, project_id)
-        tickets = await _claim_ticket_rows(claims)
-        commits = await _claim_commit_presence(claims, project_id)
-        # The three probes are pure lookups over the maps resolved above:
-        # verify_claims is sync (so it stays unit-testable with no I/O), and the
-        # authorities are async, so the awaiting happens here and the adjudication
-        # there. A MISSING key is the unresolvable signal in every map.
-        verdicts = verify_claims(
-            claims,
-            task_status_probe=lambda ref, pid: statuses.get((pid, ref)),
-            ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE),
-            commit_probe=lambda ref, pid: commits.get((pid, ref)),
-        )
-        return build_unverified_flag(verdicts, text=content)
 
     def _log_unverified_claims(flag: dict[str, Any], agent_id: str | None) -> None:
         """Emit the grep-stable operator-facing line for a flagged episode.
