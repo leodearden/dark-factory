@@ -24,6 +24,7 @@ Scheduler/BriefingAssembler, then a MagicMock scheduler) plus the
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,8 +93,21 @@ def _terminal(
     )
 
 
-async def _drive_slot(harness: Harness, terminal: TerminalReport, task_id: str = '3068'):
-    """Run ``_run_slot`` with ``build_workflow`` patched to return ``terminal``."""
+async def _drive_slot(
+    harness: Harness,
+    terminal: TerminalReport | None,
+    task_id: str = '3068',
+    *,
+    cancel: bool = False,
+    state: WorkflowState = WorkflowState.EXECUTE,
+):
+    """Run ``_run_slot`` with ``build_workflow`` patched to return ``terminal``.
+
+    ``cancel=True`` (task 3172) instead makes ``workflow.run()`` raise
+    ``asyncio.CancelledError``, driving the hard-cancel branch of ``_run_slot``.
+    ``state`` is the live workflow phase the cancel lands in, which that branch
+    reads for ``block_phase``.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'title': f'task {task_id}'}
@@ -102,7 +116,11 @@ async def _drive_slot(harness: Harness, terminal: TerminalReport, task_id: str =
 
     with patch('orchestrator.harness.build_workflow') as MockWorkflow:
         mock_wf = AsyncMock()
-        mock_wf.run.return_value = terminal
+        if cancel:
+            mock_wf.run.side_effect = asyncio.CancelledError()
+        else:
+            mock_wf.run.return_value = terminal
+        mock_wf.state = state
         mock_wf.metrics = MagicMock(
             total_cost_usd=1.25,
             total_duration_ms=4200,
@@ -194,3 +212,77 @@ class TestTaskCompletedBlockContext:
         assert data['steward_invocations'] == 0
         # Additive only: exactly the legacy keys plus the two new ones.
         assert set(data) == _LEGACY_COUNTER_KEYS | {'reason', 'block_phase'}
+
+
+# ---------------------------------------------------------------------------
+# Task 3172 — the hard-cancel path emits too
+#
+# Discovered while verifying this task's premises: the emit above sits on the
+# SUCCESS path only, so a hard-cancelled slot emitted NO task_completed at all
+# and its sole durable trace was the runs.db task_results row.  events.db had
+# nothing to GROUP BY, which is precisely the query the acceptance names
+# ("separate drain-cancelled tasks from other cancellations").
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTaskCompletedOnHardCancel:
+    """A hard-cancelled slot must be visible in events.db, with the same keys."""
+
+    async def test_hard_cancel_emits_exactly_one_task_completed(self, harness: Harness):
+        """Outcome, reason and phase all reach the payload."""
+        harness._workflow_cancel_causes['3068'] = 'terminal_status_cancel'
+
+        report = await _drive_slot(harness, None, cancel=True, state=WorkflowState.VERIFY)
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        payloads = _task_completed_payloads(harness)
+        assert len(payloads) == 1, (
+            f'expected exactly one task_completed on the cancel path, got {payloads}'
+        )
+        data = payloads[0]
+        assert data['outcome'] == WorkflowOutcome.CANCELLED.value
+        # The reason must be the RESOLVED cancel cause — the same value the
+        # synthetic report carries into runs.db, so the two stores agree.
+        assert data['reason'] == 'terminal_status_cancel'
+        assert data['reason'] == report.block_reason
+        assert data['block_phase'] == WorkflowState.VERIFY.value
+        assert data['block_phase'] == report.block_phase
+
+    async def test_drain_cancel_is_separable_in_the_payload(self, harness: Harness):
+        """The acceptance query: drain-cancelled vs any other cancellation."""
+        harness._draining = True
+
+        await _drive_slot(harness, None, cancel=True)
+
+        data = _task_completed_payloads(harness)[0]
+        assert data['outcome'] == WorkflowOutcome.CANCELLED.value
+        assert data['reason'] == 'shutdown_drain'
+
+    async def test_cancel_payload_keeps_the_legacy_key_vocabulary(
+        self, harness: Harness
+    ):
+        """Same seven counter keys as DONE/REQUEUED — a uniform row shape.
+
+        The synthetic report has no metrics (the workflow never returned one),
+        so the counters are zeros rather than omitted: DF 3068's contract is
+        that these keys are ALWAYS present, so a consumer can read every
+        task_completed row with one schema regardless of outcome.
+        """
+        harness._draining = False
+
+        await _drive_slot(harness, None, cancel=True)
+
+        data = _task_completed_payloads(harness)[0]
+        assert set(data) >= _LEGACY_COUNTER_KEYS, (
+            f'missing pre-existing counter keys: {_LEGACY_COUNTER_KEYS - set(data)}'
+        )
+        assert set(data) == _LEGACY_COUNTER_KEYS | {'reason', 'block_phase'}
+        assert data['agent_invocations'] == 0
+        assert data['execute_iterations'] == 0
+        assert data['verify_attempts'] == 0
+        assert data['review_cycles'] == 0
+        assert data['steward_cost_usd'] == 0.0
+        assert data['steward_invocations'] == 0
+        # Honest residue, not a guess: no stamped cause and not draining.
+        assert data['reason'] == 'cancelled_unattributed'

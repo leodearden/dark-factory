@@ -311,12 +311,16 @@ async def _drive_cancelled_slot(
     reason: str | None = None,
     state: WorkflowState | None = WorkflowState.EXECUTE,
     cancel_during_setup: bool = False,
+    capture_task: list | None = None,
 ):
     """Run a real _run_slot to its hard-cancel and return the synthetic report.
 
     Reuses the driver shape of test_run_slot_returns_cancelled_report_when_hard
     _cancelled: a live slot task with build_workflow patched to a wedging run(),
     then hard_cancel_workflow.
+
+    ``capture_task`` receives the wrapper asyncio.Task itself, for callers that
+    need to feed it back through ``_collect_done_reports`` (the runs.db half).
     """
     assignment = TaskAssignment(task_id=tid, task={'title': 'wedged task'}, modules=[])
     sem = asyncio.Semaphore(0)
@@ -340,6 +344,8 @@ async def _drive_cancelled_slot(
         mock_wf_cls.return_value = mock_wf
 
         wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        if capture_task is not None:
+            capture_task.append(wrapper_task)
         for _ in range(50):
             if tid in h._workflow_slot_tasks:
                 break
@@ -495,3 +501,42 @@ class TestTerminalStatusWatcherAttributesItsCancel:
         # The pre-existing restamp contract must survive the new kwarg: only
         # the threshold-CROSSING call restamps the R3 grace window.
         assert kwargs.get('restamp') is True
+
+
+@pytest.mark.asyncio
+class TestCancelledReportReachesRunStore:
+    """The runs.db half of the acceptance query (task 3172, step-21).
+
+    events.db gets the new task_completed emit; runs.db gets the same two
+    fields via ``_collect_done_reports`` → ``save_task_result``.  Pinning both
+    keeps the two stores answerable by the SAME question.
+    """
+
+    async def test_save_task_result_receives_block_reason_and_phase(
+        self, harness_for_run_slot: Harness
+    ):
+        h = harness_for_run_slot
+        captured: list = []
+
+        await _drive_cancelled_slot(
+            h,
+            '42',
+            reason='action_teardown:restart',
+            state=WorkflowState.EXECUTE,
+            capture_task=captured,
+        )
+
+        # _collect_done_reports persists whatever the slot returned.  Wire the
+        # run store only now: _run_slot itself must not need it.
+        h._run_store = MagicMock()
+        h._run_id = 'run-1'
+        h.config = MagicMock()
+        h.config.fused_memory.project_id = 'dark_factory'
+
+        h._collect_done_reports(set(captured), [])
+
+        h._run_store.save_task_result.assert_called_once()
+        saved_report = h._run_store.save_task_result.call_args.args[1]
+        assert saved_report.outcome == WorkflowOutcome.CANCELLED
+        assert saved_report.block_reason == 'action_teardown:restart'
+        assert saved_report.block_phase == WorkflowState.EXECUTE.value
