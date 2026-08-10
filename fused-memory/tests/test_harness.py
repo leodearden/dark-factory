@@ -1095,6 +1095,71 @@ class TestStage1LedgerWriteMissingPredicate:
         assert _stage1_ledger_write_missing({'error_type': 'RuntimeError'}) is False
 
 
+class TestStage2LedgerWriteMissingPredicate:
+    """`_stage2_ledger_write_missing(report)` is a pure, synchronous
+    predicate — no harness/journal/ledger fixtures needed (task 3732).
+
+    Mirrors TestStage1LedgerWriteMissingPredicate above one-for-one: the
+    Stage 2 backstop must inherit the same three structural properties —
+    `== 0` (never `!= 1`) keying, exclusion of the arm's own degraded synth,
+    and non-StageReport tolerance.
+    """
+
+    @staticmethod
+    def _report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+    def test_explicit_zero_stat_returns_true(self):
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(stage2_cycle_summary_ledger_written=0)
+        assert _stage2_ledger_write_missing(report) is True
+
+    def test_explicit_one_stat_returns_false(self):
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(stage2_cycle_summary_ledger_written=1)
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_absent_stat_returns_false(self):
+        """The no-fire rule that keeps `_mock_stage_run`-shaped reports
+        (stats={}) — and any Stage 2 that died before reaching its own
+        write — inert."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report()
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_degraded_backstop_synth_is_excluded(self):
+        """The degraded-synth arm's own row must never re-trigger the
+        write-recovered arm — the two arms can never double-process."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(
+            stage2_cycle_summary_ledger_written=0,
+            stage2_cycle_summary_degraded_backstop=True,
+        )
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_non_stagereport_object_returns_false(self):
+        """A plain dict — the `_error` / journal-round-trip shape
+        `run.stage_reports` is typed to allow — has no .stats attribute at
+        all and must not raise."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        assert _stage2_ledger_write_missing({'error_type': 'RuntimeError'}) is False
+
+
 # ---------------------------------------------------------------------------
 # Task 2440: harness-level backstop for the Stage 1 cycle_summary write.
 #
