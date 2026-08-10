@@ -186,6 +186,20 @@ _COLLECTION_TOOL: dict[str | None, str] = {
 }
 
 
+def _is_authored(value: object) -> bool:
+    """True when *value* already holds real content, i.e. is NOT a hole.
+
+    A blank/whitespace-only str, ``None``, and an empty list/dict are holes a
+    recovery may legitimately fill. Anything else is authored content that a
+    recovery must never displace — including a NON-str value such as the
+    ``files`` list, which the string-only reading would have mistaken for a
+    hole and happily overwritten with a recovered string.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
 def _repair_one_field(
     holder: dict[str, Any],
     index: int | None,
@@ -209,6 +223,21 @@ def _repair_one_field(
     silently mutilate that authored text, which is the same class of
     silent-wrong-value damage this whole PRD exists to end. Never partial,
     never guessed.
+
+    A RECOVERY ONLY EVER FILLS A HOLE. ``supplied`` is computed as the sibling
+    fields of this same record that already hold authored content, so a
+    recovered parameter can land only in an EMPTY or ABSENT sibling and can
+    never overwrite real text. That rule is not fussiness: on disk the sibling
+    key normally EXISTS (the tool wrote every field), and worktree 3024's live
+    plans show the retry fingerprint — a corrupted decision still carrying the
+    absorbed rationale while the record's own rationale field holds genuine,
+    later-authored prose. At read time those two are indistinguishable, so
+    clobbering the authored one would be precisely the silent-wrong-value
+    failure this surface exists to prevent.
+
+    The collision check itself is NOT re-implemented here: ``supplied`` is
+    handed to ``repair()``, whose accept-time disjointness condition (PRD
+    boundary row B9) does the refusing. One mechanism, per INV-5.
     """
     value = holder.get(record.field)
     if not isinstance(value, str):
@@ -219,11 +248,16 @@ def _repair_one_field(
         # anywhere in the value, so repair() is never called.
         return None
 
+    supplied = frozenset(
+        name
+        for name in record.schema_params
+        if name != record.field and _is_authored(holder.get(name))
+    )
     result = repair(
         value,
         param=record.field,
         schema_params=record.schema_params,
-        supplied=frozenset(),
+        supplied=supplied,
     )
     if result is None:
         return {
@@ -241,6 +275,11 @@ def _repair_one_field(
         }
 
     holder[record.field] = result.clean_value
+    # Every recovered value is a verbatim slice of the absorbing field (D5,
+    # guaranteed by construction in ``repair``), and every target here was
+    # proven a hole by the ``supplied`` set above.
+    for name, recovered_value in result.recovered.items():
+        holder[name] = recovered_value
     return {
         'tool': _COLLECTION_TOOL[record.collection],
         'param': record.field,
