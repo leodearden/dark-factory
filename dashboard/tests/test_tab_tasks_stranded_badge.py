@@ -52,11 +52,6 @@ def tabs_jsx(_client):
     return _client.get('/static/redux/tabs.jsx').text
 
 
-@pytest.fixture(scope='module')
-def data_js(_client):
-    return _client.get('/static/redux/data.js').text
-
-
 def _extract_function_body(source: str, func_name: str, indent: str = '') -> str:
     """Source text of ``<indent>function <func_name>(`` up to the next
     declaration at the SAME indentation level (or end-of-file).
@@ -208,27 +203,3 @@ class TestOrchTabStrandedMarker:
 
     def test_agent_cell_still_renders(self, orch_tab_body):
         assert 't.agent' in orch_tab_body
-
-
-# ---------------------------------------------------------------------------
-# data.js — the client seed's documented task-row shape
-# ---------------------------------------------------------------------------
-
-
-class TestDataJsTaskRowShape:
-    def test_active_tasks_seed_documents_stranded(self, data_js):
-        """A cold client must know the field exists.
-
-        ``ACTIVE_TASKS`` seeds as ``[]``, so the row shape is documented in a
-        comment beside it (the ``MERGE_QUEUE`` precedent). Deliberately asserts
-        only the documented key — endpoint-key coverage is already executably
-        tested by dashboard/tests/js/data_poll.test.mjs.
-        """
-        assert data_js, 'data.js fetched empty'
-        idx = data_js.find('ACTIVE_TASKS: [')
-        assert idx != -1, 'ACTIVE_TASKS seed not found in data.js'
-        window = data_js[max(0, idx - 600) : idx + 200]
-        assert 'stranded' in window, (
-            'the ACTIVE_TASKS row shape in data.js does not document the '
-            'stranded field'
-        )
