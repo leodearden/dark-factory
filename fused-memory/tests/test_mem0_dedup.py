@@ -385,25 +385,3 @@ async def test_child_records_survive_to_the_per_record_post_filter():
     assert sightings == [sighting], (
         f'A child record must survive to the per-record post-filter, got {sightings!r}'
     )
-
-
-def test_memory_service_search_does_not_import_the_suppression_filter():
-    """The suppression filter has exactly ONE home: server/grouped_read.py.
-
-    A structural guard, so a future refactor that pushes grouping down a layer
-    fails here rather than silently hiding child records from every raw
-    ``MemoryService.search`` consumer.
-    """
-    import inspect
-
-    from fused_memory.services import memory_service as memory_service_module
-
-    source = inspect.getsource(memory_service_module)
-    assert 'grouped_read' not in source, (
-        'services/memory_service.py must not reference server/grouped_read — '
-        'grouping belongs at the MCP tool layer only (task 3129 / PRD V2 bullet 4)'
-    )
-    assert 'group_search_results' not in source, (
-        'MemoryService.search must return RAW results; grouping is applied by the '
-        'MCP tool wrappers only'
-    )

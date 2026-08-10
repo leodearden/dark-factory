@@ -19,8 +19,14 @@ LAYERING CONSTRAINT (load-bearing — see ``server/tools.py``'s call sites and
     ``reconciliation/mem0_dedup.py::find_prior_memories``, whose per-record
     ``task_id``/``kind`` post-filter iterates RAW service results — hiding
     duplicates from the recon dedup detector and candidates from the
-    near-duplicate write guard.  A live test pins this, not just this
-    comment.
+    near-duplicate write guard.
+
+    The consumer contract that protects is pinned behaviourally by
+    ``fused-memory/tests/test_mem0_dedup.py::
+    test_child_records_survive_to_the_per_record_post_filter``, which drives
+    ``find_prior_memories`` over amendment and sighting rows and asserts both
+    reach that post-filter and come back.  It is a test of what the consumer
+    receives, not a structural check on where the code lives.
 
 Shaped as a sibling of ``server/near_duplicate_guard.py``: duck-typed
 service parameter, no runtime ``MemoryService`` import for typing, caps as
