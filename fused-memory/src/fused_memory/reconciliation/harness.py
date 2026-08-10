@@ -3360,6 +3360,37 @@ class ReconciliationHarness:
           the authoritative presence signal ``get_cycle_summary_presence``
           reads, not either stat.
 
+        - **Degraded-synth arm** — the ``task_knowledge_sync`` entry is
+          present but is NOT a ``StageReport``: the plain-dict shape
+          ``run.stage_reports`` (typed ``dict[str, StageReport | dict]``) is
+          allowed to hold. This is production-reachable, not defensive
+          fiction — ``journal`` reconstructs ``StageReport(**v)`` only when
+          the stored value ``isinstance(v, dict) and 'stage' in v``, and
+          otherwise keeps the raw dict, so an adopted/resumed run can carry
+          one. It is the only remaining shape where Stage 2 demonstrably
+          produced a report yet no faithful re-attempt is possible, so it is
+          the one place a synthesized row is honest rather than fabricated.
+
+          The synthesized report is honestly degraded: ``llm_calls`` and
+          ``tokens_used`` are 0 and ``started_at`` is the whole-cycle anchor
+          rather than Stage 2's real start — all unrecoverable once the real
+          report is gone — so the implied duration is an upper bound, not a
+          measurement. Zeroed means "unrecoverable", NOT "no work happened":
+          a consumer summing ``llm_calls``/``tokens_used`` across cycles must
+          filter ``stats['stage2_cycle_summary_degraded_backstop']`` rows
+          first or it will silently undercount. That stat is the row's
+          non-negotiable self-identification. When the run already carries an
+          ``_error`` record, the arm stamps its outcome there as a breadcrumb
+          rather than adding a new top-level ``stage_reports`` key — the same
+          place operators already look for a failed cycle's diagnosis.
+
+        The two arms are mutually exclusive by construction: the first
+        requires a real ``StageReport``, the second requires the entry NOT be
+        one. :func:`_stage2_ledger_write_missing` additionally excludes any
+        report stamped ``stage2_cycle_summary_degraded_backstop``, so even a
+        synthesized row round-tripping back through here cannot be
+        double-processed.
+
         Unlike Stage 1's arm 2, this method applies NO ``RunType.remediation``
         exclusion. Stage 1 excludes remediation because its own ``run()``
         early-returns before its summary write on such a pass, so firing
@@ -3398,38 +3429,80 @@ class ReconciliationHarness:
             isinstance(s2_report, StageReport)
             and _stage2_ledger_write_missing(s2_report)
         )
-        if not write_recovered:
+        # Report present but NOT a usable StageReport: Stage 2 demonstrably ran
+        # and produced something, so a row is honest — but its real numbers are
+        # unrecoverable, so the row is degraded rather than re-attempted.
+        degraded = not isinstance(s2_report, StageReport)
+        if not (write_recovered or degraded):
             return
 
         try:
-            # Stamped True *before* the call: write_stage2_cycle_summary
-            # serializes report.stats into the ledger row's payload_json
-            # synchronously, at call time — a post-call mutation can never
-            # retroactively reach an already-persisted row, so this is the only
-            # way a successful re-attempt's OWN ledger row carries the marker.
-            s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = True
-            try:
-                # Shielded against a second cancellation arriving mid-write; the
-                # write keeps running to completion in its own Task.
+            if write_recovered and isinstance(s2_report, StageReport):
+                # Stamped True *before* the call: write_stage2_cycle_summary
+                # serializes report.stats into the ledger row's payload_json
+                # synchronously, at call time — a post-call mutation can never
+                # retroactively reach an already-persisted row, so this is the only
+                # way a successful re-attempt's OWN ledger row carries the marker.
+                s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = True
+                try:
+                    # Shielded against a second cancellation arriving mid-write; the
+                    # write keeps running to completion in its own Task.
+                    ledger_written = await asyncio.shield(
+                        write_stage2_cycle_summary(
+                            self.memory, project_id, s2_report, run_id,
+                            remediation=remediation,
+                        )
+                    )
+                except BaseException:
+                    s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
+                    raise
+                if not ledger_written:
+                    s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
+                logger.warning(
+                    'reconciliation.stage2_cycle_summary_write_recovered',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'ledger_written': ledger_written,
+                    },
+                )
+            else:
+                degraded_report = StageReport(
+                    stage=StageId.task_knowledge_sync,
+                    # Whole-cycle anchor, not Stage 2's real start (see docstring).
+                    started_at=cycle_start_time,
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={'stage2_cycle_summary_degraded_backstop': True},
+                    # Zeroed means "unrecoverable", NOT "no work happened" (see
+                    # docstring). Dashboards summing llm_calls/tokens across cycles
+                    # must filter out stats['stage2_cycle_summary_degraded_backstop']
+                    # rows first, or they will silently undercount.
+                    llm_calls=0,
+                    tokens_used=0,
+                )
+                # Shielded against a second cancellation arriving mid-write (see
+                # docstring); the write keeps running to completion in its own Task.
                 ledger_written = await asyncio.shield(
                     write_stage2_cycle_summary(
-                        self.memory, project_id, s2_report, run_id,
+                        self.memory, project_id, degraded_report, run_id,
                         remediation=remediation,
                     )
                 )
-            except BaseException:
-                s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
-                raise
-            if not ledger_written:
-                s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
-            logger.warning(
-                'reconciliation.stage2_cycle_summary_write_recovered',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'ledger_written': ledger_written,
-                },
-            )
+                logger.warning(
+                    'reconciliation.stage2_cycle_summary_backstop_fired',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'ledger_written': ledger_written,
+                    },
+                )
+                # Breadcrumb on the existing _error record (when present) rather than
+                # a new top-level stage_reports key — keeps this observable from the
+                # same place operators already look for a failed cycle's diagnosis.
+                error_record = run.stage_reports.get('_error')
+                if isinstance(error_record, dict):
+                    error_record['stage2_cycle_summary_backstop_written'] = ledger_written
         except BaseException:
             # BaseException (not Exception): also catches a second cancellation
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
