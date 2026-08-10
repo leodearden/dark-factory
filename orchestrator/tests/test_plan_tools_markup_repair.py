@@ -32,6 +32,7 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -329,8 +330,24 @@ _TRAILING_ANALYSIS = (
 )
 
 
-def _all_strings(value, path=()):
-    """Every str in a nested plan document, keyed by its full path."""
+#: A path to one string inside a plan document: dict keys and list indices.
+_Path = tuple[str | int, ...]
+
+
+def _all_strings(
+    value, path: _Path = ()
+) -> Iterator[tuple[_Path, str]]:
+    """Every str in a nested plan document, keyed by its full path.
+
+    Both the ``path`` parameter and the return are annotated rather than
+    inferred. ``value`` is deliberately untyped (a plan document is arbitrary
+    nested JSON), which puts this function on pyright's call-site return
+    inference path, and the recursive ``yield from`` defeats that inference --
+    it falls back to the bare ``()`` default's type, ``tuple[()]``. Callers
+    then see an empty-tuple key, making every ``path[0]`` / ``path[-1]`` an
+    out-of-range index error. The explicit return type pins the real key type:
+    a mix of dict keys (str) and list indices (int).
+    """
     if isinstance(value, str):
         yield path, value
     elif isinstance(value, dict):
