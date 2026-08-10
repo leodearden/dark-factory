@@ -15697,10 +15697,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         status=InflightStatus.REQUEUED,
                     )
         except RunnerUnavailable as exc:
-            # Remote transport failure: do NOT clean merge_wt — the item will
-            # be re-dispatched on a free host (local fallback) with its worktree
-            # intact.  _finalize_inflight calls quarantine_and_release so the
-            # dead remote is quarantined before the re-dispatch.
+            # Remote transport failure: do NOT clean merge_wt HERE — it is
+            # returned un-cleaned so the _finalize_inflight chokepoint can
+            # dispose of it there (task 3251), adjacent to the _remerge that
+            # allocates its replacement.  The re-dispatch does NOT reuse this
+            # worktree: _remerge mints a fresh _merge-<uuid> for the retry.
+            # Disposal is deferred rather than done here so it cannot delay
+            # quarantine_and_release, which _finalize_inflight runs first to
+            # bench the dead remote before the re-dispatch.
             logger.warning(
                 'Task %s: remote runner unavailable (merge=%s) — '
                 'will re-dispatch on another host',
@@ -16422,7 +16426,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             ),
                             event_store=self._event_store,
                         )
-                self._deregister_owned_merge_worktree(vr.merge_wt)
+                # ── Dispose of the RU'd merge worktree (task 3251) ──────────
+                # _run_inflight_verify returns merge_wt UN-cleaned precisely so
+                # this chokepoint can dispose of it here, adjacent to the
+                # _remerge that allocates its replacement.  It is FULLY
+                # RECLAIMED, not merely deregistered: _remerge mints a fresh
+                # _merge-<uuid> and never reuses this one, and _record_dead_base
+                # four lines below has just declared its merge commit dead, so
+                # there is nothing left to hold a worktree slot for.  Without
+                # this the path stayed in _owned_merge_worktrees for the life of
+                # the process — one stranded entry per RU re-dispatch — where
+                # _touch_owned_merge_worktrees re-pinned its ROOT-inode mtime
+                # every heartbeat (the liveness signal the disk-scan coalesce arm
+                # reads), keep_worktrees exempted it from reaping, and
+                # worktree_ledger_violations could not see it (that audit flags
+                # only worktrees ABSENT from the ledger).
+                #
+                # _release_or_cleanup, NOT _cleanup_owned_merge_worktree: that
+                # method's own documented selection rule makes this mandatory
+                # wherever a spec_warm value is in scope, and the warm case is
+                # REACHABLE here — a LOCAL lease dispatches with runner=None
+                # through the worker's own runner pool, whose INV-2
+                # contract-currency gate raises RunnerUnavailable after the warm
+                # swap has already run, so vr.merge_wt can be a pool-owned
+                # _spec- lane that must be RELEASED rather than removed.
+                #
+                # Ordered BEFORE _remerge (and after quarantine_and_release,
+                # which is the time-sensitive half): _remerge may return a
+                # worktree-less DecidedItem or raise, so disposing afterwards
+                # would re-open the leak on exactly those paths.  This restores
+                # parity with _void_and_remerge and the FAIL/skip branch, whose
+                # disposal lines this one mirrors.  No contextlib.suppress: both
+                # arms deregister unconditionally and both git_ops calls are
+                # documented never-raise, so a residual directory degrades to an
+                # ordinary unregistered orphan the grace-window reaper claims.
+                await self._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
                 # Re-merge against actual main and front-insert into _redispatch
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will

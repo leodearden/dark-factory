@@ -1430,7 +1430,10 @@ class InflightVerifyResult:
                   InflightStatus.DROPPED             — sole-waiter abandoned; merge_wt cleaned
                   InflightStatus.REQUEUED             — operator halt; req re-queued on _queue
                   InflightStatus.RUNNER_UNAVAILABLE — remote runner raised RunnerUnavailable;
-                                        merge_wt NOT cleaned (will be re-dispatched)
+                                        merge_wt NOT cleaned at the raise site — it is carried
+                                        to _finalize_inflight, which disposes of it via
+                                        _release_or_cleanup before _remerge allocates the
+                                        replacement _merge-<uuid> (task 3251)
     reason      : str(exc) from the RunnerUnavailable exception when status is
                   InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
                   the unavailability tracker + alarm to name the actual failure cause
