@@ -1577,3 +1577,317 @@ class TestINV2StructuredFacts:
 
         assert h.facts == []
         assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B10 — the storm escape (INV-4).
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A hand-advanced clock, so a 3600s window is exercised without sleeping."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestB10StormEscape:
+    """Repair is a FAIL-SOFT path, so it carries the rate/streak escalation.
+
+    One corrupted call is routine — the measured rate is 0.26%. A BURST means
+    the upstream serialization leak is running RIGHT NOW, which is the
+    condition worth an operator's attention rather than a log line.
+
+    The generalisation this task owns is the key. The write-time counter keys
+    bursts by project alone, which was enough when the only outcome was
+    "rejected". With two tiers there are three outcomes, and a burst of
+    REPAIRS is exactly as urgent as a burst of rejections while being, by
+    construction, invisible to every caller — the calls all succeeded.
+    """
+
+    STORM_TOOL = 'escalate_info'
+
+    def _harness(self, policy, clock, **kwargs):
+        return build_harness(
+            policy, time_provider=clock, storm_threshold=3, storm_window_seconds=3600.0, **kwargs
+        )
+
+    async def _repair(self, h, project='/srv/alpha'):
+        """One FORWARD_REPAIR repair attributed to *project*."""
+        await h.call(
+            self.STORM_TOOL,
+            {
+                'summary': 's',
+                'detail': TestB3StrandRiskTierForwards.DETAIL,
+                'project_root': project,
+            },
+        )
+
+    async def _reject(self, h, project='/srv/alpha'):
+        """One REJECT_WITH_REPAIR rejection attributed to *project*."""
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                self.STORM_TOOL,
+                {
+                    'summary': 's',
+                    'detail': TestB3StrandRiskTierForwards.DETAIL,
+                    'project_root': project,
+                },
+            )
+        return excinfo
+
+    async def _unrepairable(self, h, project='/srv/alpha'):
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory',
+                {
+                    'content': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'category': 'observations_and_summaries',
+                    'project_id': 'dark_factory',
+                    'project_root': project,
+                    'agent_id': 'claude-caller',
+                },
+            )
+
+    @staticmethod
+    def _storms(h) -> list[dict[str, Any]]:
+        """The escalations that are STORMS, not residue records."""
+        return [e for e in h.escalations if e.get('error_type') == 'mcp_markup_storm']
+
+    # -- a burst of REPAIRS escalates --------------------------------------
+
+    async def test_three_repairs_in_the_window_fire_exactly_one_storm(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._repair(h)
+            clock.advance(60)
+
+        assert len(self._storms(h)) == 1
+
+    async def test_the_storm_names_the_outcome_that_burst(self):
+        """Not merely "markup rejections".
+
+        A burst of repairs is invisible to every caller — the calls all
+        succeeded — so a record that could not say WHICH outcome burst would
+        send an operator looking for failures that never happened.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._repair(h)
+            clock.advance(60)
+
+        assert self._storms(h)[0]['outcome'] == 'repaired'
+
+    async def test_the_storm_carries_the_count_threshold_window_and_projects(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+        assert storm['window_seconds'] == 3600.0
+        assert storm['project'] == '/srv/alpha'
+
+    # -- the rate limit, and the window ------------------------------------
+
+    async def test_a_fourth_event_inside_the_window_does_not_re_fire(self):
+        """Without the rate limit a runaway would file one escalation per call."""
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(4):
+            await self._repair(h)
+            clock.advance(60)
+
+        assert len(self._storms(h)) == 1
+
+    async def test_a_fresh_burst_after_the_window_fires_again(self):
+        """The leak coming back is news again — the alarm must not latch off."""
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._repair(h)
+            clock.advance(60)
+        clock.advance(3600 * 2)
+        for _ in range(3):
+            await self._repair(h)
+            clock.advance(60)
+
+        assert len(self._storms(h)) == 2
+
+    # -- the key is (project, outcome) -------------------------------------
+
+    async def test_two_outcomes_on_one_project_do_NOT_pool(self):
+        """The generalisation this task owns.
+
+        2 repairs plus 2 rejections is four corrupted calls, but neither KEY
+        crossed the threshold. Pooling them would fire an alarm naming an
+        outcome that never burst, and an operator chasing a three-repair burst
+        that does not exist learns to ignore the alarm.
+        """
+        clock = _Clock()
+        forward = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+        reject = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(2):
+            await self._repair(forward)
+            clock.advance(60)
+            await self._reject(reject)
+            clock.advance(60)
+
+        assert self._storms(forward) == []
+        assert self._storms(reject) == []
+
+    async def test_three_rejections_fire_a_burst_naming_rejected(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(3):
+            await self._reject(h)
+            clock.advance(60)
+
+        assert [s['outcome'] for s in self._storms(h)] == ['rejected']
+
+    async def test_two_projects_do_not_pool(self):
+        """One server serves every project.
+
+        A window that mixed them would file the escalation into whichever
+        project happened to cross the threshold, while the actually-leaking
+        project got nothing — the failure MarkupStormCounter's own docstring
+        records.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for project in ('/srv/alpha', '/srv/beta', '/srv/alpha'):
+            await self._repair(h, project=project)
+            clock.advance(60)
+
+        assert self._storms(h) == []
+
+    async def test_an_unrepairable_burst_keys_independently(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._unrepairable(h)
+            clock.advance(60)
+
+        assert [s['outcome'] for s in self._storms(h)] == ['unrepairable']
+
+    async def test_a_residue_escalation_is_filed_for_every_unrepairable_call(self):
+        """The storm's rate limit must not suppress the residue records.
+
+        They answer different questions — "is a leak running?" versus "where is
+        this caller's data?" — and rate-limiting the second would discard
+        payloads.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._unrepairable(h)
+            clock.advance(60)
+
+        residue = [e for e in h.escalations if e.get('error_type') == 'mcp_markup_unrepairable']
+        assert len(residue) == 3
+
+    # -- the caller-facing half --------------------------------------------
+
+    async def test_the_storm_summary_is_folded_into_the_rejection(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(2):
+            await self._reject(h)
+            clock.advance(60)
+        excinfo = await self._reject(h)
+
+        storm = _reject_payload(excinfo)['storm']
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+
+    async def test_the_storm_key_is_OMITTED_when_no_burst_fired(self):
+        """Presence is the signal — markup_tripwire's convention.
+
+        A key set to null would make "no burst" and "a burst reported as
+        nothing" the same wire shape.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        excinfo = await self._reject(h)
+
+        assert 'storm' not in _reject_payload(excinfo)
+
+    async def test_the_unrepairable_refusal_also_carries_a_fired_storm(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.REJECT_WITH_REPAIR, clock)
+
+        for _ in range(2):
+            await self._unrepairable(h)
+            clock.advance(60)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory',
+                {
+                    'content': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'project_root': '/srv/alpha',
+                },
+            )
+
+        assert _reject_payload(excinfo)['storm']['count'] == 3
+
+    # -- exemptions and overrides are not events ---------------------------
+
+    @BOTH_POLICIES
+    async def test_exemptions_and_overrides_never_count_toward_a_burst(self, policy):
+        clock = _Clock()
+        h = self._harness(
+            policy, clock, exempt_tools=frozenset({'scan_memory_content'})
+        )
+
+        for _ in range(6):
+            await h.call('scan_memory_content', {'needle': _closer('content')})
+            await h.call(
+                'submit_task',
+                {
+                    'title': 't',
+                    'description': 'quoting ' + _closer('content'),
+                    'metadata': {'allow_mcp_markup': True},
+                },
+            )
+            clock.advance(60)
+
+        assert h.escalations == []
+
+    async def test_the_counter_is_per_instance(self):
+        """No burst state bleeds between servers, or between tests."""
+        clock = _Clock()
+        first = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+        second = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(2):
+            await self._repair(first)
+            clock.advance(60)
+        for _ in range(2):
+            await self._repair(second)
+            clock.advance(60)
+
+        assert self._storms(first) == []
+        assert self._storms(second) == []
