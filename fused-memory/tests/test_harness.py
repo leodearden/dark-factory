@@ -2086,6 +2086,71 @@ class TestStage2CycleSummaryHarnessBackstop:
             'the two arms self-identify with distinct markers'
         )
 
+    @pytest.mark.asyncio
+    async def test_write_returns_false_stamps_marker_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The recovered-backstop marker must reflect the re-attempt's ACTUAL
+        outcome, not merely that a re-attempt was made. If the re-attempt also
+        fails (returns False — e.g. the transient ledger fault hasn't cleared),
+        the marker must be stamped False, not a false-positive True that would
+        read to an operator/dashboard as 'recovery succeeded'."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(return_value=False),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that itself fails must stamp False, not True — the marker '
+            'must never claim recovery succeeded when no ledger row was actually created'
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_raises_corrects_marker_to_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Complements the False-return case: if the re-attempt RAISES, the
+        optimistic True stamped before the call (needed so a genuinely
+        successful re-attempt's OWN ledger row — serialized synchronously at
+        call time — carries the marker) must be caught and corrected back to
+        False, and the exception must never escape the finally block. The
+        cycle itself must still complete; only the best-effort write failed."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed, (
+            'a failing backstop re-attempt must not fail the overall cycle'
+        )
+        mock_write.assert_awaited_once()
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that raises must correct the marker to False, never leave '
+            'it falsely True'
+        )
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
