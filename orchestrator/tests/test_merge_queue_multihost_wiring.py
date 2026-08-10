@@ -2247,7 +2247,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         """The RU'd worktree leaves the ledger — and stops being heartbeat-pinned."""
         import os
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         # escalate_after_n high so the unavailability alarm never fires and
         # cannot confound the ledger assertions.
@@ -2260,7 +2260,20 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         worker._register_owned_merge_worktree(old_wt)
         assert old_wt in worker._owned_merge_worktrees  # precondition
 
-        remerged = MagicMock(spec=SpeculativeItem)
+        # A REAL RealMergeItem, not MagicMock(spec=SpeculativeItem): the latter
+        # is a TypeAlias (RealMergeItem | DecidedItem), so the mock specs a
+        # UnionType, exposes no `.request`, and trips snapshot()'s
+        # item_merge_wt() assert_never.  Production's _remerge re-merges THIS
+        # request into a FRESH _merge-<uuid>, so this is also the faithful shape.
+        # It registers nothing in the ledger, so any entry left at the end is a
+        # stranded RU'd worktree and nothing else.
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=entry.item.merge_result,
+            merge_wt=tmp_path / '_merge-new',
+            base_sha='base456',
+            speculative=False,
+        )
         with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
             result = await worker._finalize_inflight(entry)
 
@@ -2287,15 +2300,23 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
     async def test_ru_redispatch_ledger_does_not_accumulate(self, tmp_path):
         """N successive RU re-dispatches must not grow the ledger by N entries."""
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
 
         # The stubbed _remerge registers NOTHING, so every ledger entry left
         # behind at the end is a stranded RU'd worktree and nothing else.
-        remerged = MagicMock(spec=SpeculativeItem)
-        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+        async def _fake_remerge(request, started_monotonic):
+            return RealMergeItem(
+                request=request,
+                merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
+                merge_wt=tmp_path / f'_merge-new-{request.request_id[:8]}',
+                base_sha='base456',
+                speculative=False,
+            )
+
+        with patch.object(worker, '_remerge', new=AsyncMock(side_effect=_fake_remerge)):
             for n in range(3):
                 wt = tmp_path / f'_merge-{n}'
                 wt.mkdir()

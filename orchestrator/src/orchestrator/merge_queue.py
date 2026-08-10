@@ -16422,6 +16422,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             ),
                             event_store=self._event_store,
                         )
+                self._deregister_owned_merge_worktree(vr.merge_wt)
                 # Re-merge against actual main and front-insert into _redispatch
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
