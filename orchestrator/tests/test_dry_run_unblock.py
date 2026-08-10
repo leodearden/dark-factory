@@ -23,7 +23,7 @@ from _orch_helpers import (
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,8 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  model='sonnet', max_turns=50, effort='high', backend='claude',
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
                  b3_proposal_keep_last=5, working_idle_secs=1800.0,
-                 invocation_timeout=7200.0):
+                 invocation_timeout=7200.0, project_root=None,
+                 transcript_archive=None):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
@@ -129,6 +130,23 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     # RoleDefaults(ua_cfg.*) base stands — byte-equivalent to pre-η.
     skip_role_config_layer(cfg)
     stamp_stock_routing_config(cfg)
+    # task 3271: run_dry_run_unblock's finally now archives the
+    # per-investigation config dir via archive_task_transcripts, reading
+    # config.project_root / config.transcript_archive.root. Under spec_set
+    # BOTH auto-vivify as MagicMocks and `Path(MagicMock() / MagicMock())`
+    # raises TypeError INSIDE the hook, which its except-Exception would
+    # swallow into a WARNING on every one of the ~30 call sites below — a
+    # suite that logs a real-looking archival failure 30x per run is exactly
+    # the noise that trains reviewers to ignore the signal. So stamp REAL
+    # values: archival OFF by default (these tests genuinely do not exercise
+    # it, and an enabled default would leak archive trees under the repo or
+    # /tmp), and ON only where a caller passes a real project_root. The
+    # production-on path is covered explicitly by TestDryRunTranscriptArchival.
+    cfg.project_root = Path(project_root) if project_root is not None else Path('.')
+    cfg.transcript_archive = (
+        transcript_archive if transcript_archive is not None
+        else TranscriptArchiveConfig(enabled=False)
+    )
     return cfg
 
 

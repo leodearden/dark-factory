@@ -32,7 +32,7 @@ from _orch_helpers import (
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults, RoutingDecision
@@ -409,6 +409,15 @@ def _unblock_config():
     cfg.invocation_timeout = 7200.0
     skip_role_config_layer(cfg)
     stamp_stock_routing_config(cfg)
+    # task 3271: run_dry_run_unblock's finally archives the per-investigation
+    # config dir, reading config.project_root / config.transcript_archive.root.
+    # Under spec_set both auto-vivify as MagicMocks and the hook's internal
+    # Path() coercion raises TypeError, which its except-Exception would turn
+    # into a spurious WARNING on every routing test here. Stamp real values
+    # with archival OFF — these tests pin ROUTING, not archival, and the
+    # archival behaviour is covered by test_dry_run_unblock.py.
+    cfg.project_root = Path('.')
+    cfg.transcript_archive = TranscriptArchiveConfig(enabled=False)
     return cfg
 
 
