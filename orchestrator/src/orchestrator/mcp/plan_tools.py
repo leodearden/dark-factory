@@ -417,6 +417,94 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
+#: Stable event name for a structured markup fact (INV-2). plan-tools is a bare
+#: stdio subprocess with no event bus reachable, so the log IS the channel — and
+#: for that to be usable the WHOLE message must be the payload. One line, one
+#: fact, ``json.loads``-able; never a value a consumer has to regex out of prose.
+_MARKUP_FACT_EVENT = 'plan_markup_repaired'
+
+#: Stable event name for a repair that could not be PERSISTED. Deliberately
+#: distinct from the fact event: the repair itself succeeded and was served, so
+#: folding the two would make a delivery failure look like a detection outcome.
+_MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
+
+
+def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, Any]]]:
+    """Read the plan, repairing envelope-markup corruption on the way through.
+
+    THE ONE READ PATH for every plan-tools mutation helper. Returns
+    ``(plan, facts)``: the plan as the caller should see it, and the structured
+    facts describing every field this read touched or refused (empty on the
+    overwhelmingly common clean path).
+
+    LAZY, NOT SWEPT. The corruption sits in LIVE ``.task/plan.json`` files
+    belonging to running tasks, so a fleet-wide sweep would have to quiesce
+    every lane first. Repairing at read time needs no quiesce at all: the next
+    tool call any agent makes fixes its own plan, in place, atomically.
+
+    WRITTEN BACK ONLY WHEN SOMETHING ACTUALLY CHANGED. A plan whose every fact
+    is ``'unrepairable'`` is byte-identical to what is already on disk, so
+    rewriting it would churn the file — and its mtime, under every watcher —
+    to no effect. Same for a wholly clean plan, which never reaches the write
+    at all. Reads stay reads.
+
+    TOTAL BY CONSTRUCTION. Missing plan -> ``artifacts.read_plan()``'s empty
+    dict, returned untouched with no facts and no write; an unparseable plan
+    raises exactly what ``read_plan`` already raises. This surface adds no new
+    failure mode to a path every tool depends on.
+
+    AND A WRITE-BACK FAILURE NEVER WITHHOLDS THE REPAIR. It is logged loudly
+    and the in-memory repaired plan is still returned, because the alternative
+    — refusing to serve a plan because its repair could not be persisted —
+    hands the caller the CORRUPTED text back, which is strictly worse than
+    today's behaviour and is exactly the failure this surface exists to end.
+    """
+    plan = artifacts.read_plan()
+    if not plan:
+        return plan, []
+
+    repaired, facts = _repair_plan_fields(plan)
+    if not facts:
+        return repaired, facts
+
+    plan_path = artifacts.root / 'plan.json'
+    for fact in facts:
+        logger.warning(
+            json.dumps({
+                'event': _MARKUP_FACT_EVENT,
+                'path': str(plan_path),
+                **fact,
+            })
+        )
+
+    if not any(fact['outcome'] == 'repaired' for fact in facts):
+        # Every fact was a refusal: nothing in the document changed, so there
+        # is nothing to persist. This is what keeps a plan that legitimately
+        # QUOTES the sentinels in prose (worktree 2939) byte-stable forever.
+        return repaired, facts
+
+    try:
+        _atomic_write_plan(plan_path, repaired)
+    except Exception as exc:
+        # Broad on purpose: the caller must receive the repaired plan whatever
+        # went wrong on the way to disk. mkstemp and the json.dumps in
+        # _atomic_write_plan both raise outside its own PlanWriteError wrapper
+        # (OSError / TypeError / ValueError), so narrowing here would turn a
+        # persistence failure into a failed tool call.
+        logger.warning(
+            json.dumps({
+                'event': _MARKUP_WRITE_FAILED_EVENT,
+                'path': str(plan_path),
+                'error': repr(exc),
+                'served_from_memory': True,
+                'repaired_fields': [
+                    fact['field'] for fact in facts if fact['outcome'] == 'repaired'
+                ],
+            })
+        )
+    return repaired, facts
+
+
 # ---------------------------------------------------------------------------
 # Standalone implementation functions (testable without MCP transport)
 # ---------------------------------------------------------------------------
