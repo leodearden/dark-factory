@@ -1168,7 +1168,12 @@ async def invoke_claude_agent(
 
     *resume_session_id*, when set, resumes an existing session via
     ``--resume <id>`` instead of starting a new one.  The system prompt is
-    skipped on resume (it was already set in the initial session).
+    re-passed on resume via ``--system-prompt-file``: it is a
+    process-invocation parameter that the session does not carry, so a resumed
+    invocation that omits it runs under the stock Claude Code prompt with no
+    role charter.  A resumed session therefore gets the CURRENT role prompt —
+    see ``build_claude_argv`` for the full rationale and the probed CLI
+    behaviour.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -2143,9 +2148,10 @@ def build_claude_argv(
     byte-identical.
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
-    ``temp_files`` lists the temp file paths created (empty when resuming and
-    no ``mcp_config`` is set).  The caller owns cleanup of a successful
-    return, typically via
+    ``temp_files`` lists the temp file paths created.  It is never empty — the
+    sysprompt path is always present, on the resume path too (task 3983) —
+    plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
+    owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
