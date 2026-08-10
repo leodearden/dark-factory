@@ -1564,10 +1564,34 @@ def create_mcp_server(
     #     on a kept episode, while its worst case on a false NEGATIVE is another
     #     batch of false edges.
 
+    def _group_refs_by_project(
+        claims: list[Any], subject: str
+    ) -> dict[str | None, list[str]]:
+        """Group *subject* claims' refs by the project that ADJUDICATES them.
+
+        The grouping key is the claim's own resolved project, not the writer's:
+        esc-3085-1's whole point is that the two differ, and reading the
+        writer's tree for "dark_factory task 3142 has landed" answers a question
+        nobody asked — confidently, and with the wrong tree.
+        """
+        grouped: dict[str | None, list[str]] = {}
+        for claim in claims:
+            if claim.subject != subject:
+                continue
+            refs = grouped.setdefault(claim.project_id, [])
+            if claim.ref not in refs:
+                refs.append(claim.ref)
+        return grouped
+
     async def _claim_task_statuses(
         claims: list[Any], project_id: str
     ) -> dict[tuple[str | None, str], str]:
         """Live status for every task claim, keyed ``(project_id, ref)``.
+
+        One batched read per CLAIMED project — not per claim (which would
+        multiply authority traffic by the claim count for no gain) and not one
+        read scoped to the writer (which would consult the wrong tree for a
+        cross-project claim).
 
         An ABSENT key is the unresolvable signal — the sync probe handed to
         verify_claims returns None for it, which lands the claim on
@@ -1575,34 +1599,38 @@ def create_mcp_server(
         interceptor, unregistered project, a raising read) deliberately leaves
         the key absent rather than fabricating a permissive answer.
         """
-        refs = sorted({c.ref for c in claims if c.subject == 'task'})
-        if not refs:
+        grouped = _group_refs_by_project(claims, 'task')
+        if not grouped:
             return {}
-        root = _kp.get(project_id)
-        if not _taskmaster_configured or root is None:
-            logger.warning(
-                'completion_claim_gate: live status unresolvable for %d task claim(s) '
-                '(taskmaster_configured=%s project_id=%r registered=%s)',
-                len(refs), _taskmaster_configured, project_id, root is not None,
-            )
-            return {}
-        try:
-            statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
-                project_root=root,
-                ids=refs,
-            )
-        except Exception:
-            logger.warning(
-                'completion_claim_gate: get_statuses failed for project_id=%r; '
-                'the %d task claim(s) are UNVERIFIABLE and will be tagged',
-                project_id, len(refs), exc_info=True,
-            )
-            return {}
-        return {
-            (project_id, str(key)): value
-            for key, value in (statuses or {}).items()
-            if isinstance(value, str)
-        }
+        resolved: dict[tuple[str | None, str], str] = {}
+        for claimed_project, refs in grouped.items():
+            refs = sorted(refs)
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if not _taskmaster_configured or root is None:
+                logger.warning(
+                    'completion_claim_gate: live status unresolvable for %d task claim(s) '
+                    '(taskmaster_configured=%s claimed_project=%r registered=%s '
+                    'writer_project=%r)',
+                    len(refs), _taskmaster_configured, claimed_project,
+                    root is not None, project_id,
+                )
+                continue
+            try:
+                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
+                    project_root=root,
+                    ids=refs,
+                )
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_statuses failed for claimed_project=%r; '
+                    'the %d task claim(s) are UNVERIFIABLE and will be tagged',
+                    claimed_project, len(refs), exc_info=True,
+                )
+                continue
+            for key, value in (statuses or {}).items():
+                if isinstance(value, str):
+                    resolved[(claimed_project, str(key))] = value
+        return resolved
 
     async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
         """Registry row per ticket claim, keyed by ticket id.
@@ -1645,22 +1673,28 @@ def create_mcp_server(
         asyncio.to_thread — a blocking git call on the event loop would stall
         every other in-flight MCP request behind one episode's verification.
         """
-        refs = [c.ref for c in claims if c.subject == 'commit']
-        if not refs:
+        grouped = _group_refs_by_project(claims, 'commit')
+        if not grouped:
             return {}
-        root = _kp.get(project_id)
-        if root is None:
-            logger.warning(
-                'completion_claim_gate: project_id=%r is not registered; %d commit '
-                'claim(s) are UNVERIFIABLE and will be tagged', project_id, len(refs),
-            )
-            return {}
-        probe = make_commit_probe(root)
         present: dict[tuple[str | None, str], bool] = {}
-        for ref in dict.fromkeys(refs):
-            answer = await asyncio.to_thread(probe, ref)
-            if answer is not None:
-                present[(project_id, ref)] = answer
+        for claimed_project, refs in grouped.items():
+            # Rooted at the CLAIMED project's repository, same reason as the
+            # status read above: a sha claimed for dark_factory is not answered
+            # by reify's object store.
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if root is None:
+                logger.warning(
+                    'completion_claim_gate: claimed_project=%r is not registered; %d '
+                    'commit claim(s) are UNVERIFIABLE and will be tagged '
+                    '(writer_project=%r)',
+                    claimed_project, len(refs), project_id,
+                )
+                continue
+            probe = make_commit_probe(root)
+            for ref in refs:
+                answer = await asyncio.to_thread(probe, ref)
+                if answer is not None:
+                    present[(claimed_project, ref)] = answer
         return present
 
     async def _completion_claim_gate(
