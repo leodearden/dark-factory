@@ -13017,6 +13017,124 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         )
         assert '### Per-Cycle Summary Nonce' not in prompt
 
+    # -- task 3732: the extracted write_stage2_cycle_summary wrapper --------
+    #
+    # Stage 2's write was inlined at a single call site inside run(). The
+    # harness-level backstop (task 3732) is a SECOND call site, so the five
+    # bound Stage-2 values are factored into one wrapper — exactly what
+    # write_stage1_cycle_summary does for Stage 1 (task 2440), and for the
+    # same reason: a future change to any of them can never silently diverge
+    # between the two call sites.
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_lands_a_real_ledger_row(
+        self, mock_deps, ledger_store,
+    ):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-row'
+        report = self._base_report(run_id)
+        report.llm_calls = 7
+        report.tokens_used = 777
+
+        written = await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id,
+        )
+
+        assert written is True
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['llm_calls'] == 7
+        assert payload['tokens_used'] == 777
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_binds_the_stage2_constants(
+        self, mock_deps,
+    ):
+        """Pins the binding the wrapper exists to centralise."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-binding'
+        report = self._base_report(run_id)
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=True),
+        ) as mock_write:
+            await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report, run_id,
+            )
+
+        mock_write.assert_awaited_once()
+        kwargs = mock_write.await_args.kwargs
+        assert kwargs['stage'] == 'task_knowledge_sync'
+        assert kwargs['recon_pool'] == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        assert kwargs['trim_source'] == _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE
+        assert kwargs['cap'] == STAGE2_CYCLE_SUMMARY_POOL_CAP
+        # Defaults to a full cycle unless the caller says otherwise.
+        assert kwargs['remediation'] is False
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_forwards_remediation(
+        self, mock_deps, ledger_store,
+    ):
+        """`remediation` is the one keyword Stage 1's wrapper does not need —
+        Stage 2's write is unconditional and fires on remediation passes too
+        (task_knowledge_sync.py's "Do not 'fix' this to mirror Stage 1's
+        full-cycle-only gating" note), and get_cycle_summary_presence reads
+        payload['remediation'] to disambiguate expected-missing rows."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-remediation'
+        report = self._base_report(run_id)
+
+        await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id, remediation=True,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['remediation'] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [True, False])
+    async def test_write_stage2_cycle_summary_returns_verbatim(
+        self, mock_deps, returned,
+    ):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        report = self._base_report('run-3732-wrapper-return')
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=returned),
+        ):
+            result = await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report,
+                'run-3732-wrapper-return',
+            )
+
+        assert result is returned
+
 
 # ---------------------------------------------------------------------------
 # Task 2029 scenario (b) — TaskKnowledgeSync acknowledges Stage-1
