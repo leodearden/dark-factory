@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import logging
 import re
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
+from shared.toolcall_markup import detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
 
@@ -169,6 +171,97 @@ _REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...] = (
     _PlanField('reuse', 'where', _ADD_REUSE_ITEM_PARAMS),
     _PlanField('reuse', 'how', _ADD_REUSE_ITEM_PARAMS),
 )
+
+#: The MCP tool that AUTHORED each collection, for the structured fact's
+#: ``tool`` field (contract C2's name, verbatim). 1:1 with ``collection``
+#: because each collection has exactly one writing tool; asserted callable via
+#: ``getattr(plan_tools, '_' + tool)`` by the repair tests, so the label cannot
+#: drift into prose.
+_COLLECTION_TOOL: dict[str | None, str] = {
+    None: 'create_plan',
+    'prerequisites': 'add_prerequisite',
+    'steps': 'add_plan_step',
+    'design_decisions': 'add_design_decision',
+    'reuse': 'add_reuse_item',
+}
+
+
+def _repair_one_field(
+    holder: dict[str, Any],
+    index: int | None,
+    record: _PlanField,
+) -> dict[str, Any] | None:
+    """Repair ``holder[record.field]`` IN PLACE; return a fact, or ``None``.
+
+    *holder* is the plan dict itself for a top-level record, or one item of
+    ``plan[record.collection]`` otherwise. ``None`` means nothing to report:
+    the value is absent, is not a str, or carries no envelope literal at all.
+    """
+    value = holder.get(record.field)
+    if not isinstance(value, str):
+        return None
+    if detect(value) is None:
+        # The cheap prefilter, and the overwhelmingly common path: no literal
+        # anywhere in the value, so repair() is never called.
+        return None
+
+    result = repair(
+        value,
+        param=record.field,
+        schema_params=record.schema_params,
+        supplied=frozenset(),
+    )
+    if result is None:
+        return None
+
+    holder[record.field] = result.clean_value
+    return {
+        'tool': _COLLECTION_TOOL[record.collection],
+        'param': record.field,
+        'pattern': result.pattern,
+        'misclose': result.misclose,
+        'outcome': 'repaired',
+        'recovered_params': sorted(result.recovered),
+        'collection': record.collection,
+        'index': index,
+        'field': record.field,
+    }
+
+
+def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
+    """Repair every declared prose field of *plan*; return ``(plan, facts)``.
+
+    PURE with respect to the caller and to the filesystem: the input is
+    deep-copied, so the returned document is the only thing that changed, and
+    nothing here writes to disk. Persisting the result is
+    :func:`_read_plan_repaired`'s decision, not this pass's.
+
+    The surface walked is :data:`_REPAIRABLE_PLAN_FIELDS` — the DECLARED table
+    — never an inferred walk of the plan dict. Non-dict items in a collection
+    are skipped, mirroring the ``isinstance(item, dict)`` guards the mutation
+    helpers already use, so the walk stays total for adversarial plan shapes.
+    """
+    repaired = copy.deepcopy(plan)
+    facts: list[dict[str, Any]] = []
+
+    for record in _REPAIRABLE_PLAN_FIELDS:
+        if record.collection is None:
+            fact = _repair_one_field(repaired, None, record)
+            if fact is not None:
+                facts.append(fact)
+            continue
+
+        items = repaired.get(record.collection)
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            fact = _repair_one_field(item, index, record)
+            if fact is not None:
+                facts.append(fact)
+
+    return repaired, facts
 
 
 # ---------------------------------------------------------------------------
