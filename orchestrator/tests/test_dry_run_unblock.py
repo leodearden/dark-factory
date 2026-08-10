@@ -2098,3 +2098,223 @@ class TestMergeCompletionRiskClamp:
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['risk_label'] == 'low'
         assert entry['block_class'] == 'agent_failure'
+
+
+# ---------------------------------------------------------------------------
+# task 3271 step-1: the per-investigation transcript must survive the run
+# ---------------------------------------------------------------------------
+
+# The encoded-project dir the fake transcripts are laid down under (idiom from
+# test_transcript_archive_producer_hook.py:33).
+ENC = '-home-leo-projX'
+
+
+def _transcript_writing_invoke(results):
+    """Build a fake ``invoke_agent`` that lays down a real transcript file.
+
+    ``invoke_with_cap_retry`` hands ``invoke_fn`` the per-investigation
+    ``config_dir`` as a ``Path`` and the ``session_id`` the caller allocated
+    (both already pinned by ``TestDryRunResilienceScaffolding``), so the
+    side-effect can write ``<config_dir>/projects/<ENC>/<session_id>.jsonl`` —
+    exactly the layout ``archive_task_transcripts`` globs — and record which
+    session ids and payloads it produced.
+
+    Returns ``(async_side_effect, state)`` where ``state.payloads`` maps each
+    allocated session id to the bytes written for it, in call order.
+    """
+    state = MagicMock()
+    state.sessions = []
+    state.payloads = {}
+    results = list(results)
+
+    async def _side_effect(*_args, **kwargs):
+        config_dir = Path(kwargs['config_dir'])
+        session_id = kwargs['session_id']
+        enc_dir = config_dir / 'projects' / ENC
+        enc_dir.mkdir(parents=True, exist_ok=True)
+        payload = (
+            _json.dumps({'type': 'user', 'session_id': session_id}) + '\n'
+        ).encode()
+        (enc_dir / f'{session_id}.jsonl').write_bytes(payload)
+        state.sessions.append(session_id)
+        state.payloads[session_id] = payload
+        # Clamp: the wedge path calls twice with the same canned result list.
+        return results[min(len(state.sessions) - 1, len(results) - 1)]
+
+    return _side_effect, state
+
+
+def _archive_enc_of(path: Path, archive_root: Path):
+    """Call the REAL legibility pre-filter deriver on *path*.
+
+    Asserting through the miner's own deriver (rather than restating the
+    ``<key>/<enc>/<sid>.jsonl`` layout as a string comparison) is what keeps
+    this test and ``_enumerate``'s pre-filter from drifting — the drift that
+    let this layout constraint go unchecked in the first place. ``scripts/`` is
+    installed nowhere and is not on orchestrator's pytest pythonpath, so reuse
+    the guarded sys.path insertion idiom of the other cross-package consumers
+    (shared/tests/toolcall_markup_corpus_extract.py:86-94). No layering cycle:
+    inventory.py is stdlib-only and imports nothing first-party.
+    """
+    import sys
+
+    scripts_root = Path(__file__).resolve().parents[2] / 'scripts'
+    if scripts_root.exists() and str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    from legibility.inventory import _archive_enc  # type: ignore[reportMissingImports]
+
+    return _archive_enc(path, archive_root)
+
+
+class TestDryRunTranscriptArchival:
+    """A dry-run-unblock investigation's transcript must outlive its config dir.
+
+    The per-investigation ``TaskConfigDir`` is named ``{task_id}-unblock``, and
+    BOTH exit branches lose it today: the normal path ``rmtree``s it, and the
+    forensic ``preserve_config_dir`` path merely defers the loss to ``git
+    worktree remove --force``. The ``cleanup_worktree`` teardown backstop
+    cannot cover either, because it composes its target by literal f-string
+    ``f'claude-config-{branch}'`` (git_ops.py:11780) — which never matches the
+    ``-unblock`` suffix. So the producer-side archival call is mandatory, not
+    redundant, and it must sit ABOVE the preserve/cleanup branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_successful_run_archives_transcript_durably(self, tmp_path):
+        from shared.transcript_archive import durable_archive_path
+
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(side_effect=side_effect)):
+            await run_dry_run_unblock(
+                task_id='3271',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        assert len(state.sessions) == 1, (
+            f'Expected exactly one investigation session, got {state.sessions}'
+        )
+        sid = state.sessions[0]
+
+        # Existing teardown behaviour is untouched: the config dir is gone.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+        # …but the transcript survived it, under the durable archive root.
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        archived = archive_root / '3271' / ENC / f'{sid}.jsonl'
+        assert archived.exists(), (
+            f'Expected the investigation transcript to be archived durably at '
+            f'{archived}; the config dir it lived in has already been removed, '
+            f'so this content is otherwise unrecoverable. Archive root tree: '
+            f'{sorted(p for p in archive_root.rglob("*")) if archive_root.exists() else "(absent)"}'
+        )
+        assert archived.read_bytes() == state.payloads[sid]
+
+        # Enumerability: the archive-root-relative parts[1] really is the
+        # encoded cwd, so _enumerate's pre-filter ADMITS this file. A subkeyed
+        # layout (<task_id>/unblock/<enc>/...) would put the literal 'unblock'
+        # here, matching no project prefix, and every archived investigation
+        # would be silently skipped by the miner — the same invisibility this
+        # fix exists to end, but with the files present on disk.
+        assert _archive_enc_of(archived, archive_root) == ENC
+
+        # Locatability via the module's declared SOLE session-id-keyed locator
+        # (invariant I-E): the plain-task_id key keeps the investigation
+        # reachable by the canonical reader.
+        assert durable_archive_path(archive_root, '3271', sid) == archived
+
+    @pytest.mark.asyncio
+    async def test_doubly_wedged_run_archives_even_though_config_dir_is_preserved(
+        self, tmp_path,
+    ):
+        """The forensic preserve path does NOT save the transcript.
+
+        It only defers the loss from ``cleanup()`` to ``git worktree remove
+        --force``, which no backstop covers for this dir name — so archival
+        must happen ABOVE the ``if preserve_config_dir:`` branch. This is also
+        the HIGHEST-value case: it fires only on a doubly-wedged investigation,
+        exactly the pathology a legibility miner wants the reasoning trace for.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+        side_effect, state = _transcript_writing_invoke([wedge, wedge])
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(side_effect=side_effect)):
+            await run_dry_run_unblock(
+                task_id='3272',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        # Two attempts, two freshly-allocated session ids — and the FIRST is
+        # the wedge, the diagnostically interesting one. Keying archival on a
+        # single session id would discard it; the whole-dir sweep keeps both.
+        assert len(state.sessions) == 2, (
+            f'Expected the zero-output wedge retry, got sessions {state.sessions}'
+        )
+
+        # Existing forensic behaviour intact: the dir is still preserved.
+        task_dir = worktree / '.task'
+        preserved = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert len(preserved) == 1, (
+            f'Expected the config dir to be PRESERVED after a doubly-wedged '
+            f'run (forensics), found: {preserved}'
+        )
+
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        for sid in state.sessions:
+            archived = archive_root / '3272' / ENC / f'{sid}.jsonl'
+            assert archived.exists(), (
+                f'Expected session {sid} archived at {archived} even though the '
+                f'config dir was preserved — preservation only defers the loss '
+                f'to worktree teardown, which no backstop covers for a '
+                f'claude-config-*-unblock dir. Archive root tree: '
+                f'{sorted(p for p in archive_root.rglob("*")) if archive_root.exists() else "(absent)"}'
+            )
+            assert archived.read_bytes() == state.payloads[sid]
