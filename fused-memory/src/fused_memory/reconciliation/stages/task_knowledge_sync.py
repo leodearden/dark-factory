@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.memory_service import MemoryService
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
@@ -783,6 +784,61 @@ _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
+
+
+async def write_stage2_cycle_summary(
+    memory_service: MemoryService,
+    project_id: str,
+    report: StageReport,
+    run_id: str,
+    *,
+    remediation: bool = False,
+) -> bool:
+    """Write Stage 2's authoritative per-cycle ``cycle_summary`` ledger row.
+
+    Thin Stage-2-parametrized wrapper around
+    :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`,
+    binding the four Stage-2-specific values (``stage='task_knowledge_sync'``,
+    ``recon_pool``, ``trim_source``, ``cap``) in exactly one place. Extracted
+    from the call formerly inlined in :meth:`TaskKnowledgeSync.run` (task
+    3732) so both the in-stage fast-path write (``run()`` below) and the
+    harness-level backstop
+    (``ReconciliationHarness._ensure_stage2_cycle_summary``) share the
+    identical binding — a future change to any of the four constants can
+    never silently diverge between the two call sites. This mirrors
+    :func:`~fused_memory.reconciliation.stages.memory_consolidator.write_stage1_cycle_summary`,
+    extracted for exactly that reason by task 2440.
+
+    Args:
+        remediation: Forwarded verbatim into the row's
+            ``payload['remediation']``. This is the one keyword Stage 1's
+            wrapper does not need: Stage 1 skips its own summary write on a
+            remediation pass, whereas Stage 2's write is unconditional and
+            fires on remediation passes too (see the cross-reference comment
+            at the ``run()`` call site — "Do not 'fix' this to mirror Stage
+            1's full-cycle-only gating"). ``get_cycle_summary_presence``
+            reads this flag to disambiguate an expected-missing row from a
+            genuine write failure, so both call sites must stamp the value
+            the pass actually had.
+
+    Returns:
+        ``True`` when the authoritative ledger upsert succeeded, ``False``
+        otherwise — see :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`'s
+        "Returns" section for the full contract (the Mem0 mirror and pool-cap
+        trim run unconditionally regardless of this return value).
+    """
+    return await write_cycle_summary(
+        memory_service,
+        project_id,
+        report,
+        run_id,
+        stage='task_knowledge_sync',
+        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+        cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
+        remediation=remediation,
+    )
+
 
 # Audit tag for _write_task_count_snapshot's deterministic write (task 2325)
 # — makes the Mem0 task_count_snapshot write structural (a plain Python
@@ -3001,15 +3057,17 @@ class TaskKnowledgeSync(BaseStage):
         # reaching its own summary write, by design — from a genuine Stage 1
         # write failure on a full cycle. See prompts/stage3.py's Remediation
         # Run Exception.
-        ledger_written = await write_cycle_summary(
+        # Routed through write_stage2_cycle_summary (task 3732) rather than
+        # calling write_cycle_summary inline: the harness-level backstop
+        # (ReconciliationHarness._ensure_stage2_cycle_summary) is a second
+        # call site, and the wrapper binds the four Stage-2 constants in
+        # exactly one place so they can never silently diverge between the
+        # two — the same drift task 2440 eliminated for Stage 1.
+        ledger_written = await write_stage2_cycle_summary(
             self.memory,
             self.project_id,
             report,
             run_id,
-            stage='task_knowledge_sync',
-            recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
-            trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
-            cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
             remediation=self.remediation_mode,
         )
         # Named "..._ledger_written", not "..._written" (reviewer finding

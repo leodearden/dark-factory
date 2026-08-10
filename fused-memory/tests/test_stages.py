@@ -13061,9 +13061,9 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         """Pins the binding the wrapper exists to centralise."""
         from fused_memory.reconciliation.stages import task_knowledge_sync as tks
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            STAGE2_CYCLE_SUMMARY_POOL_CAP,
             _STAGE2_CYCLE_SUMMARY_RECON_POOL,
             _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
             write_stage2_cycle_summary,
         )
 
