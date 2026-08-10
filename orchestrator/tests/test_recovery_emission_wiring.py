@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import wire_scheduler_liveness_mock
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
 from shared.task_statuses import TaskStatus
@@ -35,6 +36,10 @@ from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.recovery_emission import (
+    RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
+    RecoveryVetoStreakTracker,
+)
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -618,3 +623,298 @@ class TestZeroDispositionChange:
 
         assert result == 1
         harness._revert_in_progress_if_no_live_claimant.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# BOUNDARY #17 — the N-consecutive-vetoes alarm, end to end.
+#
+# The streak L1 is the only part of task 3535 that WRITES to the escalation
+# queue, so it is also the only part that could break the zero-behavior-change
+# contract.  It writes against a SENTINEL id for exactly that reason: a record
+# on the real task id would be read back by every veto predicate — including
+# the one that observed the hold — turning an observability signal into a
+# disposition change.  ``test_the_alarm_never_touches_the_subject_task`` is the
+# load-bearing assertion of this whole section.
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    """A monotonic clock the sweep cadence can be driven by, deterministically.
+
+    The alarm predicate is two-dimensional (streak AND elapsed span), so a test
+    that could not control time could only ever exercise one half of it.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+#: The production sweep interval both charging sites run at
+#: (``stranded_reconcile_interval_secs`` / ``deterministic_recon_sweep_interval_secs``).
+_SWEEP_INTERVAL = 900.0
+
+
+@pytest.fixture
+def clocked(harness):
+    """(harness, clock) whose veto tracker rides an injected monotonic clock."""
+    clock = _FakeClock()
+    harness._recovery_veto_tracker = RecoveryVetoStreakTracker(clock=clock)
+    return harness, clock
+
+
+async def _sweeps(harness, clock, count: int, *, interval: float = _SWEEP_INTERVAL):
+    """Run *count* sweeps *interval* seconds apart, as the real loop would."""
+    for i in range(count):
+        if i:
+            clock.advance(interval)
+        await harness._reconcile_stranded_in_progress(mid_run=False)
+
+
+def _alarms(harness, tid: str = 'T1') -> list:
+    """Pending veto-streak alarms filed against *tid*'s SENTINEL id."""
+    return harness._escalation_queue.get_by_task(
+        f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{tid}', status='pending',
+    )
+
+
+@pytest.mark.asyncio
+class TestVetoStreakAlarm:
+    async def test_the_first_two_sweeps_file_nothing(self, clocked):
+        """Two sweeps is contention, not an incident."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 2)
+
+        assert _alarms(harness) == []
+
+    async def test_the_threshold_crossing_sweep_files_exactly_one_l1(self, clocked):
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 3)
+
+        alarms = _alarms(harness)
+        assert len(alarms) == 1, f'expected one alarm, got {alarms}'
+        assert alarms[0].level == 1, 'the streak alarm is an L1, not a page'
+        assert alarms[0].severity == 'blocking'
+
+    async def test_further_sweeps_never_file_a_second(self, clocked):
+        """Boundary #17, "no storm": a hold that lasts a week is ONE alarm."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_the_alarm_names_the_task_the_site_and_the_hold(self, clocked):
+        """An operator must be able to act on the alarm without a second query."""
+        harness, clock = clocked
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1', age_secs=4200.0)]),
+        })
+
+        await _sweeps(harness, clock, 3)
+
+        body = ' '.join((_alarms(harness)[0].summary, _alarms(harness)[0].detail))
+        assert 'T1' in body, 'the REAL task id, not just the sentinel'
+        assert 'reconcile_sweep' in body, 'which site observed the streak'
+        assert 'esc-1' in body, 'which record has been holding it'
+        assert '3' in body, 'the streak that tripped the alarm'
+        assert 'escalation_pinned' in body
+
+    async def test_the_alarm_never_touches_the_subject_task(self, clocked):
+        """THE zero-behavior-change assertion of this section.
+
+        A record filed on the real id would be returned by
+        ``_resolve_open_escalations`` on the very next sweep, deepening the
+        hold that filing it merely observed.
+        """
+        harness, clock = clocked
+        report = _report(escalations=[_ref('esc-1')])
+        _bind_reports(harness, {'T1': report})
+
+        await _sweeps(harness, clock, 5)
+
+        assert len(_alarms(harness)) == 1, 'precondition: the alarm did fire'
+        assert harness._escalation_queue.get_by_task('T1', status='pending') == [], (
+            'the subject task\'s own pending set must be untouched by the alarm'
+        )
+        assert classify_recovery(report) is RecoveryAction.LEAVE, (
+            'and its classification must be exactly what it was before'
+        )
+        assert harness.scheduler.set_task_status.await_count == 0
+        assert harness.scheduler.mark_done.await_count == 0
+
+    async def test_the_crossing_sweep_also_writes_its_event_row(self, clocked):
+        """The event store must record the MOMENT the alarm was filed, even
+        though the veto signature has not changed since sweep 1 — otherwise the
+        L1 and the event stream disagree about when the hold became an
+        incident."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert [r['data']['streak'] for r in _recovery_rows(harness)] == [1, 3]
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_changed_signature_restarts_the_streak(self, clocked):
+        """An alarm may only ever describe N genuinely IDENTICAL vetoes.
+
+        Four consecutive held sweeps, but the pinning set changed midway, so
+        the longest identical run is two — no alarm.
+        """
+        harness, clock = clocked
+        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 2)
+        stub.reports['T1'] = _report(escalations=[_ref('esc-9')])
+        await _sweeps(harness, clock, 2)
+
+        assert _alarms(harness) == []
+        assert harness._recovery_veto_tracker.streak('reconcile_sweep', 'T1') == 2
+
+    async def test_a_fast_streak_alone_does_not_alarm(self, clocked):
+        """The SECOND dimension.  Three sweeps seconds apart is a retry loop or
+        a test fixture, not a task stranded for half an hour — and a per-tick
+        site that ever charged this counter must not be able to page anyone
+        seconds after a strand appears."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 6, interval=1.0)
+
+        assert _alarms(harness) == [], (
+            'streak >= threshold is necessary but not sufficient'
+        )
+
+    async def test_the_threshold_is_honoured_from_config(self, clocked):
+        """The crossing moves when an operator retunes the (green-tier) knob."""
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            veto_streak_threshold=2,
+        )
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 1, interval=1600.0)
+        assert _alarms(harness) == []
+
+        await _sweeps(harness, clock, 2, interval=1600.0)
+        assert len(_alarms(harness)) == 1
+
+    async def test_the_kill_switch_stops_the_l1_but_not_the_events(self, clocked):
+        """``streak_escalation_enabled`` is the narrow switch for the only part
+        that writes to the queue — silencing it must not blind the sweep."""
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            streak_escalation_enabled=False,
+        )
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 5)
+
+        assert _alarms(harness) == []
+        assert [r['data']['streak'] for r in _recovery_rows(harness)] == [1, 3], (
+            'the events are a separate, cheaper signal and keep flowing'
+        )
+
+
+@pytest.mark.asyncio
+class TestVetoStreakAlarmRecovery:
+    """The resolve half is not polish: without it the ``has_open_l1`` dedup
+    would silence this detector for that task for the life of the queue."""
+
+    async def test_the_alarm_auto_resolves_when_the_veto_stops(self, clocked):
+        harness, clock = clocked
+        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        await _sweeps(harness, clock, 3)
+        assert len(_alarms(harness)) == 1, 'precondition: the alarm did fire'
+
+        # The operator resolves the pinning record; the next sweep finds the
+        # task recoverable and acts on it as it always would have.
+        stub.reports['T1'] = _report(
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+        )
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness) == [], 'a resolved condition must not hold a blocker'
+        assert 'T1' not in harness._recovery_streak_filed_at, (
+            'the memo must be dropped with it, or a later recurrence would be '
+            'short-circuited before it ever reached the queue'
+        )
+        assert harness._recovery_veto_tracker.streak('reconcile_sweep', 'T1') == 0, (
+            'the tracker entry is POPPED, so the dict stays proportional to '
+            'currently-held tasks over a weeks-long run'
+        )
+
+    async def test_a_later_recurrence_files_again(self, clocked):
+        """The whole point of the resolve half."""
+        harness, clock = clocked
+        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        await _sweeps(harness, clock, 3)
+        stub.reports['T1'] = _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None)
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+        await _sweeps(harness, clock, 1)
+        assert _alarms(harness) == [], 'precondition: the first alarm resolved'
+
+        stub.reports['T1'] = _report(escalations=[_ref('esc-1')])
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1, (
+            'a task that strands again must alarm again — a detector that '
+            'fires once per task per queue lifetime is not a detector'
+        )
+
+    async def test_a_healthy_task_never_pays_for_the_resolve_check(self, clocked):
+        """The release path runs for EVERY swept task, so it must not put a
+        pending-queue scan on the healthy path."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _report(claimant=_live_claimant())})
+        harness._escalation_queue = MagicMock(wraps=harness._escalation_queue)
+
+        await _sweeps(harness, clock, 3)
+
+        assert harness._escalation_queue.has_open_l1.call_count == 0
+        assert harness._escalation_queue.submit.call_count == 0
+
+
+@pytest.mark.asyncio
+class TestPerTickSitesNeverCharge:
+    """Only the SWEEP-frequency sites charge the counter.
+
+    The dispatch gate and the scheduler's blocked-redispatch phase run per
+    dispatch TICK — seconds apart, not 900s apart — so charging them would file
+    a blocking L1 within seconds of a hold appearing.  The span dimension is
+    the belt-and-braces backstop; this is the primary guard.
+    """
+
+    async def test_hammering_the_dispatch_gate_never_files_an_l1(self, harness):
+        harness._escalation_queue.submit(Escalation(
+            id='esc-T1-1', task_id='T1', agent_role='implementer',
+            severity='blocking', category='design_concern',
+            summary='an open handoff on task T1', level=2,
+        ))
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'T1', 'metadata': {}},
+        )
+        harness._mark_in_progress_done = AsyncMock()
+
+        for _ in range(30):
+            assert await harness._already_landed_dispatch_gate('T1') is False
+
+        assert _alarms(harness) == [], (
+            'a per-tick site charging this counter would page an operator '
+            'seconds after a hold appeared, not after three 900s sweeps'
+        )
