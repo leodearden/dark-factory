@@ -32,8 +32,10 @@ if str(REPO_ROOT.resolve()) not in sys.path:
 
 from df_pytest_isolation import (  # noqa: E402
     PIPE_CLOSING_LEAKER_SRC,
+    assert_synthetic_units,
     read_leaked_pid,
     run_in_new_session,
+    synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -1518,6 +1520,85 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
         f"watchdog's FM_DEPLOY_CLOCK_PATH default ({fm_relpath!r}); fused-memory's "
         "deploy clock has the identical min-interval semantics and needs the "
         "same guard."
+    )
+
+
+def test_fleet_dir_default_matches_across_tiers() -> None:
+    """The fleet-heartbeat DIRECTORY default must not diverge across tiers.
+
+    Four mirrors of one absolute path, none of which can import the others'
+    home: the bash script (stdlib-free), scripts/drain_check.py (stdlib-only, so
+    it cannot import orchestrator), orchestrator.fleet_heartbeat (the canonical
+    PRODUCER) and df_pytest_isolation (STDLIB+PYTEST only, since every subproject
+    conftest imports it). scripts/tests/test_drain_check.py already pins legs 2
+    and 3 against each other; this adds the BASH leg, which has never had a pin,
+    and the task-3799 guard leg.
+
+    THE DECISION THIS ENCODES, not merely the mismatch: data/fleet/ is a
+    MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory (task 2395's Open-Q2,
+    decided at decompose) — measured 2026-08-07 and again 2026-08-09 holding live
+    heartbeats for SEVEN different projects' orchestrators. It sits under
+    dark-factory/data/ only because dark-factory is the fleet HOST.
+
+    So the tempting symmetry with the adjacent CLOCK_FILE six lines below it in
+    the script — "make it $REPO_DIR-relative like its neighbour" — is WRONG, and
+    wrong in the silent direction: every .worktrees/<id> checkout would resolve
+    to its own empty data/fleet, read ZERO heartbeats, and conclude the fleet is
+    absent. That is a fail-SOFT in exactly the drain gate this task family exists
+    to protect. The clock is a dark-factory REPO artifact, for which per-checkout
+    IS correct; the asymmetry is deliberate.
+
+    A CHARACTERIZATION PIN, not a RED test: the production values are already
+    correct and must not change. Test isolation is achieved by SETTING
+    ORCH_FLEET_DIR (df_pytest_isolation._df_fleet_dir_redirect), never by
+    changing this default.
+    """
+    from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR as PRODUCER_DEFAULT
+
+    import df_pytest_isolation
+
+    expected = str(PRODUCER_DEFAULT)
+    drift_note = (
+        "\ndata/fleet/ is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory "
+        "(task 2395 Open-Q2) holding seven projects' live orchestrator "
+        "heartbeats; it lives under dark-factory/data/ only because dark-factory "
+        "is the fleet host. Making it $REPO_DIR-relative -- the tempting symmetry "
+        "with the CLOCK_FILE default six lines below it -- would make every "
+        ".worktrees/<id> checkout resolve to its own EMPTY data/fleet, read zero "
+        "heartbeats, and silently conclude the fleet is absent: a fail-soft in "
+        "exactly the drain gate this guards. Isolate tests by setting "
+        "ORCH_FLEET_DIR instead."
+    )
+
+    # --- bash script mirror (FLEET_DIR default) ---
+    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    match = re.search(r'FLEET_DIR="\$\{ORCH_FLEET_DIR:-([^}]+)\}"', script_src)
+    assert match is not None, (
+        "restart-all-orchestrators.sh FLEET_DIR default pattern not found -- "
+        "did its literal shape change? Update this regex to match."
+    )
+    assert match.group(1) == expected, (
+        f"restart-all-orchestrators.sh FLEET_DIR default {match.group(1)!r} has "
+        f"drifted from orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR {expected!r}."
+        + drift_note
+    )
+
+    # --- drain_check mirror (the gate the script actually spawns) ---
+    import drain_check
+
+    assert str(drain_check.DEFAULT_FLEET_DIR) == expected, (
+        f"drain_check.DEFAULT_FLEET_DIR {str(drain_check.DEFAULT_FLEET_DIR)!r} has "
+        f"drifted from the producer's {expected!r}." + drift_note
+    )
+
+    # --- pytest-guard mirror (df_pytest_isolation, task 3799) ---
+    # A drifted mirror here is the worst kind: silently green, guarding a
+    # directory nothing writes while the real one takes the leaks.
+    assert str(df_pytest_isolation.LIVE_FLEET_DIR) == expected, (
+        f"df_pytest_isolation.LIVE_FLEET_DIR "
+        f"{str(df_pytest_isolation.LIVE_FLEET_DIR)!r} has drifted from the "
+        f"producer's {expected!r}; the synthetic-heartbeat leak guard would watch "
+        "a directory nothing writes." + drift_note
     )
 
 
@@ -3325,7 +3406,18 @@ def _boundary_make_fake_systemctl(base_dir, *, running_units, units=None):
 
     Returns (bin_dir, state_path). parents=True/exist_ok=True so callers may
     pass a not-yet-created base_dir (e.g. a fresh sub-scenario directory).
+
+    Every unit name handed in must be SYNTHETIC (task 3799). This is the
+    PATH-shimming seam -- the point where a name starts being answerable by a
+    fake that only shadows `systemctl` while its tmpdir lives -- so checking it
+    here covers every caller, including the ones nobody has written yet, and
+    cannot touch the in-process contract pins elsewhere in this file. See
+    test_boundary_fake_systemctl_rejects_a_real_unit_name for the hazard.
     """
+    assert_synthetic_units(
+        [*running_units, *(units or {})],
+        where="tests/scripts/test_orchestrator_watchdog.py::_boundary_make_fake_systemctl",
+    )
     bin_dir = base_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     fake = bin_dir / "systemctl"
@@ -3444,7 +3536,7 @@ def test_boundary_run_drain_script_timeout_kills_the_whole_process_group(
     monkeypatch.setattr(sys.modules[__name__], "RESTART_ALL_SCRIPT", leaker)
 
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
     )
@@ -3528,6 +3620,42 @@ def test_boundary_fake_systemctl_matches_unit_suite_verbatim() -> None:
     )
 
 
+def test_boundary_fake_systemctl_rejects_a_real_unit_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_boundary_make_fake_systemctl must refuse a genuinely installed unit name.
+
+    THE HAZARD, in the terms the incident established: the fake shadows
+    `systemctl` only for as long as its tmpdir sits on PATH. A poll loop that
+    outlives the test -- task 3798 measured orphans surviving 27.8 HOURS, well
+    past pytest's tmpdir GC -- resolves /usr/bin/systemctl instead and issues a
+    REAL restart of whatever unit name this factory handed it.
+    `orchestrator-reify.service` is INSTALLED on this box, so that worst case is
+    a real fleet restart; a synthetic name makes it a no-op against a unit that
+    does not exist.
+
+    Sits beside test_boundary_fake_systemctl_matches_unit_suite_verbatim, the
+    other cross-root drift guard on this harness, and mirrors
+    scripts/tests/test_restart_all_orchestrators.py::
+    test_fake_systemctl_rejects_a_real_unit_name -- two copies because these
+    directories cannot import each other's test modules, so a green test in one
+    root says nothing about the other's factory.
+
+    The check is at the FACTORY rather than over test sources on purpose: this
+    file holds ~40 real unit-name literals that are CONTRACT PINS against real
+    production configuration (the WATCHED port table, unit-file parity, the
+    in-process restart_unit call-shape assertions), and a source-text guard
+    would false-positive on every one of them.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _boundary_make_fake_systemctl(
+            tmp_path, running_units=["orchestrator-reify.service"],
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-reify.service" in message, message
+    assert "_boundary_make_fake_systemctl" in message, message
+
+
 def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
     """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
     restart-all-orchestrators.sh --drain restarts every unit, verifies each
@@ -3543,8 +3671,8 @@ def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) ->
     separately.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_a = "orchestrator-alpha.service"
-    unit_b = "orchestrator-bravo.service"
+    unit_a = synthetic_unit("alpha")
+    unit_b = synthetic_unit("bravo")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_a, unit_b],
@@ -3579,8 +3707,8 @@ def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) 
     can never silence the watchdog backstop for a full min-interval window.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_ok = "orchestrator-alpha.service"
-    unit_bad = "orchestrator-bravo.service"
+    unit_ok = synthetic_unit("alpha")
+    unit_bad = synthetic_unit("bravo")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_ok, unit_bad],
@@ -3621,8 +3749,8 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
     other units proceed while R defers.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_idle = "orchestrator-alpha.service"
-    unit_r = "orchestrator-reify.service"
+    unit_idle = synthetic_unit("alpha")
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_idle, unit_r],
@@ -3692,7 +3820,7 @@ def test_boundary5_force_restarts_busy_unit_after_grace(tmp_path: pathlib.Path) 
     makes it crash-safe -- see test_boundary10 below).
     """
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_r], units={unit_r: {"scenario": "fresh"}},
     )
@@ -3730,7 +3858,7 @@ def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: path
     "unknown" branch drain_check.classify() recognizes.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_absent = "orchestrator-alpha.service"
+    unit_absent = synthetic_unit("alpha")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path, running_units=[unit_absent], units={unit_absent: {"scenario": "fresh"}},
     )
@@ -3753,7 +3881,7 @@ def test_boundary6_absent_and_stale_heartbeat_proceed_after_grace(tmp_path: path
 
     # --- stale-heartbeat sub-case: same outcome via the other unknown branch ---
     fleet_dir_2 = tmp_path / "fleet2"
-    unit_stale_hb = "orchestrator-bravo.service"
+    unit_stale_hb = synthetic_unit("bravo")
     bin_dir_2, state_path_2 = _boundary_make_fake_systemctl(
         tmp_path / "run2",
         running_units=[unit_stale_hb], units={unit_stale_hb: {"scenario": "fresh"}},
@@ -4055,7 +4183,7 @@ def test_drain_grace_reprobe_delayed_fresh_unit_verifies_and_stamps_clock(
     show-counter cadence identical to the non-drain reference test.
     """
     fleet_dir = tmp_path / "fleet"
-    unit_r = "orchestrator-reify.service"
+    unit_r = synthetic_unit("reify")
     bin_dir, state_path = _boundary_make_fake_systemctl(
         tmp_path,
         running_units=[unit_r],

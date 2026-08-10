@@ -29,16 +29,25 @@ import pytest
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
     PIPE_CLOSING_LEAKER_SRC,
+    assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    fleet_dir_redirect_violation_reason,
     read_leaked_pid,
     run_in_new_session,
+    synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
-UNIT_R = "orchestrator-reify.service"
+# SYNTHETIC, not the real `orchestrator-reify.service` this used to be (task
+# 3799). The fake systemctl shadows the real one only for as long as its tmpdir
+# sits on PATH; an orphaned poll loop that outlives it -- 27.8h in the worst
+# case measured for task 3798 -- resolves /usr/bin/systemctl and restarts
+# whatever name it was handed. `reify` still names what the fixture stands in
+# for, so the tests below keep reading as being about the reify orchestrator.
+UNIT_R = synthetic_unit("reify")
 
 FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake `systemctl` for testing restart-all-orchestrators.sh.
@@ -172,7 +181,17 @@ def _make_fake_systemctl(tmp_path, *, running_units, units=None):
     """Write a fake multi-unit `systemctl` into <tmp_path>/bin/.
 
     Returns (bin_dir, state_path).
+
+    Every unit name handed in must be SYNTHETIC (task 3799). This is the
+    PATH-shimming seam -- the point where a name starts being answerable by a
+    fake that only shadows `systemctl` while its tmpdir lives -- so checking it
+    here covers every caller, including the ones nobody has written yet. See
+    test_fake_systemctl_rejects_a_real_unit_name for the hazard.
     """
+    assert_synthetic_units(
+        [*running_units, *(units or {})],
+        where="scripts/tests/test_restart_all_orchestrators.py::_make_fake_systemctl",
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "systemctl"
@@ -230,6 +249,82 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
 
 def _load_state(state_path):
     return json.loads(state_path.read_text())
+
+
+def test_fleet_dir_is_redirected_away_from_the_live_checkout(
+    _df_fleet_dir_redirect, tmp_path_factory,
+):
+    """ORCH_FLEET_DIR must point somewhere hermetic for the WHOLE session.
+
+    THE CONSEQUENCE of it being unset, which is what this pins: this file's
+    _run_script sets ORCH_FLEET_DIR per call, but the defect class is "a spawner
+    that forgets" -- and restart-all-orchestrators.sh's FLEET_DIR default and
+    drain_check.DEFAULT_FLEET_DIR
+    both resolve their fleet dir from `${ORCH_FLEET_DIR:-...}`, so an unset (or
+    EMPTY -- `${VAR:-...}` treats those identically) value falls through to the
+    machine-global /home/leo/src/dark-factory/data/fleet. A test-spawned drain
+    gate then reads five other projects' LIVE production heartbeats and decides
+    the real fleet's drain state from them.
+
+    This directory's OWN proof. tests/scripts/test_fleet_dir_isolation.py has
+    the mirror: the two roots are wired separately (this one does not load the
+    repo-root conftest at all), so a green test in one says nothing about the
+    other. Only the WIRING differs between the two copies, so only the wiring is
+    duplicated -- the comparison and its messages live once, in
+    df_pytest_isolation.fleet_dir_redirect_violation_reason, for the same reason
+    deploy_clock_snapshot is imported above rather than re-implemented here. Two
+    copies of the assertion body had already drifted in message text before they
+    were a day old.
+
+    Takes the redirect from the fixture BY NAME rather than reading os.environ
+    bare, so deleting the fixture fails collection with a message naming
+    `_df_fleet_dir_redirect` instead of passing off a leftover env var.
+    """
+    value = os.environ.get("ORCH_FLEET_DIR")
+    reason = fleet_dir_redirect_violation_reason(value, tmp_path_factory.getbasetemp())
+    assert reason is None, reason
+
+    # The genuinely per-root half: this proves THIS rootdir's conftest bound the
+    # fixture that set the variable checked above.
+    assert Path(_df_fleet_dir_redirect).resolve() == Path(value or "").resolve()
+
+
+# ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799).
+#
+# The mirror of this test lives in tests/scripts/test_orchestrator_watchdog.py
+# as test_boundary_fake_systemctl_rejects_a_real_unit_name. Two copies for the
+# same reason as the process-group pair below: these directories cannot import
+# each other's test modules, so each root must prove its OWN factory validates.
+# What they share is the rule itself -- df_pytest_isolation.assert_synthetic_units.
+# ---------------------------------------------------------------------------
+
+
+def test_fake_systemctl_rejects_a_real_unit_name(tmp_path):
+    """_make_fake_systemctl must refuse a genuinely installed unit name.
+
+    THE HAZARD, in the terms the incident established: the fake shadows
+    `systemctl` only for as long as its tmpdir sits on PATH. A poll loop that
+    outlives the test -- task 3798 measured orphans surviving 27.8 HOURS, well
+    past pytest's tmpdir GC -- resolves /usr/bin/systemctl instead and issues a
+    REAL restart of whatever unit name this factory handed it.
+    `orchestrator-reify.service` is INSTALLED on this box, so that worst case is
+    a real fleet restart; a synthetic name makes it a no-op against a unit that
+    does not exist.
+
+    Checked at the FACTORY, not by grepping test sources: this file's siblings
+    hold ~40 real unit-name literals that are CONTRACT PINS against real
+    production configuration, which a source-text guard would false-positive on.
+
+    pytest.raises(pytest.fail.Exception) rather than AssertionError -- pytest.fail
+    raises Failed, a BaseException, deliberately so a fixture's own
+    `except Exception` cannot swallow it.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _make_fake_systemctl(tmp_path, running_units=["orchestrator-reify.service"])
+    message = str(excinfo.value)
+    assert "orchestrator-reify.service" in message, message
+    assert "_make_fake_systemctl" in message, message
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +474,10 @@ def test_defer_withholds_restart_while_busy(tmp_path):
         )
 
     stdout = _decode(exc_info.value.stdout)
-    assert "deferring restart of orchestrator-reify.service: mid-merge" in stdout, (
+    # Interpolated, never a second copy of the literal: a hardcoded unit name
+    # here is how the task-3799 rename would silently half-land -- the defer
+    # assertion would just stop matching the name the fixture actually used.
+    assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
         f"expected a stable defer-prefix line; got stdout={stdout!r}"
     )
     state = _load_state(state_path)
