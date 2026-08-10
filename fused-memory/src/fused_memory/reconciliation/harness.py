@@ -419,6 +419,52 @@ def _stage1_ledger_write_missing(report: object) -> bool:
     return stats.get('stage1_cycle_summary_ledger_written') == 0
 
 
+def _stage2_ledger_write_missing(report: object) -> bool:
+    """Return True iff *report* is a Stage 2 report whose own in-stage
+    ``cycle_summary`` ledger upsert failed (task 3732).
+
+    Stage-2 mirror of :func:`_stage1_ledger_write_missing`, backing the
+    write-recovered arm of
+    :meth:`ReconciliationHarness._ensure_stage2_cycle_summary` — the
+    "Stage 2 completed but its own write failed" case.
+
+    Keys on the EXPLICIT failure value
+    ``stats['stage2_cycle_summary_ledger_written'] == 0``, deliberately
+    never ``!= 1``: a
+    :meth:`~fused_memory.reconciliation.stages.task_knowledge_sync.TaskKnowledgeSync.run`
+    that reached its own write always stamps this stat to 0 (upsert failed)
+    or 1 (succeeded), so ``== 0`` captures exactly the defect. An ABSENT
+    stat means the report never reached that write at all — which
+    :class:`~fused_memory.reconciliation.stages.base.BaseStage` can produce
+    for real, not just in test stubs: it returns a ``StageReport`` with
+    ``stats={}`` when the agent died before emitting ``recon_report.complete``
+    (base.py:216-224, crash path at :318-322). Synthesizing a summary for
+    such a run would fabricate numbers for a Stage 2 that demonstrably never
+    finished, so an absent stat is no-fire (``!= 1`` would wrongly fire on
+    it). It also keeps every stubbed-Stage-2 harness test inert, since the
+    shared ``_mock_stage_run`` helper builds reports with ``stats={}``.
+
+    Also excludes the degraded-synth arm's own harness-synthesized report
+    (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
+    the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
+    the same run.
+
+    Returns False for anything whose ``.stats`` isn't a dict — including a
+    non-``StageReport`` object (e.g. a plain dict, the shape
+    ``run.stage_reports['_error']`` entries use, and the shape a
+    journal-round-tripped entry can keep — journal.py reconstructs
+    ``StageReport(**v)`` only when ``isinstance(v, dict) and 'stage' in v``)
+    — since ``run.stage_reports`` is typed ``dict[str, StageReport | dict]``
+    and this predicate must never raise when handed one of those.
+    """
+    stats = getattr(report, 'stats', None)
+    if not isinstance(stats, dict):
+        return False
+    if stats.get('stage2_cycle_summary_degraded_backstop') is True:
+        return False
+    return stats.get('stage2_cycle_summary_ledger_written') == 0
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
