@@ -457,47 +457,59 @@ async def run_dry_run_unblock(
             # so `claude-config-{task_id}-unblock` can never match it. One call
             # here covers both exits; the preserved case is also the
             # highest-value one, firing only on a doubly-wedged investigation.
-            try:
-                await asyncio.to_thread(
-                    archive_task_transcripts,
-                    config_dir.path,
-                    # Plain task_id key, no subkey: _archive_enc derives the
-                    # encoded cwd as parts[1] of the archive-root-relative path
-                    # (inventory.py:465), so a `<task_id>/unblock/...` layout
-                    # would put the literal 'unblock' there, match no project
-                    # prefix, and have _enumerate silently skip every archived
-                    # investigation. Session ids are fresh uuid4s, so sharing
-                    # the key with the task's own roles cannot collide.
-                    task_id,
-                    # session_id=None → whole-dir sweep of projects/**/*.jsonl,
-                    # as the git_ops.py:11793 backstop passes. This dir is
-                    # exclusive to THIS investigation, so nothing foreign is
-                    # over-captured, and it captures BOTH the wedged first
-                    # attempt and the fresh-session retry — the wedge being the
-                    # diagnostically interesting one — without threading a
-                    # mutable last-session-id out of the _one_attempt closure.
-                    None,
-                    archive_root=config.project_root / config.transcript_archive.root,
-                )
-            except asyncio.CancelledError:
-                # Cooperative cancellation is a BaseException and must
-                # propagate; deliberately NOT caught by the except below.
-                raise
-            except Exception:
-                # Defense-in-depth for a finally that awaits cross-module work.
-                # archive_task_transcripts is total by contract (per-file
-                # OSErrors caught + counted, transcript_archive.py:224-228) but
-                # its top-level Path/archive_root construction is not
-                # individually guarded, and this finally may be unwinding an
-                # in-flight exception that must not be replaced. Loud, not
-                # silent: logged as a structured fact matching the extra=
-                # shape _record_failure already emits.
-                logger.warning(
-                    'dry_run_unblock: transcript archival failed for task %s',
-                    task_id,
-                    exc_info=True,
-                    extra={'task_id': task_id},
-                )
+            #
+            # Bound OUTSIDE the try so a mis-shaped config surfaces where the
+            # surrounding finally already guards it, and so the disabled path
+            # never spins up a worker thread. Mirrors workflow.py:12375-12376
+            # (`ta = self.config.transcript_archive; if ta.enabled and ...`)
+            # and git_ops.py:11779, so all three producers consult the one
+            # knob identically — which is what makes the config's documented
+            # "disable archival entirely" contract true fleet-wide rather than
+            # true-for-two-of-three.
+            ta = config.transcript_archive
+            if ta.enabled:
+                try:
+                    await asyncio.to_thread(
+                        archive_task_transcripts,
+                        config_dir.path,
+                        # Plain task_id key, no subkey: _archive_enc derives the
+                        # encoded cwd as parts[1] of the archive-root-relative
+                        # path (inventory.py:465), so a `<task_id>/unblock/...`
+                        # layout would put the literal 'unblock' there, match no
+                        # project prefix, and have _enumerate silently skip every
+                        # archived investigation. Session ids are fresh uuid4s, so
+                        # sharing the key with the task's own roles cannot collide.
+                        task_id,
+                        # session_id=None → whole-dir sweep of projects/**/*.jsonl,
+                        # as the git_ops.py:11793 backstop passes. This dir is
+                        # exclusive to THIS investigation, so nothing foreign is
+                        # over-captured, and it captures BOTH the wedged first
+                        # attempt and the fresh-session retry — the wedge being the
+                        # diagnostically interesting one — without threading a
+                        # mutable last-session-id out of the _one_attempt closure.
+                        None,
+                        archive_root=config.project_root / ta.root,
+                    )
+                except asyncio.CancelledError:
+                    # Cooperative cancellation is a BaseException and must
+                    # propagate; deliberately NOT caught by the except below.
+                    raise
+                except Exception:
+                    # Defense-in-depth for a finally that awaits cross-module
+                    # work. archive_task_transcripts is total by contract
+                    # (per-file OSErrors caught + counted,
+                    # transcript_archive.py:224-228) but its top-level
+                    # Path/archive_root construction is not individually
+                    # guarded, and this finally may be unwinding an in-flight
+                    # exception that must not be replaced. Loud, not silent:
+                    # logged as a structured fact matching the extra= shape
+                    # _record_failure already emits.
+                    logger.warning(
+                        'dry_run_unblock: transcript archival failed for task %s',
+                        task_id,
+                        exc_info=True,
+                        extra={'task_id': task_id},
+                    )
 
             if preserve_config_dir:
                 # Not independently reaped here: this dir lives under
