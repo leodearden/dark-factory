@@ -43,6 +43,54 @@ not counted as G1 consumers of anything here.
 >     decisions) — so someone or something else brought it in line first. No follow-up task is filed
 >     for this: the fix a follow-up would have requested is already done.
 
+> **Amendment 2026-08-10 (task 3804)** — **the LLM candidate slate is THREE arms, not four.**
+> Leo dropped **Mistral-Small-3.2-24B** on 2026-08-06 (esc-3713-10, follow-up from task 3713/LME-α)
+> after live measurement proved it unservable on this host. `scripts/local-model-serving/arms.yaml`
+> is the **authoritative slate**; this PRD is the narrative record of it. Remaining arms: Qwen3.5-9B,
+> Phi-4 14B, and the MoE stretch arm (Gemma-4-26B-A4B-it QAT).
+>
+> **Consequence, stated at the top so it cannot be missed:** η's screening funnel narrows
+> **3 → at most 3**, so the **≤3 cap's selectivity is exactly nil** — three candidates against a cap
+> of three eliminate nobody by ranking. The funnel's **absolute gates remain fully live** and can
+> still drop arms (conformance smoke, VRAM fit under the measured ~16.4 GiB, Phi-4's 16K context
+> fit, ζ's throughput floor), so η may still return fewer than three survivors — it just can no
+> longer return fewer *because of the cap*. **Whether that warrants re-opening the slate is Leo's
+> call: surfaced here, deliberately not decided.** See the consequence note at the candidate slate.
+>
+> Applied corrections (2026-08-10, task 3804) — all in `plans/`, documentation/record only:
+> - **This PRD**: the candidate-slate table (Mistral row struck through and annotated, **kept** as
+>   evidence of what was commissioned, plus a footnote closing the already-fixed quant defect and
+>   stating the re-admission condition); the funnel prose in §Sketch of approach; D6; D10's
+>   Consequence bullet (arm count only); the Contract §Pre-registration clause constraining ζ's
+>   survivor rule; α's and η's rows in the decomposition plan; the research appendix.
+> - **`plans/local-memory-models-eval-prd.capability-manifest.md`** — η's `All four arms servable …
+>   PASS` row: that verdict was **falsified** by α's own gate (one arm proved unservable), and the
+>   row now says so rather than being quietly renumbered.
+> - **`plans/local-memory-models-eval-prd.capability-manifest.yaml`** — η's `title:` realigned to
+>   task 3720's live title; `task_id`, `capabilities`, `binding`, `verdict` and every
+>   `delivered_check` left byte-identical (machine-consumed contracts).
+>
+> Cross-check dispositions (whole 3713–3725 batch re-read at correction time; each states what was
+> actually checked):
+> - Task 3719 (LME-ζ, pending) — **corrected**: the two four-arm sentences in its reasoning-mode
+>   block fixed, and the three-arm constraint on the survivor rule appended to its item 4. Its
+>   "gemma-4 extracts all four **probe entities**" / "finds all four **entities**" sentences count
+>   probe entities, not arms, and were deliberately left byte-identical.
+> - Task 3720 (LME-η, pending) — **already correct**, no edit; its description already carries the
+>   drop and the selectivity flag.
+> - Task 3721 (LME-θ, pending) — **checked, clean**: zero four-arm or Mistral assertions.
+> - Task 3722 (LME-ι, pending) — its "all four" counts the four **embedding** arms, which this
+>   LLM-axis ruling does not touch; **correctly left alone**.
+> - Tasks 3715 (β), 3716 (γ), 3717 (δ), 3718 (ε), 3723 (λ), 3725 (μ) — **checked, clean**.
+> - Task 3713 (LME-α, `done`) — **deliberately NOT edited.** Its enumeration of the original four
+>   dense arms is the historical record of what α was commissioned to serve — the same evidence
+>   argument that keeps the struck-through table row, and the same disposition task 3748 took.
+>
+> Known-remaining drift, named so it is not mistaken for an oversight: the **"Est. VRAM" column is
+> stale** against arms.yaml's measured figures (Qwen3.5-9B listed ~6GB, **measured 11.21 GiB**).
+> That is the 3748 drift class, not slate composition; out of scope here and filed as
+> `tkt_0RS9PDHN212E4G1ZW924MMCV75`, sequenced after this correction merges.
+
 ## Goal
 
 Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
