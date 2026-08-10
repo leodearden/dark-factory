@@ -181,3 +181,56 @@ class TestFilingDispatchExtraction:
         supplementary ones must cover it — otherwise the negation hole the
         strippers exist to close reopens for exactly the new family."""
         assert _extract(text) == []
+
+
+class TestCrossProjectRefResolution:
+    """Which project's registry adjudicates a task ref.
+
+    esc-3085-1: the incident claim was written by a reify agent ABOUT a
+    dark_factory artefact, so resolving every ref against the writer's project
+    would have produced a false verdict in the other direction.
+    """
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'dark_factory task 3142 has landed',
+            'dark_factory:3142 was merged',
+            "dark_factory's task 3142 has landed",
+        ],
+    )
+    def test_recognised_qualifier_overrides_the_writers_project(self, text):
+        claims = _extract(text, default_project_id='reify')
+
+        assert len(claims) == 1, f'{text!r} -> {claims!r}'
+        assert claims[0].subject == 'task'
+        assert claims[0].ref == '3142'
+        assert claims[0].project_id == 'dark_factory'
+
+    def test_unqualified_ref_inherits_the_writers_project(self):
+        claims = _extract('task 3142 has landed', default_project_id='reify')
+
+        assert len(claims) == 1
+        assert claims[0].project_id == 'reify'
+
+    def test_arbitrary_preceding_word_is_not_a_qualifier(self):
+        """'the merge task 3142' must not make 'merge' a project name."""
+        claims = _extract('the merge task 3142 has landed', default_project_id='reify')
+
+        assert len(claims) == 1
+        assert claims[0].project_id == 'reify'
+
+    def test_unknown_project_qualifier_falls_back_to_the_writer(self):
+        claims = _extract('someproject task 3142 has landed', default_project_id='reify')
+
+        assert len(claims) == 1
+        assert claims[0].project_id == 'reify'
+
+    def test_ticket_claim_carries_no_project(self):
+        """A tkt_ id is a globally unique PK — it needs no project to resolve,
+        and pinning one would reintroduce the instance-(2) false verdict."""
+        claims = _extract(_INSTANCE_2, default_project_id='reify')
+
+        assert len(claims) == 1
+        assert claims[0].subject == 'ticket'
+        assert claims[0].project_id is None
