@@ -664,3 +664,157 @@ class TestUnresolvableAuthoritiesTag:
             'The swallowed defect must still be loud in the logs — a silent '
             f'except is how a gate quietly stops gating; got: {caplog.text!r}'
         )
+
+
+# esc-3085-1 instance (2), verbatim: a reify-authored claim about a
+# dark_factory ticket that did not exist.
+_INSTANCE_2_CONTENT = (
+    'reify task 5638 was reported unactionable and re-filed into '
+    f"dark_factory's task tree as ticket {_TICKET_ID}"
+)
+_CROSS_PROJECTS = {'reify': '/reify-root', 'dark_factory': '/df-root'}
+
+
+def _cross_project_server(mock_service, *, statuses=None, ticket_row=None):
+    task_interceptor = MagicMock()
+    task_interceptor.get_statuses = AsyncMock(return_value=statuses or {})
+    task_interceptor.get_ticket_row = AsyncMock(return_value=ticket_row)
+    server = create_mcp_server(
+        mock_service,
+        task_interceptor=task_interceptor,
+        known_projects=_CROSS_PROJECTS,
+    )
+    return server, task_interceptor
+
+
+class TestCrossProjectClaims:
+    """esc-3085-1: the claim and the writer need not share a project, and
+    checking the WRITER's registry would produce a confidently WRONG verdict in
+    both directions — reporting a real dark_factory ticket as absent, and a
+    dark_factory task's status as whatever reify's tree happens to say.
+    """
+
+    @pytest.mark.asyncio
+    async def test_instance_2_absent_ticket_is_tagged(self):
+        """The incident, end to end. A reify agent claims work was re-filed as a
+        dark_factory ticket; the registry has no such ticket. Tagged, with the
+        flag naming the absent id.
+        """
+        mock_service = _episode_service()
+        server, task_interceptor = _cross_project_server(mock_service, ticket_row=None)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _INSTANCE_2_CONTENT,
+                'agent_id': 'claude-task-5638-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        assert entry.get('subject') == 'ticket', (
+            f'The most specific ref wins — this is a ticket claim; got: {entry!r}'
+        )
+        assert entry.get('kind') == 'filing_dispatch', f'Got: {entry!r}'
+        assert entry.get('status') == 'mismatch', (
+            f'The registry ANSWERED, and it said no such ticket; got: {entry!r}'
+        )
+        assert _TICKET_ID in entry.get('observed', ''), (
+            f'The flag must name the absent ticket; got: {entry!r}'
+        )
+
+        # The verdict must not depend on the writer's project in ANY way: a
+        # globally unique PK lookup, and a claim that carries no project at all.
+        task_interceptor.get_ticket_row.assert_awaited_once_with(_TICKET_ID)
+        assert entry.get('project_id') is None, (
+            f'A ticket claim resolves project-agnostically; got: {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_qualified_task_claim_reads_the_claimed_projects_root(self):
+        """"dark_factory task 3142 has landed", written by a reify agent. The
+        status read must target dark_factory's root — reading reify's tree would
+        answer a question nobody asked.
+        """
+        mock_service = _episode_service()
+        server, task_interceptor = _cross_project_server(
+            mock_service, statuses={'3142': 'in-progress'},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'dark_factory task 3142 has landed',
+                'agent_id': 'claude-task-5638-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        task_interceptor.get_statuses.assert_awaited_once()
+        kwargs = task_interceptor.get_statuses.call_args.kwargs
+        assert kwargs.get('project_root') == '/df-root', (
+            "The status read must target the CLAIMED project's root, not the "
+            f'writer\'s; got: {kwargs!r}'
+        )
+        entry = _assert_tagged(result, mock_service, ref='3142')
+        assert entry.get('project_id') == 'dark_factory', f'Got: {entry!r}'
+
+    @pytest.mark.asyncio
+    async def test_multi_project_episode_batches_one_read_per_project(self):
+        """Two claimed projects → exactly two status reads, each batched over
+        that project's own ids. One read per claim would multiply authority
+        traffic by the claim count for no gain.
+        """
+        mock_service = _episode_service()
+        server, task_interceptor = _cross_project_server(
+            mock_service, statuses={'3142': 'in-progress', '5638': 'in-progress'},
+        )
+
+        await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'dark_factory task 3142 has landed. reify task 5638 has landed'
+                ),
+                'agent_id': 'claude-task-5638-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        reads = {
+            call.kwargs.get('project_root'): sorted(call.kwargs.get('ids') or [])
+            for call in task_interceptor.get_statuses.await_args_list
+        }
+        assert reads == {'/df-root': ['3142'], '/reify-root': ['5638']}, (
+            f'Expected one batched read per claimed project; got: {reads!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_claim_naming_an_unregistered_project_is_tagged(self):
+        """A qualifier that is not in the registry falls back to the writer's
+        project (an arbitrary preceding word is not a project name). If the
+        WRITER's project is itself unregistered, no root resolves and the claim
+        is tagged — never silently passed.
+        """
+        mock_service = _episode_service()
+        server, task_interceptor = _cross_project_server(
+            mock_service, statuses={'3142': 'done'},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the merge task 3142 has landed',
+                'agent_id': 'claude-task-5638-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        kwargs = task_interceptor.get_statuses.call_args.kwargs
+        assert kwargs.get('project_root') == '/reify-root', (
+            f"An unrecognised qualifier falls back to the writer's project; got: {kwargs!r}"
+        )
+        assert 'unverified_claim' not in result, (
+            f'reify task 3142 is done, so the claim verifies; got: {result!r}'
+        )
