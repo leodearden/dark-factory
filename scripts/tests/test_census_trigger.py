@@ -1217,3 +1217,149 @@ def test_post_mcp_tool_call_does_not_retry_a_non_400_failure(install_fake_httpx)
         ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
 
     assert _methods(recorded) == ["tools/call"]
+
+
+# ---------------------------------------------------------------------------
+# task 3644: post_mcp_tool_call — SSE body decoding
+# ---------------------------------------------------------------------------
+#
+# The second half of the same defect. Once a session EXISTS, the stateful
+# escalation server answers `tools/call` with an SSE-framed body, not JSON
+# (captured verbatim from the live probe against :8103 on 2026-08-05):
+#
+#     HTTP/1.1 200 OK
+#     content-type: text/event-stream
+#
+#     event: message
+#     data: {"jsonrpc":"2.0","id":1,"result":{...}}
+#
+# `response.json()` raises a JSONDecodeError on that body, so even a perfectly
+# handshaken client still drops the escalation. The fakes below make `json()`
+# raise exactly as httpx would, so a test cannot pass by accidentally taking
+# the JSON path on an SSE response.
+
+
+class _FakeSseResponse(_FakeMcpResponse):
+    """A 200 `text/event-stream` response whose `json()` raises, exactly as
+    `httpx.Response.json()` does on an SSE body."""
+
+    def __init__(self, text, *, status_code=200):
+        super().__init__(
+            status_code=status_code,
+            headers={"content-type": "text/event-stream"},
+            text=text,
+        )
+
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", self.text or "", 0)
+
+
+def _sse_body(payload) -> str:
+    """Frame *payload* the way the escalation server frames a tools/call
+    reply: an `event:` line, a `data:` line, and a blank terminator."""
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
+
+
+def test_post_mcp_tool_call_decodes_an_sse_tools_call_response(install_fake_httpx):
+    """The post-handshake retry's SSE body must be parsed off its `data:`
+    line -- the JSON path is never taken for an SSE response."""
+    recorded = []
+    stateful = _stateful_mcp_post(recorded)
+
+    def _post(url, **kwargs):
+        response = stateful(url, **kwargs)
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "tools/call" and response.status_code == 200:
+            return _FakeSseResponse(_sse_body(
+                {"jsonrpc": "2.0", "id": 1,
+                 "result": {"structuredContent": {"id": "esc-77", "level": 0}}},
+            ))
+        return response
+
+    install_fake_httpx(_post)
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    )
+
+    assert result == {"id": "esc-77", "level": 0}
+    assert _methods(recorded)[-1] == "tools/call"
+
+
+def test_post_mcp_tool_call_decodes_an_sse_response_without_a_handshake(
+    install_fake_httpx
+):
+    """SSE framing is a property of the RESPONSE, not of the handshake: a
+    server that answers the first (session-less) POST with an SSE body must
+    decode identically, with no extra round trips."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeSseResponse(_sse_body(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}},
+        ))
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "ok": True
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_still_decodes_a_plain_json_response(install_fake_httpx):
+    """Regression guard: the stateless fused-memory shape
+    (`content-type: application/json`) must keep decoding via `json()`
+    unchanged -- SSE support is additive, not a replacement."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"task_id": "3644"}}},
+        )
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {}) == {
+        "task_id": "3644"
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_fails_loud_on_an_sse_body_with_no_data_line(
+    install_fake_httpx
+):
+    """A malformed stream must raise a bounded, diagnosable error rather than
+    degrade to `{}` -- a silently-empty result is exactly the green-on-paper
+    failure this task exists to close."""
+    def _post(url, **kwargs):
+        return _FakeSseResponse("event: message\n: keep-alive comment\n\n")
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no SSE data line") as excinfo:
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    # The offending body is reported, and reported BOUNDED (_bounded_repr) --
+    # an unbounded dump of a large stream into a warning line is the opposite
+    # of the legible failure this module exists for.
+    assert "keep-alive" in str(excinfo.value)
+
+
+def test_post_mcp_envelope_tolerates_an_empty_202_body(install_fake_httpx):
+    """`notifications/initialized` answers 202 with no body at all; decoding
+    must yield `{}` rather than raising on the absent JSON."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(status_code=202, headers={}, text="")
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_envelope(
+        "http://localhost:8103/mcp",
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+    ) == {}
