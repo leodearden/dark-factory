@@ -29,9 +29,11 @@ from fused_memory.server.grouped_read import (
     _DIGEST_ELLIPSIS,
     AMENDMENT_KIND,
     CHILD_KINDS,
+    CONTESTED_METADATA_KEY,
     SIGHTING_KIND,
     build_grouped_document,
     group_search_results,
+    is_contested_child,
 )
 
 _PROJECT_ID = 'dark_factory'
@@ -437,6 +439,145 @@ class TestGroupSearchResults:
             'A Graphiti-sourced hit must issue no child count at all, got '
             f'{service.count_memories_by_metadata.await_args_list!r}'
         )
+
+
+class TestNeverSuppressCarveOuts:
+    """Three cases where a child must survive as a top-level hit regardless."""
+
+    @pytest.mark.asyncio
+    async def test_contested_child_stays_top_level_beside_its_parent(self):
+        """esc-5712: a correction must not be demoted to a digest under what it contests."""
+        service = _stub_service([
+            _child(
+                _AMEND_1,
+                _CANONICAL_ID,
+                AMENDMENT_KIND,
+                'this claim is WRONG',
+                '2026-08-01T00:00:00+00:00',
+                **{CONTESTED_METADATA_KEY: True},
+            ),
+            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [
+            _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'}),
+            _child_result(_AMEND_1, 0.8, **{CONTESTED_METADATA_KEY: True}),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert [r['id'] for r in grouped] == [_CANONICAL_ID, _AMEND_1], (
+            'A CONTESTED child must survive as a top-level hit in its own right '
+            f'even when its parent is present, got {[r["id"] for r in grouped]!r}. '
+            'RED: the contested carve-out does not exist yet.'
+        )
+        assert grouped[1]['content'] == 'a correction'
+
+    @pytest.mark.asyncio
+    async def test_contested_child_is_also_marked_in_the_parents_digests(self):
+        """Surfacing it in BOTH places is strictly more informative than either."""
+        service = _stub_service([
+            _child(
+                _AMEND_1,
+                _CANONICAL_ID,
+                AMENDMENT_KIND,
+                'this claim is WRONG',
+                '2026-08-01T00:00:00+00:00',
+                **{CONTESTED_METADATA_KEY: True},
+            ),
+            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-02T00:00:00+00:00'),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        by_id = {d['id']: d for d in block['amendments']}
+        assert by_id[_AMEND_1].get('contested') is True, (
+            f'The contested amendment must be marked in the digest list, got {by_id[_AMEND_1]!r}'
+        )
+        assert 'contested' not in by_id[_AMEND_2], (
+            "An ordinary amendment's digest must OMIT the contested key entirely, "
+            f'got {by_id[_AMEND_2]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_child_with_an_unresolvable_parent_survives_and_is_marked(self):
+        """A dangling parent pointer must never make a child's content vanish."""
+        # parents={} → get_memory_by_id returns None: a dead/dangling pointer.
+        service = _stub_service([], parents={})
+        hits = [_child_result(_AMEND_1, 0.8)]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 1, (
+            f'A child whose parent does not resolve must NOT be dropped, got {grouped!r}'
+        )
+        assert grouped[0]['id'] == _AMEND_1
+        assert grouped[0]['content'] == 'a correction', (
+            'The surviving child keeps its OWN content'
+        )
+        assert grouped[0].get('parent_unresolved') is True, (
+            'The survivor must carry an explicit dangling-pointer marker rather '
+            f'than silently looking like an ordinary hit, got {grouped[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolvable_parent_does_not_stamp_parent_unresolved(self):
+        """Fault-only loudness: the marker appears only on the fault path."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            parents={_CANONICAL_ID: _parent_record()},
+        )
+
+        grouped = await group_search_results(service, _PROJECT_ID, [_child_result(_AMEND_1, 0.8)])
+
+        assert 'parent_unresolved' not in grouped[0], (
+            f'A resolvable parent must produce no marker, got {grouped[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_grouping_suppresses_nothing(self):
+        """We never learned what that parent's children are — so we drop none of them."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            count_errors={_TOTAL: TimeoutError('qdrant count timed out')},
+        )
+        hits = [
+            _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'}),
+            _child_result(_AMEND_1, 0.8),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert [r['id'] for r in grouped] == [_CANONICAL_ID, _AMEND_1], (
+            'A parent whose grouping FAILED must suppress nothing — suppressing on '
+            'the strength of a grouping we never actually read would hide a child '
+            f'behind a backend timeout, got {[r["id"] for r in grouped]!r}'
+        )
+        assert grouped[0]['grouped'] == {
+            'children_unavailable': True,
+            'error_type': 'TimeoutError',
+        }, f'The parent must still carry the loud fault marker, got {grouped[0]!r}'
+
+
+class TestIsContestedChild:
+    """The single home of the contested predicate (leaf γ's one constant to stamp)."""
+
+    def test_experimental_namespace_key(self):
+        assert CONTESTED_METADATA_KEY == 'x_contested', (
+            'The flag lives in the x_ experimental namespace so it needs no '
+            "amendment to task 3195's closed five-key reserved set and makes no "
+            'unknown-key census noise'
+        )
+
+    def test_truthy_flag_is_contested(self):
+        assert is_contested_child({CONTESTED_METADATA_KEY: True}) is True
+        assert is_contested_child({CONTESTED_METADATA_KEY: 'yes'}) is True
+
+    def test_absent_or_falsy_flag_is_not_contested(self):
+        assert is_contested_child({}) is False
+        assert is_contested_child({CONTESTED_METADATA_KEY: False}) is False
+        assert is_contested_child({CONTESTED_METADATA_KEY: None}) is False
+        assert is_contested_child(None) is False
 
 
 class TestChildReadFaultContainment:
