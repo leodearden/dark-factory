@@ -80,9 +80,37 @@ arms:
     # expensively. At 12.0 it refuses up front. Same class of correction as
     # qwen3-embedding-0.6b (2.0 -> 3.0) and -4b (9.0 -> 10.0).
     #
-    # phi-4-14b almost certainly carries the same understatement (declares 9.0,
-    # measured 15517 MiB resident) but its weight-only figure was not captured,
-    # so it is left alone rather than guessed at.
+    # phi-4-14b does NOT carry this understatement -- checked 2026-08-10 and
+    # this comment corrected. It was previously recorded here as "almost
+    # certainly" understated on the strength of its 15517 MiB resident figure,
+    # with the weight-only number uncaptured. The weight-only number did not
+    # need a GPU: it is the size of the safetensors on disk, and the two AWQ
+    # snapshots settle it without any inference.
+    #
+    #   arm           on-disk safetensors   declared est_vram_gib
+    #   qwen3.5-9b            11.53 GiB     was 6.0  -> now 12.0
+    #   phi-4-14b              8.51 GiB          9.0
+    #
+    # qwen3.5-9b's 6.0 was ~2x BELOW its own weights, which is what made it a
+    # real understatement. phi-4-14b's 9.0 is ABOVE its 8.51 GiB of weights, so
+    # the same defect is not present and no correction is due. (Calibration, if
+    # a ratio is wanted: vLLM reported 11.21 GiB of weights for the 11.53 GiB
+    # qwen snapshot, 0.972x, giving phi-4 ~8.27 GiB loaded; 8.27 + the same
+    # ~0.79 GiB non-KV allowance qwen carries lands on 9.06 -- i.e. exactly the
+    # declared 9.0. The disk-size comparison above is the robust form and needs
+    # no ratio at all.)
+    #
+    # The 15517 MiB that prompted the suspicion is NOT evidence of any of this.
+    # Resident is share-driven for a generate arm (see above): all three fill
+    # what `_memory_share_for` leaves them, which is why qwen3.5-9b (11.21 GiB
+    # of weights) and phi-4-14b (~8.3 GiB) land 14507 and 15519 MiB apart by
+    # only ~1 GiB. Resident says nothing about weights and must not be compared
+    # against est_vram_gib, which is an ADMISSION FLOOR.
+    #
+    # Do not "correct" phi-4-14b's 9.0 upward toward its resident figure. That
+    # would be self-inflating: `arm_fits` would demand ~15.7 GiB free against a
+    # ~16.4 GiB budget, and lms_serve derives --gpu-memory-utilization from
+    # est_vram_gib + 0.5, so the arm would then be handed even more.
     est_vram_gib: 12.0
     max_model_len: 32768
     max_num_seqs: 8
