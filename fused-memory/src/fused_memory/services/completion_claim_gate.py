@@ -44,8 +44,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
 from fused_memory.reconciliation.task_filter import (
     _CLAUSE_SPLIT_RE,
@@ -61,12 +64,44 @@ __all__ = [
     'COMMIT_REF_RE',
     'FILING_DISPATCH_RE',
     'TICKET_REF_RE',
+    'UNRESOLVABLE',
+    'UNVERIFIED_CLAIM_TAG',
+    'ClaimVerdict',
     'CompletionClaim',
+    'build_unverified_flag',
     'extract_completion_claims',
+    'verify_claims',
 ]
 
 ClaimKind = Literal['applied_work', 'filing_dispatch']
 ClaimSubject = Literal['task', 'commit', 'ticket']
+VerdictStatus = Literal['verified', 'mismatch', 'unverifiable']
+
+#: The tag stamped onto an episode carrying at least one non-verified claim.
+#: It rides the same channel ``temporal_context`` does — a plain
+#: ``add_episode`` parameter, then a durable-queue payload key, then a
+#: ``source_description`` prefix on the Graphiti episodic node and a
+#: ``metadata`` key on every derived Mem0 fact. ``add_episode`` deliberately
+#: never persists its ``metadata`` argument, so a metadata key could not carry
+#: it; and the harm in the motivating incident was the DERIVED edges, not the
+#: tool response, so a response-only tag would have labelled none of it.
+UNVERIFIED_CLAIM_TAG: str = 'unverified_claim'
+
+
+class _Unresolvable:
+    """Sentinel type: the authority could not be consulted at all."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return 'UNRESOLVABLE'
+
+
+#: Distinguishes "the registry says no such ticket" (a MISMATCH — the claim is
+#: false) from "the registry could not be reached" (UNVERIFIABLE — the claim is
+#: merely unchecked). Both end up tagged, but only the first is evidence that
+#: the writer was wrong, and the flag must not conflate them (INV-2).
+UNRESOLVABLE: _Unresolvable = _Unresolvable()
 
 
 # --------------------------------------------------------------------------- #
@@ -397,3 +432,185 @@ def _ordered_unique_pairs(
             seen.add(value)
             out.append(value)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Verification
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimVerdict:
+    """One claim adjudicated against its authority.
+
+    Attributes:
+        claim: The claim that was checked.
+        status: ``'verified'`` (the authority agrees), ``'mismatch'`` (the
+            authority CONTRADICTS the claim) or ``'unverifiable'`` (the
+            authority could not be consulted).
+        observed: What was actually seen — a live status string, an absent-id
+            report, a registry row summary. Recorded verbatim so a reader can
+            re-check the verdict rather than take it on trust (INV-2).
+    """
+
+    claim: CompletionClaim
+    status: VerdictStatus
+    observed: str
+
+
+def verify_claims(
+    claims: list[CompletionClaim],
+    *,
+    task_status_probe: Callable[[str, str | None], str | None],
+    ticket_probe: Callable[[str], dict[str, Any] | None | _Unresolvable],
+    commit_probe: Callable[[str, str | None], bool | None],
+) -> list[ClaimVerdict]:
+    """Adjudicate each claim against its authority. Pure, sync, never raises
+    on probe RESULTS (a probe that itself raises is the caller's to contain).
+
+    Probe contract — TRI-STATE in every case:
+
+    * ``task_status_probe(ref, project_id) -> str | None``: the task's live
+      status, or ``None`` when it cannot be resolved. The literal ``'unknown'``
+      sentinel a NULL/absent DB status maps to counts as unresolvable too.
+      Terminal status (done/cancelled) verifies; any other real status is a
+      mismatch.
+    * ``ticket_probe(ref) -> dict | None | UNRESOLVABLE``: the registry row,
+      ``None`` when the registry says NO SUCH TICKET (a mismatch — this is
+      esc-3085-1 instance (2)), or :data:`UNRESOLVABLE` when the registry could
+      not be consulted.
+    * ``commit_probe(ref, project_id) -> bool | None``: ``True`` present,
+      ``False`` absent, ``None`` unresolvable.
+
+    THE FAIL DIRECTION IS DELIBERATELY INVERTED relative to this module's two
+    closest siblings, and copying theirs would silently reproduce the hole this
+    gate exists to close:
+
+    * ``tools._premature_completion_block`` REJECTS a write, and
+      ``recon_claim_verification_guard.make_source_and_history_probe`` DROPS a
+      candidate. Both must fail OPEN, because an infra hiccup bouncing a
+      legitimate write is worse than the stale claim it would have caught.
+    * This gate only LABELS. Its worst case on a false positive is an extra
+      source_description prefix and one metadata key on a kept episode; its
+      worst case on a false NEGATIVE is another batch of false Graphiti edges
+      like the five in reify esc-5603-1. So an unresolvable authority lands on
+      ``'unverifiable'`` and gets TAGGED, never quietly passed.
+
+    Short-circuits on an empty claim list, so the common write path never
+    touches an authority at all.
+    """
+    if not claims:
+        return []
+
+    verdicts: list[ClaimVerdict] = []
+    for claim in claims:
+        if claim.subject == 'ticket':
+            verdicts.append(_verify_ticket(claim, ticket_probe))
+        elif claim.subject == 'commit':
+            verdicts.append(_verify_commit(claim, commit_probe))
+        else:
+            verdicts.append(_verify_task(claim, task_status_probe))
+    return verdicts
+
+
+def _verify_task(
+    claim: CompletionClaim,
+    probe: Callable[[str, str | None], str | None],
+) -> ClaimVerdict:
+    status = probe(claim.ref, claim.project_id)
+    if status is None:
+        return ClaimVerdict(
+            claim, 'unverifiable',
+            f'live status for task {claim.ref} could not be resolved '
+            f'(project={claim.project_id!r})',
+        )
+    if status in TERMINAL_TASK_STATUSES:
+        return ClaimVerdict(claim, 'verified', status)
+    if status == 'unknown':
+        # get_statuses' documented sentinel for a NULL/absent status. It is NOT
+        # a live status, so it cannot contradict the claim — but it cannot
+        # confirm it either.
+        return ClaimVerdict(
+            claim, 'unverifiable',
+            f'task {claim.ref} reports status "unknown" '
+            f'(project={claim.project_id!r})',
+        )
+    return ClaimVerdict(claim, 'mismatch', status)
+
+
+def _verify_ticket(
+    claim: CompletionClaim,
+    probe: Callable[[str], dict[str, Any] | None | _Unresolvable],
+) -> ClaimVerdict:
+    row = probe(claim.ref)
+    if isinstance(row, _Unresolvable):
+        return ClaimVerdict(
+            claim, 'unverifiable',
+            f'ticket registry could not be consulted for {claim.ref}',
+        )
+    if row is None:
+        return ClaimVerdict(
+            claim, 'mismatch', f'no ticket {claim.ref} exists in the registry',
+        )
+    return ClaimVerdict(
+        claim, 'verified',
+        f'ticket {claim.ref} exists (project_id={row.get("project_id")!r}, '
+        f'status={row.get("status")!r})',
+    )
+
+
+def _verify_commit(
+    claim: CompletionClaim,
+    probe: Callable[[str, str | None], bool | None],
+) -> ClaimVerdict:
+    present = probe(claim.ref, claim.project_id)
+    if present is None:
+        return ClaimVerdict(
+            claim, 'unverifiable',
+            f'commit {claim.ref} could not be checked in project '
+            f'{claim.project_id!r}',
+        )
+    if present:
+        return ClaimVerdict(
+            claim, 'verified',
+            f'commit {claim.ref} exists in project {claim.project_id!r}',
+        )
+    return ClaimVerdict(
+        claim, 'mismatch',
+        f'no commit {claim.ref} in project {claim.project_id!r}',
+    )
+
+
+def build_unverified_flag(
+    verdicts: list[ClaimVerdict],
+    *,
+    text: str,
+) -> dict[str, Any] | None:
+    """Build the structured flag for the non-verified verdicts, or None.
+
+    Returns ``None`` when every verdict verified (or there are none) — the
+    caller uses that to keep the clean path exactly inert: no tag, no response
+    key, no log line.
+
+    Each entry records the claim's own words (sliced from *text* by its span)
+    alongside the OBSERVED authority state, so the flag is self-contained: a
+    reader can see what was claimed, what was checked, and what was actually
+    there, without re-running anything (INV-2).
+    """
+    entries = [
+        {
+            'kind': verdict.claim.kind,
+            'subject': verdict.claim.subject,
+            'ref': verdict.claim.ref,
+            'project_id': verdict.claim.project_id,
+            'span': [verdict.claim.span[0], verdict.claim.span[1]],
+            'text': text[verdict.claim.span[0]:verdict.claim.span[1]].strip(),
+            'status': verdict.status,
+            'observed': verdict.observed,
+        }
+        for verdict in verdicts
+        if verdict.status != 'verified'
+    ]
+    if not entries:
+        return None
+    return {'tag': UNVERIFIED_CLAIM_TAG, 'claims': entries}
