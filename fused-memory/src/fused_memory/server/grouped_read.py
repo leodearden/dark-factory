@@ -229,20 +229,25 @@ async def _read_grouped_document(
     return block
 
 
-def _child_parent_id(result: Any) -> str | None:
-    """The parent id *result* attaches to, or ``None`` when it is not a child.
+def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
+    """The parent id *meta* points at, or ``None`` when it is not a child's.
 
     A child is identified STRICTLY by ``metadata.parent_id`` plus a child
     ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries
     that merely discuss the same subject stay independent peers.
     """
-    meta = getattr(result, 'metadata', None) or {}
+    meta = meta or {}
     if meta.get('kind') not in CHILD_KINDS:
         return None
     parent_id = meta.get(PARENT_ID_KEY)
     if isinstance(parent_id, str) and parent_id:
         return parent_id
     return None
+
+
+def _child_parent_id(result: Any) -> str | None:
+    """:func:`_parent_id_in_meta` for a search hit."""
+    return _parent_id_in_meta(getattr(result, 'metadata', None))
 
 
 def _is_mem0(result: Any) -> bool:
@@ -452,3 +457,38 @@ async def group_search_results(
         ordered.append(target_id)
 
     return [entries[target_id] for target_id in ordered]
+
+
+async def group_memory_document(
+    service: Any,
+    project_id: str,
+    memory_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """The grouped block for an EXACT point-id read, or ``None`` when there is none.
+
+    ADDITIVE ONLY, deliberately asymmetric with :func:`group_search_results`:
+
+    * a CHILD keeps its own ``memory_id`` / ``content`` / ``metadata`` and gains
+      only ``{'parent': {...}}``.  ``get_memory_by_id`` is an exact-point-id
+      reader whose contract is load-bearing for
+      ``reconciliation/citation_verifier.py``, recon stage 1 and
+      ``server/recon_report.py::cite_memory`` — answering a child id with its
+      parent's text would make a citation silently verify against different
+      text, a worse bug than the ungrouped state;
+    * anything else is treated as a canonical and gets
+      :func:`build_grouped_document`.
+
+    Search hits are ranked CANDIDATES rather than exact-id answers, which is
+    why upward *replacement* is safe there and not here.  Both surfaces still
+    satisfy D6 — a child's content is never unreachable — one by keeping the
+    child, the other by surfacing the group.
+    """
+    parent_id = _parent_id_in_meta(record.get('metadata'))
+    if parent_id is None:
+        return await build_grouped_document(service, project_id, memory_id)
+    parent: dict[str, Any] = {'id': parent_id}
+    block = await build_grouped_document(service, project_id, parent_id)
+    if block:
+        parent.update(block)
+    return {'parent': parent}

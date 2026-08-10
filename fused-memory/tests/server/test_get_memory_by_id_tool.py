@@ -44,6 +44,10 @@ class TestGetMemoryByIdTool:
         mock_service.get_memory_by_id = AsyncMock(
             return_value={'id': _MEMORY_ID, 'content': 'the raw memory content', 'metadata': _SAMPLE_METADATA}
         )
+        # A bare AsyncMock returns an AsyncMock from the child-count probe the
+        # tool now issues (task 3129); pin the real zero-child corpus so this
+        # keeps asserting the UNGROUPED happy-path shape.
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=0)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(

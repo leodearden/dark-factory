@@ -79,7 +79,7 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
     is_proposed_resolution_framing,
 )
-from fused_memory.server.grouped_read import group_search_results
+from fused_memory.server.grouped_read import group_memory_document, group_search_results
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
@@ -3642,6 +3642,16 @@ def create_mcp_server(
             'tombstone_created_at', 'tombstone_expires_at'}`` when the record
             was deliberately reaped; or ``{'error', 'error_type'}`` on a
             backend failure.
+
+            A hit additionally carries an optional ``grouped`` key (task 3129)
+            when the record participates in a parent/child group: a CANONICAL
+            gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
+            (plus ``'truncated': True`` when the digest listing is bounded, or
+            ``{'children_unavailable': True, 'error_type'}`` when the child
+            reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
+            while keeping its OWN ``content``/``metadata``/``memory_id``.  The
+            key is OMITTED entirely when the record has no children and is not
+            itself a child, so an ungrouped response is unchanged.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -3687,13 +3697,37 @@ def create_mcp_server(
             if tombstone:
                 miss['tombstone'] = tombstone
             return miss
-        return {
+        hit: dict[str, Any] = {
             'found': True,
             'memory_id': memory_id,
             'project_id': project_id,
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
+        # its own content/metadata/memory_id and gains only grouped.parent —
+        # replacing a child's body with its parent's would make a citation
+        # verify against different text.  Guarded and never run on the miss
+        # branch, so — exactly like the tombstone lookup above — it can only add
+        # information to an already-correct answer, never convert a correct
+        # found:True into an error dict.
+        try:
+            grouped = await group_memory_document(
+                memory_service, project_id, memory_id, record
+            )
+        except Exception:
+            logger.warning(
+                'get_memory_by_id: grouped read FAILED for memory_id=%s in project=%s; '
+                'returning the (correct) hit without a grouped block',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            grouped = None
+        if grouped:
+            hit['grouped'] = grouped
+        return hit
 
     @mcp.tool()
     @mcp_tool_errors()
