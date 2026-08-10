@@ -297,6 +297,139 @@ class TestDismissAllPendingAgeAware:
         assert 'severity=blocking' in strand.resolution
 
 
+class TestDismissAllPendingAgeAwareDegrades:
+    """The age-aware sweep degrades honestly — loudly, and never into a false strand.
+
+    Clearing stale L0s at startup must still happen even when a record's
+    timestamp cannot be aged; what must NOT happen is a malformed record being
+    silently promoted to 'stale-strand' by a floor sentinel, or dropped in
+    silence (task 3172).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def test_unparseable_timestamp_is_still_dismissed(self, tmp_path: Path):
+        """A garbage timestamp does not stop the record from being swept."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+
+    def test_unparseable_timestamp_is_never_stamped_stale_strand(self, tmp_path: Path):
+        """A malformed record must not read as maximally stale.
+
+        The parse fallback sorts an unparseable record as NEWEST, so a corrupt
+        timestamp can never be mislabelled a 20h strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution_class != 'stale-strand'
+        assert swept.resolution_class == 'benign'
+
+    def test_unparseable_timestamp_carries_no_age_token(self, tmp_path: Path):
+        """No age is claimed for a record whose age is unknowable."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        msg = 'Stale from prior run'
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution.startswith(msg)
+        assert _pending_secs(swept.resolution) is None
+
+    def test_unparseable_timestamp_logs_a_warning(self, tmp_path: Path, caplog):
+        """The skip is LOUD — a warning names the offending escalation."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING):
+            queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-7-1' in m for m in warnings), warnings
+
+    def test_naive_timestamp_is_treated_as_utc(self, tmp_path: Path):
+        """A tz-naive stamp is read as UTC, not misread as ancient.
+
+        The record is deliberately RECENT: if a naive stamp were mishandled it
+        would age out to something enormous and be mis-stamped a strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-8-1', task_id='8')
+        esc.timestamp = (datetime.now(UTC) - timedelta(seconds=90)).replace(tzinfo=None).isoformat()
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-8-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+        assert swept.resolution_class == 'benign'
+        assert swept.resolution_class != 'stale-strand'
+        assert abs(_pending_secs(swept.resolution) - 90) < 5  # type: ignore[operator]
+
+    def test_omitted_threshold_preserves_pre_3172_classification(self, tmp_path: Path):
+        """Opt-in default: without strand_age_secs a 20h L0 is still 'benign'.
+
+        A caller that has not been considered cannot be silently reclassified.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-5189-7', age_secs=75480.0, task_id='5189'))
+
+        count = queue.dismiss_all_pending('Stale from prior run')
+
+        assert count == 1
+        swept = queue.get('esc-5189-7')
+        assert swept is not None
+        assert swept.resolution_class == 'benign'
+        assert effective_benign(swept) == ('benign', 'stamped')
+
+    def test_resolve_failure_does_not_abort_the_age_aware_sweep(self, tmp_path: Path):
+        """One raising record cannot cost the others their dismissal or the count."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        original_resolve = queue.resolve
+
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False, **kwargs):
+            if esc_id == 'esc-2-1':
+                raise OSError('disk full')
+            return original_resolve(esc_id, resolution, dismiss=dismiss, **kwargs)
+
+        with patch.object(queue, 'resolve', side_effect=patched_resolve):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS
+            )
+
+        assert count == 2
+        assert queue.get('esc-1-1').resolution_class == 'stale-strand'  # type: ignore[union-attr]
+        assert queue.get('esc-3-1').resolution_class == 'benign'  # type: ignore[union-attr]
+        assert queue.get('esc-2-1').status == 'pending'  # type: ignore[union-attr]
+
+
 class TestDismissAllPendingResilience:
     """EscalationQueue.dismiss_all_pending() is resilient to per-item resolve() failures."""
 
