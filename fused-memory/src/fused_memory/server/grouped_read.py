@@ -75,6 +75,27 @@ _AMENDMENT_DIGEST_CAP = 10
 #: children are.
 CHILDREN_UNAVAILABLE_KEY = 'children_unavailable'
 
+#: Metadata flag marking a child that CONTESTS its parent rather than merely
+#: extending it.  This module is the single home of the predicate below because
+#: no landed vocabulary key carries adjudication state and the producer (leaf
+#: γ's write-triage judge) has not shipped — so without a read-side definition
+#: the D6 carve-out would be untestable.  The ``x_`` experimental namespace
+#: (``memory_metadata.EXPERIMENTAL_KEY_PREFIX``) is deliberate: it needs no
+#: amendment to task 3195's closed five-key ``RESERVED_VOCABULARY_KEYS`` set
+#: and produces no unknown-key census noise, while giving leaf γ exactly ONE
+#: constant to stamp.
+CONTESTED_METADATA_KEY = 'x_contested'
+
+
+def is_contested_child(meta: Mapping[str, Any] | None) -> bool:
+    """True when *meta* marks a child as CONTESTING its parent.
+
+    A contested child is never suppressed into a digest: demoting a correction
+    to truncated text under the very entry it contests is the esc-5712
+    five-week-wrong-appendix shape.
+    """
+    return bool((meta or {}).get(CONTESTED_METADATA_KEY))
+
 
 def _child_text(payload: Mapping[str, Any]) -> str:
     """First non-empty string among the canonical mem0 content keys."""
@@ -95,12 +116,18 @@ def _digest(text: str) -> str:
 def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build one digest entry from a scrolled child row."""
     payload = row.get('metadata') or {}
-    return {
+    entry = {
         'id': row.get('id'),
         'digest': _digest(_child_text(payload)),
         'created_at': row.get('created_at'),
         'kind': payload.get('kind', AMENDMENT_KIND),
     }
+    # A contested child appears in BOTH places — here AND as a surviving
+    # top-level hit — which is strictly more informative than either alone.
+    # Omitted (never False) when uncontested, per the fault-only convention.
+    if is_contested_child(payload):
+        entry['contested'] = True
+    return entry
 
 
 def _digest_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
@@ -282,6 +309,35 @@ async def _resolve_absent_parents(
     return resolved
 
 
+def _suppress_child(
+    child_meta: Mapping[str, Any] | None,
+    parent_base: Any,
+    parent_block: Mapping[str, Any] | None,
+) -> bool:
+    """The SINGLE gate every child-suppression decision passes through.
+
+    True only when the child is genuinely REPRESENTED by its parent's grouped
+    document.  Every carve-out lives here, in one place, so a future edit
+    cannot bypass one:
+
+    * UNRESOLVABLE PARENT — a dangling ``parent_id`` must never make a child's
+      content unreachable, so an unresolved parent suppresses nothing;
+    * CONTESTED (D6 / esc-5712) — a correction must never be demoted to a
+      truncated digest under the entry it contests;
+    * FAILED or EMPTY GROUPING — we never learned what that parent's children
+      are (a backend fault, or a count that disagrees with the hit in hand), so
+      we cannot claim this child is represented there.
+    """
+    if parent_base is None:
+        return False
+    if is_contested_child(child_meta):
+        return False
+    grouping_is_unusable = not parent_block or bool(
+        parent_block.get(CHILDREN_UNAVAILABLE_KEY)
+    )
+    return not grouping_is_unusable
+
+
 async def group_search_results(
     service: Any,
     project_id: str,
@@ -295,6 +351,8 @@ async def group_search_results(
       the child's rank slot (D6), so a child's content is never unreachable.
     * A parent reached both ways is emitted EXACTLY once, keeping the higher
       ``relevance_score``.
+    * A child the grouping cannot account for — contested, dangling parent, or
+      failed parent grouping — survives untouched; see :func:`_suppress_child`.
 
     The list only ever shrinks, and survivors keep their relative order.
 
@@ -323,39 +381,31 @@ async def group_search_results(
     ]
     resolved = await _resolve_absent_parents(service, project_id, absent)
 
-    ordered: list[str] = []
-    entries: dict[str, dict[str, Any]] = {}
-    base_by_id: dict[str, Any] = {}
-    for index, hit in enumerate(hits):
-        parent_id = child_parents.get(index)
-        base = hit_by_id.get(parent_id) or resolved.get(parent_id) if parent_id else None
-        if base is not None:
-            target_id = parent_id
-        else:
-            # Not a child, or a child whose parent did not resolve: it stays a
-            # top-level hit in its own right.
-            target_id, base = getattr(hit, 'id', None), hit
-        score = getattr(hit, 'relevance_score', 0.0)
-        existing = entries.get(target_id)
-        if existing is not None:
-            existing['relevance_score'] = max(existing['relevance_score'], score)
-            continue
-        entry = base.model_dump()
-        entry['relevance_score'] = score
-        entries[target_id] = entry
-        base_by_id[target_id] = base
-        ordered.append(target_id)
-
-    # Group only entries that can actually BE a parent: Mem0-sourced, and not
-    # themselves a surviving child (the model is flat — a child has no children).
-    groupable = [
-        target_id
-        for target_id in ordered
-        if _is_mem0(base_by_id[target_id]) and _child_parent_id(base_by_id[target_id]) is None
-    ]
+    # Grouped documents are built BEFORE any suppression decision, because
+    # "did this parent's grouping actually succeed?" is itself a carve-out:
+    # a child must never be dropped on the strength of a grouping we failed to
+    # read.  Candidates are the parents children point at, plus every
+    # Mem0-sourced non-child hit (a child has no children — the model is flat).
+    groupable = list(
+        dict.fromkeys(
+            [
+                hit_id
+                for hit in hits
+                if _is_mem0(hit)
+                and _child_parent_id(hit) is None
+                and isinstance(hit_id := getattr(hit, 'id', None), str)
+            ]
+            + [
+                parent_id
+                for parent_id in dict.fromkeys(child_parents.values())
+                if parent_id in hit_by_id or parent_id in resolved
+            ]
+        )
+    )
     blocks = await gather_collect(
         build_grouped_document(service, project_id, target_id) for target_id in groupable
     )
+    block_by_id: dict[str, Any] = {}
     for target_id, block in zip(groupable, blocks, strict=True):
         if isinstance(block, Exception):
             # build_grouped_document contains its own faults; this is
@@ -369,7 +419,36 @@ async def group_search_results(
                 extra={'project_id': project_id, 'canonical_id': target_id},
             )
             block = {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': type(block).__name__}
+        block_by_id[target_id] = block
+
+    ordered: list[str] = []
+    entries: dict[str, dict[str, Any]] = {}
+    for index, hit in enumerate(hits):
+        parent_id = child_parents.get(index)
+        parent_base = (hit_by_id.get(parent_id) or resolved.get(parent_id)) if parent_id else None
+        child_meta = getattr(hit, 'metadata', None) if parent_id else None
+        if parent_id and _suppress_child(child_meta, parent_base, block_by_id.get(parent_id)):
+            target_id, base, parent_unresolved = parent_id, parent_base, False
+        else:
+            # Not a child, or a child a carve-out keeps: it stays a top-level
+            # hit in its own right.
+            target_id, base = getattr(hit, 'id', None), hit
+            parent_unresolved = bool(parent_id) and parent_base is None
+        score = getattr(hit, 'relevance_score', 0.0)
+        existing = entries.get(target_id)
+        if existing is not None:
+            existing['relevance_score'] = max(existing['relevance_score'], score)
+            continue
+        entry = base.model_dump()
+        entry['relevance_score'] = score
+        if parent_unresolved:
+            # Loud rather than silent: this hit points at a parent no store
+            # could resolve, so its group is genuinely unknown — not empty.
+            entry['parent_unresolved'] = True
+        block = block_by_id.get(target_id)
         if block:
-            entries[target_id]['grouped'] = block
+            entry['grouped'] = block
+        entries[target_id] = entry
+        ordered.append(target_id)
 
     return [entries[target_id] for target_id in ordered]
