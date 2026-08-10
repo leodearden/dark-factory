@@ -26,6 +26,8 @@ a recon-stage agent id.
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -209,3 +211,206 @@ class TestAddEpisodeUnverifiedClaimTagging:
         assert list(kwargs.get('ids') or []) == ['5422'], (
             f'Status read must be batched over the claimed ids; got: {kwargs!r}'
         )
+
+
+# The `tkt_` id from esc-3085-1 instance (2), verbatim.
+_TICKET_ID = 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+_TICKET_CONTENT = f'the follow-up was filed as ticket {_TICKET_ID}'
+# Ref but no completion phrasing, and completion phrasing is nowhere in it —
+# the shape the gate must be entirely inert for.
+_NO_CLAIM_CONTENT = 'task 5422 is pending review and the manifest gate is still open'
+
+# Exactly the kwargs add_episode passed to the service BEFORE this gate existed.
+_BASELINE_SERVICE_KWARGS = frozenset(
+    {
+        'content',
+        'source',
+        'project_id',
+        'agent_id',
+        'session_id',
+        'source_description',
+        'causation_id',
+        'temporal_context',
+        'reference_time',
+        '_source',
+    }
+)
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    """A throwaway repo with one commit; yields (root, sha)."""
+    root = tmp_path / 'repo'
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q', '.'], cwd=root, check=True)
+    subprocess.run(
+        ['git', '-c', 'user.email=a@b', '-c', 'user.name=a',
+         'commit', '-q', '--allow-empty', '-m', 'x'],
+        cwd=root, check=True,
+    )
+    sha = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return root, sha
+
+
+def _gate_warnings(caplog) -> list[str]:
+    """Every completion_claim_gate log line captured, at any level."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if 'completion_claim_gate' in r.getMessage()
+    ]
+
+
+class TestVerifiedClaimsAreInert:
+    """PRIMARY SIGNAL (second half): a claim the authority CONFIRMS must leave
+    the write exactly as it was. A gate that tagged verified claims too would
+    make the tag meaningless — the whole point is that its presence is a signal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_done_task_claim_is_not_tagged(self, caplog):
+        """Task 5422 is live 'done' (terminal) — the claim is TRUE. No tag on
+        the service call, no flag on the response, no warning logged.
+        """
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'done'})
+
+        with caplog.at_level(logging.DEBUG):
+            result = await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': _APPLIED_CONTENT,
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        mock_service.add_episode.assert_awaited_once()
+        kwargs = _service_kwargs(mock_service)
+        assert kwargs.get('unverified_claim', False) is False, (
+            f'A verified claim must not tag the episode; got kwargs: {kwargs!r}'
+        )
+        assert 'unverified_claim' not in result, (
+            f'A verified claim must leave no flag on the response; got: {result!r}'
+        )
+        assert _gate_warnings(caplog) == [], (
+            f'A verified claim must log nothing; got: {_gate_warnings(caplog)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_existing_commit_claim_is_not_tagged(self, caplog, git_repo):
+        """A claim naming a commit that really exists in the claimed project's
+        repository verifies against git and is not tagged.
+        """
+        root, sha = git_repo
+        mock_service = _episode_service()
+        server = _server(
+            mock_service,
+            statuses={},
+            known_projects={_PROJECT_ID: str(root)},
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': f'the de-flake fix landed in commit {sha}',
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'An existing commit must not tag; got: {_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+        assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
+
+    @pytest.mark.asyncio
+    async def test_resolving_ticket_claim_is_not_tagged(self, caplog):
+        """A `tkt_` claim whose id resolves in the registry verifies by primary
+        key — the row's own project is reported, and nothing is tagged.
+        """
+        mock_service = _episode_service()
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_ticket_row = AsyncMock(
+            return_value={'ticket_id': _TICKET_ID, 'project_id': 'dark_factory',
+                          'status': 'pending'},
+        )
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': _TICKET_CONTENT,
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        task_interceptor.get_ticket_row.assert_awaited_once_with(_TICKET_ID)
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'A resolving ticket must not tag; got: {_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+        assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
+
+
+class TestNoClaimPathIsUntouched:
+    """The control: content carrying no completion claim must not pay for this
+    gate at all — no authority read, and a service call identical to the one the
+    pre-gate code made.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_claim_content_reads_nothing_and_passes_baseline_kwargs(
+        self, caplog, monkeypatch
+    ):
+        import fused_memory.server.tools as tools_mod
+
+        commit_probe_factory = MagicMock(
+            side_effect=AssertionError('git must not be touched without a commit claim')
+        )
+        monkeypatch.setattr(tools_mod, 'make_commit_probe', commit_probe_factory)
+
+        mock_service = _episode_service()
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_ticket_row = AsyncMock(return_value=None)
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': _NO_CLAIM_CONTENT,
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        task_interceptor.get_statuses.assert_not_awaited()
+        task_interceptor.get_ticket_row.assert_not_awaited()
+        commit_probe_factory.assert_not_called()
+        mock_service.add_episode.assert_awaited_once()
+        assert set(_service_kwargs(mock_service)) == set(_BASELINE_SERVICE_KWARGS), (
+            'A no-claim write must reach the service with exactly the pre-gate '
+            f'kwargs; got: {sorted(_service_kwargs(mock_service))!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+        assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
