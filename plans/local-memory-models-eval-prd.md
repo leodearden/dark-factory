@@ -177,6 +177,26 @@ block):
   suppresses the multimodal path.* Suppressing it would mean the eval measured a model configured
   differently from the one this PRD costed.
 
+> **Consequence for η's screening funnel — the LLM slate is THREE arms, not four.** The remaining
+> arms are **Qwen3.5-9B**, **Phi-4 14B**, and the **MoE stretch arm (Gemma-4-26B-A4B-it QAT)**.
+> Two things follow, and both matter for reading η's report:
+>
+> 1. **The ≤3 cap's selectivity is now exactly nil.** The funnel narrows 3 → at most 3: three
+>    candidates against a cap of three can eliminate nobody *by ranking*. The cap no longer binds.
+> 2. **The funnel's absolute gates remain fully live and can still drop arms** — schema-conformance
+>    smoke, VRAM fit under the measured ~16.4 GiB (D10), Phi-4's 16K context fit (Open Q2 already
+>    reserves "drop the arm if it doesn't fit with margin"), and ζ's pre-registered throughput
+>    floor. So η may still legitimately return **fewer than three** survivors; it just can no longer
+>    return fewer *because of the cap*. Do not read "3 → at most 3" as "everything survives by
+>    construction".
+>
+> **Whether the nil cap selectivity warrants re-opening the slate — a different Mistral quant repo,
+> or another candidate entirely — is Leo's call. It is surfaced here and deliberately not decided.**
+> One fact bearing on that call, stated as a fact and **not** as a recommendation: this PRD's own
+> research appendix already named **gpt-oss-20b** as the reserve, "screened out only if slate must
+> shrink". The slate has now shrunk, so that pre-existing conditional has **fired**. Naming it is
+> surfacing, not selecting; no replacement candidate is chosen anywhere in this correction.
+
 Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
 incumbent `text-embedding-3-small` runs as its own arm):
 
