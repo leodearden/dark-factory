@@ -2329,6 +2329,134 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
             f'{sorted(str(p) for p in worker._owned_merge_worktrees)}'
         )
 
+    # ── 3251/step-3: disk reclamation + warm-lane routing + ordering ───────
+
+    async def test_ru_finalize_reclaims_old_worktree_from_disk(self, tmp_path):
+        """Cold case: the RU'd worktree is reclaimed NOW, not left to the reaper.
+
+        Deregistering alone would trade a heartbeat-pinned ledger leak for an
+        on-disk orphan that only ``_maybe_reap_orphaned_merge_worktrees``
+        eventually claims (at the PERIODIC_REAP_MIN_AGE_SECS floor), and that
+        would meanwhile become a recurring ``worktree_ledger_violations`` I6
+        finding once past RESOURCE_AUDIT_WORKTREE_GRACE_SECS.  Reclaim it at
+        the moment the item is known dead — ``_record_dead_base`` four lines
+        later in the same branch has just declared its merge commit dead.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        new_wt = tmp_path / '_merge-new'
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=entry.item.merge_result,
+            merge_wt=new_wt,
+            base_sha='base456',
+            speculative=False,
+        )
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        cleaned = [c.args[0] for c in worker._git_ops.cleanup_merge_worktree.await_args_list]
+        assert cleaned == [old_wt], (
+            f'expected exactly one disk reclamation of the RU\'d worktree; got {cleaned}'
+        )
+        # The freshly-allocated replacement must survive — it is what the
+        # re-dispatched item will verify in.
+        assert new_wt not in cleaned
+
+    async def test_ru_finalize_releases_warm_spec_lane_instead_of_removing_it(self, tmp_path):
+        """Warm case: a pool-owned _spec- lane is RELEASED, never `worktree remove`d.
+
+        Reachable, not merely defensive: ``_run_inflight_verify`` dispatches a
+        LOCAL lease with ``runner=None``, which routes through the worker's own
+        runner pool, and that pool's INV-2 contract-currency gate raises
+        ``RunnerUnavailable`` when no distinct healthy runner remains
+        (verify_runner.py:1978/:1988) — by which point the LOCAL warm swap has
+        already run, so ``vr.merge_wt`` is a ``_spec-`` lane with
+        ``vr.spec_warm=True``.  This is why the fix must call
+        ``_release_or_cleanup`` and not ``_cleanup_owned_merge_worktree``: the
+        cold path would ``git worktree remove`` a lane belonging to
+        ``spec_warm_lane_pool`` instead of returning it FREE.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+        # _make_git_ops_mock() does not expose release_spec_lane; a bare
+        # MagicMock attribute is not awaitable, so install a recording stub.
+        worker._git_ops.release_spec_lane = AsyncMock()
+
+        lane = tmp_path / '_spec-3'
+        lane.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=lane, spec_warm=True)
+        worker._register_owned_merge_worktree(lane)
+
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=entry.item.merge_result,
+            merge_wt=tmp_path / '_merge-new',
+            base_sha='base456',
+            speculative=False,
+        )
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        worker._git_ops.release_spec_lane.assert_awaited_once_with(lane, warm=True)
+        cleaned = [c.args[0] for c in worker._git_ops.cleanup_merge_worktree.await_args_list]
+        assert lane not in cleaned, 'a pool-owned _spec- lane must never be removed from disk'
+        # ...and either way it leaves the ledger (task 3148 invariant).
+        assert lane not in worker._owned_merge_worktrees
+
+    async def test_ru_finalize_disposes_before_remerge(self, tmp_path):
+        """Disposal happens BEFORE _remerge, permanently.
+
+        _remerge does not always yield a replacement worktree — ``DecidedItem``
+        (already-merged / conflicted / vanished branch) carries none, and
+        _remerge can raise outright.  Deregistering only once _remerge had
+        registered a replacement would therefore re-open the leak on exactly
+        those paths.  Both sibling sites (``_void_and_remerge``, the
+        head-failure cascade) dispose first; this pins that ordering so the
+        alternative can never be reintroduced silently.
+        """
+        from orchestrator.merge_queue import DecidedItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+
+        observed: dict = {}
+
+        async def _spy_remerge(request, started_monotonic):
+            observed['in_ledger'] = old_wt in worker._owned_merge_worktrees
+            # DecidedItem is structurally worktree-less: no merge_wt field.
+            return DecidedItem(
+                request=request,
+                immediate_outcome=MagicMock(),
+                base_sha='base456',
+                speculative=False,
+            )
+
+        with patch.object(worker, '_remerge', new=AsyncMock(side_effect=_spy_remerge)):
+            await worker._finalize_inflight(entry)
+
+        assert observed['in_ledger'] is False, (
+            'the RU\'d worktree was still in the ledger when _remerge was entered — '
+            'disposal must precede _remerge, which may return a worktree-less '
+            'DecidedItem or raise'
+        )
+        assert old_wt not in worker._owned_merge_worktrees
+
 
 # ---------------------------------------------------------------------------
 # 1795/step-11 RED: _clear_verify_host_unreachable module-level helper
