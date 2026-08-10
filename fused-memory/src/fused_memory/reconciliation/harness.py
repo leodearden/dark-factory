@@ -3405,7 +3405,11 @@ class ReconciliationHarness:
         — keeping the recovered row's ``payload['remediation']`` identical to
         what the in-stage write would have stamped, which
         ``get_cycle_summary_presence`` reads to disambiguate expected-missing
-        rows.
+        rows. Note this does not weaken the never-fabricate guarantee on that
+        driver either: ``_run_remediation_pass``'s scope-freshness
+        short-circuit RETURNS before its ``try:`` block, so its ``finally``
+        — and therefore this method — is never reached on that never-ran-any-
+        stage path.
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
@@ -4615,6 +4619,18 @@ class ReconciliationHarness:
         finally:
             await self._ensure_stage1_cycle_summary(
                 run, run_id, project_id, current_stage_name, run.started_at,
+            )
+            # Task 3732: unlike the Stage 1 arm — which deliberately no-ops on a
+            # remediation pass, since Stage 1 skips its own summary write there —
+            # the Stage 2 backstop is wired into this driver with NO remediation
+            # exclusion: Stage 2's in-stage write is unconditional by explicit
+            # design, so a lost row here is a genuine gap. Anchored at
+            # run.started_at (this driver has no separate cycle_start_time local),
+            # exactly as the Stage 1 call above. Placed strictly after it so a
+            # Stage 2 fault can never starve that arm, and strictly before
+            # update_run_stage_reports so the persisted copy captures its markers.
+            await self._ensure_stage2_cycle_summary(
+                run, run_id, project_id, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
