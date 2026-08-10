@@ -194,7 +194,7 @@ def test_select_on_an_empty_feed_returns_empty():
 
 def test_plan_files_rejection_reason_accepts_an_all_file_level_list():
     """(a) every entry is file-level -> no reason. The systemd unit paths are
-    deliberate: `timer` and `service` ARE in shared.locking.CODE_EXTENSIONS, so
+    deliberate: `timer` and `service` ARE in shared.locking.FILE_EXTENSIONS, so
     a naive "no dot-py suffix means directory" check would wrongly reject real
     repairable paths measured in today's population."""
     candidate = _candidate(
