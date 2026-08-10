@@ -113,7 +113,20 @@ async def build_grouped_document(
     int}``.  The sighting count always comes from the EXACT count API — never
     ``len(scroll)``, which would silently under-report a fan-out wider than
     the scroll limit.
+
+    COST ORDERING (mirrors task 3197's delete gate, for the same reason): the
+    un-kinded TOTAL child count runs FIRST and short-circuits on zero, so the
+    common path — every canonical on today's corpus, where ``parent_id`` has
+    zero live footprint — pays one cheap exact count and issues no scroll at
+    all.  The detail reads are paid only when they buy something the total
+    cannot: the per-kind split and the child bodies the digests need.
     """
+    total_children = await service.count_memories_by_metadata(
+        project_id=project_id,
+        filters={PARENT_ID_KEY: canonical_id},
+    )
+    if not total_children:
+        return None
     sighting_count = await service.count_memories_by_metadata(
         project_id=project_id,
         filters={PARENT_ID_KEY: canonical_id, 'kind': SIGHTING_KIND},
@@ -124,8 +137,10 @@ async def build_grouped_document(
         limit=_AMENDMENT_DIGEST_CAP,
     )
     digests = [_digest_entry(row) for row in sorted(rows or [], key=_digest_sort_key)]
-    if not digests and not sighting_count:
-        return None
+    # A non-zero total means children EXIST, so the block is emitted even when
+    # none of them is an amendment or a sighting — reporting an empty group for
+    # a parent that demonstrably has children would be the silent under-report
+    # the total probe exists to prevent.
     return {
         'amendments': digests,
         'amendment_count': len(digests),
