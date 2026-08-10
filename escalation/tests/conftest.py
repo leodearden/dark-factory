@@ -26,6 +26,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -71,6 +73,31 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
+# ---------------------------------------------------------------------------
+# Legibility-scripts path injection for the census<->escalation E2E contract
+# test (task 3644).
+# ---------------------------------------------------------------------------
+# `scripts/legibility/census.py` posts its fail-loud escalate_info to a REAL
+# escalation MCP server, and that POST speaks the stateful streamable-HTTP
+# transport (session handshake + SSE-framed responses).  Proving the two sides
+# stay in lockstep needs BOTH the census client and a live `create_server`
+# in one process — and only THIS project env has fastmcp (`shared`, which runs
+# `scripts/tests/`, does not depend on it), so the E2E test lives here.
+#
+# `scripts/` gets the `legibility` package (`from legibility import
+# census_trigger`) and `scripts/legibility/` gets the flat module names
+# (`import census`) — the same two-entry idiom `scripts/tests/conftest.py`
+# uses, mirroring the `_SHARED_SRC` / `_ORCH_SRC` inserts above.  The `shared`
+# STUB installed by the block above is compatible: its `__path__` points at
+# the real `shared/src/shared`, so census.py's own `shared.cap_markers` import
+# resolves against real source rather than the stub's namespace.
+_SCRIPTS = _REPO_ROOT / 'scripts'
+_SCRIPTS_LEGIBILITY = _SCRIPTS / 'legibility'
+if _SCRIPTS_LEGIBILITY.is_dir():
+    for _p in (str(_SCRIPTS), str(_SCRIPTS_LEGIBILITY)):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd escalation && uv run pytest tests/`, which makes rootdir the
 # SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
@@ -94,3 +121,177 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+# ---------------------------------------------------------------------------
+# serve_escalation_mcp — a REAL escalation MCP server over REAL HTTP (task 3644)
+# ---------------------------------------------------------------------------
+#
+# A pytest FIXTURE rather than an importable helper, for the same reason
+# `scripts/tests/conftest.py` gives for its own fixtures: fixtures auto-resolve
+# for every file in this directory, whereas `from conftest import ...` is
+# fragile under the repo-wide `--import-mode=importlib` addopts.
+#
+# The teardown semantics below are COPIED VERBATIM from
+# `test_capability_guard_http.py`'s `http_server` fixture rather than
+# re-derived: task 2741 exists precisely because getting them wrong leaks a
+# daemon thread and crashes anyio's shielded lifespan cleanup at GC time.
+# That module is deliberately NOT refactored onto this fixture here — its
+# fixture is module-scoped with tuned teardown, and converting it is a
+# separate, riskier change.
+
+
+def _free_escalation_port() -> int:
+    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call.
+
+    Binds to port 0 (OS-assigned free port) and immediately closes the socket.
+    There is an inherent (small) TOCTOU window before the real server binds the
+    same port; acceptable for a single-threaded test run.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def _drain_pending_tasks(loop) -> None:
+    """Cancel and await every task still pending on *loop* before it closes.
+
+    Mirrors ``asyncio.run()``'s own internal shutdown sequence
+    (``_cancel_all_tasks``).  Without this, a task still suspended
+    mid-``await`` when the loop is stopped -- the server's own root task
+    (``run_http_async``), or an internal one it spawns (e.g. sse_starlette's
+    ``_shutdown_watcher``) -- is only unwound later at uncontrolled
+    garbage-collection time, outside of any running task context, which
+    crashes anyio's shielded lifespan cleanup with an unraisable
+    ``TypeError``/``NoEventLoopError`` instead of shutting down cleanly
+    (task 2741).
+    """
+    import asyncio
+
+    pending = asyncio.all_tasks(loop)
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
+@pytest.fixture
+def serve_escalation_mcp():
+    """Factory: serve a REAL escalation MCP server over REAL HTTP.
+
+    Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
+    Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
+    startup_sweep=False, dedupe_config=...)`` and serves it via
+    ``FastMCP.run_http_async`` on an OS-assigned free localhost port inside a
+    daemon thread running its own event loop.  Readiness is polled by a raw TCP
+    connect (bounded ~10s total) -- no fixed sleep.  Every server started
+    through the factory is torn down when the test finishes.
+
+    ``startup_sweep=False`` so pre-seeded queue files are not relocated by the
+    startup sweep (the existing test convention in this suite).
+
+    Deduplication is DISABLED by default (``DedupeConfig(infra_dedupe_enabled=
+    False)``).  ``create_server`` otherwise defaults to ``DedupeConfig()`` --
+    infra_issue dedupe ON with a 600s window -- and the fail-loud legibility
+    posters this fixture exists to test all file ``category='infra_issue'``.
+    With dedupe on, a regression that filed the SAME escalation twice would be
+    collapsed server-side into one record and an "exactly one escalation"
+    assertion would still pass: green on paper, broken in practice, which is
+    the precise failure mode task 3644 exists to close.  Pass an explicit
+    ``dedupe_config=`` to opt back in when dedupe is the thing under test.
+
+    Teardown is explicit and mirrors ``test_capability_guard_http.py``
+    (task 2741): the event loop is created in the fixture body (NOT inside the
+    thread target) so it can be stopped thread-safely; a ``stopping`` flag
+    distinguishes the deliberate stop-induced ``RuntimeError`` from a genuine
+    startup failure; ``_drain_pending_tasks`` cancels+gathers inside the
+    serving thread before ``loop.close()``; and the join is bounded at 5s with
+    an assert, so a hang surfaces loudly instead of silently leaking a daemon
+    thread past this fixture.
+    """
+    import asyncio
+    import contextlib
+    import socket
+    import threading
+    import time
+
+    from escalation.dedupe import DedupeConfig
+    from escalation.queue import EscalationQueue
+    from escalation.server import create_server
+
+    started: list[tuple] = []
+
+    def _start(queue_dir, *, dedupe_config=None, startup_sweep=False):
+        queue = EscalationQueue(queue_dir)
+        if dedupe_config is None:
+            dedupe_config = DedupeConfig(infra_dedupe_enabled=False)
+        mcp = create_server(
+            queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
+        )
+        port = _free_escalation_port()
+        loop = asyncio.new_event_loop()
+        serve_error: BaseException | None = None
+        state = {'stopping': False}
+
+        def _serve_forever() -> None:
+            nonlocal serve_error
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    mcp.run_http_async(
+                        host='127.0.0.1', port=port,
+                        show_banner=False, log_level='error',
+                    )
+                )
+            except RuntimeError as exc:
+                # Expected when teardown stops the loop mid-serve ("Event loop
+                # stopped before Future completed") -- but only when *we*
+                # induced it; a RuntimeError raised before teardown began is a
+                # genuine startup failure and must be surfaced below.
+                if not state['stopping']:
+                    serve_error = exc
+            finally:
+                _drain_pending_tasks(loop)
+                loop.close()
+
+        thread = threading.Thread(
+            target=_serve_forever, name=f'escalation-mcp-http-{port}', daemon=True,
+        )
+        thread.start()
+        started.append((loop, thread, state, port))
+
+        # Poll for readiness (bounded ~10s) instead of a fixed sleep.
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline:
+            with contextlib.suppress(OSError), socket.create_connection(
+                ('127.0.0.1', port), timeout=0.2,
+            ):
+                ready = True
+            if ready:
+                break
+            time.sleep(0.05)
+        if not ready:
+            detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
+            raise RuntimeError(
+                f'escalation HTTP test server did not become ready on '
+                f'127.0.0.1:{port} within 10s{detail}'
+            )
+
+        return f'http://127.0.0.1:{port}', port, queue
+
+    try:
+        yield _start
+    finally:
+        for loop, thread, state, port in started:
+            state['stopping'] = True
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+            assert not thread.is_alive(), (
+                f'escalation-mcp-http-{port} serving thread did not stop within '
+                'the 5s teardown bound -- event loop stop is hung or the server '
+                'task is stuck in a non-cancellable await (task 2741)'
+            )
