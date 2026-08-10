@@ -78,14 +78,15 @@ def _stub_service(
     counts: dict | None = None,
     parents: dict | None = None,
     scroll_error: Exception | None = None,
-    count_error: Exception | None = None,
+    count_errors: dict | None = None,
 ) -> AsyncMock:
     """AsyncMock service dispatching the three Mem0 read primitives over *children*.
 
     *counts* overrides the derived counts per ``kind`` filter value (or
     ``_TOTAL`` for the un-kinded total) so a test can model a scroll bounded
-    below the exact count.  *parents* maps memory id → raw record for
-    ``get_memory_by_id``.
+    below the exact count.  *count_errors* raises per count filter, keyed the
+    same way, so a test can fault ONE of the counts.  *parents* maps memory id
+    → raw record for ``get_memory_by_id``.
     """
     service = AsyncMock()
 
@@ -94,8 +95,10 @@ def _stub_service(
         return all(meta.get(key) == value for key, value in filters.items())
 
     def _count(*, project_id: str, filters: dict):
+        key = filters.get('kind', _TOTAL)
+        if count_errors is not None and key in count_errors:
+            raise count_errors[key]
         if counts is not None:
-            key = filters.get('kind', _TOTAL)
             if key in counts:
                 return counts[key]
         return len([c for c in children if _matches(c, filters)])
@@ -107,9 +110,7 @@ def _stub_service(
     def _get_by_id(*, project_id: str, memory_id: str):
         return (parents or {}).get(memory_id)
 
-    service.count_memories_by_metadata = AsyncMock(
-        side_effect=count_error or _count
-    )
+    service.count_memories_by_metadata = AsyncMock(side_effect=_count)
     service.get_memories_by_metadata = AsyncMock(side_effect=scroll_error or _scroll)
     service.get_memory_by_id = AsyncMock(side_effect=_get_by_id)
     return service
@@ -239,6 +240,89 @@ class TestBuildGroupedDocument:
         assert [d['id'] for d in block['amendments']] == [_AMEND_1, _AMEND_2], (
             'A None created_at must sort as the empty string, not raise a '
             'TypeError comparing None to str'
+        )
+
+
+class TestChildReadFaultContainment:
+    """A backend fault must never be reported as "this canonical has no children".
+
+    ``Mem0Backend`` deliberately PROPAGATES a Qdrant read-timeout as
+    ``TimeoutError`` rather than collapsing it to a falsy value, precisely so
+    a caller can tell "genuinely absent" from "backend failed".  Collapsing it
+    here would resurrect the silent-orphan class task 3197 exists to close.
+    """
+
+    @pytest.mark.asyncio
+    async def test_total_probe_timeout_is_not_reported_as_childless(self):
+        """A faulted TOTAL probe must not return None — None means "no children"."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            count_errors={_TOTAL: TimeoutError('qdrant count timed out')},
+        )
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None, (
+            'A faulted child read must NOT return None — that is the wire shape '
+            'for "this canonical genuinely has no children". '
+            'RED: the fault escapes or collapses to None.'
+        )
+        assert block == {'children_unavailable': True, 'error_type': 'TimeoutError'}, (
+            f'Expected the explicit unavailability marker, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sighting_count_timeout_does_not_emit_a_fabricated_zero(self):
+        """A faulted sighting count must not silently become sighting_count: 0."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            count_errors={SIGHTING_KIND: TimeoutError('qdrant count timed out')},
+        )
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        assert block.get('sighting_count') != 0, (
+            f'A faulted sighting count must never be reported as 0, got {block!r}'
+        )
+        assert 'sighting_count' not in block, (
+            'A fault block must carry NO count at all rather than a partial one a '
+            f'consumer could read as complete, got {block!r}'
+        )
+        assert block['children_unavailable'] is True
+        assert block['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_amendment_scroll_timeout_yields_the_unavailability_marker(self):
+        """A faulted digest scroll is loud, and carries no partial digest list."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            scroll_error=TimeoutError('qdrant scroll timed out'),
+        )
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block == {'children_unavailable': True, 'error_type': 'TimeoutError'}, (
+            f'Expected the explicit unavailability marker, got {block!r}'
+        )
+        assert 'amendments' not in block, (
+            'A fault block must not carry a partial digest list a consumer could '
+            f'read as exhaustive, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fault_does_not_propagate_out_of_the_read_path(self):
+        """A grouping fault must not escape and break an otherwise-working read."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            scroll_error=RuntimeError('qdrant exploded'),
+        )
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block == {'children_unavailable': True, 'error_type': 'RuntimeError'}, (
+            'Any backend exception — not just TimeoutError — must be contained '
+            f'and NAMED by type, got {block!r}'
         )
 
 
