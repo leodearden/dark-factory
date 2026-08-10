@@ -11420,6 +11420,23 @@ class Harness:
         L1 (steward→auto-watcher) escalations are intentionally preserved across
         restart — they represent items pending auto-triage (which may then promote
         to L2 for a human) and must not be silently lost during long AFK periods.
+
+        Strand threshold (task 3172).  ``strand_age_secs`` reuses
+        ``config.orphan_l0_timeout_secs`` so a level-0 that had already been
+        pending that long when we restarted is stamped ``'stale-strand'``
+        rather than flattened into the same ``'benign'`` class as a level-0
+        filed seconds before the restart.  This is an ANCHOR, not a semantic
+        alias: the orphan reaper's predicate is "no workflow attending", this
+        one's is "was pending across a restart".  Borrowing the already-shipped,
+        operator-tuned "an unattended L0 this old is overdue" bound avoids
+        minting a guessed constant.
+
+        Why the startup sweep is the ONLY place this class is ever observed:
+        ``_reap_orphan_l0_escalations`` skips any L0 whose task has a live
+        workflow attending it ("active workflow will handle it"), so a blocking
+        L0 with a parked workflow can never age out there.  The origin strand
+        esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
+        attending it — and then this sweep closed it as ordinary restart noise.
         """
         if self._escalation_queue is None:
             return
@@ -11427,7 +11444,9 @@ class Harness:
         resolution = (
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
-        count = self._escalation_queue.dismiss_all_pending(resolution)
+        count = self._escalation_queue.dismiss_all_pending(
+            resolution, strand_age_secs=self.config.orphan_l0_timeout_secs
+        )
         if count:
             logger.info(
                 f'Dismissed {count} stale L0 escalation(s) from prior run; '
