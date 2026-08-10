@@ -91,6 +91,7 @@ from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.recovery_emission import (
+    STREAK_CHARGING_SITES,
     LeaveReason,
     Observation,
     RecoverySite,
@@ -99,8 +100,10 @@ from orchestrator.recovery_emission import (
     as_ageable_records,
     build_recovery_payload,
     emit_recovery_event,
+    emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
     render_shape,
+    resolve_recovery_veto_streak_escalation,
     should_emit_event,
 )
 from orchestrator.repo_paths import (
@@ -4988,6 +4991,9 @@ class Harness:
             '%d held on provenance conflict (done_evidence_stale); %s',
             log_prefix, reverted, marked_done, stale_conflicts, tally.render(),
         )
+        # Every task this pass did NOT re-observe as held has stopped being
+        # held: pop its streak and resolve any alarm it filed (task 3535).
+        self._release_recovery_veto_streaks(tally)
         # Deliberately NOT `+ tally.held`: the caller uses this to decide
         # whether the main loop keeps running, and counting holds as progress
         # would make a fully-stuck fleet look busy forever.
@@ -9663,7 +9669,7 @@ class Harness:
             # silencing a noisy event detector must not also blind the sweep's
             # own operational line.
             if tally is not None:
-                tally.record(reason, records or ())
+                tally.record(reason, records or (), task_id=task_id)
 
             cfg = getattr(self.config, 'recovery_emission', None)
             if cfg is None or not cfg.enabled:
@@ -9711,6 +9717,31 @@ class Harness:
                 if transition_gated_by_caller:
                     tracker.clear(site, task_id)
                 observation = tracker.observe(site, task_id, signature)
+                # Charged BEFORE the event gate, not after: the alarm's second
+                # dimension (span) can be cleared on a LATER, quiet observation
+                # than the threshold crossing itself, and a hold that alarms
+                # only when it also happens to be re-stated would be silently
+                # dependent on the event cadence.
+                if (
+                    site in STREAK_CHARGING_SITES
+                    and cfg.streak_escalation_enabled
+                ):
+                    emit_recovery_veto_streak_escalation(
+                        escalation_queue=self._escalation_queue,
+                        task_id=task_id,
+                        site=site,
+                        streak=observation.streak,
+                        threshold=cfg.veto_streak_threshold,
+                        span_seconds=tracker.span(site, task_id),
+                        min_span_seconds=cfg.veto_streak_min_span_secs,
+                        reason=reason,
+                        shape=shape,
+                        escalation_ids=buckets,
+                        ages_secs=escalation_ages_secs(
+                            as_ageable_records(records), now=datetime.now(UTC),
+                        ),
+                        filed_at=self._recovery_streak_memo(),
+                    )
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
                 ):
@@ -9763,6 +9794,62 @@ class Harness:
                 task_id, exc,
             )
             return None
+
+    def _recovery_streak_memo(self) -> dict[str, int]:
+        """The veto-streak filed_at memo, seeded on demand.
+
+        getattr-tolerant for the same reason the tracker is: several
+        narrow-scope tests build a Harness via ``__new__``, bypassing
+        ``__init__``'s seeding.
+        """
+        memo = getattr(self, '_recovery_streak_filed_at', None)
+        if memo is None:
+            memo = {}
+            self._recovery_streak_filed_at = memo
+        return memo
+
+    def _release_recovery_veto_streaks(self, tally: RecoverySweepTally) -> None:
+        """End-of-pass: drop every streak this sweep did NOT re-observe.
+
+        The release transition is derived from the pass's own tally rather than
+        from a per-task "the hold ended" event, because that event may never
+        come: a task can stop being held by leaving the candidate set entirely
+        (it went done, or was cancelled), and a resolve half that only fired on
+        a task the sweep still visits would leave those alarms pending forever.
+        Resolving matters more than the tidy dict: ``has_open_l1`` dedup means a
+        stale pending alarm silences this detector for that task for the life of
+        the queue (see :func:`resolve_recovery_veto_streak_escalation`).
+
+        Whole-body guarded: this is bookkeeping, and bookkeeping never aborts a
+        sweep.
+        """
+        try:
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is None:
+                return
+            cfg = getattr(self.config, 'recovery_emission', None)
+            threshold = cfg.veto_streak_threshold if cfg is not None else 3
+            stale = [
+                (site, tid) for site, tid in tracker.tracked()
+                if site == RecoverySite.reconcile_sweep
+                and tid not in tally.observed_task_ids
+            ]
+            for site, tid in stale:
+                # clear() RETURNS the streak it popped, which is exactly the
+                # "how long was this held" the resolver needs to decide whether
+                # a PRIOR process could have filed before a restart.
+                recovered_streak = tracker.clear(site, tid)
+                resolve_recovery_veto_streak_escalation(
+                    escalation_queue=self._escalation_queue,
+                    task_id=tid,
+                    recovered_streak=recovered_streak,
+                    threshold=threshold,
+                    filed_at=self._recovery_streak_memo(),
+                )
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+            logger.warning(
+                'recovery veto-streak release failed (non-fatal): %s', exc,
+            )
 
     def _collect_done_reports(
         self, done: set[asyncio.Task], task_reports: list[TaskReport]

@@ -145,6 +145,24 @@ class RecoverySite(enum.StrEnum):
     already_landed_gate = 'already_landed_gate'
 
 
+#: The sites whose observations CHARGE the N-consecutive-vetoes alarm.
+#:
+#: A property of the SITE, not of any one call, so it is stated once here
+#: rather than passed as a flag a future call site could get wrong.  Only
+#: sweep-frequency sites qualify: ``stranded_reconcile_interval_secs`` and
+#: ``deterministic_recon_sweep_interval_secs`` are both 900s, so three
+#: consecutive observations mean a task has been held for half an hour.  The
+#: two sites deliberately ABSENT here — ``scheduler_blocked_redispatch`` and
+#: ``already_landed_gate`` — run per dispatch TICK, so charging them would file
+#: a blocking L1 seconds after a hold appeared.  ``veto_streak_min_span_secs``
+#: is the belt-and-braces backstop for that; this set is the primary guard.
+STREAK_CHARGING_SITES = frozenset({
+    RecoverySite.reconcile_sweep,
+    RecoverySite.deterministic_recon_sweep,
+    RecoverySite.deterministic_recon_deploy,
+})
+
+
 class LeaveReason(enum.StrEnum):
     """The closed vocabulary of reasons a site held back or fell through.
 
@@ -941,15 +959,25 @@ class RecoverySweepTally:
     left: dict[str, int] = field(default_factory=dict)
     #: Dispositions that went ahead UNCHANGED while the store was unreadable.
     store_unavailable: int = 0
+    #: Every task this pass recorded a hold/fall-through for.  Read as the
+    #: COMPLEMENT: a task the pass swept without recording one has stopped
+    #: being held, which is the transition that resolves its streak alarm.
+    #: Sourced here rather than from a per-task event because the release must
+    #: also fire for a task that left the candidate set entirely (it went done,
+    #: or was cancelled) and so will never reach the per-task chokepoint again.
+    observed_task_ids: set[str] = field(default_factory=set)
 
     def record(
         self,
         reason: LeaveReason | str | None,
         escalation_ids: Any = (),
+        task_id: str | None = None,
     ) -> None:
         """Fold one held/left task into the tally."""
         if reason is None:
             return
+        if task_id is not None:
+            self.observed_task_ids.add(task_id)
         if str(reason) == LeaveReason.escalation_pinned:
             self.held += 1
             for esc_id in _flatten_ids(escalation_ids):
