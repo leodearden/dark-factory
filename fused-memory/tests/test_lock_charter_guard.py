@@ -158,6 +158,11 @@ def _reify_guard_vector(flag: str) -> list[str]:
     that the "three-way α/γ/bash agreement is ENFORCED rather than merely
     asserted in prose" claim in both module docstrings rules out.
     """
+    assert _REIFY_GUARD_SCRIPT is not None, (
+        'every caller is skipif-guarded on _REIFY_GUARD_SCRIPT being a real '
+        'file, so reaching here with None means a caller lost its guard — fail '
+        'loudly rather than stringify None into a bogus `bash None` invocation'
+    )
     result = subprocess.run(
         ['bash', str(_REIFY_GUARD_SCRIPT), flag],
         capture_output=True,
@@ -330,6 +335,11 @@ class TestResolveReifyRoot:
 
         result = _resolve_reify_root(start)
 
+        assert result is not None, (
+            'an absent REIFY_ROOT must resolve to the named path, not None — '
+            'None would route callers to the discovery-miss skip, hiding that '
+            'the operator named a path at all'
+        )
         assert result == missing.resolve(), (
             'a REIFY_ROOT typo must surface downstream as a skip naming the bad '
             'path, not silently fall back to a discovered checkout that answers '
