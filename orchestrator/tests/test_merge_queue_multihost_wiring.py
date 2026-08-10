@@ -1500,6 +1500,116 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         assert 'Could not resolve hostname' in result.reason
 
 
+@pytest.mark.asyncio
+class TestRunInflightVerifyRunnerUnavailableSpecWarm:
+    """The RU sentinel carries spec_warm, not just merge_wt (task 3251 amend).
+
+    ``_finalize_inflight`` disposes of the RU'd worktree with
+    ``_release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)``, so
+    ``vr.spec_warm`` is the ONLY thing standing between a pool-owned ``_spec-``
+    lane and a ``git worktree remove`` of a lane the pool still holds ASSIGNED.
+    The RU return site was the one ``InflightVerifyResult`` construction in
+    ``_run_inflight_verify`` that omitted the kwarg, hard-wiring it False; these
+    pin the propagation at the SOURCE so the ledger class's warm test (which
+    hand-builds its result) is no longer the sole evidence for the warm route.
+
+    Note on reachability, so nobody mistakes these for live-path coverage: the
+    RunnerUnavailable is INJECTED.  A LOCAL lease dispatches ``runner=None``,
+    which builds a LocalRunner-only pool, and every raise site lives in
+    RemoteRunner or behind the INV-2 gate's ``isinstance(..., RemoteRunner)``
+    break — so today no local-lease verify can actually raise it, and REMOTE
+    leases (which can) skip the warm swap.  What is pinned here is the
+    CONTRACT: if the raise ever reaches this handler with a warm lane in hand,
+    the flag must ride along with the path it describes.
+    """
+
+    def _make_item(self, tmp_path, merge_wt):
+        from orchestrator.merge_queue import RealMergeItem
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        return RealMergeItem(
+            request=_make_merge_request(_make_config(), task_files=[], worktree=tmp_path),
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base123',
+            speculative=False,
+        )
+
+    async def test_ru_local_lease_warm_lane_propagates_spec_warm(self, tmp_path):
+        """LOCAL lease + warm _spec- lane + RU raise → vr.spec_warm is True."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        cold_wt = tmp_path / '_merge-cold'
+        cold_wt.mkdir()
+        lane = tmp_path / '_spec-0'
+        lane.mkdir()
+        item = self._make_item(tmp_path, cold_wt)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable('INV-2 contract-currency sync failed')
+
+        with (
+            patch(
+                'orchestrator.merge_queue._acquire_warm_verify_worktree',
+                new=AsyncMock(return_value=(lane, True)),
+            ),
+            patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable),
+        ):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.merge_wt == lane, 'the warm lane is the worktree handed to the chokepoint'
+        assert result.spec_warm is True, (
+            'the RU sentinel must carry spec_warm=_spec_warm — _finalize_inflight '
+            'routes _release_or_cleanup on it, and a False here would `git worktree '
+            'remove` a lane spec_warm_lane_pool still holds ASSIGNED'
+        )
+
+    async def test_ru_cold_worktree_reports_spec_warm_false(self, tmp_path):
+        """REMOTE lease (no warm swap) → vr.spec_warm stays False.
+
+        The companion to the warm pin: passing the flag through must not
+        mis-mark a genuinely cold ``_merge-<uuid>`` as pool-owned, which would
+        send the chokepoint down ``release_spec_lane`` and leak the directory.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        cold_wt = tmp_path / '_merge-cold'
+        cold_wt.mkdir()
+        item = self._make_item(tmp_path, cold_wt)
+
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable('ssh spawn failed')
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.merge_wt == cold_wt
+        assert result.spec_warm is False
+
+
 # ---------------------------------------------------------------------------
 # Task 2307 step-7 RED: production wiring — _run_inflight_verify threads the
 # worker's escalation queue into _run_post_merge_verify, so a laptop-side
@@ -2013,8 +2123,11 @@ def _make_ru_entry(worker, host_name, *, reason='ssh timeout', merge_wt=None, sp
             which never touch the path); ledger tests pass a real directory so
             ``os.utime`` / ``Path.resolve()`` / ``snapshot()`` are meaningful.
         spec_warm: threaded into the ``InflightVerifyResult`` so the warm
-            ``_spec-``-lane RU case (LOCAL lease → pool INV-2 gate raises
-            ``RunnerUnavailable`` after the warm swap already ran) is buildable.
+            ``_spec-``-lane RU case is buildable.  Production cannot currently
+            emit ``spec_warm=True`` alongside RUNNER_UNAVAILABLE (see
+            ``TestRunInflightVerifyRunnerUnavailableSpecWarm``), so a caller
+            passing True is exercising the chokepoint's routing contract, not a
+            live path.
     """
     import asyncio
 
@@ -2383,16 +2496,24 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
     async def test_ru_finalize_releases_warm_spec_lane_instead_of_removing_it(self, tmp_path):
         """Warm case: a pool-owned _spec- lane is RELEASED, never `worktree remove`d.
 
-        Reachable, not merely defensive: ``_run_inflight_verify`` dispatches a
-        LOCAL lease with ``runner=None``, which routes through the worker's own
-        runner pool, and that pool's INV-2 contract-currency gate raises
-        ``RunnerUnavailable`` when no distinct healthy runner remains
-        (verify_runner.py:1978/:1988) — by which point the LOCAL warm swap has
-        already run, so ``vr.merge_wt`` is a ``_spec-`` lane with
-        ``vr.spec_warm=True``.  This is why the fix must call
-        ``_release_or_cleanup`` and not ``_cleanup_owned_merge_worktree``: the
-        cold path would ``git worktree remove`` a lane belonging to
-        ``spec_warm_lane_pool`` instead of returning it FREE.
+        This is why the fix calls ``_release_or_cleanup`` and not
+        ``_cleanup_owned_merge_worktree``: the cold arm would ``git worktree
+        remove`` a lane belonging to ``spec_warm_lane_pool`` instead of
+        returning it FREE — and ``remove_merge_worktree_guarded`` exempts only
+        the persistent merge/offline-deep trees, so the lane would be destroyed
+        on disk while the pool still held it ASSIGNED.
+
+        Scope, stated honestly (task 3251 amend): the ``spec_warm=True`` result
+        is HAND-BUILT here, and today production cannot emit one — the warm swap
+        is LOCAL-only, a LOCAL lease dispatches ``runner=None`` into a
+        LocalRunner-only pool, and every ``RunnerUnavailable`` raise site sits in
+        RemoteRunner or behind the INV-2 gate's ``isinstance(..., RemoteRunner)``
+        break.  So this pins the chokepoint's ROUTING given a warm vr, nothing
+        about reachability.  The other half of the contract — that
+        ``_run_inflight_verify`` propagates ``spec_warm`` onto the RU sentinel
+        at all, rather than hard-wiring it False — is pinned separately by
+        ``TestRunInflightVerifyRunnerUnavailableSpecWarm``; without that pin
+        this test would keep passing over a vr shape nothing could produce.
         """
         from orchestrator.merge_queue import RealMergeItem
 

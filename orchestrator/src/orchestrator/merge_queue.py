@@ -15715,11 +15715,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # any open contended-lane streak rather than let its start stamp
             # outlive the re-dispatch.
             self._clear_contended_lease_streak(req.task_id)
+            # spec_warm rides along for the SAME reason merge_wt does: the
+            # chokepoint's _release_or_cleanup routes on it, and a lane it
+            # believed cold would be `git worktree remove`d out from under
+            # spec_warm_lane_pool while still ASSIGNED — a permanently lost
+            # slot, strictly worse than the ledger leak task 3251 fixed.  This
+            # was the ONE InflightVerifyResult site in this method that omitted
+            # the flag (both normal returns at the bottom pass it), which pinned
+            # vr.spec_warm False on every RU result regardless of how merge_wt
+            # was acquired.
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=merge_wt,
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
+                spec_warm=_spec_warm,
             )
         except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
             # The shared merge-verify <lane_dir>.lock was unavailable, so the
@@ -16444,12 +16454,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #
                 # _release_or_cleanup, NOT _cleanup_owned_merge_worktree: that
                 # method's own documented selection rule makes this mandatory
-                # wherever a spec_warm value is in scope, and the warm case is
-                # REACHABLE here — a LOCAL lease dispatches with runner=None
-                # through the worker's own runner pool, whose INV-2
-                # contract-currency gate raises RunnerUnavailable after the warm
-                # swap has already run, so vr.merge_wt can be a pool-owned
-                # _spec- lane that must be RELEASED rather than removed.
+                # wherever a spec_warm value is in scope, because the cold arm
+                # would `git worktree remove` a pool-owned _spec- lane instead
+                # of returning it FREE — remove_merge_worktree_guarded exempts
+                # only the persistent merge/offline-deep trees (git_ops.py
+                # :9406), so the lane would be destroyed on disk while
+                # spec_warm_lane_pool still held it ASSIGNED: a permanently
+                # lost slot, strictly worse than the ledger leak fixed here.
+                #
+                # Reachability, stated honestly (task 3251 amend): today
+                # vr.spec_warm CANNOT be True on this path.  The warm swap runs
+                # under `if lease.is_local` only, and a LOCAL lease dispatches
+                # runner=None, which makes _run_post_merge_verify build a
+                # LocalRunner-only VerifyRunnerPool — and every
+                # RunnerUnavailable raise site is either inside RemoteRunner or
+                # behind the INV-2 gate's `not isinstance(selected,
+                # RemoteRunner)` break, so no local-lease verify can raise it.
+                # REMOTE leases can raise it but skip the warm swap, so their
+                # merge_wt is a genuinely cold _merge-<uuid>.  The routing is
+                # therefore defensive, and deliberately so: admitting one remote
+                # into the local-lease pool (or giving LocalRunner a
+                # RunnerUnavailable raise) would make it live with no other
+                # edit, and the failure it prevents is unrecoverable.
+                # _run_inflight_verify's `except RunnerUnavailable` passes
+                # spec_warm=_spec_warm so the flag is truthful if that day
+                # comes; that propagation is pinned by
+                # test_ru_local_lease_warm_lane_propagates_spec_warm and this
+                # branch's routing by
+                # test_ru_finalize_releases_warm_spec_lane_instead_of_removing_it.
                 #
                 # Ordered BEFORE _remerge (and after quarantine_and_release,
                 # which is the time-sensitive half): _remerge may return a
