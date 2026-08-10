@@ -2435,6 +2435,7 @@ class MemoryService:
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
         temporal_context = payload.get('temporal_context')
+        unverified_claim = bool(payload.get('unverified_claim', False))
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -2455,6 +2456,11 @@ class MemoryService:
             metadata['secondary_category'] = classification.secondary.value
         if temporal_context == 'planning':
             metadata['planned'] = True
+        # Omitted entirely when untagged (task 3142) rather than set False, so
+        # no existing record shape changes and a metadata filter for the key
+        # matches only genuinely flagged facts.
+        if unverified_claim:
+            metadata['unverified_claim'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -2566,6 +2572,11 @@ class MemoryService:
                         'session_id': payload.get('session_id'),
                         '_causation_id': payload.get('_causation_id'),
                         'temporal_context': payload.get('temporal_context'),
+                        # task 3142: the Mem0 half rides its own payload
+                        # channel, so the episode's tag must be copied onto
+                        # every derived fact explicitly — those facts ARE the
+                        # artefacts the incident produced.
+                        'unverified_claim': payload.get('unverified_claim', False),
                     },
                 }
                 for edge in edges
