@@ -25,12 +25,14 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
 from shared.toolcall_markup import ENVELOPE_LITERALS
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -197,3 +199,105 @@ def corrupt_plan(**overrides) -> dict:
     }
     plan.update(overrides)
     return plan
+
+
+# ---------------------------------------------------------------------------
+# step-1 — the repairable surface is DECLARED and machine-checked (INV-1).
+# ---------------------------------------------------------------------------
+
+#: The (collection, field) pairs measured as the corrupted surface across the
+#: 28 live plans. ``collection is None`` means a top-level plan key. Held here
+#: as the test's own independent statement of the contract — the point of the
+#: table is that it cannot drift from this, so the two are deliberately
+#: separate spellings rather than one imported from the other.
+_EXPECTED_PAIRS = {
+    (None, 'title'),
+    (None, 'analysis'),
+    ('prerequisites', 'description'),
+    ('steps', 'description'),
+    ('design_decisions', 'decision'),
+    ('design_decisions', 'rationale'),
+    ('reuse', 'what'),
+    ('reuse', 'where'),
+    ('reuse', 'how'),
+}
+
+#: Which plan-tools entry point AUTHORED each collection, i.e. whose parameter
+#: names ``repair()`` must validate a recovery against.
+_ORIGINATING_TOOL = {
+    None: plan_tools._create_plan,
+    'prerequisites': plan_tools._add_prerequisite,
+    'steps': plan_tools._add_plan_step,
+    'design_decisions': plan_tools._add_design_decision,
+    'reuse': plan_tools._add_reuse_item,
+}
+
+
+def _tool_params(fn) -> tuple[str, ...]:
+    """The tool's parameter names, minus the leading ``artifacts`` injection."""
+    names = tuple(inspect.signature(fn).parameters)
+    assert names[0] == 'artifacts', (
+        f'{fn.__name__} no longer takes artifacts first — the table\'s '
+        'schema_params derivation assumes it does'
+    )
+    return names[1:]
+
+
+class TestRepairableFieldTable:
+    """``_REPAIRABLE_PLAN_FIELDS`` is the single declared repairable surface."""
+
+    def test_table_is_an_immutable_sequence_of_records(self):
+        table = plan_tools._REPAIRABLE_PLAN_FIELDS
+        assert isinstance(table, tuple), (
+            'the table must be immutable — a list could be appended to at '
+            'runtime, which would make the declared surface un-auditable'
+        )
+        assert table, 'the table must not be empty'
+        for record in table:
+            assert isinstance(record, tuple)
+            for attr in ('collection', 'field', 'schema_params'):
+                assert hasattr(record, attr), f'record {record!r} lacks {attr!r}'
+
+    def test_covers_exactly_the_measured_corrupted_surface(self):
+        table = plan_tools._REPAIRABLE_PLAN_FIELDS
+        pairs = {(r.collection, r.field) for r in table}
+        assert pairs == _EXPECTED_PAIRS
+        # 'reuse' contributes three of the nine, so a set of pairs alone would
+        # not catch a duplicated row: pin the record count too.
+        assert len(table) == len(_EXPECTED_PAIRS) == 9
+
+    def test_schema_params_match_the_live_tool_signatures(self):
+        """INV-1: the table is checked against the tools, not against prose.
+
+        A record's ``schema_params`` is what ``repair()`` validates a recovered
+        name against, so a table that drifts from its tool's real signature
+        would silently start refusing (or, worse, accepting) the wrong names.
+        """
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            tool = _ORIGINATING_TOOL[record.collection]
+            assert record.schema_params == _tool_params(tool), (
+                f'{record.collection}.{record.field} declares '
+                f'{record.schema_params!r} but {tool.__name__} takes '
+                f'{_tool_params(tool)!r}'
+            )
+
+    def test_the_repaired_field_is_itself_a_parameter_of_its_tool(self):
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            assert record.field in record.schema_params, (
+                f'{record.field!r} is not a parameter of '
+                f'{_ORIGINATING_TOOL[record.collection].__name__}'
+            )
+
+    def test_schema_params_are_tuples_of_str(self):
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            assert isinstance(record.schema_params, tuple)
+            assert all(isinstance(name, str) for name in record.schema_params)
+
+    def test_files_is_not_repairable(self):
+        """``files`` entries are paths, already recovered by ``_coerce_files``.
+
+        A generic walk of the plan dict would sweep them in; the declared table
+        is what keeps this surface to prose fields only.
+        """
+        fields = {r.field for r in plan_tools._REPAIRABLE_PLAN_FIELDS}
+        assert 'files' not in fields
