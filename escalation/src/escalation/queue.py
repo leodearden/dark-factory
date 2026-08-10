@@ -1701,12 +1701,40 @@ class EscalationQueue:
                 'file remains in queue_dir'
             )
 
-    def dismiss_all_pending(self, resolution: str) -> int:
+    def dismiss_all_pending(
+        self,
+        resolution: str,
+        *,
+        strand_age_secs: float | None = None,
+        now: datetime | None = None,
+    ) -> int:
         """Dismiss all pending L0 escalations with the given resolution message.
 
         Level-1 escalations are PRESERVED — they represent steward→human work
         that must survive orchestrator restart and require human attention.
         Only level-0 (agent→steward) escalations are dismissed.
+
+        Every dismissed record's resolution gains a structured
+        ``[pending_secs=<n> severity=<s>]`` suffix recording how long it had
+        been waiting when the sweep closed it (task 3172).  Before this, one
+        fixed string was written to every record, so a level-0 that had been
+        pending 20h58m with a workflow parked on it (esc-5189-7) and one
+        pending ~90s (esc-5685-1) were indistinguishable afterwards.
+
+        ``strand_age_secs``: opt-in threshold, in seconds.  A level-0 that had
+        been pending at least this long is stamped
+        ``resolution_class='stale-strand'`` — a distinct, non-benign class
+        (models.RESOLUTION_CLASSES) that keeps the strand auditable.  Records
+        below the threshold are left unstamped, so
+        ``default_resolution_class_for_resolver('auto-dismissed')`` keeps
+        stamping them ``'benign'`` exactly as before.  When *None* (the
+        default) NO record is stamped ``'stale-strand'``, making the
+        classification behaviour identical to the pre-3172 sweep for any
+        caller that does not opt in; only the age suffix is new.
+
+        ``now``: injectable clock for tests.  Read ONCE and hoisted out of the
+        loop, mirroring ``Harness._reap_orphan_l0_escalations``, so every
+        record in one sweep is aged against the same instant.
 
         Returns the number of escalations where resolve() returned non-None.
         In the common single-writer case this equals the number actually dismissed.
@@ -1714,18 +1742,37 @@ class EscalationQueue:
         get_pending() and resolve()), resolve() is a no-op but still returns the
         existing escalation, so the count may include those no-ops.  The counter
         is best read as "attempted dismissals, including no-ops for concurrent
-        resolutions".  This function is single-writer in practice.
+        resolutions".  This function is single-writer in practice.  The count
+        does NOT distinguish the per-record outcomes (age-annotated vs
+        strand-stamped); a caller that needs that detail reads the resolved
+        records themselves.
         """
         pending = self.get_pending()
+        now = now or datetime.now(UTC)
         count = 0
+        strands = 0
         for esc in (e for e in pending if e.level == 0):
             try:
-                if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
+                age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
+                is_strand = strand_age_secs is not None and age_secs >= strand_age_secs
+                per_record = f'{resolution} [pending_secs={age_secs:.0f} severity={esc.severity}]'
+                resolved = self.resolve(
+                    esc.id,
+                    per_record,
+                    dismiss=True,
+                    resolved_by='auto-dismissed',
+                    resolution_class='stale-strand' if is_strand else None,
+                )
+                if resolved is not None:
                     count += 1
+                    strands += int(is_strand)
             except Exception as e:
                 logger.warning(f'Failed to dismiss escalation {esc.id}: {e}')
         if count:
-            logger.info(f'Dismissed {count} stale L0 escalation(s): {resolution[:100]}')
+            logger.info(
+                f'Dismissed {count} stale L0 escalation(s) '
+                f'({strands} stale-strand): {resolution[:100]}'
+            )
         return count
 
     def _write_seq_counter(self, path: Path, value: int) -> None:

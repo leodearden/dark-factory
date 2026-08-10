@@ -100,7 +100,8 @@ class TestDismissAllPending:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.status == 'dismissed'
-        assert updated.resolution == 'Stale from prior run'
+        # Prefix, not equality: the pending age is always recorded (task 3172).
+        assert updated.resolution.startswith('Stale from prior run')
 
     def test_multiple_pending_all_dismissed(self, tmp_path: Path):
         """Multiple pending escalations are all dismissed; count matches."""
