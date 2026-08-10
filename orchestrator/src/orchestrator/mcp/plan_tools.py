@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import inspect
 import json
 import logging
 import os
@@ -44,7 +45,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -183,20 +184,30 @@ class _PlanField(NamedTuple):
     target_keys: Mapping[str, str]
 
 
-# The parameter tuples of the five tools that AUTHOR plan prose. Spelled once
-# each so the nine records below reference a tool's schema by meaning; the
-# tuples are asserted against ``inspect.signature`` of the live functions by
-# ``tests/test_plan_tools_markup_repair.py::TestRepairableFieldTable`` (INV-1),
-# so they cannot drift from the tools they describe.
-_CREATE_PLAN_PARAMS = ('task_id', 'title', 'analysis', 'files')
-_ADD_PREREQUISITE_PARAMS = ('prereq_id', 'description')
-_ADD_PLAN_STEP_PARAMS = ('step_id', 'step_type', 'description')
-_ADD_DESIGN_DECISION_PARAMS = ('decision', 'rationale')
-_ADD_REUSE_ITEM_PARAMS = ('what', 'where', 'how')
+def _params_of(fn: Callable[..., Any]) -> tuple[str, ...]:
+    """The originating tool's parameter names, read off its LIVE signature.
+
+    The leading ``artifacts`` is dropped: it is injected by the server wrapper,
+    never a name the harness could leak out of a sibling argument.
+
+    DERIVED, not restated. A hand-copied tuple would be a second spelling of a
+    signature this table does not own, and the only way to keep the two in step
+    would be a test that pins parameter names by introspection — coverage of the
+    copy rather than of any behaviour a caller can observe. Deriving makes the
+    drift impossible by construction, which is what INV-1 actually asks for.
+    """
+    names = tuple(inspect.signature(fn).parameters)
+    if names[:1] != ('artifacts',):
+        raise RuntimeError(
+            f'{fn.__name__} no longer takes artifacts first: _params_of would '
+            f'return {names!r}, admitting a non-parameter name as a recovery '
+            'candidate. Fix the derivation, do not widen it.'
+        )
+    return names[1:]
 
 # Which of those parameters name a PROSE PLAN KEY, and which key. Spelled one
-# mapping per tool alongside its parameter tuple above so the two read together,
-# and wrapped in MappingProxyType for the same reason the tuples are tuples: a
+# mapping per tool — this half CANNOT be derived, because the plan document's
+# key vocabulary is not the tool's — and wrapped in MappingProxyType because a
 # DECLARED surface that could be mutated at runtime is not auditable.
 #
 # Note what is MISSING from each, deliberately. ``task_id`` and ``files`` are
@@ -228,23 +239,44 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 #: would also sweep in ``files`` (path entries, already recovered by
 #: :func:`_coerce_files`) and every future non-prose key, rewriting values this
 #: surface has no business touching.
-_REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...] = (
-    _PlanField(None, 'title', _CREATE_PLAN_PARAMS, _CREATE_PLAN_TARGETS),
-    _PlanField(None, 'analysis', _CREATE_PLAN_PARAMS, _CREATE_PLAN_TARGETS),
-    _PlanField(
-        'prerequisites', 'description', _ADD_PREREQUISITE_PARAMS, _ADD_PREREQUISITE_TARGETS
-    ),
-    _PlanField('steps', 'description', _ADD_PLAN_STEP_PARAMS, _ADD_PLAN_STEP_TARGETS),
-    _PlanField(
-        'design_decisions', 'decision', _ADD_DESIGN_DECISION_PARAMS, _ADD_DESIGN_DECISION_TARGETS
-    ),
-    _PlanField(
-        'design_decisions', 'rationale', _ADD_DESIGN_DECISION_PARAMS, _ADD_DESIGN_DECISION_TARGETS
-    ),
-    _PlanField('reuse', 'what', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
-    _PlanField('reuse', 'where', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
-    _PlanField('reuse', 'how', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
-)
+#:
+#: Bound ONCE, immediately below the five writer functions it derives its
+#: ``schema_params`` from (``_params_of`` needs them to exist). Annotated but
+#: deliberately UNBOUND here, so a use before that point raises a loud
+#: NameError instead of silently reading an empty table and repairing nothing.
+_REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...]
+
+
+def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
+    """Construct :data:`_REPAIRABLE_PLAN_FIELDS`; see its docs above."""
+    return (
+        _PlanField(None, 'title', _params_of(_create_plan), _CREATE_PLAN_TARGETS),
+        _PlanField(None, 'analysis', _params_of(_create_plan), _CREATE_PLAN_TARGETS),
+        _PlanField(
+            'prerequisites',
+            'description',
+            _params_of(_add_prerequisite),
+            _ADD_PREREQUISITE_TARGETS,
+        ),
+        _PlanField(
+            'steps', 'description', _params_of(_add_plan_step), _ADD_PLAN_STEP_TARGETS
+        ),
+        _PlanField(
+            'design_decisions',
+            'decision',
+            _params_of(_add_design_decision),
+            _ADD_DESIGN_DECISION_TARGETS,
+        ),
+        _PlanField(
+            'design_decisions',
+            'rationale',
+            _params_of(_add_design_decision),
+            _ADD_DESIGN_DECISION_TARGETS,
+        ),
+        _PlanField('reuse', 'what', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
+        _PlanField('reuse', 'where', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
+        _PlanField('reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS),
+    )
 
 #: The MCP tool that AUTHORED each collection, for the structured fact's
 #: ``tool`` field (contract C2's name, verbatim). 1:1 with ``collection``
@@ -791,6 +823,12 @@ def _add_reuse_item(
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
+
+
+# The repairable-field table, bound here because ``_params_of`` reads the five
+# writer signatures above off the live functions. Declared and documented at
+# its annotation further up; nothing between that point and here reads it.
+_REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
 
 
 def _mark_step_done(

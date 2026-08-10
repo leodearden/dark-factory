@@ -312,22 +312,21 @@ class TestRepairableFieldTable:
         # not catch a duplicated row: pin the record count too.
         assert len(table) == len(_EXPECTED_PAIRS) == 9
 
-    def test_schema_params_match_the_live_tool_signatures(self):
-        """INV-1: the table is checked against the tools, not against prose.
-
-        A record's ``schema_params`` is what ``repair()`` validates a recovered
-        name against, so a table that drifts from its tool's real signature
-        would silently start refusing (or, worse, accepting) the wrong names.
-        """
-        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
-            tool = _ORIGINATING_TOOL[record.collection]
-            assert record.schema_params == _tool_params(tool), (
-                f'{record.collection}.{record.field} declares '
-                f'{record.schema_params!r} but {tool.__name__} takes '
-                f'{_tool_params(tool)!r}'
-            )
+    # There is deliberately NO test pinning ``schema_params`` against
+    # ``inspect.signature`` of the originating tool. The table now DERIVES that
+    # tuple from the live signature (``plan_tools._params_of``), so such a test
+    # would compare a value to itself. The drift it used to police is gone by
+    # construction — which is the fix, not the loss of a check. What remains
+    # below tests the half that is still hand-declared: ``field`` and
+    # ``target_keys``, whose plan-key vocabulary cannot be derived from the tool.
 
     def test_the_repaired_field_is_itself_a_parameter_of_its_tool(self):
+        """The hand-declared ``field`` must name a real parameter of its tool.
+
+        Not vacuous despite the derivation: ``field`` is a literal in the table,
+        so renaming a tool parameter without updating the row fails HERE rather
+        than silently making the row unmatchable at repair time.
+        """
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             assert record.field in record.schema_params, (
                 f'{record.field!r} is not a parameter of '
@@ -375,6 +374,11 @@ class TestRepairableFieldTable:
                 targets['injected'] = 'anything'  # type: ignore[index]
 
     def test_every_target_key_names_a_real_parameter_of_its_tool(self):
+        """``target_keys`` is hand-declared, so its keys are checked, not derived.
+
+        A key naming no real parameter of the originating tool could never be
+        recovered — the row would be dead weight that reads as coverage.
+        """
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             invented = set(record.target_keys) - set(record.schema_params)
             assert invented == set(), (
