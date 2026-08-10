@@ -29,7 +29,7 @@ import inspect
 from pathlib import Path
 
 import pytest
-from shared.toolcall_markup import ENVELOPE_LITERALS
+from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -301,3 +301,210 @@ class TestRepairableFieldTable:
         """
         fields = {r.field for r in plan_tools._REPAIRABLE_PLAN_FIELDS}
         assert 'files' not in fields
+
+
+# ---------------------------------------------------------------------------
+# step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
+# ---------------------------------------------------------------------------
+
+#: The trailing shape on a step/prerequisite ``description``. Built here rather
+#: than in the specimen block because the same field name serves two tools.
+_TRAILING_DESCRIPTION = (
+    'Clean step prose for the first step.' + _close('description') + '\n' + _INVOKE_CLOSER + '\n'
+)
+#: The trailing shape on the top-level ``analysis`` key (collection None).
+_TRAILING_ANALYSIS = (
+    'Clean analysis prose describing the approach.'
+    + _close('analysis') + '\n' + _INVOKE_CLOSER + '\n'
+)
+
+
+def _all_strings(value, path=()):
+    """Every str in a nested plan document, keyed by its full path."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _all_strings(item, (*path, key))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            yield from _all_strings(item, (*path, i))
+
+
+class TestRepairPlanFieldsTrailing:
+    """The last-parameter / trailing-residue shape — PRD boundary row B4.
+
+    97 of the 118 corrupted strings measured across the 28 live plans have this
+    shape: the leaked parameter was LAST in the call, so nothing was absorbed
+    and ``repair()`` returns ``recovered == {}``. That is a success, not a
+    refusal.
+    """
+
+    def test_trailing_rationale_repairs_with_a_full_fact(self):
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        decision = repaired['design_decisions'][0]
+        assert decision['rationale'] == _RATIONALE_PROSE
+        assert detect(decision['rationale']) is None
+        # The sibling the tool authored in the same call is untouched.
+        assert decision['decision'] == _DECISION_PROSE
+        assert facts == [
+            {
+                'tool': 'add_design_decision',
+                'param': 'rationale',
+                'pattern': _INVOKE_CLOSER,
+                'misclose': _close('rationale'),
+                'outcome': 'repaired',
+                'recovered_params': [],
+                'collection': 'design_decisions',
+                'index': 0,
+                'field': 'rationale',
+            }
+        ]
+
+    def test_is_pure__input_plan_is_not_mutated(self):
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+
+        repaired, _facts = plan_tools._repair_plan_fields(plan)
+
+        assert plan['design_decisions'][0]['rationale'] == TRAILING_RATIONALE, (
+            'the caller\'s dict must not be mutated in place — the write-back '
+            'decision belongs to the caller, not to the repair pass'
+        )
+        assert repaired is not plan
+        assert repaired['design_decisions'] is not plan['design_decisions']
+
+    def test_index_locator_is_the_items_real_position(self):
+        plan = corrupt_plan()
+        plan['reuse'][1]['how'] = TRAILING_HOW
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired['reuse'][1]['how'] == _HOW_PROSE
+        assert repaired['reuse'][0]['how'] == 'Clean reuse prose.'
+        assert len(facts) == 1
+        assert facts[0]['collection'] == 'reuse'
+        assert facts[0]['index'] == 1
+        assert facts[0]['field'] == 'how'
+        assert facts[0]['tool'] == 'add_reuse_item'
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == []
+        assert facts[0]['misclose'] == _close('how')
+
+    @pytest.mark.parametrize(
+        ('collection', 'index', 'field', 'poisoned', 'clean', 'tool'),
+        [
+            (
+                'steps', 0, 'description', _TRAILING_DESCRIPTION,
+                'Clean step prose for the first step.', 'add_plan_step',
+            ),
+            (
+                'prerequisites', 0, 'description',
+                'Clean prerequisite prose.' + _close('description') + '\n' + _INVOKE_CLOSER + '\n',
+                'Clean prerequisite prose.', 'add_prerequisite',
+            ),
+        ],
+    )
+    def test_trailing_shape_on_each_collection(
+        self, collection, index, field, poisoned, clean, tool
+    ):
+        plan = corrupt_plan()
+        plan[collection][index][field] = poisoned
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired[collection][index][field] == clean
+        assert detect(repaired[collection][index][field]) is None
+        assert len(facts) == 1
+        assert facts[0]['collection'] == collection
+        assert facts[0]['index'] == index
+        assert facts[0]['field'] == field
+        assert facts[0]['tool'] == tool
+        assert facts[0]['outcome'] == 'repaired'
+
+    def test_top_level_field_reports_collection_and_index_none(self):
+        plan = corrupt_plan(analysis=_TRAILING_ANALYSIS)
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired['analysis'] == 'Clean analysis prose describing the approach.'
+        assert len(facts) == 1
+        assert facts[0]['collection'] is None
+        assert facts[0]['index'] is None
+        assert facts[0]['field'] == 'analysis'
+        assert facts[0]['param'] == 'analysis'
+        assert facts[0]['tool'] == 'create_plan'
+
+    def test_four_corrupted_rationales_yield_four_indexed_facts(self):
+        decisions = [
+            {'decision': f'Decision number {i}.', 'rationale': TRAILING_RATIONALE}
+            for i in range(4)
+        ]
+        plan = corrupt_plan(design_decisions=decisions)
+        before = dict(_all_strings(plan))
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert len(facts) == 4
+        assert [f['index'] for f in facts] == [0, 1, 2, 3]
+        assert {f['outcome'] for f in facts} == {'repaired'}
+        for item in repaired['design_decisions']:
+            assert item['rationale'] == _RATIONALE_PROSE
+
+        # Every OTHER string in the document is byte-identical.
+        after = dict(_all_strings(repaired))
+        assert set(after) == set(before)
+        for path, value in after.items():
+            if path[0] == 'design_decisions' and path[-1] == 'rationale':
+                continue
+            assert value == before[path], f'{path} changed but was not poisoned'
+
+    def test_clean_plan_is_returned_unchanged_with_no_facts(self):
+        plan = corrupt_plan()
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert facts == []
+        assert repaired == plan
+
+    @pytest.mark.parametrize(
+        ('collection', 'index', 'field', 'poisoned'),
+        [
+            ('design_decisions', 0, 'rationale', TRAILING_RATIONALE),
+            ('reuse', 1, 'how', TRAILING_HOW),
+            ('steps', 0, 'description', _TRAILING_DESCRIPTION),
+        ],
+    )
+    def test_d5_repaired_value_is_always_a_prefix_of_the_original(
+        self, collection, index, field, poisoned
+    ):
+        """INVARIANT D5: recovery only ever SLICES; it never synthesises text."""
+        plan = corrupt_plan()
+        plan[collection][index][field] = poisoned
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        new_value = repaired[collection][index][field]
+        assert poisoned.startswith(new_value)
+        assert new_value != poisoned
+        assert facts[0]['outcome'] == 'repaired'
+
+    def test_fact_tool_names_a_real_plan_tools_entry_point(self):
+        """The ``tool`` field is a live function name, not a prose label."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+        plan['reuse'][0]['how'] = TRAILING_HOW
+        plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
+        plan['analysis'] = _TRAILING_ANALYSIS
+
+        _repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert len(facts) == 4
+        for fact in facts:
+            impl = getattr(plan_tools, '_' + fact['tool'], None)
+            assert callable(impl), f'{fact["tool"]!r} is not a plan_tools function'
+            assert fact['param'] in _tool_params(impl)
