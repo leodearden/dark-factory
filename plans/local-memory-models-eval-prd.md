@@ -87,9 +87,15 @@ not counted as G1 consumers of anything here.
 >   argument that keeps the struck-through table row, and the same disposition task 3748 took.
 >
 > Known-remaining drift, named so it is not mistaken for an oversight: the **"Est. VRAM" column is
-> stale** against arms.yaml's measured figures (Qwen3.5-9B listed ~6GB, **measured 11.21 GiB**).
-> That is the 3748 drift class, not slate composition; out of scope here and filed as
-> `tkt_0RS9PDHN212E4G1ZW924MMCV75`, sequenced after this correction merges.
+> stale** against arms.yaml's measured figures (Qwen3.5-9B listed ~6GB, **measured 11.21 GiB**) —
+> marked inline at both points of use (the arm table and D10's Consequence bullet) so the deferral is
+> visible where the number is read, not only here. That is the 3748 drift class, not slate
+> composition; out of scope here and filed as **task 3973** (from ticket
+> `tkt_0RS9PDHN212E4G1ZW924MMCV75`). Cite the **task** id: it resolves via `get_task` like every other
+> task reference in this document, whereas a `tkt_` id is a `submit_task` receipt that may resolve to
+> `combined` under a different id and is not addressable. Task 3973 is **wired to depend on this
+> task** (`dependencies: [3804]`, added 2026-08-10), so the sequencing below is enforced by the
+> scheduler rather than only asserted in prose.
 
 ## Goal
 
@@ -397,11 +403,14 @@ artifacts (e.g. margin_m = max(2·σ_control(m), floor_m) with each floor justif
 per-metric pass/fail direction, the latency envelope (p95 < 120s with stated headroom factor), the
 decision rule per axis, and the survivor rule for the screening funnel. Candidate-arm artifacts
 missing a matching `preregistration_sha` are invalid by schema.
-**Constraint on that survivor rule (2026-08-06, task 3804):** it MUST be authored against the
-**three-arm** LLM slate as recorded in `scripts/local-model-serving/arms.yaml` (the authoritative
-slate), MUST NOT presume a 4 → 3 narrowing, and MUST state explicitly whether the ≤3 cap binds at
-all given three candidates — so η reports a substantive result rather than a vacuous "all candidates
-survived". This constrains *how* ζ writes the rule; it does not pre-empt *what* the rule says.
+**Constraint on that survivor rule (authored 2026-08-10, task 3804; per Leo's 2026-08-06 drop
+ruling — the ruling date and the authoring date are different and are kept apart deliberately):** it
+MUST be authored against the **three-arm** LLM slate (authoritative: `scripts/local-model-serving/
+arms.yaml`; for what the narrowing does to the cap, see the consequence note at the candidate slate
+— not restated here), MUST NOT presume a 4 → 3 narrowing, and MUST state explicitly whether the ≤3
+cap binds at all given three candidates — so η reports a substantive result rather than a vacuous
+"all candidates survived". This constrains *how* ζ writes the rule; it does not pre-empt *what* the
+rule says.
 
 **Failure/storm rule (INV-4)**: the replay engine aborts an arm run after 5 consecutive item
 failures with a structured error record (arm, item ids, error class) — no silent absorb-and-continue;
