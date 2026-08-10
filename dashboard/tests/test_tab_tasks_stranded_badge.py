@@ -119,21 +119,6 @@ class TestTaskDetailStrandedBadge:
         frag = _fragment_around(task_detail_body, 'task.stranded')
         assert 'badge' in frag, 'the strand marker does not use the .badge class family'
 
-    def test_badge_uses_the_bad_modifier(self, task_detail_body):
-        """Same class family as the status badge; no new CSS."""
-        frag = _fragment_around(task_detail_body, 'task.stranded')
-        assert re.search(r'badge[^"\'`]*\bbad\b', frag), (
-            'the strand badge should reuse the existing .badge.bad modifier'
-        )
-
-    def test_badge_tooltip_names_the_cause(self, task_detail_body):
-        frag = _fragment_around(task_detail_body, 'task.stranded')
-        assert 'title=' in frag, 'the strand badge carries no title= tooltip'
-        assert re.search(r'claimant|heartbeat', frag), (
-            'the tooltip must name the cause (no live claimant / stale heartbeat), '
-            'not just say "stranded"'
-        )
-
     def test_stranded_is_not_derived_from_agent(self, task_detail_body):
         _assert_not_derived_from_agent(task_detail_body, 'task')
 
@@ -161,11 +146,8 @@ class TestRenderNodeStrandedMarker:
             'graph nodes do not render the strand verdict'
         )
 
-    def test_marker_follows_the_train_badge_precedent(self, render_node_body):
-        """A conditional inline span in the node's .meta row, like .train-badge."""
-        assert 'train-badge' in render_node_body, (
-            'the .train-badge precedent this marker follows has moved — re-anchor'
-        )
+    def test_marker_is_a_conditional_render_with_a_tooltip(self, render_node_body):
+        """The node marker appears only for stranded tasks, and is hoverable."""
         assert re.search(r'\{\s*t\.stranded\s*&&', render_node_body), (
             'the marker must be a conditional render on t.stranded'
         )

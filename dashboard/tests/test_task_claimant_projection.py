@@ -185,18 +185,18 @@ class TestTaskIsStrandedDelegates:
 
         shared.assert_called_once_with(task, _NOW, STRANDED_HEARTBEAT_TTL)
 
-    def test_does_not_use_has_live_claimant(self):
-        """``not has_live_claimant(...)`` is a DIFFERENT predicate.
-
-        It carries neither the in-progress status gate nor the infra_hold
-        carve-out, so substituting it would over-report strands.  Patching it
-        to a wrong answer must not change the wrapper's result.
-        """
-        task = {'status': 'done', 'claimant_run_id': None, 'heartbeat_at': None}
-        with patch.object(
-            tasks_mod, 'has_live_claimant', create=True, return_value=False
-        ):
-            assert task_is_stranded(task, now=_NOW) is False
+    # The "must not substitute ``not has_live_claimant(...)``" contract is
+    # pinned behaviorally, without patching, by the two truth-table cases that
+    # the two predicates disagree on:
+    #
+    #   * test_non_in_progress_status_is_never_stranded (the status gate), and
+    #   * test_infra_hold_metadata_carves_out_of_stranded (the carve-out).
+    #
+    # Both are rows where ``is_stranded`` is False but ``not
+    # has_live_claimant`` would be True, so an implementation that swapped the
+    # predicate fails them.  A patch-based guard cannot add anything here:
+    # tasks.py imports only ``is_stranded``, so there is no
+    # ``has_live_claimant`` attribute for a patch to intercept.
 
     def test_none_now_resolves_through_resolve_now(self):
         """Clock discipline: the wrapper reads the clock only via resolve_now."""
