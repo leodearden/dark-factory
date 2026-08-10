@@ -777,8 +777,84 @@ class TestTeardownKillSequence:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        # hard_cancel must be called because the slot never cleared
-        harness.hard_cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        # hard_cancel must be called because the slot never cleared.
+        # task 3172: the call now also attributes itself (see
+        # TestTeardownHardCancelIsAttributed below), so match on the task_id
+        # positionally and let the reason kwarg ride along.
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        assert harness.hard_cancel_workflow.call_args.args[0] == task_id  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestTeardownHardCancelIsAttributed:
+    """Escalation-action teardown names ITSELF when it hard-cancels (task 3172).
+
+    Without this, a teardown-cancelled slot's synthetic TaskReport falls into
+    the ``cancelled_unattributed`` residue bucket and is indistinguishable in
+    runs.db from a shutdown drain — the same flattening this task removes on
+    the escalation-sweep side.  The reason carries the ACTION so restart, park
+    and abandon stay separable.
+    """
+
+    def _make_wedged_harness(self, harness: Harness) -> None:
+        """Slot never clears → the poll budget exhausts → hard cancel fires."""
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.cancel_workflow = MagicMock(return_value=True)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+        harness.is_workflow_active = MagicMock(return_value=True)
+        harness.config.terminal_status_hard_cancel_polls = 2
+
+    async def test_restart_teardown_attributes_the_action(self, harness: Harness):
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-restart'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:restart', (
+            f'restart teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
+
+    async def test_park_teardown_attributes_the_action(self, harness: Harness):
+        """Park is the case an INFERRED cause would get wrong.
+
+        Park writes target_status='blocked', so ``_should_stamp`` is False and
+        it leaves NO ``_action_teardown_tasks`` marker behind (harness.py's
+        ``_should_stamp = target_status != 'blocked'``).  A reason reverse-
+        inferred from that marker would silently mislabel every park; a stamped
+        reason is correct by construction.
+        """
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-park'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='pending',
+            resolved_by='interactive',
+            level=2,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Precondition: park really does leave no teardown marker.
+        assert task_id not in harness._action_teardown_tasks
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:park', (
+            f'park teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

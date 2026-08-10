@@ -10,11 +10,12 @@ Verifies the registry-and-set behaviour without spinning up a real workflow:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
@@ -445,3 +446,52 @@ class TestHardCancelReasonFallbackLadder:
         )
 
         assert report.block_reason == 'action_teardown:park'
+
+
+# ---------------------------------------------------------------------------
+# Cancel-source attribution — task 3172, step-19
+#
+# The fallback ladder above only stays honest if every in-process cancel
+# SOURCE registers itself.  A source that silently omits `reason` lands in the
+# `cancelled_unattributed` residue bucket, which is exactly the flattening
+# this task exists to remove.  These tests pin the two in-process sources.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTerminalStatusWatcherAttributesItsCancel:
+    """The terminal-status watcher names itself when it hard-cancels a slot."""
+
+    async def test_hard_cancel_passes_terminal_status_cancel_reason(
+        self, harness: Harness
+    ):
+        """Driving the scan past the threshold attributes the cancel.
+
+        Reuses the watcher's own drive shape (two scans with threshold=2, the
+        second crossing it) from test_harness_terminal_status_watcher.py, but
+        patches ``hard_cancel_workflow`` so the assertion is on the CALL, not
+        on the downstream report — the report side is covered above.
+        """
+        h = harness
+        h.config = OrchestratorConfig(terminal_status_hard_cancel_polls=2)
+        h._terminal_cancel_counts = {}
+        h._workflow_cancel_events['6'] = asyncio.Event()
+        h.scheduler.get_statuses = AsyncMock(return_value=({'6': 'cancelled'}, None))
+        h.hard_cancel_workflow = MagicMock(return_value=True)
+
+        # Poll 1: below threshold → soft cancel only.
+        await h._scan_for_terminal_active_tasks()
+        h.hard_cancel_workflow.assert_not_called()  # type: ignore[attr-defined]
+
+        # Poll 2: at threshold → hard cancel, attributed.
+        await h._scan_for_terminal_active_tasks()
+
+        h.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = h.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'terminal_status_cancel', (
+            'terminal-status watcher must attribute its own hard cancel; '
+            f'got reason={kwargs.get("reason")!r}'
+        )
+        # The pre-existing restamp contract must survive the new kwarg: only
+        # the threshold-CROSSING call restamps the R3 grace window.
+        assert kwargs.get('restamp') is True
