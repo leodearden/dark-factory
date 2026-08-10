@@ -4164,3 +4164,180 @@ class TestWithheldTrainMemberHasRecoveryEdge:
             f'withhold reverts to {withheld.status!r} but the factory hands '
             f'members back at {hand_back.status!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (beta), part 2 — the sweep summary that speaks even when nothing
+# moved.  Before this, the line was gated on `if reverted or marked_done or
+# stale_conflicts`, so a sweep in which EVERY candidate was vetoed emitted no
+# journal line at all: the strand was invisible from the logs alone.
+#
+# The report builders are imported from the sibling wiring module rather than
+# re-declared: two copies of "what does a pinned on-main strand look like"
+# would drift, and this suite asserts against the same shapes that one does.
+# ---------------------------------------------------------------------------
+
+from test_recovery_emission_wiring import (  # noqa: E402
+    _bind_reports,
+    _live_claimant,
+    _ref,
+    _report,
+)
+
+from shared.deploy_state import DeployPhase  # noqa: E402
+
+from orchestrator.config import RecoveryEmissionConfig  # noqa: E402
+from orchestrator.task_ground_truth import BranchStateKind  # noqa: E402
+
+
+def _summary_lines(caplog) -> list[str]:
+    """Every reconcile summary line the sweep logged this pass."""
+    return [
+        r.getMessage() for r in caplog.records
+        if 'stranded task(s) reverted to pending' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepSummaryAlwaysSpeaks:
+    @staticmethod
+    def _arm(harness):
+        harness.config.recovery_emission = RecoveryEmissionConfig()
+        harness.config.stranded_blocked_escalate_enabled = False
+
+    async def test_all_vetoed_sweep_still_logs_exactly_one_summary(
+        self, harness, caplog,
+    ):
+        """Today this sweep logs NOTHING — every candidate is held, so all
+        three legacy counters are zero and the line is gated away."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1')]),
+            'T2': _report(escalations=[_ref('esc-2')]),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        assert len(_summary_lines(caplog)) == 1
+
+    async def test_summary_names_the_held_count_and_the_pinning_ids(
+        self, harness, caplog,
+    ):
+        """The operator payoff: the first post-deploy sweep names each
+        currently-stranded task's pinning ids in the journal, with no
+        event-store query."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1')]),
+            'T2': _report(escalations=[_ref('esc-2')]),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        assert 'held=2' in line
+        assert 'esc-1' in line and 'esc-2' in line
+
+    async def test_summary_breaks_the_left_count_down_by_reason(
+        self, harness, caplog,
+    ):
+        """A hold and a fall-through are different operator problems, so the
+        line must not merge them into one opaque count."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1')]),
+            'T2': _report(
+                branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+                deploy_phase=DeployPhase.FAILED,
+            ),
+        })
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        assert 'held=1' in line
+        assert 'left=1' in line
+        assert 'deploy_phase_in_flight' in line
+
+    async def test_summary_counts_a_sweep_that_acted_on_an_unreadable_store(
+        self, harness, caplog,
+    ):
+        """The disposition went ahead UNCHANGED on incomplete information —
+        visible, but never a reason to have decided differently."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(
+                branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+                store_unavailable=True,
+            ),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        assert result == 1, 'the revert still happened — nothing was held'
+        assert 'store-unavailable=1' in _summary_lines(caplog)[0]
+
+    async def test_mixed_sweep_keeps_the_three_legacy_counts_verbatim(
+        self, harness, caplog,
+    ):
+        """No regression to the existing wording: the new counters are
+        APPENDED, never a rewrite of what operators already grep for."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1')]),
+            'T2': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        line = _summary_lines(caplog)[0]
+        assert '1 stranded task(s) reverted to pending' in line
+        assert '0 marked done (branch already on main)' in line
+        assert '0 held on provenance conflict (done_evidence_stale)' in line
+        assert 'held=1' in line
+
+    async def test_return_value_never_starts_counting_holds(self, harness):
+        """The driver's int is consumed to decide whether the main loop keeps
+        running; folding holds into it would make a fully-stuck fleet look
+        busy forever."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {
+            'T1': _report(escalations=[_ref('esc-1')]),
+            'T2': _report(escalations=[_ref('esc-2')]),
+            'T3': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
+        })
+        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
+            return_value='reverted',
+        )
+
+        assert await harness._reconcile_stranded_in_progress(mid_run=False) == 1
+
+    async def test_a_quiet_fleet_reports_zeroes_at_info_not_warning(
+        self, harness, caplog,
+    ):
+        """Nothing is stranded — every candidate is simply running.  A quiet
+        fleet must not read as an incident."""
+        TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
+        _bind_reports(harness, {'T1': _report(claimant=_live_claimant())})
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        lines = _summary_lines(caplog)
+        assert len(lines) == 1
+        assert 'held=0' in lines[0] and 'left=0' in lines[0]
+        assert [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'held=' in r.getMessage()
+        ] == []
