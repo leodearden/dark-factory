@@ -11687,6 +11687,45 @@ class TestDeleteMemoryCascade:
         )
 
     @pytest.mark.asyncio
+    async def test_reported_ids_name_the_whole_destroyed_set(self, service):
+        """A grandchild is destroyed, so it must be NAMED as destroyed.
+
+        `cascaded_child_ids` is the only account of the operation an MCP
+        caller can read — they never see the server's journal. Reporting
+        the DIRECT children only would tell them a three-level cascade
+        A→B→C destroyed just B, leaving them to reconstruct the rest from a
+        log they have no access to.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        grandchild = _dm_uuid('9a9a')
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [grandchild]}
+        ).install(service)
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [grandchild, _DM_CHILD_A, _DM_PARENT]
+        # Deepest-first, mirroring the order they were destroyed in.
+        assert result['cascaded_child_ids'] == [grandchild, _DM_CHILD_A]
+        parent_row = next(
+            call.kwargs for call in journal.log_write_op.call_args_list
+            if call.kwargs['params']['memory_id'] == _DM_PARENT
+        )
+        assert parent_row['result_summary']['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+        parent_event = next(
+            call.args[0] for call in buffer.push.call_args_list
+            if call.args[0].payload['memory_id'] == _DM_PARENT
+        )
+        assert parent_event.payload['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+
+    @pytest.mark.asyncio
     async def test_self_parent_terminates_and_deletes_once(self, service):
         """A record whose own parent_id points at itself.
 

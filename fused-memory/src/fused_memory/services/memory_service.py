@@ -4317,7 +4317,15 @@ class MemoryService:
         _source: str,
         visited: set[str] | None,
     ) -> list[str]:
-        """Delete *memory_id*'s children, depth-first, and return their ids.
+        """Delete *memory_id*'s subtree, depth-first, and return EVERY id it took.
+
+        The return value is the whole destroyed set — grandchildren
+        included, deepest-first — not just the direct children.  It is what
+        the caller reports as ``cascaded_child_ids`` on the result, the
+        journal row and the ``memory_deleted`` event, and an MCP caller
+        never sees the server's journal: naming only the direct children
+        would tell them a SMALLER set was destroyed than actually was, and
+        leave them to reconstruct the rest from a log they cannot read.
 
         CHILDREN FIRST, parent last — the caller deletes the parent only
         after this returns.  Parent-first would re-open precisely the orphan
@@ -4375,7 +4383,7 @@ class MemoryService:
                 break
             for child_id in fresh:
                 visited.add(child_id)
-                await self.delete_memory(
+                child_result = await self.delete_memory(
                     memory_id=child_id,
                     store='mem0',
                     project_id=project_id,
@@ -4387,6 +4395,11 @@ class MemoryService:
                     _visited=visited,
                     _cascade_parent=memory_id,
                 )
+                # The child's OWN subtree went first, so its ids precede it
+                # here — the same deepest-first order the deletes actually
+                # ran in. Dropping this frame's return value would report
+                # A→B→C as having destroyed only B.
+                deleted.extend(child_result.get('cascaded_child_ids') or [])
                 deleted.append(child_id)
 
         if await self._count_children(memory_id, project_id=project_id):
@@ -4450,7 +4463,12 @@ class MemoryService:
 
         ``cascade=True`` is the caller's explicit opt-in: it deletes the
         CHILDREN FIRST and the parent last, then re-checks.  See
-        :meth:`_cascade_delete_children`.
+        :meth:`_cascade_delete_children`.  The result's
+        ``cascaded_child_ids`` — and the journal row and ``memory_deleted``
+        event that carry it — name EVERY record the cascade destroyed,
+        grandchildren included, deepest-first.  ``cascade`` is Mem0-only:
+        ``store='graphiti'`` with ``cascade=True`` raises ``ValueError``
+        rather than performing a silent plain delete (see below).
 
         ``memory_id`` is validated for SHAPE ONLY: it must be a canonical
         36-character UUID. A truncated id (e.g. an 8-char hex prefix lifted out
