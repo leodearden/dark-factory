@@ -14,7 +14,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from graphiti_core.nodes import EpisodeType
 
@@ -1151,6 +1151,20 @@ class ReconcileStats:
     nodes_resolved: int = 0
     task_names_normalized: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+class DescendantScan(NamedTuple):
+    """What a cascade WOULD destroy — and whether that answer is complete.
+
+    ``truncated`` is not decoration: a read-only walk cannot page past
+    ``MemoryService._CHILD_SCAN_LIMIT``, so the id list can genuinely be a
+    subset. Carrying that as data forces a caller gating an irreversible
+    multi-record delete to decide what to do about "I could not see all of
+    them" instead of reading a partial set as complete.
+    """
+
+    ids: list[str]
+    truncated: bool
 
 
 class MemoryService:
@@ -4205,6 +4219,69 @@ class MemoryService:
         )
         return [row['id'] for row in rows]
 
+    async def list_descendant_ids(
+        self, memory_id: str, *, project_id: str
+    ) -> DescendantScan:
+        """Every descendant of *memory_id*, deepest-first — WITHOUT deleting.
+
+        The read-only twin of :meth:`_cascade_delete_children`: same
+        primitives (:meth:`_count_children` / :meth:`_list_children`), same
+        visited-set termination for self-parent records and cycles, same
+        deepest-first order, no new backend call and no second tree-walk
+        (INV-5).  The enumeration a caller GATES on and the traversal the
+        cascade PERFORMS therefore cannot disagree about the shape of the
+        tree — a disagreement would mean checking one set and destroying
+        another.
+
+        Public and side-effect-free on purpose.  The citation-repoint gate
+        lives at the MCP tool layer, which needs to ask "what would this
+        cascade destroy?" *before* anything is destroyed; a hook that
+        mutated would turn look-before-you-leap into the leap.
+
+        ONE deliberate divergence from the cascade, surfaced as data rather
+        than hidden: ``truncated``.  ``_cascade_delete_children`` re-scrolls
+        past ``_CHILD_SCAN_LIMIT`` only because DELETING a page is what
+        makes the next one visible; a non-mutating walk has no such lever,
+        so a fan-out wider than the bound genuinely cannot be fully seen
+        here.  Do not "fix" this by copying the cascade's ``while`` loop
+        into this context — it would spin on the same page forever.  Say so
+        instead, and let the caller refuse.
+
+        Returns:
+            DescendantScan: ``ids`` deepest-first (the order the cascade
+            would destroy them in), excluding *memory_id* itself; and
+            ``truncated``, true when any visited node reported more children
+            than the bounded scroll returned.
+        """
+        # Seeded with the target so a record that is its own parent, or a
+        # cycle leading back to the target, terminates instead of recursing.
+        visited = {memory_id}
+        ordered: list[str] = []
+        truncated = False
+
+        async def walk(node: str) -> None:
+            nonlocal truncated
+            # Count first, scroll only on a non-zero count — the same cheap
+            # ordering the refusal gate uses, so a leaf costs one exact
+            # count and no payload fetch.
+            count = await self._count_children(node, project_id=project_id)
+            if not count:
+                return
+            children = await self._list_children(node, project_id=project_id)
+            if len(children) < count:
+                truncated = True
+            for child in children:
+                if child in visited:
+                    continue
+                visited.add(child)
+                await walk(child)
+                # Appended AFTER its own subtree: post-order is what makes
+                # the listing deepest-first.
+                ordered.append(child)
+
+        await walk(memory_id)
+        return DescendantScan(ids=ordered, truncated=truncated)
+
     async def _refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
         """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
 
@@ -4267,6 +4344,10 @@ class MemoryService:
         instead of recursing.  The loop re-scrolls until a pass yields
         nothing unvisited, so a fan-out wider than ``_CHILD_SCAN_LIMIT`` is
         fully covered — the id LISTING is bounded, the cascade is not.
+        :meth:`list_descendant_ids` walks the same tree read-only and
+        therefore CANNOT re-scroll like this (deleting a page is what makes
+        the next one visible), which is why it reports ``truncated`` where
+        this loop simply keeps going.
 
         Then CORROBORATE (INV-3, after acting): re-count the children and
         raise rather than delete the parent if any survived.  Survivors are
