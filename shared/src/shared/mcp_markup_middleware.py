@@ -79,6 +79,14 @@ from typing import Any
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
+# From ``fastmcp.tools.base``, which is where ``Middleware.on_call_tool``'s own
+# return annotation imports it from. NOT ``fastmcp.tools.tool``: that path is a
+# runtime-only backward-compat shim (``tool.py`` was renamed to ``base.py``
+# precisely to stop pyright resolving ``from fastmcp.tools import tool`` as the
+# submodule instead of the decorator), so it imports fine but type-checks as
+# reportMissingImports. Same class either way — measured identical.
+from fastmcp.tools.base import ToolResult
+
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
     detect,
@@ -106,6 +114,16 @@ _REJECT_HINT = (
     'leak is a serialization defect in your own tool-call envelope, not a '
     'content problem. If the markup is quoted DELIBERATELY (e.g. documenting '
     "the leak itself), override with metadata={'allow_mcp_markup': True}."
+)
+
+#: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
+#: otherwise have no way to learn that its arguments were altered.
+_FORWARD_HINT = (
+    'This call carried raw MCP envelope markup and was REPAIRED in place '
+    'before dispatch: the leaked fragment was stripped from `field` and the '
+    'parameters it had swallowed (see recovered_params) were restored. The '
+    'call went through, but your tool-call envelope is leaking into your own '
+    'payloads — fix the emission rather than relying on this repair.'
 )
 
 
@@ -282,10 +300,7 @@ class MarkupGuardMiddleware(Middleware):
         if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
             return self._reject(name, arguments, param, fix)
 
-        raise ToolError(
-            'Tool call carries leaked MCP envelope markup in '
-            f'{param!r} (matched {detect(value)!r}).'
-        )
+        return await self._forward(context, call_next, arguments, param, fix)
 
     def _reject(self, name, arguments, param, fix) -> None:
         """Write nothing; bounce the caller with the repaired argument map.
@@ -334,3 +349,46 @@ class MarkupGuardMiddleware(Middleware):
             'repaired_call': repaired_call,
             'hint': _REJECT_HINT,
         }))
+
+    async def _forward(self, context, call_next, arguments, param, fix):
+        """Repair in place, let the call through, and say so.
+
+        The mutation is IN PLACE on ``context.message.arguments``, which is
+        verified to reach the tool (probe: the tool body observed the mutated
+        value). That is what makes the recovered parameter LAND rather than
+        merely be reported — the point of this tier.
+
+        The warning rides on ``meta`` and NEVER on ``structured_content`` or an
+        extra content block. Both alternatives are ruled out by measurement,
+        not preference: a middleware-authored ``structured_content`` fails the
+        tool's own output schema, and an appended content block would corrupt
+        any caller that indexes ``content[0]``. ``meta`` is verified to survive
+        to the client untouched.
+
+        ``call_next``'s result already carries ``{'fastmcp': {'wrap_result':
+        True}}``, so the warning is FOLDED into whatever meta came back rather
+        than replacing it — discarding FastMCP's own signalling to deliver our
+        own would be a poor trade.
+        """
+        arguments[param] = fix.clean_value
+        arguments.update(fix.recovered)
+
+        result = await call_next(context)
+
+        meta = dict(result.meta or {})
+        meta['markup_repair'] = {
+            'outcome': _OUTCOME_REPAIRED,
+            'field': param,
+            'matched_pattern': fix.pattern,
+            'misclose': fix.misclose,
+            # NAMES only, never values: a forwarding caller needs to know WHICH
+            # of its arguments the guard altered, and the warning must not
+            # become a second copy of its payload.
+            'recovered_params': sorted(fix.recovered),
+            'hint': _FORWARD_HINT,
+        }
+        return ToolResult(
+            content=result.content,
+            structured_content=result.structured_content,
+            meta=meta,
+        )
