@@ -29,7 +29,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
 
@@ -116,6 +116,59 @@ def _coerce_files(files: list[str] | str | None) -> list[str]:
             parts,
         )
     return parts
+
+
+# ---------------------------------------------------------------------------
+# Envelope-markup repair on read (task 3692, PRD contract C3, boundary row B12)
+# ---------------------------------------------------------------------------
+
+
+class _PlanField(NamedTuple):
+    """One repairable plan field, and the tool schema it must validate against.
+
+    ``collection`` is the plan key holding a LIST OF DICTS the field lives in,
+    or ``None`` for a top-level plan key. ``schema_params`` is the ORIGINATING
+    tool's full parameter list — what ``repair()`` checks a recovered name
+    against, so a recovery can never invent a parameter that tool never had.
+    """
+
+    collection: str | None
+    field: str
+    schema_params: tuple[str, ...]
+
+
+# The parameter tuples of the five tools that AUTHOR plan prose. Spelled once
+# each so the nine records below reference a tool's schema by meaning; the
+# tuples are asserted against ``inspect.signature`` of the live functions by
+# ``tests/test_plan_tools_markup_repair.py::TestRepairableFieldTable`` (INV-1),
+# so they cannot drift from the tools they describe.
+_CREATE_PLAN_PARAMS = ('task_id', 'title', 'analysis', 'files')
+_ADD_PREREQUISITE_PARAMS = ('prereq_id', 'description')
+_ADD_PLAN_STEP_PARAMS = ('step_id', 'step_type', 'description')
+_ADD_DESIGN_DECISION_PARAMS = ('decision', 'rationale')
+_ADD_REUSE_ITEM_PARAMS = ('what', 'where', 'how')
+
+#: THE declared enumeration of the repairable surface. Adding a prose field to
+#: the plan schema means ADDING A ROW HERE — nothing infers the surface.
+#:
+#: Deliberately NOT a recursive walk of the plan dict. A heuristic walk cannot
+#: supply the originating tool's parameter names, which is the whole basis on
+#: which ``repair()`` decides a recovery is real rather than a guess (PRD D2,
+#: INV-3 corroborate-before-acting); it would have to fabricate a schema. It
+#: would also sweep in ``files`` (path entries, already recovered by
+#: :func:`_coerce_files`) and every future non-prose key, rewriting values this
+#: surface has no business touching.
+_REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...] = (
+    _PlanField(None, 'title', _CREATE_PLAN_PARAMS),
+    _PlanField(None, 'analysis', _CREATE_PLAN_PARAMS),
+    _PlanField('prerequisites', 'description', _ADD_PREREQUISITE_PARAMS),
+    _PlanField('steps', 'description', _ADD_PLAN_STEP_PARAMS),
+    _PlanField('design_decisions', 'decision', _ADD_DESIGN_DECISION_PARAMS),
+    _PlanField('design_decisions', 'rationale', _ADD_DESIGN_DECISION_PARAMS),
+    _PlanField('reuse', 'what', _ADD_REUSE_ITEM_PARAMS),
+    _PlanField('reuse', 'where', _ADD_REUSE_ITEM_PARAMS),
+    _PlanField('reuse', 'how', _ADD_REUSE_ITEM_PARAMS),
+)
 
 
 # ---------------------------------------------------------------------------
