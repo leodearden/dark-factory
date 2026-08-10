@@ -147,20 +147,29 @@ every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, o
 parse.
 
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
-returning. Run as a **background** task (`run_in_background: true`), it is exempt from the Bash
-tool's foreground timeouts — it runs detached across turns and notifies on exit — so use the long
+returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
+`timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
+`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout:
+measured 2026-08-10, background arms launched with no `timeout` parameter were killed after ~116s
+(≈ the 120000ms Bash default) against a configured `--timeout 540` slice, so the slice length was
+never the constraint; re-arming the identical command with `timeout: 3660000` survived 6m32s and
+exited cleanly with `WATCHER_REARM_OUTCOME: FIRED exit=0`. With that parameter passed, use the long
 canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
-real L2 escalation still fires instantly via inotify. A short slice buys no protection in the
-background — the old `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes.
-Only **foreground** calls (e.g. debugging outside the background task) are governed by the harness
-timeouts. An omitted Bash `timeout` parameter kills the call at the 2-minute default before the
-wait can return (the 07-09 exit-143 failure mode this wrapper exists to prevent). For a foreground
-call, size the Bash `timeout` parameter to at least `(--timeout + 60s) × 1000` ms — e.g.
-`timeout: 3660000` for `--timeout 3600` — which requires `BASH_MAX_TIMEOUT_MS` ≥ that value in the
-settings env (dark-factory onboarding provisions it — see `skills/factory-init`). Only on a
-machine WITHOUT that setting does the harness's 600000ms (10 min) foreground cap apply: there,
-cap the slice at `--timeout 540` and set the Bash tool's `timeout` **≥ 600000ms** so the slice
-can return before the harness kills it.
+real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
+`--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
+`BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
+see `skills/factory-init`). Only on a machine WITHOUT that setting does the harness's 600000ms
+(10 min) cap apply: there, cap the slice at `--timeout 540` and set the Bash tool's `timeout`
+**≥ 600000ms** so the slice can return before the harness kills it.
+
+**Diagnostic — watcher dies at ~2 minutes with no outcome line:** if an arm disappears after
+roughly 120s and stderr carries **no** `WATCHER_REARM_OUTCOME` line, the Bash `timeout` parameter
+was omitted. The wrapper emits that line on every exit path including its own timeout, so its
+absence means the exit handler never ran — an external SIGKILL to the process group, not a wrapper
+or watcher fault (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
+kill of the whole group). This hides during a backlog drain, where every arm FIRES within seconds
+and finishes well inside the 120s window; the kills only start once the queue is fully triaged and
+the watcher genuinely waits, leaving a loop that looks armed but reaps itself every ~2 minutes.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
