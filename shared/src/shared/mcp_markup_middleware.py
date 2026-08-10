@@ -211,7 +211,19 @@ class MarkupGuardMiddleware(Middleware):
         # leaf can read it live rather than capturing it at construction.
         self._storm_threshold = storm_threshold
         self._storm_window_seconds = storm_window_seconds
-        self._storm = StormCounter(time_provider=time_provider)
+        self._storm_time_provider = time_provider
+        # ONE COUNTER PER KEY, not one counter with a composed label.
+        # MEASURED: StormCounter holds a single deque and a single
+        # _last_fire_ts, so its count spans EVERY event in the window
+        # regardless of label — a label buys per-key ATTRIBUTION, never a
+        # per-key THRESHOLD. Fed ['p|repaired', 'p|repaired', 'p|rejected',
+        # 'p|rejected'] at threshold 3, one instance fires on the third event.
+        # That is exactly the pooling boundary row B10 forbids, so the keying
+        # has to live out here. This is the established shape for it, not an
+        # invention: MemoryService keys per agent_id the same way, and
+        # StormCounter.prune() exists as that consumer's sweep hook. The class
+        # itself is untouched and its body still has no fourth copy (INV-5).
+        self._storms: dict[str, StormCounter] = {}
 
     # -- the hook ---------------------------------------------------------
 
@@ -366,7 +378,8 @@ class MarkupGuardMiddleware(Middleware):
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
-            self._refuse_unrepairable(name, identity, param, value, pattern)
+            storm = self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
+            self._refuse_unrepairable(name, identity, param, value, pattern, storm)
 
         # Identity from the REPAIRED view. If the leak ate the caller's own
         # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
@@ -381,12 +394,14 @@ class MarkupGuardMiddleware(Middleware):
                 name, identity, param, pattern,
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
             )
-            return self._reject(name, arguments, param, fix)
+            storm = self._record_storm(_OUTCOME_REJECTED, identity[1])
+            return self._reject(name, arguments, param, fix, storm)
 
         self._emit_fact(
             name, identity, param, pattern,
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
+        self._record_storm(_OUTCOME_REPAIRED, identity[1])
         return await self._forward(context, call_next, arguments, param, fix)
 
     # -- facts (INV-2) ----------------------------------------------------
@@ -460,7 +475,100 @@ class MarkupGuardMiddleware(Middleware):
                 'outcome stands', outcome, tool, param,
             )
 
-    def _refuse_unrepairable(self, name, identity, param, value, pattern) -> NoReturn:
+    # -- the storm escape (INV-4) -----------------------------------------
+
+    def _record_storm(self, outcome: str, project: str | None) -> dict[str, Any] | None:
+        """Count this outcome; escalate and return a summary iff a burst fired.
+
+        Repair is a FAIL-SOFT path, so it owes the rate/streak escalation. One
+        corrupted call is routine — the measured rate is 0.26% — but a BURST
+        means the upstream serialization leak is running right now.
+
+        Keyed by ``(project, outcome)``, which is the generalisation this task
+        owns. ``MarkupStormCounter`` keys by project alone, which sufficed while
+        "rejected" was the only outcome. With two declared tiers there are
+        three, and a burst of REPAIRS is exactly as urgent as a burst of
+        rejections while being invisible to every caller — those calls all
+        succeeded. Pooling the outcomes would fire an alarm naming one that
+        never burst, and an operator sent chasing a burst that did not happen
+        learns to ignore the alarm.
+
+        Threshold and window are passed PER CALL, honouring ``StormCounter``'s
+        reload-safety contract, so a registration site backed by a green-tier
+        config leaf can read them live rather than capturing them here.
+        """
+        key = f'{project}\x1f{outcome}'
+        counter = self._storms.get(key)
+        if counter is None:
+            counter = StormCounter(time_provider=self._storm_time_provider)
+            self._storms[key] = counter
+
+        summary = counter.record(
+            threshold=self._storm_threshold,
+            window_seconds=self._storm_window_seconds,
+            label=key,
+        )
+
+        # One counter per key means one object per key ever seen, and `project`
+        # is caller-supplied — so sweep the dormant ones, exactly as the
+        # MemoryService consumer StormCounter.prune() was written for.
+        for other, dormant in list(self._storms.items()):
+            if other != key and dormant.prune(self._storm_window_seconds) == 0:
+                del self._storms[other]
+
+        if summary is None:
+            return None
+
+        storm = {
+            'count': summary['count'],
+            'threshold': summary['threshold'],
+            'window_seconds': summary['window_seconds'],
+            'outcome': outcome,
+            'project': project,
+        }
+        # ERROR, and greppable: markup_tripwire's split again — the summary
+        # folded into the response reaches ONLY the leaking caller, which is
+        # the one party that already knows, so the operator-facing half cannot
+        # ride on it.
+        logger.error(
+            'markup_guard_storm: %d %s outcome(s) in %ss for project=%r — the '
+            'serialization leak is ACTIVE (see DF 3083)',
+            storm['count'], outcome, storm['window_seconds'], project,
+        )
+        self._file_storm_escalation(storm)
+        return storm
+
+    def _file_storm_escalation(self, storm: dict[str, Any]) -> None:
+        """Hand the burst to the injected sink; never change an outcome.
+
+        No dedup here. ``emit_markup_storm_escalation`` dedups against an OPEN
+        escalation in the target queue, which is knowledge this layer does not
+        have and must not guess at — the sink owns it, exactly as it does
+        today.
+        """
+        if self._escalation_sink is None:
+            return
+        try:
+            self._escalation_sink({'error_type': 'mcp_markup_storm', **storm})
+        except Exception:
+            logger.exception(
+                'markup guard: the escalation sink failed for storm %r; the '
+                'ERROR above still records the burst', storm,
+            )
+
+    @staticmethod
+    def _with_storm(payload: dict[str, Any], storm: dict[str, Any] | None) -> dict[str, Any]:
+        """Fold a FIRED burst into a caller-facing payload, and only then.
+
+        ``build_markup_block``'s convention: the key is OMITTED entirely when
+        no burst fired, rather than set to ``None``, so its presence is an
+        unambiguous signal instead of a value the caller has to inspect.
+        """
+        if storm is not None:
+            payload['storm'] = storm
+        return payload
+
+    def _refuse_unrepairable(self, name, identity, param, value, pattern, storm) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
         The tiers disagree about what to do with a REPAIR. They do not disagree
@@ -518,7 +626,7 @@ class MarkupGuardMiddleware(Middleware):
             # payload twice in one record.
         })
 
-        raise ToolError(json.dumps({
+        raise ToolError(json.dumps(self._with_storm({
             'error': (
                 f'Tool call refused: {param!r} carries raw MCP envelope markup '
                 'whose own boundary cannot be determined, so no repair was '
@@ -533,7 +641,7 @@ class MarkupGuardMiddleware(Middleware):
             # NO 'repaired_call'. There is no repair, and offering one would
             # invite a retry that re-sends a guess.
             'hint': _UNREPAIRABLE_HINT,
-        }))
+        }, storm)))
 
     def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
         """Hand the residue to the injected sink; never change the outcome.
@@ -575,7 +683,7 @@ class MarkupGuardMiddleware(Middleware):
         )
         return escalation_id
 
-    def _reject(self, name, arguments, param, fix) -> NoReturn:
+    def _reject(self, name, arguments, param, fix, storm) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
         RAISES rather than short-circuiting with a middleware-authored
@@ -606,7 +714,7 @@ class MarkupGuardMiddleware(Middleware):
         old single-literal guard could not produce.
         """
         repaired_call = {**arguments, param: fix.clean_value, **fix.recovered}
-        raise ToolError(json.dumps({
+        raise ToolError(json.dumps(self._with_storm({
             'error': (
                 'Tool call rejected: it carries raw MCP envelope markup in '
                 f'{param!r}, which means the caller serialized part of its own '
@@ -621,7 +729,7 @@ class MarkupGuardMiddleware(Middleware):
             'recovered_params': sorted(fix.recovered),
             'repaired_call': repaired_call,
             'hint': _REJECT_HINT,
-        }))
+        }, storm)))
 
     async def _forward(self, context, call_next, arguments, param, fix):
         """Repair in place, let the call through, and say so.
