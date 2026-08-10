@@ -75,6 +75,12 @@ _AMENDMENT_DIGEST_CAP = 10
 #: children are.
 CHILDREN_UNAVAILABLE_KEY = 'children_unavailable'
 
+#: Where a SWALLOWED child hit is pinned into its parent's block, carrying its
+#: FULL body.  Deliberately separate from ``amendments`` so a sighting is never
+#: misfiled as an amendment and ``amendment_count`` / ``truncated`` keep meaning
+#: exactly what the count API said.  See :func:`_pin_matched_child`.
+MATCHED_CHILDREN_KEY = 'matched_children'
+
 #: Metadata flag marking a child that CONTESTS its parent rather than merely
 #: extending it.  This module is the single home of the predicate below because
 #: no landed vocabulary key carries adjudication state and the producer (leaf
@@ -134,7 +140,14 @@ def _digest_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
     """Deterministic (created_at, id) ordering; a missing timestamp sorts first.
 
     Coerced to str so a ``None`` created_at cannot raise comparing None to str
-    — two runs over the same corpus must agree on digest order.
+    — two runs over the same corpus must agree on the ORDER of the rows they
+    were given.
+
+    This orders the sample; it does not choose it.  The backend caps the scroll
+    at ``_AMENDMENT_DIGEST_CAP`` BEFORE this module ever sorts, so WHICH
+    cap-sized subset of a wide fan-out comes back is arbitrary.  That
+    arbitrariness is precisely why a swallowed child can never be assumed
+    present in the digest list — see :func:`_pin_matched_child`.
     """
     return (row.get('created_at') or '', row.get('id') or '')
 
@@ -314,16 +327,16 @@ async def _resolve_absent_parents(
     return resolved
 
 
-def _suppress_child(
+def _carve_outs_allow_suppression(
     child_meta: Mapping[str, Any] | None,
     parent_base: Any,
     parent_block: Mapping[str, Any] | None,
 ) -> bool:
-    """The SINGLE gate every child-suppression decision passes through.
+    """The carve-outs that do NOT depend on how the block was populated.
 
-    True only when the child is genuinely REPRESENTED by its parent's grouped
-    document.  Every carve-out lives here, in one place, so a future edit
-    cannot bypass one:
+    Shared by :func:`_suppress_child` (the decision) and the pinning pass in
+    :func:`group_search_results` (which must know the same thing BEFORE the
+    block is populated), so the two cannot disagree about who is a candidate:
 
     * UNRESOLVABLE PARENT — a dangling ``parent_id`` must never make a child's
       content unreachable, so an unresolved parent suppresses nothing;
@@ -343,6 +356,67 @@ def _suppress_child(
     return not grouping_is_unusable
 
 
+def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
+    """Record a child about to be SWALLOWED inside its parent's grouped block.
+
+    Suppressing a child is only honest when the block that replaces it actually
+    carries it, and two live paths break that: a matched amendment beyond
+    ``_AMENDMENT_DIGEST_CAP`` (the retained sample is arbitrary — see
+    :func:`_digest_sort_key`) and ANY matched sighting, which the
+    amendment-only digest scroll can never list.  In both, the matched id and
+    its text would vanish from the response entirely.
+
+    The body is taken from the hit ALREADY IN HAND — zero extra backend reads —
+    and carried in FULL rather than truncated to ``_DIGEST_CHARS``: that text
+    was in the response before grouping, so cutting it here would BE the
+    retrieval regression.  Each pinned body appears exactly once, so the
+    grouped response can never exceed the ungrouped one it replaces.
+
+    Pins land in a SEPARATE ``matched_children`` list, never in ``amendments``:
+    a sighting is not an amendment, and ``amendment_count`` / ``truncated``
+    must keep meaning exactly what the count API said.  When the child is
+    already listed as a digest (the common in-cap amendment case) that entry is
+    marked in place instead of being duplicated.
+
+    Mutates only *block* — a dict this call's :func:`build_grouped_document`
+    just built, never a shared or cached structure.
+    """
+    child_id = getattr(hit, 'id', None)
+    if not isinstance(child_id, str) or not child_id:
+        # Not pinnable and not verifiable; the caller keeps such a hit.
+        return
+    for digest in block.get('amendments') or []:
+        if digest.get('id') == child_id:
+            digest['matched'] = True
+            return
+    pinned: list[dict[str, Any]] = block.setdefault(MATCHED_CHILDREN_KEY, [])
+    if any(entry.get('id') == child_id for entry in pinned):
+        return
+    meta = getattr(hit, 'metadata', None) or {}
+    pinned.append(
+        {
+            'id': child_id,
+            'content': getattr(hit, 'content', '') or '',
+            'created_at': getattr(hit, 'created_at', None),
+            'kind': meta.get('kind'),
+            'matched': True,
+        }
+    )
+
+
+def _suppress_child(
+    child_meta: Mapping[str, Any] | None,
+    parent_base: Any,
+    parent_block: Mapping[str, Any] | None,
+) -> bool:
+    """The SINGLE gate every child-suppression decision passes through.
+
+    Every carve-out lives here, in one place, so a future edit cannot bypass
+    one; see :func:`_carve_outs_allow_suppression` for what they are.
+    """
+    return _carve_outs_allow_suppression(child_meta, parent_base, parent_block)
+
+
 async def group_search_results(
     service: Any,
     project_id: str,
@@ -358,6 +432,9 @@ async def group_search_results(
       ``relevance_score``.
     * A child the grouping cannot account for — contested, dangling parent, or
       failed parent grouping — survives untouched; see :func:`_suppress_child`.
+    * Every child that IS swallowed is first pinned into its parent's block
+      with its full body (:func:`_pin_matched_child`), so a suppressed child's
+      text is never lost from the response.
 
     The list only ever shrinks, and survivors keep their relative order.
 
@@ -425,6 +502,25 @@ async def group_search_results(
             )
             block = {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': type(block).__name__}
         block_by_id[target_id] = block
+
+    # PIN every child that is about to be swallowed into its parent's block,
+    # BEFORE any suppression decision is taken.  Suppressing a child is only
+    # honest when the block that replaces it demonstrably carries it, and the
+    # digest list alone does not: a matched amendment beyond the cap or ANY
+    # matched sighting is absent from it.  Pinning satisfies both goals at once
+    # — the canonical still absorbs its children (esc-5541) and the matched
+    # text stays reachable (D6) — at zero extra backend reads.
+    for index, hit in enumerate(hits):
+        parent_id = child_parents.get(index)
+        if parent_id is None:
+            continue
+        parent_base = hit_by_id.get(parent_id) or resolved.get(parent_id)
+        block = block_by_id.get(parent_id)
+        if block is None or not _carve_outs_allow_suppression(
+            getattr(hit, 'metadata', None), parent_base, block
+        ):
+            continue
+        _pin_matched_child(block, hit)
 
     ordered: list[str] = []
     entries: dict[str, dict[str, Any]] = {}
