@@ -139,6 +139,24 @@ COMMIT_REF_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# A project qualifier sitting immediately before a ref — "dark_factory task
+# 3142", "dark_factory's task 3142". Case-sensitive and anchored to the end of
+# the preceding text, and (crucially) only HONOURED when the captured word is a
+# member of the server's project registry: without that membership test "the
+# merge task 3142" would read 'merge' as a project name, and every unqualified
+# ref in ordinary prose would acquire a bogus owner.
+_PROJECT_QUALIFIER_RE: re.Pattern[str] = re.compile(
+    r"([A-Za-z][A-Za-z0-9_-]*)(?:'s)?\s+$"
+)
+
+# The `<project_id>:<task_id>` external-dependency spelling used throughout
+# task metadata. TASK_REF_RE cannot see it (no task/df/# cue), and it is only
+# ever accepted for a REGISTERED project, which is what keeps it from firing on
+# an unrelated "label:1234" or a "host:8080".
+_EXTERNAL_TASK_REF_RE: re.Pattern[str] = re.compile(
+    r'\b([A-Za-z][A-Za-z0-9_-]*):(\d+)\b'
+)
+
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
     # bare past-tense/participle completion words that read as a completion of
@@ -273,17 +291,16 @@ def extract_completion_claims(
         else:
             continue
 
-        subject, refs = _refs_in_clause(clause)
+        subject, refs = _refs_in_clause(
+            clause,
+            default_project_id=default_project_id,
+            known_project_ids=known_project_ids,
+        )
         if subject is None:
             continue
 
         span = (offset, offset + len(clause))
-        # A ticket id is a globally unique primary key in one shared
-        # tickets.db, so a ticket claim carries no project at all — that is
-        # precisely what let instance (2) (a reify writer claiming a
-        # dark_factory ticket) be adjudicated correctly.
-        project_id = None if subject == 'ticket' else default_project_id
-        for ref in refs:
+        for ref, project_id in refs:
             key = (kind, subject, ref, project_id)
             if key in seen:
                 continue
@@ -301,8 +318,25 @@ def extract_completion_claims(
     return claims
 
 
-def _refs_in_clause(clause: str) -> tuple[ClaimSubject | None, list[str]]:
-    """Return the MOST SPECIFIC ref family named in *clause*.
+def _qualifying_project(
+    clause: str, start: int, known_project_ids: frozenset[str] | set[str]
+) -> str | None:
+    """Return the registered project qualifying the ref at *start*, else None."""
+    match = _PROJECT_QUALIFIER_RE.search(clause[:start])
+    if match is None:
+        return None
+    candidate = match.group(1)
+    return candidate if candidate in known_project_ids else None
+
+
+def _refs_in_clause(
+    clause: str,
+    *,
+    default_project_id: str,
+    known_project_ids: frozenset[str] | set[str],
+) -> tuple[ClaimSubject | None, list[tuple[str, str | None]]]:
+    """Return the MOST SPECIFIC ref family named in *clause*, each ref paired
+    with the project whose authority adjudicates it.
 
     Precedence is ticket > commit > task, and it is deliberately exclusive: a
     clause naming both ("task 5638 ... re-filed as ticket tkt_X") is one claim
@@ -312,13 +346,32 @@ def _refs_in_clause(clause: str) -> tuple[ClaimSubject | None, list[str]]:
     """
     tickets = _ordered_unique(TICKET_REF_RE.findall(clause))
     if tickets:
-        return 'ticket', tickets
-    commits = _ordered_unique(COMMIT_REF_RE.findall(clause))
+        # A ticket id is a globally unique primary key in one shared
+        # tickets.db, so a ticket claim carries no project at all — that is
+        # precisely what let instance (2) (a reify writer claiming a
+        # dark_factory ticket) be adjudicated correctly.
+        return 'ticket', [(ref, None) for ref in tickets]
+
+    commits = [
+        (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
+         or default_project_id)
+        for match in COMMIT_REF_RE.finditer(clause)
+    ]
     if commits:
-        return 'commit', commits
-    tasks = _ordered_unique(TASK_REF_RE.findall(clause))
+        return 'commit', _ordered_unique_pairs(commits)
+
+    tasks = [
+        (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
+         or default_project_id)
+        for match in TASK_REF_RE.finditer(clause)
+    ]
+    tasks += [
+        (match.group(2), match.group(1))
+        for match in _EXTERNAL_TASK_REF_RE.finditer(clause)
+        if match.group(1) in known_project_ids
+    ]
     if tasks:
-        return 'task', tasks
+        return 'task', _ordered_unique_pairs(tasks)
     return None, []
 
 
@@ -326,6 +379,19 @@ def _ordered_unique(values: list[str]) -> list[str]:
     """De-duplicate *values* preserving first-appearance order."""
     seen: set[str] = set()
     out: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _ordered_unique_pairs(
+    values: list[tuple[str, str | None]],
+) -> list[tuple[str, str | None]]:
+    """De-duplicate ``(ref, project_id)`` pairs preserving first-appearance order."""
+    seen: set[tuple[str, str | None]] = set()
+    out: list[tuple[str, str | None]] = []
     for value in values:
         if value not in seen:
             seen.add(value)
