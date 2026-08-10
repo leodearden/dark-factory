@@ -541,6 +541,218 @@ class TestCanonicalUniquenessViolationType:
 
 _UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 _UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+_UUID3 = 'b1e0f2c4-5a6d-4e8f-9b0a-1c2d3e4f5a6b'
+_UUID4 = 'd4c3b2a1-9e8f-4a7b-8c6d-5e4f3a2b1c0d'
+
+
+class TestParentHasChildrenError:
+    """`ParentHasChildrenError` — the delete-time refusal (leaf δ, task 3197).
+
+    The contract-fixed half of PRD V3's lifecycle rule ("no operation may
+    silently orphan a child"). It lives in the registry module, next to
+    `MemoryMetadataValidationError`, so both contract-fixed errors read
+    identically to a caller and an out-of-process consumer can import the
+    error without pulling in `MemoryService`.
+    """
+
+    def test_is_exported_and_subclasses_exception(self):
+        import fused_memory.memory_metadata as mm
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        assert issubclass(ParentHasChildrenError, Exception)
+        assert 'ParentHasChildrenError' in mm.__all__
+
+    def test_exposes_parent_id_and_child_ids(self):
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2, _UUID3])
+        assert err.parent_id == _UUID
+        assert err.child_ids == [_UUID2, _UUID3]
+        assert err.truncated is False
+
+    def test_child_ids_is_a_defensive_copy(self):
+        """Mirrors `MemoryMetadataValidationError.__init__`'s `list(violations)`.
+
+        The caller builds the id list from a live scroll; if the error
+        aliased it, a later mutation of that list would retroactively
+        rewrite what the refusal claimed.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        children = [_UUID2]
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=children)
+        children.append(_UUID3)
+        assert err.child_ids == [_UUID2]
+
+    def test_str_names_parent_every_child_the_count_cascade_and_registry(self):
+        """The refusal must be actionable from the message alone.
+
+        This is the user-observable signal the task exists to produce: an
+        agent that hits the refusal at the MCP wire gets `str(err)` and
+        nothing else, so it has to carry the ids, the way out (`cascade`)
+        and where the vocabulary lives.
+        """
+        from fused_memory.memory_metadata import (
+            MemoryMetadataValidationError,
+            ParentHasChildrenError,
+        )
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2, _UUID3])
+        text = str(err)
+        assert _UUID in text
+        assert _UUID2 in text
+        assert _UUID3 in text
+        # In CONTEXT, never as a bare substring: the message embeds the child
+        # UUIDs, and _UUID2 itself contains a literal '2', so `'2' in text`
+        # would pass even with the count omitted entirely or rendered wrong.
+        assert 'it has 2 child record(s)' in text
+        assert 'cascade' in text
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in text
+
+    def test_the_count_tracks_the_number_of_children(self):
+        """A wrong count must fail, not ride along on a UUID's digits.
+
+        Paired with the two-child case above: the count is the one number an
+        operator reads to size the damage a `cascade=true` is about to do, so
+        it has to be pinned at more than one value to be pinned at all.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(
+            parent_id=_UUID, child_ids=[_UUID2, _UUID3, _UUID4]
+        )
+        text = str(err)
+        assert 'it has 3 child record(s)' in text
+        assert 'it has 2 child' not in text
+
+    def test_untruncated_message_does_not_imply_a_partial_listing(self):
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2])
+        assert 'at least' not in str(err)
+
+    def test_truncated_message_says_the_listing_is_partial(self):
+        """A bounded scroll must never read as an exhaustive listing.
+
+        `truncated=True` is set when the id scroll returned fewer rows than
+        the live child count (limit or race); saying "2 children" there
+        would understate the damage a cascade is about to do.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(
+            parent_id=_UUID, child_ids=[_UUID2, _UUID3], truncated=True
+        )
+        assert err.truncated is True
+        text = str(err)
+        assert 'at least' in text
+        assert _UUID2 in text
+        assert _UUID3 in text
+
+
+class TestParentLivenessViolation:
+    """The two write-time liveness codes and their public factory (leaf δ).
+
+    The LOOKUP happens at the service seam — `validate_memory_metadata` is
+    pure by construction and cannot reach a store (leaf β pinned that
+    boundary structurally). But the violation CODES and the message WORDING
+    stay here, behind this factory, so the registry remains the single
+    normative home for the rule text and the seam cannot grow a second copy
+    of it (INV-5).
+    """
+
+    def test_codes_are_distinct_constants_and_exported(self):
+        import fused_memory.memory_metadata as mm
+        from fused_memory.memory_metadata import (
+            PARENT_ID_DEAD_CODE,
+            PARENT_ID_UNAVAILABLE_CODE,
+        )
+
+        assert PARENT_ID_DEAD_CODE == 'dead_parent_id'
+        assert PARENT_ID_UNAVAILABLE_CODE == 'parent_id_liveness_unavailable'
+        assert PARENT_ID_DEAD_CODE != PARENT_ID_UNAVAILABLE_CODE
+        for name in (
+            'PARENT_ID_DEAD_CODE',
+            'PARENT_ID_UNAVAILABLE_CODE',
+            'parent_liveness_violation',
+        ):
+            assert name in mm.__all__
+
+    def test_dead_parent_violation_shape(self):
+        from fused_memory.memory_metadata import (
+            PARENT_ID_DEAD_CODE,
+            MetadataViolation,
+            parent_liveness_violation,
+        )
+
+        v = parent_liveness_violation(_UUID, code=PARENT_ID_DEAD_CODE)
+        assert isinstance(v, MetadataViolation)
+        assert v.key == 'parent_id'
+        assert v.code == 'dead_parent_id'
+        assert v.fatal is True
+
+    def test_dead_parent_message_names_the_id_the_rule_and_the_registry(self):
+        from fused_memory.memory_metadata import (
+            PARENT_ID_DEAD_CODE,
+            MemoryMetadataValidationError,
+            parent_liveness_violation,
+        )
+
+        text = parent_liveness_violation(_UUID, code=PARENT_ID_DEAD_CODE).message
+        assert _UUID in text
+        assert 'live' in text
+        assert 'same-project' in text
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in text
+
+    def test_unavailable_violation_shape(self):
+        from fused_memory.memory_metadata import (
+            PARENT_ID_UNAVAILABLE_CODE,
+            MetadataViolation,
+            parent_liveness_violation,
+        )
+
+        v = parent_liveness_violation(_UUID, code=PARENT_ID_UNAVAILABLE_CODE)
+        assert isinstance(v, MetadataViolation)
+        assert v.key == 'parent_id'
+        assert v.code == 'parent_id_liveness_unavailable'
+        # Fatal is INV-3 read literally: an actor that cannot corroborate
+        # must not act. Under `enforce` this rejects; in warn mode it
+        # censuses and the write proceeds, via the same uniform arms.
+        assert v.fatal is True
+
+    def test_unavailable_message_says_unchecked_not_dead(self):
+        """An operator reading the census line must never be told a parent is
+        dead when the backend merely timed out.
+
+        `Mem0Backend.get_point_by_id` deliberately PROPAGATES a read timeout
+        rather than collapsing it into None, precisely to preserve this
+        distinction; collapsing both codes into `dead_parent_id` would throw
+        it away at the seam.
+        """
+        from fused_memory.memory_metadata import (
+            PARENT_ID_UNAVAILABLE_CODE,
+            MemoryMetadataValidationError,
+            parent_liveness_violation,
+        )
+
+        text = parent_liveness_violation(
+            _UUID, code=PARENT_ID_UNAVAILABLE_CODE
+        ).message
+        assert _UUID in text
+        assert 'could not be checked' in text.lower()
+        assert 'dead' not in text.lower()
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in text
+
+    def test_unrecognised_code_raises(self):
+        """No silent minting of an unknown census code.
+
+        Census codes are what operators grep; a typo'd code that quietly
+        became a new census axis would be indistinguishable from a real one.
+        """
+        from fused_memory.memory_metadata import parent_liveness_violation
+
+        with pytest.raises(ValueError):
+            parent_liveness_violation(_UUID, code='parent_id_something_else')
 
 
 def _codes(violations):

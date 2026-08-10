@@ -36,6 +36,11 @@ def service(mock_config, write_journal):
     svc.mem0.search = AsyncMock(return_value={'results': []})
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # delete_memory's child gate (task 3197) awaits count_by_metadata on
+    # every mem0 delete; the childless default models the live corpus leaf α
+    # measured (`metadata.parent_id` has zero footprint).
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
