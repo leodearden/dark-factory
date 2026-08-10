@@ -78,6 +78,22 @@ def _service_kwargs(mock_service) -> dict:
     return mock_service.add_episode.call_args.kwargs
 
 
+@pytest.fixture(autouse=True)
+def _no_real_escalations(monkeypatch):
+    """Neutralise the escalation emitter for every test in this module.
+
+    A tagged ingestion files into `Path(project_root) / 'data/escalations'`, and
+    these tests use registry roots like '/root' and '/df-root' that are only
+    unwritable by accident of who runs pytest. The tests that care about the
+    emitter re-patch it with their own stub, which wins over this one.
+    """
+    import fused_memory.server.tools as tools_mod
+
+    monkeypatch.setattr(
+        tools_mod, 'emit_unverified_claim_escalation', lambda *a, **k: None,
+    )
+
+
 class TestAddEpisodeUnverifiedClaimTagging:
     """PRIMARY SIGNAL (first half): a completion claim naming a task whose LIVE
     status is non-terminal is INGESTED and TAGGED — never rejected.
@@ -406,7 +422,13 @@ class TestNoClaimPathIsUntouched:
 
         task_interceptor.get_statuses.assert_not_awaited()
         task_interceptor.get_ticket_row.assert_not_awaited()
-        commit_probe_factory.assert_not_called()
+        # A plain (sync) MagicMock, so call_count rather than an assert_not_*
+        # helper: the task-525 style check forbids mixing assert_not_called with
+        # assert_not_awaited in one function, and the two above are the async ones.
+        assert commit_probe_factory.call_count == 0, (
+            'git must not be touched without a commit claim; the probe factory '
+            f'was built {commit_probe_factory.call_count} time(s)'
+        )
         mock_service.add_episode.assert_awaited_once()
         assert set(_service_kwargs(mock_service)) == set(_BASELINE_SERVICE_KWARGS), (
             'A no-claim write must reach the service with exactly the pre-gate '

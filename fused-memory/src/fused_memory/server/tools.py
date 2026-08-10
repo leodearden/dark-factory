@@ -103,6 +103,7 @@ from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
     build_unverified_flag,
+    emit_unverified_claim_escalation,
     extract_completion_claims,
     make_commit_probe,
     verify_claims,
@@ -2800,6 +2801,27 @@ def create_mcp_server(
             # actually caused harm in esc-5603-1.
             extra['unverified_claim'] = True
             _log_unverified_claims(unverified_flag, agent_id)
+            # The tag labels the corpus; the escalation reaches an operator.
+            # Both, or the finding lives only in a WARNING nobody greps (INV-4).
+            # emit_unverified_claim_escalation is built never to raise, but a
+            # call site that RELIED on that promise would turn a future
+            # regression there into an outage on the write path — same reasoning
+            # as the markup gate's wrapping of its own emitter.
+            try:
+                esc_id = emit_unverified_claim_escalation(
+                    _kp.get(project_id), unverified_flag
+                )
+            except Exception:  # pragma: no cover — defensive only
+                logger.exception(
+                    'completion_claim_gate: emit_unverified_claim_escalation raised '
+                    'for project_id=%r; the episode is still ingested and tagged',
+                    project_id,
+                )
+                esc_id = None
+            if esc_id is not None:
+                # Echoed so the writer (or a reviewer reading the response) can
+                # find the filed record without grepping logs.
+                unverified_flag = {**unverified_flag, 'escalation_id': esc_id}
         result = await memory_service.add_episode(
             content=content,
             source=source,

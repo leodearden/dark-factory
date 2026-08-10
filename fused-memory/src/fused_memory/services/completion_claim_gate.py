@@ -48,7 +48,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
@@ -63,6 +63,21 @@ from fused_memory.reconciliation.task_filter import (
     TASK_REF_RE,
 )
 
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+# Defensive import of the optional ``escalation`` workspace package, mirroring
+# server/markup_tripwire.py: when it is missing (minimal CI envs, deployments
+# that have not installed it) the escalation becomes a logged no-op. This module
+# sits on the MCP write path, so it must never make a write fail — the episode is
+# already ingested and tagged by the time escalation is attempted.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
+    HAS_ESCALATION = True
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    HAS_ESCALATION = False
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -75,6 +90,7 @@ __all__ = [
     'ClaimVerdict',
     'CompletionClaim',
     'build_unverified_flag',
+    'emit_unverified_claim_escalation',
     'make_commit_probe',
     'extract_completion_claims',
     'verify_claims',
@@ -695,3 +711,167 @@ def make_commit_probe(repo_root: Path | str) -> Callable[[str], bool | None]:
         return None
 
     return probe
+
+
+# --------------------------------------------------------------------------- #
+# Operator-facing escalation
+# --------------------------------------------------------------------------- #
+#
+# Copied shape-for-shape from server/markup_tripwire.emit_markup_storm_escalation
+# (task 3141), including its choice of channel. The recon_report filer is NOT
+# usable here: it silently DROPS findings when no Stage-2 run is active, and an
+# episode arrives at arbitrary times, so a gate that filed through it would go
+# quiet exactly when nothing else is watching. Opening the project's queue
+# directly is what makes the finding survive to an operator.
+_QUEUE_DIRNAME: str = 'data/escalations'
+_ANCHOR_PREFIX: str = 'unverified-claim'
+_AGENT_ROLE: str = 'fused-memory/completion-claim-gate'
+_CATEGORY: str = 'unverified_completion_claim'
+
+
+def emit_unverified_claim_escalation(
+    project_root: str | None,
+    flag: dict[str, Any],
+) -> str | None:
+    """File an ``unverified_completion_claim`` escalation for *flag* (INV-4).
+
+    Returns the escalation id — freshly filed, or the id of an already-open
+    escalation for this ``(project_root, ref)`` (dedup) — or ``None`` when
+    filing is impossible or fails.
+
+    NEVER raises. The episode is already ingested and tagged by the time this
+    runs, so escalation is purely ADDITIVE: every failure mode degrades to
+    ``None`` plus a log line rather than changing the write's outcome.
+
+    The tag alone is not enough. It labels the corpus, but nothing routinely
+    reads the corpus hunting for tags — without a queued record the finding
+    lives only in a WARNING line, which is how the motivating incident went
+    unnoticed long enough to matter in the first place.
+
+    The anchor is per-REF rather than per-project (the markup sibling's choice):
+    two different false claims are two different findings and each deserves its
+    own record, while a writer repeating the SAME claim collapses onto the one
+    open escalation instead of minting a new one per episode.
+    """
+    entries = (flag or {}).get('claims') or []
+    if not entries:
+        return None
+    ref = str(entries[0].get('ref') or '').strip()
+    if not ref:
+        return None
+    if project_root is None:
+        logger.debug(
+            'completion_claim_gate: no project_root resolved; unverified claim '
+            'about %r will not be escalated', ref,
+        )
+        return None
+    if not HAS_ESCALATION:
+        logger.debug(
+            'completion_claim_gate: escalation package unavailable; unverified '
+            'claim about %r in project_root=%r will not be escalated',
+            ref, project_root,
+        )
+        return None
+
+    anchor = f'{_ANCHOR_PREFIX}-{ref}'
+    try:
+        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+    except Exception:
+        logger.exception(
+            'completion_claim_gate: failed to open the escalation queue for '
+            'project_root=%r; unverified claim about %r not escalated',
+            project_root, ref,
+        )
+        return None
+
+    # Best-effort dedup: a read failure falls THROUGH to filing rather than
+    # bailing out — losing duplicate-suppression is strictly better than losing
+    # the finding.
+    try:
+        existing = queue.get_by_task(anchor, status='pending')
+    except Exception:
+        logger.exception(
+            'completion_claim_gate: failed to check for an existing open '
+            'escalation for anchor=%r in project_root=%r; proceeding to file',
+            anchor, project_root,
+        )
+        existing = []
+    if existing:
+        logger.info(
+            'completion_claim_gate: %s already open for anchor=%r in '
+            'project_root=%r; not filing a duplicate',
+            existing[0].id, anchor, project_root,
+        )
+        return existing[0].id
+
+    detail = '\n'.join(
+        [f'project_root={project_root!r}', '']
+        + [
+            line
+            for entry in entries
+            for line in (
+                f'- subject={entry.get("subject")!r} ref={entry.get("ref")!r} '
+                f'kind={entry.get("kind")!r} project_id={entry.get("project_id")!r}',
+                f'  verdict={entry.get("status")!r} observed={entry.get("observed")!r}',
+                f'  claimed: {entry.get("text")!r}',
+            )
+        ]
+        + [
+            '',
+            'An episode was ingested carrying a completion claim that the live '
+            'authority CONTRADICTS (verdict=mismatch) or could not confirm '
+            '(verdict=unverifiable). The episode was TAGGED, not rejected: its '
+            "Graphiti source_description is prefixed '[unverified_claim] ' and "
+            "every derived Mem0 fact carries metadata['unverified_claim']=True, "
+            'so the derived edges are labelled at the point of harm.',
+            '',
+            'Check the claim against the authority named above. If it is false, '
+            'the derived facts need correcting at the source — a tag marks them, '
+            'it does not retract them. If it is true, the authority was stale or '
+            'unreachable and the tag is the false positive; that is the cheap '
+            'direction and needs no corpus repair.',
+            '',
+            'Task 3142 / PRD leaf pi owns this gate '
+            '(fused_memory.services.completion_claim_gate); grep the server logs '
+            "for 'completion_claim_gate.unverified' for the full set.",
+        ]
+    )
+
+    try:
+        esc = Escalation(  # type: ignore[possibly-unbound]
+            id=queue.make_id(anchor),
+            task_id=anchor,
+            agent_role=_AGENT_ROLE,
+            # 'info', not 'blocking': nothing is stuck. The episode landed, the
+            # tag is on it, and this record exists so the claim gets checked —
+            # filing it as blocking would put routine write-path noise in front
+            # of work that genuinely cannot proceed.
+            severity='info',
+            category=_CATEGORY,
+            summary=(
+                f'unverified completion claim about {entries[0].get("subject")} '
+                f'{ref} ({entries[0].get("status")}: '
+                f'{entries[0].get("observed")!r})'
+            ),
+            detail=detail,
+            suggested_action=(
+                'check the claim against the named authority; if it is false, '
+                'correct the derived facts at the source'
+            ),
+        )
+        esc_id = queue.submit(esc)
+    except Exception:
+        # A queue I/O failure must not propagate: the episode is already
+        # ingested and tagged, and the WARNING at the call site has already
+        # recorded the finding. The operator simply loses the queued heads-up.
+        logger.exception(
+            'completion_claim_gate: failed to submit the unverified-claim '
+            'escalation for project_root=%r anchor=%r', project_root, anchor,
+        )
+        return None
+
+    logger.warning(
+        'completion_claim_gate: queued %s for project_root=%r anchor=%r',
+        esc_id, project_root, anchor,
+    )
+    return esc_id
