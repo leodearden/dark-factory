@@ -9195,6 +9195,21 @@ class Harness:
             # workflow's own state; a late read can yield 'cancelled' when
             # _finalise_cancellation already advanced the machine, which is
             # still strictly more truthful than the '' this used to record.
+            #
+            # The read is DEFENSIVE because it runs inside a CancelledError
+            # handler: an object bound to `workflow` that exposes no usable
+            # `.state` (a stub, or a future non-TaskWorkflow builder result)
+            # must degrade to an honest label, never raise and convert the
+            # synthetic CANCELLED report into an unhandled AttributeError that
+            # unwinds the slot.  The isinstance(str) check also keeps a
+            # non-string state out of the JSON event payload below.
+            _wf_state_value = getattr(getattr(workflow, 'state', None), 'value', None)
+            if workflow is None:
+                _block_phase = 'dispatch_setup'
+            elif isinstance(_wf_state_value, str):
+                _block_phase = _wf_state_value
+            else:
+                _block_phase = 'phase_unavailable'
             report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
@@ -9206,10 +9221,53 @@ class Harness:
                     or ('shutdown_drain' if getattr(self, '_draining', False)
                         else 'cancelled_unattributed')
                 ),
-                block_phase=(
-                    workflow.state.value if workflow is not None else 'dispatch_setup'
-                ),
+                block_phase=_block_phase,
             )
+            # Task 3172: emit on the cancel path too.  Before this, the emit
+            # above sat on the SUCCESS path only, so a hard-cancelled slot left
+            # NO events.db row at all and its sole durable trace was the runs.db
+            # task_results row — which is why "separate drain-cancelled tasks
+            # from other cancellations" was unanswerable there.
+            #
+            # Same key vocabulary as the success-path emit, deliberately: the
+            # seven legacy counters (zeros — the synthetic report carries no
+            # metrics because workflow.run() never returned one) plus the
+            # always-present reason/block_phase that task 3068 established, so
+            # every task_completed row reads with ONE schema regardless of
+            # outcome.  cost_usd/duration_ms are 0.0/0 for the same reason.
+            #
+            # Safe for existing consumers: digest.py counts only
+            # outcome='done', and zero_progress_requeue.py reuses this same key
+            # vocabulary, so no existing count can be perturbed — the change
+            # strictly ADDS rows for an outcome that previously produced none.
+            #
+            # Own try/except: a telemetry failure must not convert a hard
+            # cancel into an unhandled exception on the way out of the slot.
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.task_completed,
+                        task_id=assignment.task_id,
+                        cost_usd=report.cost_usd,
+                        duration_ms=report.duration_ms,
+                        data={
+                            'outcome': WorkflowOutcome.CANCELLED.value,
+                            'agent_invocations': report.agent_invocations,
+                            'execute_iterations': report.execute_iterations,
+                            'verify_attempts': report.verify_attempts,
+                            'review_cycles': report.review_cycles,
+                            'steward_cost_usd': report.steward_cost_usd,
+                            'steward_invocations': report.steward_invocations,
+                            'reason': report.block_reason,
+                            'block_phase': report.block_phase,
+                        },
+                    )
+            except Exception as emit_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    'Task %s: task_completed emit failed on the cancel path '
+                    '(non-fatal): %s',
+                    assignment.task_id, emit_exc,
+                )
             return report
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
