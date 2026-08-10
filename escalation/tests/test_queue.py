@@ -4412,3 +4412,32 @@ class TestResolveGrantedFiles:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.granted_files == []
+
+
+class TestResolvedAtIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — companion to the models-side pin (task 3236).
+
+    See ``test_models.py::TestTimestampIsStampedFromTheLiveClock``: no
+    cached/session clock exists in the stamping code, so this pins the
+    falsifiable part — resolved_at is stamped, tz-aware, and ordered after the
+    record's own timestamp.
+    """
+
+    def test_resolve_stamps_resolved_at_after_timestamp(self, tmp_path):
+        """resolved_at is stamped, tz-aware, and never precedes timestamp."""
+        from datetime import datetime
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = _make_escalation('esc-1-1')
+        queue.submit(esc)
+
+        resolved = queue.resolve('esc-1-1', 'fixed', resolved_by='steward')
+
+        assert resolved is not None
+        assert resolved.resolved_at is not None, 'resolve() left resolved_at unstamped'
+        stamped = datetime.fromisoformat(resolved.resolved_at)
+        assert stamped.tzinfo is not None, f'Naive resolved_at: {resolved.resolved_at!r}'
+        assert stamped >= datetime.fromisoformat(resolved.timestamp), (
+            f'resolved_at {resolved.resolved_at!r} precedes timestamp '
+            f'{resolved.timestamp!r} for the same record'
+        )

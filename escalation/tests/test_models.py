@@ -1120,3 +1120,41 @@ class TestFilingClaimantRunId:
         payload['not_a_real_field'] = 'boom'
         restored = Escalation.from_dict(payload)
         assert not hasattr(restored, 'not_a_real_field')
+
+
+class TestTimestampIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
+
+    ``Escalation.timestamp`` is stamped by a per-instance
+    ``field(default_factory=...)`` off the live clock, so the backdating the
+    task asked about has no cause in the stamping code.  This pins the two
+    falsifiable regression classes: a stamp hoisted to an import-time
+    ``field(default=...)`` (every record in a process would share one value),
+    and a tz-naive stamp (``datetime.now()`` without UTC).
+    """
+
+    def test_two_constructions_get_distinct_non_decreasing_aware_timestamps(self):
+        """Each construction gets its own tz-aware stamp from the live clock."""
+        import time
+        from datetime import datetime
+
+        first = Escalation(
+            id='esc-1-1', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        time.sleep(0.01)
+        second = Escalation(
+            id='esc-1-2', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+
+        assert first.timestamp != second.timestamp, (
+            'Both Escalations share one timestamp — the stamp looks hoisted to '
+            'an import-time constant rather than a per-instance default_factory'
+        )
+        assert datetime.fromisoformat(first.timestamp).tzinfo is not None, (
+            f'Naive timestamp: {first.timestamp!r}'
+        )
+        assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
+            first.timestamp,
+        ), 'Timestamps must be non-decreasing across constructions'
