@@ -803,8 +803,25 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
 
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply with an empty JSON-RPC body.
+
+    `status_code`, `headers` and `json()` were added for task 3644:
+    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
+    which reads `status_code` (to detect the stateful escalation server's 400
+    "Missing session ID") and `content-type` (to detect an SSE-framed body)
+    before decoding. Without them this fake would die on an AttributeError
+    and stop exercising the real code path -- so the task-2953 header
+    contract below keeps being asserted against the transport that actually
+    ships, not against a fake the implementation has outgrown."""
+
+    status_code = 200
+    headers = {'content-type': 'application/json'}
+
     def raise_for_status(self):
         pass
+
+    def json(self):
+        return {}
 
 
 def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
