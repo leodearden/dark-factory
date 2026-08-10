@@ -451,8 +451,12 @@ graphiti `OpenAIGenericClient` + `structured_output_mode` — getzep/graphiti PR
 local-endpoint rough edges — issues #912, #1116 (api_base ignored → silent fallback to
 api.openai.com; re-verified against our own plumbing in β), #868, #1074.
 LLM candidates: Qwen3.5-9B official HF card (IFEval 91.5, BFCL-V4 66.1); Mistral-Small-3.2 release
-notes; Phi-4 SOB score arXiv:2604.25359; gpt-oss-20b model card arXiv:2508.10925 (screened out only
-if slate must shrink — Leo selected the four above); 3090 throughput: tfriedel/qwen3.6-rtx3090-lab
+notes (retained: this appendix records what was researched on 2026-08-05, not which arms are live —
+the Mistral arm was dropped 2026-08-06, see the candidate slate); Phi-4 SOB score arXiv:2604.25359;
+gpt-oss-20b model card arXiv:2508.10925 (reserve candidate, screened out only if the slate must
+shrink — Leo selected four arms on 2026-08-05; the slate is now three after the 2026-08-06 drop, so
+this condition has **fired**. Whether to admit a reserve is Leo's call, surfaced at the candidate
+slate and not decided here); 3090 throughput: tfriedel/qwen3.6-rtx3090-lab
 (single-source, treated as directional).
 Embedders: Qwen3-Embedding family (0.6B/4B/8B — **no 2B**) QwenLM GitHub + HF cards, MTEB(eng,v2)
 70.70/74.60; granite-embedding-english-r2 arXiv:2508.21085 (Fig.1 composite 59.5; 144 docs/s H100);
