@@ -12366,7 +12366,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # a cancelled-in-flight invocation keeps its sidecar for resume.
             if self.artifacts is not None and not session_preserved:
                 self.artifacts.clear_agent_session()
-            # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
+            # Producer hook (task 2742, agent-transcript-archival-prd α): archive
             # this just-finished session's transcripts to a durable archive root
             # OUTSIDE the worktree (project_root / config.root), so they survive
             # worktree teardown. _last_invoke_session_id is set before the try,
@@ -12375,11 +12375,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             ta = self.config.transcript_archive
             if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
                 # Offload to a worker thread: archive_task_transcripts does
-                # blocking, CPU-bound work (glob + stream-gzip each transcript).
-                # This finally runs on the shared event loop for every role of
-                # every concurrent task, so a multi-MB transcript archived inline
-                # would stall all other in-flight tasks; to_thread keeps the loop
-                # free.
+                # blocking filesystem work (glob + move each transcript). Task
+                # 3618 dropped the compression, so the per-file cost is now an
+                # O(1) same-filesystem rename rather than a CPU-bound
+                # stream-gzip; what remains is the glob and the syscalls.
+                #
+                # The to_thread is therefore no longer load-bearing for loop
+                # latency, and it is what CancelledError kills at SIGTERM —
+                # losing every in-flight transcript. Collapsing this to a
+                # synchronous, uncancellable call is leaf 2 of
+                # plans/transcript-preservation-seam-prd.md, which 3618 exists
+                # to unblock. Do not re-justify the offload on gzip grounds.
                 try:
                     await asyncio.to_thread(
                         archive_task_transcripts,
