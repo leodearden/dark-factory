@@ -2082,10 +2082,33 @@ def create_mcp_server(
            re-derive the enumeration by hand — the step that found 3 of 8 in
            the incident."
 
-        The cost is one extra ``get_tasks`` read per id. That is accepted
-        rather than cached for the reason ``_scan_task_citations`` already
-        documents: a snapshot cache trades the fail-closed guarantee for a
-        race on the one operation whose harm motivated the gate.
+        COST, stated honestly. Every record in the set is scanned against
+        the whole task tree TWICE — once here, once again in
+        ``_cascade_citation_repoint_pass`` — and each
+        ``_citation_repoint_gate`` call runs its own ``_scan_task_citations``,
+        which is one ``task_interceptor.get_tasks`` plus an
+        O(tasks x metadata-nodes) walk. So a cascade of N records costs 2N
+        full task-DB reads and 2N deep metadata walks, not the "one extra
+        read per id" an earlier revision of this docstring claimed.
+
+        That is accepted rather than optimised, and the two halves are
+        accepted for DIFFERENT reasons, so neither should be traded away on
+        the other's argument:
+
+        * The mutating pass's per-id re-read is the fail-closed guarantee
+          itself, for the reason ``_scan_task_citations`` already documents:
+          a snapshot cache trades that guarantee for a race on the one
+          operation whose harm motivated the gate. It must stay live.
+        * This pass's per-id read is NOT load-bearing for freshness — the
+          mutating pass re-reads anyway — so it could in principle collapse
+          to a single bucketing walk over the whole id set. It does not,
+          because that means a second implementation of "which tasks cite
+          this id", drifting from the gate's own (tombstone-excluding
+          ``find_live_citation_occurrences``, fail-closed-on-scan-error, and
+          all three ``replacement_memory_id`` preconditions). ``scan_only``
+          is a MODE on the one gate precisely so every rule keeps one home
+          (INV-5); N redundant reads is the price of that, and it is paid
+          only on the ``cascade=True`` path.
 
         *cascade_ids* is descendants-first with the target LAST, mirroring
         the children-before-parent order the cascade actually deletes in.

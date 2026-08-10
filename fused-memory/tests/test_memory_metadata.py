@@ -542,6 +542,7 @@ class TestCanonicalUniquenessViolationType:
 _UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 _UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 _UUID3 = 'b1e0f2c4-5a6d-4e8f-9b0a-1c2d3e4f5a6b'
+_UUID4 = 'd4c3b2a1-9e8f-4a7b-8c6d-5e4f3a2b1c0d'
 
 
 class TestParentHasChildrenError:
@@ -601,9 +602,28 @@ class TestParentHasChildrenError:
         assert _UUID in text
         assert _UUID2 in text
         assert _UUID3 in text
-        assert '2' in text
+        # In CONTEXT, never as a bare substring: the message embeds the child
+        # UUIDs, and _UUID2 itself contains a literal '2', so `'2' in text`
+        # would pass even with the count omitted entirely or rendered wrong.
+        assert 'it has 2 child record(s)' in text
         assert 'cascade' in text
         assert MemoryMetadataValidationError.REGISTRY_LOCATION in text
+
+    def test_the_count_tracks_the_number_of_children(self):
+        """A wrong count must fail, not ride along on a UUID's digits.
+
+        Paired with the two-child case above: the count is the one number an
+        operator reads to size the damage a `cascade=true` is about to do, so
+        it has to be pinned at more than one value to be pinned at all.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(
+            parent_id=_UUID, child_ids=[_UUID2, _UUID3, _UUID4]
+        )
+        text = str(err)
+        assert 'it has 3 child record(s)' in text
+        assert 'it has 2 child' not in text
 
     def test_untruncated_message_does_not_imply_a_partial_listing(self):
         from fused_memory.memory_metadata import ParentHasChildrenError
