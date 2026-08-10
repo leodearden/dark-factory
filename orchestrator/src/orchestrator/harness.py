@@ -11543,6 +11543,93 @@ class Harness:
             f'are NOT ordinary restart artifacts'
         )
 
+        self._file_stale_l0_strand_escalation(strands)
+
+    # Strand-sweep aggregate escalation (task 3172).  Constant (not per-task)
+    # dedup key — one open record at a time however many strands a restart
+    # sweeps — mirroring _LANE_RECORD_DRIFT_ROOT_CAUSE's bare-literal style.
+    _STALE_L0_STRAND_SENTINEL: str = '__stale_l0_strand_sweep__'
+    _STALE_L0_STRAND_ROOT_CAUSE: str = 'stale_l0_strand_sweep'
+    _STALE_L0_STRAND_ROLE: str = 'harness-stale-l0-strand-sweep'
+
+    def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
+        """File ONE level-1 escalation for the strands this restart destroyed.
+
+        Level is load-bearing.  ``dismiss_all_pending`` sweeps every pending L0
+        at startup, so an aggregate filed at L0 would be erased by the very
+        next restart's own sweep — reproducing exactly the evidence destruction
+        this task exists to stop.  Level 1 is explicitly preserved across
+        restart, so the strand record outlives the restart that ended it.
+
+        Aggregated on purpose: the origin incident dismissed 11 L0s in one
+        sweep, and eleven separate escalations would be its own noise failure.
+        Per-strand granularity is not lost — it lives in the
+        ``stale_l0_strand_dismissed`` events and in this record's detail.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue or not strands:
+            return
+        try:
+            # find_pending_l2_by_root_cause is level-2 only by construction, so
+            # the L1 aggregate needs the level-appropriate equivalent of the
+            # same O(N) root_cause scan.
+            for existing in queue.get_pending():
+                if existing.level == 1 and existing.root_cause == self._STALE_L0_STRAND_ROOT_CAUSE:
+                    return  # dedup: one open strand record at a time
+
+            from escalation.models import Escalation
+
+            max_age = max(s['pending_secs'] for s in strands)
+            blocked = sum(1 for s in strands if s['workflow_blocked'])
+            summary = (
+                f'{len(strands)} L0 escalation(s) stranded across restart '
+                f'(max pending {max_age}s, {blocked} with a workflow waiting)'
+            )[:200]
+            lines = '\n'.join(
+                f'  - {s["escalation_id"]} (task {s["task_id"]}): pending '
+                f'{s["pending_secs"]}s, severity={s["severity"]}, '
+                f'workflow_blocked={s["workflow_blocked"]}, category={s["category"]}, '
+                f'agent_role={s["agent_role"]}'
+                for s in strands
+            )
+            detail = (
+                f'The startup L0 sweep dismissed {len(strands)} escalation(s) that had '
+                f'already been pending longer than the '
+                f'{self.config.orphan_l0_timeout_secs:.0f}s strand threshold.  These are '
+                f'NOT ordinary restart artifacts: each one had been waiting, unanswered, '
+                f'while the previous orchestrator run was alive.\n\n'
+                f'{lines}\n\n'
+                f'A strand with workflow_blocked=True means a workflow slot was parked on '
+                f'that escalation (derived from severity != "info") and was killed by the '
+                f'restart without ever getting an answer.  The orphan-L0 reaper cannot see '
+                f'this class: it skips any L0 whose task has a live workflow attending it, '
+                f'which is precisely the condition these records were in.\n\n'
+                f'Investigate why the escalation(s) went unanswered for that long — an '
+                f'unattended steward, a wedged watcher, or a long AFK period.'
+            )
+            esc = Escalation(
+                id=queue.make_id(self._STALE_L0_STRAND_SENTINEL),
+                task_id=self._STALE_L0_STRAND_SENTINEL,
+                agent_role=self._STALE_L0_STRAND_ROLE,
+                severity='blocking',
+                category='risk_identified',
+                level=1,
+                root_cause=self._STALE_L0_STRAND_ROOT_CAUSE,
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_stranded_escalation',
+            )
+            queue.submit(esc)
+            logger.warning(
+                'stale-l0-strand: filed L1 %s for %d strand(s) (max pending %ds)',
+                esc.id, len(strands), max_age,
+            )
+        except Exception:
+            logger.warning(
+                'stale-l0-strand: failed to file the L1 strand record for %d strand(s)',
+                len(strands), exc_info=True,
+            )
+
     def _rehydrate_merge_halt(self) -> str | None:
         """Restore merge-halt state from preserved L1 escalations after restart.
 
