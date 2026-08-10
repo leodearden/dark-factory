@@ -3,12 +3,58 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from _recording_event_store import _RecordingEventStore
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+
+# The origin incident (task 3172): esc-5189-7 had been pending 20h58m with a
+# workflow parked on it; esc-5685-1 had been pending ~90s.  The restart sweep
+# closed both with one fixed string and one 'benign' class, so the strand was
+# indistinguishable from ordinary restart noise afterwards.
+STRAND_AGE_SECS = 75480.0  # 20h58m
+FRESH_AGE_SECS = 90.0
+THRESHOLD_SECS = 600.0
+
+
+def _seed_escalation(
+    queue: EscalationQueue,
+    esc_id: str,
+    task_id: str,
+    *,
+    age_secs: float,
+    level: int = 0,
+    severity: str = 'blocking',
+) -> Escalation:
+    """Submit a pending escalation stamped *age_secs* in the past."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='implementer',
+        severity=severity,
+        category='task_failure',
+        summary=f'stranded escalation for task {task_id}',
+        level=level,
+    )
+    esc.timestamp = (datetime.now(UTC) - timedelta(seconds=age_secs)).isoformat()
+    queue.submit(esc)
+    return esc
+
+
+def _strand_events(harness: Harness) -> list[dict]:
+    """The recorded stale_l0_strand_dismissed emits, newest-last."""
+    return [
+        payload
+        for name, payload in harness.event_store.events  # type: ignore[union-attr]
+        if name == str(EventType.stale_l0_strand_dismissed)
+    ]
 
 
 @pytest.fixture
@@ -289,3 +335,136 @@ class TestDismissStaleEscalationsFatal:
 
         # The warning should appear in logs
         assert error_msg in caplog.text or 'dismiss' in caplog.text.lower()
+
+
+@pytest.fixture
+def strand_harness(harness: Harness, tmp_path: Path) -> Harness:
+    """Harness wired to a REAL EscalationQueue plus a recording event store."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'strand_queue')
+    harness.event_store = _RecordingEventStore()  # type: ignore[assignment]
+    harness.config.orphan_l0_timeout_secs = THRESHOLD_SECS
+    return harness
+
+
+@pytest.mark.asyncio
+class TestStaleL0StrandIsLoud:
+    """A level-0 stranded across a restart is recorded as a strand, not as noise.
+
+    ACCEPTANCE for task 3172 ASK A + ASK B: the sweep must (a) leave the strand
+    and the fresh restart artifact distinguishable in the durable record, and
+    (b) say so out loud rather than silently flattening both into 'benign'.
+    """
+
+    async def test_both_pending_l0s_are_still_dismissed(self, strand_harness: Harness):
+        """Loudness must not cost the sweep its actual job."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        assert queue.get('esc-5189-7').status == 'dismissed'
+        assert queue.get('esc-5685-1').status == 'dismissed'
+
+    async def test_strand_and_fresh_record_are_distinguishable_afterwards(
+        self, strand_harness: Harness
+    ):
+        """The exact flattening the origin incident exposed is gone."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand.resolution_class == 'stale-strand'
+        assert fresh.resolution_class == 'benign'
+        assert 'pending_secs=' in strand.resolution
+        assert 'pending_secs=' in fresh.resolution
+
+    async def test_exactly_one_strand_event_keyed_on_the_real_task_id(
+        self, strand_harness: Harness
+    ):
+        """One event per strand, keyed so it joins against task_completed."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        events = _strand_events(strand_harness)
+        assert len(events) == 1
+        assert events[0]['task_id'] == '5189'
+        assert events[0]['data']['escalation_id'] == 'esc-5189-7'
+
+    async def test_strand_event_payload_carries_age_and_blocked_ness(
+        self, strand_harness: Harness
+    ):
+        """The payload states how long it waited and that a workflow was on it."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        data = _strand_events(strand_harness)[0]['data']
+        assert abs(data['pending_secs'] - STRAND_AGE_SECS) < 5
+        assert data['workflow_blocked'] is True
+        assert data['severity'] == 'blocking'
+        assert data['resolution_class'] == 'stale-strand'
+
+    async def test_fresh_l0_produces_no_strand_event(self, strand_harness: Harness):
+        """An ordinary restart artifact stays ordinary — no strand telemetry."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        assert _strand_events(strand_harness) == []
+
+    async def test_info_severity_strand_reports_workflow_not_blocked(
+        self, strand_harness: Harness
+    ):
+        """Blocked-ness is DERIVED from the durable severity, never guessed.
+
+        escalate_info files severity='info' and the agent keeps going;
+        escalate_blocker files severity='blocking' and the filing workflow
+        genuinely parks.  After a restart _escalation_events is empty, so the
+        record's own severity is the only surviving signal.
+        """
+        queue = strand_harness._escalation_queue
+        _seed_escalation(
+            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
+        )
+
+        await strand_harness._dismiss_stale_escalations()
+
+        events = _strand_events(strand_harness)
+        assert len(events) == 1
+        assert events[0]['data']['workflow_blocked'] is False
+        assert events[0]['data']['severity'] == 'info'
+
+    async def test_strand_sweep_logs_at_warning(self, strand_harness: Harness, caplog):
+        """journald is loud too — a swept strand is not an INFO-level footnote."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+
+        with caplog.at_level(logging.WARNING):
+            await strand_harness._dismiss_stale_escalations()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('strand' in m.lower() for m in warnings), warnings
+
+    async def test_telemetry_failure_never_aborts_the_dismissal(
+        self, strand_harness: Harness
+    ):
+        """An observability failure must not cost the sweep its primary action."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        strand_harness.event_store.emit = MagicMock(  # type: ignore[union-attr]
+            side_effect=RuntimeError('event store exploded')
+        )
+
+        await strand_harness._dismiss_stale_escalations()
+
+        assert queue.get('esc-5189-7').status == 'dismissed'
