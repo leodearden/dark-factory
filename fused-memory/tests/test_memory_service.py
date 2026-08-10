@@ -11793,3 +11793,114 @@ class TestDeleteMemoryCascade:
                 memory_id=_DM_PARENT, store='mem0', project_id='test'
             )
         assert graph.deleted == []
+
+
+class TestListDescendantIds:
+    """The read-only enumeration the citation gate pre-flights on.
+
+    The tool layer has to answer "what would this cascade destroy?" BEFORE
+    deciding to destroy it, so this walk must see the same tree the cascade
+    walks, in the same order, while mutating nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_level_tree_returns_every_descendant_deepest_first(
+        self, service
+    ):
+        """Same order the cascade destroys in — grandchild before child.
+
+        A gate that visited ids in a different order than the traversal it
+        gates would be reasoning about a different sequence than the one
+        that actually runs.
+        """
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert sorted(scan.ids) == sorted([_DM_CHILD_A, _DM_CHILD_B, grandchild])
+        assert scan.ids.index(grandchild) < scan.ids.index(_DM_CHILD_A)
+        assert _DM_PARENT not in scan.ids
+
+    @pytest.mark.asyncio
+    async def test_fully_visible_tree_is_not_truncated(self, service):
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is False
+
+    @pytest.mark.asyncio
+    async def test_childless_target_scans_empty(self, service):
+        _DMGraph({}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan == ([], False)
+
+    @pytest.mark.asyncio
+    async def test_scan_is_read_only(self, service):
+        """It runs BEFORE the caller has decided to delete anything.
+
+        A walk that deleted, journalled or emitted would turn the gate's
+        look-before-you-leap into the leap.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        service.mem0.delete.assert_not_awaited()
+        assert graph.deleted == []
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates(self, service):
+        _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == []
+
+    @pytest.mark.asyncio
+    async def test_cycle_terminates_and_lists_each_id_once(self, service):
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == [_DM_CHILD_A]
+
+    @pytest.mark.asyncio
+    async def test_partial_visibility_reports_truncated(self, service):
+        """THE load-bearing case.
+
+        A read-only walk cannot page past `_CHILD_SCAN_LIMIT` the way the
+        cascade can — the cascade only ever sees the next page because
+        deleting the previous one made it visible. So the enumeration has to
+        be able to say "I could not see all of them"; silently returning the
+        visible subset would let the gate read a partial set as complete and
+        clear a cascade over records it never checked.
+        """
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}, page_size=1
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is True
+        assert scan.ids == [_DM_CHILD_A]
