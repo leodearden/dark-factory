@@ -1906,6 +1906,71 @@ def create_mcp_server(
 
         return None, {'citation_repoint': stats}
 
+    async def _cascade_enumerate(
+        memory_id: str, project_id: str
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """The cascade set the gate will reason over — or a REFUSAL.
+
+        Returns ``(None, [descendants..., memory_id])`` — deepest-first with
+        the target last, the order the cascade destroys in — or
+        ``(rejection, [])`` when the set could not be fully enumerated.
+
+        Both failure arms refuse rather than warn. A cascade the gate could
+        not fully SEE is exactly the case where a silent success manufactures
+        the dangling pointers this gate exists to prevent: it would destroy
+        records nobody checked while reporting them verified, which is worse
+        than the original defect because it would LOOK verified. This is the
+        same posture the gate already takes twice — ``CitationScanFailed`` on
+        an unreadable task DB, ``CitationReplacementCheckFailed`` on an
+        unresolvable replacement — applied to the one remaining unknown.
+
+        ``truncated`` is not a lesser case than a raised walk, which is why
+        both carry the same ``error_type``: partial visibility and no
+        visibility are the same claim ("I cannot prove this set is safe")
+        with different causes, and the causes are in the message.
+        """
+        try:
+            scan = await memory_service.list_descendant_ids(
+                memory_id, project_id=project_id
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'cascade gate: descendant enumeration failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Could not enumerate what a cascade delete of {memory_id} '
+                    'would destroy, so its records cannot be checked for live '
+                    'citations. Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CASCADE_GATE_HINT,
+            }, []
+
+        if scan.truncated:
+            return {
+                'error': (
+                    f'A cascade delete of {memory_id} would destroy more '
+                    f'records than could be enumerated ({len(scan.ids)} seen), '
+                    'so the unseen ones cannot be checked for live citations. '
+                    'Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'cascade_size': len(scan.ids) + 1,
+                'truncated': True,
+                'hint': _CASCADE_GATE_HINT,
+            }, []
+
+        return None, [*scan.ids, memory_id]
+
     async def _cascade_citation_preflight(
         cascade_ids: list[str],
         memory_id: str,
@@ -3521,18 +3586,19 @@ def create_mcp_server(
         # gate pays for no enumeration at all: walking a tree whose result
         # would be discarded is pure cost.
         if cascade and _citation_gate_applies(store, project_id):
-            scan = await memory_service.list_descendant_ids(
-                resolved_id, project_id=project_id
-            )
             # Descendants first, target LAST — the order the cascade will
             # destroy them in, so the set that is gated and the sequence that
-            # runs are read the same way.
-            cascade_ids = [*scan.ids, resolved_id]
-            rejection = await _cascade_citation_preflight(
-                cascade_ids, resolved_id, store, project_id, agent_id,
-                replacement_memory_id,
-                allow_dangling_citations=allow_dangling_citations,
+            # runs are read the same way. A set that cannot be fully
+            # enumerated refuses here and never reaches the pre-flight.
+            rejection, cascade_ids = await _cascade_enumerate(
+                resolved_id, project_id
             )
+            if rejection is None:
+                rejection = await _cascade_citation_preflight(
+                    cascade_ids, resolved_id, store, project_id, agent_id,
+                    replacement_memory_id,
+                    allow_dangling_citations=allow_dangling_citations,
+                )
         if rejection is None and cascade_ids:
             # The pre-flight proved the whole set is clearable; now clear it,
             # in the same deepest-first order, before the delete runs.
