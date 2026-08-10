@@ -28,8 +28,10 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -1040,3 +1042,366 @@ class TestAtomicWritePlanFollowsSymlink:
         assert lane_plan.is_symlink()
         assert not lane_plan.exists(), 'a stray regular file was materialised'
         assert {p.name for p in lane_task.iterdir()} == {'plan.json'}
+
+
+# ---------------------------------------------------------------------------
+# step-13 — lazy write-back on read, its idempotence, and boundary row B12.
+# ---------------------------------------------------------------------------
+
+#: The stable event name every structured markup fact is logged under (INV-2).
+MARKUP_FACT_EVENT = 'plan_markup_repaired'
+
+#: C2's field names verbatim, plus the plan-specific locators this surface adds.
+FACT_LOG_KEYS = frozenset({
+    'tool', 'param', 'pattern', 'misclose', 'outcome', 'recovered_params',
+    'collection', 'index', 'field', 'path',
+})
+
+
+def _fact_payloads(caplog) -> list[dict]:
+    """Every structured fact plan-tools logged, already parsed.
+
+    Consuming a fact must never require regex-scraping prose out of a log line:
+    the WHOLE message is the payload, so ``json.loads`` is the only parser
+    needed. A record from this logger that is not parseable JSON fails here,
+    which is the point — that is what "structured" has to mean to be usable.
+    """
+    payloads = []
+    for record in caplog.records:
+        if record.name != plan_tools.__name__ or record.levelno < logging.WARNING:
+            continue
+        payloads.append(json.loads(record.getMessage()))
+    return payloads
+
+
+def _seed_mixed_plan(artifacts) -> dict:
+    """Write a plan carrying one REPAIRABLE and one UNREPAIRABLE field."""
+    plan = corrupt_plan()
+    plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+    plan['design_decisions'][1]['decision'] = PROSE_QUOTED
+    artifacts.write_plan(copy.deepcopy(plan))
+    return plan
+
+
+class TestReadPlanRepaired:
+    """The lazy write-back: repaired on read, in place, atomically."""
+
+    def test_returns_the_repaired_document(self, plan_artifacts):
+        _seed_mixed_plan(plan_artifacts)
+
+        plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
+        assert detect(plan['design_decisions'][0]['rationale']) is None
+        outcomes = sorted(fact['outcome'] for fact in facts)
+        assert outcomes == ['repaired', 'unrepairable']
+
+    def test_the_repair_is_persisted_to_disk(self, plan_artifacts):
+        """The user-observable signal: the FILE is fixed, not just the reply.
+
+        An in-memory-only repair would leave the next agent — and every later
+        reader of this plan — looking at the corrupted rationale again.
+        """
+        _seed_mixed_plan(plan_artifacts)
+
+        plan_tools._read_plan_repaired(plan_artifacts)
+
+        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        assert on_disk['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
+        # ...and the refusing field is BYTE-IDENTICAL on disk, not sanitized.
+        assert on_disk['design_decisions'][1]['decision'] == PROSE_QUOTED
+
+    def test_write_back_leaves_the_rest_of_the_document_intact(self, plan_artifacts):
+        seeded = _seed_mixed_plan(plan_artifacts)
+
+        plan_tools._read_plan_repaired(plan_artifacts)
+
+        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        assert on_disk['_schema_version'] == PLAN_SCHEMA_VERSION
+        for key in ('task_id', 'title', 'analysis', 'files', 'prerequisites',
+                    'steps', 'reuse'):
+            assert on_disk[key] == seeded[key]
+        assert on_disk['design_decisions'][0]['decision'] == _DECISION_PROSE
+        assert on_disk['design_decisions'][1]['rationale'] == 'A second clean rationale.'
+
+    # -- idempotence ------------------------------------------------------
+
+    def test_second_read_repairs_nothing_and_writes_nothing(
+        self, plan_artifacts, monkeypatch
+    ):
+        """A clean (or already-repaired) plan must NOT be rewritten per call.
+
+        Rewriting on every tool call would churn mtimes under every watcher and
+        turn a read into a write for the overwhelmingly common clean path.
+        """
+        _seed_mixed_plan(plan_artifacts)
+        plan_path = plan_artifacts.root / 'plan.json'
+
+        first, _ = plan_tools._read_plan_repaired(plan_artifacts)
+        before_bytes = plan_path.read_bytes()
+        before_mtime = plan_path.stat().st_mtime_ns
+
+        writes: list = []
+        real_write = plan_tools._atomic_write_plan
+        monkeypatch.setattr(
+            plan_tools,
+            '_atomic_write_plan',
+            lambda path, plan: (writes.append(path), real_write(path, plan))[1],
+        )
+
+        second, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert second == first
+        assert [f for f in facts if f['outcome'] == 'repaired'] == []
+        assert writes == [], 'an already-repaired plan was rewritten'
+        assert plan_path.read_bytes() == before_bytes
+        assert plan_path.stat().st_mtime_ns == before_mtime
+
+    def test_a_wholly_clean_plan_is_never_written(self, plan_artifacts, monkeypatch):
+        plan_artifacts.write_plan(corrupt_plan())
+        plan_path = plan_artifacts.root / 'plan.json'
+        before_mtime = plan_path.stat().st_mtime_ns
+        writes: list = []
+        monkeypatch.setattr(
+            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+        )
+
+        plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert facts == []
+        assert writes == []
+        assert plan_path.stat().st_mtime_ns == before_mtime
+
+    def test_an_unrepairable_only_plan_is_never_written(
+        self, plan_artifacts, monkeypatch
+    ):
+        """Nothing changed, so nothing is written — the 2939 prose plan stays put."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+        plan_path = plan_artifacts.root / 'plan.json'
+        before_bytes = plan_path.read_bytes()
+        writes: list = []
+        monkeypatch.setattr(
+            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+        )
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in facts] == ['unrepairable']
+        assert writes == []
+        assert plan_path.read_bytes() == before_bytes
+
+    # -- the structured fact (INV-2) --------------------------------------
+
+    def test_every_fact_is_logged_as_a_parseable_structured_payload(
+        self, plan_artifacts, caplog
+    ):
+        _seed_mixed_plan(plan_artifacts)
+
+        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+            _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        payloads = _fact_payloads(caplog)
+        assert len(payloads) == len(facts) == 2
+        for payload in payloads:
+            assert payload['event'] == MARKUP_FACT_EVENT
+            assert set(payload) >= FACT_LOG_KEYS
+            assert payload['outcome'] in {'repaired', 'unrepairable'}
+            assert payload['path'] == str(plan_artifacts.root / 'plan.json')
+        assert sorted(p['outcome'] for p in payloads) == ['repaired', 'unrepairable']
+
+    def test_the_logged_payload_carries_the_full_locator(self, plan_artifacts, caplog):
+        """Enough to point at the exact field without reopening the plan."""
+        plan = corrupt_plan()
+        plan['reuse'][1]['how'] = TRAILING_HOW
+        plan_artifacts.write_plan(plan)
+
+        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+            plan_tools._read_plan_repaired(plan_artifacts)
+
+        payload = _fact_payloads(caplog)[0]
+        assert payload['collection'] == 'reuse'
+        assert payload['index'] == 1
+        assert payload['field'] == 'how'
+        assert payload['param'] == 'how'
+        assert payload['tool'] == 'add_reuse_item'
+        assert payload['outcome'] == 'repaired'
+        assert payload['recovered_params'] == []
+
+    def test_each_message_is_a_single_line(self, plan_artifacts, caplog):
+        """One fact per log record — never a multi-line blob to reassemble."""
+        _seed_mixed_plan(plan_artifacts)
+
+        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+            plan_tools._read_plan_repaired(plan_artifacts)
+
+        messages = [
+            r.getMessage() for r in caplog.records if r.name == plan_tools.__name__
+        ]
+        assert messages
+        for message in messages:
+            assert '\n' not in message
+
+    # -- degradation ------------------------------------------------------
+
+    def test_missing_plan_degrades_exactly_as_read_plan_does(
+        self, plan_artifacts, monkeypatch
+    ):
+        """No plan.json -> ``{}``, no facts, no write. No NEW failure mode."""
+        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path.unlink(missing_ok=True)
+        assert plan_artifacts.read_plan() == {}
+        writes: list = []
+        monkeypatch.setattr(
+            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+        )
+
+        plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert plan == {}
+        assert facts == []
+        assert writes == []
+        assert not plan_path.exists()
+
+    def test_unparseable_plan_raises_exactly_what_read_plan_raises(
+        self, plan_artifacts, monkeypatch
+    ):
+        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path.write_text('{not json at all')
+        before_bytes = plan_path.read_bytes()
+        with pytest.raises(json.JSONDecodeError):
+            plan_artifacts.read_plan()
+        writes: list = []
+        monkeypatch.setattr(
+            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert writes == []
+        assert plan_path.read_bytes() == before_bytes
+
+    def test_a_failed_write_back_still_serves_the_repaired_plan(
+        self, plan_artifacts, monkeypatch, caplog
+    ):
+        """Refusing to serve a repair we could not persist is strictly worse.
+
+        The caller would then get the CORRUPTED text back — the exact failure
+        this surface exists to end — because persistence happened to fail.
+        """
+        _seed_mixed_plan(plan_artifacts)
+
+        def boom(_path, _plan):
+            raise plan_tools.PlanWriteError('disk on fire')
+
+        monkeypatch.setattr(plan_tools, '_atomic_write_plan', boom)
+
+        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+            plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
+        assert any(f['outcome'] == 'repaired' for f in facts)
+        assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
+
+
+# ---------------------------------------------------------------------------
+# step-13(d) — boundary row B12: a concurrent reader never sees a partial file.
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentReadersNeverSeeAPartialPlan:
+    """B12 stated as an executable property, not as an assertion about code.
+
+    ``TaskArtifacts._write_json`` is ``path.write_text`` — truncate-then-write —
+    so a reader racing it CAN observe a half-written file. The repair write-back
+    must not inherit that window, and the only convincing evidence is to race it.
+    """
+
+    READERS = 4
+    READS_PER_READER = 300
+    WRITES = 50
+
+    def test_readers_only_ever_observe_a_complete_document(self, tmp_path):
+        directory = tmp_path / 'meta'
+        directory.mkdir()
+        plan_path = directory / 'plan.json'
+
+        # Two documents of DIFFERENT sizes: a torn read of the larger one
+        # cannot be mistaken for a clean read of the smaller.
+        doc_a = corrupt_plan(title='A' * 4000)
+        doc_b = corrupt_plan(title='B', analysis='B' * 40000)
+        expected = []
+        for doc in (doc_a, doc_b):
+            stamped = copy.deepcopy(doc)
+            stamped['_schema_version'] = PLAN_SCHEMA_VERSION
+            expected.append(stamped)
+
+        plan_path.write_text(json.dumps(expected[0], indent=2) + '\n')
+
+        errors: list = []
+        observed_unexpected: list = []
+        start = threading.Barrier(self.READERS + 1)
+        done = threading.Event()
+
+        def reader():
+            start.wait(timeout=30)
+            for _ in range(self.READS_PER_READER):
+                try:
+                    document = json.loads(plan_path.read_text())
+                except Exception as exc:  # noqa: BLE001 — recorded, then asserted on
+                    errors.append(repr(exc))
+                    continue
+                if document not in expected:
+                    observed_unexpected.append(sorted(document))
+                if done.is_set():
+                    break
+
+        threads = [
+            threading.Thread(target=reader, name=f'reader-{i}', daemon=True)
+            for i in range(self.READERS)
+        ]
+        for thread in threads:
+            thread.start()
+
+        start.wait(timeout=30)
+        for i in range(self.WRITES):
+            plan_tools._atomic_write_plan(plan_path, copy.deepcopy(doc_b if i % 2 else doc_a))
+        done.set()
+
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive(), f'{thread.name} did not finish'
+
+        assert errors == [], f'a reader observed an unparseable plan.json: {errors[:3]}'
+        assert observed_unexpected == [], (
+            'a reader observed a document that is neither the pre-write nor the '
+            f'post-write plan: {observed_unexpected[:2]}'
+        )
+
+    def test_the_plan_path_is_never_absent_mid_write(self, tmp_path):
+        """``os.replace`` swaps in place — it must never unlink-then-create."""
+        directory = tmp_path / 'meta'
+        directory.mkdir()
+        plan_path = directory / 'plan.json'
+        plan_path.write_text(json.dumps(corrupt_plan(), indent=2) + '\n')
+
+        misses: list = []
+        stop = threading.Event()
+
+        def watcher():
+            while not stop.is_set():
+                if not plan_path.exists():
+                    misses.append(1)
+
+        thread = threading.Thread(target=watcher, daemon=True)
+        thread.start()
+        try:
+            for i in range(self.WRITES):
+                plan_tools._atomic_write_plan(plan_path, corrupt_plan(title=f't{i}'))
+        finally:
+            stop.set()
+            thread.join(timeout=30)
+
+        assert misses == [], 'plan.json vanished during an atomic write-back'
