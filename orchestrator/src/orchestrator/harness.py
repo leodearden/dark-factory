@@ -1836,6 +1836,13 @@ class Harness:
         # silently wrong for park, which leaves no teardown marker at all.
         self._workflow_cancel_causes: dict[str, str] = {}
 
+        # True once run()'s finally has begun draining in-flight slots (task
+        # 3172).  A POSITIVE drain signal, not an inference from an absence:
+        # on SIGTERM/SIGINT the cancel arrives at the MAIN task via cli.py's
+        # _make_cancel_handler and reaches slot tasks ONLY through that
+        # finally, so a flag set there asserts the fact directly.
+        self._draining: bool = False
+
         # Per-task CONSECUTIVE streak of requeues that invoked no agent at all
         # (task 3068).  Fed from _apply_retry_cap — the single per-report
         # chokepoint that sees every outcome — and read by
@@ -2803,6 +2810,12 @@ class Harness:
                 await self._run_full_review_and_tag()
 
         finally:
+            # Task 3172: set BEFORE the drain loop below (the primary route by
+            # which a SIGTERM reaches a slot task) and before the straggler
+            # sweep that backstops it, so any slot that unwinds from here can
+            # attribute its cancel to the drain rather than falling into the
+            # unattributed residue bucket.
+            self._draining = True
             # 4. Shutdown
             # 4a. Cancel any in-flight workflow tasks BEFORE shutting down
             # usage_gate — otherwise a cap-hit in a still-running agent can
@@ -9186,7 +9199,13 @@ class Harness:
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
                 outcome=WorkflowOutcome.CANCELLED,
-                block_reason=self._cancel_causes().pop(assignment.task_id, None) or '',
+                # Ladder: stamped cause → drain → honest residue.  Never a
+                # guess that an unattributed cancel "must have been" a drain.
+                block_reason=(
+                    self._cancel_causes().pop(assignment.task_id, None)
+                    or ('shutdown_drain' if getattr(self, '_draining', False)
+                        else 'cancelled_unattributed')
+                ),
                 block_phase=(
                     workflow.state.value if workflow is not None else 'dispatch_setup'
                 ),
@@ -9221,6 +9240,11 @@ class Harness:
             # stamp would auto-expire regardless; this just does it promptly).
             self.scheduler.clear_merge_phase(assignment.task_id)
             self._terminal_cancel_counts.pop(assignment.task_id, None)
+            # Belt-and-braces (task 3172): the ladder above consumes the cause
+            # on the cancel path; this covers every OTHER slot exit so a
+            # stamped-but-unconsumed entry can never leak into a later
+            # re-dispatch of the same task.
+            self._cancel_causes().pop(assignment.task_id, None)
             # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
             # that missed B1, e.g. authoritative-cancel returning normally from
             # workflow.run()) is retired.  The workflow's own kind-aware
