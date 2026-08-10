@@ -24,12 +24,12 @@ from fused_memory.memory_metadata import KIND_REGISTRY, validate_memory_metadata
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
-    AMENDMENT_KIND,
-    CHILD_KINDS,
-    SIGHTING_KIND,
     _AMENDMENT_DIGEST_CAP,
     _DIGEST_CHARS,
     _DIGEST_ELLIPSIS,
+    AMENDMENT_KIND,
+    CHILD_KINDS,
+    SIGHTING_KIND,
     build_grouped_document,
     group_search_results,
 )
@@ -101,9 +101,8 @@ def _stub_service(
         key = filters.get('kind', _TOTAL)
         if count_errors is not None and key in count_errors:
             raise count_errors[key]
-        if counts is not None:
-            if key in counts:
-                return counts[key]
+        if counts is not None and key in counts:
+            return counts[key]
         return len([c for c in children if _matches(c, filters)])
 
     def _scroll(*, project_id: str, filters: dict, limit: int = 1000):
@@ -696,7 +695,7 @@ class TestChildRecordSchema:
         """'amendment' and 'sighting' are already KIND_REGISTRY members (task 3195)."""
         assert AMENDMENT_KIND == 'amendment'
         assert SIGHTING_KIND == 'sighting'
-        assert CHILD_KINDS == frozenset({'amendment', 'sighting'})
+        assert frozenset({'amendment', 'sighting'}) == CHILD_KINDS
         for kind in CHILD_KINDS:
             assert kind in KIND_REGISTRY, (
                 f'{kind!r} must be a landed KIND_REGISTRY member — this leaf adds '

@@ -32,14 +32,18 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import MemoryResult
+
 # The canonical 'data' → 'memory' → 'content' payload-key fallback that turns
 # a raw Qdrant payload into its text.  IMPORTED rather than re-declared: the
 # search path and the point-id path already disagree about which key holds
 # the text, and a third private copy would be a fourth place to drift (INV-5).
 from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS
+from fused_memory.utils.async_utils import gather_collect
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -196,3 +200,176 @@ async def _read_grouped_document(
     if amendment_count > len(digests):
         block['truncated'] = True
     return block
+
+
+def _child_parent_id(result: Any) -> str | None:
+    """The parent id *result* attaches to, or ``None`` when it is not a child.
+
+    A child is identified STRICTLY by ``metadata.parent_id`` plus a child
+    ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries
+    that merely discuss the same subject stay independent peers.
+    """
+    meta = getattr(result, 'metadata', None) or {}
+    if meta.get('kind') not in CHILD_KINDS:
+        return None
+    parent_id = meta.get(PARENT_ID_KEY)
+    if isinstance(parent_id, str) and parent_id:
+        return parent_id
+    return None
+
+
+def _is_mem0(result: Any) -> bool:
+    """True for a Mem0-sourced hit — the only kind that can BE a parent.
+
+    ``parent_id`` liveness resolves through ``Mem0Backend.get_point_by_id`` at
+    the write seam (task 3197), so a Graphiti edge uuid can never be a live
+    parent.  Probing one would spend a guaranteed-zero Qdrant count per graph
+    hit on every search.
+    """
+    return getattr(result, 'source_store', None) == SourceStore.mem0
+
+
+def _promoted_parent(parent_id: str, record: Mapping[str, Any]) -> MemoryResult:
+    """Turn a raw ``get_memory_by_id`` record into a search-hit-shaped parent."""
+    payload = record.get('metadata') or {}
+    raw_category = payload.get('category')
+    try:
+        category = MemoryCategory(raw_category) if isinstance(raw_category, str) else None
+    except ValueError:
+        category = None
+    created_at = payload.get('created_at')
+    return MemoryResult(
+        id=parent_id,
+        content=record.get('content') or '',
+        category=category,
+        source_store=SourceStore.mem0,
+        metadata=dict(payload),
+        created_at=created_at if isinstance(created_at, str) else None,
+    )
+
+
+async def _resolve_absent_parents(
+    service: Any,
+    project_id: str,
+    parent_ids: list[str],
+) -> dict[str, MemoryResult]:
+    """Fetch each parent NOT already present in the hit list, once, concurrently.
+
+    A parent that does not resolve is simply absent from the returned mapping —
+    the caller keeps that child as a top-level hit rather than dropping it, so
+    a dangling pointer can never make a child's content unreachable.
+    """
+    if not parent_ids:
+        return {}
+    records = await gather_collect(
+        service.get_memory_by_id(project_id=project_id, memory_id=parent_id)
+        for parent_id in parent_ids
+    )
+    resolved: dict[str, MemoryResult] = {}
+    for parent_id, record in zip(parent_ids, records, strict=True):
+        if isinstance(record, Exception):
+            logger.warning(
+                'grouped_read: parent lookup FAILED for parent_id=%s in project=%s; '
+                'keeping the child as a top-level hit',
+                parent_id,
+                project_id,
+                exc_info=record,
+                extra={'project_id': project_id, 'parent_id': parent_id},
+            )
+            continue
+        if record:
+            resolved[parent_id] = _promoted_parent(parent_id, record)
+    return resolved
+
+
+async def group_search_results(
+    service: Any,
+    project_id: str,
+    results: Sequence[Any],
+) -> list[dict[str, Any]]:
+    """Collapse child hits into their parents' grouped documents, in rank order.
+
+    * A child whose parent is ALSO a hit folds into it — the esc-5541 failure
+      mode where untagged survivors outrank the canonical they amend.
+    * A CHILD-ONLY match resolves UPWARD: the parent's grouped document takes
+      the child's rank slot (D6), so a child's content is never unreachable.
+    * A parent reached both ways is emitted EXACTLY once, keeping the higher
+      ``relevance_score``.
+
+    The list only ever shrinks, and survivors keep their relative order.
+
+    .. warning::
+        ``SearchResults.degraded`` / ``failed_stores`` / ``failure_diagnostics``
+        do NOT survive a list transform (see ``memory_service.SearchResults``'s
+        own warning) — this function returns a plain ``list``.  Read those
+        attributes BEFORE calling it.
+    """
+    hits = list(results)
+    hit_by_id: dict[str, Any] = {}
+    for hit in hits:
+        hit_id = getattr(hit, 'id', None)
+        if isinstance(hit_id, str) and hit_id not in hit_by_id:
+            hit_by_id[hit_id] = hit
+
+    child_parents = {
+        index: parent_id
+        for index, hit in enumerate(hits)
+        if (parent_id := _child_parent_id(hit)) is not None
+    }
+    absent = [
+        parent_id
+        for parent_id in dict.fromkeys(child_parents.values())
+        if parent_id not in hit_by_id
+    ]
+    resolved = await _resolve_absent_parents(service, project_id, absent)
+
+    ordered: list[str] = []
+    entries: dict[str, dict[str, Any]] = {}
+    base_by_id: dict[str, Any] = {}
+    for index, hit in enumerate(hits):
+        parent_id = child_parents.get(index)
+        base = hit_by_id.get(parent_id) or resolved.get(parent_id) if parent_id else None
+        if base is not None:
+            target_id = parent_id
+        else:
+            # Not a child, or a child whose parent did not resolve: it stays a
+            # top-level hit in its own right.
+            target_id, base = getattr(hit, 'id', None), hit
+        score = getattr(hit, 'relevance_score', 0.0)
+        existing = entries.get(target_id)
+        if existing is not None:
+            existing['relevance_score'] = max(existing['relevance_score'], score)
+            continue
+        entry = base.model_dump()
+        entry['relevance_score'] = score
+        entries[target_id] = entry
+        base_by_id[target_id] = base
+        ordered.append(target_id)
+
+    # Group only entries that can actually BE a parent: Mem0-sourced, and not
+    # themselves a surviving child (the model is flat — a child has no children).
+    groupable = [
+        target_id
+        for target_id in ordered
+        if _is_mem0(base_by_id[target_id]) and _child_parent_id(base_by_id[target_id]) is None
+    ]
+    blocks = await gather_collect(
+        build_grouped_document(service, project_id, target_id) for target_id in groupable
+    )
+    for target_id, block in zip(groupable, blocks, strict=True):
+        if isinstance(block, Exception):
+            # build_grouped_document contains its own faults; this is
+            # belt-and-braces so a future edit there cannot turn a working
+            # search into an exception.
+            logger.warning(
+                'grouped_read: grouping FAILED for canonical_id=%s in project=%s',
+                target_id,
+                project_id,
+                exc_info=block,
+                extra={'project_id': project_id, 'canonical_id': target_id},
+            )
+            block = {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': type(block).__name__}
+        if block:
+            entries[target_id]['grouped'] = block
+
+    return [entries[target_id] for target_id in ordered]
