@@ -399,10 +399,14 @@ def _repair_one_field(
     THE ONE HOLE B9 CANNOT COVER IS THE FIELD ITSELF. ``supplied`` must exclude
     ``record.field`` — repair() is repairing that parameter, so declaring it
     already-supplied would refuse every candidate — which means a tail that
-    RE-DECLARES the field being repaired passes the disjointness check. Writing
-    it back would overwrite the ``clean_value`` just recovered and leave the
-    stub in place of the authored prose. The redeclaration is therefore declined
-    and reported on ``declined_params``; the authored value always wins.
+    RE-DECLARES the field being repaired passes the disjointness check, and both
+    sides of the mis-close become candidates for the one field. WHICH SIDE HOLDS
+    THE AUTHORED TEXT DEPENDS ON WHERE THE MIS-CLOSE SITS, so this is decided by
+    content and never by position: the fill-a-hole rule above governs the
+    field's own key exactly as it governs its siblings, read through the same
+    ``_is_authored`` helper. The authored side wins in BOTH directions; only a
+    redeclaration that would displace authored text is declined and reported on
+    ``declined_params``.
 
     A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The repairable surface
     distinguishes the TOOL's parameter vocabulary (``schema_params``) from the
@@ -471,22 +475,58 @@ def _repair_one_field(
 
     holder[record.field] = result.clean_value
     # Every recovered value is a verbatim slice of the absorbing field (D5,
-    # guaranteed by construction in ``repair``), and every target here was
-    # proven a hole by the ``supplied`` set above.
+    # guaranteed by construction in ``repair``), and every SIBLING target here
+    # was proven a hole by the ``supplied`` set above. The field's own key is
+    # deliberately NOT in ``supplied``, so it carries no such proof and is
+    # decided on content just below.
     written: list[str] = []
     declined: list[str] = []
     for name, recovered_value in result.recovered.items():
-        if name == record.field:
-            # THE TAIL RE-DECLARED THE FIELD BEING REPAIRED. ``supplied``
-            # deliberately excludes ``record.field`` (repair() is repairing it,
-            # so calling it already-supplied would refuse every candidate), and
-            # repair()'s B9 disjointness check therefore ACCEPTS a tail that
-            # recovers that same name — e.g. authored prose, a mis-closed
-            # </rationale>, then a stub <parameter name="rationale">. Writing it
-            # would overwrite the ``clean_value`` set one line above and silently
-            # destroy the authored prose: a verbatim slice, so D5 still holds,
-            # but the surviving text would be the STUB. The authored value wins;
-            # the redeclaration is declined and reported.
+        # THE TAIL RE-DECLARED THE FIELD BEING REPAIRED. ``supplied``
+        # deliberately excludes ``record.field`` (repair() is repairing it,
+        # so calling it already-supplied would refuse every candidate), and
+        # repair()'s B9 disjointness check therefore ACCEPTS a tail that
+        # recovers that same name. Both sides of the mis-close are then
+        # candidates for the one field, and WHICH SIDE IS AUTHORED DEPENDS
+        # ENTIRELY ON WHERE THE MIS-CLOSE SITS — so a fixed choice is wrong
+        # in one direction whichever way it is fixed:
+        #
+        #   Mis-close near the END — authored prose, the mis-close, then a
+        #   stub re-opener. ``clean_value`` is the prose and the recovered
+        #   self-value is the stub. Keep ``clean_value``.
+        #
+        #   Mis-close at or near the START — the mis-close, then the real
+        #   re-opener. ``clean_value`` is the HOLE (empty, or whitespace)
+        #   and the recovered self-value is the authored prose. Keep the
+        #   RECOVERED value. Declining here would blank the field, and
+        #   because the fact still reads ``outcome: 'repaired'``,
+        #   ``_read_plan_repaired`` would persist that blank through
+        #   ``_atomic_write_plan`` — authored text destroyed on disk,
+        #   unrecoverable on the next read. That is the same
+        #   silent-authored-text-loss this whole surface exists to end,
+        #   merely pointed the other way.
+        #
+        # So the SAME rule the siblings already follow decides it, through
+        # the same ``_is_authored`` helper rather than a second policy
+        # (INV-5): A RECOVERY ONLY EVER FILLS A HOLE. Decline when
+        # ``clean_value`` is already authored, or when the recovered
+        # self-value is not authored; otherwise fall through and let the
+        # ordinary ``target_keys`` write path install it — ``record.field``
+        # maps to itself for every record, which the repair tests assert, so
+        # no separate write path is needed. When BOTH sides are holes the
+        # decline keeps ``clean_value``, which is equivalent.
+        #
+        # A recovered self-value MAY itself still trip ``detect()``: a
+        # nested opener with no closing tag parses into the recovered value,
+        # since ``_parse_tail`` only refuses on an embedded closer. That is
+        # why writing it is RIGHT and not merely tolerable — the prose
+        # survives, and the next read re-detects it, finds no mis-close to
+        # validate, and reports ``unrepairable``, leaving the residue
+        # visible and byte-identical. Declining would have thrown the prose
+        # away to reach that same visibility.
+        if name == record.field and (
+            _is_authored(result.clean_value) or not _is_authored(recovered_value)
+        ):
             declined.append(name)
             continue
         key = record.target_keys.get(name)

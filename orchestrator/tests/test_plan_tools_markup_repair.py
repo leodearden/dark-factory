@@ -998,6 +998,71 @@ class TestRepairPlanFieldsAbsorbedSibling:
         assert facts[0]['recovered_params'] == []
         assert facts[0]['declined_params'] == ['rationale']
 
+    def test_a_redeclaring_tail_wins_when_the_misclose_starts_the_value(self):
+        """The MIRROR of the case above, and it must resolve the other way.
+
+        Same shape — a tail re-declaring the field being repaired — but the
+        mis-close sits at position 0, so the two sides swap roles:
+        ``clean_value`` is the HOLE and the recovered self-value is the authored
+        prose. Declining here would blank the field, and because the fact still
+        reads ``outcome: 'repaired'``, ``_read_plan_repaired`` persists that
+        blank through ``_atomic_write_plan`` — authored text destroyed on disk,
+        unrecoverable on the next read. Which side wins is therefore decided by
+        CONTENT, never by position.
+        """
+        authored = 'The REAL authored rationale, all of it.'
+        plan = corrupt_plan(
+            design_decisions=[{
+                'decision': 'A decision.',
+                'rationale': (
+                    _close('rationale') + '\n'
+                    + _open_param('rationale') + authored
+                ),
+            }],
+        )
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['rationale'] == authored, (
+            'the decline blanked the field the recovered tail was holding'
+        )
+        assert detect(item['rationale']) is None
+        assert item['decision'] == 'A decision.'
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'repaired'
+        # The mirror of the case above: here the tail is what gets WRITTEN, so
+        # nothing is declined and the fact must not read as a refusal.
+        assert facts[0]['recovered_params'] == ['rationale']
+        assert facts[0]['declined_params'] == []
+
+    def test_a_whitespace_only_clean_value_is_a_hole_the_tail_may_fill(self):
+        """``_is_authored`` decides it, so whitespace is a hole here too.
+
+        The near-miss of the case above: the mis-close sits just past a run of
+        whitespace rather than at offset 0, so ``clean_value`` is non-empty but
+        still holds nothing. Reading emptiness as ``clean_value == ''`` would
+        let this one through as a blanking write.
+        """
+        authored = 'The REAL authored rationale, all of it.'
+        plan = corrupt_plan(
+            design_decisions=[{
+                'decision': 'A decision.',
+                'rationale': (
+                    '   \n\t  ' + _close('rationale') + '\n'
+                    + _open_param('rationale') + authored
+                ),
+            }],
+        )
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['rationale'] == authored
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == ['rationale']
+        assert facts[0]['declined_params'] == []
+
     def test_never_overwrites_a_non_blank_authored_sibling(self):
         """The invariant: fill a hole, NEVER overwrite authored text.
 
