@@ -63,6 +63,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import (
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+    write_stage2_cycle_summary,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
@@ -3060,6 +3061,14 @@ class ReconciliationHarness:
                 await self._ensure_stage1_cycle_summary(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
+                # Strictly AFTER the Stage 1 arm (task 3732): that arm is
+                # pre-existing, load-bearing behaviour and a Stage 2 backstop
+                # fault must never be able to starve it. Both stay before
+                # update_run_stage_reports so the persisted stage_reports copy
+                # captures whatever markers either arm stamped.
+                await self._ensure_stage2_cycle_summary(
+                    run, run_id, project_id, cycle_start_time,
+                )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
@@ -3280,6 +3289,118 @@ class ReconciliationHarness:
                 exc_info=True,
                 extra={'run_id': run_id, 'project_id': project_id},
             )
+
+    async def _ensure_stage2_cycle_summary(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        cycle_start_time: datetime,
+    ) -> None:
+        """Recover a Stage 2 ``cycle_summary`` ledger row for *run_id* when
+        Stage 2 ran but its row did not land (task 3732).
+
+        Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
+        from the same two S1→S2→S3 drivers' ``finally`` blocks
+        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), and
+        deliberately NARROWER than the Stage 1 method in one decisive way:
+        it has no analogue of Stage 1's arm 1 (synthesize a row when the
+        stage produced no report at all). Fabricating a summary for a cycle
+        whose Stage 2 never ran is exactly what this backstop must not do,
+        so BOTH arms are hard-gated on the ``task_knowledge_sync`` key being
+        PRESENT in ``run.stage_reports``.
+
+        - **Write-recovered arm** — Stage 2 completed and DID return a real
+          report, but its own in-stage ledger upsert failed transiently
+          (``write_cycle_summary``'s ``ledger.upsert`` caught the failure,
+          logged a WARNING and returned False), leaving the explicit failure
+          signal ``stats['stage2_cycle_summary_ledger_written'] == 0`` (see
+          :func:`_stage2_ledger_write_missing` for the stat/marker
+          predicate). Gated additionally on a ``ReconLedgerStore`` actually
+          being wired (``self.memory.recon_ledger is not None``) — otherwise
+          an intentionally ``recon_ledger_enabled=False`` deployment (whose
+          stat is always 0) would re-fire, and WARNING, every cycle for no
+          reason.
+
+          It RE-ATTEMPTS ``write_stage2_cycle_summary`` with the REAL Stage 2
+          report (real llm_calls/tokens/stats), not a zeroed synth — the
+          ledger upsert is idempotent (``ON CONFLICT`` on the 5-part
+          identity), so a re-attempt after a transient failure is safe and
+          cannot duplicate. It stamps
+          ``stage2_cycle_summary_write_recovered_backstop`` on the report —
+          optimistically ``True`` *before* the call, since
+          ``write_stage2_cycle_summary`` serializes ``report.stats`` into the
+          ledger row's ``payload_json`` synchronously at call time (see
+          ``write_cycle_summary``'s docstring), so this is the only way a
+          successful re-attempt's OWN ledger row ends up carrying the marker.
+          ``stage2_cycle_summary_ledger_written`` itself is left at its
+          in-stage value of 0 either way — the ledger row's mere EXISTENCE is
+          the authoritative presence signal ``get_cycle_summary_presence``
+          reads, not either stat.
+
+        Unlike Stage 1's arm 2, this method applies NO ``RunType.remediation``
+        exclusion. Stage 1 excludes remediation because its own ``run()``
+        early-returns before its summary write on such a pass, so firing
+        there would fabricate a spurious row. Stage 2 is the exact opposite,
+        and its source says so explicitly (see the cross-reference comment
+        above ``TaskKnowledgeSync.run``'s write: the call "is unconditional —
+        it also fires on remediation passes, not just full cycles. That is
+        intentional, not a missed guard ... Do not 'fix' this to mirror Stage
+        1's full-cycle-only gating"). A lost Stage 2 ledger write on a
+        remediation pass is therefore a genuine gap this backstop must close,
+        so ``remediation`` is derived from the run and forwarded to the write
+        — keeping the recovered row's ``payload['remediation']`` identical to
+        what the in-stage write would have stamped, which
+        ``get_cycle_summary_presence`` reads to disambiguate expected-missing
+        rows.
+
+        Must never raise: awaited unshielded in the ``finally``, immediately
+        before ``update_run_stage_reports``, and AFTER
+        :meth:`_ensure_stage1_cycle_summary` so a fault here can never starve
+        that pre-existing arm. An exception escaping would replace whatever
+        exception is already propagating and skip that persistence call, so
+        the body swallows ``BaseException`` and each write itself runs under
+        ``asyncio.shield`` to survive a second cancellation arriving
+        mid-write.
+        """
+        s2_key = StageId.task_knowledge_sync.value
+        s2_report = run.stage_reports.get(s2_key)
+        if s2_report is None:
+            # Never fabricate a cycle that did not happen.
+            return
+        if getattr(self.memory, 'recon_ledger', None) is None:
+            return
+
+        remediation = run.run_type == RunType.remediation
+        write_recovered = (
+            isinstance(s2_report, StageReport)
+            and _stage2_ledger_write_missing(s2_report)
+        )
+        if not write_recovered:
+            return
+
+        # Stamped True *before* the call: write_stage2_cycle_summary
+        # serializes report.stats into the ledger row's payload_json
+        # synchronously, at call time — a post-call mutation can never
+        # retroactively reach an already-persisted row, so this is the only
+        # way a successful re-attempt's OWN ledger row carries the marker.
+        s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = True
+        # Shielded against a second cancellation arriving mid-write; the
+        # write keeps running to completion in its own Task.
+        ledger_written = await asyncio.shield(
+            write_stage2_cycle_summary(
+                self.memory, project_id, s2_report, run_id,
+                remediation=remediation,
+            )
+        )
+        logger.warning(
+            'reconciliation.stage2_cycle_summary_write_recovered',
+            extra={
+                'run_id': run_id,
+                'project_id': project_id,
+                'ledger_written': ledger_written,
+            },
+        )
 
     # ── Remediation support ───────────────────────────────────────────
 
