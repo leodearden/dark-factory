@@ -32,7 +32,7 @@ import logging
 import os
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -254,6 +254,41 @@ def _tool_params(fn) -> tuple[str, ...]:
     return names[1:]
 
 
+#: Tool PARAMETERS that name no prose plan key and may therefore NEVER receive a
+#: recovered string. Three of them are stored under a DIFFERENT plan key
+#: (``prereq_id``/``step_id`` -> ``id``, ``step_type`` -> ``type``), and two are
+#: not prose at all (``files`` is a list, ``task_id`` an identifier). Writing a
+#: recovered tail into any of them is silent-wrong-value corruption of the
+#: artifact that the lock charter and the merge gate both consume.
+_NON_PROSE_PARAMS = frozenset({'task_id', 'files', 'prereq_id', 'step_id', 'step_type'})
+
+
+def _observed_plan_keys(root) -> dict[str | None, set[str]]:
+    """Build a plan through the REAL writers; return the keys they actually wrote.
+
+    Keyed by collection (``None`` for the top-level document). This is the
+    machine-check that keeps ``target_keys`` from drifting into a vocabulary the
+    plan never uses — deriving the allowed key sets from the tools themselves,
+    exactly as ``schema_params`` is derived from ``inspect.signature``, rather
+    than restating them as a hardcoded literal a refactor could silently orphan.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.init('test-1', 'Test task', 'A test')
+    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
+    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
+    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
+    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
+    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+    plan = artifacts.read_plan()
+
+    observed: dict[str | None, set[str]] = {None: set(plan)}
+    for collection in ('prerequisites', 'steps', 'design_decisions', 'reuse'):
+        items = plan[collection]
+        assert items, f'{collection} came back empty — the writers did not run'
+        observed[collection] = {key for item in items for key in item}
+    return observed
+
+
 class TestRepairableFieldTable:
     """``_REPAIRABLE_PLAN_FIELDS`` is the single declared repairable surface."""
 
@@ -266,7 +301,7 @@ class TestRepairableFieldTable:
         assert table, 'the table must not be empty'
         for record in table:
             assert isinstance(record, tuple)
-            for attr in ('collection', 'field', 'schema_params'):
+            for attr in ('collection', 'field', 'schema_params', 'target_keys'):
                 assert hasattr(record, attr), f'record {record!r} lacks {attr!r}'
 
     def test_covers_exactly_the_measured_corrupted_surface(self):
@@ -304,14 +339,86 @@ class TestRepairableFieldTable:
             assert isinstance(record.schema_params, tuple)
             assert all(isinstance(name, str) for name in record.schema_params)
 
-    def test_files_is_not_repairable(self):
+    def test_files_is_neither_a_repaired_field_nor_a_recovery_target(self):
         """``files`` entries are paths, already recovered by ``_coerce_files``.
 
-        A generic walk of the plan dict would sweep them in; the declared table
-        is what keeps this surface to prose fields only.
+        BOTH directions matter, and only the first was ever asserted. Not being
+        a repaired FIELD stops the walk from rewriting the list; not being a
+        recovery TARGET stops an absorbed ``files`` tail from being written back
+        as a bare ``str``, replacing the list the lock charter reads.
         """
-        fields = {r.field for r in plan_tools._REPAIRABLE_PLAN_FIELDS}
-        assert 'files' not in fields
+        table = plan_tools._REPAIRABLE_PLAN_FIELDS
+        assert 'files' not in {r.field for r in table}
+        assert 'files' not in {name for r in table for name in r.target_keys}
+        assert 'files' not in {key for r in table for key in r.target_keys.values()}
+
+    def test_every_record_declares_an_immutable_target_keys_mapping(self):
+        """A recovery target must be DECLARED, not inferred from the param name.
+
+        ``schema_params`` is the tool's vocabulary; the plan document has its
+        own. Conflating them is what let a recovered ``step_type`` land as a
+        junk key on a step dict.
+        """
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            targets = record.target_keys
+            assert isinstance(targets, Mapping), (
+                f'{record.collection}.{record.field}.target_keys is '
+                f'{type(targets).__name__}, not a Mapping'
+            )
+            assert all(isinstance(k, str) and isinstance(v, str) for k, v in targets.items())
+            assert not isinstance(targets, dict), (
+                'target_keys must not be a plain dict — the declared surface '
+                'would then be mutable at runtime and un-auditable; wrap it in '
+                'types.MappingProxyType'
+            )
+            with pytest.raises(TypeError):
+                targets['injected'] = 'anything'  # type: ignore[index]
+
+    def test_every_target_key_names_a_real_parameter_of_its_tool(self):
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            invented = set(record.target_keys) - set(record.schema_params)
+            assert invented == set(), (
+                f'{record.collection}.{record.field} declares recovery targets '
+                f'for parameters {sorted(invented)} that '
+                f'{_ORIGINATING_TOOL[record.collection].__name__} never takes'
+            )
+
+    def test_every_target_value_is_a_key_the_real_writers_produce(self, tmp_path):
+        """INV-1 again: the mapping is checked against a plan the TOOLS wrote.
+
+        A target value that no writer ever produces is by definition a junk key
+        — the exact defect this mapping exists to prevent — so the allowed set
+        is derived, never hardcoded.
+        """
+        observed = _observed_plan_keys(tmp_path)
+
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            allowed = observed[record.collection]
+            for param, key in record.target_keys.items():
+                assert key in allowed, (
+                    f'{record.collection}.{record.field} would recover {param!r} '
+                    f'into {key!r}, which the writers never produce; real keys '
+                    f'are {sorted(allowed)}'
+                )
+
+    def test_the_repaired_field_is_a_target_that_maps_to_itself(self):
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            assert record.field in record.target_keys
+            assert record.target_keys[record.field] == record.field
+
+    def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
+        """Identifiers, enums and lists may never receive a recovered string.
+
+        ``prereq_id``/``step_id`` are stored under ``id`` and ``step_type``
+        under ``type``, so a recovery keyed on the PARAMETER name could only
+        ever create a junk key while leaving the real one corrupt.
+        """
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            illegal = _NON_PROSE_PARAMS & set(record.target_keys)
+            assert illegal == set(), (
+                f'{record.collection}.{record.field} declares non-prose '
+                f'recovery targets {sorted(illegal)}'
+            )
 
 
 # ---------------------------------------------------------------------------
