@@ -3462,6 +3462,12 @@ def create_mcp_server(
         ``metadata={'allow_dangling_citations': True}``. See
         ``_citation_repoint_gate``.
 
+        **A ``cascade=True`` delete passes every record it would destroy**
+        through that same gate, not just the target (task 3197). The cascade
+        recurses inside the service, below this layer, so without the
+        pre-flight each descendant would be destroyed unchecked — one guarded
+        record and N unguarded ones, reported as a success.
+
         Args:
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
@@ -3496,7 +3502,21 @@ def create_mcp_server(
                 success while every citation still addresses the destroyed
                 entry. Copy the value from the search/consolidation result
                 rather than reconstructing it.
-            cascade: Delete this record's CHILDREN too (default False).
+            cascade: Delete this record's CHILDREN too (default False). The
+                WHOLE cascade is refused — nothing deleted, nothing repointed
+                — if any record it would destroy still has live task citers
+                and neither escape was given
+                (``CascadeCitationGateRejected``, whose ``blocked[]`` names
+                every offending record with its own citers, so the set is
+                fixed in one pass rather than one refusal at a time). Both
+                escapes apply to the ENTIRE cascade set, not just the target:
+                ``replacement_memory_id`` repoints every cited record in it,
+                and ``allow_dangling_citations`` accepts dangling every one of
+                them. A cascade set that cannot be fully enumerated is also
+                refused (``CascadeCitationScanIncomplete``) — a set the gate
+                could not see is one it cannot prove safe, and destroying
+                unchecked records while reporting them verified is worse than
+                not checking at all.
 
         Deleting a Mem0 entry that other records point at via
         `metadata.parent_id` REFUSES with `ParentHasChildrenError`, listing
