@@ -488,3 +488,116 @@ class TestMakeCommitProbe:
         probe = make_commit_probe(tmp_path / 'does-not-exist')
 
         assert probe('0' * 40) is None
+
+
+class TestEmitUnverifiedClaimEscalation:
+    """The operator-visible half (INV-4). The tag labels the corpus, but nothing
+    reads the corpus looking for tags — an unverified claim also has to reach a
+    queue a human or the auto-watcher actually opens.
+
+    Copied shape-for-shape from markup_tripwire.emit_markup_storm_escalation,
+    and for the same reason it exists there rather than going through
+    recon_lifecycle_filer: the recon_report channel silently DROPS findings when
+    no Stage-2 run is active, and an episode arrives at arbitrary times.
+    """
+
+    @staticmethod
+    def _flag(ref: str = '5422') -> dict:
+        return {
+            'tag': UNVERIFIED_CLAIM_TAG,
+            'claims': [
+                {
+                    'kind': 'applied_work',
+                    'subject': 'task',
+                    'ref': ref,
+                    'project_id': 'dark_factory',
+                    'span': [0, 41],
+                    'text': f"task {ref}'s de-flake fix has been applied",
+                    'status': 'mismatch',
+                    'observed': 'in-progress',
+                }
+            ],
+        }
+
+    def test_files_one_escalation_carrying_the_flag_payload(self, tmp_path):
+        import json
+
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        esc_id = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
+        if not gate_mod.HAS_ESCALATION:
+            assert esc_id is None
+            return
+
+        assert isinstance(esc_id, str)
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'unverified_completion_claim'
+
+        # The record must be actionable without opening the code or the corpus:
+        # it names WHAT was claimed and WHAT was observed. Asserted as labelled
+        # substrings — a bare `'5422' in detail` would also be satisfied by a
+        # digit in the interpolated tmp_path.
+        detail = payload['detail']
+        assert "ref='5422'" in detail, f'must name the ref: {detail!r}'
+        assert "observed='in-progress'" in detail, f'must state what was seen: {detail!r}'
+        assert "subject='task'" in detail, f'must name the authority: {detail!r}'
+        assert 'has been applied' in detail, f'must quote the claim: {detail!r}'
+
+    def test_dedupes_per_project_and_ref(self, tmp_path):
+        """A repeated claim about the SAME ref collapses onto the open record;
+        a claim about a DIFFERENT ref is its own finding and files separately.
+        """
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        first = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
+        if not gate_mod.HAS_ESCALATION:
+            assert first is None
+            return
+
+        again = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
+        assert again == first, (
+            f'the same (project_root, ref) must dedup onto {first!r}; got {again!r}'
+        )
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 1
+
+        other = gate_mod.emit_unverified_claim_escalation(
+            str(tmp_path), self._flag(ref='9999'),
+        )
+        assert other != first, 'a different ref is a different finding'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 2
+
+    def test_none_project_root_is_a_quiet_no_op(self):
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        assert gate_mod.emit_unverified_claim_escalation(None, self._flag()) is None
+
+    def test_missing_escalation_package_is_a_quiet_no_op(self, tmp_path, monkeypatch):
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        monkeypatch.setattr(gate_mod, 'HAS_ESCALATION', False)
+        assert gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag()) is None
+        assert not (tmp_path / 'data').exists()
+
+    def test_queue_open_failure_returns_none_without_raising(self, tmp_path, monkeypatch):
+        """Escalation is purely ADDITIVE — the episode is already ingested and
+        tagged by the time this runs. Every failure mode degrades to None plus a
+        log line, never to an exception on the write path.
+        """
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        if not gate_mod.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable')
+        monkeypatch.setattr(
+            gate_mod,
+            'EscalationQueue',
+            lambda *a, **k: (_ for _ in ()).throw(OSError('queue dir unwritable')),
+        )
+        assert gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag()) is None
+
+    def test_empty_flag_files_nothing(self, tmp_path):
+        from fused_memory.services import completion_claim_gate as gate_mod
+
+        assert gate_mod.emit_unverified_claim_escalation(str(tmp_path), {'claims': []}) is None

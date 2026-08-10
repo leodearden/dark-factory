@@ -818,3 +818,92 @@ class TestCrossProjectClaims:
         assert 'unverified_claim' not in result, (
             f'reify task 3142 is done, so the claim verifies; got: {result!r}'
         )
+
+
+class TestTaggedIngestionFilesAnEscalation:
+    """The tag labels the corpus; the escalation reaches an operator. Both, or
+    the finding lives only in a log line nobody greps (INV-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_tagged_ingestion_invokes_the_emitter_for_the_writers_root(
+        self, monkeypatch
+    ):
+        import fused_memory.server.tools as tools_mod
+
+        emitter = MagicMock(return_value='esc-unverified-claim-1')
+        monkeypatch.setattr(tools_mod, 'emit_unverified_claim_escalation', emitter)
+
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        emitter.assert_called_once()
+        args, _ = emitter.call_args
+        assert args[0] == _KNOWN_PROJECTS[_PROJECT_ID], (
+            f'the emitter must be given a filesystem root, not a project id: {args!r}'
+        )
+        assert (args[1].get('claims') or [])[0].get('ref') == '5422', (
+            f'the emitter must receive the flag payload; got: {args!r}'
+        )
+        assert result['unverified_claim'].get('escalation_id') == 'esc-unverified-claim-1', (
+            f'the filed id must be echoed onto the response flag; got: {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verified_ingestion_files_nothing(self, monkeypatch):
+        import fused_memory.server.tools as tools_mod
+
+        emitter = MagicMock(return_value=None)
+        monkeypatch.setattr(tools_mod, 'emit_unverified_claim_escalation', emitter)
+
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'done'})
+
+        await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_emitter_raising_does_not_change_the_writes_outcome(self, monkeypatch):
+        """The emitter is built never to raise — but a call site that RELIED on
+        that promise would turn a future regression there into an outage here.
+        Same reasoning as the markup gate's wrapping of its own emitter.
+        """
+        import fused_memory.server.tools as tools_mod
+
+        emitter = MagicMock(side_effect=RuntimeError('escalation queue exploded'))
+        monkeypatch.setattr(tools_mod, 'emit_unverified_claim_escalation', emitter)
+
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'5422': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _APPLIED_CONTENT,
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        entry = _assert_tagged(result, mock_service, ref='5422')
+        assert entry.get('observed') == 'in-progress', f'Got: {entry!r}'
+        assert 'escalation_id' not in result['unverified_claim'], (
+            f'no id was filed, so none may be echoed; got: {result!r}'
+        )
