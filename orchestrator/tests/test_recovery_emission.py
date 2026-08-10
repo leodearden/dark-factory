@@ -535,3 +535,274 @@ class TestShouldEmitEvent:
         from orchestrator.recovery_emission import should_emit_event
 
         assert should_emit_event(self._obs(streak=1, changed=True), threshold=1) is True
+
+
+# ---------------------------------------------------------------------------
+# S7 — the streak escalation and its mandatory recovery half
+# ---------------------------------------------------------------------------
+
+
+def _file_streak(**kwargs):
+    """Call the streak filer, importing at call time so a missing symbol fails
+    only these tests rather than breaking module collection."""
+    from orchestrator.recovery_emission import emit_recovery_veto_streak_escalation
+
+    return emit_recovery_veto_streak_escalation(**kwargs)
+
+
+def _resolve_streak(**kwargs):
+    from orchestrator.recovery_emission import resolve_recovery_veto_streak_escalation
+
+    return resolve_recovery_veto_streak_escalation(**kwargs)
+
+
+def _streak_sentinel(task_id: str) -> str:
+    from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_SENTINEL_PREFIX
+
+    return f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+
+
+def _streak_kwargs(queue, *, task_id='3535', streak=3, threshold=3,
+                   span_seconds=1800.0, min_span_seconds=1500.0, **extra):
+    """Filer kwargs for a streak that clears BOTH halves of the predicate."""
+    from orchestrator.recovery_emission import LeaveReason, RecoverySite
+
+    kwargs = {
+        'escalation_queue': queue,
+        'task_id': task_id,
+        'site': RecoverySite.reconcile_sweep,
+        'streak': streak,
+        'threshold': threshold,
+        'span_seconds': span_seconds,
+        'min_span_seconds': min_span_seconds,
+        'reason': LeaveReason.escalation_pinned,
+        'shape': 'in-progress|false|on_main|true|-',
+        'escalation_ids': {'queue_handoff': ['esc-3535-1'], 'dead_l0': [], 'non_pinning': []},
+        'ages_secs': {'esc-3535-1': 7200.0},
+    }
+    kwargs.update(extra)
+    return kwargs
+
+
+class TestEmitRecoveryVetoStreakEscalation:
+    """One blocking L1 per unresolved veto streak; never raises; never pins."""
+
+    def test_below_threshold_files_nothing(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(**_streak_kwargs(queue, streak=2, threshold=3)) is False
+        assert queue.get_by_task(_streak_sentinel('3535'), status='pending') == []
+
+    def test_short_span_files_nothing_however_long_the_streak(self, tmp_path):
+        """The two-dimensional predicate's second half.
+
+        Both sweep intervals are 900.0s, so three consecutive sweeps span
+        1800s at the crossing.  A streak that accrued in SECONDS came from a
+        per-tick site charging the counter by mistake, and paging a human at
+        the loudest severity tier for that would be a false positive.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(
+            **_streak_kwargs(queue, streak=9, span_seconds=12.0, min_span_seconds=1500.0),
+        ) is False
+        assert queue.get_by_task(_streak_sentinel('3535'), status='pending') == []
+
+    def test_files_one_blocking_l1_against_the_sentinel_task_id(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(**_streak_kwargs(queue)) is True
+
+        filed = queue.get_by_task(_streak_sentinel('3535'), status='pending')
+        assert len(filed) == 1, f'expected exactly one escalation, got {filed}'
+        esc = filed[0]
+        assert esc.task_id == _streak_sentinel('3535')
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+        assert esc.agent_role == 'orchestrator-recovery-veto-streak'
+
+    def test_the_real_task_id_gains_no_open_record(self, tmp_path):
+        """THE zero-behavior-change guard — not a style preference.
+
+        An escalation on the REAL task id would immediately be read by every
+        veto predicate (``report.open_escalations`` in the reconcile sweep,
+        ``get_by_task`` in the scheduler phase), so the act of OBSERVING a hold
+        would itself deepen that hold — an observability signal mutating into a
+        disposition change, at the very site that filed it.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        before = queue.get_by_task('3535', status='pending')
+        assert _file_streak(**_streak_kwargs(queue)) is True
+        after = queue.get_by_task('3535', status='pending')
+
+        assert before == [] and after == [], (
+            'filing on the real task id would pin the task at every veto site'
+        )
+
+    def test_body_names_the_real_task_the_site_and_the_evidence(self, tmp_path):
+        """The L1 must be actionable without a second query.
+
+        It also carries the REAL task id in its body — the escalation's own
+        task_id is the synthetic sentinel, so the real id in the body is what
+        keeps the alarm joinable against this task's recovery_vetoed rows.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_streak(**_streak_kwargs(queue))
+        esc = queue.get_by_task(_streak_sentinel('3535'), status='pending')[0]
+        body = f'{esc.summary}\n{esc.detail}'
+
+        assert '3535' in esc.summary
+        assert 'reconcile_sweep' in body
+        assert '3' in esc.summary  # the streak
+        assert 'esc-3535-1' in body, 'the pinning escalation id must be named'
+        assert 'escalation_pinned' in body, 'the veto reason must be named'
+        assert 'in-progress|false|on_main|true|-' in body
+        # The suggested action must point at the green-tier knobs, so an
+        # operator can retune or silence a noisy detector without a restart.
+        assert 'recovery_emission' in esc.suggested_action
+
+    def test_dedups_against_a_still_open_sentinel_l1(self, tmp_path):
+        """Boundary #17 — no storm.
+
+        The sweep runs every 900s for as long as the hold lasts; without the
+        dedup, one L1 per sweep would bury the queue during exactly the
+        long-lived strand this exists to report.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(**_streak_kwargs(queue, streak=3)) is True
+        assert _file_streak(**_streak_kwargs(queue, streak=4)) is False
+        assert _file_streak(**_streak_kwargs(queue, streak=12)) is False
+        assert len(queue.get_by_task(_streak_sentinel('3535'), status='pending')) == 1
+
+    def test_dedup_filters_on_category_not_just_the_sentinel(self, tmp_path):
+        """An UNRELATED open L1 on the sentinel must not suppress this signal.
+
+        Task 2757's rationale, carried over verbatim.
+        """
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+        queue.make_id.return_value = 'esc-streak-1'
+
+        _file_streak(**_streak_kwargs(queue))
+
+        assert queue.has_open_l1.call_args.kwargs.get('category'), (
+            'has_open_l1 must be called with the same category the filing uses'
+        )
+
+    def test_distinct_tasks_get_distinct_sentinels(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _file_streak(**_streak_kwargs(queue, task_id='3535')) is True
+        assert _file_streak(**_streak_kwargs(queue, task_id='3536')) is True
+        assert len(queue.get_by_task(_streak_sentinel('3535'), status='pending')) == 1
+        assert len(queue.get_by_task(_streak_sentinel('3536'), status='pending')) == 1
+
+    def test_filed_at_memo_short_circuits_before_touching_the_filesystem(self, tmp_path):
+        """The memo answers the dedup for free on the sweep hot path."""
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+        queue.make_id.return_value = 'esc-streak-1'
+        memo: dict[str, int] = {}
+
+        assert _file_streak(**_streak_kwargs(queue, streak=3, filed_at=memo)) is True
+        assert memo, 'the memo must record the filing'
+        queue.has_open_l1.reset_mock()
+
+        assert _file_streak(**_streak_kwargs(queue, streak=4, filed_at=memo)) is False
+        assert queue.has_open_l1.call_count == 0, (
+            'the memo must short-circuit before any queue read'
+        )
+
+    def test_no_queue_is_a_silent_no_op(self, tmp_path):
+        assert _file_streak(**_streak_kwargs(None)) is False
+
+    def test_a_raising_queue_never_propagates_into_the_sweep(self, tmp_path):
+        """Fail-open: telemetry must never abort a recovery sweep."""
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = RuntimeError('queue wedged')
+        assert _file_streak(**_streak_kwargs(queue)) is False
+
+        submitting = MagicMock()
+        submitting.has_open_l1.return_value = False
+        submitting.make_id.return_value = 'esc-streak-1'
+        submitting.submit.side_effect = RuntimeError('disk full')
+        assert _file_streak(**_streak_kwargs(submitting)) is False
+
+
+class TestResolveRecoveryVetoStreakEscalation:
+    """Without the recovery half the dedup would silence the detector forever."""
+
+    def test_resolves_the_pending_sentinel_l1_and_drops_the_memo(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        memo: dict[str, int] = {}
+        assert _file_streak(**_streak_kwargs(queue, filed_at=memo)) is True
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5,
+            threshold=3, filed_at=memo,
+        ) is True
+
+        assert queue.get_by_task(_streak_sentinel('3535'), status='pending') == []
+        assert memo == {}, 'the memo must be popped so a recurrence re-files'
+
+    def test_a_later_recurrence_can_re_file(self, tmp_path):
+        """The whole point of the recovery half.
+
+        ``has_open_l1`` dedup would otherwise permanently suppress the alarm
+        for a genuine LATER strand on the same task — one incident per task,
+        for the life of the queue.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        memo: dict[str, int] = {}
+        assert _file_streak(**_streak_kwargs(queue, filed_at=memo)) is True
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=3,
+            threshold=3, filed_at=memo,
+        )
+        assert _file_streak(**_streak_kwargs(queue, filed_at=memo)) is True
+        assert len(queue.get_by_task(_streak_sentinel('3535'), status='pending')) == 1
+
+    def test_a_short_never_filed_streak_skips_the_filesystem(self, tmp_path):
+        """Every swept task calls this; a healthy fleet must not scan the queue."""
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=1,
+            threshold=3, filed_at={},
+        ) is False
+        assert queue.get_by_task.call_count == 0
+
+    def test_no_queue_is_a_silent_no_op(self, tmp_path):
+        assert _resolve_streak(
+            escalation_queue=None, task_id='3535', recovered_streak=9, threshold=3,
+        ) is False
+
+    def test_a_raising_queue_never_propagates(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+        queue.get_by_task.side_effect = RuntimeError('queue wedged')
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=9, threshold=3,
+        ) is False
