@@ -74,7 +74,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, NoReturn
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
@@ -115,6 +115,27 @@ _REJECT_HINT = (
     'content problem. If the markup is quoted DELIBERATELY (e.g. documenting '
     "the leak itself), override with metadata={'allow_mcp_markup': True}."
 )
+
+#: Surfaced when the value's boundary is a GUESS. It deliberately does NOT
+#: offer a mechanical retry — there is no repaired call to resend — so it points
+#: at the two things the caller can actually do.
+_UNREPAIRABLE_HINT = (
+    'This value is UNREPAIRABLE: its own boundary cannot be determined, so no '
+    'repair was attempted and nothing was written. Guessing would silently '
+    'drop whatever arguments hide in the residue. Your full payload is '
+    'preserved verbatim in the escalation named above — resend it from your '
+    'own copy once your tool-call envelope stops leaking, rather than '
+    'reconstructing it from this error. If the markup is quoted DELIBERATELY, '
+    "override with metadata={'allow_mcp_markup': True}."
+)
+
+#: The residue escalation's category, and the machine-readable owner that will
+#: exit the hold unprompted (INV-7). This is a queue-backed handoff, so the
+#: bound is the L2 watcher's standing age surfacing rather than a deadline of
+#: this record's own — which is what ``_ESCALATION_LEVEL`` buys.
+_ESCALATION_CATEGORY = 'mcp_markup_residue'
+_ESCALATION_OWNER = 'l2-escalation-watcher'
+_ESCALATION_LEVEL = 2
 
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
@@ -220,14 +241,20 @@ class MarkupGuardMiddleware(Middleware):
         if hit is None:
             return await call_next(context)
 
-        param, value = hit
-        return await self._handle_markup(context, call_next, name, arguments, param, value)
+        param, value, pattern = hit
+        return await self._handle_markup(
+            context, call_next, name, arguments, param, value, pattern
+        )
 
     # -- detection --------------------------------------------------------
 
     @staticmethod
-    def _first_markup_argument(arguments: Mapping[str, Any]) -> tuple[str, str] | None:
-        """Return the first ``(param, value)`` whose value carries envelope markup.
+    def _first_markup_argument(arguments: Mapping[str, Any]) -> tuple[str, str, str] | None:
+        """Return the first ``(param, value, pattern)`` carrying envelope markup.
+
+        The matched *pattern* is carried out of the scan rather than re-derived
+        later: it is needed on all three outcome paths, and only here is it
+        known to be non-``None``.
 
         Insertion order, which for a JSON-RPC argument map is the order the
         caller sent. Non-string values are skipped: the leak is a serialization
@@ -241,9 +268,43 @@ class MarkupGuardMiddleware(Middleware):
         anyway.
         """
         for param, value in arguments.items():
-            if isinstance(value, str) and detect(value) is not None:
-                return param, value
+            if isinstance(value, str):
+                pattern = detect(value)
+                if pattern is not None:
+                    return param, value, pattern
         return None
+
+    # -- identity ---------------------------------------------------------
+
+    @staticmethod
+    def _identity(arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
+        """The ``(agent_id, project)`` this call attributes itself to.
+
+        A DECLARED, deliberately narrow precedence, not an oversight: middleware
+        sits above the tool bodies and has no equivalent of
+        ``fused_memory.server.tools._resolve_identity(ctx)``, which can consult
+        the request context and the server's own config. All this layer has is
+        the call's own arguments.
+
+        * ``agent_id`` — from the ``agent_id`` argument, or ``None``.
+        * ``project`` — from ``project_root`` FIRST, then ``project_id``.
+
+        ``project_root`` wins because it is the label
+        ``MarkupStormCounter`` already keys on and the one an escalation queue
+        is addressed by, so a burst attributed here lands in the same queue
+        attribution the write-time tripwire would have chosen. A record whose
+        project cannot be resolved carries ``None`` rather than a guessed
+        default: an escalation filed against the wrong project is worse than
+        one an operator has to place by hand.
+
+        Non-string values yield ``None``. These fields are identity, and a
+        caller that sent a dict where a name belongs has not identified itself.
+        """
+        def _text(key: str) -> str | None:
+            value = arguments.get(key)
+            return value if isinstance(value, str) else None
+
+        return _text('agent_id'), _text('project_root') or _text('project_id')
 
     # -- schema resolution ------------------------------------------------
 
@@ -278,7 +339,7 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- policy -----------------------------------------------------------
 
-    async def _handle_markup(self, context, call_next, name, arguments, param, value):
+    async def _handle_markup(self, context, call_next, name, arguments, param, value, pattern):
         """Apply the declared policy to a detected leak.
 
         The schema read happens HERE and not on the fast path, so the awaited
@@ -288,21 +349,121 @@ class MarkupGuardMiddleware(Middleware):
         fix = repair(value, param, await self._schema_params(context, name), tuple(arguments))
 
         if fix is None:
-            # UNREPAIRABLE — one refusal shared by both tiers. Lands in a later
-            # step of this task, together with the residue escalation that
-            # preserves the caller's payload. Refusing is already the right
-            # direction and must stay so.
-            raise ToolError(
-                'Tool call carries leaked MCP envelope markup in '
-                f'{param!r} (matched {detect(value)!r}) that could not be repaired.'
-            )
+            self._refuse_unrepairable(name, arguments, param, value, pattern)
 
         if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
             return self._reject(name, arguments, param, fix)
 
         return await self._forward(context, call_next, arguments, param, fix)
 
-    def _reject(self, name, arguments, param, fix) -> None:
+    def _refuse_unrepairable(self, name, arguments, param, value, pattern) -> NoReturn:
+        """ONE refusal, shared by both tiers, when the boundary is a guess.
+
+        The tiers disagree about what to do with a REPAIR. They do not disagree
+        about this: :attr:`RepairPolicy.FORWARD_REPAIR` forwards a repair, and a
+        tier that forwarded unparsed residue would deliver a call the caller
+        never made while permanently dropping whatever arguments hide inside it
+        — the silent fail-soft this whole guard exists to end.
+
+        No separate handling is needed for PRD boundary rows B8 (a recovered
+        name outside the tool's schema) and B9 (a recovered name the caller
+        already supplied). Task 3688's :func:`repair` already refuses both at
+        its accept-time conditions, so they arrive here as an ordinary ``None``.
+        That is the point of keeping every "may I?" question in one place: this
+        layer never has to re-implement a rule it can only get subtly wrong.
+
+        The residue escalation is what makes refusing non-destructive. Without
+        it a refusal DESTROYS the caller's payload whenever the caller does not
+        retry — which is the common case for a leak that is, by construction,
+        an agent emitting text it cannot re-emit identically.
+        """
+        agent_id, project = self._identity(arguments)
+        escalation_id = self._file_residue_escalation({
+            'error_type': 'mcp_markup_unrepairable',
+            'category': _ESCALATION_CATEGORY,
+            # INV-7: a machine-readable owner plus a bound. This hold is a
+            # queue-backed handoff to a supervised consumer, so the bound is
+            # that consumer's standing age surfacing rather than a deadline of
+            # this record's own.
+            'owner': _ESCALATION_OWNER,
+            'level': _ESCALATION_LEVEL,
+            'tool': name,
+            'field': param,
+            'matched_pattern': pattern,
+            'agent_id': agent_id,
+            'project': project,
+            # FULL and VERBATIM, deliberately unlike build_markup_block's
+            # 200-char content_excerpt. That excerpt is a diagnostic sitting
+            # beside a payload the caller still holds; this is the only
+            # surviving copy of data that may never be resent.
+            'raw_value': value,
+            'summary': (
+                f'Unrepairable MCP envelope markup in {name}.{param} — the '
+                'call was refused and its payload preserved here'
+            ),
+            'suggested_action': (
+                'Recover the raw_value for the caller if it is still needed, '
+                'then chase the harness serialization leak that produced it.'
+            ),
+            # No 'detail' blob: raw_value plus the flat fields above ARE the
+            # detail, and prose duplicating them would carry the caller's
+            # payload twice in one record.
+        })
+
+        logger.warning(
+            'markup guard: UNREPAIRABLE envelope markup in %s.%s (matched %r) '
+            'from agent_id=%r project=%r; refused under policy=%s, residue '
+            'escalation=%r',
+            name, param, pattern, agent_id, project, self.policy.value, escalation_id,
+        )
+        raise ToolError(json.dumps({
+            'error': (
+                f'Tool call refused: {param!r} carries raw MCP envelope markup '
+                'whose own boundary cannot be determined, so no repair was '
+                'attempted.'
+            ),
+            'error_type': 'mcp_markup_unrepairable',
+            'outcome': _OUTCOME_UNREPAIRABLE,
+            'tool': name,
+            'field': param,
+            'matched_pattern': pattern,
+            'escalation_id': escalation_id,
+            # NO 'repaired_call'. There is no repair, and offering one would
+            # invite a retry that re-sends a guess.
+            'hint': _UNREPAIRABLE_HINT,
+        }))
+
+    def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
+        """Hand the residue to the injected sink; never change the outcome.
+
+        The refusal is already decided by the time this runs, so escalation is
+        purely ADDITIVE — the same never-raises contract
+        ``markup_tripwire.emit_markup_storm_escalation`` keeps, and for the same
+        reason: a queue I/O failure should cost the operator a heads-up, not
+        turn a clean refusal into an opaque middleware crash.
+
+        Returns the id the sink reports, so the refusal payload can name the
+        record holding the caller's data. A sink that reports something other
+        than a string reports no id — the caller is better told nothing than
+        pointed at a value it cannot look up.
+        """
+        if self._escalation_sink is None:
+            logger.warning(
+                'markup guard: no escalation_sink is wired, so the residue of '
+                '%r will not be preserved anywhere', record.get('tool'),
+            )
+            return None
+        try:
+            escalation_id = self._escalation_sink(record)
+        except Exception:
+            logger.exception(
+                'markup guard: the escalation sink failed for %r; the refusal '
+                'stands but the residue was not preserved', record.get('tool'),
+            )
+            return None
+        return escalation_id if isinstance(escalation_id, str) else None
+
+    def _reject(self, name, arguments, param, fix) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
         RAISES rather than short-circuiting with a middleware-authored
