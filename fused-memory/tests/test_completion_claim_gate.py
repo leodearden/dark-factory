@@ -22,6 +22,7 @@ from fused_memory.services.completion_claim_gate import (
     CompletionClaim,
     build_unverified_flag,
     extract_completion_claims,
+    make_commit_probe,
     verify_claims,
 )
 
@@ -408,3 +409,82 @@ class TestBuildUnverifiedFlag:
 
     def test_no_verdicts_yields_no_flag(self):
         assert build_unverified_flag([], text='') is None
+
+
+class TestMakeCommitProbe:
+    """The one impure export. Tri-state, bounded, and never raises: an infra
+    failure must read as UNRESOLVABLE (None), never as a clean absence (False)
+    — a False here would be reported as "the writer claimed a commit that does
+    not exist", which is a serious accusation to make on a git hiccup.
+    """
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        import subprocess
+
+        root = tmp_path / 'repo'
+        root.mkdir()
+        subprocess.run(['git', 'init', '-q', '.'], cwd=root, check=True)
+        subprocess.run(
+            ['git', '-c', 'user.email=a@b', '-c', 'user.name=a',
+             'commit', '-q', '--allow-empty', '-m', 'x'],
+            cwd=root, check=True,
+        )
+        sha = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return root, sha
+
+    def test_existing_commit_probes_true_full_and_abbreviated(self, repo):
+        root, sha = repo
+        probe = make_commit_probe(root)
+
+        assert probe(sha) is True
+        assert probe(sha[:8]) is True
+
+    def test_absent_but_well_formed_sha_probes_false(self, repo):
+        root, _sha = repo
+        probe = make_commit_probe(root)
+
+        assert probe('0000000000000000000000000000000000000001') is False
+
+    def test_non_repository_root_is_unresolvable_not_absent(self, tmp_path):
+        """`git cat-file` exits 128 for BOTH a missing object and a missing
+        repository — conflating them would turn 'git was unusable' into 'the
+        writer lied'."""
+        outside = tmp_path / 'not-a-repo'
+        outside.mkdir()
+
+        assert make_commit_probe(outside)('0' * 40) is None
+
+    def test_missing_git_binary_is_unresolvable(self, repo, monkeypatch):
+        root, sha = repo
+        probe = make_commit_probe(root)
+        monkeypatch.setattr(
+            'fused_memory.services.completion_claim_gate.subprocess.run',
+            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError('git')),
+        )
+
+        assert probe(sha) is None
+
+    def test_subprocess_timeout_is_unresolvable(self, repo, monkeypatch):
+        import subprocess
+
+        root, sha = repo
+        probe = make_commit_probe(root)
+
+        def _timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd='git', timeout=1.0)
+
+        monkeypatch.setattr(
+            'fused_memory.services.completion_claim_gate.subprocess.run', _timeout,
+        )
+
+        assert probe(sha) is None
+
+    def test_probe_never_raises(self, tmp_path):
+        """Including a repo_root that does not exist at all."""
+        probe = make_commit_probe(tmp_path / 'does-not-exist')
+
+        assert probe('0' * 40) is None
