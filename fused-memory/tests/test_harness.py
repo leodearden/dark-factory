@@ -2076,11 +2076,19 @@ class TestStage2CycleSummaryHarnessBackstop:
         assert run.status == RunStatus.completed
         mock_write.assert_awaited_once()
         assert mock_write.await_args is not None
-        assert mock_write.await_args.args[2] is stage2_report, (
+        written = mock_write.await_args.args[2]
+        assert written.llm_calls == 9 and written.tokens_used == 900, (
             'the re-attempt must reuse the REAL Stage 2 report (honest '
             'llm_calls/tokens), not a zeroed synthesis'
         )
-        assert mock_write.await_args.args[2].llm_calls == 9
+        assert written.stats.get('stage2_cycle_summary_ledger_written') == 0, (
+            "the re-attempt must carry the real report's stats verbatim"
+        )
+        assert written is not stage2_report, (
+            'the writer must be handed a marker-stamped COPY, never the live '
+            'report mutated across the asyncio.shield boundary — see '
+            '_reattempt_cycle_summary_write'
+        )
         assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is True
         assert 'stage2_cycle_summary_degraded_backstop' not in stage2_report.stats, (
             'the write-recovered arm must never stamp the degraded-synth marker — '
@@ -2150,6 +2158,136 @@ class TestStage2CycleSummaryHarnessBackstop:
         assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is False, (
             'a re-attempt that raises must correct the marker to False, never leave '
             'it falsely True'
+        )
+
+    @pytest.mark.asyncio
+    async def test_writer_always_sees_marker_true_even_when_outcome_unconfirmed(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The marker must not be mutated on the LIVE report across the
+        asyncio.shield boundary. write_cycle_summary serializes report.stats
+        into payload_json only once the shielded task takes its first step —
+        so if the harness task is already being cancelled, the await raises
+        BEFORE that step and any post-hoc correction of the live report would
+        be picked up by the still-pending serialization, landing a row stamped
+        False for a write that actually succeeded.
+
+        Pinned by holding onto the object the writer was handed and reading it
+        back AFTER the harness has corrected the live report: the writer's
+        report must still read True (a shielded serialization that happens
+        later still records the recovery), while the live report — the copy
+        update_run_stage_reports persists — reads only the CONFIRMED outcome,
+        False. Handing the writer the live report itself would collapse the
+        two and leak the correction into the row."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        handed_to_writer: list[StageReport] = []
+
+        async def _capturing_writer(_memory, _project_id, report, _run_id, **_kw):
+            handed_to_writer.append(report)
+            raise RuntimeError('cancelled-analogue: never returns')
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            _capturing_writer,
+        ):
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        assert len(handed_to_writer) == 1
+        # Read AFTER the harness corrected the live report: a serialization that
+        # only happens later (the shielded task's first step) must still see True.
+        assert handed_to_writer[0].stats.get(
+            'stage2_cycle_summary_write_recovered_backstop'
+        ) is True, (
+            'the report handed to the writer — the one serialized into the row '
+            '— must still carry the marker True after the correction, so a '
+            'landed row records the recovery it actually performed'
+        )
+        assert stage2_report.stats.get(
+            'stage2_cycle_summary_write_recovered_backstop'
+        ) is False, (
+            'the live, journal-persisted report must record only the CONFIRMED '
+            'outcome and never over-claim'
+        )
+
+    # -- idempotency of the re-attempt --------------------------------------
+    #
+    # The write-recovered arm re-attempts with the REAL report on the grounds
+    # that the ledger upsert is idempotent on its 5-part identity. That claim
+    # is load-bearing (it is why re-attempting is safe at all), so it is pinned
+    # against a REAL ledger rather than a patched writer.
+
+    @staticmethod
+    async def _count_cycle_summary_rows(ledger_store, run_id: str) -> int:
+        cursor = await ledger_store._require_db().execute(
+            """
+            SELECT COUNT(*) FROM recon_ledger
+            WHERE project_id = ? AND record_kind = 'cycle_summary'
+              AND task_id = '' AND flag_type = 'task_knowledge_sync'
+              AND run_id = ?
+            """,
+            ('test-project', run_id),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    @pytest.mark.asyncio
+    async def test_repeat_backstop_invocations_leave_exactly_one_honest_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Drives run_full_cycle with the REAL write_stage2_cycle_summary (no
+        patch), then fires the backstop AGAIN on the same run — the
+        interrupt-then-resume shape, where the finally runs once per driver
+        invocation on the same run_id. Exactly one row must exist, and it must
+        carry the REAL llm_calls both times (never degraded to zeros)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        run = await harness.run_full_cycle('test-project', 'test-trigger')
+        assert run.status == RunStatus.completed
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None, (
+            'the write-recovered arm must land a real row through the real writer'
+        )
+        assert json.loads(record.payload_json)['llm_calls'] == 9
+        assert await self._count_cycle_summary_rows(ledger_store, run.id) == 1
+
+        # Fire again on the SAME run (resume path): the report still carries
+        # stage2_cycle_summary_ledger_written == 0, so the arm re-fires.
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', run.started_at,
+        )
+
+        assert await self._count_cycle_summary_rows(ledger_store, run.id) == 1, (
+            'the upsert is idempotent on its 5-part identity — a re-attempt '
+            'must never duplicate the row'
+        )
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['llm_calls'] == 9, (
+            'a repeat re-attempt must keep the row honest, never zero it out'
         )
 
     # -- no-fire boundaries -------------------------------------------------
@@ -2363,6 +2501,54 @@ class TestStage2CycleSummaryHarnessBackstop:
         err = run.stage_reports.get('_error')
         assert isinstance(err, dict)
         assert err['stage2_cycle_summary_backstop_written'] is True
+
+    @pytest.mark.asyncio
+    async def test_degraded_arm_never_clobbers_an_existing_authoritative_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Unlike the write-recovered arm, this arm has NO evidence Stage 2's
+        own write failed — it fires on the SHAPE of the stage_reports entry
+        alone. The ledger upsert is last-write-wins on the 5-part identity, so
+        firing blind over a Stage 2 that DID write its row would replace real
+        llm_calls/tokens with zeros: strictly worse than doing nothing. The arm
+        must read the row back first and skip."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry({'items_flagged': []})
+
+        # An authoritative row for this identity already exists — Stage 2's own
+        # in-stage write landed it before the entry decayed to a plain dict.
+        written = await write_stage2_cycle_summary(
+            mock_memory_service,
+            'test-project',
+            self._stage2_report(stage2_cycle_summary_ledger_written=1),
+            run.id,
+        )
+        assert written is True
+
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', datetime.now(UTC),
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 9 and payload['tokens_used'] == 900, (
+            'the degraded arm must never overwrite an authoritative row with zeros'
+        )
+        assert 'stage2_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'the pre-existing honest row must survive unstamped'
+        )
+        assert run.stage_reports.get('_error') is None
 
 
 class TestStage2CycleSummaryRemediationBackstop:
