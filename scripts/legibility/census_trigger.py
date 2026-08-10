@@ -636,10 +636,14 @@ _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_
 # a `tools/call` POST to a local MCP `/mcp` endpoint. The streamable-HTTP MCP
 # transport 406s ("Not Acceptable: Client must accept application/json")
 # *before* even dispatching the tools/call if `Accept` doesn't include BOTH
-# media types -- verified live against localhost:8002 (and :8003). With this
-# header present the server's response Content-Type is `application/json` (not
-# SSE-framed) for these calls, so `response.json()` needs no `data:`-line
-# parsing. Kept load-bearing-constant-single-sourced here (census_trigger is
+# media types -- verified live against localhost:8002 (and :8003). The reply's
+# Content-Type then depends on the SERVER, not on this header: the stateless
+# fused-memory server answers `application/json`, while the stateful escalation
+# server answers an authenticated `tools/call` with `text/event-stream` (task
+# 3644, verified live against :8103 -- the claim previously recorded here, that
+# these calls are never SSE-framed, was wrong and cost every legibility
+# escalation). `_decode_mcp_body` below handles both.
+# Kept load-bearing-constant-single-sourced here (census_trigger is
 # already imported by census.py, nightly.py, and check_transcript_persistence.py)
 # so a future transport change is a one-line edit, not four lockstep edits
 # with a silent-406 risk on any one that's missed. See nightly._default_poster,
@@ -747,6 +751,48 @@ _MCP_SESSION_HEADER = "mcp-session-id"
 _MCP_SESSION_REQUIRED_STATUS = 400
 
 
+def _decode_mcp_body(response) -> dict:
+    """Decode an MCP `/mcp` response body into a JSON-RPC dict.
+
+    Three shapes, all observed live and all load-bearing:
+
+    * `202` / empty content -- `notifications/initialized` answers with no
+      body at all. Yields `{}` rather than raising on the absent JSON.
+    * `text/event-stream` -- what the STATEFUL escalation server (:8103)
+      returns for an authenticated `tools/call`: an `event: message` line
+      followed by `data: {json}`. `response.json()` raises a JSONDecodeError
+      on it, which is the second half of the task-3644 defect: even a
+      correctly handshaken client still dropped every escalation here.
+    * `application/json` -- the STATELESS fused-memory server (:8002) shape;
+      decoded by `response.json()` exactly as before, unchanged.
+
+    A `text/event-stream` body with no `data:` line raises rather than
+    returning `{}`: a malformed stream is a real fault, and degrading it to
+    an empty result is precisely the silent-failure mode this task exists to
+    close. The offending body is reported through `_bounded_repr` so one
+    oversized stream cannot turn a warning into a screenful.
+
+    The 202 check is on the STATUS, and `response.text` is read only inside
+    the SSE branch, so decoding a JSON reply never touches the body twice --
+    and an unexpectedly empty 200 surfaces as a loud `json()` failure through
+    the caller's warning rather than as a silent `{}`.
+    """
+    if response.status_code == 202:
+        return {}
+
+    content_type = (response.headers or {}).get("content-type", "")
+    if "text/event-stream" in content_type:
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[len("data:"):].strip())
+        raise StatusFetchUnavailable(
+            f"no SSE data line in MCP response body: "
+            f"{_bounded_repr(response.text)}"
+        )
+
+    return response.json()
+
+
 def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dict:
     """POST one JSON-RPC *envelope* to an MCP `/mcp` endpoint, handshaking
     only if the server demands a session. Returns the decoded response body.
@@ -779,7 +825,7 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
     )
     if response.status_code != _MCP_SESSION_REQUIRED_STATUS:
         response.raise_for_status()
-        return response.json()
+        return _decode_mcp_body(response)
 
     # --- stateful server: handshake, then retry the original envelope once ---
     #
@@ -831,7 +877,7 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
         url, json=envelope, headers=session_headers, timeout=timeout,
     )
     retried.raise_for_status()
-    return retried.json()
+    return _decode_mcp_body(retried)
 
 
 def post_mcp_tool_call(
