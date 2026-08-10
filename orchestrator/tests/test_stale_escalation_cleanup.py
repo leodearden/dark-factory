@@ -468,3 +468,113 @@ class TestStaleL0StrandIsLoud:
         await strand_harness._dismiss_stale_escalations()
 
         assert queue.get('esc-5189-7').status == 'dismissed'
+
+
+def _aggregate_escalations(harness: Harness) -> list:
+    """Pending strand-sweep aggregate escalations currently in the queue."""
+    return [
+        e
+        for e in harness._escalation_queue.get_pending()  # type: ignore[union-attr]
+        if e.agent_role == 'harness-stale-l0-strand-sweep'
+    ]
+
+
+@pytest.mark.asyncio
+class TestStaleL0StrandEscalationSurvivesRestart:
+    """The strand record must outlive the restart that destroyed the evidence.
+
+    Level is LOAD-BEARING (task 3172): dismiss_all_pending sweeps every pending
+    L0 at startup, so an aggregate filed at L0 would be erased by the very next
+    restart — reproducing exactly the evidence destruction this task exists to
+    stop.  L1 is explicitly preserved across restart.
+    """
+
+    async def test_one_aggregate_escalation_for_several_strands(
+        self, strand_harness: Harness
+    ):
+        """Two strands plus a fresh L0 file exactly ONE aggregate, not three."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5190-1', '5190', age_secs=STRAND_AGE_SECS + 600)
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        assert len(_aggregate_escalations(strand_harness)) == 1
+
+    async def test_aggregate_is_filed_at_level_1(self, strand_harness: Harness):
+        """L0 would be swept by the next restart's own dismissal; L1 survives."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        agg = _aggregate_escalations(strand_harness)[0]
+        assert agg.level == 1
+        assert agg.status == 'pending'
+
+    async def test_aggregate_survives_a_subsequent_restart_sweep(
+        self, strand_harness: Harness
+    ):
+        """The whole point: a second restart must not erase the strand record."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        agg_id = _aggregate_escalations(strand_harness)[0].id
+
+        await strand_harness._dismiss_stale_escalations()  # the next restart
+
+        assert queue.get(agg_id).status == 'pending'
+
+    async def test_aggregate_detail_names_every_strand(self, strand_harness: Harness):
+        """Per-strand detail is not lost to aggregation."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5190-1', '5190', age_secs=STRAND_AGE_SECS + 600)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        detail = _aggregate_escalations(strand_harness)[0].detail
+        assert 'esc-5189-7' in detail
+        assert 'esc-5190-1' in detail
+        assert '5189' in detail and '5190' in detail
+        assert '75480' in detail  # the pending age, in seconds
+
+    async def test_second_sweep_with_open_aggregate_files_no_duplicate(
+        self, strand_harness: Harness
+    ):
+        """Anti-storm dedup: one OPEN aggregate at a time, however many strands."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+
+        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+
+        assert len(_aggregate_escalations(strand_harness)) == 1
+
+    async def test_zero_strands_files_nothing(self, strand_harness: Harness):
+        """An ordinary restart that strands nothing stays completely quiet."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        assert _aggregate_escalations(strand_harness) == []
+
+    async def test_submit_failure_does_not_abort_startup(
+        self, strand_harness: Harness, caplog
+    ):
+        """A failure to file the aggregate is logged, never raised into startup."""
+        queue = strand_harness._escalation_queue
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        with (
+            patch.object(queue, 'submit', side_effect=OSError('disk full')),
+            caplog.at_level(logging.WARNING),
+        ):
+            await strand_harness._dismiss_stale_escalations()  # must not raise
+
+        assert queue.get('esc-5189-7').status == 'dismissed'
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), 'the filing failure must be logged'
