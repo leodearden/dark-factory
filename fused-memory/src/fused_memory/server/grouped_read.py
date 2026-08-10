@@ -65,6 +65,12 @@ _DIGEST_ELLIPSIS = '…'
 #: EXACT count plus a ``truncated`` marker rather than by a longer list.
 _AMENDMENT_DIGEST_CAP = 10
 
+#: Set on a grouped block whose child reads FAILED.  Its presence is the record
+#: that the grouping is INCOMPLETE — a block carrying it is never used to
+#: suppress a child, because we never actually learned what that parent's
+#: children are.
+CHILDREN_UNAVAILABLE_KEY = 'children_unavailable'
+
 
 def _child_text(payload: Mapping[str, Any]) -> str:
     """First non-empty string among the canonical mem0 content keys."""
@@ -120,6 +126,38 @@ async def build_grouped_document(
     zero live footprint — pays one cheap exact count and issues no scroll at
     all.  The detail reads are paid only when they buy something the total
     cannot: the per-kind split and the child bodies the digests need.
+
+    FAULT CONTAINMENT: a failed child read returns
+    ``{'children_unavailable': True, 'error_type': ...}`` — never ``None``
+    (which is the wire shape for "genuinely childless") and never a fabricated
+    zero.  ``Mem0Backend`` propagates a Qdrant read-timeout as ``TimeoutError``
+    exactly so this distinction survives; collapsing it here would tell an
+    operator a canonical has no children because a backend timed out.  Nothing
+    partial is returned alongside the marker, so no consumer can read half a
+    grouping as a whole one.
+    """
+    try:
+        return await _read_grouped_document(service, project_id, canonical_id)
+    except Exception as exc:
+        logger.warning(
+            'grouped_read: child reads FAILED for canonical_id=%s in project=%s; '
+            'reporting children_unavailable rather than a silent "no children"',
+            canonical_id,
+            project_id,
+            exc_info=True,
+            extra={'project_id': project_id, 'canonical_id': canonical_id},
+        )
+        return {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': type(exc).__name__}
+
+
+async def _read_grouped_document(
+    service: Any,
+    project_id: str,
+    canonical_id: str,
+) -> dict[str, Any] | None:
+    """The child reads themselves — see :func:`build_grouped_document`.
+
+    Raises whatever the backend raises; the caller owns fault containment.
     """
     total_children = await service.count_memories_by_metadata(
         project_id=project_id,
