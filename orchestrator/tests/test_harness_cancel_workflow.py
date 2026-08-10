@@ -398,3 +398,50 @@ class TestHardCancelReportCarriesCause:
 
         assert report.outcome == WorkflowOutcome.CANCELLED
         assert report.block_phase == 'dispatch_setup'
+
+
+@pytest.mark.asyncio
+class TestHardCancelReasonFallbackLadder:
+    """With no attributed cause, the reason is derived — never guessed (task 3172)."""
+
+    async def test_drain_cancel_reports_shutdown_drain(self, harness_for_run_slot: Harness):
+        """A slot drained by run()'s finally is separable from every other cancel.
+
+        _draining is a POSITIVE signal: it is set at the top of run()'s finally,
+        before the only loop that cancels slot tasks on SIGTERM/SIGINT.
+        """
+        harness_for_run_slot._draining = True
+
+        report = await _drive_cancelled_slot(harness_for_run_slot, '42')
+
+        assert report.block_reason == 'shutdown_drain'
+
+    async def test_unattributed_cancel_is_labelled_honestly(
+        self, harness_for_run_slot: Harness
+    ):
+        """No cause and no drain gets a residue label, not an invented one."""
+        harness_for_run_slot._draining = False
+
+        report = await _drive_cancelled_slot(harness_for_run_slot, '42')
+
+        assert report.block_reason == 'cancelled_unattributed'
+
+    async def test_stamped_cause_is_consumed_once(self, harness_for_run_slot: Harness):
+        """A re-dispatch of the same task cannot inherit a stale reason."""
+        harness_for_run_slot._draining = False
+
+        await _drive_cancelled_slot(harness_for_run_slot, '42', reason='terminal_status_cancel')
+
+        assert '42' not in harness_for_run_slot._workflow_cancel_causes
+
+    async def test_stamped_cause_wins_over_the_drain_flag(
+        self, harness_for_run_slot: Harness
+    ):
+        """An explicit attribution outranks the drain inference."""
+        harness_for_run_slot._draining = True
+
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', reason='action_teardown:park'
+        )
+
+        assert report.block_reason == 'action_teardown:park'
