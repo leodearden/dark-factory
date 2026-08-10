@@ -2075,6 +2075,7 @@ class TestStage2CycleSummaryHarnessBackstop:
 
         assert run.status == RunStatus.completed
         mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
         assert mock_write.await_args.args[2] is stage2_report, (
             'the re-attempt must reuse the REAL Stage 2 report (honest '
             'llm_calls/tokens), not a zeroed synthesis'
@@ -2359,7 +2360,9 @@ class TestStage2CycleSummaryHarnessBackstop:
             run, run.id, 'test-project', datetime.now(UTC),
         )
 
-        assert run.stage_reports['_error']['stage2_cycle_summary_backstop_written'] is True
+        err = run.stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage2_cycle_summary_backstop_written'] is True
 
 
 class TestStage2CycleSummaryRemediationBackstop:

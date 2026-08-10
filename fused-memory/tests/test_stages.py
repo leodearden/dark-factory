@@ -13078,6 +13078,7 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
             )
 
         mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
         kwargs = mock_write.await_args.kwargs
         assert kwargs['stage'] == 'task_knowledge_sync'
         assert kwargs['recon_pool'] == _STAGE2_CYCLE_SUMMARY_RECON_POOL
