@@ -66,6 +66,21 @@ class EventType(StrEnum):
     # Escalations
     escalation_created = 'escalation_created'
     escalation_resolved = 'escalation_resolved'
+    # Stale-L0 strand swept at startup (task 3172, origin records esc-5189-7
+    # pending 20h58m with a workflow parked on it vs esc-5685-1 pending ~90s).
+    # Emitted by Harness._dismiss_stale_escalations, once per level-0 whose
+    # pending age had already crossed the strand threshold when the restart
+    # sweep closed it.  Keyed on the STRANDED escalation's REAL task_id so the
+    # rows stay joinable against task_completed for that task.
+    # data: {escalation_id, pending_secs, severity, workflow_blocked, category,
+    #        agent_role, resolution_class}
+    #
+    # Why a dedicated member rather than a flag on escalation_resolved: the one
+    # query this task exists to enable is "how many strands did this restart
+    # destroy, and which" — a GROUP BY that must separate a strand from routine
+    # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
+    # it directly; a json_extract discriminator over every resolution would not.
+    stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
 
     # Waste detection
     waste_detected = 'waste_detected'
