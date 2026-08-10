@@ -2210,6 +2210,106 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
 
 
 # ---------------------------------------------------------------------------
+# 3251/step-1 RED: the RU branch of _finalize_inflight must DISPOSE of the
+# RU'd merge worktree instead of stranding it in the owned-liveness ledger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
+    """RUNNER_UNAVAILABLE re-dispatch must not strand its merge worktree (task 3251).
+
+    THE LEAK. ``_run_inflight_verify``'s ``except RunnerUnavailable`` returns
+    ``merge_wt`` UN-cleaned, and ``_finalize_inflight``'s RU branch disposes of
+    the host lease (``quarantine_and_release``), the dead base
+    (``_record_dead_base``) and the lifecycle registry
+    (FINALIZING -> MERGING -> REDISPATCH_PARKED) — but never the worktree.  It
+    then calls ``_remerge``, which allocates and registers a BRAND-NEW
+    ``_merge-<uuid>``.  The old path therefore stays in
+    ``_owned_merge_worktrees`` for the life of the process, one stranded entry
+    per RU re-dispatch.
+
+    WHY A RETAINED LEDGER ENTRY IS UNRECOVERABLE, not merely untidy:
+      · ``_touch_owned_merge_worktrees`` ``os.utime``s it every heartbeat tick,
+        pinning the ROOT-inode mtime that the disk-scan coalesce arm reads as
+        proof of liveness — an immortal corpse;
+      · it is exempt from both ``reap_orphaned_merge_worktrees`` and the
+        ``keep_worktrees=set(self._owned_merge_worktrees)`` guard;
+      · it is INVISIBLE to ``worktree_ledger_violations``, which flags only
+        on-disk ``_merge-`` dirs ABSENT from the ledger (``if path in owned:
+        continue``).
+
+    Task 3148 added ``_inflight_worktree_is_stale``, which CONTAINS the symptom
+    at the coalesce gate; these tests pin the leak itself closed at the source.
+    """
+
+    async def test_ru_finalize_drops_old_merge_worktree_from_ledger(self, tmp_path):
+        """The RU'd worktree leaves the ledger — and stops being heartbeat-pinned."""
+        import os
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        # escalate_after_n high so the unavailability alarm never fires and
+        # cannot confound the ledger assertions.
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+        assert old_wt in worker._owned_merge_worktrees  # precondition
+
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            result = await worker._finalize_inflight(entry)
+
+        # ── the leak itself ────────────────────────────────────────────────
+        assert old_wt not in worker._owned_merge_worktrees, (
+            'RU re-dispatch stranded the old merge worktree in the liveness ledger'
+        )
+        assert str(old_wt.resolve()) not in worker.snapshot()['owned_merge_worktrees']
+
+        # ── the "immortal heartbeat-pinned corpse" symptom ─────────────────
+        # Stamp a known-old mtime, then run one heartbeat tick: it must touch
+        # nothing and leave the RU'd path's mtime alone, so the path can age
+        # out of the liveness window instead of being refreshed forever.
+        os.utime(old_wt, (0, 0))
+        mtime_before = old_wt.stat().st_mtime
+        assert worker._touch_owned_merge_worktrees() == 0
+        assert old_wt.stat().st_mtime == mtime_before
+
+        # ── RU control flow UNCHANGED ──────────────────────────────────────
+        assert result is False
+        fake_alloc.quarantine_and_release.assert_awaited_once()
+        assert worker._redispatch[0] is remerged
+        assert not entry.item.request.result.done()
+
+    async def test_ru_redispatch_ledger_does_not_accumulate(self, tmp_path):
+        """N successive RU re-dispatches must not grow the ledger by N entries."""
+        from orchestrator.merge_queue import SpeculativeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        # The stubbed _remerge registers NOTHING, so every ledger entry left
+        # behind at the end is a stranded RU'd worktree and nothing else.
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for n in range(3):
+                wt = tmp_path / f'_merge-{n}'
+                wt.mkdir()
+                entry = _make_ru_entry(worker, 'laptop', merge_wt=wt)
+                worker._register_owned_merge_worktree(wt)
+                await worker._finalize_inflight(entry)
+
+        assert worker._owned_merge_worktrees == set(), (
+            'ledger grew one stranded entry per RU re-dispatch: '
+            f'{sorted(str(p) for p in worker._owned_merge_worktrees)}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # 1795/step-11 RED: _clear_verify_host_unreachable module-level helper
 # ---------------------------------------------------------------------------
 
