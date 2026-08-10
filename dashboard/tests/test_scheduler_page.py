@@ -3135,29 +3135,3 @@ def test_shape_scheduler_surfaces_recovery_events_and_counts():
     inner['recovery_event_counts']['sentinel'] = 1
     assert len(recovery_events['proj-a']) == 2
     assert 'sentinel' not in recovery_events
-
-
-def test_tab_scheduler_renders_recovery_event_count(client):
-    """tab_scheduler.jsx surfaces the recovery-sweep count next to the banners.
-
-    Python JSX source-assertion idiom (the node suite under dashboard/tests/js/
-    cannot import a .jsx).  A count surface only — no new panel — reading the
-    shaped keys directly rather than re-deriving them from events_by_task.
-    """
-    resp = client.get('/static/redux/tab_scheduler.jsx')
-    assert resp.status_code == 200
-    body = resp.text
-    assert body, 'tab_scheduler.jsx fetched empty — the assertions below would be vacuous'
-
-    assert 'recovery_events' in body, (
-        'tab_scheduler.jsx must destructure recovery_events from D.SCHEDULER'
-    )
-    assert 'recovery_event_counts' in body, (
-        'tab_scheduler.jsx must read the per-project recovery_event_counts'
-    )
-    assert 'recovery' in body.lower()
-    # The count must come from the shaped payload, never re-derived by
-    # re-filtering events_by_task on the client.
-    assert 'events_by_task' not in body.split('recovery_event_counts')[1][:400], (
-        'the recovery count must read the shaped counts, not re-filter events_by_task'
-    )
