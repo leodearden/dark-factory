@@ -179,8 +179,15 @@ exemptions exist:
   `TaskInterceptor._repair_done_provenance_same_status`. It writes
   `done_provenance` **only**, and validates it (`kind` enum + `git merge-base
   --is-ancestor`); it cannot touch any other field.
-- **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of a
-  non-load-bearing advisory annotation (e.g. `possible_scope_mismatch`).
+- **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of an advisory
+  annotation (e.g. `possible_scope_mismatch`). These stay clearable and stay
+  **advisory**: `possible_scope_mismatch` has no behavioural consumer that can
+  block anything, so clearing it costs no enforcement. The dispatch-time
+  cross-repo gate (§3.2.1) deliberately has **no leg** for it; its two blocking
+  legs read `metadata.cross_repo` and `metadata.files`, neither of which is
+  clearable. The stamp's one remaining effect there is cosmetic — its
+  `suggested_project` supplies the owner **name** in an escalation raised by one
+  of those other legs.
 - **`x_`-prefixed annotation adds** — a merge-mode add of forward-compat
   `x_`-namespaced annotation keys.
 
@@ -308,6 +315,50 @@ branch) rather than the false "implementation has not delivered". The
 orchestrator additionally honors an explicitly-set `metadata.cross_repo` for
 the absolute-path-foreign shape it can classify without the registry.
 
+**A marked task no longer reaches merge time at all.** As of task 3121 the
+orchestrator also runs a **dispatch-time cross-repo admission gate**
+(`orchestrator/src/orchestrator/cross_repo_gate.py`), in `Harness._run_slot`
+just ahead of the D4 substrate gate and **before any agent spins up**. A task
+is blocked there with `block_reason='cross_repo_misfile'` and an **L1
+`scope_violation`** when **either** of exactly two legs fires:
+
+- `metadata.cross_repo` is truthy — the **marker** leg. This is the submit
+  path's own assertion that the declared files are owned elsewhere, so the L1
+  states foreign ownership as fact and names the owner from
+  `metadata.cross_repo_project` (falling back to a project name embedded in the
+  marker string, then to `possible_scope_mismatch.suggested_project`).
+- every entry in `metadata.files` is an **absolute** path resolving outside the
+  orchestrator's `project_root` — the **containment** leg, which needs no
+  registry. Containment proves only "outside this `project_root`": with no
+  cross-project registry the gate cannot tell a sibling checkout from a path no
+  project owns, so when nothing names an owner the L1 says exactly that and
+  offers both remedies (refile under the owning project, **or** correct
+  `metadata.files` to in-tree paths).
+
+`metadata.possible_scope_mismatch` is **not** a third leg and cannot block a
+dispatch. It is an advisory prose stamp that over-fires by design, and the
+shape it actually carries — registry **prefixes** such as `orchestrator/`, not
+file paths — is not classifiable by path containment at all. It already fires
+its own advisory escalation at submit time; here it only supplies an owner
+**name** when one of the two real legs has fired.
+
+Metadata that is present but unreadable is a logged **SKIP** — dispatch
+proceeds (an unparseable blob is not evidence of a misfile) but the gate says
+loudly that it read nothing, so a skipped check never passes for a clean one.
+Absent metadata is the ordinary shape and is silent. The fix for a blocked task
+is to **refile it under the owning project** (or correct its `metadata.files`),
+not to unblock it in place.
+
+The merge-time `OutcomeKind.plan_files_cross_repo` route above is unchanged
+and still applies to a task that reaches merge by another path. It was
+previously the *only* consumer of the cross-repo signal, which is why a task
+whose branch never got built — the reify-5638 shape — used to reach the
+architect, burn an agent, and land an L2 anyway.
+
+The dispatch gate reads the task **as it stands at dispatch**, so a marker or
+a `metadata.files` list stamped **after** creation (the `files_tagged_at`
+shape) is honoured too — a submit-time gate structurally cannot see those.
+
 **Merely CITING another project's paths in prose is not a scope error.** A
 task whose description references `orchestrator/src/foo.py` as evidence, as
 a thing to mirror, or as prior art is created normally — the citation never
@@ -315,6 +366,16 @@ blocks anything. It can, however, attract the advisory annotation
 `metadata.possible_scope_mismatch` (plus a non-blocking `scope_violation`
 escalation an operator then has to read), because a prose scan cannot tell
 "modifies X" from "mentions X".
+
+The annotation stays advisory, and has **no** behavioural consumer: nothing
+reads it to block, reject, requeue, or gate anything. Its escalation is the
+whole of its effect. The dispatch-time gate above deliberately has no leg for
+it — turning a false-positive advisory into a stalled task plus a spurious L1
+would be strictly worse than leaving it advisory, and its `matched_paths` carry
+registry **prefixes** (`orchestrator/`, `fused_memory/`) rather than file paths,
+so there is no independent evidence available to confirm it against. The gate
+does read its `suggested_project` to *name* an owner in an L1 its own legs
+raised; that is cosmetic, not a trigger.
 
 A **declared deliverable** can, so it is what the advisory is attributed on.
 The annotation is suppressed when your declared deliverables attest local
@@ -784,8 +845,9 @@ human_curator_adjudicated_at, last_blocked_at
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
 `metadata.files` are all owned by one other registered project (and the
-filer is itself registered), and read by the orchestrator pre-merge
-narrowing gate.
+filer is itself registered), and read by **both** the orchestrator's
+dispatch-time cross-repo admission gate (which blocks the task before any
+agent spins up) and its pre-merge narrowing gate.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are

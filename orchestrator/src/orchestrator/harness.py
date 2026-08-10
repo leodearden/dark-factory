@@ -7190,6 +7190,140 @@ class Harness:
                 exc,
             )
 
+    async def _block_and_escalate_cross_repo(
+        self,
+        task_id: str,
+        *,
+        verdict,
+    ) -> None:
+        """Block a task and file an L1 escalation for a cross-repo misfile.
+
+        Structurally a sibling of ``_block_and_escalate_substrate_flip`` below —
+        the two dispatch-gate blockers are kept adjacent deliberately:
+        - Sets the task to ``blocked`` via ``scheduler.set_task_status``
+          (unconditional; wrapped in try/except so a transient write failure does
+          not prevent the L1 from being filed).
+        - Submits a level-1 ``Escalation`` with category='scope_violation'.
+        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the
+          requeue cooldown expires) do not stack duplicate escalations.
+        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness tests).
+
+        ``scope_violation`` rather than the substrate gate's ``design_concern``:
+        the task's work belongs to ANOTHER project — a scope failure, not a
+        premise failure.
+
+        The summary NAMES the owning project when the verdict resolved one, so
+        the L1 is directly actionable ("refile task N under project B") instead
+        of costing a triage round trip.  When no owner could be resolved it says
+        so explicitly: the orchestrator has no cross-project registry, and a
+        placeholder name in an L1 is worse than an honest "unresolved".
+
+        The summary/detail are written to CLAIM ONLY WHAT THE FIRING SIGNALS
+        ESTABLISH — see the comment on the claim/remedy branch below.  A verdict
+        carrying only path-containment evidence asserts "paths outside
+        project_root", not "owned by another project", because the gate has no
+        way to tell a sibling checkout from a path no project owns.
+        """
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Cross-repo block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id,
+                exc_info=True,
+            )
+
+        if not self._escalation_queue:
+            logger.warning(
+                'Cross-repo block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+
+        if self._escalation_queue.has_open_l1(task_id):
+            logger.warning(
+                'Cross-repo block for task %s — open L1 already exists, suppressing '
+                'duplicate; pre-existing L1 may be for an unrelated cause',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        from orchestrator.cross_repo_gate import SIGNAL_MARKER  # noqa: PLC0415
+
+        owner = verdict.owner_project
+        signals = tuple(verdict.signals or ())
+
+        # Claim exactly what the evidence establishes, and no more.
+        #
+        # The path-containment leg proves only "every declared path is absolute
+        # and resolves outside project_root" — with no cross-project registry it
+        # CANNOT distinguish a sibling project's checkout from a path that
+        # belongs to no project at all (~/.claude/skills/…, /etc/…, a stray
+        # $HOME path).  Asserting foreign OWNERSHIP there, and telling the
+        # operator to refile under "the owning project", would be unactionable
+        # advice for a task whose paths have no owner.  _resolve_owner already
+        # refuses to invent a name; this prose holds the same line.
+        #
+        # The marker leg is different: metadata.cross_repo is the submit path's
+        # own assertion that the declared files ARE owned elsewhere, so ownership
+        # may be stated as fact even when nothing named the owner.
+        if owner:
+            claim = f'declares work owned by {owner}'
+            remedy = (
+                f'The fix is to refile this task under {owner} (and cancel or '
+                f're-scope this one), not to unblock it here.'
+            )
+        elif SIGNAL_MARKER in signals:
+            claim = 'declares work owned by another project (owner unresolved)'
+            remedy = (
+                'The submit path marked this task cross-repo but named no owner '
+                '(no metadata.cross_repo_project companion). The fix is to identify '
+                'the owning project and refile the task there, not to unblock it here.'
+            )
+        else:
+            claim = "declares only paths outside this orchestrator's project_root"
+            remedy = (
+                'This gate has no cross-project registry, so it CANNOT tell whether '
+                'these paths belong to another project or to no project at all. Two '
+                'remedies, depending on which it is: refile the task under the owning '
+                'project if one owns them, or correct metadata.files to the in-tree '
+                'paths this task actually delivers. Do not simply unblock it here.'
+            )
+
+        summary = f'CROSS_REPO_MISFILE: task {task_id} {claim}'
+        paths = '\n'.join(f'  - {path}' for path in verdict.foreign_paths) or '  (none declared)'
+        detail = (
+            f'Dispatch-time cross-repo admission gate blocked this task BEFORE any '
+            f'agent spun up.\n'
+            f'Owning project: {owner if owner else "UNRESOLVED — nothing in the task metadata named it"}\n'
+            f'Signals: {", ".join(signals) or "(none)"}\n'
+            f'Observed: {verdict.reason}\n'
+            f'Paths judged outside project_root:\n{paths}\n'
+            f'This orchestrator owns a single project_root and cannot legitimately land '
+            f'work outside it. {remedy}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category='scope_violation',
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Filed L1 cross-repo-misfile escalation %s for task %s (owner=%s)',
+            esc.id,
+            task_id,
+            owner or 'unresolved',
+        )
+
     async def _block_and_escalate_substrate_flip(
         self,
         task_id: str,
@@ -7264,6 +7398,62 @@ class Harness:
             esc.id,
             task_id,
         )
+
+    async def _run_cross_repo_gate(self, assignment) -> bool:
+        """Run the dispatch-time cross-repo admission gate (task 3121).
+
+        Classifies the task as foreign-owned (its declared work belongs to
+        another project) and either allows dispatch (True) or blocks +
+        escalates (False).
+
+        Unlike ``_run_substrate_gate`` this gate is PURE and in-process: no
+        worktree, no subprocess, no thread offload — classification is a
+        metadata read plus path containment.  That is why it runs FIRST: a
+        foreign-owned task that also carries a substrate probe never pays for
+        an ephemeral worktree it can only throw away.
+
+        Returns:
+            True   — ALLOW or SKIP (dispatch may proceed).  SKIP means the
+                     task's metadata was unreadable, i.e. "no evidence", not
+                     "verified clean"; classify_cross_repo already warned.
+            False  — BLOCK (task blocked + L1 filed inside the gate; caller must
+                     arm the requeue cooldown and skip workflow construction).
+        """
+        from orchestrator import cross_repo_gate  # noqa: PLC0415
+
+        task_id = assignment.task_id
+
+        try:
+            verdict = cross_repo_gate.classify_cross_repo(
+                task=assignment.task,
+                project_root=self.config.project_root,
+            )
+        except Exception as exc:
+            logger.warning(
+                'cross_repo_gate: classify_cross_repo raised for task %s: %s',
+                task_id, exc, exc_info=True,
+            )
+            # Fail CLOSED — an unverifiable classification is not a clean bill
+            # of health (mirrors _run_substrate_gate's except branch).
+            verdict = cross_repo_gate.CrossRepoVerdict(
+                verdict=cross_repo_gate.BLOCK,
+                owner_project=None,
+                signals=('classify_error',),
+                foreign_paths=(),
+                reason=f'cross-repo unverifiable / classify_cross_repo raised: {exc}',
+            )
+
+        logger.info(
+            'cross_repo_gate: task %s verdict=%s owner=%s signals=%r reason=%r',
+            task_id, verdict.verdict, verdict.owner_project or 'unresolved',
+            verdict.signals, verdict.reason,
+        )
+
+        if verdict.blocked:
+            await self._block_and_escalate_cross_repo(task_id, verdict=verdict)
+            return False
+
+        return True
 
     async def _run_substrate_gate(self, assignment) -> bool:
         """Run the dispatch-time substrate re-check gate (D4).
@@ -7946,6 +8136,46 @@ class Harness:
                         cost_store=self.cost_store,
                     )
                 steward_factory = _make_steward
+
+            # ── Cross-repo admission gate ────────────────────────────────────
+            # Block a FOREIGN-OWNED task (its declared work belongs to another
+            # project) BEFORE spinning up the agent, rather than letting it
+            # reach the architect, produce a legitimately-empty branch, and
+            # cost an L2 at merge time — the only place the cross-repo signal
+            # was previously read (merge_gates.is_cross_repo_task), which such
+            # a task never reaches.
+            #
+            # Runs FIRST, ahead of the D4 substrate gate: classification here is
+            # pure and in-process (a metadata read + path containment), whereas
+            # the substrate gate builds an ephemeral worktree and runs a checker
+            # subprocess.  A foreign-owned task that also carries a probe must
+            # not pay for a worktree it can only throw away.  This ordering is
+            # asserted in test_cross_repo_gate.py so it cannot silently invert.
+            #
+            # NOTE: the predicate is cross_repo_gate.carries_cross_repo_signal
+            # (key-presence), for the same reason the substrate gate uses a
+            # key-presence predicate — gating on any stricter definition (e.g.
+            # one requiring a well-formed marker) would let a MALFORMED marker
+            # skip the gate entirely instead of entering it and failing closed.
+            # It admits PRESENT-BUT-UNREADABLE metadata for the same reason, so
+            # the gate's loud SKIP is actually reachable from here rather than
+            # being a guarantee the dispatch path quietly withholds.
+            from orchestrator import cross_repo_gate  # noqa: PLC0415
+
+            if cross_repo_gate.carries_cross_repo_signal(assignment.task) and not await self._run_cross_repo_gate(assignment):
+                # Foreign-owned: task is already blocked + escalated inside the
+                # gate.  Return a BLOCKED report so the caller (and
+                # reconciliation) can observe the outcome; arm the requeue
+                # cooldown so the task is not immediately re-dispatched before
+                # the blocked-status propagation window closes.
+                arm_requeue_cooldown = True
+                return TaskReport(
+                    task_id=assignment.task_id,
+                    title=assignment.task.get('title', ''),
+                    outcome=WorkflowOutcome.BLOCKED,
+                    block_reason='cross_repo_misfile',
+                )
+            # ────────────────────────────────────────────────────────────────
 
             # ── D4 substrate gate ────────────────────────────────────────────
             # Re-run the committed probe set against current main BEFORE
