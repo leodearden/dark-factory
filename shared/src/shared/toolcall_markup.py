@@ -157,6 +157,24 @@ ENVELOPE_LITERALS: tuple[str, ...] = tuple(
 )
 
 
+#: ONE pass over the whole literal set, as an alternation in tuple order.
+#:
+#: ``re.search`` returns the LEFTMOST match and, at one position, tries the
+#: branches left to right — which is exactly :func:`detect`'s contract
+#: (earliest by text position, ties broken on tuple order), so this is a
+#: like-for-like replacement for the per-literal ``str.find`` loop it grew out
+#: of, not a redefinition.
+#:
+#: Why it matters that it is one pass: :mod:`shared.mcp_markup_middleware` calls
+#: :func:`detect` on every string argument of every tool call on the server, and
+#: the corruption rate measured in PRD section 2.3 is 0.26%. A loop over the six
+#: literals paid six full passes over every value on the 99.74% clean path, over
+#: values the corpus shows reaching tens of KB. Each branch is ``re.escape``\\ d,
+#: so ``match.group(0)`` is always exactly one member of
+#: :data:`ENVELOPE_LITERALS`.
+_ENVELOPE_RE = re.compile('|'.join(re.escape(literal) for literal in ENVELOPE_LITERALS))
+
+
 def detect(value: object) -> str | None:
     """Return the earliest :data:`ENVELOPE_LITERALS` member occurring in *value*.
 
@@ -166,6 +184,9 @@ def detect(value: object) -> str | None:
     the leaked envelope actually starts, rather than whichever literal happens to
     be listed first. Ties break on tuple order, which cannot arise today because
     no two literals share a prefix.
+
+    ONE scan of *value*, via :data:`_ENVELOPE_RE`, not one per literal — see that
+    constant for why the difference is load-bearing at the middleware boundary.
 
     Matching is CASE-SENSITIVE: the harness emits lowercase tags, and
     case-folding would only widen the guard onto prose that shouts a tag name.
@@ -177,16 +198,8 @@ def detect(value: object) -> str | None:
     """
     if not value or not isinstance(value, str):
         return None
-    best_index = -1
-    best_literal: str | None = None
-    for literal in ENVELOPE_LITERALS:
-        index = value.find(literal)
-        if index == -1:
-            continue
-        if best_index == -1 or index < best_index:
-            best_index = index
-            best_literal = literal
-    return best_literal
+    match = _ENVELOPE_RE.search(value)
+    return match.group(0) if match is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +439,9 @@ def repair(
         # far more often than it reaches either: every value with no qualifying
         # candidate at all, plus every ordinary argument that merely happens to
         # contain a closing tag. Hoisting a detect() above the loop would
-        # instead pay one full-string pass per ENVELOPE_LITERALS member (six)
-        # on that overwhelmingly common no-op path, at a per-tool-call
-        # middleware boundary (PRD contract C2) over values the corpus shows
-        # reaching tens of KB.
+        # instead pay a full-string scan on that overwhelmingly common no-op
+        # path, at a per-tool-call middleware boundary (PRD contract C2) over
+        # values the corpus shows reaching tens of KB.
         detected = detect(value)
         return Repair(
             clean_value=clean_value,
