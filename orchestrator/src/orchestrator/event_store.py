@@ -558,9 +558,11 @@ class EventType(StrEnum):
     # task_completed / escalation_created.
     #
     # The discriminator between the two:
-    #   recovery_vetoed — an open escalation (or an unreadable store) actively
-    #     vetoed a recovery / redispatch / done-flip that would OTHERWISE have
-    #     been taken.  Something was held back.
+    #   recovery_vetoed — an open escalation actively vetoed a recovery /
+    #     redispatch / done-flip / dispatch that would OTHERWISE have been
+    #     taken.  Something was held back, and the payload names by what:
+    #     reason escalation_pinned, or provenance_arbitration for the
+    #     already-landed gate's contested-task withhold.
     #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
     #     unmapped shape, an in-flight deploy phase, or escalation_store_
     #     unavailable.  Nothing was held back by a record; the site simply had

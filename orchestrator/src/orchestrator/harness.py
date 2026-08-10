@@ -1451,6 +1451,28 @@ def _extract_tagger_entries(payload: Any) -> list:
     return payload if isinstance(payload, list) else []
 
 
+def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
+    """The ``shape`` :meth:`Harness._already_landed_dispatch_gate` emits.
+
+    Rendered from what that gate ACTUALLY knows, and nothing else — a shape
+    element it guessed would be worse than one it admits it never resolved:
+
+    * ``pending`` is structural, not assumed.  The gate is consulted only over
+      dispatch CANDIDATES (``Scheduler._consult_already_landed`` walks the
+      scored pending set), so a task reaching it is pending by construction.
+    * The claimant and branch elements are ``unknown``: this hot per-tick path
+      deliberately resolves neither (see the ``live_claimant=False is
+      deliberate and free`` comment at the veto), and ``render_shape`` maps a
+      ``None`` element to ``unknown`` for exactly this case.
+    * The deploy phase is ``-`` ("no deploy state"), a known fact rather than
+      an unresolved one: ``_consult_already_landed`` skips deterministic tasks
+      outright, so nothing carrying a deploy phase ever reaches this gate.
+
+    Factored out so the two arms that emit here cannot drift apart on it.
+    """
+    return render_shape('pending', None, None, has_open_escalation, None)
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -9584,6 +9606,7 @@ class Harness:
         records: Sequence[Any] | None = None,
         store_unavailable: bool = False,
         tally: RecoverySweepTally | None = None,
+        transition_gated_by_caller: bool = False,
     ) -> Observation | None:
         """DESCRIBE one already-reached recovery disposition — never change it.
 
@@ -9613,6 +9636,17 @@ class Harness:
         there is no per-subject signature to track, so it is latched PER SITE
         instead of tracked: emitted once per process per site, so silencing
         one site's notice never silences another's.
+
+        ``transition_gated_by_caller`` is for a site that ALREADY owns
+        transition state finer than the veto signature — today only the
+        already-landed gate's arbitration hold, whose
+        ``ProvenanceConflictSink`` keys on ``(task_id, reopen_at)``.  Its
+        streak is RESET rather than consulted, so the caller's transition is
+        the one that decides: double-gating it against an unchanged signature
+        would silence a hold that released and came back, leaving the
+        structured record strictly worse than the log line it accompanies.
+        Reset (not bypass) keeps the tracker entry bounded and leaves a clean
+        streak behind for the ordinary signature-gated path at that site.
 
         Returns the :class:`Observation` (so a caller can charge the streak
         alarm) or ``None`` when nothing was recorded — including every
@@ -9674,6 +9708,8 @@ class Harness:
                     str(reason), shape,
                     ','.join(sorted(i for ids in buckets.values() for i in ids)),
                 ))
+                if transition_gated_by_caller:
+                    tracker.clear(site, task_id)
                 observation = tracker.observe(site, task_id, signature)
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
@@ -9687,13 +9723,18 @@ class Harness:
             now = datetime.now(UTC)
             emit_recovery_event(
                 event_store=self.event_store,
-                # A record actively held something back -> vetoed.  Every other
-                # reason is a fall-through: nothing was held, the site simply
-                # had no mapped action (or could not read the store to find
-                # out).  See the EventType members for the full discriminator.
+                # A record actively held something back -> vetoed: either it
+                # pinned the task, or (at the already-landed gate) it is the
+                # arbitration that withheld the dispatch.  Every other reason
+                # is a fall-through: nothing was held, the site simply had no
+                # mapped action (or could not read the store to find out).
+                # See the EventType members for the full discriminator.
                 event_type=(
                     EventType.recovery_vetoed
-                    if reason is LeaveReason.escalation_pinned
+                    if reason in (
+                        LeaveReason.escalation_pinned,
+                        LeaveReason.provenance_arbitration,
+                    )
                     else EventType.recovery_left
                 ),
                 task_id=task_id,
@@ -11086,10 +11127,24 @@ class Harness:
         (PRD D3 / boundary row #8): an annotation is not a handoff, and a
         naive ``bool(pending_rows)`` veto would wedge a genuinely-landed
         task carrying one ``escalate_info`` record into re-dispatching
-        every tick forever.  The veto is LOGGED with the pinning escalation
-        ids so a task that stops auto-flipping says why; task beta (3535)
-        replaces that log line with the structured ``recovery_vetoed``
-        emission plus its N-consecutive-vetoes dedup escalation.
+        every tick forever.
+
+        The veto says why, TWICE and on purpose (task beta 3535): the INFO
+        log line names the pinning ids for a human reading the journal, and
+        :meth:`_emit_recovery_disposition` records the same hold as a
+        structured ``recovery_vetoed`` event for a consumer that has to
+        COUNT holds — which no amount of log text can support.  Neither
+        replaces the other.  Both arms of this gate emit through that one
+        adapter: the pin veto here (``escalation_pinned``, or
+        ``escalation_store_unavailable`` when the read failed) and the
+        arbitration hold below (``provenance_arbitration``).  Emission is
+        transition-gated, never one row per tick — see
+        ``orchestrator.recovery_emission``'s module docstring, the canonical
+        WHY for the whole mechanism.  This site does NOT charge the
+        N-consecutive-vetoes streak alarm: it runs per dispatch TICK, so
+        charging it would file a blocking L1 within seconds of a hold
+        appearing rather than after three 900s sweeps (that counter belongs
+        to the sweep-frequency sites).
 
         That veto sits BELOW both arbitration holds (and above all git
         subprocess work), which is load-bearing rather than incidental.  The
@@ -11291,9 +11346,7 @@ class Harness:
                 # ever re-warms `should_skip` to quiet it.  Logging it
                 # unconditionally at INFO would therefore emit one line per
                 # tick, indefinitely, until a human resolved the L2.  Loud on
-                # the (task, reopen_at) TRANSITION, quiet on the repeats; task
-                # beta (3535) replaces both with the structured
-                # `recovery_vetoed` emission plus its streak dedup.
+                # the (task, reopen_at) TRANSITION, quiet on the repeats.
                 first_observation = self._provenance_conflict_sink.note_hold_observed(
                     task_id, reopen_at=metadata.get('reopen_at'),
                 )
@@ -11307,6 +11360,23 @@ class Harness:
                     task_id,
                     metadata.get('reopen_at'),
                 )
+                if first_observation:
+                    # The structured twin of that log line (task beta 3535):
+                    # same transition, same rows, no second store read.  The
+                    # SINK stays the authority for this arm's transition state
+                    # — it keys on (task_id, reopen_at), which the emitter's
+                    # veto signature cannot see, so a hold released and
+                    # re-established under an unchanged signature would
+                    # otherwise go unannounced.  `transition_gated_by_caller`
+                    # is how the adapter is told that.
+                    self._emit_recovery_disposition(
+                        task_id,
+                        site=RecoverySite.already_landed_gate,
+                        reason=LeaveReason.provenance_arbitration,
+                        shape=_already_landed_gate_shape(has_open_escalation=True),
+                        records=rows,
+                        transition_gated_by_caller=True,
+                    )
                 return True
 
             # The hold does not bind this task (any more): drop its log-streak
@@ -11324,6 +11394,30 @@ class Harness:
                     task_id,
                     ', '.join((*pinned.queue_handoff, *pinned.dead_l0))
                     or '<store unavailable>',
+                )
+                # The machine-readable half of that same line.  This branch
+                # carries BOTH holds `vetoes_done_flip` covers, and they are
+                # different facts: records that pinned, versus a store that
+                # could not be read at all (`records=None`).  Collapsing them
+                # would re-create the esc-3163 ambiguity in the event stream
+                # itself — an empty id list reading as "nothing held it".
+                self._emit_recovery_disposition(
+                    task_id,
+                    site=RecoverySite.already_landed_gate,
+                    reason=(
+                        LeaveReason.escalation_store_unavailable
+                        if pinned.store_unavailable
+                        else LeaveReason.escalation_pinned
+                    ),
+                    shape=_already_landed_gate_shape(
+                        # Unknown, not False: on an unreadable store this site
+                        # does not know whether an escalation is open.
+                        has_open_escalation=None if pinned.store_unavailable else True,
+                    ),
+                    # The rows this gate ALREADY read — telemetry never adds a
+                    # second store read to a per-dispatch-tick path.
+                    records=rows,
+                    store_unavailable=pinned.store_unavailable,
                 )
                 return False
 

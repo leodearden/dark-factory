@@ -2011,7 +2011,7 @@ class TestAlreadyLandedGatePinVetoEmission:
             'telemetry may not add a second store read to a per-tick path'
         )
 
-    async def test_repeated_identical_veto_emits_exactly_one_row(
+    async def test_repeat_ticks_with_an_identical_signature_emit_once(
         self, mock_orch_config, tmp_path,
     ) -> None:
         """TICK-FREQUENCY GUARD.  This gate runs once per dispatch tick for as
@@ -2023,12 +2023,40 @@ class TestAlreadyLandedGatePinVetoEmission:
             _open_escalation('esc-42-9', level=2),
         )
 
-        for _ in range(5):
+        for _ in range(2):
             assert await h._already_landed_dispatch_gate('42') is False
 
         assert len(_recovery_rows(h)) == 1, (
-            'five ticks of the SAME hold is one fact, not five'
+            'a quiet repeat of a hold already on record must not re-state it'
         )
+
+    async def test_many_ticks_stay_bounded_not_one_row_per_tick(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Twenty ticks produce TWO rows, not twenty: the transition, plus the
+        one deliberate re-statement at the streak threshold crossing.
+
+        The same bound the OTHER per-tick site keeps
+        (``test_scheduler_stranded_blocked_redispatch.py``'s
+        ``test_many_ticks_stay_bounded_not_one_row_per_tick``) — one adapter,
+        one cadence, so an operator reading these rows never has to know which
+        site wrote them to know how to read their frequency.  Here the crossing
+        marks the moment a sweep-frequency site WOULD have alarmed; this gate
+        deliberately files no L1 of its own (see the method docstring).
+        """
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        for _ in range(20):
+            assert await h._already_landed_dispatch_gate('42') is False
+
+        rows = _recovery_rows(h)
+        assert len(rows) == 2, f'expected transition + threshold crossing: {rows}'
+        assert [r['data']['streak'] for r in rows] == [
+            1, h.config.recovery_emission.veto_streak_threshold,
+        ]
 
     async def test_changed_pinning_ids_re_emit(
         self, mock_orch_config, tmp_path,
@@ -2212,10 +2240,15 @@ class TestAlreadyLandedGateStoreUnavailableEmission:
             'dead_l0': [], 'queue_handoff': [], 'non_pinning': [],
         }, 'an unreadable store yields NO ids — never a false empty pin set'
 
-    async def test_repeated_read_failure_emits_exactly_one_row(
+    async def test_repeated_read_failure_stays_bounded(
         self, mock_orch_config, tmp_path,
     ) -> None:
-        """A store outage lasts many ticks; it is one fact, not one per tick."""
+        """A store outage lasts many ticks; it is one fact, not one per tick.
+
+        Bounded exactly as the pin veto is — the transition plus the single
+        threshold-crossing re-statement — because both arms ride the one
+        adapter rather than each inventing a cadence.
+        """
         h = _emitting_harness(mock_orch_config, tmp_path)
         h._escalation_queue = MagicMock()
         h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
@@ -2223,10 +2256,12 @@ class TestAlreadyLandedGateStoreUnavailableEmission:
             side_effect=OSError('escalation queue dir unreadable'),
         )
 
-        for _ in range(4):
+        for _ in range(20):
             assert await h._already_landed_dispatch_gate('42') is False
 
-        assert len(_recovery_rows(h)) == 1
+        rows = _recovery_rows(h)
+        assert len(rows) == 2, f'expected transition + threshold crossing: {rows}'
+        assert all(r['data']['reason'] == 'escalation_store_unavailable' for r in rows)
 
 
 def _matrix_pinned(h: Harness) -> None:
