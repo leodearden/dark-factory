@@ -1405,3 +1405,287 @@ class TestConcurrentReadersNeverSeeAPartialPlan:
             thread.join(timeout=30)
 
         assert misses == [], 'plan.json vanished during an atomic write-back'
+
+
+# ---------------------------------------------------------------------------
+# step-15 — EVERY read path repairs, and the triggering tool reports it.
+# ---------------------------------------------------------------------------
+
+_NEW_SHA = 'a' * 40
+
+
+def _seed_corrupt(artifacts) -> None:
+    """Put a corrupted-but-otherwise-valid plan on disk for a tool to open."""
+    plan = corrupt_plan()
+    plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+    artifacts.write_plan(plan)
+
+
+def _on_disk(artifacts) -> dict:
+    return json.loads((artifacts.root / 'plan.json').read_text())
+
+
+def _added_step(plan: dict) -> None:
+    assert [s['id'] for s in plan['steps']] == ['step-1', 'step-2', 'step-9']
+
+
+def _added_prereq(plan: dict) -> None:
+    assert [p['id'] for p in plan['prerequisites']] == ['pre-1', 'pre-9']
+
+
+def _added_decision(plan: dict) -> None:
+    assert plan['design_decisions'][2] == {
+        'decision': 'A newly added decision.',
+        'rationale': 'A newly added rationale.',
+    }
+
+
+def _added_reuse(plan: dict) -> None:
+    assert plan['reuse'][2]['what'] == 'A newly reused thing'
+
+
+def _step_marked_done(plan: dict) -> None:
+    assert plan['steps'][0]['status'] == 'done'
+    assert plan['steps'][0]['commit'] == _NEW_SHA
+
+
+def _step_pre_committed(plan: dict) -> None:
+    assert plan['steps'][0]['status'] == 'done'
+    assert plan['steps'][0]['commit'] == _NEW_SHA
+    assert plan['steps'][0]['description'].startswith(f'[COMMITTED {_NEW_SHA[:12]}]')
+
+
+def _metadata_updated(plan: dict) -> None:
+    assert plan['files'] == ['orchestrator/src/orchestrator/artifacts.py']
+    assert plan['analysis'] == 'A newly written analysis.'
+
+
+def _step_removed(plan: dict) -> None:
+    assert [s['id'] for s in plan['steps']] == ['step-1']
+
+
+def _step_replaced(plan: dict) -> None:
+    assert plan['steps'][1]['type'] == 'impl'
+    assert plan['steps'][1]['description'] == 'A newly written step description.'
+
+
+def _plan_finalized(plan: dict) -> None:
+    assert plan['_finalized_at']
+    assert plan['_revalidated_at']
+
+
+#: ``(id, call, expected-response-subset, on-disk-mutation-check)`` for every
+#: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
+#: absent on purpose: it overwrites the document wholesale, so it has no read to
+#: repair — guarding its INBOUND arguments belongs to the write-time middleware.
+READ_PATH_CASES = [
+    (
+        'add_plan_step',
+        lambda a: plan_tools._add_plan_step(a, 'step-9', 'impl', 'A newly added step.'),
+        {'status': 'ok', 'step_id': 'step-9', 'total_steps': 3},
+        _added_step,
+    ),
+    (
+        'add_prerequisite',
+        lambda a: plan_tools._add_prerequisite(a, 'pre-9', 'A newly added prerequisite.'),
+        {'status': 'ok', 'prereq_id': 'pre-9'},
+        _added_prereq,
+    ),
+    (
+        'add_design_decision',
+        lambda a: plan_tools._add_design_decision(
+            a, 'A newly added decision.', 'A newly added rationale.'
+        ),
+        {'status': 'ok', 'total_decisions': 3},
+        _added_decision,
+    ),
+    (
+        'add_reuse_item',
+        lambda a: plan_tools._add_reuse_item(
+            a, 'A newly reused thing', 'somewhere.py', 'By importing it.'
+        ),
+        {'status': 'ok', 'total_reuse': 3},
+        _added_reuse,
+    ),
+    (
+        'mark_step_done',
+        lambda a: plan_tools._mark_step_done(a, 'step-1', _NEW_SHA),
+        {'status': 'ok', 'step_id': 'step-1', 'new_status': 'done', 'commit': _NEW_SHA},
+        _step_marked_done,
+    ),
+    (
+        # Contract A1's DELIBERATELY divergent envelope — ``ok`` plus ``status``
+        # meaning the step's NEW status. Adding markup_repairs must not disturb it.
+        'mark_step_committed',
+        lambda a: plan_tools._mark_step_committed(a, 'step-1', _NEW_SHA),
+        {'ok': True, 'step_id': 'step-1', 'status': 'done'},
+        _step_pre_committed,
+    ),
+    (
+        'update_plan_metadata',
+        lambda a: plan_tools._update_plan_metadata(
+            a,
+            files=['orchestrator/src/orchestrator/artifacts.py'],
+            analysis='A newly written analysis.',
+        ),
+        {'status': 'ok', 'files': 1},
+        _metadata_updated,
+    ),
+    (
+        'remove_plan_step',
+        lambda a: plan_tools._remove_plan_step(a, 'step-2'),
+        {'status': 'ok', 'removed': 'step-2', 'collection': 'steps'},
+        _step_removed,
+    ),
+    (
+        'replace_plan_step',
+        lambda a: plan_tools._replace_plan_step(
+            a, 'step-2', 'impl', 'A newly written step description.'
+        ),
+        {'status': 'ok', 'replaced': 'step-2'},
+        _step_replaced,
+    ),
+    (
+        'confirm_plan',
+        lambda a: plan_tools._confirm_plan(a),
+        {'status': 'ok', 'finalized': True, 'steps': 2, 'files': 1},
+        _plan_finalized,
+    ),
+]
+
+READ_PATH_IDS = [case[0] for case in READ_PATH_CASES]
+
+
+@pytest.fixture()
+def on_branch(monkeypatch):
+    """``mark_step_committed``'s reachability guard, satisfied.
+
+    Stubbed rather than staged as a real commit: this module tests the repair
+    surface, and the guard itself is covered by ``test_plan_tools_server``.
+    """
+    monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda worktree, sha: True)
+
+
+@pytest.mark.parametrize(
+    ('call', 'expected_response', 'check_mutation'),
+    [case[1:] for case in READ_PATH_CASES],
+    ids=READ_PATH_IDS,
+)
+class TestPlanToolsReadPathsRepair:
+    """Opening the plan through ANY tool repairs it — no tool is a bypass.
+
+    One unhooked read site is enough to leave a corrupted plan corrupted for
+    the whole task, so coverage is asserted entry point by entry point rather
+    than inferred from the one helper they are all supposed to share.
+    """
+
+    def test_the_documented_envelope_is_unchanged(
+        self, plan_artifacts, on_branch, call, expected_response, check_mutation
+    ):
+        _seed_corrupt(plan_artifacts)
+
+        response = call(plan_artifacts)
+
+        for key, value in expected_response.items():
+            assert response[key] == value, f'{key!r} changed shape'
+
+    def test_the_on_disk_plan_is_repaired(
+        self, plan_artifacts, on_branch, call, expected_response, check_mutation
+    ):
+        _seed_corrupt(plan_artifacts)
+
+        call(plan_artifacts)
+
+        rationale = _on_disk(plan_artifacts)['design_decisions'][0]['rationale']
+        assert rationale == _RATIONALE_PROSE
+        assert detect(rationale) is None
+
+    def test_the_requested_mutation_lands_in_the_same_file(
+        self, plan_artifacts, on_branch, call, expected_response, check_mutation
+    ):
+        """The repair must not eat the write it rode in on.
+
+        A repair write-back followed by the tool's own write is two writes to
+        one file; if they raced or ordered wrongly, one of them would vanish.
+        """
+        _seed_corrupt(plan_artifacts)
+
+        call(plan_artifacts)
+
+        plan = _on_disk(plan_artifacts)
+        check_mutation(plan)
+        assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
+
+    def test_the_response_reports_what_was_repaired(
+        self, plan_artifacts, on_branch, call, expected_response, check_mutation
+    ):
+        """The agent that opened the plan must SEE what changed under it."""
+        _seed_corrupt(plan_artifacts)
+
+        response = call(plan_artifacts)
+
+        repairs = response['markup_repairs']
+        assert isinstance(repairs, list)
+        assert len(repairs) == 1
+        assert repairs[0]['outcome'] == 'repaired'
+        assert repairs[0]['collection'] == 'design_decisions'
+        assert repairs[0]['index'] == 0
+        assert repairs[0]['field'] == 'rationale'
+
+    def test_a_clean_plan_response_is_byte_identical_to_today(
+        self, plan_artifacts, on_branch, call, expected_response, check_mutation
+    ):
+        """No key at all on the common path — not an empty list, not a null.
+
+        Every existing caller and every existing assertion on these envelopes
+        must be unable to tell this change happened.
+        """
+        plan_artifacts.write_plan(corrupt_plan())
+
+        response = call(plan_artifacts)
+
+        assert 'markup_repairs' not in response
+
+
+class TestNoReadPathBypassesTheRepair:
+    """A future read site must not be able to silently skip the repair."""
+
+    @staticmethod
+    def _module_functions() -> dict:
+        return {
+            name: obj
+            for name, obj in vars(plan_tools).items()
+            if inspect.isfunction(obj) and obj.__module__ == plan_tools.__name__
+        }
+
+    def test_no_function_calls_artifacts_read_plan_directly(self):
+        offenders = sorted(
+            name
+            for name, fn in self._module_functions().items()
+            if name != '_read_plan_repaired'
+            and 'artifacts.read_plan(' in inspect.getsource(fn)
+        )
+        assert offenders == [], (
+            'these read the plan directly and so skip the repair entirely — '
+            f'route them through _read_plan_repaired: {offenders}'
+        )
+
+    def test_every_read_path_entry_point_goes_through_the_repair(self):
+        """The non-vacuous half: the guard above passes trivially if nobody reads."""
+        expected = {f'_{case_id}' for case_id in READ_PATH_IDS}
+        callers = {
+            name
+            for name, fn in self._module_functions().items()
+            if '_read_plan_repaired(' in inspect.getsource(fn)
+        } - {'_read_plan_repaired'}
+        assert expected <= callers, f'not routed through the repair: {expected - callers}'
+
+    def test_create_plan_is_deliberately_not_hooked(self):
+        """It overwrites the document wholesale, so it has no read to repair.
+
+        Guarding its INBOUND arguments is the write-time middleware's job, not
+        this surface's. Asserted so the omission reads as a decision.
+        """
+        source = inspect.getsource(plan_tools._create_plan)
+        assert '_read_plan_repaired(' not in source
+        assert 'artifacts.read_plan(' not in source
