@@ -53,14 +53,22 @@ straight through.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shared.toolcall_markup import MCP_MARKUP_PATTERNS
+# markup_override_requested / strip_markup_override are RE-EXPORTS, not local
+# callers: server/tools.py imports both from this module (the write-path guards
+# call them, this module only defines the flag they key on). The noqa is the
+# re-export marker — deleting either import as "unused" would break tools.py.
+from shared.toolcall_markup import (  # noqa: F401
+    MARKUP_OVERRIDE_KEY,
+    MCP_MARKUP_PATTERNS,
+    markup_override_requested,
+    strip_markup_override,
+)
 
 from fused_memory.server.storm_counter import StormCounter
 
@@ -94,14 +102,24 @@ logger = logging.getLogger(__name__)
 # docstring gives. Its value and order are unchanged, and the same-file drift
 # guard in tests/server/test_markup_tripwire.py still pins them from here.
 
-# Write-time-only control flag that bypasses the tripwire for markup a caller is
-# quoting DELIBERATELY (DF 3083's own task description quotes all three literals
-# in prose, so without this the very sibling this leaf exists to feed could not
-# be updated). Only a literal boolean ``True`` enables it, and it is stripped
-# from metadata before persistence at every boundary — mirroring the established
-# ``allow_near_duplicate`` lifecycle in ``server/tools.py``. An accidental
-# harness serialization leak never sets an explicit flag; an author can.
-MARKUP_OVERRIDE_KEY = 'allow_mcp_markup'
+# MARKUP_OVERRIDE_KEY, markup_override_requested, strip_markup_override —
+# imported above, NOT defined here.
+#
+# The enumeration moved to shared.toolcall_markup under task 3688; task 3689
+# moved its OVERRIDE LIFECYCLE after it, for the same reason. There are now TWO
+# guards that can bounce a caller for envelope markup — this write-time tripwire
+# and shared.mcp_markup_middleware at the FastMCP boundary (PRD contract C2,
+# boundary row B6) — and the middleware sits in the base layer, which may not
+# import fused_memory. A second implementation of "is this deliberate?" is
+# exactly the lockstep-duplication defect (INV-5) the enumeration move repaired;
+# one override, one lifecycle, honoured identically by both guards.
+#
+# What the move does NOT change: the semantics are byte-for-byte the ones this
+# module has always had — fail-closed on a literal boolean True only,
+# dict-or-JSON-string tolerant, never raising, and stripped NON-mutatingly in
+# the caller's own shape before dispatch. server/tools.py imports all three from
+# HERE and needs no edit; shared/tests/test_toolcall_markup.py pins both the
+# semantics and this re-export.
 
 # Surfaced in the rejection dict, the four tool docstrings and
 # FUSED_MEMORY_INSTRUCTIONS so the remediation and the escalation pointer are
@@ -199,75 +217,6 @@ def find_markup_violation(fields: Mapping[str, object]) -> tuple[str, str] | Non
         if pattern is not None:
             return field_name, pattern
     return None
-
-
-def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
-    """Best-effort read of *metadata* as a dict, else ``None``.
-
-    ``submit_task``/``update_task`` accept metadata as an object OR a JSON
-    string, so both shapes are understood. Anything unparseable — malformed
-    JSON, a non-dict JSON payload, a wrong type entirely — yields ``None``
-    without raising: validating metadata is not this module's job, and a write
-    must never fail because the override helper choked on a field it does not
-    own.
-    """
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        try:
-            parsed = json.loads(metadata)
-        except (ValueError, TypeError):
-            return None
-        if isinstance(parsed, dict):
-            return parsed
-    return None
-
-
-def markup_override_requested(metadata: object) -> bool:
-    """Return True iff *metadata* carries an explicit :data:`MARKUP_OVERRIDE_KEY` opt-in.
-
-    Fail-closed: ONLY a literal boolean ``True`` counts, mirroring add_memory's
-    ``metadata.get('allow_near_duplicate') is True`` check (``tools.py``:1199).
-    A truthy-but-not-``True`` value (``'yes'``, ``1``) is far more likely to be
-    unrelated data than a considered decision to write raw MCP envelope markup
-    into the corpus — and the failure mode being contained, an accidental
-    serialization leak, never sets an explicit flag at all.
-
-    Never raises, for any input.
-    """
-    parsed = _as_metadata_dict(metadata)
-    if parsed is None:
-        return False
-    return parsed.get(MARKUP_OVERRIDE_KEY) is True
-
-
-def strip_markup_override(metadata: Any) -> Any:
-    """Return *metadata* without :data:`MARKUP_OVERRIDE_KEY`, in the same shape.
-
-    The override is a write-time-only control flag: it must never be persisted
-    into stored memory metadata or the task metadata vocabulary. Returning the
-    shape it was given (dict in / dict out, JSON string in / JSON string out)
-    lets a call site substitute the result inline before forwarding downstream.
-
-    NON-mutating — the caller's own dict is left intact, since the handler may
-    still need the original and quietly mutating caller-owned metadata is
-    action-at-a-distance this guard should not introduce. (This is the one
-    deliberate divergence from ``allow_near_duplicate``'s in-place
-    ``cleaned_meta.pop`` at ``tools.py``:1266, which operates on a dict it has
-    already copied.)
-
-    Unparseable input passes straight through unchanged, never raising.
-    """
-    if isinstance(metadata, dict):
-        if MARKUP_OVERRIDE_KEY not in metadata:
-            return metadata
-        return {k: v for k, v in metadata.items() if k != MARKUP_OVERRIDE_KEY}
-    if isinstance(metadata, str):
-        parsed = _as_metadata_dict(metadata)
-        if parsed is None or MARKUP_OVERRIDE_KEY not in parsed:
-            return metadata
-        return json.dumps({k: v for k, v in parsed.items() if k != MARKUP_OVERRIDE_KEY})
-    return metadata
 
 
 def build_markup_block(
