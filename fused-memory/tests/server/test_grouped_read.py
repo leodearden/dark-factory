@@ -27,8 +27,10 @@ from fused_memory.server.grouped_read import (
     _AMENDMENT_DIGEST_CAP,
     _DIGEST_CHARS,
     _DIGEST_ELLIPSIS,
+    _suppress_child,
     AMENDMENT_KIND,
     CHILD_KINDS,
+    CHILDREN_UNAVAILABLE_KEY,
     CONTESTED_METADATA_KEY,
     SIGHTING_KIND,
     build_grouped_document,
@@ -557,6 +559,135 @@ class TestNeverSuppressCarveOuts:
             'children_unavailable': True,
             'error_type': 'TimeoutError',
         }, f'The parent must still carry the loud fault marker, got {grouped[0]!r}'
+
+    # ---- fourth carve-out: NOT REPRESENTED -------------------------------
+    #
+    # ``_suppress_child`` claimed suppression happened "only when the child is
+    # genuinely REPRESENTED by its parent's grouped document" but never checked
+    # it.  These pin the claim as an ENFORCED precondition, behind the pinning
+    # that makes it true on the normal path: a future edit to either mechanism
+    # then degrades to keeping a child as a VISIBLE DUPLICATE rather than to
+    # silently losing it as an invisible retrieval regression.
+
+    @staticmethod
+    def _resolvable_parent() -> MemoryResult:
+        return _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'})
+
+    @staticmethod
+    def _block(**overrides) -> dict:
+        block = {'amendments': [], 'amendment_count': 0, 'sighting_count': 0}
+        block.update(overrides)
+        return block
+
+    def test_child_listed_as_a_digest_is_represented(self):
+        """The in-cap amendment case: present in `amendments` → suppressible."""
+        block = self._block(
+            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+        )
+
+        assert _suppress_child(_AMEND_1, {}, self._resolvable_parent(), block) is True
+
+    def test_child_absent_from_the_block_is_never_suppressed(self):
+        """The truncated-list case: a cap-sized sample listing only OTHER ids."""
+        block = self._block(
+            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}],
+            amendment_count=50,
+            truncated=True,
+        )
+
+        assert _suppress_child(_AMEND_2, {}, self._resolvable_parent(), block) is False, (
+            'A child the block does not list must NOT be suppressed — dropping it '
+            'would erase its text from the response entirely. '
+            'RED: _suppress_child does not check representation yet.'
+        )
+
+    def test_a_pinned_child_counts_as_represented(self):
+        """`matched_children` is representation too — that is what pinning buys."""
+        block = self._block(
+            matched_children=[{'id': _SIGHT_1, 'content': 'seen again', 'matched': True}],
+            sighting_count=4,
+        )
+
+        assert _suppress_child(_SIGHT_1, {}, self._resolvable_parent(), block) is True
+        assert _suppress_child(_SIGHT_2, {}, self._resolvable_parent(), block) is False, (
+            'A matched_children list naming only OTHER ids represents nothing '
+            'about this child'
+        )
+
+    def test_block_carrying_neither_key_represents_nothing(self):
+        """A block with no `amendments` and no `matched_children` suppresses nothing."""
+        block = {'amendment_count': 0, 'sighting_count': 3}
+
+        assert _suppress_child(_SIGHT_1, {}, self._resolvable_parent(), block) is False
+
+    def test_unusable_child_id_is_never_suppressed(self):
+        """Neither pinnable nor verifiable → keep it, visibly."""
+        block = self._block(
+            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+        )
+
+        for bad_id in ('', None, 123, {'id': _AMEND_1}):
+            assert _suppress_child(bad_id, {}, self._resolvable_parent(), block) is False, (
+                f'A child whose id is {bad_id!r} cannot be pinned into the block nor '
+                'checked against it, so it must survive rather than vanish'
+            )
+
+    def test_the_three_existing_carve_outs_still_short_circuit_first(self):
+        """Cheapest and most specific first — their behaviour is unchanged."""
+        represented = self._block(
+            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+        )
+
+        assert _suppress_child(_AMEND_1, {}, None, represented) is False, (
+            'UNRESOLVABLE PARENT still wins even over a block that represents the child'
+        )
+        assert (
+            _suppress_child(
+                _AMEND_1,
+                {CONTESTED_METADATA_KEY: True},
+                self._resolvable_parent(),
+                represented,
+            )
+            is False
+        ), 'CONTESTED still wins even over a block that represents the child'
+        assert (
+            _suppress_child(
+                _AMEND_1,
+                {},
+                self._resolvable_parent(),
+                {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': 'TimeoutError'},
+            )
+            is False
+        ), 'A failed grouping still suppresses nothing'
+
+    @pytest.mark.asyncio
+    async def test_unpinnable_child_survives_as_a_top_level_hit(self):
+        """End-to-end: the precondition keeps it visible instead of losing it."""
+        service = _stub_service(_two_amendments_three_sightings())
+        # An empty id defeats pinning (nothing to key the entry on) AND
+        # verification — the child must therefore stay a hit in its own right.
+        unpinnable = _result(
+            '',
+            'an unkeyed correction',
+            0.8,
+            metadata={'parent_id': _CANONICAL_ID, 'kind': AMENDMENT_KIND},
+        )
+        hits = [
+            _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'}),
+            unpinnable,
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 2, (
+            'A child that can be neither pinned nor verified must survive as a '
+            f'TOP-LEVEL hit rather than vanishing, got {grouped!r}'
+        )
+        assert grouped[1]['content'] == 'an unkeyed correction'
+        block = grouped[0]['grouped']
+        assert not block.get('matched_children'), (
+            f'An unkeyed child cannot be pinned, so nothing may be invented, got {block!r}'
+        )
 
 
 #: A matched child body deliberately LONGER than ``_DIGEST_CHARS``, so "the
