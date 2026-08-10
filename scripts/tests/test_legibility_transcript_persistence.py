@@ -887,3 +887,95 @@ def test_read_spawn_script_unreadable_returns_empty(tmp_path):
     a_dir = tmp_path / "a_dir"
     a_dir.mkdir()
     assert mod._read_spawn_script(a_dir) == ""
+
+
+# ---------------------------------------------------------------------------
+# task 3644: the transcript-loss alarm must survive a STATEFUL server
+# ---------------------------------------------------------------------------
+#
+# Same defect as nightly.py's and census.py's posters: `_default_poster`
+# bare-POSTed `tools/call`, the escalation server rejects it at the transport
+# layer with `400 Bad Request` / "Missing session ID" (captured live
+# 2026-08-05), and `post_findings` swallows that best-effort and returns
+# False -- so the transcript-loss alarm never reached anyone. Fixed by the
+# same single-sourced transport in census_trigger.
+
+
+class _FakeStatefulResponse:
+    """An `httpx.Response` stand-in for the stateful-server handshake."""
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
+            # install_fake_httpx stub exposes only `post` and pytest.fails on
+            # any other attribute (task 3376).
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response has no JSON body")
+        return self._payload
+
+
+def _stateful_escalation_post(recorded, *, session_id="sid-transcript"):
+    """A fake `httpx.post` behaving like the STATEFUL escalation server:
+    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
+    as a response header; `notifications/initialized` -> 202; `tools/call`
+    WITH that header -> 200."""
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeStatefulResponse(
+                headers={"mcp-session-id": session_id,
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeStatefulResponse(status_code=202)
+        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
+            return _FakeStatefulResponse(
+                status_code=400,
+                headers={"content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": "server-error",
+                         "error": {"code": -32600,
+                                   "message": "Bad Request: Missing session ID"}},
+            )
+        return _FakeStatefulResponse(
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"id": "esc-11", "status": "queued"}}},
+        )
+
+    return _post
+
+
+def test_post_findings_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
+    """The DEFAULT poster (no `poster=` injection) must handshake and land.
+
+    `post_findings` -- NOT `post_escalation`; this module's escalation
+    entrypoint takes a `Sequence[MissingTranscript]` -- so a minimal non-empty
+    findings list is what reaches the POST."""
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    recorded = []
+    install_fake_httpx(_stateful_escalation_post(recorded))
+
+    assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is True
+
+    methods = [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
+    assert methods == [
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+    ]
+    # The retried call carries the server-assigned session id...
+    assert (recorded[-1][1].get("headers") or {}).get("mcp-session-id") == "sid-transcript"
+    # ...and is still the escalate_info the alarm meant to file.
+    params = (recorded[-1][1].get("json") or {})["params"]
+    assert params["name"] == "escalate_info"
+    assert "sess-lost-1" in params["arguments"]["detail"]
