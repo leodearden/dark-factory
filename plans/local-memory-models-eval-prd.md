@@ -254,7 +254,8 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
     - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
       it implies is corrected.
     - **Consequence** (not a decision — see Open Q3): on a **weights-only** basis — the same basis
-      that disqualifies the MoE arm below — the three dense LLM arms (~6, ~9, ~14 GiB) and all
+      that disqualifies the MoE arm below — the two remaining dense LLM arms (~6, ~9 GiB — the
+      ~14 GiB Mistral-Small-3.2-24B arm was dropped 2026-08-06, see the candidate slate) and all
       embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
       Qwen3.6-35B-A3B at IQ4) does not. **Runtime fit is stricter and separate**: vLLM's paged KV
       cache can balloon well past the weights figure (α's README, `RESOLVED alongside: the pooling
