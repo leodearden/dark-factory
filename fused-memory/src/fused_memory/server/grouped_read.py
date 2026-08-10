@@ -404,17 +404,52 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     )
 
 
+def _represented_ids(parent_block: Mapping[str, Any] | None) -> set[str]:
+    """Every child id *parent_block* demonstrably accounts for.
+
+    A digest names the child it summarises; a pin (:func:`_pin_matched_child`)
+    carries the child's full body.  Either is representation; nothing else is.
+    """
+    block = parent_block or {}
+    ids: set[str] = set()
+    for entry in list(block.get('amendments') or []) + list(block.get(MATCHED_CHILDREN_KEY) or []):
+        entry_id = entry.get('id') if isinstance(entry, dict) else None
+        if isinstance(entry_id, str) and entry_id:
+            ids.add(entry_id)
+    return ids
+
+
 def _suppress_child(
+    child_id: Any,
     child_meta: Mapping[str, Any] | None,
     parent_base: Any,
     parent_block: Mapping[str, Any] | None,
 ) -> bool:
     """The SINGLE gate every child-suppression decision passes through.
 
-    Every carve-out lives here, in one place, so a future edit cannot bypass
-    one; see :func:`_carve_outs_allow_suppression` for what they are.
+    True only when the child is genuinely REPRESENTED by its parent's grouped
+    document — a claim this function ENFORCES rather than assumes.  Every
+    carve-out lives here, in one place, so a future edit cannot bypass one.
+    The three that do not depend on the block's contents short-circuit first
+    (cheapest and most specific): see :func:`_carve_outs_allow_suppression`.
+
+    The fourth is NOT REPRESENTED: the child's id must be a non-empty string
+    present in the block's represented-id set.  It is the PRD's
+    "retrieval-regression branch of Option B", closed here by decision — a
+    child dropped from the results while its text is absent from the block
+    that replaced it is not grouped, it is LOST.
+
+    Two mechanisms deliberately cover the same ground: pinning makes
+    representation TRUE on the normal path, this precondition makes it
+    VERIFIED.  So an edit to either degrades to keeping the child as a visible
+    duplicate rather than to silently losing it as an invisible regression.
     """
-    return _carve_outs_allow_suppression(child_meta, parent_base, parent_block)
+    if not _carve_outs_allow_suppression(child_meta, parent_base, parent_block):
+        return False
+    if not isinstance(child_id, str) or not child_id:
+        # Neither pinnable nor checkable — so it cannot be shown to be there.
+        return False
+    return child_id in _represented_ids(parent_block)
 
 
 async def group_search_results(
@@ -528,7 +563,9 @@ async def group_search_results(
         parent_id = child_parents.get(index)
         parent_base = (hit_by_id.get(parent_id) or resolved.get(parent_id)) if parent_id else None
         child_meta = getattr(hit, 'metadata', None) if parent_id else None
-        if parent_id and _suppress_child(child_meta, parent_base, block_by_id.get(parent_id)):
+        if parent_id and _suppress_child(
+            getattr(hit, 'id', None), child_meta, parent_base, block_by_id.get(parent_id)
+        ):
             # _suppress_child's UNRESOLVABLE-PARENT carve-out already returned
             # False for a None parent_base; restated so the checker sees it too.
             assert parent_base is not None
