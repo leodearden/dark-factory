@@ -242,6 +242,109 @@ class TestBuildGroupedDocument:
         )
 
 
+class TestBoundedListingHonesty:
+    """A bounded digest listing must never read as exhaustive.
+
+    ``get_memories_by_metadata`` is a single un-cursored scroll with no in-band
+    truncation flag, so deriving a count from ``len(rows)`` would silently
+    under-report a wide fan-out — the same honesty task 3197's
+    ``DescendantScan.truncated`` provides on the delete path.
+    """
+
+    @staticmethod
+    def _wide_amendment_fanout(extra: int = 5) -> list[dict]:
+        total = _AMENDMENT_DIGEST_CAP + extra
+        return [
+            _child(
+                f'44444444-4444-4444-8444-{index:012d}',
+                _CANONICAL_ID,
+                AMENDMENT_KIND,
+                f'correction {index}',
+                f'2026-08-01T00:00:{index:02d}+00:00',
+            )
+            for index in range(total)
+        ] + [
+            _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-01T00:00:00+00:00'),
+            _child(_SIGHT_2, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-01T00:00:01+00:00'),
+            _child(_SIGHT_3, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-01T00:00:02+00:00'),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_wide_fanout_is_capped_and_marked_truncated(self):
+        """More amendments than the cap → capped list + truncated + EXACT count."""
+        service = _stub_service(self._wide_amendment_fanout(extra=5))
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        assert len(block['amendments']) == _AMENDMENT_DIGEST_CAP, (
+            f'The digest list must be bounded by _AMENDMENT_DIGEST_CAP '
+            f"({_AMENDMENT_DIGEST_CAP}), got {len(block['amendments'])}"
+        )
+        assert block.get('truncated') is True, (
+            'A capped listing must carry truncated: True so it is never read as '
+            f'exhaustive, got {block!r}. RED: no truncation marker yet.'
+        )
+        assert block['amendment_count'] == _AMENDMENT_DIGEST_CAP + 5, (
+            'amendment_count must be the EXACT count from the count API, not '
+            f"len(digests) ({len(block['amendments'])}), got "
+            f"{block['amendment_count']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sighting_count_stays_exact_when_amendments_truncate(self):
+        """The sighting count is a count-API read and is unaffected by the cap."""
+        service = _stub_service(self._wide_amendment_fanout(extra=5))
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        assert block['sighting_count'] == 3, (
+            f"sighting_count must stay exact under truncation, got {block!r}"
+        )
+        sighting_filters = {'parent_id': _CANONICAL_ID, 'kind': SIGHTING_KIND}
+        issued = [c.kwargs['filters'] for c in service.count_memories_by_metadata.await_args_list]
+        assert sighting_filters in issued, (
+            f'sighting_count must come from count_memories_by_metadata, got {issued!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_write_between_reads_is_marked_truncated(self):
+        """count > len(scroll) below the cap (a race) is truncation too."""
+        # Two amendment rows on disk, but the exact count says seven — the shape
+        # a write landing between the count and the scroll produces.
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            counts={AMENDMENT_KIND: 7},
+        )
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        assert len(block['amendments']) == 2
+        assert block['amendment_count'] == 7, (
+            f'The exact count must win over len(digests), got {block!r}'
+        )
+        assert block.get('truncated') is True, (
+            'Any count > len(digests) — cap OR concurrent write — must be marked '
+            f'truncated, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_complete_listing_omits_the_truncated_key(self):
+        """Fault-only loudness: a complete listing carries no truncated key at all."""
+        service = _stub_service(_two_amendments_three_sightings())
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        assert 'truncated' not in block, (
+            "'truncated' must be OMITTED (not False) when the listing is "
+            f'complete, matching the search tool degraded-key convention, got {block!r}'
+        )
+        assert block['amendment_count'] == 2
+
+
 class TestZeroChildCommonPath:
     """The whole live corpus today: a canonical with NO children.
 
