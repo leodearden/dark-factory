@@ -410,7 +410,7 @@ def _refs_in_clause(
         # dark_factory ticket) be adjudicated correctly.
         return 'ticket', [(ref, None) for ref in tickets]
 
-    commits = [
+    commits: list[tuple[str, str | None]] = [
         (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
          or default_project_id)
         for match in COMMIT_REF_RE.finditer(clause)
@@ -418,7 +418,7 @@ def _refs_in_clause(
     if commits:
         return 'commit', _ordered_unique_pairs(commits)
 
-    tasks = [
+    tasks: list[tuple[str, str | None]] = [
         (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
          or default_project_id)
         for match in TASK_REF_RE.finditer(clause)
