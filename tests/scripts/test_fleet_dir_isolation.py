@@ -63,7 +63,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     LIVE_FLEET_DIR,
     SYNTHETIC_UNIT_PREFIX,
@@ -223,68 +222,56 @@ class TestAssertSyntheticUnits:
         )
 
 
-class TestSharedVocabularyIsReachableFromBothRoots:
-    """It lives in ``df_pytest_isolation``, the one module BOTH roots import."""
+def test_df_pytest_isolation_stays_stdlib_and_pytest_only() -> None:
+    """The import constraint the module docstring states, pinned.
 
-    def test_the_symbols_are_module_attributes(self) -> None:
-        """``scripts/tests/`` and ``tests/scripts/`` cannot import each other's
-        test modules (the constraint that forced
-        ``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` into
-        existence), so the vocabulary has to sit in the shared module or it
-        cannot be shared at all.
-        """
-        for name in (
-            'SYNTHETIC_UNIT_PREFIX',
-            'synthetic_unit',
-            'non_synthetic_unit_names',
-            'assert_synthetic_units',
-        ):
-            assert hasattr(df_pytest_isolation, name), name
+    Every subproject conftest imports ``df_pytest_isolation`` and must be able
+    to, from inside its own venv — escalation's lacks aiosqlite and stubs
+    ``shared`` in ``sys.modules``.  An import of ``drain_check`` or
+    ``orchestrator.fleet_heartbeat`` here would break collection for a whole
+    subproject, loudly but far from the edit that caused it.
 
-    def test_the_module_stays_stdlib_and_pytest_only(self) -> None:
-        """The import constraint the module docstring states, pinned.
+    BEHAVIOURAL, not textual.  This deliberately imports the module in a clean
+    interpreter and inspects ``sys.modules`` rather than scanning the source
+    for forbidden substrings.  The substring form was tried and removed: it let
+    ``from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR`` — the single
+    most likely real regression, and the exact line the comments here forbid —
+    through untouched, while false-positiving on PROSE (the comment at the
+    FLEET_DIR literal reads "not an import of drain_check…" and passed only by
+    the accident of the word "of").  Asking sys.modules catches every spelling,
+    cannot be broken by rewording a comment, and cannot confuse a docstring
+    mention for a real import.
 
-        Every subproject conftest imports this module and must be able to, from
-        inside its own venv — escalation's lacks aiosqlite and stubs ``shared``
-        in ``sys.modules``.  An import of ``drain_check`` or
-        ``orchestrator.fleet_heartbeat`` here would break collection for a whole
-        subproject, loudly but far from the edit that caused it.
-
-        BEHAVIOURAL, not textual.  This deliberately imports the module in a
-        clean interpreter and inspects ``sys.modules`` rather than scanning the
-        source for forbidden substrings.  The substring form was tried and
-        removed: it let ``from orchestrator.fleet_heartbeat import
-        DEFAULT_FLEET_DIR`` — the single most likely real regression, and the
-        exact line the comments here forbid — through untouched, while
-        false-positiving on PROSE (the comment at the FLEET_DIR literal reads
-        "not an import of drain_check…" and passed only by the accident of the
-        word "of").  Asking sys.modules catches every spelling, cannot be
-        broken by rewording a comment, and cannot confuse a docstring mention
-        for a real import.
-        """
-        probe = '\n'.join((
-            'import sys',
-            'import df_pytest_isolation',
-            'roots = {"drain_check", "orchestrator", "shared"}',
-            'leaked = sorted(m for m in sys.modules if m.split(".")[0] in roots)',
-            'if leaked:',
-            '    sys.exit("df_pytest_isolation pulled in: " + ", ".join(leaked))',
-        ))
-        # cwd=REPO_ROOT so the bare `import df_pytest_isolation` resolves: the
-        # module sits at the repo root, and `python -c` puts cwd on sys.path.
-        result = subprocess.run(
-            [sys.executable, '-c', probe],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        assert result.returncode == 0, (
-            f'df_pytest_isolation must import with nothing but the stdlib and '
-            f'pytest, so every subproject venv can import it.\n'
-            f'exit={result.returncode}\nstdout={result.stdout}\n'
-            f'stderr={result.stderr}'
-        )
+    That the shared vocabulary is REACHABLE from this root needs no test of its
+    own: the module-scope ``from df_pytest_isolation import (...)`` above is the
+    reachability proof, and it is load-bearing — drop a symbol and this file
+    dies at COLLECTION, before any assertion could run.  A ``hasattr`` loop over
+    the same names lived here until it was found to be unfailable, and only
+    pinned spelling a rename would have to edit twice.
+    """
+    probe = '\n'.join((
+        'import sys',
+        'import df_pytest_isolation',
+        'roots = {"drain_check", "orchestrator", "shared"}',
+        'leaked = sorted(m for m in sys.modules if m.split(".")[0] in roots)',
+        'if leaked:',
+        '    sys.exit("df_pytest_isolation pulled in: " + ", ".join(leaked))',
+    ))
+    # cwd=REPO_ROOT so the bare `import df_pytest_isolation` resolves: the
+    # module sits at the repo root, and `python -c` puts cwd on sys.path.
+    result = subprocess.run(
+        [sys.executable, '-c', probe],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f'df_pytest_isolation must import with nothing but the stdlib and '
+        f'pytest, so every subproject venv can import it.\n'
+        f'exit={result.returncode}\nstdout={result.stdout}\n'
+        f'stderr={result.stderr}'
+    )
 
 
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
