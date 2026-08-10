@@ -886,6 +886,197 @@ class TestRepairPlanFieldsAbsorbedSibling:
 
 
 # ---------------------------------------------------------------------------
+# step-19 — a recovery may only ever land on a REAL prose plan key.
+# ---------------------------------------------------------------------------
+
+#: An absorbed ``files`` argument on the top-level ``title``. This is the state
+#: the harness leaves behind when it mis-closes ``title`` during ``create_plan``
+#: and swallows the ``files`` argument: the plan's ``files`` is the empty list
+#: (nothing was ever parsed into it), which is precisely what makes it look like
+#: a HOLE a recovery may fill — and ``files`` is a LIST, so filling it with the
+#: recovered ``str`` replaces the value the lock charter (``derive_modules`` /
+#: ``files_to_modules``) and the merge gate (``plan_files_not_touched``) read.
+_ABSORBED_FILES_TITLE = (
+    'A real title.' + _close('title') + '\n' + _open_param('files') + 'orchestrator/src/a.py'
+)
+
+#: An absorbed ``step_type`` argument on a step ``description``. ``step_type``
+#: is the TOOL's parameter name; the plan stores it as ``type``. Keyed on the
+#: parameter name, the recovery creates a junk ``step_type`` key and leaves the
+#: real ``type`` — the field actually corrupted — untouched.
+_ABSORBED_STEP_TYPE = 'Do the thing.' + _close('description') + '\n' + _open_param('step_type') + 'test'
+
+#: The same shape with ``prereq_id``, which the plan stores as ``id``.
+_ABSORBED_PREREQ_ID = (
+    'A prerequisite.' + _close('description') + '\n' + _open_param('prereq_id') + 'pre-99'
+)
+
+
+class TestRecoveryTargetsAreRealPlanKeys:
+    """A recovered value lands on a DECLARED prose key, or nowhere at all.
+
+    Both correctness findings share one root cause: the walk keyed recoveries
+    on the TOOL's parameter names, which are not the PLAN's key names. The fix
+    is not a new collision check — ``repair()`` still makes every accept/refuse
+    decision (INV-5). It is that a parameter with no prose target is supplied
+    UNCONDITIONALLY, so ``repair()``'s existing B9 disjointness condition
+    refuses any candidate that would recover it.
+    """
+
+    def test_an_absorbed_files_argument_never_replaces_the_files_list(self):
+        """Measured before the fix: ``plan['files']`` came back a ``str``."""
+        plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=[])
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert isinstance(repaired['files'], list), (
+            'a recovered path string replaced the files LIST — the lock charter '
+            'and the merge gate both read this value'
+        )
+        assert repaired['files'] == []
+        assert repaired['title'] == _ABSORBED_FILES_TITLE
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'unrepairable'
+        assert facts[0]['field'] == 'title'
+        assert facts[0]['recovered_params'] == []
+
+    def test_a_non_empty_files_list_is_equally_untouched(self):
+        original = ['orchestrator/src/orchestrator/mcp/plan_tools.py']
+        plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=list(original))
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert repaired['files'] == original
+        assert repaired['title'] == _ABSORBED_FILES_TITLE
+        assert facts[0]['outcome'] == 'unrepairable'
+
+    def test_an_absorbed_step_type_creates_no_junk_key(self):
+        """Measured before the fix: the step gained ``step_type: 'test'``.
+
+        ...while ``type``, the field actually corrupted, stayed wrong — so the
+        repair reported success having fixed nothing and added a key no reader
+        of the plan schema expects.
+        """
+        step = {
+            'id': 'step-1',
+            'type': 'impl',
+            'description': _ABSORBED_STEP_TYPE,
+            'status': 'pending',
+            'commit': None,
+        }
+        plan = corrupt_plan(steps=[step])
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['steps'][0]
+        assert 'step_type' not in item, f'junk key written: {sorted(item)}'
+        assert item['type'] == 'impl'
+        assert item['description'] == _ABSORBED_STEP_TYPE
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'unrepairable'
+        assert facts[0]['recovered_params'] == []
+
+    def test_an_absorbed_prereq_id_creates_no_junk_key(self):
+        prereq = {
+            'id': 'pre-1',
+            'description': _ABSORBED_PREREQ_ID,
+            'status': 'pending',
+            'commit': None,
+            'tests': [],
+        }
+        plan = corrupt_plan(prerequisites=[prereq])
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['prerequisites'][0]
+        assert 'prereq_id' not in item, f'junk key written: {sorted(item)}'
+        assert item['id'] == 'pre-1'
+        assert item['description'] == _ABSORBED_PREREQ_ID
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'unrepairable'
+
+    def test_no_junk_key_survives_a_mixed_plan(self, tmp_path):
+        """The invariant, over every specimen at once and against REAL keys.
+
+        The allowed key sets are derived by building a plan through the actual
+        writers, exactly as the table test does — a hardcoded list here would
+        just be a second thing to keep in sync.
+        """
+        observed = _observed_plan_keys(tmp_path)
+        decisions = [
+            {'decision': _DECISION_PROSE, 'rationale': TRAILING_RATIONALE},
+            {'decision': 'A clean decision.', 'rationale': 'A clean rationale.'},
+        ]
+        plan = corrupt_plan(
+            title=_ABSORBED_FILES_TITLE,
+            files=[],
+            steps=[
+                {
+                    'id': 'step-1',
+                    'type': 'impl',
+                    'description': _ABSORBED_STEP_TYPE,
+                    'status': 'pending',
+                    'commit': None,
+                },
+            ],
+            prerequisites=[
+                {
+                    'id': 'pre-1',
+                    'description': _ABSORBED_PREREQ_ID,
+                    'status': 'pending',
+                    'commit': None,
+                    'tests': [],
+                },
+            ],
+            design_decisions=decisions,
+        )
+
+        repaired, _facts = plan_tools._repair_plan_fields(plan)
+
+        assert set(repaired) <= observed[None], (
+            f'top-level junk keys: {sorted(set(repaired) - observed[None])}'
+        )
+        for collection in ('prerequisites', 'steps', 'design_decisions', 'reuse'):
+            for index, item in enumerate(repaired[collection]):
+                junk = set(item) - observed[collection]
+                assert junk == set(), f'{collection}[{index}] junk keys: {sorted(junk)}'
+
+    def test_the_dominant_trailing_shapes_still_repair(self):
+        """The load-bearing no-over-refusal guard.
+
+        Supplying the non-target parameters unconditionally must not make the
+        repair conservative in general: 97 of the 118 live corrupted strings
+        have the trailing shape, and every one of them must still repair.
+        """
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
+        plan['reuse'][1]['how'] = TRAILING_HOW
+        plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
+        plan['analysis'] = _TRAILING_ANALYSIS
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        assert [f['outcome'] for f in facts] == ['repaired'] * 4
+        assert all(f['recovered_params'] == [] for f in facts)
+        assert repaired['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
+        assert repaired['reuse'][1]['how'] == _HOW_PROSE
+        assert repaired['steps'][0]['description'] == 'Clean step prose for the first step.'
+        assert repaired['analysis'] == 'Clean analysis prose describing the approach.'
+
+    def test_the_absorbed_sibling_recovery_still_fills_an_empty_sibling(self):
+        """``rationale`` IS a declared target, so step-7's recovery is intact."""
+        plan = _absorbed_decision(rationale='')
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['decision'] == _DECISION_PROSE
+        assert item['rationale'] == _RATIONALE_PROSE
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == ['rationale']
+
+
+# ---------------------------------------------------------------------------
 # step-9 — the atomic write helper, contract C3 / boundary row B12.
 # ---------------------------------------------------------------------------
 
