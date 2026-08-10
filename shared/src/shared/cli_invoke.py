@@ -2166,20 +2166,50 @@ def build_claude_argv(
     # back to a clean unlink of everything created so far, leaving no
     # orphaned temp files for the caller to worry about.
     try:
+        # Write system prompt to temp file to avoid ARG_MAX on large payloads.
+        #
+        # UNCONDITIONAL — including on resume (task 3983).  This used to live in
+        # the `else` below, on the belief that --system-prompt-file and --resume
+        # were incompatible.  They are NOT: probed on CLI 2.1.226, the pair is
+        # accepted and fails only on a nonexistent session id, i.e. past argument
+        # validation.  CLI CHANGELOG 2.0.64 — "Fixed --system-prompt being ignored
+        # when using --continue or --resume flags" — makes re-passing the intended
+        # usage.  The system prompt is a process-invocation parameter that is never
+        # persisted with the session, so omitting it on resume dropped the role
+        # charter entirely and the agent silently ran under the stock Claude Code
+        # prompt.
+        #
+        # REPLACE, not append: roles are RESTRICTIVE charters, and
+        # --append-system-prompt-file would layer them over the stock
+        # general-purpose identity that produced the role-disowning behaviour in
+        # the first place.  Replace also keeps fresh and resumed argv
+        # byte-identical.  Re-passing is a prompt-cache HIT; omitting it was a
+        # total cache MISS — this is cheaper than the status quo, not costlier.
+        #
+        # A resumed session gets the CURRENT role prompt, not a byte-replay of the
+        # original.  That is the intended semantics: no role prompt is templated
+        # with per-invocation task context (that lives in the USER prompt), though
+        # a few are built from live inputs that can shift between invocations —
+        # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
+        # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
+        # recon-verify is tool-list templated.
+        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        temp_files.append(sysprompt_path)
+        with open(fd, 'w') as f:
+            f.write(system_prompt)
+        cmd.extend(['--system-prompt-file', sysprompt_path])
+
         if resume_session_id:
-            # Resume an existing session — skip --system-prompt (incompatible)
+            # Resume an existing session.
             cmd.extend(['--resume', resume_session_id])
-        else:
-            # Write system prompt to temp file to avoid ARG_MAX on large payloads
-            fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
-            temp_files.append(sysprompt_path)
-            with open(fd, 'w') as f:
-                f.write(system_prompt)
-            cmd.extend(['--system-prompt-file', sysprompt_path])
+        elif session_id:
             # Pre-allocate the session UUID so future --resume can find it.
-            # --session-id and --resume are mutually exclusive at the CLI level.
-            if session_id:
-                cmd.extend(['--session-id', session_id])
+            # Unlike --system-prompt-file, --session-id IS genuinely exclusive
+            # with --resume, verbatim from the CLI: "--session-id can only be
+            # used with --continue or --resume if --fork-session is also
+            # specified."  So it stays in the branch while the system prompt
+            # does not.
+            cmd.extend(['--session-id', session_id])
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
