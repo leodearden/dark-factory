@@ -18,6 +18,7 @@ from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow_types import WorkflowState
 
 
 @pytest.fixture
@@ -300,3 +301,100 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
         # Cleanup: hard-cancel the wedged slot and drain.
         h.hard_cancel_workflow(tid)
         await asyncio.wait({wrapper_task}, timeout=5.0)
+
+
+async def _drive_cancelled_slot(
+    h: Harness,
+    tid: str,
+    *,
+    reason: str | None = None,
+    state: WorkflowState | None = WorkflowState.EXECUTE,
+    cancel_during_setup: bool = False,
+):
+    """Run a real _run_slot to its hard-cancel and return the synthetic report.
+
+    Reuses the driver shape of test_run_slot_returns_cancelled_report_when_hard
+    _cancelled: a live slot task with build_workflow patched to a wedging run(),
+    then hard_cancel_workflow.
+    """
+    assignment = TaskAssignment(task_id=tid, task={'title': 'wedged task'}, modules=[])
+    sem = asyncio.Semaphore(0)
+
+    with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
+        if cancel_during_setup:
+            # A cancel landing BEFORE `workflow` is bound.  The except handler
+            # must not touch an unbound local.
+            mock_wf_cls.side_effect = asyncio.CancelledError()
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+            done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
+            assert wrapper_task in done
+            return wrapper_task.result()
+
+        async def _wedge() -> None:
+            await asyncio.sleep(3600)
+
+        mock_wf = MagicMock()
+        mock_wf.run = _wedge
+        mock_wf.state = state
+        mock_wf_cls.return_value = mock_wf
+
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        for _ in range(50):
+            if tid in h._workflow_slot_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert tid in h._workflow_slot_tasks
+
+        if reason is None:
+            h.hard_cancel_workflow(tid)
+        else:
+            h.hard_cancel_workflow(tid, reason=reason)
+
+        done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
+        assert wrapper_task in done, 'wrapper_task did not finish within 5 s'
+        return wrapper_task.result()
+
+
+@pytest.mark.asyncio
+class TestHardCancelReportCarriesCause:
+    """A hard-cancelled slot's synthetic report must say WHY and WHERE (task 3172).
+
+    Before this, block_reason/block_phase both fell back to '', so a
+    drain-cancelled task was indistinguishable in runs.db from a
+    terminal-status cancel or an escalation-action teardown.
+    """
+
+    async def test_report_carries_the_attributed_cancel_reason(
+        self, harness_for_run_slot: Harness
+    ):
+        """The reason stamped by hard_cancel_workflow reaches the report."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', reason='terminal_status_cancel'
+        )
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.block_reason == 'terminal_status_cancel'
+
+    async def test_report_carries_the_live_workflow_phase(
+        self, harness_for_run_slot: Harness
+    ):
+        """block_phase reads the live workflow's own state, not a guess."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot,
+            '42',
+            reason='terminal_status_cancel',
+            state=WorkflowState.VERIFY,
+        )
+
+        assert report.block_phase == WorkflowState.VERIFY.value
+
+    async def test_setup_phase_cancel_reports_dispatch_setup(
+        self, harness_for_run_slot: Harness
+    ):
+        """A cancel landing before build_workflow must not raise UnboundLocalError."""
+        report = await _drive_cancelled_slot(
+            harness_for_run_slot, '42', cancel_during_setup=True
+        )
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.block_phase == 'dispatch_setup'
