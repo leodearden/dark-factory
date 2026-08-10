@@ -1514,42 +1514,64 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
     hand-builds its result) is no longer the sole evidence for the warm route.
 
     Note on reachability, so nobody mistakes these for live-path coverage: the
-    RunnerUnavailable is INJECTED.  A LOCAL lease dispatches ``runner=None``,
-    which builds a LocalRunner-only pool, and every raise site lives in
-    RemoteRunner or behind the INV-2 gate's ``isinstance(..., RemoteRunner)``
-    break — so today no local-lease verify can actually raise it, and REMOTE
-    leases (which can) skip the warm swap.  What is pinned here is the
-    CONTRACT: if the raise ever reaches this handler with a warm lane in hand,
-    the flag must ride along with the path it describes.
+    warm lane is derived by the real production helper, but the
+    RunnerUnavailable itself is INJECTED.  A LOCAL lease dispatches
+    ``runner=None``, which builds a LocalRunner-only pool, and every raise site
+    lives in RemoteRunner or behind the INV-2 gate's ``isinstance(...,
+    RemoteRunner)`` break — so today no local-lease verify can actually raise
+    it, and REMOTE leases (which can) skip the warm swap.  What is pinned here
+    is the CONTRACT: if the raise ever reaches this handler with a warm lane in
+    hand, the flag must ride along with the path it describes.
     """
 
-    def _make_item(self, tmp_path, merge_wt):
+    def _make_item(self, tmp_path, merge_wt, *, config=None, speculative=False):
         from orchestrator.merge_queue import RealMergeItem
 
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
         return RealMergeItem(
-            request=_make_merge_request(_make_config(), task_files=[], worktree=tmp_path),
+            request=_make_merge_request(
+                config or _make_config(), task_files=[], worktree=tmp_path,
+            ),
             merge_result=merge_result,
             merge_wt=merge_wt,
             base_sha='base123',
-            speculative=False,
+            speculative=speculative,
         )
 
     async def test_ru_local_lease_warm_lane_propagates_spec_warm(self, tmp_path):
-        """LOCAL lease + warm _spec- lane + RU raise → vr.spec_warm is True."""
+        """LOCAL lease + warm _spec- lane + RU raise → vr.spec_warm is True.
+
+        The warm swap is driven through the REAL ``_acquire_warm_verify_worktree``
+        (spec-lane-pool knob on + speculative item + valve disabled, the three
+        preconditions of its ``_spec-`` branch) with only ``git_ops`` stubbed —
+        never by monkeypatching the helper onto ``orchestrator.merge_queue``,
+        which ``test_merge_queue_reachback_patch_guard`` freezes.  So the True
+        asserted below is the value production would compute, not one injected.
+        """
+        from orchestrator.config import GitConfig, OrchestratorConfig
         from orchestrator.merge_queue import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
+        lane = tmp_path / '_spec-0'
+        lane.mkdir()
+        cold_wt = tmp_path / '_merge-cold'
+        cold_wt.mkdir()
+
         git_ops = _make_git_ops_mock()
+        # The one production input that decides warm-ness: the pool hands back a
+        # seeded lane.  Everything downstream of it is the real code path.
+        git_ops.acquire_spec_lane = AsyncMock(return_value=(lane, True))
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
 
-        cold_wt = tmp_path / '_merge-cold'
-        cold_wt.mkdir()
-        lane = tmp_path / '_spec-0'
-        lane.mkdir()
-        item = self._make_item(tmp_path, cold_wt)
+        config = OrchestratorConfig(
+            git=GitConfig(main_branch='main', merge_spec_warm_lane_pool=True),
+        )
+        # persistent_merge_worktree_safety_valve_every_n defaults to 0 → the
+        # inv.6 cold valve is disabled, so the _spec- branch is taken.
+        assert config.git.persistent_merge_worktree_safety_valve_every_n == 0
+        item = self._make_item(tmp_path, cold_wt, config=config, speculative=True)
 
         fake_local = MagicMock()
         fake_local.name = 'local'
@@ -1559,13 +1581,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         async def _raise_unavailable(*args, **kwargs):
             raise RunnerUnavailable('INV-2 contract-currency sync failed')
 
-        with (
-            patch(
-                'orchestrator.merge_queue._acquire_warm_verify_worktree',
-                new=AsyncMock(return_value=(lane, True)),
-            ),
-            patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable),
-        ):
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
             result = await worker._run_inflight_verify(item, lease)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
