@@ -44,8 +44,10 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
@@ -145,14 +147,40 @@ class _PlanField(NamedTuple):
     """One repairable plan field, and the tool schema it must validate against.
 
     ``collection`` is the plan key holding a LIST OF DICTS the field lives in,
-    or ``None`` for a top-level plan key. ``schema_params`` is the ORIGINATING
-    tool's full parameter list — what ``repair()`` checks a recovered name
-    against, so a recovery can never invent a parameter that tool never had.
+    or ``None`` for a top-level plan key.
+
+    ``schema_params`` and ``target_keys`` are DELIBERATELY ASYMMETRIC, and the
+    asymmetry is the whole point of carrying both.
+
+    ``schema_params`` is the ORIGINATING TOOL'S FULL PARAMETER LIST. ``repair()``
+    needs it complete so it can RECOGNISE a tail that names any real parameter
+    of that call — a name outside the list is not a leaked argument at all and
+    the candidate is refused.
+
+    ``target_keys`` is the strictly smaller subset of those parameters that name
+    a PROSE PLAN KEY a recovered value may legally be written to, mapped to the
+    key to write it under. The two vocabularies are NOT the same: the tool's
+    parameter names and the plan document's key names differ. A parameter absent
+    from ``target_keys`` is one of three things, and none of them is a legal
+    recovery target:
+
+    * an identifier the plan stores under a different key — ``prereq_id`` and
+      ``step_id`` are both written as ``id``;
+    * an enum the plan stores under a different key — ``step_type`` is written
+      as ``type``;
+    * a non-prose value — ``files`` is a list, ``task_id`` an identifier.
+
+    Keying a recovery on the parameter name alone would therefore write a JUNK
+    KEY onto the record (``step_type`` beside the real, still-corrupt ``type``)
+    or a bare ``str`` over the ``files`` list. Both are silent-wrong-value
+    corruption of the plan artifact, which is the damage class this surface
+    exists to end.
     """
 
     collection: str | None
     field: str
     schema_params: tuple[str, ...]
+    target_keys: Mapping[str, str]
 
 
 # The parameter tuples of the five tools that AUTHOR plan prose. Spelled once
@@ -166,6 +194,30 @@ _ADD_PLAN_STEP_PARAMS = ('step_id', 'step_type', 'description')
 _ADD_DESIGN_DECISION_PARAMS = ('decision', 'rationale')
 _ADD_REUSE_ITEM_PARAMS = ('what', 'where', 'how')
 
+# Which of those parameters name a PROSE PLAN KEY, and which key. Spelled one
+# mapping per tool alongside its parameter tuple above so the two read together,
+# and wrapped in MappingProxyType for the same reason the tuples are tuples: a
+# DECLARED surface that could be mutated at runtime is not auditable.
+#
+# Note what is MISSING from each, deliberately. ``task_id`` and ``files`` are
+# not prose. ``prereq_id`` and ``step_id`` are stored as ``id``; ``step_type``
+# is stored as ``type`` — so keying a recovery on the parameter name would
+# create a junk key and leave the real one corrupt. The plan-key values are
+# machine-checked against a plan built by these very tools and read back
+# (``TestRepairableFieldTable::test_every_target_value_is_a_key_the_real_writers_produce``),
+# so this mapping cannot drift from what the writers actually produce.
+_CREATE_PLAN_TARGETS: Mapping[str, str] = MappingProxyType(
+    {'title': 'title', 'analysis': 'analysis'}
+)
+_ADD_PREREQUISITE_TARGETS: Mapping[str, str] = MappingProxyType({'description': 'description'})
+_ADD_PLAN_STEP_TARGETS: Mapping[str, str] = MappingProxyType({'description': 'description'})
+_ADD_DESIGN_DECISION_TARGETS: Mapping[str, str] = MappingProxyType(
+    {'decision': 'decision', 'rationale': 'rationale'}
+)
+_ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
+    {'what': 'what', 'where': 'where', 'how': 'how'}
+)
+
 #: THE declared enumeration of the repairable surface. Adding a prose field to
 #: the plan schema means ADDING A ROW HERE — nothing infers the surface.
 #:
@@ -177,15 +229,21 @@ _ADD_REUSE_ITEM_PARAMS = ('what', 'where', 'how')
 #: :func:`_coerce_files`) and every future non-prose key, rewriting values this
 #: surface has no business touching.
 _REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...] = (
-    _PlanField(None, 'title', _CREATE_PLAN_PARAMS),
-    _PlanField(None, 'analysis', _CREATE_PLAN_PARAMS),
-    _PlanField('prerequisites', 'description', _ADD_PREREQUISITE_PARAMS),
-    _PlanField('steps', 'description', _ADD_PLAN_STEP_PARAMS),
-    _PlanField('design_decisions', 'decision', _ADD_DESIGN_DECISION_PARAMS),
-    _PlanField('design_decisions', 'rationale', _ADD_DESIGN_DECISION_PARAMS),
-    _PlanField('reuse', 'what', _ADD_REUSE_ITEM_PARAMS),
-    _PlanField('reuse', 'where', _ADD_REUSE_ITEM_PARAMS),
-    _PlanField('reuse', 'how', _ADD_REUSE_ITEM_PARAMS),
+    _PlanField(None, 'title', _CREATE_PLAN_PARAMS, _CREATE_PLAN_TARGETS),
+    _PlanField(None, 'analysis', _CREATE_PLAN_PARAMS, _CREATE_PLAN_TARGETS),
+    _PlanField(
+        'prerequisites', 'description', _ADD_PREREQUISITE_PARAMS, _ADD_PREREQUISITE_TARGETS
+    ),
+    _PlanField('steps', 'description', _ADD_PLAN_STEP_PARAMS, _ADD_PLAN_STEP_TARGETS),
+    _PlanField(
+        'design_decisions', 'decision', _ADD_DESIGN_DECISION_PARAMS, _ADD_DESIGN_DECISION_TARGETS
+    ),
+    _PlanField(
+        'design_decisions', 'rationale', _ADD_DESIGN_DECISION_PARAMS, _ADD_DESIGN_DECISION_TARGETS
+    ),
+    _PlanField('reuse', 'what', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
+    _PlanField('reuse', 'where', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
+    _PlanField('reuse', 'how', _ADD_REUSE_ITEM_PARAMS, _ADD_REUSE_ITEM_TARGETS),
 )
 
 #: The MCP tool that AUTHORED each collection, for the structured fact's
