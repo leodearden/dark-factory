@@ -276,11 +276,17 @@ class TestTerminalAutoResolve:
 
     @pytest.mark.asyncio
     async def test_blocker_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,action}.
+        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,level,action}.
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field Escalation dump. After step-2, the shape is normalized to
-        the minimal four-field contract plus 'action' from the blocker wrapper.
+        the minimal contract plus 'action' from the blocker wrapper.
+
+        Task 3236 adds exactly one field, 'level': the response contract
+        documents 'level' as the way a caller confirms its requested level
+        landed, so omitting it here would leave a caller written to that
+        contract with a KeyError on this branch.  The invariant this pin
+        actually guards — no full-record dump — is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('done')
@@ -288,18 +294,20 @@ class TestTerminalAutoResolve:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'action'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level', 'action'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys}, got: {set(result.keys())}"
         )
 
     @pytest.mark.asyncio
     async def test_info_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by} (no 'action').
+        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by,level} (no 'action').
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field dump. After step-2, the shape is normalized to the minimal
-        four-field contract — no 'action' key (that is blocker-only).
+        contract — no 'action' key (that is blocker-only).  Task 3236 adds
+        'level' (see the blocker-side sibling for why); the no-full-dump
+        invariant this pin guards is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('cancelled')
@@ -307,7 +315,7 @@ class TestTerminalAutoResolve:
 
         result = await _info(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys} (no 'action'), got: {set(result.keys())}"
         )

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import types
 from datetime import UTC, datetime
@@ -5860,16 +5861,34 @@ class TestEscalateBlockerLevelParam:
         assert queue.get_pending() == [], 'level=2 must not submit any record'
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('bad_level', [-1, 3, 99])
-    async def test_out_of_range_level_rejected(self, tmp_path: Path, bad_level: int):
-        """An out-of-range level is rejected with {'error': ...} and submits nothing."""
+    @pytest.mark.parametrize(
+        'bad_level',
+        [
+            # Out-of-range ints.
+            -1, 3, 99,
+            # bool is an int subclass, so a bare `level in {0, 1}` check would
+            # read True as level=1 and False as level=0.  The guard rejects
+            # bool explicitly; without these cases that branch is untested.
+            True, False,
+            # Non-int types a JSON/MCP client can realistically send.
+            '1', '0', None, 1.0,
+        ],
+    )
+    async def test_out_of_range_level_rejected(self, tmp_path: Path, bad_level: Any):
+        """A non-{0,1} level is rejected with {'error': ...} and submits nothing.
+
+        Covers three guard branches: the range check, the ``isinstance(level,
+        bool)`` rejection (bool is an int subclass, so ``True`` must NOT be
+        read as ``level=1``), and the ``not isinstance(level, int)`` rejection
+        for string/None/float clients.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
         result = await _blocker(server, level=bad_level, **_COMMON_KWARGS)
 
-        assert 'error' in result, f'level={bad_level}: expected error, got: {result}'
-        assert queue.get_pending() == [], f'level={bad_level} must not submit any record'
+        assert 'error' in result, f'level={bad_level!r}: expected error, got: {result}'
+        assert queue.get_pending() == [], f'level={bad_level!r} must not submit any record'
 
     @pytest.mark.asyncio
     async def test_born_at_l2_severity_keeps_precedence_over_level1(self, tmp_path: Path):
@@ -5891,3 +5910,166 @@ class TestEscalateBlockerLevelParam:
         esc = queue.get(result['id'])
         assert esc is not None
         assert esc.level == 2, f'Expected born-at-L2 to win, got level={esc.level}'
+
+
+class TestUnexpectedLevel1FilerIsObservable:
+    """A non-steward ``level=1`` filing is ALLOWED but logged at WARNING.
+
+    Level 1 skips the steward, is read by escalation-watcher-auto (which can
+    promote to L2), and pins the task via QUEUE_HANDOFF independently of the
+    filer — so a non-steward role reaching for it is worth recording.  It is
+    deliberately NOT rejected: ``agent_role`` is a caller-supplied MCP argument
+    (a gate on it is defeated by passing the string), and a hard reject would
+    drop a legitimate steward re-escalation filed under an unexpected role
+    spelling — the very swallow this task fixes.  These tests pin the
+    observability, i.e. that the bypass is never silent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_steward_level1_is_filed_and_warned(self, tmp_path: Path, caplog):
+        """An implementer filing level=1 still lands, and logs a WARNING naming it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _blocker(
+                server, level=1,
+                **{**_COMMON_KWARGS, 'agent_role': 'implementer', 'task_id': 'task-777'},
+            )
+
+        # The record is NOT rejected — fail-safe beats fail-closed here.
+        assert 'error' not in result, f'A non-steward L1 must still be filed: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 1, f'Expected the L1 to persist, got level={esc.level}'
+
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        matching = [m for m in warnings if 'implementer' in m and 'task-777' in m]
+        assert matching, (
+            'Expected a WARNING naming the filing role and task_id so the '
+            f'steward bypass is observable; got warnings: {warnings}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_steward_level1_is_not_warned(self, tmp_path: Path, caplog):
+        """The steward's own level=1 is the expected shape — no warning noise."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _blocker(
+                server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        unexpected = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and 'Level-1 escalation filed by' in r.message
+        ]
+        assert unexpected == [], (
+            f'The steward is the documented L1 filer — no warning expected, got: {unexpected}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_level0_never_warns_regardless_of_role(self, tmp_path: Path, caplog):
+        """The default level=0 path is untouched: no warning for any role."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            await _blocker(server, **{**_COMMON_KWARGS, 'agent_role': 'implementer'})
+
+        unexpected = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and 'Level-1 escalation filed by' in r.message
+        ]
+        assert unexpected == [], f'level=0 must not warn, got: {unexpected}'
+
+
+class TestLevelEchoIsPresentOnEveryResponseBranch:
+    """``level`` is documented as the way a caller confirms its level landed.
+
+    escalate_blocker's docstring says "``level`` echoes the level actually
+    persisted, so a caller that passed ``level=1`` can confirm it landed".  A
+    caller written to that contract (``result['level'] == 1``) must not hit a
+    KeyError on any branch — least of all the degraded fail-open branch, which
+    exists precisely to survive the race where a re-read is unavailable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queued_branch_echoes_level(self, tmp_path: Path):
+        """The ordinary queued response carries the persisted level."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
+
+    @pytest.mark.asyncio
+    async def test_fail_open_branch_still_echoes_level(self, tmp_path: Path):
+        """A post-write re-read that RAISES still yields a response carrying level.
+
+        This is the degraded path the fail-open exists for: the filing must be
+        reported as queued rather than lost, and the contract-following caller
+        must still be able to read ``level``.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        real_get = queue.get
+
+        def _boom(esc_id: str):
+            raise OSError('simulated re-read failure')
+
+        queue.get = _boom  # type: ignore[method-assign]
+        try:
+            result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        finally:
+            queue.get = real_get  # type: ignore[method-assign]
+
+        assert result.get('status') == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result.get('level') == 1, (
+            f'The fail-open branch must still echo the level written, got: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_skipped_branch_echoes_level(self, tmp_path: Path):
+        """A folded filing echoes its level (== the parent's, folding is level-scoped)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        kwargs = {
+            **_COMMON_KWARGS,
+            'agent_role': 'steward',
+            'category': 'infra_issue',
+            'summary': 'docker daemon unreachable',
+        }
+        first = await _blocker(server, level=1, **kwargs)
+        second = await _blocker(server, level=1, **kwargs)
+
+        assert second.get('status') == 'dedup_skipped', (
+            f'Expected the second filing to fold into the first ({first}), got: {second}'
+        )
+        assert second.get('level') == 1, (
+            f'The dedup_skipped branch must echo the level too, got: {second}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_auto_resolve_branch_echoes_level(self, tmp_path: Path):
+        """The terminal-task auto-resolve response carries the persisted level."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        async def _terminal_lookup(task_id: str) -> str:
+            return 'done'
+
+        server = create_server(queue, task_status_lookup=_terminal_lookup)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result.get('status') != 'queued', (
+            f'Expected the terminal-task auto-resolve branch, got: {result}'
+        )
+        assert result.get('level') == 1, (
+            f'The auto-resolve branch must echo the level too, got: {result}'
+        )

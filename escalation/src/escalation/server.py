@@ -21,7 +21,6 @@ from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.dedupe import DedupeConfig
-from escalation.dedupe import observed_submit_response as _observed_submit_response
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
     AGENT_FILABLE_LEVELS,
@@ -32,6 +31,7 @@ from escalation.models import (
     EvidenceEntry,
 )
 from escalation.queue import EscalationQueue
+from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,49 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     through to the downgrade path instead of raising ``AttributeError``.
     """
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+# The role the steward's own filings carry (orchestrator.steward
+# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# steward's documented recourse, so an L1 from this role — or from a harness
+# sentinel — is the EXPECTED shape and is not logged.
+_EXPECTED_L1_FILER_ROLE = 'steward'
+
+
+def _warn_if_unexpected_l1_filer(agent_role: str, task_id: str, category: str) -> None:
+    """Log a WARNING when a non-steward, non-sentinel role files at ``level=1``.
+
+    Task 3236 amendment.  ``level=1`` is deliberately NOT role-gated, and that
+    is a considered choice rather than an oversight:
+
+    - ``agent_role`` is a free-form MCP tool argument, not an enforced
+      property.  A hard gate on ``agent_role == 'steward'`` is defeated by any
+      caller that simply passes that string, so it would buy the APPEARANCE of
+      authority enforcement without the substance.
+    - Worse, a hard REJECT is not fail-safe.  The steward briefing does not
+      mandate any particular ``agent_role`` spelling, so a steward filing under
+      a different string would have its re-escalation rejected and lost —
+      re-introducing precisely the swallowed-re-escalation failure this task
+      exists to fix.  The C4/D3 severity precedent is a DOWNGRADE (the record
+      still lands), never a rejection.
+
+    So the level axis is closed by OBSERVABILITY instead of by a gate: every
+    unexpected L1 filing is loud and attributable in the server log, honouring
+    the loud-over-silent-degradation norm.  ``_ESCALATION_INSTRUCTIONS`` in
+    ``orchestrator.agents.roles`` states the same thing to agents.
+    """
+    role = agent_role or ''
+    if role == _EXPECTED_L1_FILER_ROLE or _is_harness_sentinel_role(role):
+        return
+    logger.warning(
+        'Level-1 escalation filed by agent_role=%r (task_id=%r, category=%r), '
+        'which is neither %r nor a harness sentinel. Level 1 skips the steward, '
+        'is read by escalation-watcher-auto (which may promote to L2), and pins '
+        'the task via QUEUE_HANDOFF independently of the filer. This is allowed '
+        'but recorded: agent_role is caller-supplied, so it is observed, not '
+        'enforced.',
+        role, task_id, category, _EXPECTED_L1_FILER_ROLE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,16 +392,19 @@ def create_server(
         ``level=2``.  Folding them into an existing parent (which retains its
         original lower level) would silently drop the L2 routing signal.
 
-        Response shapes (from dedupe.submit_or_dedupe):
+        Response shapes (from dedupe.submit_or_dedupe).  ``level`` is present on
+        every branch:
         - Queued:        ``{'id': esc_id, 'status': 'queued', 'level': <persisted>}``
         - Auto-resolved/dismissed (the record was NOT pending after the write,
           e.g. a concurrent sweep won the race): ``{'id', 'status',
           'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
           function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
           post-write state rather than write intent, and fail open to
-          ``'queued'`` when the re-read is unavailable.
+          ``'queued'`` — carrying ``esc.level`` — when the re-read is
+          unavailable.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
-                            'parent_id': parent_id, 'child_id': esc.id}``
+                            'parent_id': parent_id, 'child_id': esc.id,
+                            'level': esc.level}``
           (never returned for L2 escalations — they always produce 'queued')
 
         Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
@@ -370,8 +416,9 @@ def create_server(
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc_id = queue.submit(esc)
             # Task 3236: this branch does NOT route through dedupe, so it needs
-            # the observed-state response separately.  Fail-open to 'queued'.
-            return _observed_submit_response(queue, esc_id)
+            # the observed-state response separately.  Fail-open to 'queued'
+            # (still carrying esc.level, so the 'level' echo is never missing).
+            return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
     # --- Terminal-task chokepoint helper ---
@@ -484,6 +531,10 @@ def create_server(
                 'status': resolved.status,
                 'resolution': resolved.resolution,
                 'resolved_by': resolved.resolved_by,
+                # Task 3236: `resolved` is the persisted record, so echoing its
+                # level costs no read and keeps the documented 'level' echo
+                # present on this branch too.
+                'level': resolved.level,
             }
 
         # Non-terminal or unknown status → submit normally
@@ -533,11 +584,11 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape:
+        Response shape (``level`` is present on every branch):
         - Queued (task alive):    ``{id, status, level}``  where status='queued'
-        - Deduped (folded):       ``{id, status, parent_id, child_id}``
+        - Deduped (folded):       ``{id, status, parent_id, child_id, level}``
           (L2 escalations are never deduped — they always produce 'queued')
-        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
+        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by, level}``
         - Already resolved/dismissed at filing time (a concurrent resolver or
           sweep won the race): ``{id, status, resolution, resolved_by, level}``
           with the record's REAL status — the response reports observed
@@ -614,6 +665,13 @@ def create_server(
         ``level != 0`` record to QUEUE_HANDOFF, so it pins the task independently
         of the filer's liveness.
 
+        ``level=1`` is not restricted to any role — ``agent_role`` is
+        caller-supplied and so cannot be enforced, and a hard reject would lose
+        a steward re-escalation filed under an unexpected role string.  It is
+        instead OBSERVED: a level=1 filing from a role that is neither
+        ``'steward'`` nor a harness sentinel is logged at WARNING naming the
+        role and task_id.  The record is still filed.
+
         Only ``{0, 1}`` are accepted — anything else (including ``2``) is
         rejected with an ``{'error': ...}`` response and NOTHING is submitted.
         Agents must not self-mint L2: the legitimate routes there are a
@@ -632,18 +690,21 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape always includes ``action='terminate_cleanly'`` plus:
+        Response shape always includes ``action='terminate_cleanly'`` and
+        ``level`` (on EVERY branch, including the fail-open one) plus:
         - Queued:        ``{id, status, level, action}``  where status='queued'
-        - Deduped:       ``{id, status, parent_id, child_id, action}``
+        - Deduped:       ``{id, status, parent_id, child_id, level, action}``
           (L2 escalations are never deduped — they always produce 'queued')
-        - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
+        - Auto-resolved: ``{id, status, resolution, resolved_by, level, action}``
         - Already resolved/dismissed at filing time (a concurrent resolver or
           sweep won the race): ``{id, status, resolution, resolved_by, level,
           action}`` with the record's REAL status.  Task 3236: the response
           reports observed post-write state, never write intent — a
           ``status='queued'`` reply now means the record really was pending
-          after the write.  ``level`` echoes the level actually persisted, so a
-          caller that passed ``level=1`` can confirm it landed.
+          after the write.  ``level`` echoes the level actually persisted
+          (falling back to the level written when a post-write re-read is
+          unavailable), so a caller that passed ``level=1`` can confirm it
+          landed without risking a ``KeyError`` on a degraded path.
           Callers needing the full record can call get_escalation(id).
         """
         if severity not in KNOWN_SEVERITIES:
@@ -669,6 +730,11 @@ def create_server(
                     'or use promote_to_l2.'
                 ),
             }
+        # Level=1 is not role-gated (see _warn_if_unexpected_l1_filer for why a
+        # gate on caller-supplied agent_role would be both defeatable and
+        # fail-dangerous); an unexpected filer is made observable instead.
+        if level == 1:
+            _warn_if_unexpected_l1_filer(agent_role, task_id, category)
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,

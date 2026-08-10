@@ -168,6 +168,15 @@ steward); if the steward cannot resolve it, re-escalate by passing `level=1` to
 human is needed).  `escalate_blocker` accepts only `level=0` (the default) or
 `level=1` — anything else is rejected with an `{'error': ...}` response and
 nothing is filed.
+
+**`level=1` is the STEWARD's route, not yours.** As a non-steward role your
+filings belong at `level=0` (the default): that is where the steward — the
+consumer that can actually resolve your blocker — reads them.  Level 1 skips
+the steward entirely and goes to the auto-watcher.  The server does not reject
+a non-steward `level=1`, because `agent_role` is caller-supplied and a reject
+would lose a legitimate steward filing — but every one is **logged at WARNING
+naming your role and task_id**.  Filing at level 1 to jump the queue buys no
+faster resolution, only an audit trail showing you bypassed your handler.
 """
 
 _MEMORY_TOOLS = [

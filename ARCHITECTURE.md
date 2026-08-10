@@ -615,7 +615,14 @@ flowchart LR
   retry/timeout/empty-output cap, or finds its worktree missing at preflight.
   Deliberately, a steward that judges an L0 beyond its own reach re-escalates
   by calling `escalate_blocker(..., level=1)` (task 3236); `level` accepts only
-  `{0, 1}`, since an agent must not self-mint an L2. Either way the record is
+  `{0, 1}`, since an agent must not self-mint an L2. `level=1` is **observed,
+  not role-gated**: `agent_role` is a caller-supplied MCP argument, so a gate
+  on it would be defeated by passing the string, and a hard reject would drop a
+  legitimate steward re-escalation filed under an unexpected role spelling —
+  the very swallow task 3236 fixes. A `level=1` from a role that is neither
+  `steward` nor a harness sentinel is therefore filed *and* logged at WARNING
+  naming the role and task_id. (Contrast the severity axis, which fails safe by
+  *downgrading* rather than rejecting — see Born-at-L2 below.) Either way the record is
   outside the workflow's level=0 dismissal sweeps by construction, is visible
   to the level-filtering auto-watcher, and pins the task via
   `escalation.pins` QUEUE_HANDOFF regardless of the filer's liveness. A
