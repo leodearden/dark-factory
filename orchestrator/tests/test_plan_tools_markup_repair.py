@@ -939,3 +939,104 @@ class TestAtomicWritePlan:
 
         assert target.read_bytes() == before_bytes
         assert set(plan_dir.iterdir()) == before_entries
+
+
+# ---------------------------------------------------------------------------
+# step-11 — the write-back must PRESERVE the lane plan symlink.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def lane_and_meta(tmp_path):
+    """The real meta-root plan plus the absolute lane symlink onto it.
+
+    Reproduces exactly what ``TaskArtifacts.ensure_lane_plan_symlink`` builds:
+    ``<worktree>/.task/plan.json`` is an ABSOLUTE symlink to the durable
+    meta-root plan, so the lane copy can never diverge from it.
+    """
+    meta = tmp_path / 'meta'
+    meta.mkdir()
+    real_plan = meta / 'plan.json'
+    real_plan.write_text(json.dumps({'task_id': 'test-1'}, indent=2) + '\n')
+
+    lane_task = tmp_path / 'worktree' / '.task'
+    lane_task.mkdir(parents=True)
+    lane_plan = lane_task / 'plan.json'
+    os.symlink(real_plan, lane_plan)
+    return lane_plan, real_plan
+
+
+class TestAtomicWritePlanFollowsSymlink:
+    """A naive os.replace onto the lane path would EAT the symlink.
+
+    ``TaskArtifacts.ensure_lane_plan_symlink`` makes the lane plan an absolute
+    symlink onto the meta-root copy, and ``_artifacts_from_args`` still
+    supports ``meta_root=None`` where ``self.root`` IS ``<worktree>/.task`` —
+    so ``self.root / 'plan.json'`` can be that symlink. Replacing it with a
+    regular file would silently RE-FORK the lane and meta-root copies, which is
+    the esc-5205-9 stale-plan divergence the symlink exists to make impossible.
+    """
+
+    def test_symlink_survives_and_the_real_file_receives_the_write(
+        self, lane_and_meta, monkeypatch
+    ):
+        lane_plan, real_plan = lane_and_meta
+        link_target_before = os.readlink(lane_plan)
+        spies = _AtomicSpies(monkeypatch)
+
+        plan_tools._atomic_write_plan(lane_plan, corrupt_plan(title='written'))
+
+        assert lane_plan.is_symlink(), 'the lane symlink was replaced by a file'
+        assert os.readlink(lane_plan) == link_target_before
+        assert json.loads(real_plan.read_text())['title'] == 'written'
+        # And the lane path still resolves to the same single source of truth.
+        assert json.loads(lane_plan.read_text())['title'] == 'written'
+        assert spies.replace_calls[0]['dst'] == real_plan
+
+    def test_temp_lands_beside_the_REAL_file_not_beside_the_symlink(
+        self, lane_and_meta, monkeypatch
+    ):
+        """The mechanism, not a side effect.
+
+        Resolving first is what keeps the rename intra-filesystem (the lane and
+        the meta root need not share one) AND what stops the replace from
+        eating the link.
+        """
+        lane_plan, real_plan = lane_and_meta
+        spies = _AtomicSpies(monkeypatch)
+
+        plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
+
+        assert spies.mkstemp_dirs == [real_plan.parent]
+        assert spies.mkstemp_dirs != [lane_plan.parent]
+
+    def test_no_temp_residue_in_either_directory(self, lane_and_meta):
+        lane_plan, real_plan = lane_and_meta
+
+        plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
+
+        assert {p.name for p in real_plan.parent.iterdir()} == {'plan.json'}
+        assert {p.name for p in lane_plan.parent.iterdir()} == {'plan.json'}
+
+    def test_dangling_symlink_fails_loudly_without_materialising_a_file(self, tmp_path):
+        """A broken link must NOT quietly become a stray regular file.
+
+        Materialising one at the link path is the divergence itself: the lane
+        would hold a plan the meta root has never seen.
+        """
+        lane_task = tmp_path / 'worktree' / '.task'
+        lane_task.mkdir(parents=True)
+        lane_plan = lane_task / 'plan.json'
+        missing = tmp_path / 'gone' / 'plan.json'
+        os.symlink(missing, lane_plan)
+        assert lane_plan.is_symlink() and not lane_plan.exists()
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
+
+        message = str(excinfo.value)
+        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
+        assert str(missing) in message, 'the RESOLVED path must be named too'
+        assert lane_plan.is_symlink()
+        assert not lane_plan.exists(), 'a stray regular file was materialised'
+        assert {p.name for p in lane_task.iterdir()} == {'plan.json'}
