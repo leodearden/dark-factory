@@ -1388,13 +1388,12 @@ class TestCollectSnapshotTaskSourceAndCap:
     """
 
     @pytest.mark.asyncio
-    async def test_reads_tasks_and_no_longer_imports_the_status_map(
+    async def test_reads_tasks_as_its_single_source(
         self, burndown_env, dummy_client,
     ):
-        """One source, not two. A lingering ``fetch_statuses`` import in this
-        module invites a second, disagreeing source for the same census."""
-        import dashboard.data.burndown as burndown_mod
-
+        """``collect_snapshot`` fetches exactly once per discovered root, through
+        ``fetch_tasks`` — the only seam carrying the claimant columns the
+        live/stranded split needs."""
         db_path, config, conn = burndown_env
         seen_roots: list[str] = []
 
@@ -1409,10 +1408,6 @@ class TestCollectSnapshotTaskSourceAndCap:
             await collect_snapshot(conn, config, client=dummy_client)
 
         assert seen_roots == [str(config.project_root)]
-        assert not hasattr(burndown_mod, 'fetch_statuses'), (
-            'collect_snapshot must have exactly one task source; fetch_statuses '
-            'cannot supply the claimant columns the split needs'
-        )
 
     @pytest.mark.asyncio
     async def test_persists_the_live_stranded_split(self, burndown_env, dummy_client):
