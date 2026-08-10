@@ -7250,6 +7250,7 @@ class Harness:
             return
 
         from escalation.models import Escalation  # noqa: PLC0415
+
         from orchestrator.cross_repo_gate import SIGNAL_MARKER  # noqa: PLC0415
 
         owner = verdict.owner_project
