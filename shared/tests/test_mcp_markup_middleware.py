@@ -56,6 +56,7 @@ byte-identical at runtime and never appears verbatim in the file text.
 """
 from __future__ import annotations
 
+import contextlib
 import enum
 import json
 from pathlib import Path
@@ -1200,13 +1201,13 @@ class TestINV2StructuredFacts:
         seen = set()
         for policy in RepairPolicy:
             forward = build_harness(policy)
-            try:
+            # One tier forwards this and the other rejects it; the point here
+            # is which outcome each EMITS, so the raise is beside the point.
+            with contextlib.suppress(ToolError):
                 await forward.call(
                     'escalate_info',
                     {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
                 )
-            except ToolError:
-                pass
             refuse = build_harness(policy)
             with pytest.raises(ToolError):
                 await refuse.call(
@@ -1308,7 +1309,7 @@ class TestINV2StructuredFacts:
         assert h.facts[0]['recovered_params'] == ['priority']
         assert 'low' not in json.dumps(h.facts[0]), 'the recovered VALUE leaked into the fact'
 
-    async def test_recovered_params_never_carries_the_absorbing_value_either(self):
+    async def test_no_recovered_value_and_no_payload_rides_along(self):
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError):
@@ -1319,8 +1320,57 @@ class TestINV2StructuredFacts:
 
         assert sorted(h.facts[0]['recovered_params']) == ['agent_id', 'metadata', 'priority']
         serialized = json.dumps(h.facts[0])
-        assert 'claude-x' not in serialized
-        assert 'Fix it.' not in serialized
+        assert '{"source": "probe"}' not in serialized, 'a recovered value leaked'
+        assert 'Fix it.' not in serialized, 'the absorbing value leaked'
+
+    async def test_an_agent_id_the_leak_SWALLOWED_still_attributes_the_leak(self):
+        """The one recovered value the fact may carry — because it is not a
+        value, it is the attribution.
+
+        PRD section 2.1's first specimen has the leak swallowing ``agent_id``
+        itself, so resolving identity from the pre-repair arguments would blank
+        the attribution on the single most common corruption shape — losing the
+        one thing "who is leaking?" exists to answer.
+
+        Safe because the repair VALIDATED: repair() only returns a recovery
+        whose names are disjoint from the supplied ones (B9), so this can never
+        overwrite an ``agent_id`` the caller actually sent. And it is coherent
+        with what the same rejection already does — ``repaired_call`` hands this
+        exact value back and tells the caller to resend it, so treating it as
+        untrustworthy for attribution alone would be incoherent.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {'title': 'A task', 'description': TestB2TotalDrift.DESCRIPTION},
+            )
+
+        assert h.facts[0]['agent_id'] == 'claude-x'
+        assert _reject_payload(excinfo)['repaired_call']['agent_id'] == 'claude-x'
+
+    async def test_a_supplied_agent_id_always_wins_over_the_tail(self):
+        """The other side of that decision, and the one that must not slip.
+
+        B9 makes a colliding tail unrepairable outright, so the recovered value
+        never reaches identity resolution at all — but this pins the OUTCOME
+        rather than the mechanism, so a future refactor cannot quietly start
+        preferring the tail.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'submit_task',
+                {
+                    'title': 'A task',
+                    'description': TestB9RecoveredNameCollidesWithASuppliedArgument.DESCRIPTION,
+                    'agent_id': 'claude-the-caller',
+                },
+            )
+
+        assert h.facts[0]['agent_id'] == 'claude-the-caller'
 
     async def test_recovered_params_is_empty_for_the_last_parameter_case(self):
         """B4 recovers nothing, and an empty list is the honest report of that.

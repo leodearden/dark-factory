@@ -104,6 +104,10 @@ _OUTCOME_REJECTED = 'rejected'
 _OUTCOME_UNREPAIRABLE = 'unrepairable'
 OUTCOMES: tuple[str, ...] = (_OUTCOME_REPAIRED, _OUTCOME_REJECTED, _OUTCOME_UNREPAIRABLE)
 
+#: The fact names itself, so a multiplexed sink does not have to infer a
+#: record's type from which callable it arrived on.
+FACT_MARKUP_DETECTED = 'markup_detected'
+
 #: Surfaced at the point of rejection, mirroring markup_tripwire's
 #: ``_MARKUP_HINT``: the remediation must be discoverable where the caller is
 #: bounced, not only in documentation it may never have read.
@@ -348,15 +352,115 @@ class MarkupGuardMiddleware(Middleware):
         """
         fix = repair(value, param, await self._schema_params(context, name), tuple(arguments))
 
+        # All three emissions sit SIDE BY SIDE, and every one of them runs
+        # BEFORE its outcome is delivered. Two reasons. The detection is a fact
+        # whether or not the tool then succeeds, so emitting after ``call_next``
+        # would lose it to any tool that raises. And keeping the three calls in
+        # one function is what makes "the eight keys cannot drift between
+        # paths" visible rather than merely intended.
         if fix is None:
-            self._refuse_unrepairable(name, arguments, param, value, pattern)
+            # Identity from the RAW arguments: no recovery validated, so
+            # nothing from the tail may be believed.
+            identity = self._identity(arguments)
+            self._emit_fact(
+                name, identity, param, pattern,
+                outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
+            )
+            self._refuse_unrepairable(name, identity, param, value, pattern)
+
+        # Identity from the REPAIRED view. If the leak ate the caller's own
+        # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
+        # then reporting the pre-repair ``None`` would lose the one thing the
+        # attribution exists for. Reading the recovery cannot overwrite a
+        # supplied value: repair() only validates when the recovered names are
+        # DISJOINT from the supplied ones (boundary row B9).
+        identity = self._identity({**arguments, **fix.recovered})
 
         if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
+            self._emit_fact(
+                name, identity, param, pattern,
+                outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
+            )
             return self._reject(name, arguments, param, fix)
 
+        self._emit_fact(
+            name, identity, param, pattern,
+            outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
+        )
         return await self._forward(context, call_next, arguments, param, fix)
 
-    def _refuse_unrepairable(self, name, arguments, param, value, pattern) -> NoReturn:
+    # -- facts (INV-2) ----------------------------------------------------
+
+    def _emit_fact(
+        self,
+        tool: str,
+        identity: tuple[str | None, str | None],
+        param: str,
+        pattern: str,
+        *,
+        outcome: str,
+        misclose: str | None,
+        recovered: Any,
+    ) -> None:
+        """Emit one ``markup_detected`` (INV-2), and never change an outcome.
+
+        ONE builder for all three paths, so the contracted key set cannot drift
+        between them. The record is COMPLETE even where the answer is ``None``:
+        the unrepairable path has no accepted mis-close — that is precisely why
+        it is unrepairable — so ``misclose`` is present and null rather than
+        absent, and a consumer never has to tell "no mis-close" apart from "that
+        emitter forgot the key".
+
+        ``recovered_params`` carries NAMES ONLY. Names are what a consumer needs
+        to see which parameters a leak is eating; the values are the caller's
+        data, and this stream is not where it survives. That is the residue
+        escalation's job, on the one path where it would otherwise be lost.
+
+        ``pattern`` and ``misclose`` are kept APART on purpose. ``pattern`` is
+        the envelope literal :func:`detect` matched; ``misclose`` is the tag
+        that actually drifted, verbatim, including the blended dialect's stray
+        quote — which is not a literal at all. PRD section 2.2: collapsing them
+        is what left the old guard blaming whatever happened to follow a
+        mis-closed ``description``.
+
+        The log line carries the same fields, mirroring ``markup_tripwire``'s
+        split: the structured record goes to the operator-facing channel while
+        the caller-facing block reaches only the leaking caller.
+        """
+        agent_id, project = identity
+        fact = {
+            'fact': FACT_MARKUP_DETECTED,
+            'tool': tool,
+            'param': param,
+            'pattern': pattern,
+            'misclose': misclose,
+            'outcome': outcome,
+            'recovered_params': sorted(recovered),
+            'agent_id': agent_id,
+            'project': project,
+        }
+
+        logger.warning(
+            'markup guard: %s tool=%s param=%s pattern=%r misclose=%r '
+            'recovered_params=%r agent_id=%r project=%r',
+            outcome, tool, param, pattern, misclose,
+            fact['recovered_params'], agent_id, project,
+        )
+
+        if self._fact_sink is None:
+            return
+        try:
+            self._fact_sink(fact)
+        except Exception:
+            # Additive, exactly like the escalation sink: the outcome is
+            # already decided, so a sink outage costs an operator visibility
+            # rather than turning a working guard into an outage of its own.
+            logger.exception(
+                'markup guard: the fact sink failed for %s on %s.%s; the '
+                'outcome stands', outcome, tool, param,
+            )
+
+    def _refuse_unrepairable(self, name, identity, param, value, pattern) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
         The tiers disagree about what to do with a REPAIR. They do not disagree
@@ -377,7 +481,11 @@ class MarkupGuardMiddleware(Middleware):
         retry — which is the common case for a leak that is, by construction,
         an agent emitting text it cannot re-emit identically.
         """
-        agent_id, project = self._identity(arguments)
+        # The SAME identity the fact carries, threaded in rather than
+        # re-resolved, so the two records cannot disagree about which agent is
+        # leaking — an operator reading one and acting on the other would
+        # otherwise be chasing two different callers.
+        agent_id, project = identity
         escalation_id = self._file_residue_escalation({
             'error_type': 'mcp_markup_unrepairable',
             'category': _ESCALATION_CATEGORY,
@@ -410,12 +518,6 @@ class MarkupGuardMiddleware(Middleware):
             # payload twice in one record.
         })
 
-        logger.warning(
-            'markup guard: UNREPAIRABLE envelope markup in %s.%s (matched %r) '
-            'from agent_id=%r project=%r; refused under policy=%s, residue '
-            'escalation=%r',
-            name, param, pattern, agent_id, project, self.policy.value, escalation_id,
-        )
         raise ToolError(json.dumps({
             'error': (
                 f'Tool call refused: {param!r} carries raw MCP envelope markup '
@@ -461,7 +563,17 @@ class MarkupGuardMiddleware(Middleware):
                 'stands but the residue was not preserved', record.get('tool'),
             )
             return None
-        return escalation_id if isinstance(escalation_id, str) else None
+        if not isinstance(escalation_id, str):
+            return None
+        # Naming the queued record, exactly as emit_markup_storm_escalation
+        # signs off — the operator's entry point to the preserved payload.
+        logger.warning(
+            'markup guard: queued %s holding the unrepairable payload of '
+            '%s.%s (%d chars)',
+            escalation_id, record.get('tool'), record.get('field'),
+            len(record.get('raw_value') or ''),
+        )
+        return escalation_id
 
     def _reject(self, name, arguments, param, fix) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
