@@ -67,6 +67,7 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.recovery_emission import LeaveReason, render_shape
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -85,10 +86,13 @@ __all__ = [
     'Claimant',
     'ClaimantSource',
     'EscalationRef',
+    'LeaveReason',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
+    'leave_reason',
+    'recovery_shape_str',
 ]
 
 
@@ -868,3 +872,71 @@ def classify_recovery(report: TruthReport) -> RecoveryAction:
     phantom-done, never guess on an unrecognized shape).
     """
     return _RECOVERY.get(_shape(report), RecoveryAction.LEAVE)
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (beta) — DESCRIBING a LEAVE, never deciding one.
+#
+# Both functions below are PURE and add no decision: `classify_recovery`'s body
+# and the `_RECOVERY` table above are untouched.  They exist so every veto site
+# can emit a structured account of the disposition it ALREADY reached.  The
+# canonical WHY for that mechanism lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+#
+# THE PRECEDENCE CHAIN, evaluated top to bottom (same discipline as
+# escalation/pins.py's documented chain: re-ordering these links changes what
+# an operator is told, so change them deliberately).
+#
+#   1. live_claimant present            -> LIVE_CLAIMANT
+#      A held task is not stranded; there is nothing to recover yet.  Above
+#      everything else because a pinned-AND-held task is simply running, and
+#      because this is the healthy majority of every sweep (it emits nothing).
+#   2. escalation_store_unavailable     -> ESCALATION_STORE_UNAVAILABLE
+#      "we could not READ the store" is a strictly better explanation than any
+#      conclusion drawn from the empty list that outage produced.  Above
+#      escalation_pinned only for completeness — an unavailable store always
+#      yields open_escalations == [] — and above unmapped_shape because the
+#      shape is only unmapped as a CONSEQUENCE of the failed read.
+#   3. open_escalations non-empty       -> ESCALATION_PINNED
+#      The veto proper: a record actively held back an action the table would
+#      otherwise have taken.  Boundary #9 (row (f)) lands here.
+#   4. deploy_phase present             -> DEPLOY_PHASE_IN_FLIGHT
+#      One of the deliberately-unmapped phases (VERIFIED / FAILED / SCHEDULED /
+#      ESCALATED / DONE — see the note in `_RECOVERY`).  Below link 3 because a
+#      deploy holding an open record is PINNED, not merely in flight.
+#   5. otherwise                        -> UNMAPPED_SHAPE
+#      The table's fail-safe default reached on its own merits.
+# ---------------------------------------------------------------------------
+
+
+def leave_reason(report: TruthReport) -> LeaveReason | None:
+    """Describe WHY *report* classified :attr:`RecoveryAction.LEAVE`.
+
+    Returns ``None`` whenever :func:`classify_recovery` did NOT return LEAVE,
+    so a caller can never mislabel an action it actually took as a hold.
+
+    See the precedence chain above for the ordering and its rationale.  Pure:
+    no I/O, no mutation, and no influence on the disposition itself.
+    """
+    if classify_recovery(report) is not RecoveryAction.LEAVE:
+        return None
+    if report.live_claimant is not None:
+        return LeaveReason.live_claimant
+    if report.escalation_store_unavailable:
+        return LeaveReason.escalation_store_unavailable
+    if report.open_escalations:
+        return LeaveReason.escalation_pinned
+    if report.deploy_phase is not None:
+        return LeaveReason.deploy_phase_in_flight
+    return LeaveReason.unmapped_shape
+
+
+def recovery_shape_str(report: TruthReport) -> str:
+    """Render *report*'s discretized shape as the emitted ``shape`` string.
+
+    Delegates to ``recovery_emission.render_shape`` over EXACTLY the tuple
+    :func:`_shape` builds its ``_RECOVERY`` key from — by splatting ``_shape``'s
+    own output, not by re-listing the elements.  That binding is what keeps an
+    emitted shape string from drifting away from the table key it describes.
+    """
+    return render_shape(*_shape(report))
