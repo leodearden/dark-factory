@@ -1304,7 +1304,7 @@ def test_newest_watched_commit_epoch_timeout_returns_none(
 # _JournalLog.warning() fail-soft swallow tests (follow-up from esc-2032-2)
 #
 # _JournalLog.warning() routes through the module-level log() helper and is
-# itself wrapped in `try/except Exception: pass` so a journald-write failure
+# itself wrapped in `contextlib.suppress(Exception)` so a journald-write failure
 # can never convert a probe's return-None contract into a raised exception.
 # These tests monkeypatch log() to raise, then force each probe into its
 # broad-except branch (where logger.warning(...) is actually invoked) and
@@ -4379,8 +4379,17 @@ def test_liveness_verdict_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_liveness_pass_revives_on_port_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """USER-SIGNAL: fused_memory_liveness_pass() restarts the unit when the port is down."""
+def test_liveness_pass_revives_on_port_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """USER-SIGNAL: fused_memory_liveness_pass() restarts the unit when the port is down.
+
+    Since task 3764 a restart requires FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE
+    non-healthy verdicts, so the port-down verdict is driven that many times.
+    The intent of this test is unchanged — "this verdict class leads to a
+    restart" — only the tick count. That the FIRST tick does not restart is
+    asserted separately in Part D.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
 
@@ -4392,15 +4401,22 @@ def test_liveness_pass_revives_on_port_down(monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
 
-    wdog.fused_memory_liveness_pass()
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
 
     assert restarted == ["fused-memory.service"], (
         f"Expected fused-memory.service restarted exactly once, got: {restarted}"
     )
 
 
-def test_liveness_pass_no_restart_when_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_liveness_pass_no_restart_when_healthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     """fused_memory_liveness_pass() must not restart when port is up and health succeeds."""
     wdog = _load_watchdog()
     restarted: list[str] = []
@@ -4411,14 +4427,23 @@ def test_liveness_pass_no_restart_when_healthy(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(wdog, "probe_health", lambda: True)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    # A healthy verdict CLEARS the streak file — point it at tmp so this test
+    # can never unlink the real data/fused-memory/ state.
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
 
     wdog.fused_memory_liveness_pass()
 
     assert restarted == [], "No restart expected when port is up and health succeeds"
 
 
-def test_liveness_pass_restarts_when_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """fused_memory_liveness_pass() restarts when the port is up but the health fetch fails."""
+def test_liveness_pass_restarts_when_wedged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """fused_memory_liveness_pass() restarts when the port is up but the health fetch fails.
+
+    Since task 3764 this needs FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE wedged
+    verdicts; the intent ("a wedge leads to a restart") is unchanged.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
 
@@ -4428,8 +4453,13 @@ def test_liveness_pass_restarts_when_wedged(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(wdog, "probe_health", lambda: False)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
 
-    wdog.fused_memory_liveness_pass()
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
 
     assert restarted == ["fused-memory.service"], (
         f"Expected fused-memory.service restarted when wedged, got: {restarted}"
@@ -4753,8 +4783,28 @@ def test_fused_memory_recon_busy_verdict_unknown_on_fetch_exception(
     assert warnings, "the swallowed fetch exception must be logged"
 
 
+def _isolate_fm_liveness_state(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point every fm persisted-state path at tmp_path (all absent by default).
+
+    The fm report row is read-only, so reading the repo's real
+    data/fused-memory/ would be harmless — but it would make a test's output
+    depend on whatever the live watchdog last wrote there. Shared by the
+    task-3764 Part D report tests (via _wire_report_row) and the older row
+    tests, which predate the streak/liveness-clock fields.
+    """
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "deploy_clock.json"))
+
+
 def test_print_fused_memory_liveness_row_includes_deploy_age(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """The enriched fm row renders DEPLOY-AGE as fm-clock age in hours (one decimal).
 
@@ -4763,6 +4813,7 @@ def test_print_fused_memory_liveness_row_includes_deploy_age(
     """
     wdog = _load_watchdog()
     now = 2_000_000_000.0
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: now - 3 * 3600)
@@ -4771,19 +4822,28 @@ def test_print_fused_memory_liveness_row_includes_deploy_age(
     wdog._print_fused_memory_liveness()
 
     out = capsys.readouterr().out
-    assert "DEPLOY-AGE" in out, f"expected DEPLOY-AGE label in fm row: {out!r}"
-    assert "3.0h" in out, f"expected DEPLOY-AGE ~3.0h in fm row: {out!r}"
+    assert re.search(r"DEPLOY-AGE:\s*3\.0h", out), (
+        f"expected a labelled DEPLOY-AGE of ~3.0h in fm row: {out!r}"
+    )
 
 
 def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """DEPLOY-AGE renders 'unknown' when the fm deploy clock is absent (fail-open).
 
     Mirrors _read_last_fm_deploy_epoch's fail-open contract (None when the fm
     clock file has never been stamped / is unreadable).
+
+    ANCHORED to the DEPLOY-AGE label on purpose: the row now also carries a
+    LIVENESS-RESTART-AGE field that renders 'unknown' whenever the liveness
+    clock is unstamped, so a bare `"unknown" in out` would pass even if
+    DEPLOY-AGE stopped rendering altogether.
     """
     wdog = _load_watchdog()
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
@@ -4791,15 +4851,19 @@ def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
     wdog._print_fused_memory_liveness()
 
     out = capsys.readouterr().out
-    assert "DEPLOY-AGE" in out
-    assert "unknown" in out, f"expected DEPLOY-AGE 'unknown' in fm row: {out!r}"
+    assert re.search(r"DEPLOY-AGE:\s*unknown", out), (
+        f"expected a labelled DEPLOY-AGE of 'unknown' in fm row: {out!r}"
+    )
 
 
 def test_print_fused_memory_liveness_row_includes_recon_busy(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
 ) -> None:
     """The enriched fm row carries a labelled recon-busy field from the verdict."""
     wdog = _load_watchdog()
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "busy")
@@ -4845,8 +4909,8 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
-    clock = tmp_path / "last_redeploy_fused_memory.json"
-    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock))
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
+    clock = pathlib.Path(wdog.FM_DEPLOY_CLOCK_PATH)
 
     wdog._print_fused_memory_liveness()
 
@@ -4855,6 +4919,12 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     _assert_zero_mutating_calls(recorded_calls)
     assert not clock.exists(), (
         "the read-only fm row must never write the fm deploy clock file"
+    )
+    assert not pathlib.Path(wdog.FM_LIVENESS_RESTART_CLOCK_PATH).exists(), (
+        "the read-only fm row must never write the liveness restart clock"
+    )
+    assert not pathlib.Path(wdog.FM_LIVENESS_STREAK_PATH).exists(), (
+        "the read-only fm row must never create the liveness streak file"
     )
 
 
@@ -5974,3 +6044,2025 @@ def test_service_bounds_the_whole_tick() -> None:
         "legitimate multi-unit restart tick instead of only a genuine wedge"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm-liveness streak + restart cap constants (task 3764)
+#
+# The fm liveness pass previously restarted fused-memory on a SINGLE
+# non-healthy verdict, uncapped. Task 3764 adds the missing temporal
+# dimension in two independent layers, each with its own knobs:
+#
+#   Layer 1 (streak)  — FM_LIVENESS_STREAK_PATH / _THRESHOLD / _MAX_AGE_SECS
+#   Layer 2 (cap)     — FM_LIVENESS_RESTART_CLOCK_PATH /
+#                       FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
+#
+# Every knob follows an existing precedent in this file: the three integer
+# knobs mirror FM_RESTART_MIN_INTERVAL_SECS's try/int/except env pattern
+# (a typo'd env var must not crash the oneshot watchdog), and the two path
+# knobs mirror FM_DEPLOY_CLOCK_PATH's os.environ.get(..., REPO_DIR/data/...)
+# pattern so tests can point them at tmp files.
+# ---------------------------------------------------------------------------
+
+
+def test_fm_liveness_streak_threshold_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_THRESHOLD defaults to 3 consecutive non-healthy verdicts."""
+    monkeypatch.delenv("FM_LIVENESS_STREAK_THRESHOLD", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 3
+
+
+def test_fm_liveness_streak_threshold_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_THRESHOLD honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "5")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 5
+
+
+def test_fm_liveness_streak_threshold_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_STREAK_THRESHOLD falls back to 3, not a crash."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "three")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 3
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-7"])
+def test_fm_liveness_streak_threshold_clamps_to_at_least_one(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """A non-positive FM_LIVENESS_STREAK_THRESHOLD is CLAMPED to 1, not honoured.
+
+    0/-1 parse fine, so the try/except fallback cannot catch them. Left
+    unclamped, `streak < FM_LIVENESS_STREAK_THRESHOLD` would never hold (the
+    recorder always returns >=1), silently restoring the exact
+    one-non-healthy-verdict-per-kill behaviour this task removes. The other
+    two knobs in this block DO treat <=0 as "disable", so an operator
+    reasonably tries the same spelling here — it must fail safe.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", raw)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 1
+
+
+def test_liveness_pass_threshold_zero_still_requires_a_full_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BEHAVIOURAL: FM_LIVENESS_STREAK_THRESHOLD=0 must not revert the old behaviour.
+
+    The clamp is only meaningful if the pass honours it end-to-end. With the
+    env var set to 0 the pass must still demand a recorded failure (the
+    clamped threshold of 1) rather than treating the gate as vacuous — and
+    critically, a 'healthy' verdict must still restart nothing.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "0")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 1
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["healthy", "wedged"])
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == [], "a healthy verdict must never restart fm, whatever N is"
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"], (
+        f"the clamped N=1 threshold must still gate on a recorded failure; got {restarted}"
+    )
+
+
+def test_fm_liveness_streak_max_age_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_MAX_AGE_SECS defaults to 300 (5x the 60s timer cadence)."""
+    monkeypatch.delenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 300
+
+
+def test_fm_liveness_streak_max_age_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_MAX_AGE_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", "42")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 42
+
+
+def test_fm_liveness_streak_max_age_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_STREAK_MAX_AGE_SECS falls back to 300, not a crash."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", "5m")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 300
+
+
+def test_fm_liveness_restart_min_interval_secs_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS defaults to 3600 (1h)."""
+    monkeypatch.delenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 3600
+
+
+def test_fm_liveness_restart_min_interval_secs_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_fm_liveness_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_RESTART_MIN_INTERVAL_SECS falls back to 3600.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring FM_RESTART_MIN_INTERVAL_SECS's malformed-env test.
+    """
+    monkeypatch.setenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", "1h")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 3600
+
+
+def test_fm_liveness_streak_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_PATH defaults to fm_liveness_streak.json under REPO_DIR.
+
+    Mirrors FM_DEPLOY_CLOCK_PATH's default-path shape so both pieces of fm
+    watchdog state live in the same data/fused-memory/ directory.
+    """
+    monkeypatch.delenv("FM_LIVENESS_STREAK", raising=False)
+    wdog = _load_watchdog()
+    assert os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "fm_liveness_streak.json"
+    ) == wdog.FM_LIVENESS_STREAK_PATH
+
+
+def test_fm_liveness_streak_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_PATH honors the FM_LIVENESS_STREAK env override.
+
+    Tests must be able to point the streak file at a tmp path so no test ever
+    touches the real data/fused-memory/ state.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK", "/tmp/custom_fm_streak.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_PATH == "/tmp/custom_fm_streak.json"
+
+
+def test_fm_liveness_restart_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_RESTART_CLOCK_PATH defaults under REPO_DIR/data/fused-memory."""
+    monkeypatch.delenv("FM_LIVENESS_RESTART_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
+    ) == wdog.FM_LIVENESS_RESTART_CLOCK_PATH
+
+
+def test_fm_liveness_restart_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_RESTART_CLOCK_PATH honors the FM_LIVENESS_RESTART_CLOCK override."""
+    monkeypatch.setenv("FM_LIVENESS_RESTART_CLOCK", "/tmp/custom_liveness_clock.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH == "/tmp/custom_liveness_clock.json"
+
+
+def test_fm_liveness_restart_clock_separate_from_fm_deploy_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The liveness restart clock must be a DIFFERENT file than fm's deploy clock.
+
+    I5 ("brokenness is not a scheduled deploy") in BOTH directions: sharing one
+    file would mean a liveness revive silences the fm STALENESS backstop for 8h
+    (a merged fm change would sit undeployed because the watchdog once revived
+    a wedge), and conversely a scheduled deploy would license an immediate
+    extra liveness kill.
+    """
+    monkeypatch.delenv("FM_LIVENESS_RESTART_CLOCK", raising=False)
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH != wdog.FM_DEPLOY_CLOCK_PATH
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH != wdog.FLEET_DEPLOY_CLOCK_PATH
+    assert wdog.FM_LIVENESS_STREAK_PATH != wdog.FM_DEPLOY_CLOCK_PATH
+
+
+def test_fm_liveness_streak_threshold_exceeds_longest_observed_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DERIVED INVARIANT: the required non-response window must exceed the evidence.
+
+    The controlled experiment (2026-08-06 07:14-09:14Z, kill path disconnected)
+    recorded six /health stalls >=8s, four >15s, three exceeding a 25s probe
+    cap — and every single one SELF-RECOVERED. The watchdog ticks every 60s
+    (orchestrator-watchdog.timer's OnUnitActiveSec=60), so N consecutive
+    non-healthy verdicts demand N*60s of CONTINUOUS non-response. That window
+    must strictly exceed the longest observed transient stall, otherwise a
+    stall the system recovers from on its own can still get fused-memory
+    killed — which is the exact defect this task fixes.
+
+    Asserted as a derived property rather than only the literal default so the
+    load-bearing relationship survives a future retune of the number.
+    """
+    monkeypatch.delenv("FM_LIVENESS_STREAK_THRESHOLD", raising=False)
+    wdog = _load_watchdog()
+    longest_observed_stall_secs = 25
+    tick_cadence_secs = 60
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD * tick_cadence_secs > longest_observed_stall_secs, (
+        f"FM_LIVENESS_STREAK_THRESHOLD={wdog.FM_LIVENESS_STREAK_THRESHOLD} at a "
+        f"{tick_cadence_secs}s cadence requires only "
+        f"{wdog.FM_LIVENESS_STREAK_THRESHOLD * tick_cadence_secs}s of continuous "
+        f"non-response, which does not exceed the longest observed "
+        f"({longest_observed_stall_secs}s+) SELF-RECOVERING /health stall"
+    )
+
+
+def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DERIVED INVARIANT: the cap must exceed the worst observed instance lifetime.
+
+    The pathological behaviour this task bounds is fused-memory instances being
+    killed and re-killed; the worst observed lifetime was ~53 minutes (3180s).
+    The min-interval cap must strictly EXCEED that, so that even a WRONG
+    liveness verdict cannot reproduce the observed pathology. A cap SHORTER
+    than the observed lifetime (e.g. 900s) would make the failure mode worse,
+    not better — it would license a 15-minute lifetime.
+
+    Also pinned: the liveness cap stays well below the staleness pass's
+    deliberately-slow 8h deploy cadence, since a brokenness revive must react
+    faster than a scheduled deploy (I5).
+    """
+    monkeypatch.delenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    monkeypatch.delenv("FM_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    worst_observed_instance_lifetime_secs = 3180  # 53 min
+    assert (
+        worst_observed_instance_lifetime_secs < wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
+    ), (
+        f"FM_LIVENESS_RESTART_MIN_INTERVAL_SECS="
+        f"{wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS} does not exceed the "
+        f"{worst_observed_instance_lifetime_secs}s worst observed pathological "
+        f"instance lifetime, so even a wrong verdict could reproduce it"
+    )
+    assert (
+        wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS < wdog.FM_RESTART_MIN_INTERVAL_SECS
+    ), (
+        "a brokenness revive must react faster than the scheduled fm deploy "
+        "cadence (I5)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part D: shared persistence helpers _atomic_write_json / _read_json_state
+# (task 3764)
+#
+# This task adds THREE more persisted-state writers/readers to a file that
+# already had two (_stamp_fm_deploy_clock / _read_last_fm_deploy_epoch).
+# Without extraction the ~20-line makedirs/mkstemp/os.replace/unlink-on-error
+# dance would be copy-pasted a third and fourth time. The extraction is
+# behaviour-preserving; the existing Part C deploy-clock suite is its
+# regression net, re-asserted explicitly at the bottom of this section.
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_json_writes_body_and_creates_parent_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_atomic_write_json writes the JSON body, creating a missing parent dir.
+
+    Asserted against the REAL on-disk file (parsed back), never a mock.
+    """
+    wdog = _load_watchdog()
+    target = tmp_path / "deep" / "nested" / "state.json"
+    assert not target.parent.exists()
+
+    wdog._atomic_write_json(str(target), {"count": 2, "verdict": "wedged"})
+
+    assert target.exists(), "the write must create the target file and its parent dir"
+    assert json.loads(target.read_text()) == {"count": 2, "verdict": "wedged"}
+
+
+def test_atomic_write_json_leaves_no_stray_temp_file(tmp_path: pathlib.Path) -> None:
+    """A successful _atomic_write_json leaves ONLY the target file behind.
+
+    The write goes via tempfile.mkstemp + os.replace; the temp file must be
+    renamed away, not left accumulating in data/fused-memory/ on every tick.
+    """
+    wdog = _load_watchdog()
+    target = tmp_path / "state.json"
+
+    wdog._atomic_write_json(str(target), {"ts": 1})
+
+    survivors = sorted(p.name for p in tmp_path.iterdir())
+    assert survivors == ["state.json"], f"stray temp file(s) left behind: {survivors}"
+
+
+def test_atomic_write_json_fail_soft_on_replace_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failed rename is logged and swallowed, and the temp file is unlinked.
+
+    Fail-soft: a persistence hiccup must never crash the oneshot watchdog.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    target = tmp_path / "state.json"
+
+    # Must not raise.
+    wdog._atomic_write_json(str(target), {"ts": 1})
+
+    assert not target.exists(), "a failed write must not leave a partial target"
+    assert list(tmp_path.iterdir()) == [], (
+        f"the temp file must be unlinked on failure: "
+        f"{sorted(p.name for p in tmp_path.iterdir())}"
+    )
+    assert logged, "a swallowed write failure must be logged, not silent"
+
+
+def test_atomic_write_json_fail_soft_on_unwritable_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An unwritable target directory is logged and swallowed, not raised."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # r-x: cannot create the temp file inside
+    try:
+        # Must not raise.
+        wdog._atomic_write_json(str(locked / "state.json"), {"ts": 1})
+    finally:
+        locked.chmod(0o700)
+
+    assert not (locked / "state.json").exists()
+    assert logged, "a swallowed write failure must be logged, not silent"
+
+
+def test_atomic_write_json_reports_whether_the_write_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The writer returns True only after the rename succeeded, False otherwise.
+
+    Fail-soft is not the same as fail-safe: one caller
+    (_stamp_fm_liveness_restart_clock) ARMS a cap, so it must be able to tell
+    a landed write from a swallowed failure rather than assume the former.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    assert wdog._atomic_write_json(str(tmp_path / "ok.json"), {"ts": 1}) is True
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    assert wdog._atomic_write_json(str(tmp_path / "bad.json"), {"ts": 1}) is False
+
+
+def test_read_json_state_returns_parsed_dict(tmp_path: pathlib.Path) -> None:
+    """_read_json_state parses a well-formed file into a dict."""
+    wdog = _load_watchdog()
+    target = tmp_path / "state.json"
+    target.write_text('{"ts": 1783000000, "iso": "2026-08-06T00:00:00+00:00"}')
+
+    assert wdog._read_json_state(str(target)) == {
+        "ts": 1783000000,
+        "iso": "2026-08-06T00:00:00+00:00",
+    }
+
+
+def test_read_json_state_missing_file_returns_none_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A missing file yields None with NO log line.
+
+    "The state does not exist yet" is the normal case on a fresh checkout — it
+    is not a degradation and must not spam the journal every tick.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._read_json_state(str(tmp_path / "absent.json")) is None
+    assert logged == [], f"a missing state file must not log: {logged}"
+
+
+def test_read_json_state_corrupt_json_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A truncated/corrupt body yields None (fail-open) AND a log line."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    target = tmp_path / "corrupt.json"
+    target.write_text('{"ts": 178300')  # truncated / partially written
+
+    assert wdog._read_json_state(str(target)) is None
+    assert logged, "a corrupt state file is a real degradation and must be logged"
+
+
+def test_read_json_state_non_object_body_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A well-formed but NON-OBJECT body yields None AND a log line.
+
+    ``[1, 2]`` / ``"hello"`` parse fine but carry no state, so every caller
+    loses its clock or streak — indistinguishable in consequence from a
+    corrupt file, and therefore a genuine degradation that must leave journal
+    evidence. Before the task-3764 extraction this case raised TypeError on
+    ``raw["ts"]`` inside _read_last_fm_deploy_epoch and WAS logged; a silent
+    None here would make the fm deploy backstop and the liveness restart cap
+    both vanish with nothing in the journal to explain it.
+    """
+    wdog = _load_watchdog()
+    for body in ("[1, 2]", '"hello"', "null", "3"):
+        logged: list[str] = []
+        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
+        target = tmp_path / "nonobject.json"
+        target.write_text(body)
+
+        assert wdog._read_json_state(str(target)) is None, (
+            f"a non-object body must yield None: {body!r}"
+        )
+        assert logged, f"a non-object state body must be logged: {body!r}"
+        assert any(str(target) in m for m in logged), (
+            f"the log line must name the offending path: {logged!r}"
+        )
+
+
+def test_read_json_state_oserror_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A non-FileNotFoundError OSError yields None (fail-open) AND a log line."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    target = tmp_path / "state.json"
+    target.write_text('{"ts": 1}')
+    target.chmod(0o000)
+    try:
+        result = wdog._read_json_state(str(target))
+    finally:
+        target.chmod(0o600)
+
+    assert result is None
+    assert logged, "an unreadable state file must be logged, not silently ignored"
+
+
+def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """REGRESSION: the existing deploy-clock pair still round-trips unchanged.
+
+    _stamp_fm_deploy_clock / _read_last_fm_deploy_epoch are rewritten as thin
+    wrappers over the shared helpers in this task. Their observable contract —
+    a {ts, iso} body, read back as float(ts), with the parent dir created —
+    must not change, and the wrappers must read their module-global path at
+    CALL time so monkeypatching wdog.FM_DEPLOY_CLOCK_PATH keeps working.
+    """
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "data" / "fused-memory" / "last_redeploy_fused_memory.json"
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_deploy_clock()
+
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must still carry ts+iso: {body}"
+    assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
+
+
+# ---------------------------------------------------------------------------
+# Part D: shared CLOCK-layer primitives (task 3764 amendment)
+#
+# _read_clock_epoch / _stamp_clock / _within_min_interval sit one level above
+# the JSON primitives and are now the SINGLE definition behind all eight clock
+# wrappers (fleet-deploy, fm-deploy, fm-liveness-restart). The wrappers' own
+# suites (Part A/C/D) are the behavioural regression net; these pin the
+# primitives' contracts directly so a drift between the three fail-open
+# contracts is caught at the source rather than in triplicate.
+# ---------------------------------------------------------------------------
+
+
+def test_read_clock_epoch_roundtrips_a_stamped_clock(tmp_path: pathlib.Path) -> None:
+    """_stamp_clock writes {ts, iso}; _read_clock_epoch reads it back as float."""
+    wdog = _load_watchdog()
+    clock = tmp_path / "nested" / "clock.json"
+    assert not clock.parent.exists(), "the stamp must create the parent dir"
+
+    wdog._stamp_clock(str(clock))
+
+    body = json.loads(clock.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    epoch = wdog._read_clock_epoch(str(clock), "test clock")
+    assert isinstance(epoch, float)
+    assert epoch == pytest.approx(float(body["ts"]))
+
+
+def test_read_clock_epoch_missing_file_returns_none_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An absent clock is the normal 'never stamped' case: None, and no log spam."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._read_clock_epoch(str(tmp_path / "absent.json"), "test clock") is None
+    assert logged == [], f"a never-stamped clock must not log every tick: {logged!r}"
+
+
+def test_read_clock_epoch_unusable_ts_returns_none_and_names_the_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A body with a missing/unusable `ts` fails open to None AND names the label.
+
+    The label is the whole reason it is a parameter: with three clocks now
+    sharing one reader, a journal line that did not say WHICH clock degraded
+    would be useless to an operator.
+    """
+    wdog = _load_watchdog()
+    for body in ('{"iso": "2026-08-06T00:00:00+00:00"}', '{"ts": "not-a-number"}'):
+        logged: list[str] = []
+        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
+        clock = tmp_path / "clock.json"
+        clock.write_text(body)
+
+        assert wdog._read_clock_epoch(str(clock), "fm-deploy clock") is None
+        assert any("fm-deploy clock" in m for m in logged), (
+            f"the log line must name the degraded clock: {logged!r}"
+        )
+
+
+def test_within_min_interval_uses_the_reader_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate compares now - reader() against secs, honouring the passed reader.
+
+    Taking the READER rather than a path is what keeps each wrapper's named
+    epoch function the single seam tests substitute at — a wrapper can never
+    silently bypass its own reader.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
+
+    assert wdog._within_min_interval(3600, lambda: 1_000_000.0) is True
+    assert wdog._within_min_interval(60, lambda: 1_000_000.0) is False
+
+
+def test_within_min_interval_disabled_does_not_read_the_clock() -> None:
+    """secs<=0 disables the cap outright — the reader is not even called.
+
+    A disabled cap must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+
+    def boom() -> float:
+        pytest.fail("a disabled min-interval must not read its clock")
+
+    assert wdog._within_min_interval(0, boom) is False
+    assert wdog._within_min_interval(-1, boom) is False
+
+
+def test_within_min_interval_absent_clock_is_outside_the_window() -> None:
+    """A None epoch counts as OUTSIDE the window (fail toward acting).
+
+    Failing the other way would let one unreadable file suppress every future
+    restart indefinitely.
+    """
+    wdog = _load_watchdog()
+    assert wdog._within_min_interval(3600, lambda: None) is False
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm liveness streak file primitives (task 3764)
+#
+# _write_fm_liveness_streak / _read_fm_liveness_streak / _clear_fm_liveness_streak.
+# Every test here points FM_LIVENESS_STREAK_PATH at a REAL file under tmp_path
+# and asserts against its actual on-disk bytes — never against a mock. A mock
+# would happily satisfy an implementation that kept the counter in memory,
+# which is the exact regression this task must prevent (the watchdog is a
+# Type=oneshot: the process EXITS between ticks).
+#
+# The fail direction is uniformly toward NOT restarting: unreadable, corrupt,
+# absent or nonsensical state means "no streak", which means no restart. This
+# task exists because the old code's only bias was toward killing fused-memory.
+# ---------------------------------------------------------------------------
+
+
+def test_write_fm_liveness_streak_creates_parent_dir_and_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_write_fm_liveness_streak writes {count, verdict, ts, iso}, creating the dir."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "data" / "fused-memory" / "fm_liveness_streak.json"
+    assert not streak_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._write_fm_liveness_streak(2, "wedged", 1783000000.5)
+
+    assert streak_file.exists(), "the write must create the streak file and parent dir"
+    body = json.loads(streak_file.read_text())
+    assert body["count"] == 2
+    assert body["verdict"] == "wedged"
+    assert float(body["ts"]) == pytest.approx(1783000000.5)
+    assert "iso" in body, f"streak body must carry a human-readable iso field: {body}"
+
+
+def test_read_fm_liveness_streak_roundtrips_a_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A write immediately followed by a read round-trips exactly, via the real file."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._write_fm_liveness_streak(3, "port-down", 1783000123.0)
+    result = wdog._read_fm_liveness_streak()
+
+    assert result is not None
+    count, ts = result
+    assert count == 3
+    assert isinstance(count, int)
+    assert ts == pytest.approx(1783000123.0)
+    assert isinstance(ts, float)
+
+
+def test_read_fm_liveness_streak_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """FAIL-OPEN: an absent streak file means "no streak", not an error."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_fm_liveness_streak() is None
+
+
+@pytest.mark.parametrize(
+    ("body", "label"),
+    [
+        ('{"count": 2, "ts": 1783', "truncated json"),
+        ('{"verdict": "wedged", "ts": 1783000000}', "missing count"),
+        ('{"count": 2, "verdict": "wedged"}', "missing ts"),
+        ('{"count": "two", "ts": 1783000000}', "non-integer count"),
+        ('{"count": 2, "ts": "yesterday"}', "non-numeric ts"),
+        ('{"count": 0, "ts": 1783000000}', "zero count"),
+        ('{"count": -4, "ts": 1783000000}', "negative count"),
+    ],
+)
+def test_read_fm_liveness_streak_fails_open_to_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, body: str, label: str
+) -> None:
+    """FAIL-OPEN: any unusable streak body yields None ("no streak" => no restart).
+
+    Corrupt/nonsensical state must never be read as "we already have N
+    failures" — the whole point of this task is that the watchdog's bias must
+    fall toward leaving fused-memory alone.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text(body)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    assert wdog._read_fm_liveness_streak() is None, f"must fail open for: {label}"
+
+
+def test_read_fm_liveness_streak_logs_on_corrupt_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A corrupt streak body is LOGGED, not silently swallowed.
+
+    Silently degrading persisted state that decides whether fused-memory gets
+    killed is exactly the silent-degradation the project's norms forbid.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text('{"count": 2, "ts": 1783')
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    assert wdog._read_fm_liveness_streak() is None
+    assert logged, "a corrupt streak file must be logged"
+
+
+def test_clear_fm_liveness_streak_removes_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_clear_fm_liveness_streak removes the real file from disk."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text('{"count": 2, "ts": 1783000000}')
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+
+    wdog._clear_fm_liveness_streak()
+
+    assert not streak_file.exists(), "clearing must remove the streak file"
+    assert wdog._read_fm_liveness_streak() is None
+
+
+def test_clear_fm_liveness_streak_absent_file_is_silent_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Clearing an already-absent streak is a silent no-op, not a raise.
+
+    The overwhelmingly common case: fused-memory is healthy, so every 60s tick
+    clears a streak that does not exist. It must neither raise nor log.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "absent.json"))
+
+    # Must not raise.
+    wdog._clear_fm_liveness_streak()
+
+    assert logged == [], f"clearing an absent streak must not log every tick: {logged}"
+
+
+def test_clear_fm_liveness_streak_swallows_and_logs_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A non-FileNotFoundError OSError from unlink is logged and swallowed."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+
+    def boom(_path):  # noqa: ANN001
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr(wdog.os, "unlink", boom)
+
+    # Must not raise.
+    wdog._clear_fm_liveness_streak()
+
+    assert logged, "a swallowed unlink failure must be logged, not silent"
+
+
+# ---------------------------------------------------------------------------
+# Part D: _record_fm_liveness_failure() accumulation semantics (task 3764)
+# ---------------------------------------------------------------------------
+
+
+def test_record_fm_liveness_failure_starts_at_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """With no streak file, the first recorded failure returns 1 and persists it."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+
+    body = json.loads(streak_file.read_text())
+    assert body["count"] == 1
+    assert body["verdict"] == "wedged"
+
+
+def test_record_fm_liveness_failure_accumulates_monotonically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Successive failures increment 1 -> 2 -> 3, with the file tracking each step."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    seen = []
+    for _ in range(3):
+        seen.append(wdog._record_fm_liveness_failure("wedged"))
+        assert json.loads(streak_file.read_text())["count"] == seen[-1]
+        now[0] += 60.0  # one timer tick
+
+    assert seen == [1, 2, 3]
+
+
+def test_record_fm_liveness_failure_tracks_latest_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A wedged-then-port-down sequence still accumulates; the file names the LATEST.
+
+    Both are non-healthy verdicts and stream onto the SAME streak (design
+    decision: uniformity avoids a second code path with its own untested
+    edges, and it closes a real race where an fm restart initiated elsewhere
+    leaves the port briefly down).
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+    now[0] += 60.0
+    assert wdog._record_fm_liveness_failure("port-down") == 2
+
+    assert json.loads(streak_file.read_text())["verdict"] == "port-down"
+
+
+def test_record_fm_liveness_failure_expires_stale_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A streak entry older than FM_LIVENESS_STREAK_MAX_AGE_SECS restarts at 1, not 4.
+
+    Item 2's requirement: "a stale streak from hours ago cannot be mistaken for
+    a fresh one". A gap larger than the max age means >=4 ticks were missed
+    (watchdog stopped, timer disabled, host suspended), so the CONSECUTIVE
+    claim no longer holds and continuity must be re-established from scratch.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    stale_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 3, "verdict": "wedged", "ts": stale_ts}))
+    # Hours later — far outside the max age.
+    monkeypatch.setattr(wdog.time, "time", lambda: stale_ts + 7200.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1, (
+        "an expired streak must restart the count at 1, not resume it"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+def test_record_fm_liveness_failure_increments_just_inside_max_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BOUNDARY: an entry just inside FM_LIVENESS_STREAK_MAX_AGE_SECS still increments.
+
+    A slightly-late tick (systemd timer jitter, a slow probe) must not silently
+    reset the evidence, or a genuinely wedged fm could never reach the
+    threshold.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    prior_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": prior_ts}))
+    monkeypatch.setattr(wdog.time, "time", lambda: prior_ts + 299.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 3
+
+
+def test_record_fm_liveness_failure_discards_streak_predating_the_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Evidence recorded against a PREVIOUS fm process must not kill its successor.
+
+    Reachable with the shipped constants, not just in principle: wedged ticks
+    at T-120 and T-60 leave count=2 ts=T-60; an EXTERNAL restart lands at T;
+    the T+60 and T+120 ticks return early on STARTUP_GRACE_SECS=120 without
+    clearing anything; and the first post-grace tick at T+180 sees age=240s,
+    still inside FM_LIVENESS_STREAK_MAX_AGE_SECS=300, so the max-age window
+    alone would increment to 3 and kill an instance that has been up for
+    three minutes and is merely slow to serve /health during warm-up.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    restart_ts = 1783000000.0  # the external fm restart
+    now = restart_ts + 180.0  # first post-grace tick
+    streak_file.write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": restart_ts - 60.0})
+    )
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # fm has been up 180s: the persisted ts (restart_ts - 60) predates that.
+    assert wdog._record_fm_liveness_failure("wedged", 180.0) == 1, (
+        "a streak predating the current instance must restart the count at 1"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+    assert any("predates" in m for m in logged), (
+        f"discarding cross-instance evidence must leave journal evidence: {logged!r}"
+    )
+
+
+def test_record_fm_liveness_failure_keeps_streak_from_the_same_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BOUNDARY: evidence recorded DURING the current instance still accumulates.
+
+    The instance-boundary check must not become a second, stricter max-age
+    that stops a genuinely wedged long-running fm from ever reaching N.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    now = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": now - 60.0}))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # fm has been up an hour — the 60s-old entry is comfortably inside it.
+    assert wdog._record_fm_liveness_failure("wedged", 3600.0) == 3
+
+
+def test_record_fm_liveness_failure_unknown_instance_age_still_accumulates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An unknown instance start (None) leaves the max-age expiry as the only gate.
+
+    _unit_start_elapsed_secs fails open to None (no recorded PID, unparseable
+    property, systemctl failure). That must not silently disable the streak —
+    the pass would then never restart a genuinely wedged fm. Documented as the
+    residual in fused_memory_liveness_pass's docstring.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    now = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": now - 60.0}))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    assert wdog._record_fm_liveness_failure("wedged", None) == 3
+    assert wdog._record_fm_liveness_failure("wedged") == 4, (
+        "the instance argument must stay optional for existing callers"
+    )
+
+
+def test_liveness_pass_does_not_kill_on_evidence_from_a_prior_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """END-TO-END: a streak written before an fm restart cannot reach the threshold.
+
+    Replays the reachable sequence through the real pass: two pre-restart
+    wedged ticks, an external restart, then post-grace wedged ticks. The
+    surviving count must not be credited to the new instance, so the tick that
+    WOULD have been the third does not restart.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
+    restart_ts = 1783000000.0
+    streak_file.write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": restart_ts - 60.0})
+    )
+    now = restart_ts + 180.0
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    # fm restarted 180s ago, so it is out of the 120s grace window but every
+    # persisted tick predates it.
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 180.0)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], (
+        f"cross-instance evidence must not reach the threshold; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+def test_record_fm_liveness_failure_write_error_fails_safe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A write failure does not propagate, and nothing persists — so it fails SAFE.
+
+    Because nothing landed on disk, the NEXT call starts from 1 again and the
+    counter can never climb to FM_LIVENESS_STREAK_THRESHOLD. A watchdog that
+    cannot persist evidence therefore never restarts fused-memory, which is the
+    correct direction for this task.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.0)
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+
+    # Must not raise.
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+    assert not streak_file.exists(), "a failed write must not leave partial state"
+    assert wdog._record_fm_liveness_failure("wedged") == 1, (
+        "with nothing persisted the counter must restart, never silently climb"
+    )
+
+
+def test_record_fm_liveness_failure_persists_across_module_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """THE KEY TEST: the streak lives on DISK, not in module memory.
+
+    orchestrator-watchdog.service is Type=oneshot driven by a 60s timer, so the
+    process EXITS between probes — a module-level in-memory counter could never
+    accumulate, and an in-fixture-only assertion would not catch that.
+
+    _load_watchdog() re-execs the module from its file path, producing a
+    genuinely FRESH module object with brand-new globals. Recording one failure
+    through instance A and another through instance B therefore proves the
+    count survived a process boundary: an in-memory implementation is
+    structurally incapable of returning 2 here.
+    """
+    streak_path = tmp_path / "streak.json"
+    monkeypatch.setenv("FM_LIVENESS_STREAK", str(streak_path))
+
+    mod_a = _load_watchdog()
+    assert str(streak_path) == mod_a.FM_LIVENESS_STREAK_PATH
+    assert mod_a._record_fm_liveness_failure("wedged") == 1
+    assert json.loads(streak_path.read_text())["count"] == 1
+
+    del mod_a  # the "process" exits; nothing in memory survives
+
+    mod_b = _load_watchdog()
+    assert mod_b is not None
+    assert mod_b._record_fm_liveness_failure("wedged") == 2, (
+        "a fresh module instance must resume the on-disk streak; an in-memory "
+        "counter would restart at 1 here"
+    )
+    assert json.loads(streak_path.read_text())["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm-liveness restart clock trio (task 3764)
+#
+# Line-for-line siblings of the Part C fm deploy-clock trio above, reading the
+# liveness cap's OWN clock file against its OWN interval. The separation tests
+# at the bottom are the I5 guard: a liveness revive must not silence the fm
+# staleness backstop, and a scheduled deploy must not license an extra kill.
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_and_read_fm_liveness_restart_clock_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_stamp_fm_liveness_restart_clock writes {ts,iso} (creating the parent dir)
+    that _read_last_fm_liveness_restart_epoch reads back as float(ts)."""
+    wdog = _load_watchdog()
+    clock_file = (
+        tmp_path / "data" / "fused-memory" / "last_liveness_restart_fused_memory.json"
+    )
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_liveness_restart_clock()
+
+    assert clock_file.exists(), "stamp must create the clock file and its parent dir"
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    assert wdog._read_last_fm_liveness_restart_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_liveness_restart_epoch(), float)
+
+
+def test_read_last_fm_liveness_restart_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A never-stamped liveness restart clock reads as None (fail-open)."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "absent.json")
+    )
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+def test_read_last_fm_liveness_restart_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A truncated/corrupt liveness restart clock reads as None (fail-open)."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text('{"ts": 178300')  # truncated / partially written
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+def test_within_fm_liveness_restart_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True while now - last < FM_LIVENESS_RESTART_MIN_INTERVAL_SECS."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is True
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once FM_LIVENESS_RESTART_MIN_INTERVAL_SECS has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 3600.0 + 1.0)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS<=0 disables the cap outright.
+
+    The clock file must not even be READ — mirroring
+    test_within_fm_deploy_min_interval_false_when_disabled.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_liveness_restart_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent/unreadable clock means "outside the window" — never silence.
+
+    Failing the other way would let one unreadable file suppress every future
+    liveness revive indefinitely, which is a worse failure than an extra
+    restart the streak has already justified.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_stamp_fm_liveness_restart_clock_reports_whether_the_cap_was_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The stamp propagates the writer's verdict instead of dropping it."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness.json")
+    )
+
+    assert wdog._stamp_fm_liveness_restart_clock() is True
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    assert wdog._stamp_fm_liveness_restart_clock() is False
+
+
+def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A cap that cannot be armed gets its OWN high-signal line, not a routine one.
+
+    The cap's arming is a fail-soft write, so its failure points the WRONG
+    way: with the clock file unwritable (stale root-owned file, ENOSPC,
+    exhausted inodes) while streak writes still succeed, the pass degrades to
+    a revive roughly every FM_LIVENESS_STREAK_THRESHOLD ticks (~180s at
+    defaults) indefinitely — strictly worse flapping than the one-per-hour
+    bound this layer promises. Nothing else reconstructs this clock (unlike
+    the fm deploy clock, which self-heals from ActiveEnterTimestamp), so one
+    `_atomic_write_json:` line buried among healthy ticks is not enough
+    signal.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    logged: list[str] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("no space left on device")
+
+    real_replace = os.replace
+
+    def replace_but_not_the_clock(src, dst):  # noqa: ANN001
+        # Streak writes keep succeeding — only the cap clock is unwritable.
+        if str(dst) == wdog.FM_LIVENESS_RESTART_CLOCK_PATH:
+            return boom(src, dst)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(wdog.os, "replace", replace_but_not_the_clock)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"an unarmable cap must not block the justified revive; got {restarted}"
+    )
+    unarmed = [m for m in logged if "could NOT be armed" in m]
+    assert unarmed, (
+        f"a cap that could not be armed must say so distinguishably: {logged!r}"
+    )
+    assert any(wdog.FM_LIVENESS_RESTART_CLOCK_PATH in m for m in unarmed), (
+        f"the line must name the file the operator has to fix: {unarmed!r}"
+    )
+    assert any("unbounded" in m for m in unarmed), (
+        f"the line must state the consequence, not just the failure: {unarmed!r}"
+    )
+    routine = [m for m in logged if m.startswith("_atomic_write_json:")]
+    assert routine and unarmed != routine, (
+        "the high-signal line must be distinguishable from the routine "
+        f"persistence hiccup line: {logged!r}"
+    )
+
+
+def test_stamp_fm_liveness_restart_clock_does_not_touch_fm_deploy_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5: stamping the liveness clock must leave the fm DEPLOY clock untouched.
+
+    Sharing one file would mean a liveness revive silences the fm staleness
+    backstop for 8h — a merged fm change sitting undeployed because the
+    watchdog once revived a wedge.
+    """
+    wdog = _load_watchdog()
+    liveness_clock = tmp_path / "liveness.json"
+    deploy_clock = tmp_path / "deploy.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(liveness_clock))
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(deploy_clock))
+
+    wdog._stamp_fm_liveness_restart_clock()
+
+    assert liveness_clock.exists()
+    assert not deploy_clock.exists(), (
+        "a liveness revive must not advance fm's deploy clock (I5)"
+    )
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_stamp_fm_deploy_clock_does_not_touch_liveness_restart_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5, the other direction: a scheduled deploy must not arm/reset the liveness cap."""
+    wdog = _load_watchdog()
+    liveness_clock = tmp_path / "liveness.json"
+    deploy_clock = tmp_path / "deploy.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(liveness_clock))
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(deploy_clock))
+
+    wdog._stamp_fm_deploy_clock()
+
+    assert deploy_clock.exists()
+    assert not liveness_clock.exists(), (
+        "a scheduled fm deploy must not touch the liveness restart clock (I5)"
+    )
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+# ---------------------------------------------------------------------------
+# Part D: fused_memory_liveness_pass() streak wiring (task 3764)
+#
+# THE USER-OBSERVABLE SIGNAL. Before this task ONE non-healthy verdict killed
+# fused-memory. The measured evidence (2026-08-06 controlled experiment) says
+# that is wrong: six /health stalls >=8s, four >15s, three past a 25s probe cap
+# — all self-recovered, needing 0 restarts over 20 cycles.
+#
+# Every test here drives the pass against a REAL streak file under tmp_path,
+# and points the liveness restart clock at an absent tmp path so the cap (step
+# 13's concern) never confounds the streak assertions. No test may touch the
+# real data/fused-memory/ state.
+# ---------------------------------------------------------------------------
+
+
+def _wire_liveness_pass(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    verdicts: list[str] | None = None,
+) -> list[str]:
+    """Wire a liveness pass onto tmp state; return the list restart_unit appends to.
+
+    Gates open (unit enabled, outside the startup grace window), streak file
+    and liveness restart clock both under tmp_path (the clock absent, so the
+    min-interval cap never fires). When *verdicts* is given, the verdict
+    function pops from it left-to-right, one per pass() call.
+    """
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
+    if verdicts is not None:
+        queue = list(verdicts)
+        monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: queue.pop(0))
+    return restarted
+
+
+def test_liveness_pass_single_wedged_verdict_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(a) ONE non-healthy verdict must NOT restart fused-memory.
+
+    This is the whole defect: every observed /health stall self-recovered, and
+    a single 60s-cadence probe cannot distinguish a transient stall from a
+    genuine wedge.
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"one wedged verdict must not restart fm; got {restarted}"
+    assert json.loads((tmp_path / "streak.json").read_text())["count"] == 1
+
+
+def test_liveness_pass_two_wedged_verdicts_do_not_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(b) Two consecutive non-healthy verdicts still issue no restart."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged", "wedged"])
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"two wedged verdicts must not restart fm; got {restarted}"
+    assert json.loads((tmp_path / "streak.json").read_text())["count"] == 2
+
+
+def test_liveness_pass_restarts_on_threshold_tick(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(c) The THIRD consecutive non-healthy verdict issues exactly one restart."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"expected exactly one restart on the threshold tick, got {restarted}"
+    )
+
+
+def test_liveness_pass_healthy_verdict_resets_the_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(d) A healthy verdict between failures RESETS the streak — no restart.
+
+    Exactly the observed transient-stall shape: fm stalls, recovers, stalls
+    again. Without the reset those unrelated stalls would accumulate into a
+    kill.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(
+        wdog, monkeypatch, tmp_path, ["wedged", "healthy", "wedged", "wedged"]
+    )
+
+    wdog.fused_memory_liveness_pass()
+    assert streak_file.exists()
+
+    wdog.fused_memory_liveness_pass()  # healthy
+    assert not streak_file.exists(), "a healthy verdict must clear the streak file"
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], (
+        f"an interleaved healthy verdict must prevent the restart; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 2
+
+
+def test_liveness_pass_clears_streak_after_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(e) After a restart the streak is CLEARED — the next kill needs a fresh N.
+
+    Otherwise the pass would degrade back to one-verdict-per-kill immediately
+    after the first restart, reintroducing the defect.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"]
+    assert not streak_file.exists(), "the consumed streak must be cleared"
+
+    wdog.fused_memory_liveness_pass()  # fourth wedged verdict
+
+    assert restarted == ["fused-memory.service"], (
+        f"the tick after a restart must not immediately re-restart; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+def test_liveness_pass_port_down_streaks_and_preserves_short_circuit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(f) 'port-down' streaks on the SAME counter, via the REAL verdict function.
+
+    Driven through the real _fused_memory_liveness_verdict() with probe_port
+    stubbed False and probe_health stubbed to pytest.fail, so this simultaneously
+    proves the port-probe SHORT-CIRCUIT is preserved: a dead port must still be
+    classified without waiting on the up-to-15s /health fetch.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    monkeypatch.setattr(
+        wdog,
+        "probe_health",
+        lambda: pytest.fail("probe_health must not run when the port is down"),
+    )
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+    assert restarted == [], f"port-down must also require a streak; got {restarted}"
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"], (
+        f"three consecutive port-down verdicts must revive fm exactly once; got {restarted}"
+    )
+
+
+def test_liveness_pass_mixed_non_healthy_verdicts_reach_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(g) A mixed wedged/port-down/wedged sequence reaches the threshold on tick 3.
+
+    Both are non-healthy verdicts for streak purposes; only 'healthy' proves
+    continuity is broken.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(
+        wdog, monkeypatch, tmp_path, ["wedged", "port-down", "wedged"]
+    )
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"mixed non-healthy verdicts must accumulate on one streak; got {restarted}"
+    )
+
+
+def test_liveness_pass_streak_survives_across_module_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(h) PASS-LEVEL cross-invocation proof: the streak survives a process boundary.
+
+    The watchdog is a Type=oneshot on a 60s timer — each tick is a NEW process.
+    Here each tick runs through a separate _load_watchdog() module object with
+    entirely fresh globals, so nothing can be carried in memory. Instances 1
+    and 2 must not restart; instance 3 must, having read the two prior failures
+    off disk.
+    """
+    streak_path = tmp_path / "streak.json"
+    monkeypatch.setenv("FM_LIVENESS_STREAK", str(streak_path))
+    monkeypatch.setenv("FM_LIVENESS_RESTART_CLOCK", str(tmp_path / "liveness_clock.json"))
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "3")
+    restarted: list[str] = []
+
+    def _tick() -> None:
+        wdog = _load_watchdog()
+        monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+        monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+        monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+        monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+        monkeypatch.setattr(wdog, "log", lambda _m: None)
+        wdog.fused_memory_liveness_pass()
+
+    _tick()
+    assert restarted == [], "instance 1 must not restart"
+    assert json.loads(streak_path.read_text())["count"] == 1
+
+    _tick()
+    assert restarted == [], "instance 2 must not restart"
+    assert json.loads(streak_path.read_text())["count"] == 2
+
+    _tick()
+    assert restarted == ["fused-memory.service"], (
+        f"instance 3 must restart, having read the streak off disk; got {restarted}"
+    )
+    assert not streak_path.exists(), "the consumed streak must be cleared"
+
+
+# ---------------------------------------------------------------------------
+# Part D: fused_memory_liveness_pass() restart min-interval cap (task 3764)
+#
+# The second layer, and the second half of the user-observable signal. The
+# streak makes a WRONG verdict rare; the cap makes a wrong verdict HARMLESS by
+# bounding watchdog-initiated fm revives to at most one per
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (3600s > the 3180s worst observed
+# pathological instance lifetime).
+# ---------------------------------------------------------------------------
+
+
+def _stamp_clock_file(path: pathlib.Path, ts: float) -> None:
+    """Write a {ts, iso} clock body directly, without importing the module."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"ts": ts, "iso": "2026-08-06T00:00:00+00:00"}))
+
+
+def test_liveness_pass_cap_suppresses_restart_inside_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A satisfied streak still issues NO restart inside the min-interval window.
+
+    Even if every verdict were wrong, fm cannot be revived more than once per
+    window — so a wrong verdict cannot reproduce the observed ~53 min
+    kill-and-re-kill pathology.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    now = 1783000000.0
+    _stamp_clock_file(tmp_path / "liveness_clock.json", now - 600.0)  # 10 min ago
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"the cap must suppress the restart; got {restarted}"
+    assert any("3600" in m for m in logged), (
+        f"the skip line must name the interval so an operator can see WHY: {logged}"
+    )
+
+
+def test_liveness_pass_cap_does_not_clear_the_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A capped tick must NOT clear the streak — "too soon" is not "it recovered".
+
+    The accumulated evidence must survive across the capped window so the
+    revive fires PROMPTLY the moment the window expires, rather than the count
+    restarting from scratch on every suppressed tick.
+
+    Driven at the REAL 60s timer cadence (OnUnitActiveSec=60) rather than by
+    jumping the clock: a jump would mean ticks were genuinely missed, which
+    FM_LIVENESS_STREAK_MAX_AGE_SECS correctly treats as breaking the
+    "consecutive" claim. This is the honest model of a wedged fm being probed
+    every minute throughout a capped hour.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+    start = 1783000000.0
+    now = [start]
+    # A liveness restart happened 10 minutes ago — we are inside the window.
+    _stamp_clock_file(tmp_path / "liveness_clock.json", start - 600.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+        now[0] += 60.0
+
+    assert restarted == [], "the cap must suppress the restart"
+    assert streak_file.exists(), "a capped tick must not clear the accumulated evidence"
+    assert json.loads(streak_file.read_text())["count"] == 3
+
+    # Keep ticking at the real cadence until the 3600s window expires. The
+    # evidence must accumulate throughout, never reset.
+    while now[0] - (start - 600.0) < 3600.0:
+        wdog.fused_memory_liveness_pass()
+        assert restarted == [], f"no restart may fire before the window expires at {now[0]}"
+        assert json.loads(streak_file.read_text())["count"] >= 3, (
+            "the streak must keep accumulating across the capped window"
+        )
+        now[0] += 60.0
+
+    # First tick past the window: the revive must fire immediately, with no
+    # fresh N-streak required.
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"the revive must fire on the first tick past the window; got {restarted}"
+    )
+    assert not streak_file.exists(), "the consumed streak must then be cleared"
+
+
+def test_liveness_pass_restart_stamps_the_liveness_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A restart outside the window fires once and (re)stamps the liveness clock.
+
+    Read back from the REAL file and compared against the monkeypatched clock,
+    so a restart that failed to arm the cap (leaving fm revivable again on the
+    very next tick) cannot pass.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    clock_file = tmp_path / "liveness_clock.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    now = 1783000000.0
+    _stamp_clock_file(clock_file, now - 7200.0)  # 2h ago — outside the window
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"]
+    assert float(json.loads(clock_file.read_text())["ts"]) == pytest.approx(now, abs=1.0), (
+        "the restart must re-stamp the liveness clock with the current time"
+    )
+
+
+def test_liveness_pass_cap_disabled_allows_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS<=0 disables the cap entirely."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 0)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    now = 1783000000.0
+    _stamp_clock_file(tmp_path / "liveness_clock.json", now - 1.0)  # one second ago
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"a disabled cap must not suppress the restart; got {restarted}"
+    )
+
+
+def test_liveness_pass_restart_does_not_touch_fm_deploy_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5 AT THE PASS LEVEL: a liveness revive must not silence the staleness backstop.
+
+    Writing FM_DEPLOY_CLOCK_PATH here would leave a merged fused-memory change
+    undeployed for the staleness pass's full 8h window purely because the
+    watchdog once revived a wedge. The pass must also never delegate to the
+    deploy script — brokenness is not a scheduled deploy.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    deploy_clock = tmp_path / "deploy_clock.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(deploy_clock))
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("liveness must never delegate to the fm deploy script (I5)"),
+    )
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"]
+    assert not deploy_clock.exists(), (
+        "a liveness revive must leave fm's DEPLOY clock untouched (I5)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part D: preserved invariants after the rewrite (task 3764, item 5)
+#
+# The gates and fail-directions this task must NOT change, re-asserted with
+# streak-file side-effect checks the pre-3764 tests could not make.
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_pass_disabled_unit_creates_no_streak_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A DISABLED unit: no probe, no restart, and NO streak file is created.
+
+    Disabling is explicit operator intent. Recording it as accumulating failure
+    evidence would mean re-enabling the unit later starts from a poisoned
+    streak.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    probed: list[int] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], f"a disabled unit must not be probed; probed {probed}"
+    assert restarted == []
+    assert not streak_file.exists(), (
+        "operator intent must not be recorded as failure evidence"
+    )
+
+
+def test_liveness_pass_grace_window_leaves_streak_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Inside STARTUP_GRACE_SECS: no probe, no restart, streak file untouched.
+
+    The grace branch must return BEFORE any streak read or write — it neither
+    accumulates evidence (a unit that has not bound its port yet is not a
+    wedge) nor clears it (that would let a restart loop reset the evidence on
+    every cycle).
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    original = json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    streak_file.write_text(original)
+    probed: list[int] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], f"no probe inside the grace window; probed {probed}"
+    assert restarted == []
+    assert streak_file.read_text() == original, (
+        "the grace branch must neither write nor clear the streak file"
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "probe_port",
+        "_fused_memory_liveness_verdict",
+        "_read_fm_liveness_streak",
+        "_record_fm_liveness_failure",
+        "_clear_fm_liveness_streak",
+        "_within_fm_liveness_restart_min_interval",
+        "_stamp_fm_liveness_restart_clock",
+    ],
+)
+def test_liveness_pass_isolates_exception_from_any_internal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, target: str
+) -> None:
+    """An exception from ANY probe/verdict/persistence internal is swallowed.
+
+    Every new persistence call must sit inside the pass's existing
+    try/except Exception, exactly like the probe calls: a hiccup writing or
+    reading a JSON file must never crash the oneshot watchdog.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 1)
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise RuntimeError(f"{target} exploded")
+
+    monkeypatch.setattr(wdog, target, boom)
+
+    # Must not raise.
+    wdog.fused_memory_liveness_pass()
+
+
+def test_cli_continues_past_a_liveness_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """WIRE-LEVEL: a liveness persistence hiccup must not stop the rest of the tick.
+
+    Extends the _cli ordering test: with the liveness pass's own internals
+    raising, staleness_pass() and fused_memory_staleness_pass() must still run,
+    so a corrupt streak file can never silently stall the fm deploy backstop.
+    """
+    wdog = _load_watchdog()
+    calls: list[str] = []
+    monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fm_staleness_pass")
+    )
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise RuntimeError("streak persistence exploded")
+
+    monkeypatch.setattr(wdog, "_record_fm_liveness_failure", boom)
+
+    assert wdog._cli([]) == 0
+    assert calls == ["main", "staleness_pass", "fm_staleness_pass"], (
+        f"the tick must continue past a liveness persistence failure; got {calls}"
+    )
+
+
+def test_liveness_pass_http_error_is_healthy_and_never_restarts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """PRESERVED: a 503 (HTTPError) still means ALIVE — no streak, no restart.
+
+    probe_health()'s deliberately inverted fail-direction is NOT touched by
+    this task: fused-memory's /health returns 503 when a backing store is
+    degraded, but a 503 proves the asyncio event loop IS serving requests.
+    Restarting would not fix a down store, would flap the single instance all
+    orchestrators depend on, and would cancel in-flight reconciliation work.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0}))
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+
+    def fake_urlopen(*_a, **_k):  # noqa: ANN002, ANN003
+        raise wdog.urllib.error.HTTPError(
+            wdog.FUSED_MEMORY_HEALTH_URL, 503, "Service Unavailable", {}, None  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+
+    for _ in range(5):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"a 503 must never lead to a restart; got {restarted}"
+    assert not streak_file.exists(), "a 503 is 'healthy' and must CLEAR the streak"
+
+
+# ---------------------------------------------------------------------------
+# Part D: --report surfaces the new persisted state (task 3764)
+#
+# Introducing hidden persisted state that changes whether fused-memory gets
+# killed, with no doctor-mode way to inspect it, is exactly the silent
+# degradation the project's norms forbid. An operator must be able to answer
+# "why didn't the watchdog restart fused-memory" without hand-reading JSON.
+# Both fields are STRICTLY read-only, like every other --report field.
+# ---------------------------------------------------------------------------
+
+
+def _wire_report_row(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point the fm report row's reads at tmp state with a known verdict."""
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "no")
+    _isolate_fm_liveness_state(wdog, monkeypatch, tmp_path)
+
+
+def test_report_row_shows_streak_when_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """USER-SIGNAL: the fm row renders the streak as "<count>/<threshold>"."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    (tmp_path / "streak.json").write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    )
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "2/3" in out, f"the row must show the streak position: {out!r}"
+
+
+def test_report_row_shows_streak_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No streak file renders as 'none', not a blank or a crash."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert re.search(r"streak:\s*none", out), f"absent streak must render 'none': {out!r}"
+
+
+def test_report_row_shows_liveness_restart_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The liveness-restart age renders hours-to-one-decimal, like DEPLOY-AGE."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    now = 1783000000.0
+    _stamp_clock_file(tmp_path / "liveness_clock.json", now - 7200.0)  # 2h ago
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "2.0h" in out, f"the row must show the liveness restart age: {out!r}"
+
+
+def test_report_row_shows_unknown_liveness_restart_age_when_never_stamped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A never-stamped liveness restart clock renders 'unknown'."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert re.search(r"LIVENESS-RESTART-AGE:\s*unknown", out), (
+        f"a never-stamped liveness clock must render 'unknown': {out!r}"
+    )
+
+
+def test_report_row_is_strictly_read_only_over_streak_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """I7/I8: the row must not restart, stamp a clock, or mutate the streak file.
+
+    --report is a doctor-mode read. If printing the streak could create, modify
+    or clear it, running --report would itself change whether fused-memory gets
+    killed on the next tick.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda _u: pytest.fail("--report must never restart")
+    )
+    streak_file = tmp_path / "streak.json"
+    original = json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    streak_file.write_text(original)
+    before_mtime = streak_file.stat().st_mtime_ns
+
+    wdog._print_fused_memory_liveness()
+    capsys.readouterr()
+
+    assert streak_file.read_text() == original, "--report must not modify the streak file"
+    assert streak_file.stat().st_mtime_ns == before_mtime
+    assert not (tmp_path / "liveness_clock.json").exists(), (
+        "--report must not stamp the liveness restart clock"
+    )
+    assert not (tmp_path / "deploy_clock.json").exists(), (
+        "--report must not stamp the fm deploy clock"
+    )
+
+
+def test_report_row_absent_streak_stays_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Printing an absent streak must not CREATE one."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+    capsys.readouterr()
+
+    assert not (tmp_path / "streak.json").exists(), (
+        "reading an absent streak must not materialise it"
+    )
+
+
+def test_report_row_degrades_single_field_on_streak_read_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An exception from the streak read degrades THAT FIELD, not all of --report.
+
+    The row must still print the verdict and the other fields — losing one
+    diagnostic must not cost an operator the whole doctor-mode line.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    def boom():
+        raise RuntimeError("streak read exploded")
+
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", boom)
+
+    # Must not raise.
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "wedged" in out, f"the rest of the row must survive a field failure: {out!r}"
+    assert "recon-busy" in out
+
+
+def test_cli_report_exit_code_unchanged_by_the_new_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_cli(["--report"]) still returns report()'s OWN staleness-only exit code.
+
+    The fm row is informational; the new fields must not leak into the exit
+    code any more than the existing ones do.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    (tmp_path / "streak.json").write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    )
+    monkeypatch.setattr(wdog, "report", lambda: 1)
+
+    assert wdog._cli(["--report"]) == 1
+    assert "2/" in capsys.readouterr().out
