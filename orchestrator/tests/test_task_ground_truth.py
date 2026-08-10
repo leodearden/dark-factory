@@ -1291,7 +1291,12 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('30')
 
-        assert sorted(report.open_escalations, key=lambda r: r.id) == [
+        # ``created_at`` is stamped by the queue at submit time, so it is
+        # stripped for this identity comparison and asserted on its own below.
+        assert [
+            dataclasses.replace(ref, created_at=None)
+            for ref in sorted(report.open_escalations, key=lambda r: r.id)
+        ] == [
             EscalationRef(
                 id='esc-30-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id='run-A/sess-A/pid=1',
@@ -1301,6 +1306,9 @@ class TestDeriveTruthRemainingFields:
                 filing_claimant_run_id=None,
             ),
         ]
+        assert all(ref.created_at for ref in report.open_escalations), (
+            'the filing time must survive the JSON round-trip (task 3535)'
+        )
 
     async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
         self, tmp_path: Path,
@@ -1318,7 +1326,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('31')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(
                 id='esc-31-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id=None,
@@ -1340,7 +1350,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('32')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(id='esc-32-1', level=0, category='infra_issue', severity=''),
         ]
 
@@ -1641,10 +1653,10 @@ class TestResolveOpenEscalationsThirdState:
         assert report.open_escalations[0].created_at == row.timestamp
 
 
-@pytest.mark.asyncio
 class TestStoreUnavailableChangesNoDisposition:
     """ZERO-DISPOSITION-CHANGE regression pin (task 3535's whole contract)."""
 
+    @pytest.mark.asyncio
     async def test_store_unavailable_off_main_strand_still_reverts_to_pending(self):
         """The fold that must NOT happen.
 
