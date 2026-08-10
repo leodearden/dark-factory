@@ -705,6 +705,160 @@ def _extract_tool_result(rpc_response: dict) -> dict:
     )
 
 
+# ---------------------------------------------------------------------------
+# post_mcp_envelope / post_mcp_tool_call — the session-aware MCP transport
+# ---------------------------------------------------------------------------
+#
+# THE ROOT-CAUSE FIX (task 3644). Two MCP servers, two transport MODES, and
+# every legibility poster spoke only to the second one:
+#
+#   fused-memory (:8002) is STATELESS -- a bare `tools/call` POST returns 200
+#   with `content-type: application/json` and no session id. This is why
+#   `census.default_submit_fn` works today and must keep working.
+#
+#   the escalation server (:8103) is STATEFUL. A bare `tools/call` POST is
+#   rejected at the TRANSPORT layer, before the tool ever runs (captured
+#   verbatim from a live probe on 2026-08-05):
+#
+#       HTTP/1.1 400 Bad Request
+#       mcp-session-id: 93599e03ba3b4baeb5bd0d2b6b399ddd
+#       {"jsonrpc":"2.0","id":"server-error",
+#        "error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
+#
+# All THREE legibility fail-loud escalation posters (census._post_mcp_tool_call,
+# nightly._default_poster, check_transcript_persistence._default_poster) target
+# the escalation server and all three swallow failures best-effort, so all three
+# were silently dropping every escalation they ever filed. Single-sourcing the
+# transport here -- alongside MCP_STREAMABLE_HTTP_HEADERS, which the task-2953
+# 406 fix centralised for exactly this reason -- keeps the fix one edit instead
+# of three lockstep ones.
+#
+# The handshake sequence is ported (to a synchronous, single-shot form) from
+# `fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient` (task 2491), the
+# same fix in async form; its two hard-won traps are carried over below.
+
+_MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_CLIENT_INFO = {"name": "dark-factory-legibility", "version": "1.0"}
+_MCP_SESSION_HEADER = "mcp-session-id"
+
+# The stateful server's "you need a session" status. ONLY this status triggers
+# the handshake+retry: any other non-2xx is a genuine server failure and must
+# propagate unretried rather than be double-sent and buried in handshake noise.
+_MCP_SESSION_REQUIRED_STATUS = 400
+
+
+def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dict:
+    """POST one JSON-RPC *envelope* to an MCP `/mcp` endpoint, handshaking
+    only if the server demands a session. Returns the decoded response body.
+
+    ADAPTIVE by design (task 3644): the envelope goes out session-less first,
+    and the MCP `initialize` -> `notifications/initialized` handshake runs
+    only on an HTTP 400. An unconditional handshake would add two round trips
+    to every `submit_task` the census files against the STATELESS fused-memory
+    server and change a path that works today; this way that path stays
+    byte-for-byte one POST. The wasted first POST against a stateful server is
+    harmless -- the 400 is raised at the transport layer before any tool
+    executes, so there is no double-execution risk -- and the retry is bounded
+    to exactly ONE attempt.
+
+    Raises whatever `response.raise_for_status()` raises on any other non-2xx
+    (and any transport exception verbatim); callers wrap this best-effort.
+
+    IMPLEMENTATION CONSTRAINT (task 3376): only `httpx.post` may be used, and
+    the 400 must be detected by reading `response.status_code` BEFORE calling
+    `raise_for_status()` -- never via an httpx exception type and never via
+    `httpx.Client`. The shared `install_fake_httpx` test fixture
+    (scripts/tests/conftest.py) exposes only `post` and `pytest.fail`s loudly
+    on any other attribute, precisely so a future reach for `httpx.Timeout` or
+    `except httpx.HTTPError` cannot stay green off the stub's own miss.
+    """
+    import httpx
+
+    response = httpx.post(
+        url, json=envelope, headers=MCP_STREAMABLE_HTTP_HEADERS, timeout=timeout,
+    )
+    if response.status_code != _MCP_SESSION_REQUIRED_STATUS:
+        response.raise_for_status()
+        return response.json()
+
+    # --- stateful server: handshake, then retry the original envelope once ---
+    #
+    # TRAP 1 (task 2491): `initialize` MUST be sent session-less. A stateful
+    # server 404s "Session not found" if the client invents its own id -- and
+    # the 400 above carries an `mcp-session-id` response header of its own
+    # which is NOT a usable session either. The only usable id is the one the
+    # server ASSIGNS on the initialize response, so nothing from before this
+    # point is carried forward.
+    init = httpx.post(
+        url,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": _MCP_PROTOCOL_VERSION,
+                "clientInfo": _MCP_CLIENT_INFO,
+                "capabilities": {},
+            },
+        },
+        headers=MCP_STREAMABLE_HTTP_HEADERS,
+        timeout=timeout,
+    )
+    init.raise_for_status()
+
+    # TRAP 2 (task 2491): capture the session id from the RESPONSE HEADER, and
+    # do it before any 202/empty-body early return -- `initialize` carries a
+    # JSON body but `notifications/initialized` may not.
+    session_id = init.headers.get(_MCP_SESSION_HEADER)
+    if not session_id:
+        raise RuntimeError(
+            f"MCP server at {url} demanded a session (HTTP "
+            f"{_MCP_SESSION_REQUIRED_STATUS}) but assigned no "
+            f"{_MCP_SESSION_HEADER} on initialize"
+        )
+
+    session_headers = {**MCP_STREAMABLE_HTTP_HEADERS, _MCP_SESSION_HEADER: session_id}
+
+    notified = httpx.post(
+        url,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        headers=session_headers,
+        timeout=timeout,
+    )
+    notified.raise_for_status()
+
+    retried = httpx.post(
+        url, json=envelope, headers=session_headers, timeout=timeout,
+    )
+    retried.raise_for_status()
+    return retried.json()
+
+
+def post_mcp_tool_call(
+    url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0,
+) -> dict:
+    """Call MCP tool *tool_name* at *url* and return its unwrapped result.
+
+    The one transport entrypoint every legibility MCP consumer goes through:
+    builds the `tools/call` envelope, posts it via :func:`post_mcp_envelope`
+    (session handshake included when the server is stateful), and unwraps the
+    JSON-RPC envelope via :func:`_extract_tool_result` -- so callers get the
+    tool's actual return value, not `{"jsonrpc": ..., "result": ...}`.
+    """
+    return _extract_tool_result(
+        post_mcp_envelope(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+            timeout=timeout,
+        )
+    )
+
+
 def default_status_fetcher(project_root: str | Path):
     """Return a zero-arg best-effort get_statuses caller for the standalone
     `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
