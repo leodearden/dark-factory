@@ -74,6 +74,38 @@ unaffected either way, since it already ORs in ``worktree_registered``/
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
+**Pending deterministic pure gates (task 3751).** A third bare-orchestrator-lock
+false positive affects **pending** deterministic tasks of the PURE-GATE shape —
+``always_escalates`` truthy AND ``before_done`` absent (see
+:func:`is_pure_gate_metadata`).  ``DeterministicRunner`` dispatches such a task
+through section 3 only: file one born-at-L2 escalation (deduped), stamp
+``metadata.gate_escalated_at``, set status ``blocked``.  No script, no systemd,
+no ``git_ops`` — and, like every deterministic task, no worktree/branch ever.
+So while it is pending the bare project-wide lock is never task-specific
+evidence for it.  ``detect_live_workflow`` therefore forces ``orchestrator_live``
+to ``False`` when ``status == 'pending' AND task_kind == 'deterministic' AND
+pure_gate`` (rule 5 of :func:`_orchestrator_signal_ineligible`), with
+``pure_gate`` passed in by the callers that hold the task's metadata.
+
+This is deliberately NOT a wholesale addition of ``'pending'`` to
+``ORCH_LIVE_INELIGIBLE_STATUSES``.  Beyond breaking every ordinary pending task
+(which is dispatch-eligible), it would race deterministic tasks that DO carry a
+``before_done``: ``Harness._run_deterministic_slot`` never flips a deterministic
+task to ``'in-progress'`` before invoking the runner, so such a task stays
+``'pending'`` for the whole duration of a blocking deploy/predicate script plus
+systemd inspection and fresh-PID verification — minutes of real, side-effecting
+work with zero git evidence to reveal it.  Restricting the exemption to the
+pure-gate subclass keeps it exactly as wide as the class of tasks that provably
+perform no side effects the bare lock could be evidence of (a short
+escalate-then-block write window does remain even for a pure gate — accepted
+residual risk, documented on :func:`is_pure_gate_metadata`).  Confirmed
+incident: dark_factory task **3845** (a
+pending ``always_escalates`` deterministic gate with no ``before_done``, verified
+by direct ``get_task`` read) stalled 3+ consecutive reconciliation cycles (runs
+0e98f0ac, f112de8), listed in Stage 2's Live-Workflow Signals with ONLY the bare
+``orchestrator`` signal, which permanently blocked its recon disposition; tasks
+3741/3749 were earlier observed instances of the same shape.
+
 **Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
 entry in ``git worktree list --porcelain`` marked ``prunable`` (its directory
 was removed/reaped, but the registration itself was not yet pruned) does NOT
@@ -161,6 +193,13 @@ _GIT_TIMEOUT: int = 10
 # pipeline."  A blocked *deterministic* task is handled separately by
 # `_orchestrator_signal_ineligible` below — see its docstring — rather than by
 # adding 'blocked' here, since that would wrongly suppress normal blocked tasks.
+# The one 'pending' exception is likewise handled there, by rule 5 (task 3751):
+# a pending deterministic PURE GATE (`always_escalates` truthy, `before_done`
+# absent) is exempt, because its whole DeterministicRunner run is
+# file-escalation-then-block. It is scoped as a compound rule rather than a
+# status addition here because a pending deterministic task WITH `before_done`
+# can be mid-deploy inside the runner (its status is never flipped to
+# 'in-progress'), and every ordinary pending task is dispatch-eligible.
 ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', 'cancelled'})
 
 # task_kind value used by the orchestrator/scheduler for deterministic tasks
@@ -235,6 +274,7 @@ def detect_live_workflow(
     base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
     task_kind: str | None = None,
+    pure_gate: bool | None = None,
     corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
 ) -> WorkflowLiveness:
@@ -280,6 +320,26 @@ def detect_live_workflow(
             blocked task with genuine per-task evidence (a registered worktree
             or a recent commit), or for any non-blocked status, the
             orchestrator_live computation is unaffected by ``task_kind``.
+            ``task_kind`` also scopes rule 5 via ``pure_gate`` (below).
+        pure_gate: Whether the task's metadata has the ``DeterministicRunner``
+            PURE-GATE shape (``always_escalates`` truthy AND ``before_done``
+            absent), as classified by :func:`is_pure_gate_metadata` — passed in
+            by the callers that hold the task's metadata dict. When ``status ==
+            'pending'`` AND ``task_kind == DETERMINISTIC_TASK_KIND`` AND this is
+            truthy, the project-wide ``orchestrator_live`` signal is forced
+            ``False`` (rule 5, task 3751): such a task's entire run is "file one
+            escalation, stamp ``gate_escalated_at``, set blocked", so it
+            performs no side effects the bare project lock could be evidence of
+            (a short escalate-then-block write window does remain — see
+            :func:`is_pure_gate_metadata`). ``None`` (the default) and
+            ``False`` are equivalent and
+            leave the rule inert, so the detector is byte-for-byte unchanged for
+            every caller that does not pass this kwarg — including a pending
+            deterministic task WITH a ``before_done``, which may be mid-deploy
+            inside ``DeterministicRunner`` and must keep the signal. The
+            per-task ``worktree_registered``/``recent_commit`` signals are
+            unaffected, so a pure gate that somehow did acquire a worktree is
+            still ``is_live``.
         corroborated: Per-task corroboration verdict for the in-progress
             liveness gate (task 2963). Only an explicit ``False`` downgrades:
             when ``status == 'in-progress'`` AND there is no ``recent_commit``
@@ -292,13 +352,17 @@ def detect_live_workflow(
             in-progress workflow whose lingering worktree registration and the
             freshly-restarted project-wide orchestrator lock both still assert
             liveness. ``recent_commit`` is EXEMPT (genuine per-task work
-            evidence). ``corroborated is None`` (the default — used by every
-            existing caller, and by ``recon_write_policy``/integrity-escalation
-            which lack the task dict) and ``corroborated is True`` both leave
-            the gate inert, so the detector's behavior is byte-for-byte
-            unchanged for all existing callers. The verdict is computed by
-            :func:`corroboration_for_task` and passed in only by
-            :func:`_render_live_workflow_section`, which HAS the task dict.
+            evidence). ``corroborated is None`` (the default) and
+            ``corroborated is True`` both leave the gate inert, so the
+            detector's behavior is byte-for-byte unchanged for any caller that
+            does not pass this kwarg. The verdict is computed by
+            :func:`corroboration_for_task` and passed in by the three consumers
+            that hold the task dict, which task 2964 made agree with each other:
+            :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._render_live_workflow_section`
+            (the render-time Live-Workflow Signals section),
+            ``recon_write_policy.check``'s Gate 2 (via its
+            ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
+            integrity-escalation gate over cited tasks.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -350,13 +414,16 @@ def detect_live_workflow(
     # project-wide lock is not evidence of liveness for a task that will never
     # be dispatched (or, for blocked deterministic tasks, never acquires a
     # worktree/branch of its own; or, for blocked normal tasks with no
-    # per-task git evidence, task 2409; or, status-agnostically, for a task
-    # whose branch is provably bare with its worktree reaped, task 2767).  The
-    # FINAL worktree_registered/recent_commit (post-prunable/post-bare, already
-    # computed above) and branch_bare are threaded through so rules 3 and 4 can
-    # evaluate the same evidence the caller sees.
+    # per-task git evidence, task 2409; or, for pending deterministic PURE
+    # GATES whose whole run is file-escalation-then-block, task 3751; or,
+    # status-agnostically, for a task whose branch is provably bare with its
+    # worktree reaped, task 2767).  The FINAL worktree_registered/recent_commit
+    # (post-prunable/post-bare, already computed above) and branch_bare are
+    # threaded through so rules 3 and 4 can evaluate the same evidence the
+    # caller sees.  pure_gate is normalized to a bool here so the default None
+    # (every caller that does not classify metadata) leaves rule 5 inert.
     if _orchestrator_signal_ineligible(
-        status, task_kind, worktree_registered, recent_commit, branch_bare
+        status, task_kind, worktree_registered, recent_commit, branch_bare, bool(pure_gate)
     ):
         orchestrator_live = False
     else:
@@ -495,6 +562,58 @@ def corroboration_for_task(
     )
 
 
+def is_pure_gate_metadata(metadata: object) -> bool:
+    """Return True when *metadata* has the ``DeterministicRunner`` PURE-GATE shape.
+
+    The pure-gate shape is ``always_escalates`` truthy AND ``before_done``
+    absent/falsy — the same two metadata fields ``DeterministicRunner`` itself
+    branches on (orchestrator/src/orchestrator/deterministic_runner.py section
+    3), and the same pair ``shared.task_metadata.TaskMetadata.
+    _deterministic_invariants`` validates. Such a task's ENTIRE execution is
+    "file one born-at-L2 escalation (deduped), stamp ``metadata.
+    gate_escalated_at``, set status ``blocked``": no script, no systemd, no
+    ``git_ops`` (the runner is constructed without ``git_ops`` for this path,
+    precisely to prove it). It therefore performs no git/worktree/script side
+    effects at all, so the bare project-wide lock carries no per-task evidence
+    for it — which is what makes it safe to drop that lock while the task is
+    still ``pending`` (see rule 5 of :func:`_orchestrator_signal_ineligible`,
+    task 3751).
+
+    That is a claim about EVIDENCE, not a claim that the task is never
+    mid-execution. A pending pure gate IS dispatch-eligible, and
+    ``Harness._run_deterministic_slot`` re-reads its status only once, at
+    dispatch (task 2983's double-dispatch guard); the task stays ``'pending'``
+    for the whole runner call. A short write window therefore remains between
+    the runner's escalation filing and its trailing
+    ``set_task_status(task_id, 'blocked')``, and that trailing write does NOT
+    re-check status first — so a recon-stage terminal write landing inside the
+    window would be clobbered (the task resurrected out of ``cancelled`` into
+    ``blocked``, with an L2 gate escalation standing for a task recon just
+    disposed of). Accepted residual risk: the window spans three writes with no
+    blocking work between them, and rule 2 (task 2067) already accepts a
+    comparable one for blocked deterministic tasks. There is no backstop guard
+    in ``DeterministicRunner`` today; hardening that trailing write is filed as
+    a follow-up (ticket ``tkt_0RS7FXG7C9W0RSTP9FBWK61V5Y``, from task 3751).
+
+    A truthy ``before_done`` deliberately DISQUALIFIES the shape: that path runs
+    a blocking deploy/predicate script plus systemd inspection and fresh-PID
+    verification — minutes of real, side-effecting work — while the task's
+    status is still ``'pending'``, because ``Harness._run_deterministic_slot``
+    never flips a deterministic task to ``'in-progress'`` before invoking the
+    runner. Such a task has no git evidence to reveal that it is running, so the
+    orchestrator lock is the only signal protecting it from a recon race.
+
+    Fail-safe toward live: only POSITIVE evidence of the shape returns True. Any
+    non-``Mapping`` input (``None``, a string, an int, a list) returns False, so
+    an absent, malformed, or unparseable metadata blob leaves the task live
+    rather than suppressing its signal. Uses truthiness rather than ``is True``
+    because task metadata round-trips through JSON.
+    """
+    if not isinstance(metadata, Mapping):
+        return False
+    return bool(metadata.get('always_escalates')) and not metadata.get('before_done')
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -549,12 +668,13 @@ def _orchestrator_signal_ineligible(
     worktree_registered: bool = False,
     recent_commit: bool = False,
     branch_bare: bool = False,
+    pure_gate: bool = False,
 ) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
     forced False for this *status*/*task_kind*/*worktree_registered*/
-    *recent_commit*/*branch_bare* combination.
+    *recent_commit*/*branch_bare*/*pure_gate* combination.
 
-    Four independent rules are centralized here:
+    Five independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -594,6 +714,23 @@ def _orchestrator_signal_ineligible(
        unaffected; a just-started dispatch keeps a LIVE (non-prunable)
        worktree, so ``worktree_registered`` is True and this rule stays
        inert.
+    5. ``status == 'pending' and task_kind == DETERMINISTIC_TASK_KIND and
+       pure_gate`` — a PENDING deterministic task of the PURE-GATE shape
+       (``always_escalates`` truthy AND ``before_done`` absent, classified by
+       :func:`is_pure_gate_metadata`), whose entire ``DeterministicRunner`` run
+       is "file one born-at-L2 escalation, stamp ``gate_escalated_at``, set
+       status blocked" — no script, no systemd, no ``git_ops``, and (like every
+       deterministic task) no worktree/branch — so it performs no side effects
+       the bare project lock could be evidence of (task 3751; confirmed
+       incident: task 3845 stalled 3+ recon cycles showing only the bare
+       ``orchestrator`` signal). A short escalate-then-block write window does
+       remain, and the runner's trailing ``blocked`` write does not re-check
+       status — accepted residual risk, documented in full on
+       :func:`is_pure_gate_metadata`. Unconditional on the git signals, like
+       rule 2. ``pure_gate`` defaults False, so this rule is inert for every
+       caller that does not classify the task's metadata. It is evaluated
+       before rule 4 in the body below purely for readability — the rules form
+       a disjunction of independent early returns, so their order is immaterial.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
@@ -603,6 +740,13 @@ def _orchestrator_signal_ineligible(
     (status AND task_kind [AND NOT git-evidence]) conditions for rules 2 and 3,
     rather than an unconditional status addition. Rule 4 is the sole exception
     to the "scoped by status" pattern, by design (see above).
+
+    ``'pending'`` is likewise NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``:
+    every ordinary pending task is dispatch-eligible, and a pending
+    *deterministic* task carrying a ``before_done`` may be mid-deploy inside
+    ``DeterministicRunner`` (``Harness._run_deterministic_slot`` never flips it
+    to ``'in-progress'``) with no git evidence to reveal it. Hence rule 5's
+    compound (status AND task_kind AND pure_gate) condition.
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
@@ -615,6 +759,8 @@ def _orchestrator_signal_ineligible(
             and not recent_commit
         ):
             return True
+    if status == 'pending' and task_kind == DETERMINISTIC_TASK_KIND and pure_gate:
+        return True
     return branch_bare and not worktree_registered and not recent_commit
 
 

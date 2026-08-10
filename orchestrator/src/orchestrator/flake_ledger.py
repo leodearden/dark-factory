@@ -292,6 +292,39 @@ def ensure_schema(db_path: Path) -> None:
         logger.warning('flake_ledger: schema init failed for %s', db_path, exc_info=True)
 
 
+def _canonicalize_utc(dt: datetime, *, origin: str | None = None) -> str:
+    """Coerce *dt* to aware-UTC and return its canonical ISO-8601 spelling.
+
+    Shared by both ledger clocks: :func:`_normalize_observed_at` (the discriminator-
+    supplied ``observed_at``) and ``open_debt``/``resolve_debt`` (the ledger-owned
+    ``opened_at``/``resolved_at``/``last_occurrence_at``).  A naive value gets UTC
+    ATTACHED, never ``.astimezone()``: every one of these columns is documented as UTC,
+    and ``.astimezone()`` on a naive datetime applies the HOST's local offset, which
+    would silently shift the stamp by the dispatcher's timezone.
+
+    *origin* controls whether a naive *dt* is worth a loud warning, and is left
+    ``None`` on the :func:`_normalize_observed_at` path deliberately: ``observed_at``
+    arrives over the wire from a remote discriminator with no runtime validation, so a
+    missing offset there is expected input, not a caller bug, and warning on it would
+    just be noise on every legitimate remote observation.  ``open_debt``/``resolve_debt``
+    pass their function name: their ``now`` is supplied by IN-REPO callers, where a
+    naive datetime is a caller bug rather than untrusted input — the repo's own
+    precedent for the analogous case is loud (``orchestrator/overrides.py:222`` raises
+    on a naive ``ttl_until``) — and silent coercion would otherwise mask a future ζ/ε
+    call site passing ``datetime.now()`` instead of ``datetime.now(UTC)``, producing a
+    stamp that is wrong by the host offset while still looking canonical.
+    """
+    if dt.tzinfo is None:
+        if origin is not None:
+            logger.warning(
+                'flake_ledger: %s received a naive now; treating as UTC — callers '
+                'should pass datetime.now(UTC)',
+                origin,
+            )
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
+
+
 def _normalize_observed_at(raw: str) -> str:
     """Canonicalise a discriminator stamp to ISO-8601 UTC.
 
@@ -304,25 +337,21 @@ def _normalize_observed_at(raw: str) -> str:
     from ``datetime.isoformat()`` — would otherwise land the SAME observation twice and
     sort apart inside a window.
 
-    A naive stamp gets UTC ATTACHED, never ``.astimezone()``: the field is documented as
-    UTC, and ``.astimezone()`` on a naive datetime applies the HOST's local offset, which
-    would silently shift a remote observation's stamp by the dispatcher's timezone.
-
     Raises on a malformed stamp, deliberately — the caller's B12 catch-all turns that
     into a loud warning and a dropped write, which beats persisting a stamp that breaks
     both dedup and the window scan.
 
-    BOTH SIDES OF THE COMPARISON MUST GO THROUGH HERE.  This is used on the WRITE path
-    (``record_flake_occurrence``) and on the READ path (:func:`read_occurrences`'s
-    ``since`` boundary), and normalising only one of them is worse than normalising
-    neither: it makes a correct-looking query against a correctly-stored row return
-    NOTHING, silently.  Any future window bound (an ``until``, a debt-age cutoff) must be
-    routed through here too.
+    BOTH SIDES OF THE COMPARISON MUST GO THROUGH HERE (or through :func:`_canonicalize_utc`
+    for an already-parsed ``datetime``, as ``open_debt``/``resolve_debt`` do for their
+    ``opened_at``/``resolved_at``/``last_occurrence_at`` columns).  This is used on the
+    WRITE path (``record_flake_occurrence``) and on the READ path
+    (:func:`read_occurrences`'s ``since`` boundary), and normalising only one side of a
+    comparison is worse than normalising neither: it makes a correct-looking query
+    against a correctly-stored row return NOTHING, silently.  Any future window bound (an
+    ``until``, a debt-age cutoff) must be routed through here — or through
+    :func:`_canonicalize_utc` — too.
     """
-    parsed = datetime.fromisoformat(raw)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC).isoformat()
+    return _canonicalize_utc(datetime.fromisoformat(raw))
 
 
 def record_flake_occurrence(
@@ -630,7 +659,15 @@ async def open_debt(
     file a de-flake task against a test that does not exist.
 
     *now* defaults to the current UTC time; it is injectable so §5.4's ledger-owned
-    timestamps are deterministically testable.
+    timestamps are deterministically testable.  Whatever is passed — naive or any
+    offset — is routed through :func:`_canonicalize_utc` before being stamped, so an
+    injected clock cannot write ``opened_at``/``last_occurrence_at`` in a spelling that
+    breaks :func:`list_open_debt`'s ``ORDER BY opened_at`` contract against rows written
+    by the default aware-UTC path.  In-repo callers should always pass aware-UTC
+    (``datetime.now(UTC)``) — a naive ``now`` is coerced rather than rejected, to honour
+    the never-raises invariant, but it also logs a loud warning, because here (unlike
+    :func:`_normalize_observed_at`'s wire-supplied ``observed_at``) a missing offset is
+    a caller bug, not untrusted input.
     """
     try:
         if test_id == UNKNOWN_TEST_ID:
@@ -641,7 +678,7 @@ async def open_debt(
             )
             return None
 
-        stamp = (now or datetime.now(UTC)).isoformat()
+        stamp = _canonicalize_utc(now or datetime.now(UTC), origin='open_debt')
         conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
@@ -730,9 +767,16 @@ async def resolve_debt(
     A zero-rowcount UPDATE — no debt for this test, or its cycle is already closed — is a
     legitimate no-op, not an error.  ``async`` for the same forward-compat reason as
     :func:`open_debt` — η adds the recurrence escalation inside this function.
+
+    *now* is canonicalised through :func:`_canonicalize_utc` exactly as ``open_debt``
+    does for ``opened_at``/``last_occurrence_at``, so an injected naive or non-UTC clock
+    cannot write ``resolved_at`` in a spelling that sorts differently from the default
+    aware-UTC path.  Same loud-on-naive treatment as ``open_debt`` too: in-repo callers
+    should always pass aware-UTC, and a naive ``now`` here is a caller bug rather than
+    untrusted input, so it is coerced (never-raises) but logged.
     """
     try:
-        stamp = (now or datetime.now(UTC)).isoformat()
+        stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
         conn = _open(db_path)
         try:
             conn.execute(

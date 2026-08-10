@@ -40,36 +40,35 @@ from pathlib import Path
 # it. Same correction in tests/scripts/test_migrate_metadata_modules_to_files.py.
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
-    AuditCoverage,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    AuditCoverage,
     WipeCandidate,
 )
-
 from repair_wiped_metadata_files import (
+    ALL_DISPOSITIONS,
     CLIENT_NAME,
-    EXIT_NOTHING_SCANNED,
     EXIT_NO_ROOT,
+    EXIT_NOTHING_SCANNED,
     EXIT_OK,
     EXIT_SERVER_UNREACHABLE,
+    FAILED,
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
-    SKIP_FILES_PRESENT,
-    SKIP_MISSING,
-    SKIP_NOT_TERMINAL,
-    ALL_DISPOSITIONS,
-    FAILED,
     SKIP_CONTRADICTED,
+    SKIP_FILES_PRESENT,
     SKIP_LOCK_CHARTER,
     SKIP_LOCK_LEVEL_FIDELITY,
+    SKIP_MISSING,
+    SKIP_NOT_TERMINAL,
     RepairOutcome,
-    _make_client,
     RepairResult,
+    _make_client,
     build_repair_payload,
     classify_live_task,
     format_summary,
@@ -195,7 +194,7 @@ def test_select_on_an_empty_feed_returns_empty():
 
 def test_plan_files_rejection_reason_accepts_an_all_file_level_list():
     """(a) every entry is file-level -> no reason. The systemd unit paths are
-    deliberate: `timer` and `service` ARE in shared.locking.CODE_EXTENSIONS, so
+    deliberate: `timer` and `service` ARE in shared.locking.FILE_EXTENSIONS, so
     a naive "no dot-py suffix means directory" check would wrongly reject real
     repairable paths measured in today's population."""
     candidate = _candidate(

@@ -48,9 +48,9 @@ from __future__ import annotations
 import pathlib
 
 import pytest
+from orchestrator.config import OrchestratorConfig, _discover_module_configs
 
 from orchestrator import verify, verify_plan
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

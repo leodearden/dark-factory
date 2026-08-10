@@ -461,19 +461,32 @@ async def maybe_escalate_stalled_gate_backlog(
       CAN *suppress* a same-task HOR escalation — harmless because the two
       populations are disjoint in practice.
     - Otherwise build an ``Escalation`` with ``level=1``, ``severity='blocking'``,
-      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The
-      human-readable age is recomputed from ``task_by_id[task_id]['metadata']``
-      via ``gate_escalated_age_secs`` for the summary/detail.  Any failure
-      (id-gen, construction, or submit) logs WARNING and excludes the task_id
-      from the returned list.
+      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The summary
+      states the ``gate_escalated_at`` anchor from
+      ``task_by_id[task_id]['metadata']`` together with the static
+      ``threshold_secs`` fact — both true at any later read time, including
+      through a ``compact=True`` drain, which keeps ``summary`` but drops
+      ``detail`` (see ``_COMPACT_ESCALATION_FIELDS`` in
+      ``escalation/src/escalation/server.py``).  Naming the threshold alongside
+      the anchor lets a compact-drain read convey urgency without requiring a
+      mental diff against "now".  The age recomputed via
+      ``gate_escalated_age_secs`` is retained only as a filing-time forensic
+      value in the detail block (``age_hours_at_filing``), since it goes stale
+      while the escalation sits open.  The ``age_hours is not None`` branch
+      condition doubles as a guard: it holds only when ``gate_escalated_at``
+      parsed successfully, so the summary anchor is provably a real timestamp;
+      an unparseable or absent stamp falls through to the threshold-named
+      fallback summary below instead.  Any failure (id-gen, construction, or
+      submit) logs WARNING and excludes the task_id from the returned list.
 
     Returns the list of task_ids that received a new escalation.  Returns
     ``[]`` immediately when the ``escalation`` package is unavailable.
 
     *threshold_secs* is accepted for signature symmetry with
     ``extract_stalled_gate_backlog_task_ids`` (the caller has already applied
-    the age filter) and names the boundary in the fallback summary when a
-    task's age cannot be recomputed.
+    the age filter) and names the boundary in both summary branches: paired
+    with the live anchor when the age is known, alone in the fallback summary
+    when it cannot be recomputed.
     """
     if Escalation is None:
         return []
@@ -501,7 +514,9 @@ async def maybe_escalate_stalled_gate_backlog(
 
         if age_hours is not None:
             summary = (
-                f'Gate task {task_id} has awaited a human decision for {age_hours}h'
+                f'Gate task {task_id} has awaited a human decision since '
+                f'{gate_escalated_at} (past the {threshold_secs / 3600:.0f}h '
+                f'gate-backlog threshold)'
             )
         else:
             summary = (
@@ -514,7 +529,7 @@ async def maybe_escalate_stalled_gate_backlog(
             f'run_id: {run_id}',
             f'task_id: {task_id}',
             f'gate_escalated_at: {gate_escalated_at}',
-            f'age_hours: {age_hours if age_hours is not None else "unknown"}',
+            f'age_hours_at_filing: {age_hours if age_hours is not None else "unknown"}',
         ]
         title = task.get('title') if isinstance(task, dict) else None
         if title:

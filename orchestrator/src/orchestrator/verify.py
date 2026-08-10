@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -25,11 +26,19 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
+from shared.psi import read_psi_sample
 from shared.verify_admission import acquire_task_slot, nice_prefix
 
 from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+# The discriminator's VOCABULARY only (flake-ledger PRD task β). Deliberately
+# NOT record_flake_occurrence / open_debt: `confirm_isolated_rerun_verdict` is
+# PURE (INV-5), and keeping every side-effecting name out of this import
+# surface is what makes that structural rather than a reviewing burden.
+# flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
+from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -7219,6 +7228,138 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 _SWEEP_CONFIRM_TIMEOUT_SECS: int = 300
 
 
+class _RerunOutcome(StrEnum):
+    """What a bounded isolated re-run actually observed — verify's INTERNAL
+    engine vocabulary, deliberately distinct from the wire-facing
+    :class:`orchestrator.flake_ledger.FlakeVerdict`.
+
+    Exists because ``bool`` cannot say the third thing. ``_run_isolated_confirm_group``'s
+    own log line has always said ``'unconfirmable, not counted as a pass'`` for an
+    infra-sentinel attempt, while its return type collapsed that into the same
+    ``False`` a genuine red produces — the fact lived in a variable and died in a
+    log (INV-2, structured-facts-at-failure). ``confirm_isolated_rerun_verdict``
+    needs the distinction to map an infra-sentinel re-run to
+    ``FlakeVerdict.unconfirmable`` rather than mislabelling it as a real red.
+
+    PRECEDENCE WITHIN ONE GROUP, when that group's attempts disagree:
+    ``passed`` (a pass anywhere is proof the group can run green) > ``failed``
+    (a genuine red observed anywhere is real evidence) > ``unconfirmable`` (we
+    never actually got a verdict). So a group's ``unconfirmable`` means EVERY
+    attempt on THAT group was uninformative, never "some were".
+
+    ACROSS GROUPS, ``confirm_isolated_rerun_verdict`` applies the same relative
+    order to the two non-pass outcomes — a ``failed`` group outranks an
+    ``unconfirmable`` one, which is why an unconfirmable group does NOT
+    short-circuit the groups still to run — with ONE deliberate difference:
+    ``passed`` is conjunctive there rather than disjunctive. Every group must
+    confirm green, so one group's pass never rescues another group's red.
+    """
+
+    passed = 'passed'  # some attempt ran and PASSED — a confirmed flake for this group
+    failed = 'failed'  # some attempt ran and genuinely FAILED, none passed
+    unconfirmable = 'unconfirmable'  # no attempt produced a usable verdict at all
+
+
+@dataclass(frozen=True)
+class _RerunObservation:
+    """What ONE call-site engine actually saw re-running ONE subproject group.
+
+    Richer than a bare :class:`_RerunOutcome` because
+    ``confirm_isolated_rerun_verdict`` has to NAME why a re-run was
+    uninformative (``infra_transient_rerun:<category>``), and because the merge
+    gate's existing log line renders the observed ``category``/``passed`` pair
+    verbatim.
+    """
+
+    outcome: _RerunOutcome
+    category: str  # last observed VerifyResult.category ('' when none was observed)
+    passed: bool  # last observed VerifyResult.passed (False when none was observed)
+
+
+def _classify_rerun_result(result: VerifyResult) -> _RerunObservation:
+    """Map ONE completed ``VerifyResult`` to a :class:`_RerunObservation`.
+
+    Category-FIRST, deliberately independent of the ``passed`` flag: an
+    infra-sentinel category is never trusted as confirmation EITHER WAY, even
+    in the (normally impossible) case it were paired with ``passed=True`` —
+    the same rule ``_run_isolated_confirm_group_observation`` and
+    ``run_main_tip_sweep`` already apply.
+    """
+    if result.category in INFRA_TRANSIENT_CATEGORIES:
+        return _RerunObservation(
+            _RerunOutcome.unconfirmable, result.category, result.passed,
+        )
+    if result.passed:
+        return _RerunObservation(_RerunOutcome.passed, result.category, result.passed)
+    return _RerunObservation(_RerunOutcome.failed, result.category, result.passed)
+
+
+async def _run_isolated_confirm_group_observation(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_config: ModuleConfig,
+) -> _RerunObservation:
+    """Run *module_config* (already scoped + forced-serial) up to
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*, preserving WHAT
+    was observed.
+
+    The source of truth for this family; ``_run_isolated_confirm_group`` is the
+    one lossier shim over it, kept only because its single legacy caller wants
+    a bool. This is also the ``main_probe`` call-site engine
+    (``_CALL_SITE_POLICY``), which needs the last observed CATEGORY to name an
+    ``infra_transient_rerun:<category>`` reason.
+
+    Reports ``passed`` as soon as any attempt PASSES (that group is a confirmed
+    flake). Otherwise ``failed`` if any attempt produced a genuine red — a real
+    failure, or a timeout (``VerifyResult.timed_out`` with ``passed=False``) —
+    and ``unconfirmable`` only when EVERY attempt was uninformative: an
+    infra-sentinel category (``pytest_internalerror``/``env_transient`` — never
+    trusted as confirmation either way) or a raised exception (caught here so a
+    transient error on one attempt doesn't abort the remaining attempts).
+    Never raises.
+    """
+    saw_genuine_failure = False
+    last_category = ''
+    last_passed = False
+    for attempt in range(_SWEEP_CONFIRM_MAX_ATTEMPTS):
+        try:
+            result = await run_verification(worktree, config, module_config, max_retries=0)
+        except Exception:
+            logger.debug(
+                'confirm_main_tip_failure_is_real: isolated re-run raised '
+                '(attempt %d/%d) for %r',
+                attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS, module_config.test_command,
+                exc_info=True,
+            )
+            continue
+        last_category = result.category
+        last_passed = result.passed
+        # An infra-sentinel category (pytest_internalerror/env_transient) is
+        # never trusted as confirmation, even in the (normally impossible)
+        # case it were paired with passed=True — mirrors run_main_tip_sweep's
+        # own category-first check, which is deliberately independent of the
+        # passed flag (see its INFRA_TRANSIENT_CATEGORIES branch).
+        if result.category in INFRA_TRANSIENT_CATEGORIES:
+            logger.debug(
+                'confirm_main_tip_failure_is_real: isolated re-run hit %s '
+                '(attempt %d/%d) for %r — unconfirmable, not counted as a pass',
+                result.category, attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS,
+                module_config.test_command,
+            )
+            continue
+        if result.passed:
+            return _RerunObservation(_RerunOutcome.passed, last_category, last_passed)
+        # A completed, non-sentinel, non-passing attempt IS evidence of a real
+        # red — the one thing an exhausted loop must not report as "we could
+        # not tell".
+        saw_genuine_failure = True
+    return _RerunObservation(
+        _RerunOutcome.failed if saw_genuine_failure else _RerunOutcome.unconfirmable,
+        last_category,
+        last_passed,
+    )
+
+
 async def _run_isolated_confirm_group(
     worktree: Path,
     config: 'OrchestratorConfig',
@@ -7235,34 +7376,18 @@ async def _run_isolated_confirm_group(
     confirmation either way), and a raised exception (caught here so a
     transient error on one attempt doesn't abort the remaining attempts).
     Never raises.
+
+    A lossy shim over ``_run_isolated_confirm_group_observation``, which is the
+    outcome-preserving source of truth: both ``failed`` and ``unconfirmable``
+    flatten to ``False`` here, deliberately, so the ONE remaining caller —
+    ``confirm_main_tip_failure_is_real`` — observes no behaviour change at all.
+    (The merge gate and the main probe were the other two callers before they
+    became thin wrappers over ``confirm_isolated_rerun_verdict``, which consumes
+    the observation directly and must NOT lose the distinction.)
     """
-    for attempt in range(_SWEEP_CONFIRM_MAX_ATTEMPTS):
-        try:
-            result = await run_verification(worktree, config, module_config, max_retries=0)
-        except Exception:
-            logger.debug(
-                'confirm_main_tip_failure_is_real: isolated re-run raised '
-                '(attempt %d/%d) for %r',
-                attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS, module_config.test_command,
-                exc_info=True,
-            )
-            continue
-        # An infra-sentinel category (pytest_internalerror/env_transient) is
-        # never trusted as confirmation, even in the (normally impossible)
-        # case it were paired with passed=True — mirrors run_main_tip_sweep's
-        # own category-first check, which is deliberately independent of the
-        # passed flag (see its INFRA_TRANSIENT_CATEGORIES branch).
-        if result.category in INFRA_TRANSIENT_CATEGORIES:
-            logger.debug(
-                'confirm_main_tip_failure_is_real: isolated re-run hit %s '
-                '(attempt %d/%d) for %r — unconfirmable, not counted as a pass',
-                result.category, attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS,
-                module_config.test_command,
-            )
-            continue
-        if result.passed:
-            return True
-    return False
+    return (await _run_isolated_confirm_group_observation(
+        worktree, config, module_config,
+    )).outcome is _RerunOutcome.passed
 
 
 def _group_node_ids_by_subproject(
@@ -7685,139 +7810,6 @@ async def confirm_main_tip_failure_is_real(
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
 
-
-async def confirm_merge_verify_flake_suppressible(
-    config: 'OrchestratorConfig',
-    failing_result: VerifyResult,
-    *,
-    worktree: Path,
-    module_configs: list[ModuleConfig],
-) -> list[str] | None:
-    """PURE gate: is *failing_result* a suppressible CPU-starvation flake?
-
-    The merge-path analogue of ``confirm_main_tip_failure_is_real``, with three
-    deliberate differences (PRD task α):
-
-    * SAME-TREE (INV-3): re-runs the named failing tests in the GIVEN merge
-      *worktree* at the merge SHA — the exact tree being gated — rather than
-      minting a fresh probe worktree for a different SHA. No ``git worktree
-      add``/``remove``, no cleanup ``finally``.
-    * Returns a VERDICT (``list[str]`` of confirmed-flake node-ids, or
-      ``None``) and NEVER raises: the merge path (merge_queue.py) has no
-      ``VerifyInfraError`` handler, so an uncaught raise there stalls the merge
-      queue. The whole body is defensively wrapped — any unexpected exception
-      fails CLOSED to ``None`` (merge stays red).
-    * Single-shot per node-id group (PRD §5.1), not the sweep's 2-attempt loop.
-
-    Returns the extracted node-id list ONLY when every named failing test
-    demonstrably PASSES on a scoped + forced-serial + generous-timeout isolated
-    re-run. Returns ``None`` (fail-closed to red — never mask a REAL red) for:
-    no recoverable node-id (opaque/lint/type failure), any node-id that maps to
-    no given subproject, a re-run that still fails / errors / times out, or an
-    infra-sentinel re-run category (``INFRA_TRANSIENT_CATEGORIES`` — never
-    trusted as confirmation).
-
-    Node-id -> subproject mapping DELEGATES to ``_group_node_ids_by_subproject``
-    over ``{mc.prefix: mc for mc in module_configs}`` — the same shared helper
-    ``confirm_main_tip_failure_is_real`` and the sweep pre-filter use (task
-    3290 retired this call site's inline copy). The list -> dict conversion is
-    order-preserving on a prefix-deduped list, so candidate iteration and
-    first-wins ambiguity resolution are unchanged. The mapping runs over the
-    GIVEN *module_configs* + *worktree* (the merge tree already on disk), never
-    re-discovered. Empty *module_configs* / files-not-on-disk (unit-test fakes)
-    naturally map nothing -> ``None``, which keeps existing
-    ``LocalRunner.run_merge_verify`` tests byte-identical.
-    """
-    try:
-        node_ids = _extract_failing_test_ids(failing_result.test_output)
-        if not node_ids:
-            return None
-
-        # Map each node-id to its owning subproject over the given
-        # module_configs + the on-disk merge worktree, via the SHARED helper
-        # (see its docstring for the probe rules and the ambiguity WARNING).
-        # mc_by_prefix is the single source for both the helper argument and
-        # the per-group lookup below.
-        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-        groups = _group_node_ids_by_subproject(
-            worktree, mc_by_prefix, node_ids,
-            log_label='confirm_merge_verify_flake_suppressible',
-        )
-        # `not groups`, NOT `is None`: both sentinels must fail CLOSED. Falling
-        # into the groups.items() loop with an empty dict would exit having run
-        # ZERO isolated re-runs and then `return node_ids` — a full suppression
-        # verdict on zero evidence, letting a genuinely red merge land. Mirrors
-        # the same defensive guard in _sweep_failure_reproduces_in_isolation.
-        if not groups:
-            # Name the offending node-ids HERE so this ONE merge-lane line
-            # answers both "which tests failed to map?" and "what did the gate
-            # decide?" without correlating a second line: the shared helper's
-            # own INFO names the first unmappable node-id but only knows the
-            # neutral 'unconfirmable', while the verdict vocabulary ('not
-            # suppressing') is the caller's alone. Rendering `groups` also
-            # separates the reachable None case from the defensive-only {}.
-            # The preview is bounded — a mass failure can extract hundreds of
-            # node-ids, and a log line is not a report.
-            shown = node_ids[:10]
-            extra = len(node_ids) - len(shown)
-            logger.info(
-                'confirm_merge_verify_flake_suppressible: node-id -> subproject '
-                'mapping yielded nothing usable (%r) for %s%s in %s — '
-                'unconfirmable, not suppressing',
-                groups, shown, f' (+{extra} more)' if extra else '', worktree,
-            )
-            return None
-
-        # Each subproject group gets its own scoped + forced-serial +
-        # generous-timeout isolated re-run in the SAME merge worktree. ALL
-        # groups must confirm green to suppress.
-        for prefix, group_node_ids in groups.items():
-            mc = mc_by_prefix[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                ),
-                _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
-            )
-            result = await run_verification(
-                worktree, config, scoped_mc,
-                max_retries=0, is_merge_verify=True, role='merge',
-            )
-            # An infra-sentinel category is never trusted as confirmation, even
-            # paired with passed=True (mirrors _run_isolated_confirm_group).
-            if result.category in INFRA_TRANSIENT_CATEGORIES or not result.passed:
-                logger.info(
-                    'confirm_merge_verify_flake_suppressible: isolated re-run '
-                    'for %s did not confirm green (category=%r, passed=%s) — '
-                    'not suppressing',
-                    prefix, result.category, result.passed,
-                )
-                return None
-
-        logger.info(
-            'confirm_merge_verify_flake_suppressible: merge-verify flake '
-            'confirmed suppressible: %s failed under load, passed on isolated '
-            're-run in %s',
-            node_ids, worktree,
-        )
-        return node_ids
-
-    except Exception:
-        logger.warning(
-            'confirm_merge_verify_flake_suppressible: unexpected error — '
-            'failing closed to red',
-            exc_info=True,
-        )
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Main-probe isolated-flake confirm gate (task 3597)
-# ---------------------------------------------------------------------------
-
 #: Generous per-test timeout (seconds) injected into the main-probe confirm
 #: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
 #: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
@@ -7828,7 +7820,536 @@ async def confirm_merge_verify_flake_suppressible(
 #: isolated confirm run into a false "still fails" verdict — and here that
 #: false verdict would mean a false red-main verdict (BLOCKED awaiting a
 #: hotfix for a main that is actually green) survives untouched.
+#:
+#: Lives beside the merge gate's constant (rather than in the main-probe
+#: section it was written in) because both are now read by ``_CALL_SITE_POLICY``
+#: below. Kept as two names, deliberately: co-locating the tuning knobs is not
+#: the same as coupling them.
 _MAIN_PROBE_CONFIRM_TIMEOUT_SECS: int = 300
+
+
+# ---------------------------------------------------------------------------
+# The ONE isolated-rerun discriminator (flake-ledger PRD task β, §8.1)
+# ---------------------------------------------------------------------------
+
+
+async def _merge_gate_isolated_rerun(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    scoped_mc: ModuleConfig,
+) -> _RerunObservation:
+    """The merge gate's re-run engine: ONE shot, merge-role (PRD §5.1).
+
+    Deliberately does NOT catch: an exception here belongs to
+    ``confirm_isolated_rerun_verdict``'s outer fail-CLOSED handler (INV-1), so
+    a merge stays red rather than being suppressed on an unobserved re-run.
+    """
+    result = await run_verification(
+        worktree, config, scoped_mc,
+        max_retries=0, is_merge_verify=True, role='merge',
+    )
+    return _classify_rerun_result(result)
+
+
+def _log_merge_gate_success(node_ids: list[str], worktree: Path) -> None:
+    logger.info(
+        'confirm_merge_verify_flake_suppressible: merge-verify flake '
+        'confirmed suppressible: %s failed under load, passed on isolated '
+        're-run in %s',
+        node_ids, worktree,
+    )
+
+
+def _log_merge_gate_group_not_confirmed(
+    prefix: str, observation: _RerunObservation,
+) -> None:
+    logger.info(
+        'confirm_merge_verify_flake_suppressible: isolated re-run '
+        'for %s did not confirm green (category=%r, passed=%s) — '
+        'not suppressing',
+        prefix, observation.category, observation.passed,
+    )
+
+
+def _log_main_probe_success(node_ids: list[str], _worktree: Path) -> None:
+    # WARNING, not INFO: the merge gate's success only unblocks a merge, but
+    # this one contradicts a red-main verdict that would otherwise file an L1.
+    logger.warning(
+        'verify_failure_is_preexisting_on_main confirm gate: %s passed on '
+        'isolated re-run on the main probe — main is not red for these '
+        'tests',
+        node_ids,
+    )
+
+
+@dataclass(frozen=True)
+class _RerunPolicy:
+    """Per-call-site knobs for the ONE discriminator.
+
+    INV-5 (no-lockstep-duplication) is about one IMPLEMENTATION of "passes in
+    isolation", NOT one set of tuning constants. The two gates differ in five
+    genuine, deliberately-calibrated ways — re-run engine, timeout constant,
+    log label, success log level, and the other-leg precondition — and every
+    one of those is pinned by an existing assertion. Capturing them as a
+    ``call_site -> policy`` table gives exactly ONE body to drift from while
+    keeping each site's calibration independent and visible in one place.
+    """
+
+    #: Caller name embedded in every log line so an operator can attribute a
+    #: message to the right call site. Also passed to
+    #: ``_group_node_ids_by_subproject`` as its ``log_label``.
+    log_label: str
+    #: Per-test timeout injected into the isolated re-run command. SEPARATE
+    #: per site by design — the two are retuned on different signals.
+    timeout_secs: int
+    #: Whether a non-clean lint/type leg on the failing result bails the whole
+    #: gate before any work (main_probe only — see the discriminator's
+    #: docstring for why it must NOT apply to the merge gate).
+    requires_clean_other_legs: bool
+    #: Verdict-vocabulary tail of the "mapping yielded nothing usable" line;
+    #: the caller's alone (the shared helper only knows 'unconfirmable').
+    unmapped_log_tail: str
+    #: Verdict-vocabulary tail of the catch-all "unexpected error" WARNING.
+    #: Per-site so each gate's operator grep survives the extraction verbatim.
+    error_log_tail: str
+    #: How this site re-runs ONE scoped subproject group.
+    engine: Callable[
+        [Path, 'OrchestratorConfig', ModuleConfig], Awaitable[_RerunObservation],
+    ]
+    #: Emitted once when every group confirmed green.
+    log_success: Callable[[list[str], Path], None]
+    #: Emitted per non-confirming group, when the site has such a line today.
+    log_group_not_confirmed: Callable[[str, _RerunObservation], None] | None = None
+
+
+def _psi_cpu_some10_or_none() -> float | None:
+    """Host CPU pressure at observation, or ``None`` when it is not knowable.
+
+    ``read_ok=False`` is ``shared.psi``'s documented fail-open sentinel, and
+    maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
+    The ``except`` is belt to that braces: a TELEMETRY read must never change
+    a gate's verdict, so it may not raise into the discriminator.
+    """
+    try:
+        sample = read_psi_sample()
+    except Exception:
+        # WARN, not DEBUG: ``read_psi_sample`` already fails OPEN via
+        # ``read_ok=False``, so reaching this handler at all means the
+        # telemetry path broke in a way it does not itself model. Swallowing
+        # that at DEBUG is the silent-degradation shape the tree-wide
+        # silent-fallthrough gate exists to catch — the verdict is still
+        # unaffected (INV-1: telemetry may not change a gate's answer), but
+        # the psi column going quietly null must be visible to an operator.
+        logger.warning(
+            '_psi_cpu_some10_or_none: PSI read failed; '
+            'recording psi_cpu_some10=None for this observation',
+            exc_info=True,
+        )
+        return None
+    return sample.cpu_some10 if sample.read_ok else None
+
+
+def _observe(
+    verdict: FlakeVerdict,
+    test_ids: Iterable[str],
+    *,
+    call_site: FlakeCallSite | str,
+    runner: str,
+    reason: str | None = None,
+    now: datetime | None = None,
+) -> FlakeSuppression:
+    """The ONLY construction site for a ``FlakeSuppression`` in this module.
+
+    Routing every return through one builder is what makes INV-2 (the
+    discriminator is TOTAL) structural rather than a reviewing burden: no
+    branch can construct a verdict that forgets ``observed_at`` or the psi
+    reading, and no branch can return ``None``.
+
+    ``observed_at`` is stamped HERE, at OBSERVATION time — not at record time
+    — because it is one third of §8.3's ``(test_id, observed_at, call_site)``
+    idempotency key: a replayed merge-path write must land one row, not two.
+    """
+    return FlakeSuppression(
+        verdict=verdict,
+        test_ids=tuple(test_ids),
+        observed_at=(now or datetime.now(UTC)).isoformat(),
+        call_site=call_site,  # type: ignore[arg-type]  # see coercion in the caller
+        runner=runner,
+        psi_cpu_some10=_psi_cpu_some10_or_none(),
+        unconfirmable_reason=reason,
+    )
+
+
+async def confirm_isolated_rerun_verdict(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: list[ModuleConfig],
+    failing_result: VerifyResult,
+    *,
+    call_site: FlakeCallSite | str,
+    runner: str = 'local',
+    now: datetime | None = None,
+) -> FlakeSuppression:
+    """THE isolated-rerun discriminator: did *failing_result*'s named failures
+    pass when re-run alone (PRD §8.1)?
+
+    ONE implementation of "passes in isolation", shared by every gate that
+    needs the question answered, so the gates cannot drift into different
+    answers (INV-5). Per-site calibration lives in ``_CALL_SITE_POLICY``; the
+    body is common.
+
+    Returns a ``FlakeSuppression`` ALWAYS — never ``None``, never a bare list
+    (INV-2). Both existing gates map every non-``passes_in_isolation`` verdict
+    back to ``None`` at their wrapper, so no gate's behaviour changes today;
+    what changes is that the reason is now stated instead of dropped.
+
+    NEVER RAISES (INV-1), and an unexpected exception deliberately maps to
+    ``fails_in_isolation`` rather than ``unconfirmable``: the merge path
+    (merge_queue.py) has no ``VerifyInfraError`` handler, so the only safe
+    default is "merge stays red". That is a different judgement from the
+    named-``unconfirmable`` paths, which are cases we UNDERSTAND well enough
+    to say we could not tell — an unhandled exception is not.
+
+    PURE (INV-5). It OBSERVES; it does not act. Deliberately absent, and
+    fenced by ``TestConfirmIsolatedRerunVerdictIsPure``: no event emit, no
+    ledger write, no escalation, no task filing, no suppression-streak bump,
+    and no worktree churn. Those side-effects belong to the RECORDER (task ε),
+    and keeping them out is what lets this run wherever the worktree is —
+    local or remote — with the dispatcher doing the recording afterwards from
+    the returned ``FlakeSuppression``. This is why the module imports only the
+    three vocabulary types from ``flake_ledger`` and never its writers: the
+    import surface makes the purity structural rather than a reviewing burden.
+    ``read_psi_sample`` is the one read added, and it is wrapped so it can
+    never raise — a telemetry read must never change a gate's verdict.
+
+    SAME-TREE (INV-3): every re-run targets the GIVEN *worktree*. No
+    ``git worktree add``/``remove``, no cleanup ``finally``.
+
+    SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
+    re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
+    _scope_to_keyword(...)), policy.timeout_secs)`` with ``lint_command`` and
+    ``type_check_command`` nulled, so only the named tests run, serially,
+    without pyproject ``addopts`` or its 60s per-test default.
+
+    Node-id -> subproject mapping DELEGATES to
+    ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
+    module_configs}`` — the same shared helper ``confirm_main_tip_failure_is_real``
+    and the sweep pre-filter use. The list -> dict conversion is
+    order-preserving on a prefix-deduped list, so candidate iteration and
+    first-wins ambiguity resolution are unchanged. The mapping runs over the
+    GIVEN *module_configs* + *worktree*, never re-discovered: empty
+    *module_configs* or files-not-on-disk naturally map nothing, which is an
+    honest ``unconfirmable`` rather than a guess.
+
+    ``test_ids`` carries the RAW extracted node-ids, never the
+    prefix-qualified group ids — the qualified id is a re-run implementation
+    detail (which subproject to invoke pytest from), whereas the raw node-id is
+    the test's IDENTITY and is what α's ``flake_debt.test_id`` primary key and
+    §8.3's idempotency key are built on. Recording a prefix-qualified variant
+    would split one test's debt across two rows.
+
+    Args:
+        worktree: The tree to re-run in. Judged as given (INV-3).
+        config: Orchestrator config, passed through to ``run_verification``.
+        module_configs: Subprojects to map node-ids against, as given by the
+            caller.
+        failing_result: The failing result whose named tests are re-examined.
+        call_site: Which gate is asking. Selects the ``_CALL_SITE_POLICY``
+            entry; a valid member with no entry answers ``unconfirmable``.
+        runner: WHERE the re-run ran. ``'local'`` is correct for both of this
+            task's in-process call sites; it exists so the dispatcher can
+            supply the true origin at the remote boundary (task ε).
+        now: Observation timestamp, for deterministic tests. Defaults to
+            ``datetime.now(UTC)``.
+    """
+    # Bound BEFORE the try so the except handler can never hit an unbound
+    # local and re-raise a NameError out of a public entry point (α's
+    # record_flake_occurrence sets this precedent for the same reason).
+    node_ids: list[str] = []
+    try:
+        coerced_site: FlakeCallSite | str = FlakeCallSite(call_site)
+    except ValueError:
+        # Keep the raw string on the returned FlakeSuppression: the dataclass
+        # has no runtime validation, and α's record_flake_occurrence already
+        # coerces + degrades loudly through B12 rather than persisting a
+        # guess. Fall through to the catch-all so this fails CLOSED.
+        coerced_site = call_site
+
+    try:
+        policy = _CALL_SITE_POLICY[coerced_site]  # type: ignore[index]
+    except (KeyError, TypeError):
+        if isinstance(coerced_site, FlakeCallSite):
+            # A VALID member with no β policy — a known-unknown (chronic_marker
+            # is task κ's), not a defect. Answering honestly keeps it countable
+            # in θ's class-1 rate instead of hiding it in the exception path.
+            logger.info(
+                'confirm_isolated_rerun_verdict: no policy registered for '
+                'call_site %r — unconfirmable', str(coerced_site),
+            )
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason=f'unsupported_call_site:{coerced_site}', now=now,
+            )
+        logger.warning(
+            'confirm_isolated_rerun_verdict: uncoercible call_site %r — '
+            'failing closed to red', call_site,
+        )
+        return _observe(
+            FlakeVerdict.fails_in_isolation, (),
+            call_site=coerced_site, runner=runner, now=now,
+        )
+
+    try:
+        # PRECONDITION, main_probe only: bail before ANY work when another leg
+        # is known non-clean. ``run_verification``'s
+        # ``_summarize_checks``/``_worst_category`` picks ONE category across up
+        # to three legs, so a matched (category, cause_hint) signature does NOT
+        # prove the lint/type legs were clean — a genuine, co-occurring
+        # lint/type break can lose the "worst" contest to the test leg's
+        # category and still be real. Re-running just the named TEST node-ids
+        # would then wrongly downgrade a genuinely red main.
+        # ``lint_output``/``type_output`` are populated ONLY when that leg's
+        # return code was non-zero, so a non-empty value is a precise, free
+        # signal. Promoting today's bare ``return None`` to
+        # ``unconfirmable('other_leg_failed')`` is INV-2 applied to a third
+        # dropped fact. Deliberately NOT applied to the merge gate: it has no
+        # such bail today, PRD §3 does not ask for one, and adding it would
+        # newly refuse to suppress merges carrying any lint output.
+        if policy.requires_clean_other_legs and (
+            failing_result.lint_output or failing_result.type_output
+        ):
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason='other_leg_failed', now=now,
+            )
+
+        node_ids = _extract_failing_test_ids(failing_result.test_output)
+        if not node_ids:
+            # We examined NOTHING — an opaque/lint/type-only failure names no
+            # test. test_ids is empty, which §8 permits only on `unconfirmable`.
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason='no_recoverable_node_ids', now=now,
+            )
+
+        # Map each node-id to its owning subproject over the given
+        # module_configs + the on-disk worktree, via the SHARED helper (see its
+        # docstring for the probe rules and the ambiguity WARNING).
+        # mc_by_prefix is the single source for both the helper argument and
+        # the per-group lookup below.
+        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+        groups = _group_node_ids_by_subproject(
+            worktree, mc_by_prefix, node_ids, log_label=policy.log_label,
+        )
+        # `not groups`, NOT `is None`: BOTH sentinels must fail closed. Falling
+        # into the groups.items() loop with an empty dict would exit having run
+        # ZERO isolated re-runs and then report `passes_in_isolation` — a full
+        # suppression verdict on zero evidence, letting a genuinely red merge
+        # land.
+        if not groups:
+            # Name the offending node-ids HERE so this ONE line answers both
+            # "which tests failed to map?" and "what did the gate decide?"
+            # without correlating a second line: the shared helper's own INFO
+            # names the first unmappable node-id but only knows the neutral
+            # 'unconfirmable', while the verdict vocabulary is the CALLER's
+            # alone (hence policy.unmapped_log_tail). Rendering `groups` also
+            # separates the reachable None case from the defensive-only {}.
+            # The preview is bounded — a mass failure can extract hundreds of
+            # node-ids, and a log line is not a report.
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
+            logger.info(
+                '%s: node-id -> subproject mapping yielded nothing usable (%r) '
+                'for %s%s in %s — unconfirmable, %s',
+                policy.log_label, groups, shown,
+                f' (+{extra} more)' if extra else '', worktree,
+                policy.unmapped_log_tail,
+            )
+            # We DID examine these specific tests, so they are named (PRD B6)
+            # — unlike the "nothing to examine" branch above.
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason='node_ids_unmapped_to_subproject', now=now,
+            )
+
+        # Each subproject group gets its own scoped + forced-serial +
+        # generous-timeout isolated re-run in the SAME worktree (INV-3 — the
+        # discriminator judges the tree it was handed and never mints another).
+        # ALL groups must confirm green.
+        #
+        # CROSS-GROUP PRECEDENCE extends _RerunOutcome's within-group rule: a
+        # genuine red observed in ANY group is real evidence and outranks "we
+        # could not re-run" observed in another, so an `unconfirmable` group is
+        # REMEMBERED and the remaining groups are still re-run rather than
+        # short-circuiting. Short-circuiting on it would make the recorded
+        # verdict depend on `groups` iteration order — i.e. on which subproject
+        # prefix happens to come first — so the same failing result could be
+        # labelled `unconfirmable` or `fails_in_isolation` run to run, and a
+        # run where one group hit an infra sentinel while another was genuinely
+        # red would report the "some groups were uninformative" case the
+        # doctrine forbids. Both verdicts still map to None at today's
+        # wrappers; what this buys is an HONEST verdict for ε's ledger row and
+        # θ's class-1 unconfirmable rate. A `failed` group still returns at
+        # once: no later group can outrank it, so there is nothing to gain by
+        # continuing and a full re-run's cost to lose.
+        unconfirmable_observation: _RerunObservation | None = None
+        for prefix, group_node_ids in groups.items():
+            mc = mc_by_prefix[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                policy.timeout_secs,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            observation = await policy.engine(worktree, config, scoped_mc)
+            if observation.outcome is _RerunOutcome.passed:
+                continue
+            if policy.log_group_not_confirmed is not None:
+                policy.log_group_not_confirmed(prefix, observation)
+            if observation.outcome is not _RerunOutcome.unconfirmable:
+                # A genuine red anywhere is decisive — return at once,
+                # preserving today's early `return None`.
+                return _observe(
+                    FlakeVerdict.fails_in_isolation, node_ids,
+                    call_site=coerced_site, runner=runner, now=now,
+                )
+            # We could not RE-RUN this group, which is not evidence the test is
+            # red. Reporting it as `fails_in_isolation` would launder an
+            # infrastructure failure into a verdict about the code — so hold it
+            # and let the remaining groups speak first (see the precedence note
+            # above). FIRST unconfirmable group wins the named category: only
+            # reached when NO group was genuinely red, and one host-level
+            # sentinel is as good an explanation as the next.
+            if unconfirmable_observation is None:
+                unconfirmable_observation = observation
+
+        if unconfirmable_observation is not None:
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason=(
+                    f'infra_transient_rerun:'
+                    f'{unconfirmable_observation.category or "unknown"}'
+                ),
+                now=now,
+            )
+
+        policy.log_success(node_ids, worktree)
+        return _observe(
+            FlakeVerdict.passes_in_isolation, node_ids,
+            call_site=coerced_site, runner=runner, now=now,
+        )
+
+    except Exception:
+        logger.warning(
+            '%s: unexpected error — %s',
+            policy.log_label, policy.error_log_tail, exc_info=True,
+        )
+        return _observe(
+            FlakeVerdict.fails_in_isolation, tuple(node_ids),
+            call_site=coerced_site, runner=runner, now=now,
+        )
+
+
+#: call_site -> per-site calibration for the ONE discriminator. See
+#: :class:`_RerunPolicy` for why these differences are kept rather than
+#: flattened. ``chronic_marker`` is deliberately absent — task κ owns it, and
+#: the discriminator answers `unconfirmable` for it honestly rather than
+#: guessing.
+_CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
+    FlakeCallSite.merge_gate: _RerunPolicy(
+        log_label='confirm_merge_verify_flake_suppressible',
+        timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
+        requires_clean_other_legs=False,
+        unmapped_log_tail='not suppressing',
+        error_log_tail='failing closed to red',
+        engine=_merge_gate_isolated_rerun,
+        log_success=_log_merge_gate_success,
+        log_group_not_confirmed=_log_merge_gate_group_not_confirmed,
+    ),
+    FlakeCallSite.main_probe: _RerunPolicy(
+        log_label='verify_failure_is_preexisting_on_main confirm gate',
+        timeout_secs=_MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
+        # See the precondition block in confirm_isolated_rerun_verdict for why
+        # this is main_probe's alone.
+        requires_clean_other_legs=True,
+        unmapped_log_tail='keeping the preexisting verdict',
+        error_log_tail='keeping the preexisting verdict',
+        # The BOUNDED _SWEEP_CONFIRM_MAX_ATTEMPTS loop, which passes only
+        # max_retries=0 — no role, no is_merge_verify (run_verification's own
+        # defaults apply).
+        engine=_run_isolated_confirm_group_observation,
+        log_success=_log_main_probe_success,
+        # No per-group line today; the main probe reports only its verdict.
+        log_group_not_confirmed=None,
+    ),
+}
+
+
+async def confirm_merge_verify_flake_suppressible(
+    config: 'OrchestratorConfig',
+    failing_result: VerifyResult,
+    *,
+    worktree: Path,
+    module_configs: list[ModuleConfig],
+) -> list[str] | None:
+    """THIN WRAPPER: is *failing_result* a suppressible CPU-starvation flake?
+
+    Holds NO re-run logic of its own. It asks THE discriminator —
+    :func:`confirm_isolated_rerun_verdict` with ``call_site='merge_gate'`` —
+    and maps the returned verdict onto this gate's long-standing
+    ``list[str] | None`` contract. Everything substantive (the node-id ->
+    subproject mapping rules and their ambiguity handling, *module_configs*
+    provenance, the SAME-TREE / forced-serial / generous-timeout re-run
+    composition, and this site's calibration in ``_CALL_SITE_POLICY``) is
+    documented THERE, so it is stated once: two gates asking the same question
+    through one implementation cannot drift into two different notions of
+    "passes in isolation" (PRD §8.1, INV-5).
+
+    Returns the examined node-id list ONLY on ``passes_in_isolation`` — every
+    named failing test demonstrably PASSED on a scoped + forced-serial +
+    generous-timeout isolated re-run in the GIVEN merge *worktree* at the merge
+    SHA (INV-3: the exact tree being gated; no ``git worktree add``/``remove``,
+    no cleanup ``finally``). Single-shot per node-id group (PRD §5.1), not the
+    sweep's 2-attempt loop — the merge_gate policy's engine.
+
+    Returns ``None`` for EVERY other verdict — ``fails_in_isolation`` and BOTH
+    flavours of ``unconfirmable`` alike (no recoverable node-id from an
+    opaque/lint/type failure; a node-id mapping to no given subproject; an
+    infra-sentinel re-run category, which is never trusted as confirmation).
+    That collapse is deliberate: it is what makes the extraction provably
+    behaviour-preserving here. Fail CLOSED — never mask a REAL red — and NEVER
+    raise, because the merge path (merge_queue.py) has no ``VerifyInfraError``
+    handler and an uncaught raise there stalls the merge queue; the
+    discriminator's INV-1 owns that guarantee now (an unexpected exception
+    becomes ``fails_in_isolation``, which lands here as ``None``). The finer
+    ``unconfirmable`` distinction is visible to the discriminator's consumers
+    and deliberately invisible to this one — widening this return type is task
+    γ's work, not this extraction's.
+
+    Empty *module_configs* / files-not-on-disk (unit-test fakes) naturally map
+    nothing -> ``None``, which keeps existing ``LocalRunner.run_merge_verify``
+    tests byte-identical.
+    """
+    suppression = await confirm_isolated_rerun_verdict(
+        worktree, config, module_configs, failing_result,
+        call_site=FlakeCallSite.merge_gate,
+    )
+    if suppression.verdict is FlakeVerdict.passes_in_isolation:
+        return list(suppression.test_ids)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main-probe isolated-flake confirm gate (task 3597)
+# ---------------------------------------------------------------------------
 
 #: Per-signature repeat counter for the main-probe isolated-flake downgrade
 #: (reviewer_comprehensive finding 4, task 3597 amendment pass). The
@@ -7853,7 +8374,8 @@ async def _main_probe_failure_is_isolated_flake(
     module_configs: 'list[ModuleConfig]',
     main_result: VerifyResult,
 ) -> list[str] | None:
-    """CONFIRM GATE: did *main_result*'s named failures pass on isolated re-run?
+    """THIN WRAPPER (confirm gate): did *main_result*'s named failures pass on
+    isolated re-run?
 
     Called by ``verify_failure_is_preexisting_on_main`` immediately before it
     would return ``(True, main_sha)`` — i.e. after the main probe's
@@ -7862,56 +8384,49 @@ async def _main_probe_failure_is_isolated_flake(
     timing-sensitive test on both the task branch and the main probe,
     matching signatures on a main that is actually green (ground truth:
     esc-3514-2 / task 3514 — 12 named failures on an aborted xdist run, all
-    passing in isolation, main was not broken). This gate re-runs JUST the
-    node-ids named in *main_result*'s own failing output — scoped,
-    forced-serial (``-p no:xdist -o addopts=``), generous-timeout — inside
-    the ALREADY-OPEN *probe_worktree* pinned at main (SAME-TREE, no second
-    ``git worktree add``; the caller owns the worktree's lifecycle).
+    passing in isolation, main was not broken).
 
-    PRECONDITION — test-leg-only (reviewer_comprehensive finding 1):
-    ``run_verification``'s ``_summarize_checks``/``_worst_category`` picks
-    ONE ``category`` across up to three legs (test/lint/type), so a matched
-    (category, cause_hint) signature does NOT by itself guarantee the
-    lint/type legs were clean on main — a genuine, co-occurring lint/type
-    break can lose the "worst" contest to the test leg's category (e.g. it
-    classifies as the lower-priority ``unknown_test_failure``) and still be
-    real. Re-running just the named TEST node-ids would then wrongly
-    downgrade a genuinely red main. ``VerifyResult.lint_output``/
-    ``type_output`` are populated ONLY when that leg's return code is
-    non-zero (see ``run_verification``'s result construction), so a
-    non-empty value here is a precise, free signal that another leg is not
-    clean — this bails to ``None`` before doing any work.
+    Holds NO re-run logic of its own. It asks THE discriminator —
+    :func:`confirm_isolated_rerun_verdict` with ``call_site='main_probe'`` —
+    inside the ALREADY-OPEN *probe_worktree* pinned at main (INV-3, SAME-TREE:
+    no second ``git worktree add``; the caller owns the worktree's lifecycle),
+    and maps the returned verdict onto this gate's ``list[str] | None``
+    contract. The main_probe entry in ``_CALL_SITE_POLICY`` carries this site's
+    calibration — the bounded ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` re-run engine,
+    ``_MAIN_PROBE_CONFIRM_TIMEOUT_SECS`` (a constant SEPARATE from the merge
+    gate's by design; the two are retuned on different signals), and the
+    "another leg is not clean on main" precondition that is deliberately this
+    site's alone. That precondition's rationale, the node-id -> subproject
+    mapping rules, and the *module_configs* provenance are all documented on
+    the discriminator so they are stated ONCE (PRD §8.1, INV-5) — the merge
+    gate and this gate can no longer drift into different notions of "passes
+    in isolation", because there is one implementation left to drift from.
 
     Returns:
-        ``list[str]`` — every named failing test on THIS main tip
-        demonstrably PASSED on isolated re-run. The caller MAY downgrade its
-        verdict to ``(False, '')``, which is ``verify_failure_is_preexisting_on_main``'s
-        own documented fail-safe return.
+        ``list[str]`` — on ``passes_in_isolation`` ONLY: every named failing
+        test on THIS main tip demonstrably PASSED on isolated re-run. The
+        caller MAY downgrade its verdict to ``(False, '')``, which is
+        ``verify_failure_is_preexisting_on_main``'s own documented fail-safe
+        return.
 
-        ``None`` — every other (fail-safe) path; the caller keeps today's
-        ``(True, main_sha)`` verdict unchanged. Covers: a co-occurring
-        lint/type break on main (see PRECONDITION above); no recoverable
-        node-id in ``main_result.test_output`` (an opaque/lint/type-only
-        failure); a node-id that maps to no discovered subproject (or
-        *module_configs* is empty); an isolated re-run that still fails,
-        times out, or hits an infra-sentinel category
-        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as confirmation)
-        after ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts; and any unexpected
-        exception (never raises).
+        ``None`` — EVERY other verdict, i.e. every fail-safe path; the caller
+        keeps today's ``(True, main_sha)`` verdict unchanged. Covers
+        ``fails_in_isolation`` (the re-run still failed or timed out) and every
+        flavour of ``unconfirmable``: a co-occurring lint/type break on main
+        (``other_leg_failed``), no recoverable node-id in
+        ``main_result.test_output`` (an opaque/lint/type-only failure), a
+        node-id that maps to no discovered subproject (or *module_configs* is
+        empty), and an infra-sentinel re-run category
+        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as confirmation) after
+        ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts. Any unexpected exception
+        becomes ``fails_in_isolation`` inside the discriminator (INV-1: it
+        never raises) and lands here as ``None`` too.
 
     ONE-WAY RATCHET: this gate can only downgrade a verdict that an isolated
     re-run has POSITIVELY shown green. Every degraded path preserves today's
-    verdict, so nothing about a genuinely red main changes.
-
-    Node-id -> subproject mapping delegates to
-    ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
-    module_configs}`` — the FOURTH call site (after
-    ``confirm_main_tip_failure_is_real``,
-    ``_sweep_failure_reproduces_in_isolation``, and
-    ``confirm_merge_verify_flake_suppressible``). The isolated re-run engine
-    is ``_run_isolated_confirm_group`` (the bounded
-    ``_SWEEP_CONFIRM_MAX_ATTEMPTS``-attempt loop, ``role='task'`` by
-    default via ``run_verification``'s own default), unchanged.
+    verdict, so nothing about a genuinely red main changes. The finer
+    ``unconfirmable`` distinction the discriminator now returns is deliberately
+    NOT surfaced here — widening this return type is task δ's work.
 
     *module_configs* SOURCE (reviewer_comprehensive finding 5): this is the
     CALLER's snapshot — discovered on the task branch's worktree by
@@ -7928,73 +8443,18 @@ async def _main_probe_failure_is_isolated_flake(
     tree/config mismatch beyond what that earlier call already accepts. A
     task that renames/adds a subproject or changes a ``test_command``
     between branch and main degrades fail-safe, not silently wrong: a stale
-    prefix yields either no recoverable node-id (early-out above), an
-    unmapped node-id (``_group_node_ids_by_subproject`` returns ``None``,
-    below), or a scoped command that errors/still-fails on the probe tree
-    (``_run_isolated_confirm_group`` returns ``False``) — every one of those
-    keeps today's verdict rather than producing a wrong downgrade.
+    prefix yields either ``unconfirmable`` (no recoverable node-id, or an
+    unmapped one) or a scoped command that errors / still-fails on the probe
+    tree — every one of those keeps today's verdict rather than producing a
+    wrong downgrade.
     """
-    try:
-        # PRECONDITION (finding 1 above): bail before any work when another
-        # leg is known non-clean on main.
-        if main_result.lint_output or main_result.type_output:
-            return None
-
-        node_ids = _extract_failing_test_ids(main_result.test_output)
-        if not node_ids:
-            return None
-
-        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-        groups = _group_node_ids_by_subproject(
-            probe_worktree, mc_by_prefix, node_ids,
-            log_label='verify_failure_is_preexisting_on_main confirm gate',
-        )
-        # `not groups`, NOT `is None`: both sentinels must keep today's
-        # verdict. Falling into the groups.items() loop with an empty dict
-        # would run ZERO isolated re-runs and then `return node_ids` — a
-        # full downgrade on zero evidence. Mirrors the same defensive guard
-        # in confirm_merge_verify_flake_suppressible /
-        # _sweep_failure_reproduces_in_isolation.
-        if not groups:
-            shown = node_ids[:10]
-            extra = len(node_ids) - len(shown)
-            logger.info(
-                'verify_failure_is_preexisting_on_main confirm gate: node-id '
-                '-> subproject mapping yielded nothing usable (%r) for %s%s '
-                'in %s — unconfirmable, keeping the preexisting verdict',
-                groups, shown, f' (+{extra} more)' if extra else '', probe_worktree,
-            )
-            return None
-
-        for prefix, group_node_ids in groups.items():
-            mc = mc_by_prefix[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                ),
-                _MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
-            )
-            if not await _run_isolated_confirm_group(probe_worktree, config, scoped_mc):
-                return None
-
-        logger.warning(
-            'verify_failure_is_preexisting_on_main confirm gate: %s passed on '
-            'isolated re-run on the main probe — main is not red for these '
-            'tests',
-            node_ids,
-        )
-        return node_ids
-
-    except Exception:
-        logger.warning(
-            'verify_failure_is_preexisting_on_main confirm gate: unexpected '
-            'error — keeping the preexisting verdict',
-            exc_info=True,
-        )
-        return None
+    suppression = await confirm_isolated_rerun_verdict(
+        probe_worktree, config, module_configs, main_result,
+        call_site=FlakeCallSite.main_probe,
+    )
+    if suppression.verdict is FlakeVerdict.passes_in_isolation:
+        return list(suppression.test_ids)
+    return None
 
 
 def _merge_flake_suppressed_pass(

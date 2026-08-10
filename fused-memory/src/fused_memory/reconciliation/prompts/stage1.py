@@ -3,6 +3,8 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -37,6 +39,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
@@ -96,6 +99,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
 
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
+
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
 mandatory two-step verification:
@@ -107,9 +112,10 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution. \
+IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+structured `ValidationError` that names the malformed id and tells you how to resolve the \
+real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
+are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
 **Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \

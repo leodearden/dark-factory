@@ -25,6 +25,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    same_module_siblings,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -46,31 +47,6 @@ from orchestrator.workflow_types import StewardResolved
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
 # ---------------------------------------------------------------------------
-
-
-def _same_module_siblings(lock_depth: int) -> tuple[str, str]:
-    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
-
-    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
-    components, so two files share a lock module iff those components agree.
-    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
-    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
-    themselves and become DIFFERENT modules, making the "same-module widen"
-    premise unsatisfiable.
-
-    That is not hypothetical — it is why these tests went red on main when
-    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
-    094d634465, deliberately making module locks file-granular). The autouse
-    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
-    at the LIVE operational config, so ``config.lock_depth`` here is the real
-    deployed value by design, not a code default.
-
-    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
-    CONSTRUCTION at any depth, so these stay tests of same-module widen
-    behaviour instead of silently becoming tests of the knob's current value.
-    """
-    package = '/'.join(f'p{i}' for i in range(lock_depth))
-    return f'{package}/e.py', f'{package}/f.py'
 
 
 @pytest.fixture
@@ -558,7 +534,7 @@ class TestStatusPreservationOnResume:
         module set is unchanged.
         """
         # Same-package siblings: identical module set at config.lock_depth.
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -834,7 +810,7 @@ class TestSetTaskScope:
         # Two files co-located in the same package: at config.lock_depth the
         # module set is identical with or without F2 — a genuine same-module
         # widen (self-validating precondition asserted first).
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -995,7 +971,7 @@ class TestCheckScopeInvariant:
         old file-granularity comparison (which would escalate) and passes under
         the module-granularity comparison.
         """
-        _f1, _f2 = _same_module_siblings(config.lock_depth)
+        _f1, _f2 = same_module_siblings(config.lock_depth)
         plan_files = [_f1, _f2]
         metadata_files = [_f1]
         # Self-validating precondition: genuinely same-module but file-divergent.
@@ -1386,4 +1362,76 @@ class TestStartupGraceSecsReachesWatchdog:
             f'Expected startup_grace_secs=77.0 forwarded to invoke_with_cap_retry; '
             f'got {call_kwargs.get("startup_grace_secs")!r}. '
             'workflow._invoke must thread config.timeouts.startup_grace_secs end-to-end.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Contract: the same-module-sibling constructor is depth-invariant (task 3866)
+# ---------------------------------------------------------------------------
+
+
+class TestSameModuleSiblings:
+    """Pin `same_module_siblings`'s contract across every plausible lock_depth.
+
+    See `same_module_siblings`' own docstring in `_workflow_helpers` for WHY
+    the pair is derived from the depth rather than written as a literal; that
+    rationale is kept in exactly one place so the copies cannot drift.
+
+    Depths cover the operational value (12), the package-bundled default
+    (`defaults.yaml:7` = 4), the pydantic Field default (2), the smallest
+    depth that can honour the contract (1), and a deeper future setting (20);
+    `test_rejects_depths_below_one` pins the boundary just under it.
+    """
+
+    @pytest.mark.parametrize('lock_depth', [1, 2, 3, 4, 12, 20])
+    def test_siblings_are_distinct_files_in_one_module_at_any_depth(self, lock_depth: int):
+        f1, f2 = same_module_siblings(lock_depth)
+
+        assert f1 != f2, (
+            f'same_module_siblings({lock_depth}) returned identical paths {f1!r}; '
+            '"same module, DIFFERENT file" is unconstructible if the two paths '
+            'are the same string.'
+        )
+
+        modules = files_to_modules([f1, f2], lock_depth)
+        assert len(modules) == 1, (
+            f'Expected {f1!r} and {f2!r} to collapse to ONE module at '
+            f'lock_depth={lock_depth}; got {sorted(modules)!r}.'
+        )
+
+        assert files_to_modules([f1], lock_depth) == modules, (
+            f'Adding sibling {f2!r} must not widen the module set of {f1!r} at '
+            f'lock_depth={lock_depth} — that equality is the exact precondition '
+            'the same-module-widen tests assert.'
+        )
+
+    @pytest.mark.parametrize('lock_depth', [0, -1])
+    def test_rejects_depths_below_one(self, lock_depth: int):
+        """Below depth 1 the guarantee is UNSATISFIABLE, so it must raise.
+
+        `OrchestratorConfig.lock_depth` carries no `ge=1` constraint, so a
+        caller forwarding `config.lock_depth` can genuinely reach this input.
+        """
+        with pytest.raises(ValueError, match='lock_depth >= 1'):
+            same_module_siblings(lock_depth)
+
+        # The boundary is real, not arbitrary — and the reason it must RAISE
+        # rather than return is that the unguarded construction fails
+        # SILENTLY.  Both paths truncate to '' (parts[:0]), files_to_modules
+        # DROPS them, and the same-module precondition the callers assert
+        # degenerates to [] == [] — passing VACUOUSLY while the workflow under
+        # test holds no module lock at all.
+        package = '/'.join(f'p{i}' for i in range(max(lock_depth, 0)))
+        f1, f2 = f'{package}/e.py', f'{package}/f.py'
+        assert files_to_modules([f1, f2], lock_depth) == [], (
+            f'expected the unguarded pair at lock_depth={lock_depth} to yield NO '
+            f'modules; got {files_to_modules([f1, f2], lock_depth)!r}. If this '
+            'changed, re-derive the guard\'s rationale from the new behaviour.'
+        )
+        assert files_to_modules([f1], lock_depth) == files_to_modules(
+            [f1, f2], lock_depth,
+        ), (
+            'the same-module precondition is expected to pass VACUOUSLY here — '
+            'that vacuity is precisely why same_module_siblings refuses this '
+            'depth instead of returning a pair'
         )

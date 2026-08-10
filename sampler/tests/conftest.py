@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import (  # noqa: E402
+    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )

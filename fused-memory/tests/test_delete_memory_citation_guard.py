@@ -291,19 +291,6 @@ class TestCitationGateScopingAndFailures:
         )
 
     @pytest.mark.asyncio
-    async def test_non_recon_caller_bypasses_the_gate_entirely(
-        self, mcp_server, mock_service, interceptor,
-    ):
-        """(a) An interactive caller pays no extra get_tasks read and is never
-        blocked — the gate is scoped to the consolidation path the incident
-        actually came from."""
-        result = await _call_delete(mcp_server, agent_id='claude-interactive')
-
-        assert result['status'] == 'deleted'
-        mock_service.delete_memory.assert_awaited_once()
-        interceptor.get_tasks.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_graphiti_store_bypasses_the_gate_entirely(
         self, mcp_server, mock_service, interceptor,
     ):
@@ -418,6 +405,425 @@ class TestCitationGateScopingAndFailures:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
         interceptor.get_tasks.assert_not_awaited()
+
+
+class TestGateAppliesToEveryCaller:
+    """The gate keys on the RECORD, not on who is deleting it (task 3624).
+
+    "Will this delete dangle a live pointer?" is a property of the entry and
+    the task DB, not of the caller's agent_id. The original scoping bounded the
+    gate to ``recon-stage-*`` callers, so the identical delete issued from an
+    interactive session — the way the 25-gate consolidation batch of task 3524
+    is actually driven — landed unguarded and stranded exactly the pointers the
+    guard exists to protect.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1201', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1202', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_with_live_citers_is_refused(
+        self, mcp_server, mock_service,
+    ):
+        """(a) THE LEAF SIGNAL. An interactive delete of a still-cited mem0
+        entry is refused, exactly as a recon-stage one already was."""
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        assert [c['task_id'] for c in result['citing_tasks']] == ['1201']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_with_no_live_citers_still_deletes(
+        self, mock_service,
+    ):
+        """(b) REGRESSION for the common case. Broadening the gate must not
+        turn every ordinary interactive delete into a refusal — the gate runs,
+        finds nothing live, and gets out of the way."""
+        interceptor = _make_interceptor([
+            _task('1211', 'pending', {'cited': SURVIVOR}),
+            _task('1212', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interactive_caller_can_repoint_with_a_replacement(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(c) The remedy is available to every caller too: supplying a valid
+        survivor gets the interactive caller the same repoint-then-delete path
+        recon already had, not merely a refusal it cannot clear."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_runs_when_agent_id_is_absent(
+        self, mcp_server, mock_service,
+    ):
+        """(d) The deliberate consequence of keying on the record: a delete
+        with no agent_id at all is gated too. Under the old predicate an
+        unidentified caller was the LEAST guarded one."""
+        result = await _call_delete(mcp_server, agent_id=None)
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refusal_hint_names_the_allow_dangling_citations_escape(
+        self, mcp_server,
+    ):
+        """A refusal with no reachable next action is a dead end, not a guard.
+
+        ``hint`` is a field of the structured tool response, so this is
+        behaviour rather than prose. Before broadening, the only exit the hint
+        offered was "supply a surviving UUID" — which is unreachable for the
+        caller the broadening newly captures: an operator dropping a record
+        outright, with no survivor at all to repoint to. The escape is
+        undiscoverable unless the refusal names it.
+        """
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        assert 'allow_dangling_citations' in result['hint']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'bad_replacement',
+        ['search(query="canonical dispatch advice")', SURVIVOR[:8], DOOMED],
+        ids=['search-instruction', 'truncated-uuid', 'self-repoint'],
+    )
+    async def test_a_bad_replacement_is_not_offered_the_escape(
+        self, mcp_server, bad_replacement,
+    ):
+        """The escape is available to every caller but advertised to only one.
+
+        A caller who reached CitationReplacementInvalid did so BY naming a
+        survivor, so they demonstrably have one and their fix is to correct the
+        value. Dangling a live pointer because a UUID was truncated reproduces
+        the incident this gate closes, so the shared hint must keep saying
+        "copy the correct UUID" and nothing else.
+        """
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=bad_replacement,
+        )
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        assert 'allow_dangling_citations' not in result['hint']
+        assert 'replacement_memory_id' in result['hint']
+
+
+class TestAllowDanglingCitationsEscape:
+    """``metadata={'allow_dangling_citations': True}`` is the deliberate escape.
+
+    Broadening the gate (task 3624) leaves one caller with no reachable next
+    action: an operator dropping a record outright, with no survivor at all to
+    repoint to. ``replacement_memory_id`` cannot help them, so the refusal would
+    be a dead end. The escape closes that — knowingly, loudly, and only on a
+    LITERAL ``True``.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1301', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1302', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_override_permits_the_delete(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(a) The flag lets the delete through with no replacement supplied —
+        and rewrites nothing. It dangles the citation knowingly; it does not
+        silently invent a forwarding pointer.
+
+        The response names what was dangled, in the same shape the refusal
+        reports in ``citing_tasks``. A server-side WARNING alone would be
+        invisible to the MCP caller this escape exists to serve, which is the
+        same silent-override defect the placement of the check argues against.
+        """
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
+        assert result['dangled_citation_count'] == 1
+        assert [c['task_id'] for c in result['dangled_citations']] == ['1301']
+        assert result['dangled_citations'][0]['paths'] == ['mem0_canonical_entry']
+        # Nothing was dropped, so there is no ignored-argument noise to report.
+        assert 'ignored_replacement_memory_id' not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true', None])
+    async def test_only_a_literal_true_counts(
+        self, mcp_server, mock_service, value,
+    ):
+        """(b) The ``is True`` half of the house override idiom
+        (tools.py:2103-2104). A truthy ``'yes'`` or ``1`` must NOT unlock an
+        irreversible delete — the same literal-boolean convention CHANGELOG.md
+        records for ``allow_mcp_markup``.
+
+        And it must not degrade SILENTLY: a dropped value plus a hint telling
+        the caller to pass the flag they believe they just passed is a retry
+        loop, not a guard. The refusal names the value it ignored.
+        """
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationRepointRequired', value
+        mock_service.delete_memory.assert_not_awaited()
+        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert 'literal boolean True' in result['hint']
+
+    @pytest.mark.asyncio
+    async def test_a_literal_false_is_honoured_without_being_reported(
+        self, mcp_server, mock_service,
+    ):
+        """The ignored-value report is for a MALFORMED override, not for a
+        deliberate one. ``False`` is a literal boolean saying "do not override";
+        answering it with "your override was ignored" would be noise on a caller
+        who did exactly the right thing."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': False},
+        )
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
+        assert 'ignored_override' not in result
+        assert 'literal boolean True' not in result['hint']
+
+    @pytest.mark.asyncio
+    async def test_override_does_not_defeat_the_fail_closed_scan_error(
+        self, mock_service,
+    ):
+        """(c) PLACEMENT, pinned. The escape sits AFTER the scan, so an
+        unreadable task DB still fails closed. The flag means "I accept
+        dangling the citers you just showed me" — with nothing enumerated there
+        is nothing to knowingly accept, so this is the right semantics rather
+        than an accident of ordering."""
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['error_type'] == 'CitationScanFailed'
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_is_never_forwarded_to_the_store(
+        self, mcp_server, mock_service,
+    ):
+        """(d) The write-time flag must not reach persistence. It cannot today
+        (delete_memory discards _extract_causation's cleaned dict and the
+        service call takes no metadata parameter), so this guards the actual
+        hazard: a future signature change that starts forwarding the
+        envelope."""
+        await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': True},
+        )
+
+        kwargs = mock_service.delete_memory.await_args.kwargs
+        assert 'metadata' not in kwargs
+        assert 'allow_dangling_citations' not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_override_applies_to_a_recon_caller_too(
+        self, mcp_server, mock_service,
+    ):
+        """(e) The escape is a property of stated INTENT, not of identity —
+        adding a second caller-identity check would reintroduce exactly the
+        scoping this task just removed."""
+        result = await _call_delete(
+            mcp_server,
+            agent_id=RECON_AGENT,
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_override_logs_a_warning_naming_the_memory_id_and_every_dangled_citer(
+        self, mock_service, caplog,
+    ):
+        """The override must leave a TRACE. An escape that lands silently is the
+        same class of defect as the gate that never ran: the operator's stated
+        intent is recorded, but which pointers it stranded is not — which is
+        exactly the enumerate-by-hand step the incident got wrong (3 of 8).
+
+        The WARNING names ``live_citers``, the same list the rejection path
+        reports in ``citing_tasks``: what is being knowingly dangled, not every
+        task that ever mentioned the id. A citer that has already reached a
+        terminal status is not dangled by this delete, so naming it would
+        overstate the damage.
+        """
+        interceptor = _make_interceptor([
+            _task('1311', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1312', 'pending', {
+                'memory_hints': {'entities': [], 'queries': [f'advice {DOOMED} here']},
+            }),
+            _task('1313', 'done', {'cited': DOOMED}),
+            _task('1314', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['status'] == 'deleted'
+        assert [r for r in caplog.records if r.levelname == 'WARNING']
+        assert 'allow_dangling_citations' in caplog.text
+        # The record being destroyed, and the caller who asked for it.
+        assert DOOMED in caplog.text
+        assert 'claude-interactive' in caplog.text
+        # Every live citer this delete strands.
+        assert '1311' in caplog.text
+        assert '1312' in caplog.text
+        # ...and only those: the terminal citer is not dangled by this delete.
+        assert '1313' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_override_warning_names_a_supplied_replacement_it_did_not_use(
+        self, mcp_server, mock_service, interceptor, caplog,
+    ):
+        """Both arguments together are contradictory — "repoint them to this
+        survivor" vs "dangle them knowingly" — so one must be dropped. The
+        override wins, keeping a single code path, but the dropped value is
+        REPORTED rather than silently discarded (the repo's
+        loud-over-silent-degradation norm)."""
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                replacement_memory_id=SURVIVOR,
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        # The override wins: nothing was repointed to the survivor.
+        interceptor.update_task.assert_not_awaited()
+        # But the ignored argument is named, not dropped in silence — in the
+        # log AND in the response, since the MCP caller who supplied it reads
+        # only the latter.
+        assert SURVIVOR in caplog.text
+        assert result['ignored_replacement_memory_id'] == SURVIVOR
+
+    @pytest.mark.asyncio
+    async def test_scan_cost_is_reported_at_debug(
+        self, mcp_server, mock_service, caplog,
+    ):
+        """Broadening the gate put a full task-tree read on EVERY mem0 delete,
+        so a 25-delete batch pays it 25 times. The snapshot is deliberately not
+        cached (a stale one would hide a citer that appeared after it was taken,
+        which is a race on an irreversible delete), so the cost is made
+        measurable instead. DEBUG, not INFO: this is now the common path."""
+        with caplog.at_level('DEBUG'):
+            await _call_delete(
+                mcp_server,
+                agent_id='claude-interactive',
+                metadata={'allow_dangling_citations': True},
+            )
+
+        scan_lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'DEBUG' and 'citation gate: scanned' in r.getMessage()
+        ]
+        assert len(scan_lines) == 1
+        # The two numbers an operator needs: how much tree was walked, and how
+        # long it took.
+        assert 'scanned 2 task(s)' in scan_lines[0]
+        assert ' ms' in scan_lines[0]
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_the_flag_is_absent(
+        self, mcp_server, mock_service, caplog,
+    ):
+        """The trace belongs to the OVERRIDE, not to every gated delete. An
+        ordinary refusal already returns its citers to the caller structurally,
+        so logging there would be noise on the common path and would dilute the
+        one line an operator needs to find."""
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'CitationRepointRequired'
+        mock_service.delete_memory.assert_not_awaited()
+        assert 'allow_dangling_citations' not in caplog.text
 
 
 TOMBSTONE_KEY = 'x_memory_citation_tombstones'
@@ -687,19 +1093,22 @@ class TestReplacementMustResolveAndDiffer:
 
     @pytest.mark.asyncio
     async def test_inactive_gate_pays_for_no_existence_read(self, interceptor):
-        """(e) An out-of-scope caller (non-recon agent, or a graphiti store)
-        bypasses the gate entirely and reads nothing."""
-        for overrides in (
-            {'agent_id': 'claude-interactive'},
-            {'store': 'graphiti'},
-        ):
-            service = _make_service()
-            mcp_server = self._server(service, interceptor)
+        """(e) An out-of-scope RECORD (a graphiti store) bypasses the gate
+        entirely and reads nothing.
 
-            result = await _call_delete(
-                mcp_server, replacement_memory_id=HALLUCINATED, **overrides,
-            )
+        Task 3624 narrowed this: the caller-identity arm
+        (``{'agent_id': 'claude-interactive'}``) used to sit alongside the
+        graphiti one, but the gate no longer keys on WHO is deleting — only on
+        the record. That arm's inverse now lives in
+        ``TestGateAppliesToEveryCaller``.
+        """
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
 
-            assert result['status'] == 'deleted', overrides
-            service.get_memory_by_id.assert_not_awaited()
-            interceptor.get_tasks.assert_not_awaited()
+        result = await _call_delete(
+            mcp_server, replacement_memory_id=HALLUCINATED, store='graphiti',
+        )
+
+        assert result['status'] == 'deleted'
+        service.get_memory_by_id.assert_not_awaited()
+        interceptor.get_tasks.assert_not_awaited()

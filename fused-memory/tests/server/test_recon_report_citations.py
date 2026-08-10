@@ -268,6 +268,24 @@ class TestCiteEdge:
         assert fake.get_edge_calls == []
 
     @pytest.mark.asyncio
+    async def test_invalid_uuid_shape_trailing_newline(self):
+        """A canonical UUID with a trailing newline → invalid_uuid_shape.
+
+        Not hypothetical: the anchored `^...$` regex this gate used to apply
+        with `.match()` ACCEPTED it, because Python's `$` matches immediately
+        before a trailing newline. Such an id passed the gate and then resolved
+        to nothing downstream — the same silent no-op delete_memory now
+        hard-errors on (task 3132).
+        """
+        state, run_id, finding_id, fake = self._state_and_finding()
+
+        result = await state.cite_edge(run_id, finding_id, self._VALID_UUID + '\n')
+
+        assert result.get('error') == 'invalid_uuid_shape'
+        assert result.get('error_type') == 'ReconReportInvalidUuid'
+        assert fake.get_edge_calls == []
+
+    @pytest.mark.asyncio
     async def test_invalid_uuid_shape_leaves_cited_edges_unchanged(self):
         """UUID shape rejection must NOT mutate cited_edges."""
         state, run_id, finding_id, _ = self._state_and_finding()

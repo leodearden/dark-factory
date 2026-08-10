@@ -5766,10 +5766,22 @@ class TestAmendmentUncommittedWorkGuard:
 
 
 @pytest.mark.asyncio
+# Task 3536 (γ₁): the merge-entry gate now parks the row through
+# _mark_blocked instead of returning a steward-less ESCALATED, so this class
+# drives the workflow to BLOCKED and must opt into the dry-run-unblock mock.
+@pytest.mark.mocks_dry_run_unblock
 class TestMergePhaseEscalationGate:
     """Fix 3: Defense-in-depth gate at MERGE entry.  A blocking L0 escalation
     queued during execute/verify/review (from any code path — including
     future ones not currently checked) must gate the merge.
+
+    Task 3536 (γ₁, PRD boundary #1/#2) changed what happens AFTER the gate
+    fires: rather than a bare ``return WorkflowOutcome.ESCALATED`` with no
+    steward, no wait and no task-status write (the spec-E1 strand), the gate
+    now enters the shared bounded ESCALATED machinery.  A blocking L0 is
+    steward-resolvable, so this test wires a steward and pins the disposition
+    that machinery produces — the merge is still never attempted, which is
+    this class's whole point.
     """
 
     async def test_pending_l0_blocks_merge(
@@ -5778,9 +5790,20 @@ class TestMergePhaseEscalationGate:
         from escalation.models import Escalation
 
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
+
+        # Shrink the ESCALATED-wait window BEFORE run().  BOTH terms must be
+        # shrunk: the wait is bounded by the DERIVED
+        # ``timeouts.steward + steward_completion_timeout`` sum, so leaving
+        # timeouts.steward at its stock 1800s would give this test a 2100s
+        # window (see test_workflow_escalated_steward_stall.py:91-118).  The
+        # steward below clears the L0 before the wait loop ever blocks, so the
+        # window is not expected to be ridden at all — this is the belt to the
+        # asyncio.wait_for braces below, not the mechanism under test.
+        config.steward_completion_timeout = 0.5
+        config.timeouts.steward = 0.5
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
@@ -5809,15 +5832,29 @@ class TestMergePhaseEscalationGate:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # A steward that handles the L0 and hands off to a human — the real
+        # ``TaskSteward._auto_escalate_to_human`` shape.  It clears the L0 and
+        # leaves an L1 open, so _wait_for_resolution's tail raises
+        # _StewardReescalated and the gate parks the row instead of merging.
+        workflow._steward_factory = _make_resolve_then_dismiss_chained_steward(
+            queue, task_assignment.task_id,
+        )
 
-        # MERGE-phase gate must intercept before submitting to the queue.
-        assert outcome == WorkflowOutcome.ESCALATED
-        # The escalation is still pending (not consumed by the gate).
+        # Guard: a regression to an unbounded merge-entry wait must fail
+        # loudly here rather than hang CI.
+        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
+
+        # MERGE-phase gate must intercept before submitting to the queue, and
+        # write the row before returning (spec S1 — no strand).
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses.get(task_assignment.task_id, [])[-1:] == ['blocked']
+        # The gating L0 was adjudicated, not left orphaned: nothing pending at
+        # level 0 survives to re-strand the next entry on the same record.
         pending = queue.get_by_task(
             task_assignment.task_id, status='pending', level=0,
         )
-        assert len(pending) == 1
+        assert pending == []
+        assert queue.has_open_l1(task_assignment.task_id)
 
 
 @pytest.mark.asyncio
@@ -6087,13 +6124,24 @@ class TestBornAtL2GatesPostDebugger:
 
 
 @pytest.mark.asyncio
+# Task 3536 (γ₁): see TestMergePhaseEscalationGate — the merge-entry gate now
+# reaches BLOCKED via _mark_blocked, so this class opts in too.
+@pytest.mark.mocks_dry_run_unblock
 class TestBornAtL2GatesMergeEntry:
     """task γ / C7: A born-at-L2 escalation (critical, level=2) pending at
-    MERGE entry must cause ``run()`` to return ESCALATED before merge starts.
+    MERGE entry must stop ``run()`` before merge starts.
 
     RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
     ignores critical/level-2, so run() proceeds past the gate and the stubbed
     _execute_verify_review_loop returns DONE.
+
+    Task 3536 (γ₁, PRD boundary #2) changed the gate's DISPOSITION, not what
+    gates: instead of a bare ``return WorkflowOutcome.ESCALATED`` with no
+    steward and no task-status write (the spec-E1 strand — the harness slot
+    then nulled the claimant while the row stayed ``in-progress``), the gate
+    enters the shared bounded ESCALATED machinery.  A born-at-L2 record trips
+    ``_wait_for_resolution``'s stop-the-line short-circuit before the wait
+    loop, so the outcome is BLOCKED with the row written first.
     """
 
     async def test_critical_l2_blocks_merge_entry(
@@ -6102,7 +6150,7 @@ class TestBornAtL2GatesMergeEntry:
         from escalation.models import Escalation
 
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
@@ -6132,10 +6180,16 @@ class TestBornAtL2GatesMergeEntry:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # The stop-the-line short-circuit fires BEFORE _wait_for_resolution's
+        # wait loop, so no steward window is ridden; the guard makes a
+        # regression that DOES wait fail loudly instead of hanging CI on this
+        # module's stock (unshrunk) timeouts.steward.
+        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
 
-        # MERGE-phase gate must intercept before merge is attempted.
-        assert outcome == WorkflowOutcome.ESCALATED
+        # MERGE-phase gate must intercept before merge is attempted, and park
+        # the row before returning (spec S1 — no strand).
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses.get(task_assignment.task_id, [])[-1:] == ['blocked']
         # The escalation is still pending — the gate does not consume it.
         pending = queue.get_by_task(
             task_assignment.task_id, status='pending', level=2,

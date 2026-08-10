@@ -25,6 +25,7 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 copies of one fake-httpx idiom spread across four of this directory's files.
 """
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -39,6 +40,16 @@ _LEGIBILITY_DIR = _SCRIPTS_DIR / 'legibility'
 if str(_LEGIBILITY_DIR) not in sys.path:
     sys.path.insert(0, str(_LEGIBILITY_DIR))
 
+# Same insert for scripts/local-model-serving/ (task 3713, LME-alpha).  That
+# directory name is HYPHENATED, so unlike a dotted package name it can never be
+# imported as a namespace package at all — a direct sys.path entry is the only
+# way its flat `lms_*` modules resolve by bare name under --import-mode=importlib.
+# Mirrored in the root pyproject.toml [tool.pyright] extraPaths, which is what
+# `npx pyright scripts/` resolves against.
+_LMS_DIR = _SCRIPTS_DIR / 'local-model-serving'
+if str(_LMS_DIR) not in sys.path:
+    sys.path.insert(0, str(_LMS_DIR))
+
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
 # this directory does not load the repo-root conftest.py, so each test-root
 # conftest wires the defence itself.  APPEND the repo root, never
@@ -50,7 +61,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import (  # noqa: E402
+    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
 
@@ -58,6 +71,71 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+_FLEET_DEPLOY_CLOCK_ENV = 'ORCH_FLEET_DEPLOY_CLOCK'
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_fleet_deploy_clock_redirect(tmp_path_factory):
+    """Point the fleet-deploy clock at a tmp file for this whole session (3797).
+
+    ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE`` from
+    ``$ORCH_FLEET_DEPLOY_CLOCK``, falling back to
+    ``$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json`` — the
+    LIVE checkout the script sits in. Its exit-0 all-units-verified-fresh path
+    stamps that file unconditionally, and every fake-systemctl test in this
+    directory that drives a successful restart reaches it. The stamp is
+    indistinguishable from a genuine one:
+    ``scripts/orchestrator-watchdog.py`` reads it as "the fleet redeployed at
+    <ts>" and SKIPS its staleness backstop for
+    ``ORCH_RESTART_MIN_INTERVAL_SECS`` (28800s = 8h), so a green test run
+    silently disarms fleet staleness recovery for the rest of the day.
+
+    This is deliberately a conftest fixture rather than an extra assignment
+    inside ``_run_script``. The defect class is "a spawner that forgets the env
+    var", so fixing today's single spawner leaves the hole open for the next
+    one. Every spawner in this directory — present and future — inherits the
+    redirect for free, because a subprocess env built from ``dict(os.environ)``
+    picks it up automatically. A test that wants its OWN clock file still wins:
+    ``_run_script`` applies its ``env=`` overrides after copying ``os.environ``.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
+    documents (df_pytest_isolation.py) — cost (an autouse function-scoped
+    fixture runs once per test across ~50 files, times every xdist worker) and
+    coverage (module-/session-scoped fixtures that spawn the script must be
+    covered too).
+
+    One shared file across the session is safe DESPITE being shared, and the
+    distinction matters. It is not that nothing in this directory looks at the
+    clock: ``test_suite_never_stamps_the_repo_fleet_deploy_clock`` reads this
+    very file and asserts its ``{ts, iso}`` body. It is that no test may assert
+    on it ABSOLUTELY — every earlier exit-0 test in the session has already
+    stamped this path, so ``exists()`` and "the body is well-formed" are
+    satisfiable by someone else's stamp. Assertions here must therefore be
+    TIME-RELATIVE: snapshot ``(bytes, st_mtime_ns)`` before spawning and require
+    it to have CHANGED. A test that genuinely needs a pristine per-test clock
+    should not weaken this fixture; it should pass its own via ``_run_script``'s
+    ``env=``, which ``full_env.update(env)`` applies last — the shape
+    ``tests/scripts/test_restart_all_orchestrators.py`` uses, where
+    ``clock_file`` is a required per-test parameter precisely because those
+    suites do assert absolutely.
+
+    Restores the previous value EXACTLY on teardown, popping the key when it
+    was absent rather than setting an empty string — an empty
+    ``ORCH_FLEET_DEPLOY_CLOCK`` is not "unset" to the script's ``${VAR:-…}``
+    default, and leaking one would be its own bug.
+    """
+    saved = os.environ.get(_FLEET_DEPLOY_CLOCK_ENV)
+    clock = tmp_path_factory.mktemp('fleet-deploy-clock') / 'last_redeploy_orchestrator.json'
+    os.environ[_FLEET_DEPLOY_CLOCK_ENV] = str(clock)
+    try:
+        yield clock
+    finally:
+        if saved is None:
+            os.environ.pop(_FLEET_DEPLOY_CLOCK_ENV, None)
+        else:
+            os.environ[_FLEET_DEPLOY_CLOCK_ENV] = saved
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +284,13 @@ def install_fake_httpx(monkeypatch):
     Uses ``monkeypatch.setitem`` (never a bare ``sys.modules[...] = ...``) so
     the real module is restored at teardown and cannot leak into later tests.
 
-    The stub exposes only ``post`` — all four consumers use nothing else today.
+    The stub exposes ``post``, and ``get`` when a caller supplies one (task
+    3713: readiness polling hits GET ``/health`` and GET ``/v1/models``, which
+    a POST-only stub cannot express).  ``get`` stays OPT-IN rather than a
+    no-arg default, so a module that starts issuing GETs without its test
+    saying so still lands in the loud-miss path below instead of silently
+    receiving a stub response nobody wrote.
+
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
     ``AttributeError``, because ``default_status_fetcher`` funnels every
     ``Exception`` into ``StatusFetchUnavailable``: a future production change
@@ -216,9 +300,11 @@ def install_fake_httpx(monkeypatch):
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
     """
-    def _make(post):
+    def _make(post, get=None):
         fake = type(sys)('httpx')
         fake.post = post
+        if get is not None:
+            fake.get = get
 
         def _missing(name: str):
             if name.startswith('__') and name.endswith('__'):

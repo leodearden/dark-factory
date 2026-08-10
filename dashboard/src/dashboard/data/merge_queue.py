@@ -1031,10 +1031,17 @@ async def _probe_live_one(
     'error' key, meaning the orchestrator/worker is not running), returns
     {entries: [], reachable: False, error: <message>}.  An authoritative empty
     queue (entries=[], no error) returns {entries: [], reachable: True}.
+
+    *timeout* bounds the probe at two complementary layers: it is threaded
+    into ``mcp_tool_call`` so it reaches ``client.post`` (bounding
+    connect/read/write *and pool acquisition* on the shared client), while
+    the enclosing ``asyncio.wait_for`` still bounds the operation as a whole
+    — a cold session performs three posts, so the per-request layer alone
+    would permit roughly 3x *timeout*.
     """
     try:
         result = await asyncio.wait_for(
-            mcp_tool_call(client, base_url, 'get_merge_queue', {}),
+            mcp_tool_call(client, base_url, 'get_merge_queue', {}, timeout=timeout),
             timeout=timeout,
         )
     except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:

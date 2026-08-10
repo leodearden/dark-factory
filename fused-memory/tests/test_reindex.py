@@ -260,6 +260,17 @@ class TestUpdateEdgeEmbedding:
 # step-7: list_indices / drop_index
 # ---------------------------------------------------------------------------
 
+#: The MEASURED live ``CALL db.indexes()`` header (task 3706, 2026-08-06), taken
+#: read-only via ``GRAPH.RO_QUERY dark_factory "CALL db.indexes()"``.  Note that
+#: ``entitytype`` is index 6 and ``options`` is index 3 — the gap that hid the
+#: pre-3706 ``entity_type: row[3]`` mis-binding.  ``list_indices()`` now resolves
+#: these by NAME, so the order here is data, not a contract.
+LIVE_INDEXES_HEADER = [
+    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
+    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
+]
+
+
 class TestListIndices:
     """GraphitiBackend.list_indices() returns parsed index records.
 
@@ -268,29 +279,46 @@ class TestListIndices:
     ``CALL db.indexes()`` on the ``GRAPH.RO_QUERY`` path lives in
     ``fused-memory/tests/test_list_indices_integration.py``
     (Task 530 / esc-486-49).
+
+    Column-binding and normalizer-composition tests live in
+    ``tests/test_falkor_indices.py::TestListIndicesColumnBinding`` (task 3706).
     """
 
     @pytest.mark.asyncio
     async def test_returns_index_list(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
-        # FalkorDB index records: [label, property, type, entity_type]
+        # The MEASURED live shape (task 3706, 2026-08-06, read-only via
+        # `GRAPH.RO_QUERY dark_factory "CALL db.indexes()"`): a 9-column header,
+        # `properties` a LIST, `types` a DICT of property -> list of index-type
+        # strings, and `entitytype` the string 'NODE'/'RELATIONSHIP' at index 6.
+        #
+        # This previously mocked 4-column rows with SCALAR type values
+        # (['Entity', 'name_embedding', 'VECTOR', 'NODE']) — a shape live
+        # FalkorDB never emits. Do not reintroduce it: that fiction is what let
+        # list_indices() bind entity_type to the `options` column unnoticed.
         rows = [
-            ['Entity', 'name_embedding', 'VECTOR', 'NODE'],
-            ['Entity', 'name', 'FULLTEXT', 'NODE'],
+            [
+                'Entity', ['name_embedding'], {'name_embedding': ['VECTOR']},
+                {'name_embedding': {}}, 'english', [], 'NODE', 'OPERATIONAL', {},
+            ],
+            [
+                'Entity', ['name'], {'name': ['FULLTEXT']},
+                {'name': {}}, 'english', [], 'NODE', 'OPERATIONAL', {},
+            ],
         ]
-        graph = make_graph_mock(rows)
+        graph = make_graph_mock(rows, header=LIVE_INDEXES_HEADER)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.list_indices(group_id='test')
         assert len(result) == 2
         assert result[0]['label'] == 'Entity'
-        assert result[0]['field'] == 'name_embedding'
-        assert result[0]['type'] == 'VECTOR'
+        assert result[0]['field'] == ['name_embedding']
+        assert result[0]['type'] == {'name_embedding': ['VECTOR']}
         assert result[0]['entity_type'] == 'NODE'
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_indices(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
+        graph = make_graph_mock([], header=LIVE_INDEXES_HEADER)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.list_indices(group_id='test')
         assert result == []
@@ -305,7 +333,14 @@ class TestListIndices:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
+        # The factory is wrapped rather than passed bare because list_indices()
+        # now resolves its columns by name and so needs a real header; the shared
+        # helper's own contract (ro_query awaited once, query never) is unchanged.
+        graph = await assert_ro_query_only(
+            backend,
+            lambda rows: make_graph_mock(rows, header=LIVE_INDEXES_HEADER),
+            [], 'list_indices', group_id='test',
+        )
         cypher = extract_cypher(graph.ro_query.call_args)
         assert 'db.indexes' in cypher
 
@@ -345,17 +380,53 @@ class TestDropIndex:
 # ---------------------------------------------------------------------------
 
 class TestDropVectorIndices:
-    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices."""
+    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices.
 
+    These stubs were rewritten (task 3706) from the SCALAR record shape
+    (``'type': 'VECTOR'``) to the MEASURED live one (``'type':
+    {'name_embedding': ['VECTOR']}``) — the same fiction ``TestListIndices``
+    above bans, and for the same reason: a stub live FalkorDB never emits is how
+    the ``entity_type: row[3]`` mis-binding survived unnoticed.
+
+    Against the real shape ``drop_vector_indices``' predicate
+    ``entry.get('type') == 'VECTOR'`` compares a dict to a string, is always
+    False, and the function drops nothing.  So the two tests that actually
+    exercise a VECTOR index are marked ``xfail(strict=True)`` — the no-op is now
+    recorded as a KNOWN RED rather than hidden behind a green fixture.  The fix
+    is **task 3769**, deliberately out of scope for 3706; when it lands, both
+    marks must be removed (``strict=True`` makes that mandatory — a fixed
+    implementation turns them into XPASS failures, so the marks cannot be
+    forgotten).
+
+    ``test_no_op_when_no_vector_indices`` is deliberately NOT marked: it passes
+    under both the broken and the fixed implementation, so it is insensitive to
+    the defect rather than evidence of it, and a strict xfail there would fail
+    on XPASS today.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason='drop_vector_indices compares the types dict against the string '
+               "'VECTOR', so it drops nothing — task 3769",
+    )
     @pytest.mark.asyncio
     async def test_drops_only_vector_type_indices(self, mock_config, make_backend):
         """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'RELATES_TO', 'field': 'fact_embedding', 'type': 'VECTOR', 'entity_type': 'RELATIONSHIP'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'RELATES_TO', 'field': ['fact_embedding'],
+                'type': {'fact_embedding': ['VECTOR']}, 'entity_type': 'RELATIONSHIP',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
@@ -368,14 +439,25 @@ class TestDropVectorIndices:
         assert ('Entity', 'name_embedding') in called_pairs
         assert ('RELATES_TO', 'fact_embedding') in called_pairs
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason='drop_vector_indices compares the types dict against the string '
+               "'VECTOR', so it returns [] — task 3769",
+    )
     @pytest.mark.asyncio
     async def test_returns_list_of_dropped_indices(self, mock_config, make_backend):
         """Returns list of dicts with 'label' and 'field' for each dropped index."""
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
@@ -387,12 +469,23 @@ class TestDropVectorIndices:
 
     @pytest.mark.asyncio
     async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
-        """When no VECTOR indices exist, drop_index not called and returns []."""
+        """When no VECTOR indices exist, drop_index not called and returns [].
+
+        NOT xfail-marked — see the class docstring: this passes both before and
+        after task 3769, so it is insensitive to the no-op rather than a witness
+        to it.
+        """
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'created_at', 'type': 'RANGE', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['created_at'],
+                'type': {'created_at': ['RANGE']}, 'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()

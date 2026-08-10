@@ -1146,6 +1146,64 @@ class TestInfraFailureClassification:
         assert entry['status'] == 'investigation_failed'
 
     @pytest.mark.asyncio
+    async def test_cli_input_rejected_classified_as_infra_failure(self, tmp_path):
+        """Task 3143: a pre-turn CLI rejection means the investigation never
+        ran at all, so it must stay a RETRYABLE infra_failure proposal and
+        never be presented as a human-review conclusion.
+
+        It reached that status by accident before (via EMPTY_OUTPUT), carrying
+        the fixed 'agent returned empty output' text that actively misdescribed
+        the cause; the proposal must now carry the CLI's real stderr line.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_cli_input_rejected',
+            output='Agent produced no output',
+            cost_usd=0.0,
+            timed_out=False,
+            duration_ms=2100,
+            transcript_turns=None,
+            session_id='sess-y',
+            stderr=(
+                'Warning: no stdin data received in 3s, proceeding without it.\n'
+                'Error: Input must be provided either through stdin or as a '
+                'prompt argument when using --print\n'
+            ),
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='703',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        _assert_one_proposal_persist(scheduler)
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"a rejection means the investigation never ran -- it must stay a "
+            f"retryable infra_failure, got {entry['status']!r}"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['subtype'] == 'error_cli_input_rejected'
+        assert 'Input must be provided' in entry['proposal_text'], (
+            f"the proposal must carry the CLI's real cause, got "
+            f"{entry['proposal_text']!r}"
+        )
+        assert 'agent returned empty output' not in entry['proposal_text']
+
+    @pytest.mark.asyncio
     async def test_high_turn_timeout_still_classified_infra_failure(self, tmp_path):
         """Pin current behavior (review note, task 2020): classification is
         by AgentFailureKind alone (timed_out=True -> TIMED_OUT), NOT gated on

@@ -55,7 +55,6 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +73,19 @@ from fused_memory.topic_slug import (
     TOPIC_SLUG_RE,
     is_valid_topic_slug,
 )
+
+# The canonical-full-UUID predicate that used to live here (task 3132, leaf η).
+# It moved to ``utils/validation.py`` so the delete_memory guards, recon_report's
+# citation gate and citation_verifier's forwarding-pointer guard all answer
+# "is this a canonical full UUID" from ONE definition (INV-5).
+from fused_memory.utils.validation import is_full_uuid
+
+#: Back-compat alias for the pre-move private spelling; import
+#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
+# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
+# tests/test_retro_stamp_topics.py import the predicate directly (both are
+# outside this task's locked file scope).
+_is_full_uuid = is_full_uuid
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
@@ -103,12 +115,25 @@ EXPERIMENTAL_KEY_PREFIX = 'x_'
 def normalize_supersedes(value: Any) -> list[Any]:
     """Normalize a ``supersedes`` metadata value to a list (PRD D2).
 
+    This docstring is the SINGLE HOME of the ``supersedes`` writer/reader
+    map; the other sites that touch the key point here instead of
+    re-deriving it, and name SYMBOLS rather than line numbers (a pinned
+    line number is falsified by the next edit made above it — the churn
+    that motivated this consolidation).
+
     ``supersedes`` is a list in V1, but the corpus carries 81 records with
-    a **scalar** value and 65 with a list.  The live scalar writer is
-    ``reconciliation/harness.py:1167``; the readers are
-    ``reconciliation/targeted.py:1464`` (truthiness discriminator) and
-    leaf 3112's closure predicate.  Both go through this helper so the
-    legacy scalar shape stays tolerated on read.
+    a **scalar** value and 65 with a list.  The writer —
+    ``ReconciliationHarness._reconcile_status_correction`` in
+    ``reconciliation/harness.py`` — emitted a scalar until task 3196
+    migrated it to the canonical list shape; the 81 measured records
+    predate that migration and are not rewritten by it (PRD D2 defers
+    retro normalization to leaf θ's stamping sweep), which is why read
+    tolerance for the legacy scalar stays.  The readers are
+    ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
+    discriminator, which tests ``any()`` of the normalized members — see
+    ITS docstring for why member-level and not container truthiness) and
+    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
     non-``str`` sequence (→ list copy).  The returned list is always a
@@ -501,7 +526,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # `enforce_kind_registry` flips.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
-    'project_status_correction',      # reconciliation/harness.py:1166 (same dict as the scalar `supersedes` at :1167)
+    # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
+    'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
     # No live Mem0 writer found — retained per esc-3194-1 pending the
     # PRD §10 open questions.  `entity_standing_decision` is a SQLite
@@ -750,29 +776,6 @@ def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolat
     )
 
 
-def _is_full_uuid(value: Any) -> bool:
-    """True iff *value* is a canonical full-UUID string.
-
-    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
-    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
-    prefixes.  Requiring the canonical 36-char dashed rendering is what
-    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
-    members) and truncated hex generally — a bare parse would let a
-    32-hex-digit string through as "well formed" while no store would
-    resolve it in that spelling.
-
-    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
-    a rendering choice, not a different identifier.
-    """
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return str(parsed) == value.lower()
-
-
 def validate_memory_metadata(
     meta: dict[str, Any], *, enforce_kind_registry: bool
 ) -> list[MetadataViolation]:
@@ -832,19 +835,28 @@ def validate_memory_metadata(
 
     # 1. supersedes — NORMALIZE, never reject the container shape.
     #
-    # The β-before-γ hazard: PRD §9 sequences γ after β, and
-    # `reconciliation/harness.py:1167` writes a SCALAR `supersedes` today
-    # (81 live records).  Rejecting the scalar form here would break the
-    # recon harness's own writes for the entire window until γ migrates it.
-    # Coercing at the write boundary mirrors `_normalize_task_id_metadata`,
-    # which already does exactly this for the same class of problem in the
-    # same two functions, and is compatible with V1's "legacy scalar
-    # tolerated on read".  Only malformed MEMBERS are rejected.
+    # The β-before-γ hazard: PRD §9 sequenced γ after β, and
+    # `reconciliation/harness.py` wrote a SCALAR `supersedes` (81 live
+    # records) for that whole window.  Rejecting the scalar form here would
+    # have broken the recon harness's own writes until γ migrated it.  That
+    # window is now CLOSED — task 3196 (γ) migrated that writer
+    # (`ReconciliationHarness._reconcile_status_correction`) to the canonical
+    # list shape.
+    #
+    # The in-place coercion below is nonetheless RETAINED as
+    # defense-in-depth, not left over: no corpus rewrite shipped with γ, so
+    # the 81 pre-migration records still carry scalars (PRD D2 defers retro
+    # normalization to leaf θ's stamping sweep), and out-of-repo writers are
+    # not bound by the in-repo migration.  Coercing at the write boundary
+    # mirrors `_normalize_task_id_metadata`, which already does exactly this
+    # for the same class of problem in the same two functions, and is
+    # compatible with V1's "legacy scalar tolerated on read".  Only malformed
+    # MEMBERS are rejected.
     if 'supersedes' in meta:
         members = normalize_supersedes(meta['supersedes'])
         meta['supersedes'] = members
         for member in members:
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 violations.append(_violation(
                     'supersedes',
                     'invalid_supersedes_member',
@@ -943,7 +955,7 @@ def validate_memory_metadata(
     # 2d. parent_id — SHAPE only; liveness is leaf δ's (see the docstring).
     if 'parent_id' in meta:
         parent_id = meta['parent_id']
-        if not _is_full_uuid(parent_id):
+        if not is_full_uuid(parent_id):
             violations.append(_violation(
                 'parent_id',
                 'invalid_parent_id_shape',

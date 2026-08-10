@@ -4227,6 +4227,30 @@ class TestShouldArchiveCategory:
         """'tree_sitter_generate_error' ends with '_error' → True."""
         assert self._should_archive('tree_sitter_generate_error') is True
 
+    def test_pytest_internalerror_archived_for_human_triage(self):
+        """'pytest_internalerror' → True since task 3683.
+
+        This test previously asserted False (and sat in the "must NOT be
+        archived" block below) on the rationale that "an xdist worker-kill
+        INTERNALERROR is infra noise, not human-triage content; the sweep
+        already retries on this category (returns None sentinel)". Task 3683's
+        audit overturned it: that sweep retry is the FIRST-PASS arm only
+        (verify.py:7062/:7141), which returns a None sentinel and never
+        escalates. The category is ALSO retried by three bounded windows that
+        each terminate in a blocking level-1 infra_issue escalation on
+        exhaustion — the primary one being workflow.py:9020's default-5-attempt
+        loop, which stamps escalate_to_human=True / category='infra_issue' at
+        :9060-9067.
+
+        Archival is decided per attempt from the category alone
+        (verify.py:1902), with no knowledge of whether this is the exhausting
+        attempt, so archive=False discarded the log on the attempt that hands
+        the incident to a human too — leaving that human only a truncated
+        failure_report(). See TestPytestInternalerrorArchivesForHumanTriage in
+        test_verify_categories.py for the full grounding.
+        """
+        assert self._should_archive('pytest_internalerror') is True
+
     # Categories that must NOT be archived (debugger can handle without human)
     def test_test_failure_not_archived(self):
         """'test_failure' does not end with '_error' → False."""
@@ -4247,15 +4271,6 @@ class TestShouldArchiveCategory:
     def test_empty_string_not_archived(self):
         """'' (empty) → False."""
         assert self._should_archive('') is False
-
-    def test_pytest_internalerror_not_archived(self):
-        """'pytest_internalerror' ends with '_error' but is in deny-list → False.
-
-        An xdist worker-kill INTERNALERROR is infra noise, not human-triage content.
-        The sweep already retries on this category (returns None sentinel); archiving
-        it would create spurious human-triage artifacts for transient crashes.
-        """
-        assert self._should_archive('pytest_internalerror') is False
 
 
 class TestBuildFallbackConfigConftest:

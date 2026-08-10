@@ -10175,12 +10175,53 @@ class Harness:
         it.
 
         Ancestry-path guards mirror ``_reconcile_one_stranded``'s own guard
-        sequence so this gate can never flip a false positive: an open L1
-        escalation is a deliberate human handoff (never second-guessed); a
-        degenerate branch (tip == branch_base_sha) carries zero task work,
-        so ``is_ancestor`` returning True is a trivial false "already on
-        main" signal; and a missing citation rejects the zero-commit-branch
-        shape where no commit on main actually cites this task.
+        sequence so this gate can never flip a false positive: an open
+        escalation at ANY level is a deliberate handoff (never
+        second-guessed); a degenerate branch (tip == branch_base_sha)
+        carries zero task work, so ``is_ancestor`` returning True is a
+        trivial false "already on main" signal; and a missing citation
+        rejects the zero-commit-branch shape where no commit on main
+        actually cites this task.
+
+        **Any-level escalation veto** (task 3534, PRD
+        ``plans/task-escalation-state-graph-prd.md`` eta-0 / spec
+        ``docs/task-escalation-state-spec.md`` E8).  That first guard used
+        to read ``has_open_l1(task_id)``, which silently missed an L2-only
+        (or L0-only) open escalation while this docstring already claimed
+        parity with ``_reconcile_one_stranded`` — whose own veto went
+        any-level in W10 (see :meth:`_reconcile_one_stranded`, "an open
+        escalation at ANY level ... the resolver's row (f) folds every
+        level") over exactly the rows
+        ``TaskGroundTruth._resolve_open_escalations`` reads.  The veto now
+        asks the SHARED pin predicate
+        :func:`escalation.pins.classify_pins` for
+        :attr:`~escalation.pins.PinReport.vetoes_done_flip` over the same
+        ``get_by_task(task_id, status='pending')`` read, so this gate and
+        the resolver agree by construction rather than by copied intent
+        (INV-5).  ``info``-severity records are deliberately carved out
+        (PRD D3 / boundary row #8): an annotation is not a handoff, and a
+        naive ``bool(pending_rows)`` veto would wedge a genuinely-landed
+        task carrying one ``escalate_info`` record into re-dispatching
+        every tick forever.  The veto is LOGGED with the pinning escalation
+        ids so a task that stops auto-flipping says why; task beta (3535)
+        replaces that log line with the structured ``recovery_vetoed``
+        emission plus its N-consecutive-vetoes dedup escalation.
+
+        That veto sits BELOW both arbitration holds (and above all git
+        subprocess work), which is load-bearing rather than incidental.  The
+        guards return OPPOSITE values: an arbitration hold returns ``True``
+        — an affirmative "withhold dispatch, this task is contested" —
+        whereas the escalation veto returns ``False``, this gate's ABSTAIN
+        ("I will not flip it; make the dispatch decision normally").  The
+        stronger claim has to win, and it is not hypothetical: a
+        ``done_evidence_stale`` rejection files its own pending L2
+        ``provenance_conflict`` (severity ``urgent``) via
+        :class:`~orchestrator.provenance_conflict.ProvenanceConflictSink`,
+        so a contested task reaching the any-level veto would be told to
+        dispatch from the tick after its conflict was filed.  The old
+        L1-only read missed that record only by accident (``urgent`` is
+        born at L2) — going any-level removes the accident, so the hold now
+        has to carry the invariant explicitly.
 
         The branch-deleted merge-marker path (also mirroring
         ``_reconcile_one_stranded``) catches the case where the branch ref
@@ -10215,12 +10256,36 @@ class Harness:
         ``reopen_at``), ``_mark_in_progress_done`` catches the rejection,
         routes it to the shared ``ProvenanceConflictSink``, and returns
         ``False`` — but this gate still returns ``True`` immediately after
-        (a contested task must never dispatch while under arbitration). The
-        ``should_skip`` pre-check right after ``metadata`` is resolved below
-        makes that terminal-for-this-tick outcome cheap on every SUBSEQUENT
-        tick at the same ``reopen_at``: it short-circuits before the
-        git-ancestry subprocess work and before re-attempting the
-        already-rejected write.
+        (a contested task must never dispatch while under arbitration).
+
+        That guarantee is carried on SUBSEQUENT ticks by two layers, because
+        one alone is not enough:
+
+        1. :meth:`~orchestrator.provenance_conflict.ProvenanceConflictSink.should_skip`
+           — the in-memory memo, checked right after ``metadata`` is
+           resolved below.  The zero-I/O fast path: it short-circuits before
+           even the escalation-store read, before the git-ancestry
+           subprocess work, and before re-attempting the already-rejected
+           write.  Terminal-for-this-tick, but LOST ON RESTART.
+        2. :meth:`~orchestrator.provenance_conflict.ProvenanceConflictSink.arbitration_pending`
+           — the durable backstop (task 3534), decided from the pending
+           escalation rows this gate has already read, and ordered ABOVE the
+           any-level veto.  It cannot be ordered below it: that veto returns
+           ``False``, i.e. "dispatch normally", and the task's own pending
+           ``provenance_conflict`` record is exactly the kind of record it
+           vetoes on — so a contested task would DISPATCH.  Unlike that veto
+           (which abstains, so the task dispatches and stops being a
+           candidate), this hold re-fires every tick until the arbitration
+           ends, so it is logged at INFO only on a ``(task_id, reopen_at)``
+           transition and at DEBUG on the repeats — INV-4, via the sink's
+           ``note_hold_observed`` / ``clear_hold_observed`` streak state.
+
+        Layer 2 exists because layer 1's memo is empty on any process that
+        did not itself file the conflict: after a fleet-redeploy/watchdog
+        restart, or when a merge-queue writer site filed it.  Ordering alone
+        cannot deliver "never dispatch while under arbitration"; durability
+        can.  Neither layer costs an extra store read — layer 2 reuses the
+        rows the veto already fetched.
 
         **Delivered-capability guard** (task 3057, seam 2 of eleven): all
         three evidence arms above — git ancestry, merge marker, content
@@ -10245,17 +10310,12 @@ class Harness:
         wait-and-retry degradation would wedge the task permanently, whereas
         an extra dispatch of an already-landed task always terminates.
 
-        The guard sits DOWNSTREAM of every existing veto (open L1, the
-        task-2677 ``should_skip`` memo, the degenerate-branch check, and each
+        The guard sits DOWNSTREAM of every existing veto (the task-2677
+        ``should_skip`` memo, the durable ``arbitration_pending`` hold, the
+        any-level escalation pin, the degenerate-branch check, and each
         arm's ``validate_landing_evidence`` verdict), so a landing that is
         being refused anyway never pays for check work.
         """
-        if (
-            self._escalation_queue is not None
-            and self._escalation_queue.has_open_l1(task_id)
-        ):
-            return False
-
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
@@ -10272,6 +10332,116 @@ class Harness:
             task_id, reopen_at=metadata.get('reopen_at'),
         ):
             return True
+
+        if self._escalation_queue is not None:
+            # An open escalation at ANY level (not just L1 — the resolver's
+            # row (f) folds every level) is the deliberate
+            # human/automation-handoff signal, and a handoff is never
+            # second-guessed by an automatic done-flip.  `live_claimant=False`
+            # is deliberate and free: `vetoes_done_flip` is True for BOTH the
+            # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
+            # cannot change this site's answer — and this hot per-dispatch-tick
+            # path skips claimant resolution entirely for an identical result.
+            from escalation.pins import classify_pins  # noqa: PLC0415
+
+            try:
+                rows = self._escalation_queue.get_by_task(
+                    task_id, status='pending',
+                )
+            except Exception:
+                # `classify_pins`'s store-correctness contract, obligation 2:
+                # a read that FAILED must be passed as `records=None`, never
+                # substituted with `[]` — a false "no open escalations" is
+                # exactly the esc-3163 collapse (a genuinely-pinned task
+                # routed down the act-anyway branch).  Letting it propagate
+                # instead would make the disposition invisible: the
+                # scheduler's generic `_consult_already_landed` catch-all
+                # logs a traceback and fails open for the WHOLE gate, so
+                # "never phantom-done on an unreadable store" would be
+                # incidental rather than local and testable.
+                #
+                # `except Exception` is broad on purpose: `get_by_task`
+                # already absorbs per-file JSON/type errors internally, so
+                # what reaches here is filesystem-level (OSError) or an
+                # unexpected store-implementation fault — neither of which
+                # may abort a dispatch tick.
+                logger.warning(
+                    'already-landed dispatch gate: could not READ the '
+                    'escalation store for task %s — treating as '
+                    'store_unavailable and vetoing the auto-done flip '
+                    '(never phantom-done on an unreadable store); '
+                    'dispatching normally',
+                    task_id,
+                    exc_info=True,
+                )
+                rows = None
+
+            pinned = classify_pins(task_id, rows, live_claimant=False)
+
+            # The task's OWN arbitration escalation is a pending urgent L2,
+            # so `vetoes_done_flip` below is True for it — and that veto's
+            # answer is `return False`, which means "dispatch normally".  For
+            # a task under provenance arbitration that is precisely the
+            # outcome this gate's docstring forbids, so the hold must be
+            # decided FIRST.
+            #
+            # It reads the DURABLE store records (already in hand — no second
+            # read), not the `should_skip` memo above: that memo is in-memory
+            # only (see ProvenanceConflictSink's class docstring) and is empty
+            # on any process that did not itself file the conflict — after a
+            # fleet-redeploy/watchdog restart, or when a merge-queue writer
+            # site filed it.  Ordering alone cannot deliver the invariant;
+            # durability is what delivers it.
+            #
+            # `reopen_at` is the SAME `metadata.get('reopen_at')` the
+            # `should_skip` pre-check above already passes, so the durable
+            # hold and the in-memory memo invalidate on exactly one shared
+            # signal — a restart changes performance, not behaviour.
+            if self._provenance_conflict_sink.arbitration_pending(
+                rows, reopen_at=metadata.get('reopen_at'),
+            ):
+                # INV-4 ("storm escape is dedupe_count, never log spam"): the
+                # hold re-fires on EVERY dispatch tick for as long as the
+                # arbitration stands — and on a cold-memo process it
+                # short-circuits above `_mark_in_progress_done`, so nothing
+                # ever re-warms `should_skip` to quiet it.  Logging it
+                # unconditionally at INFO would therefore emit one line per
+                # tick, indefinitely, until a human resolved the L2.  Loud on
+                # the (task, reopen_at) TRANSITION, quiet on the repeats; task
+                # beta (3535) replaces both with the structured
+                # `recovery_vetoed` emission plus its streak dedup.
+                first_observation = self._provenance_conflict_sink.note_hold_observed(
+                    task_id, reopen_at=metadata.get('reopen_at'),
+                )
+                logger.log(
+                    logging.INFO if first_observation else logging.DEBUG,
+                    'already-landed dispatch gate: task %s is under provenance '
+                    'arbitration (pending provenance_conflict escalation at '
+                    'reopen_at=%s) — withholding it from dispatch rather than '
+                    're-attempting the already-rejected done-write; reopening '
+                    'the task again releases this hold',
+                    task_id,
+                    metadata.get('reopen_at'),
+                )
+                return True
+
+            # The hold does not bind this task (any more): drop its log-streak
+            # state so a hold that returns later announces itself loudly again
+            # rather than being folded into a stale streak — and so the sink's
+            # streak dict stays bounded by currently-held tasks.
+            self._provenance_conflict_sink.clear_hold_observed(task_id)
+
+            if pinned.vetoes_done_flip:
+                logger.info(
+                    'already-landed dispatch gate: task %s is NOT eligible for '
+                    'auto-done — pinned by open escalation(s) %s (any-level '
+                    'veto, PRD task-escalation-state-graph D4/E8); '
+                    'dispatching normally',
+                    task_id,
+                    ', '.join((*pinned.queue_handoff, *pinned.dead_l0))
+                    or '<store unavailable>',
+                )
+                return False
 
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None

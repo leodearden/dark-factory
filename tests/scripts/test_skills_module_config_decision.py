@@ -111,9 +111,6 @@ import posixpath
 import shlex
 import subprocess
 
-from orchestrator import verify_cmd
-from orchestrator.config import _discover_module_configs
-
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
 # because tests/scripts/conftest.py puts this directory on sys.path (pytest's
@@ -122,6 +119,9 @@ from orchestrator.config import _discover_module_configs
 # for systemd_unit_invariants. A bare `import`, never an importorskip: if the
 # probe stops importing, this guard must fail loudly.
 import test_root_lint_covers_nonmember_py as skills_ruff_probe
+from orchestrator.config import _discover_module_configs
+
+from orchestrator import verify_cmd
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -232,9 +232,18 @@ def test_no_skills_prefixed_module_config_is_registered() -> None:
     if discovery's excluded-directory pruning ever changes such that a
     committed ``skills/orchestrator.yaml`` stops being walked.
 
-    ``skills`` (prefix depth 1) is well inside the effective ``lock_depth`` of
-    4, and ``_discover_module_configs`` only skips ``prefix == '.'``, so such a
+    ``skills`` (prefix depth 1) is inside ``lock_depth`` at every layer the
+    config can resolve — the pydantic Field default, the package-bundled
+    ``defaults.yaml``, and this project's override alike — and
+    ``_discover_module_configs`` only skips ``prefix == '.'``, so such a
     config WOULD be discovered. Registering one is feasible; it is declined.
+
+        CORRECTED IN PLACE (task 3866): this used to read "the effective
+        ``lock_depth`` of 4", which stopped being true when
+        ``dark-factory-orchestrator.yaml`` moved that knob to 12. The
+        conclusion never depended on the number — depth 1 is inside 2, 4 and
+        12 alike — so it is now stated as the invariant rather than re-pinned,
+        and the next retune falsifies nothing here.
 
     TWO REASONS, both measured (task 3554, full record in the DECIDED block):
 

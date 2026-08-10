@@ -77,7 +77,8 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     with open(path, encoding='utf-8') as f:
         # Wrap only the read iteration — decoding happens lazily HERE, per
         # chunk, not at open() — leaving the JSONDecodeError skip inside the
-        # loop so the file-level vs line-level split above is preserved. Catch tuple and wrapping are BOTH the shared inventory
+        # loop so the file-level vs line-level split above is preserved.
+        # Catch tuple and wrapping are BOTH the shared inventory
         # helpers, not local copies: that is what makes this reader and
         # iter_json_lines agree structurally instead of by two edits landing
         # together.

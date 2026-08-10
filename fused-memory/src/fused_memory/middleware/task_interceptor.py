@@ -935,6 +935,53 @@ class TaskInterceptor:
             # meanwhile — the same pattern curator_escalator.py's
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
+            #
+            # task_metadata (task 3751) comes off the SAME `before` snapshot
+            # as old_status, so the metadata and live_status the gate sees can
+            # never disagree, and no second get_task is issued. The RAW value
+            # is forwarded deliberately: check() owns the coercion (via
+            # _coerce_metadata_dict), so a dict, a JSON-object string, a
+            # malformed blob, or an absent key all degrade to
+            # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
+            # the forwarding enables at gate 2 is live_workflow_detector's
+            # task_kind-scoped rules: rule 2 (blocked + deterministic, task
+            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
+            # (pending + deterministic + pure gate, task 3751). Only rule 5
+            # actually changes gate 2's verdict — rule 3 already fired there
+            # on the previous implicit task_kind=None, and rule 2's extra
+            # coverage is masked because gate 2 reads is_live, which ORs in
+            # the per-task worktree/commit evidence. See check()'s Gate 2
+            # docstring for the full no-widening argument and the tests
+            # pinning it.
+            #
+            # task_snapshot (task 2964) is that SAME `before` dict — not a
+            # second read. old_status, task_metadata and the claimant fields
+            # the corroboration gate needs (`claimant_run_id`/`heartbeat_at`,
+            # the same top-level pair live_task_write_guard.has_live_claimant
+            # (before) consumes further down this method) therefore all come
+            # from one snapshot taken under _write_lock, so they can never
+            # disagree, and no extra get_task is issued. It is passed as a
+            # SEPARATE kwarg from task_metadata because those two claimant
+            # fields live at the task's top level, not inside `metadata` — see
+            # check()'s Gate 2 docstring. The corroboration assembly performs
+            # two more blocking on-disk reads (scheduler_state.json and
+            # orchestrator.lock); they ride the asyncio.to_thread hop that
+            # already exists for gate 2's blocking git I/O rather than needing
+            # a second hop or re-blocking the event loop, which is why the
+            # verdict is computed inside check() rather than here. What it
+            # unlocks is the detector's in-progress corroboration gate (task
+            # 2963): an in-progress task killed by a fleet redeploy, whose
+            # lingering worktree registration and freshly re-acquired
+            # project-wide lock both still assert liveness with no recent
+            # commit, is now downgraded here exactly as the render-time
+            # Live-Workflow Signals section already downgrades it — closing
+            # the task 599/600 Gate-2-vs-renderer divergence (5 consecutive
+            # guard rejections, run dbfa3df8-0d7d-40e6-bc4a-bc30cce38228).
+            #
+            # The other check() call site — update_task's, further down this
+            # module — is deliberately NOT given a task_snapshot: gate 2 fires
+            # only for op == 'set_task_status', so the kwarg would be inert
+            # there and would only buy that path two pointless disk reads.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -951,6 +998,8 @@ class TaskInterceptor:
                     target_status=status,
                     live_status=old_status,
                     snapshot_token=None,
+                    task_metadata=before.get('metadata') if isinstance(before, dict) else None,
+                    task_snapshot=before if isinstance(before, dict) else None,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()

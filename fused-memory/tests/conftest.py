@@ -57,6 +57,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from _fm_helpers import pydantic_spec, reap_leaked_ticket_workers  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
@@ -149,24 +150,46 @@ def make_backend():
 
 @pytest.fixture
 def make_graph_mock():
-    """Factory fixture: returns a callable(rows, *, ro_rows, q_rows) -> MagicMock graph.
+    """Factory fixture: returns a callable(rows, *, ro_rows, q_rows, header) -> MagicMock graph.
 
     The returned mock has both .query and .ro_query as AsyncMocks.
+
+    ``header`` sets ``result.header`` on every returned result object, and
+    defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
+    ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
+    columns BY NAME (``GraphitiBackend.list_indices``, and
+    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
+    call would raise ``TypeError`` instead of exercising the code under test.
+    The ``[]`` default is safe because no existing consumer of this fixture
+    reads ``.header``; a by-name consumer must pass one explicitly.
+
+    Header values are the measured live 2-tuples, e.g. (task 3706, measured
+    2026-08-06 via ``GRAPH.RO_QUERY dark_factory "CALL db.indexes()"``)::
+
+        [[1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'],
+         [1, 'language'], [1, 'stopwords'], [1, 'entitytype'], [1, 'status'],
+         [1, 'info']]
     """
     def _factory(
         rows: list[list] | None = None,
         *,
         ro_rows: list[list] | None = None,
         q_rows: list[list] | None = None,
+        header: list | None = None,
     ) -> MagicMock:
+        header_value = header if header is not None else []
         if ro_rows is not None or q_rows is not None:
             ro_result = MagicMock()
             ro_result.result_set = ro_rows if ro_rows is not None else (rows or [])
+            ro_result.header = header_value
             q_result = MagicMock()
             q_result.result_set = q_rows if q_rows is not None else (rows or [])
+            q_result.header = header_value
         else:
             ro_result = MagicMock()
             ro_result.result_set = rows if rows is not None else []
+            ro_result.header = header_value
             q_result = ro_result
 
         graph_mock = MagicMock()

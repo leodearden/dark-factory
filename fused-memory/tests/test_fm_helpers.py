@@ -909,6 +909,172 @@ class TestPollUntil:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the shared poll_until_stable() settle barrier (task 3697)
+# ---------------------------------------------------------------------------
+# poll_until is a LIVENESS barrier: it returns at the FIRST truthy sample. That
+# makes it structurally unable to back an EXACT-COUNT assertion — a second event
+# arriving milliseconds later is invisible, because the assertion already ran.
+# poll_until_stable is the missing SETTLE barrier: it waits for the sampled
+# value to STOP CHANGING before returning.
+#
+# Every value change below is driven off the SAMPLER'S CALL COUNT, never off
+# wall clock, so this suite is load-independent and cannot itself become the
+# next flake. (A settle window is safe in the same asymmetric way the helper
+# documents: too short can only cause a false PASS, never a false FAIL.)
+
+class TestPollUntilStable:
+    """Unit tests for poll_until_stable(sample, *, settle, timeout, interval, message)."""
+
+    @pytest.mark.asyncio
+    async def test_poll_until_returns_first_value_while_stable_waits_for_the_settled_one(self):
+        """THE FLAW, PINNED: a liveness poll observes only the first occurrence.
+
+        This is the executable statement of why poll_until_stable exists. The
+        motivating call site is
+        fused-memory/tests/test_ticket_worker.py::test_worker_created_path_emits_journal_event,
+        whose `assert len(task_created_events) == 1` was being gated on a
+        `poll_until(lambda: any(...))` — so the assertion ran the instant the
+        first event landed and a duplicate arriving milliseconds later was
+        structurally invisible.
+
+        Both samplers here are equivalent: the value goes 1 -> 2 on the SECOND
+        call. poll_until returns 1 (it stopped looking); poll_until_stable
+        returns 2 (it kept looking until the value stopped changing).
+        """
+        from _fm_helpers import poll_until, poll_until_stable
+
+        def make_sampler():
+            calls = 0
+
+            def sample():
+                nonlocal calls
+                calls += 1
+                return 1 if calls == 1 else 2
+
+            return sample
+
+        liveness_result = await poll_until(make_sampler(), timeout=5.0, interval=0.001)
+        settled_result = await poll_until_stable(
+            make_sampler(), settle=0.05, timeout=5.0, interval=0.001,
+        )
+
+        assert liveness_result == 1, (
+            f'poll_until should return the FIRST truthy value; got {liveness_result!r}'
+        )
+        assert settled_result == 2, (
+            f'poll_until_stable should return the SETTLED value; got {settled_result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_settle_window_restarts_when_the_value_changes(self):
+        """A 1 -> 2 -> 2 -> 2... sampler returns 2, and polling continued past the first truthy sample.
+
+        The call-count assertion is what proves the settle window is real: the
+        value was already truthy on call 1, so a liveness poll would have
+        stopped there. Reaching call 3 or beyond means the helper re-sampled,
+        saw the change, and restarted its window.
+        """
+        from _fm_helpers import poll_until_stable
+
+        calls = 0
+
+        def sample():
+            nonlocal calls
+            calls += 1
+            return 1 if calls == 1 else 2
+
+        result = await poll_until_stable(sample, settle=0.05, timeout=5.0, interval=0.001)
+
+        assert result == 2, f'expected the settled value 2, got {result!r}'
+        # First truthy sample was call 1; a settle barrier must sample again
+        # (call 2, seeing the change) and once more to confirm (call 3+).
+        assert calls >= 3, (
+            f'expected the helper to keep polling past the first truthy sample; got {calls} calls'
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_stable_value_is_returned_verbatim(self):
+        """An already-stable value settles promptly and is returned verbatim, not coerced to True.
+
+        Matches poll_until's documented return contract so callers can chain on
+        the returned object (e.g. a stats dict) instead of re-fetching state.
+        """
+        from _fm_helpers import poll_until_stable
+
+        payload = {'done': True, 'value': 42}
+
+        result = await poll_until_stable(
+            lambda: payload, settle=0.02, timeout=5.0, interval=0.001,
+        )
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_never_ready_sampler_raises_with_the_caller_message(self):
+        """A sampler that is always falsy raises AssertionError carrying the caller's message."""
+        from _fm_helpers import poll_until_stable
+
+        with pytest.raises(AssertionError, match='worker never journalled anything'):
+            await poll_until_stable(
+                lambda: 0,
+                settle=0.02,
+                timeout=0.05,
+                interval=0.01,
+                message='worker never journalled anything',
+            )
+
+    @pytest.mark.asyncio
+    async def test_never_stable_sampler_raises_a_distinguishable_message_naming_the_values(self):
+        """A forever-changing value times out with a message distinct from the never-ready one.
+
+        'It never happened' and 'it kept changing' demand different debugging.
+        Collapsing them into one 'timed out' string is exactly the legibility
+        failure this case exists to prevent, so assert on the distinguishing
+        substring AND on an actually-observed value appearing in the trail —
+        not merely on the exception type.
+        """
+        from _fm_helpers import poll_until_stable
+
+        observed = []
+
+        def sample():
+            observed.append(len(observed) + 1)
+            return observed[-1]
+
+        with pytest.raises(AssertionError) as excinfo:
+            await poll_until_stable(sample, settle=0.05, timeout=0.2, interval=0.001)
+
+        text = str(excinfo.value)
+        assert 'never settled' in text, f'expected a never-settled diagnostic, got: {text!r}'
+        assert str(observed[-1]) in text, (
+            f'expected the observed-value trail to name {observed[-1]!r}, got: {text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_sampler_is_awaited(self):
+        """A coroutine-function sampler is awaited, mirroring poll_until's isawaitable contract.
+
+        Pinned the same way the existing async poll_until test pins it: an
+        un-awaited coroutine object is always truthy AND never equal to the
+        previous one, so a helper that failed to await would never settle and
+        would raise instead of returning 2.
+        """
+        from _fm_helpers import poll_until_stable
+
+        calls = 0
+
+        async def sample():
+            nonlocal calls
+            calls += 1
+            return 1 if calls == 1 else 2
+
+        result = await poll_until_stable(sample, settle=0.05, timeout=5.0, interval=0.001)
+
+        assert result == 2, f'expected the settled value 2, got {result!r}'
+        assert calls >= 3, f'expected the coroutine body to run repeatedly; got {calls} calls'
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
 # ---------------------------------------------------------------------------
 # Idempotent + 409-tolerant collection (re)creation, used by the qdrant
