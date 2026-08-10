@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from shared import toolcall_markup
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -749,3 +750,29 @@ class TestEmitMarkupStormEscalation:
         assert payload['task_id'] == 'markup-tripwire'
         assert payload['detail'], f'a detail is still required: {payload!r}'
         assert '3083' in payload['detail'], f'must still route to DF 3083: {payload!r}'
+
+
+# ---------------------------------------------------------------------------
+# INV-5: the envelope literals are enumerated ONCE, in shared.toolcall_markup.
+#
+# Kept at END OF FILE deliberately: an INV-5 block spliced into the middle of a
+# test class silently adopts every method below the splice point, which is how
+# the escalation cases above briefly became methods of TestSingleSourceOfTruth.
+# Append new blocks here rather than inserting them.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSourceOfTruth:
+    """INV-5, enforced from the consumer side."""
+
+    def test_mcp_markup_patterns_is_the_shared_object(self):
+        """IDENTITY, not equality — a copied tuple would re-open the drift.
+
+        ``==`` is satisfied by a tuple re-spelled here with the same value,
+        which is precisely the state this task exists to end: this write-time
+        list and ``toolcall_xml_leak``'s read-time list drifted apart while both
+        were documented as the single source of truth. Object identity is the
+        one assertion a duplicate cannot pass.
+        """
+        assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
+

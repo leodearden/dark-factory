@@ -16,10 +16,13 @@ to derive a wrong value from the fragment. Root cause, the Qdrant payload
 text-match read tool, and the retroactive corpus sweep belong to **DF task
 3083** and are deliberately out of scope here.
 
-:data:`MCP_MARKUP_PATTERNS` is the SINGLE write-time pattern list (INV-5) —
-every one of the four MCP write boundaries (``add_memory``, ``add_episode``,
-``submit_task``, ``update_task``) rejects against exactly this tuple, and
-nothing else in the package enumerates these literals.
+:data:`MCP_MARKUP_PATTERNS` is the write-time pattern list — every one of the
+four MCP write boundaries (``add_memory``, ``add_episode``, ``submit_task``,
+``update_task``) rejects against exactly this tuple. It is RE-EXPORTED from
+:mod:`shared.toolcall_markup`, which OWNS the literal enumeration (INV-5);
+nothing in this package spells those literals. The write-time and read-time
+calibrations described below are two NAMED PREDICATES over that one set — the
+split is preserved, the duplicated enumeration behind it is not.
 
 Calibration vs. the retrospective scanner
 -----------------------------------------
@@ -57,6 +60,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.toolcall_markup import MCP_MARKUP_PATTERNS
+
 from fused_memory.server.storm_counter import StormCounter
 
 if TYPE_CHECKING:
@@ -76,13 +81,18 @@ except ImportError:  # pragma: no cover — exercised only in minimal envs
 
 logger = logging.getLogger(__name__)
 
-# Raw MCP envelope fragments that must never appear inside a write payload.
+# MCP_MARKUP_PATTERNS — imported above, NOT spelled here.
 #
-# Matched as bare, CASE-SENSITIVE substrings (see the module docstring for why
-# this deliberately over-reports relative to scripts/scan_task_toolcall_leaks.py).
-# This is the single write-time source of truth (INV-5); the same-file drift
-# guard in tests/server/test_markup_tripwire.py must be updated alongside it.
-MCP_MARKUP_PATTERNS: tuple[str, ...] = ('</content>', '<parameter name=', '</invoke>')
+# The enumeration is owned by shared.toolcall_markup (INV-5). It used to be
+# written out in this module while the read-time prefilter list was written out
+# in fused_memory/utils/toolcall_xml_leak.py, each documented as the single
+# source of truth; they drifted, which is the defect task 3688 repairs.
+#
+# What the move does NOT change: this predicate is still WRITE-time and
+# recall-first — bare, CASE-SENSITIVE substrings, deliberately over-reporting
+# relative to scripts/scan_task_toolcall_leaks.py for the reason the module
+# docstring gives. Its value and order are unchanged, and the same-file drift
+# guard in tests/server/test_markup_tripwire.py still pins them from here.
 
 # Write-time-only control flag that bypasses the tripwire for markup a caller is
 # quoting DELIBERATELY (DF 3083's own task description quotes all three literals
