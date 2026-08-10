@@ -317,3 +317,215 @@ class TestEmitRecoveryEvent:
         store = _RecordingStore()
         assert self._emit(store, task_id=None) is True
         assert store.calls[0][1]['task_id'] is None
+
+
+# ---------------------------------------------------------------------------
+# S5 — the streak tracker and the emission-cadence predicate
+# ---------------------------------------------------------------------------
+
+
+def _tracker(clock=None):
+    from orchestrator.recovery_emission import RecoveryVetoStreakTracker
+
+    if clock is None:
+        return RecoveryVetoStreakTracker()
+    return RecoveryVetoStreakTracker(clock=clock)
+
+
+class TestRecoveryVetoStreakTracker:
+    """Per-(site, task) consecutive-identical-veto counting, in memory."""
+
+    def test_first_observation_starts_a_streak_and_reports_changed(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        obs = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        assert obs.streak == 1
+        assert obs.changed is True
+
+    def test_identical_signature_accumulates_quietly(self):
+        """A quiet repeat is the same hold observed again, not a new fact."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        first = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        second = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        third = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        assert (first.streak, second.streak, third.streak) == (1, 2, 3)
+        assert second.changed is False
+        assert third.changed is False
+
+    def test_a_changed_signature_restarts_the_streak(self):
+        """So an L1 only ever describes N genuinely IDENTICAL consecutive vetoes."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        changed = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1,esc-2')
+        assert changed.streak == 1
+        assert changed.changed is True
+
+    def test_sites_keep_independent_streaks_for_one_task(self):
+        """A per-TICK site must never inflate a per-SWEEP site's count."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        for _ in range(5):
+            tracker.observe(RecoverySite.already_landed_gate, '3535', 'pinned|esc-1')
+        sweep = tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        assert sweep.streak == 1, 'the tick site must not have charged the sweep site'
+        assert tracker.streak(RecoverySite.already_landed_gate, '3535') == 5
+
+    def test_tasks_keep_independent_streaks_at_one_site(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        other = tracker.observe(RecoverySite.reconcile_sweep, '3536', 'pinned|esc-9')
+        assert other.streak == 1
+        assert tracker.streak(RecoverySite.reconcile_sweep, '3535') == 2
+
+    def test_streak_is_zero_for_an_unknown_key(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        assert _tracker().streak(RecoverySite.reconcile_sweep, 'never-seen') == 0
+
+    def test_clear_pops_the_entry_so_the_footprint_stays_bounded(self):
+        """Pop-on-reset, not set-to-zero.
+
+        This tracker lives for the whole life of a multi-week orchestrator
+        process, and the reconcile sweep visits EVERY in-progress and blocked
+        task.  A dict that grew one entry per task ever swept would be a slow
+        leak; it must stay proportional to the tasks CURRENTLY held.
+        """
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        tracker.observe(RecoverySite.reconcile_sweep, '3536', 'pinned|esc-2')
+        assert set(tracker.tracked()) == {
+            (RecoverySite.reconcile_sweep, '3535'),
+            (RecoverySite.reconcile_sweep, '3536'),
+        }
+        tracker.clear(RecoverySite.reconcile_sweep, '3535')
+        assert set(tracker.tracked()) == {(RecoverySite.reconcile_sweep, '3536')}
+        assert tracker.streak(RecoverySite.reconcile_sweep, '3535') == 0
+
+    def test_clear_of_an_unknown_key_is_a_no_op(self):
+        """Every swept task calls this; an unheld one must not raise."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        tracker.clear(RecoverySite.reconcile_sweep, 'never-seen')
+        assert tuple(tracker.tracked()) == ()
+
+    def test_clear_returns_the_streak_it_dropped(self):
+        """The resolve half needs the pre-reset streak to describe what ended."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = _tracker()
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        assert tracker.clear(RecoverySite.reconcile_sweep, '3535') == 2
+        assert tracker.clear(RecoverySite.reconcile_sweep, '3535') == 0
+
+
+class TestRecoveryVetoStreakTrackerSpan:
+    """The second half of the two-dimensional alarm predicate."""
+
+    def _seq_tracker(self, readings):
+        seq = iter(readings)
+        return _tracker(clock=lambda: next(seq))
+
+    def test_span_measures_from_the_first_observation_of_the_streak(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = self._seq_tracker([100.0, 400.0, 1900.0])
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')  # t=100
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')  # t=400
+        assert tracker.span(RecoverySite.reconcile_sweep, '3535') == 1800.0  # t=1900
+
+    def test_span_is_zero_for_an_unknown_key(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = self._seq_tracker([100.0])
+        assert tracker.span(RecoverySite.reconcile_sweep, 'never-seen') == 0.0
+
+    def test_span_is_never_negative(self):
+        """A non-monotonic clock injected by a test must not produce nonsense."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = self._seq_tracker([1000.0, 10.0])
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        assert tracker.span(RecoverySite.reconcile_sweep, '3535') == 0.0
+
+    def test_span_restarts_with_the_streak_on_a_changed_signature(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = self._seq_tracker([100.0, 2000.0, 2100.0])
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')   # t=100
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-2')   # t=2000, reset
+        assert tracker.span(RecoverySite.reconcile_sweep, '3535') == 100.0      # t=2100
+
+    def test_span_is_dropped_with_the_streak_on_clear(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        tracker = self._seq_tracker([100.0, 5000.0])
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
+        tracker.clear(RecoverySite.reconcile_sweep, '3535')
+        assert tracker.span(RecoverySite.reconcile_sweep, '3535') == 0.0
+
+    def test_default_clock_is_monotonic(self):
+        """Wall clock would let an NTP step or DST jump corrupt a span."""
+        import time
+
+        assert _tracker()._clock is time.monotonic
+
+
+class TestShouldEmitEvent:
+    """The emission-cadence predicate — signature-transition-gated (INV-4)."""
+
+    def _obs(self, *, streak, changed):
+        from orchestrator.recovery_emission import Observation, RecoverySite
+
+        return Observation(
+            site=RecoverySite.reconcile_sweep,
+            task_id='3535',
+            signature='pinned|esc-1',
+            streak=streak,
+            changed=changed,
+        )
+
+    def test_emits_on_a_new_or_changed_signature(self):
+        from orchestrator.recovery_emission import should_emit_event
+
+        assert should_emit_event(self._obs(streak=1, changed=True), threshold=3) is True
+
+    def test_stays_quiet_on_a_repeat_below_the_threshold(self):
+        """Two per-TICK sites call this; one row per tick would storm the store."""
+        from orchestrator.recovery_emission import should_emit_event
+
+        assert should_emit_event(self._obs(streak=2, changed=False), threshold=3) is False
+
+    def test_emits_exactly_once_at_the_threshold_crossing(self):
+        """The escalation moment must appear in the event store."""
+        from orchestrator.recovery_emission import should_emit_event
+
+        assert should_emit_event(self._obs(streak=3, changed=False), threshold=3) is True
+
+    def test_stays_quiet_forever_after_the_crossing(self):
+        """A long-lived veto must not re-emit on every later observation."""
+        from orchestrator.recovery_emission import should_emit_event
+
+        for streak in (4, 5, 50, 5000):
+            assert should_emit_event(
+                self._obs(streak=streak, changed=False), threshold=3,
+            ) is False, f'streak={streak} must not re-emit'
+
+    def test_a_changed_signature_above_the_threshold_still_emits(self):
+        """`changed` is the primary clause — a NEW fact is always worth a row."""
+        from orchestrator.recovery_emission import should_emit_event
+
+        assert should_emit_event(self._obs(streak=1, changed=True), threshold=1) is True
