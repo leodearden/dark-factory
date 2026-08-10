@@ -1697,3 +1697,184 @@ class TestStoreUnavailableChangesNoDisposition:
 
         assert _shape(available) == _shape(unavailable)
         assert classify_recovery(available) == classify_recovery(unavailable)
+
+
+def _leave_report(**overrides) -> TruthReport:
+    """A TruthReport that classifies LEAVE unless an override says otherwise."""
+    base = {
+        'db_status': 'in-progress',
+        'live_claimant': None,
+        'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+        'worktree_present': False,
+        'open_escalations': [EscalationRef(id='esc-1', level=1, severity='blocking')],
+        'deploy_phase': None,
+        'escalation_store_unavailable': False,
+    }
+    base.update(overrides)
+    return TruthReport(**base)
+
+
+class TestLeaveReason:
+    """The pure description of a LEAVE — never a new decision (task 3535).
+
+    ``leave_reason`` adds a DESCRIPTION of what ``classify_recovery`` already
+    decided.  Its precedence chain is documented at the implementation; these
+    tests pin it as a contract rather than an implementation accident.
+    """
+
+    def test_returns_none_for_every_non_leave_action(self):
+        """A caller must never be able to mislabel an ACTION as a hold."""
+        from orchestrator.task_ground_truth import leave_reason
+
+        acted = [
+            # (a) MARK_DONE_WITH_PROVENANCE
+            _leave_report(open_escalations=[]),
+            # (c) REVERT_TO_PENDING
+            _leave_report(
+                open_escalations=[],
+                branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN, None),
+            ),
+            # (g) RE_FILE_ESCALATION
+            _leave_report(
+                db_status='blocked', open_escalations=[],
+                branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            ),
+        ]
+        for report in acted:
+            assert classify_recovery(report) != RecoveryAction.LEAVE, 'fixture drift'
+            assert leave_reason(report) is None
+
+    def test_a_live_claimant_leave_is_reported_as_such(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(run_id='r', heartbeat_at=None, source=ClaimantSource.DB),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_recovery_row_f_is_escalation_pinned(self):
+        """Boundary #9's classification half.
+
+        IN_PROGRESS + no claimant + ON_MAIN + an open record: the MARK_DONE
+        that row (a) would otherwise take is VETOED by the record.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report()
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_any_other_leave_with_open_records_is_escalation_pinned(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_unmapped_shape(self):
+        """"we could not read the store" is a strictly better explanation."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            db_status='cancelled',  # a shape the table does not map
+            escalation_store_unavailable=True,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+    @pytest.mark.parametrize(
+        'phase',
+        [
+            DeployPhase.VERIFIED, DeployPhase.FAILED, DeployPhase.SCHEDULED,
+            DeployPhase.ESCALATED, DeployPhase.DONE,
+        ],
+    )
+    def test_a_deliberately_unmapped_deploy_phase_is_reported_as_in_flight(self, phase):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=phase,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.deploy_phase_in_flight
+
+    def test_every_remaining_leave_is_unmapped_shape(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(open_escalations=[], db_status='cancelled')
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.unmapped_shape
+
+    def test_live_claimant_outranks_an_open_escalation(self):
+        """A pinned-AND-held task is HELD: there is nothing to recover yet.
+
+        Load-bearing for emission volume — a live-claimant LEAVE emits nothing,
+        and it is the healthy majority of every sweep.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(
+                run_id='r', heartbeat_at=None, source=ClaimantSource.IN_MEMORY,
+            ),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_an_open_escalation_outranks_a_deploy_phase(self):
+        """A RAN deploy holding an open record is PINNED, not merely in flight."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.RAN,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_a_deploy_phase(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.FAILED,
+            escalation_store_unavailable=True,
+        )
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+
+class TestRecoveryShapeStr:
+    """The emitted shape and the ``_RECOVERY`` table key must never drift."""
+
+    def test_matches_render_shape_over_the_same_five_elements(self):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        report = _leave_report()
+        key = _shape(report)
+        assert recovery_shape_str(report) == render_shape(*key)
+
+    @pytest.mark.parametrize(
+        'report',
+        [
+            _leave_report(),
+            _leave_report(open_escalations=[]),
+            _leave_report(
+                live_claimant=Claimant(
+                    run_id='r', heartbeat_at=None, source=ClaimantSource.DB,
+                ),
+            ),
+            _leave_report(db_status='blocked', deploy_phase=DeployPhase.RAN),
+        ],
+    )
+    def test_stays_bound_to_the_table_key_across_shapes(self, report):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        assert recovery_shape_str(report) == render_shape(*_shape(report))
