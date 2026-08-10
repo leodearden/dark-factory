@@ -27,6 +27,15 @@ dependencies = [
     "aiosqlite>=0.20",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    # A GENUINE runtime import, unlike the four above: shared/src/shared/
+    # mcp_markup_middleware.py imports fastmcp at module scope to subclass
+    # Middleware and to type its ToolResult return. Declared in [project]
+    # dependencies rather than the dev group for that reason — a dev-only
+    # declaration would leave `cd shared && npx pyright` reporting
+    # reportMissingImports and would break any consumer importing the module.
+    # The module is deliberately NOT re-exported from shared/__init__, so
+    # `import shared` still does not pull fastmcp. See task 3689.
+    "fastmcp>=2.0",
 ]
 
 [project.optional-dependencies]

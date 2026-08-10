@@ -755,6 +755,7 @@ source = { editable = "shared" }
 dependencies = [
     { name = "aiosqlite" },
     { name = "anyio" },
+    { name = "fastmcp" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -783,6 +784,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'vllm'", specifier = ">=3.9" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "anyio", specifier = ">=4.0" },
+    { name = "fastmcp", specifier = ">=2.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.0" },
