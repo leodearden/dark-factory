@@ -58,9 +58,11 @@ from __future__ import annotations
 
 import enum
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
+import toolcall_markup_corpus_extract as extract
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -91,6 +93,32 @@ INVOKE_CLOSER = '\x3c/invoke>'
 
 
 # ---------------------------------------------------------------------------
+# Real specimens, drawn from the committed corpus.
+# ---------------------------------------------------------------------------
+#
+# The unrepairable rows are driven by ACTUAL leaked payloads rather than
+# hand-authored ones. A refusal is the one outcome an invented specimen can
+# trivially fake — anything sufficiently mangled refuses — so the assertion
+# that this guard never guesses is only worth something against input the
+# harness really produced.
+
+CORPUS_PATH = Path(__file__).resolve().parent / 'fixtures' / 'toolcall_markup_corpus.jsonl'
+
+
+def specimen(tool_use_id: str) -> dict[str, Any]:
+    """The committed corpus record with this ``tool_use_id``.
+
+    Keyed by id rather than by index or by "the shortest one", so a corpus
+    refresh that adds records cannot silently repoint a test at a different
+    payload.
+    """
+    for record in extract.load_corpus(CORPUS_PATH):
+        if record.get('tool_use_id') == tool_use_id:
+            return record
+    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
+
+
+# ---------------------------------------------------------------------------
 # The harness.
 # ---------------------------------------------------------------------------
 
@@ -117,6 +145,29 @@ class _Recorder:
         """The single recorded call's arguments — asserts there was exactly one."""
         assert len(self.calls) == 1, f'expected exactly one call, got {self.calls!r}'
         return self.calls[0]
+
+
+#: What the fake escalation sink hands back. The real emitter returns an
+#: escalation id (see ``markup_tripwire.emit_markup_storm_escalation``), and the
+#: refusal payload has to be able to name it — a caller told only "unrepairable"
+#: cannot point an operator at the record holding its data.
+ESCALATION_ID = 'esc-markup-residue-1'
+
+
+class _EscalationSink:
+    """Records residue escalations and returns an id, like the real emitter.
+
+    A bare ``list.append`` would return ``None``, which would let a middleware
+    that never propagated the sink's return value pass the payload assertions
+    by accident.
+    """
+
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        self.records = records
+
+    def __call__(self, record: dict[str, Any]) -> str:
+        self.records.append(record)
+        return ESCALATION_ID
 
 
 class Harness:
@@ -198,13 +249,19 @@ def build_harness(
         return 'mem_1'
 
     @mcp.tool
+    def add_reuse_item(what: str, how: str, where: str) -> str:
+        """PRD boundary row B5's named specimen is an ``add_reuse_item.how``."""
+        rec.record('add_reuse_item', what=what, how=how, where=where)
+        return 'reuse_1'
+
+    @mcp.tool
     def scan_memory_content(needle: str) -> str:
         """The exemption case: its whole job is to be handed literal substrings."""
         rec.record('scan_memory_content', needle=needle)
         return 'scanned'
 
     guard_kwargs.setdefault('fact_sink', facts.append)
-    guard_kwargs.setdefault('escalation_sink', escalations.append)
+    guard_kwargs.setdefault('escalation_sink', _EscalationSink(escalations))
     mcp.add_middleware(
         MarkupGuardMiddleware(policy, exempt_tools=exempt_tools, **guard_kwargs)
     )
@@ -761,3 +818,291 @@ class TestB4LastParameterNothingDropped:
         assert payload['outcome'] == 'rejected'
         assert payload['repaired_call'] == {'content': 'A memory.'}
         assert h.recorder.calls == []
+
+
+# ---------------------------------------------------------------------------
+# B5, B8, B9 — UNREPAIRABLE. One refusal, shared by both tiers.
+# ---------------------------------------------------------------------------
+
+
+class TestB5UnrepairableIsNeverGuessed:
+    """PRD boundary row B5, on its own named specimen.
+
+    ``repair()`` returning ``None`` means the value's boundary is a GUESS. The
+    two tiers disagree about what to do with a repair; they do not disagree
+    about this. FORWARD_REPAIR forwards a REPAIR, not a guess — a tier that
+    forwarded unparsed residue would deliver a call the caller never made and
+    permanently drop whatever arguments hid inside it, which is the exact
+    silent fail-soft this guard exists to end.
+
+    The residue escalation is what makes the refusal non-destructive: the
+    payload the caller sent survives in a record an operator can act on even if
+    the caller never retries (INV-7).
+    """
+
+    #: A real ``mcp__plan-tools__add_reuse_item.how`` from the corpus, named by
+    #: PRD section 12's B5 row. Its tail carries an ``\\x3c/invoke>`` in the
+    #: MIDDLE, so no candidate parses with zero leftover.
+    SPECIMEN_ID = 'toolu_01A4bMDaYzQZnLYqacRnYJbV'
+
+    @staticmethod
+    def _value() -> str:
+        record = specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)
+        assert record['expected_outcome'] == 'unrepairable', (
+            'this row is only meaningful while the corpus still classifies the '
+            'specimen as unrepairable'
+        )
+        return record['value']
+
+    async def _refuse(self, policy):
+        h = build_harness(policy)
+        value = self._value()
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the sampler', 'how': value, 'where': 'shared/'},
+            )
+        return h, value, excinfo
+
+    @BOTH_POLICIES
+    async def test_both_tiers_refuse(self, policy):
+        await self._refuse(policy)
+
+    @BOTH_POLICIES
+    async def test_nothing_is_written_under_either_tier(self, policy):
+        """Including under FORWARD_REPAIR, whose whole tier otherwise forwards."""
+        h, _, _ = await self._refuse(policy)
+
+        assert h.recorder.calls == [], (
+            'an unrepairable value must not reach the tool under ANY tier — a '
+            'partial write is worse than a refusal, because it looks like a '
+            'successful call'
+        )
+
+    @BOTH_POLICIES
+    async def test_exactly_one_escalation_is_filed(self, policy):
+        h, _, _ = await self._refuse(policy)
+
+        assert len(h.escalations) == 1
+
+    @BOTH_POLICIES
+    async def test_the_escalation_carries_the_FULL_raw_payload_verbatim(self, policy):
+        """Untruncated, and byte-for-byte.
+
+        ``build_markup_block``'s ``content_excerpt`` is capped at 200 chars
+        because it is a DIAGNOSTIC sitting beside a payload the caller still
+        holds. This record is the only surviving copy of data the caller may
+        never resend, so truncating it would discard the thing the escalation
+        exists to preserve.
+        """
+        h, value, _ = await self._refuse(policy)
+
+        assert h.escalations[0]['raw_value'] == value
+        assert len(h.escalations[0]['raw_value']) == len(value)
+
+    @BOTH_POLICIES
+    async def test_the_escalation_names_its_owner_and_its_bound(self, policy):
+        """INV-7: a hold names a machine-readable owner and carries a bound.
+
+        This one is a queue-backed handoff, so the bound is the standing L2 age
+        surfacing rather than a deadline of its own.
+        """
+        h, _, _ = await self._refuse(policy)
+
+        record = h.escalations[0]
+        assert record['owner'], 'a hold with no named owner is an unbounded hold'
+        assert record['level'] == 2
+        assert record['category']
+
+    @BOTH_POLICIES
+    async def test_the_escalation_locates_the_leak(self, policy):
+        h, _, _ = await self._refuse(policy)
+
+        record = h.escalations[0]
+        assert record['tool'] == 'add_reuse_item'
+        assert record['field'] == 'how'
+        assert record['matched_pattern'] == INVOKE_CLOSER
+
+    @BOTH_POLICIES
+    async def test_the_refusal_names_the_escalation_and_offers_no_repair(self, policy):
+        """The caller must be able to point at the record holding its data.
+
+        And must NOT be handed a ``repaired_call``: there is no repair. A
+        payload carrying one would invite a retry that re-sends a guess.
+        """
+        _, _, excinfo = await self._refuse(policy)
+
+        payload = _reject_payload(excinfo)
+        assert payload['outcome'] == 'unrepairable'
+        assert payload['escalation_id'] == ESCALATION_ID
+        assert 'repaired_call' not in payload
+        assert payload['hint']
+
+    @BOTH_POLICIES
+    async def test_a_sink_that_raises_does_not_change_the_outcome(self, policy):
+        """The refusal is already decided; escalation is purely additive.
+
+        Same reasoning as ``emit_markup_storm_escalation``'s never-raises
+        contract — a queue I/O failure must cost the operator a heads-up, not
+        turn a clean refusal into an opaque middleware crash.
+        """
+        def boom(record):
+            raise RuntimeError('queue unavailable')
+
+        h = build_harness(policy, escalation_sink=boom)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'w', 'how': self._value(), 'where': 'shared/'},
+            )
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+        assert h.recorder.calls == []
+
+
+class TestB8RecoveredNameOutsideTheToolSchema:
+    """A tail that parses CLEANLY but names a parameter the tool does not have.
+
+    The recovery is well-formed markup and wrong anyway: accepting it would
+    invent an argument for a tool that cannot take one, so the honest answer is
+    that the value's boundary is unknown. The check runs against the tool's
+    LIVE schema, which is why the guard reads it per call.
+    """
+
+    #: A real ``mcp__fused-memory__add_memory.content`` whose tail recovers
+    #: ``session_id`` — not a parameter of add_memory, here or in production.
+    SPECIMEN_ID = 'toolu_01MoQr2NFzcWNf9mhYfFcaQp'
+
+    @staticmethod
+    def _record() -> dict[str, Any]:
+        record = specimen(TestB8RecoveredNameOutsideTheToolSchema.SPECIMEN_ID)
+        assert 'session_id' not in record['schema_params'], (
+            'the whole row rests on the recovered name being outside the schema'
+        )
+        return record
+
+    async def _refuse(self, policy):
+        h = build_harness(policy)
+        record = self._record()
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory',
+                {
+                    'content': record['value'],
+                    'category': 'observations_and_summaries',
+                    'project_id': 'dark_factory',
+                    'agent_id': 'claude-caller',
+                },
+            )
+        return h, record, excinfo
+
+    @BOTH_POLICIES
+    async def test_it_is_unrepairable_under_both_tiers(self, policy):
+        _, _, excinfo = await self._refuse(policy)
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+
+    @BOTH_POLICIES
+    async def test_it_is_never_forwarded(self, policy):
+        h, _, _ = await self._refuse(policy)
+
+        assert h.recorder.calls == []
+
+    @BOTH_POLICIES
+    async def test_the_out_of_schema_name_is_never_invented_as_an_argument(self, policy):
+        """Not in the escalation, and — since the tool never ran — nowhere else."""
+        h, _, _ = await self._refuse(policy)
+
+        assert 'session_id' not in h.escalations[0]
+
+    @BOTH_POLICIES
+    async def test_the_payload_survives_in_the_escalation(self, policy):
+        h, record, _ = await self._refuse(policy)
+
+        assert h.escalations[0]['raw_value'] == record['value']
+
+
+class TestB9RecoveredNameCollidesWithASuppliedArgument:
+    """A tail recovering ``agent_id`` when the caller already supplied one.
+
+    Two values claim one parameter and nothing in the payload says which is
+    authoritative. Overwriting the caller's own argument with a value scraped
+    out of a mangled tail is precisely the fabrication this guard forbids, so
+    the collision is unrepairable.
+    """
+
+    DESCRIPTION = (
+        'Do it.'
+        + _closer('description')
+        + '\n' + _opener('agent_id') + 'claude-from-the-tail' + _closer('agent_id')
+        + INVOKE_CLOSER
+    )
+
+    async def _refuse(self, policy):
+        h = build_harness(policy)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {
+                    'title': 'A task',
+                    'description': self.DESCRIPTION,
+                    'agent_id': 'claude-the-caller',
+                },
+            )
+        return h, excinfo
+
+    @BOTH_POLICIES
+    async def test_the_collision_is_unrepairable(self, policy):
+        _, excinfo = await self._refuse(policy)
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+
+    @BOTH_POLICIES
+    async def test_the_tool_never_ran(self, policy):
+        h, _ = await self._refuse(policy)
+
+        assert h.recorder.calls == []
+
+    @BOTH_POLICIES
+    async def test_the_callers_own_agent_id_is_never_overwritten(self, policy):
+        """The record must attribute the leak to the caller that made it.
+
+        Attributing it to the tail's value would point an operator at an agent
+        that never made the call.
+        """
+        h, _ = await self._refuse(policy)
+
+        assert h.escalations[0]['agent_id'] == 'claude-the-caller'
+
+    @BOTH_POLICIES
+    async def test_the_callers_value_survives_intact_in_the_raw_payload(self, policy):
+        h, _ = await self._refuse(policy)
+
+        assert h.escalations[0]['raw_value'] == self.DESCRIPTION
+
+    @BOTH_POLICIES
+    async def test_the_SAME_tail_repairs_when_the_caller_supplied_nothing(self, policy):
+        """The control. Only the collision makes this unrepairable.
+
+        Same value, same schema, same tier — drop the caller's own ``agent_id``
+        and the identical tail becomes a clean recovery. That is what proves
+        the refusal is the collision rule firing, and not the guard simply
+        failing to parse this shape.
+        """
+        h = build_harness(policy)
+
+        if policy is RepairPolicy.REJECT_WITH_REPAIR:
+            with pytest.raises(ToolError) as excinfo:
+                await h.call(
+                    'submit_task', {'title': 'A task', 'description': self.DESCRIPTION}
+                )
+            payload = _reject_payload(excinfo)
+            assert payload['outcome'] == 'rejected'
+            assert payload['repaired_call']['agent_id'] == 'claude-from-the-tail'
+        else:
+            await h.call(
+                'submit_task', {'title': 'A task', 'description': self.DESCRIPTION}
+            )
+            assert h.recorder.args['agent_id'] == 'claude-from-the-tail'
+        assert h.escalations == [], 'a repairable value is not residue'
