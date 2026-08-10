@@ -70,6 +70,7 @@ the consumers that never touch the middleware.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -82,10 +83,30 @@ from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
     detect,
     markup_override_requested,
+    repair,
     strip_markup_override,
 )
 
 logger = logging.getLogger(__name__)
+
+#: The three legal values of a fact's ``outcome``. ONE source for both INV-2's
+#: fact vocabulary and INV-4's storm key, so the two cannot drift apart.
+_OUTCOME_REPAIRED = 'repaired'
+_OUTCOME_REJECTED = 'rejected'
+_OUTCOME_UNREPAIRABLE = 'unrepairable'
+OUTCOMES: tuple[str, ...] = (_OUTCOME_REPAIRED, _OUTCOME_REJECTED, _OUTCOME_UNREPAIRABLE)
+
+#: Surfaced at the point of rejection, mirroring markup_tripwire's
+#: ``_MARKUP_HINT``: the remediation must be discoverable where the caller is
+#: bounced, not only in documentation it may never have read.
+_REJECT_HINT = (
+    'Resubmit repaired_call verbatim — it is the COMPLETE argument map with the '
+    'leaked envelope fragment removed and the parameters it swallowed restored '
+    '(see recovered_params). Do NOT reword the payload around the fragment: the '
+    'leak is a serialization defect in your own tool-call envelope, not a '
+    'content problem. If the markup is quoted DELIBERATELY (e.g. documenting '
+    "the leak itself), override with metadata={'allow_mcp_markup': True}."
+)
 
 
 class RepairPolicy(enum.StrEnum):
@@ -206,18 +227,110 @@ class MarkupGuardMiddleware(Middleware):
                 return param, value
         return None
 
+    # -- schema resolution ------------------------------------------------
+
+    @staticmethod
+    async def _schema_params(context, name: str) -> tuple[str, ...]:
+        """The invoked tool's LIVE parameter names.
+
+        Two measured substrate facts, both of which the PRD's section 6 table
+        gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
+        awaited, and ``tool.parameters`` is a full JSON Schema dict — so the
+        names are under ``'properties'``, not the object itself.
+
+        LIVE rather than declared at registration: what a recovery is allowed
+        to name has to be checked against the tool as it actually is, or the
+        guard would validate against a schema that has since drifted.
+
+        Any failure to resolve one yields an EMPTY set, which makes repair()
+        refuse rather than recover against a phantom schema. That is the same
+        fail-safe direction ``_as_name_set`` already takes: with no schema,
+        every recovered name is out-of-schema, so nothing can be fabricated.
+        """
+        try:
+            tool = await context.fastmcp_context.fastmcp.get_tool(name)
+        except Exception:
+            logger.exception('markup guard could not resolve the schema for %r', name)
+            return ()
+        parameters = getattr(tool, 'parameters', None) or {}
+        properties = parameters.get('properties') if isinstance(parameters, dict) else None
+        if not isinstance(properties, dict):
+            return ()
+        return tuple(properties)
+
+    # -- policy -----------------------------------------------------------
+
     async def _handle_markup(self, context, call_next, name, arguments, param, value):
         """Apply the declared policy to a detected leak.
 
-        Interim shape: the schema read, the two policy tiers and the
-        unrepairable refusal land in the following steps of this task. What is
-        already true and must STAY true is the direction of the failure — a
-        detected leak is never forwarded un-analysed. Forwarding it would be
-        precisely the silent fail-soft this guard exists to end: the write-time
-        tripwire downstream would bounce it anyway, having lost whatever caller
-        arguments were hiding in the residue.
+        The schema read happens HERE and not on the fast path, so the awaited
+        ``get_tool`` round-trip is paid only by the 0.26% of calls that
+        actually carry a leak.
         """
+        fix = repair(value, param, await self._schema_params(context, name), tuple(arguments))
+
+        if fix is None:
+            # UNREPAIRABLE — one refusal shared by both tiers. Lands in a later
+            # step of this task, together with the residue escalation that
+            # preserves the caller's payload. Refusing is already the right
+            # direction and must stay so.
+            raise ToolError(
+                'Tool call carries leaked MCP envelope markup in '
+                f'{param!r} (matched {detect(value)!r}) that could not be repaired.'
+            )
+
+        if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
+            return self._reject(name, arguments, param, fix)
+
         raise ToolError(
             'Tool call carries leaked MCP envelope markup in '
             f'{param!r} (matched {detect(value)!r}).'
         )
+
+    def _reject(self, name, arguments, param, fix) -> None:
+        """Write nothing; bounce the caller with the repaired argument map.
+
+        RAISES rather than short-circuiting with a middleware-authored
+        ``ToolResult``. Measured: a tool with a return annotation carries an
+        output schema, and a ToolResult that does not satisfy it fails with
+        "Output validation error: 'result' is a required property". This
+        middleware is generic over every tool on the server, so it cannot know
+        how to satisfy an arbitrary output schema. Raising is verified to
+        prevent the tool body from running at all — which is what makes
+        "nothing written" TRUE rather than merely intended — and to round-trip
+        a ``json.dumps`` payload to the caller byte-intact, so ``repaired_call``
+        survives the boundary.
+
+        (The repo's usual "return a dict, don't raise" convention comes from the
+        ``@mcp_tool_errors`` decorator INSIDE tool bodies. Middleware sits above
+        that layer and has no such wrapper.)
+
+        ``repaired_call`` is the COMPLETE argument map, not just the repaired
+        field, so the retry is mechanical: resubmit it verbatim. A caller
+        reassembling the rest by hand is how the swallowed arguments get lost
+        for good.
+
+        The flat key vocabulary — error / error_type / field / matched_pattern
+        / hint — is markup_tripwire's ``build_markup_block``, so an agent
+        bounced by this guard sees the same diagnostic shape as one bounced by
+        the write-time tripwire: one mechanism, one error contract. It is
+        EXTENDED with misclose, recovered_params and repaired_call, which the
+        old single-literal guard could not produce.
+        """
+        repaired_call = {**arguments, param: fix.clean_value, **fix.recovered}
+        raise ToolError(json.dumps({
+            'error': (
+                'Tool call rejected: it carries raw MCP envelope markup in '
+                f'{param!r}, which means the caller serialized part of its own '
+                'tool-call envelope into the payload.'
+            ),
+            'error_type': 'mcp_markup_detected',
+            'outcome': _OUTCOME_REJECTED,
+            'tool': name,
+            'field': param,
+            'matched_pattern': fix.pattern,
+            'misclose': fix.misclose,
+            'recovered_params': sorted(fix.recovered),
+            'repaired_call': repaired_call,
+            'hint': _REJECT_HINT,
+        }))
