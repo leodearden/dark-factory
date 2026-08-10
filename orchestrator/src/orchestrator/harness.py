@@ -1823,6 +1823,19 @@ class Harness:
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
 
+        # Per-task cancel CAUSE, stamped by hard_cancel_workflow immediately
+        # before task.cancel() and consumed once by _run_slot's
+        # `except asyncio.CancelledError` handler (task 3172).  This is the
+        # first place anything in the harness records WHY a workflow was
+        # cancelled: _workflow_cancel_events is a bare Event and
+        # _workflow_cancel_at is a monotonic float, so before this a
+        # drain-cancelled task was indistinguishable from a terminal-status
+        # cancel or an escalation-action teardown.  Deliberately a stamp at
+        # the source rather than a reverse-inference from
+        # _terminal_cancel_counts / _action_teardown_tasks: the latter is
+        # silently wrong for park, which leaves no teardown marker at all.
+        self._workflow_cancel_causes: dict[str, str] = {}
+
         # Per-task CONSECUTIVE streak of requeues that invoked no agent at all
         # (task 3068).  Fed from _apply_retry_cap — the single per-report
         # chokepoint that sees every outcome — and read by
@@ -8729,6 +8742,11 @@ class Harness:
     ) -> TaskReport | None:
         """Run a single workflow slot."""
         report = None
+        # Hoisted (task 3172) so the `except asyncio.CancelledError` handler can
+        # read the live phase defensively: a cancel landing during slot SETUP
+        # arrives before the build_workflow assignment below, where touching an
+        # unhoisted local would raise UnboundLocalError.
+        workflow = None
         # Set to True in the except Exception handler (any unhandled workflow-slot
         # exception) so the existing requeue cooldown is armed via scheduler.release,
         # preventing the rapid re-block loop where reconciliation immediately
@@ -9160,10 +9178,18 @@ class Harness:
             # teardown is NOT "work finished and discardable" — the lane
             # stays ASSIGNED and the periodic terminal-lane reconciler / next
             # acquire reclaims it later.
+            # Truthful cause and phase (task 3172).  block_phase reads the live
+            # workflow's own state; a late read can yield 'cancelled' when
+            # _finalise_cancellation already advanced the machine, which is
+            # still strictly more truthful than the '' this used to record.
             report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
                 outcome=WorkflowOutcome.CANCELLED,
+                block_reason=self._cancel_causes().pop(assignment.task_id, None) or '',
+                block_phase=(
+                    workflow.state.value if workflow is not None else 'dispatch_setup'
+                ),
             )
             return report
         except Exception as e:
@@ -12623,7 +12649,23 @@ class Harness:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
 
-    def hard_cancel_workflow(self, task_id: str, *, restamp: bool = True) -> bool:
+    def _cancel_causes(self) -> dict[str, str]:
+        """The cancel-cause registry, lazily created when absent.
+
+        Several test fixtures build a Harness via ``Harness.__new__`` and set
+        only the registries they exercise, so this mirrors the
+        ``getattr(self, '_escalation_queue', None)`` defensive idiom used
+        elsewhere rather than assuming ``__init__`` ran.
+        """
+        causes = getattr(self, '_workflow_cancel_causes', None)
+        if causes is None:
+            causes = {}
+            self._workflow_cancel_causes = causes
+        return causes
+
+    def hard_cancel_workflow(
+        self, task_id: str, *, restamp: bool = True, reason: str | None = None
+    ) -> bool:
         """Hard-cancel the asyncio.Task running the workflow slot for ``task_id``.
 
         This is the escalation path when a workflow ignores the soft
@@ -12633,6 +12675,25 @@ class Harness:
         runs (CancelledError is BaseException, so it bypasses the
         ``except Exception`` guard at harness.py:1833) ensuring lock release
         and registry cleanup.
+
+        ``reason`` (task 3172) records WHY, stamped into
+        ``_workflow_cancel_causes`` immediately before ``task.cancel()`` and
+        consumed once by ``_run_slot``'s ``except asyncio.CancelledError``
+        handler, which surfaces it as the synthetic report's ``block_reason``.
+        Idempotent under the repeated at/above-threshold polls the
+        terminal-status watcher makes.
+
+        The reason vocabulary is deliberately CLOSED and low-cardinality so it
+        stays GROUP-BY-able in runs.db (the same property that made
+        ``block_reason`` the field task 3068 chose to persist):
+
+        - ``'terminal_status_cancel'``   — the terminal-status watcher.
+        - ``'action_teardown:<action>'`` — escalation-action teardown
+          (restart / park / abandon).
+        - ``'shutdown_drain'``          — ``run()``'s finally drained the slot.
+        - ``'cancelled_unattributed'``  — the honest residue.  A NEW cancel
+          source that does not register itself here lands in this bucket; that
+          is a signal to add a member above, never something to guess about.
 
         ``restamp`` controls whether ``_workflow_cancel_at`` is updated.  Pass
         ``restamp=True`` (the default) on the threshold-crossing call so the R3
@@ -12653,6 +12714,8 @@ class Harness:
             # window.  Only stamp at the threshold-crossing call; subsequent
             # polls pass restamp=False to keep the window anchored.
             self.scheduler.note_workflow_cancelled(task_id)
+        if reason is not None:
+            self._cancel_causes()[task_id] = reason
         task.cancel()
         return True
 
