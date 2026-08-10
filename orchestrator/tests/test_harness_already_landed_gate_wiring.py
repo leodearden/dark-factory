@@ -22,7 +22,10 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,8 +33,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.models import Escalation
 
-from orchestrator.config import DeliveredChecksConfig
+from orchestrator.config import DeliveredChecksConfig, RecoveryEmissionConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.landing_evidence import LandingEvidenceVerdict
 
@@ -1809,3 +1813,534 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         assert result is True
         guard.assert_not_awaited()
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task beta (3535): the two emissions this gate was PROMISED.
+#
+# Task 3534 left two forward references in this very method — its docstring
+# ("The veto is LOGGED with the pinning escalation ids ...; task beta (3535)
+# replaces that log line with the structured ``recovery_vetoed`` emission plus
+# its N-consecutive-vetoes dedup escalation") and the comment above the
+# arbitration hold ("... task beta (3535) replaces both with the structured
+# `recovery_vetoed` emission plus its streak dedup").  These tests are the
+# other half of those promises: honour them, or the spine is left carrying two
+# stale lies.
+#
+# The canonical WHY for the whole mechanism lives in
+# ``orchestrator/src/orchestrator/recovery_emission.py``'s module docstring and
+# is deliberately not restated here.
+# ---------------------------------------------------------------------------
+
+#: What this gate renders as its ``shape``.  It resolves neither a claimant
+#: (``live_claimant=False is deliberate and free``) nor a branch state, so both
+#: elements are ``unknown`` rather than guessed; ``pending`` is a STRUCTURAL
+#: fact of the site (it is consulted only over dispatch candidates), and the
+#: trailing ``-`` is "no deploy state", read from the metadata already in hand.
+_GATE_PINNED_SHAPE = 'pending|unknown|unknown|true|-'
+#: Same, for the arm that could not read the store: the escalation element is
+#: not merely absent, it is UNKNOWN (the esc-3163 distinction).
+_GATE_UNREADABLE_SHAPE = 'pending|unknown|unknown|unknown|-'
+
+
+def _emitting_harness(mock_orch_config, tmp_path: Path) -> Harness:
+    """A wired ancestry harness with a REAL EventStore and a REAL config model.
+
+    ``mock_orch_config`` is a spec'd MagicMock, so ``config.recovery_emission``
+    would hand the streak predicate a MagicMock threshold — which the adapter's
+    fail-open guard swallows, silently hiding whatever a test meant to pin.  A
+    real :class:`RecoveryEmissionConfig` keeps the assertions honest.
+    """
+    h = _wired_ancestry_harness(mock_orch_config)
+    h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    h.config.recovery_emission = RecoveryEmissionConfig()
+    return h
+
+
+def _recovery_rows(harness: Harness) -> list[dict]:
+    """Every recovery event row, oldest first, with ``data`` JSON-decoded."""
+    conn = sqlite3.connect(str(harness.event_store.db_path))
+    try:
+        return [
+            {'task_id': tid, 'event_type': et, 'data': json.loads(raw or '{}')}
+            for tid, et, raw in conn.execute(
+                'SELECT task_id, event_type, data FROM events '
+                'WHERE event_type IN (?, ?) ORDER BY id',
+                (EventType.recovery_vetoed.value, EventType.recovery_left.value),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _conflict_escalation(esc_id: str = 'esc-42-conflict') -> Escalation:
+    """A pending ``provenance_conflict`` L2 — the record the hold decides on.
+
+    ``detail`` is left empty on purpose: ``arbitration_pending``'s documented
+    ambiguity asymmetry ("EVERY ambiguity ... resolves to HOLD") then binds the
+    task regardless of the caller's ``reopen_at``, so these tests exercise the
+    hold arm without depending on reopen_at serialisation details that
+    ``TestAlreadyLandedDispatchGateArbitrationHoldIsDurable`` already pins.
+    """
+    return Escalation(
+        id=esc_id,
+        task_id='42',
+        agent_role='merge-worker',
+        severity='urgent',
+        category='provenance_conflict',
+        summary='done evidence predates reopen_at',
+        level=2,
+    )
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGatePinVetoEmission:
+    """BOUNDARY #10: the any-level pin veto now emits, not just logs.
+
+    A pending task carrying landing evidence and an open L2 is NOT auto-flipped
+    (unchanged), and that hold stops being a log-only fact: it becomes a
+    structured ``recovery_vetoed`` row naming the record that held it.
+    """
+
+    async def test_pin_veto_emits_exactly_one_recovery_vetoed_row(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False, 'the veto disposition is unchanged: abstain'
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        rows = _recovery_rows(h)
+        assert len(rows) == 1, f'expected exactly one recovery row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['task_id'] == '42', (
+            'task_id must be a first-class column so the row joins against '
+            'task_completed / escalation_created'
+        )
+
+    async def test_pin_veto_payload_carries_the_full_key_set(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        await h._already_landed_dispatch_gate('42')
+
+        data = _recovery_rows(h)[0]['data']
+        assert set(data) == {
+            'task_id', 'site', 'shape', 'reason', 'escalation_ids',
+            'ages_secs', 'measured_at', 'store_unavailable', 'streak',
+        }
+        assert data['task_id'] == '42'
+        assert data['site'] == 'already_landed_gate'
+        assert data['reason'] == 'escalation_pinned'
+        assert data['store_unavailable'] is False
+        assert data['shape'] == _GATE_PINNED_SHAPE, (
+            'this gate resolves neither claimant nor branch state — it must '
+            'render them unknown rather than guessing a shape it never saw'
+        )
+        stamp = datetime.fromisoformat(data['measured_at'])
+        assert stamp.tzinfo is not None, 'measured_at must be tz-aware'
+
+    async def test_pin_veto_payload_names_exactly_the_ids_the_log_names(
+        self, mock_orch_config, tmp_path, caplog,
+    ) -> None:
+        """The structured row and the human log line must not disagree.
+
+        The log names ``(*queue_handoff, *dead_l0)`` — the records that
+        actually pinned.  The payload buckets those SAME ids and additionally
+        carries the non-pinning ones, so a consumer can see the whole open set
+        without the two records ever contradicting each other about which
+        record held the task.
+        """
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+            _open_escalation('esc-42-5', level=0, severity='info'),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        buckets = _recovery_rows(h)[0]['data']['escalation_ids']
+        pinning = sorted((*buckets['queue_handoff'], *buckets['dead_l0']))
+        assert pinning == ['esc-42-9'], (
+            'the info-severity record never pins (PRD D3 / boundary row #8)'
+        )
+        assert buckets['non_pinning'] == ['esc-42-5'], (
+            'a non-pinning record is still REPORTED — the operator sees the '
+            'whole open set, bucketed, not a filtered half of it'
+        )
+        veto_lines = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness' and 'esc-42-9' in r.getMessage()
+        ]
+        assert veto_lines, 'the human log line is KEPT, not replaced'
+        assert not any('esc-42-5' in m for m in veto_lines), (
+            'the log names the pinning ids only — the payload is the place '
+            'the full bucketed set lives'
+        )
+
+    async def test_pin_veto_payload_ages_each_pinning_id_by_id(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Ages join by ID, never by position — and come from the rows the
+        gate ALREADY read (an ``Escalation`` spells its birth ``timestamp``)."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        old = _open_escalation('esc-42-9', level=2)
+        old.timestamp = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat()
+        recent = _open_escalation('esc-42-8', level=1)
+        recent.timestamp = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        h._escalation_queue = _queue_with_open(old, recent)
+
+        await h._already_landed_dispatch_gate('42')
+
+        ages = _recovery_rows(h)[0]['data']['ages_secs']
+        assert set(ages) == {'esc-42-9', 'esc-42-8'}
+        assert 3500.0 < ages['esc-42-9'] < 3700.0
+        assert 60.0 < ages['esc-42-8'] < 300.0
+        assert cast(MagicMock, h._escalation_queue).get_by_task.call_count == 1, (
+            'ages must come from the single read the gate already pays for — '
+            'telemetry may not add a second store read to a per-tick path'
+        )
+
+    async def test_repeated_identical_veto_emits_exactly_one_row(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """TICK-FREQUENCY GUARD.  This gate runs once per dispatch tick for as
+        long as the task keeps being a candidate, so an unconditional emit
+        would append one SQLite row per tick per pinned task, forever — the
+        INV-4 storm this gate's own hold-logging already dodges."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        for _ in range(5):
+            assert await h._already_landed_dispatch_gate('42') is False
+
+        assert len(_recovery_rows(h)) == 1, (
+            'five ticks of the SAME hold is one fact, not five'
+        )
+
+    async def test_changed_pinning_ids_re_emit(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A DIFFERENT record pinning the task is a new fact, not a repeat."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        await h._already_landed_dispatch_gate('42')
+        cast(MagicMock, h._escalation_queue).get_by_task = MagicMock(
+            return_value=[_open_escalation('esc-42-11', level=1)],
+        )
+        await h._already_landed_dispatch_gate('42')
+
+        rows = _recovery_rows(h)
+        assert len(rows) == 2, f'a changed pin set must re-announce: {rows}'
+        assert sorted(
+            i for ids in rows[1]['data']['escalation_ids'].values() for i in ids
+        ) == ['esc-42-11']
+
+    async def test_healthy_flip_emits_nothing(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Nothing held the task back, so there is nothing to describe.  The
+        ABSENCE of a row is the meaningful signal (see the EventType members)."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open()
+
+        assert await h._already_landed_dispatch_gate('42') is True
+
+        assert _recovery_rows(h) == []
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateArbitrationHoldEmission:
+    """The arbitration hold describes itself too — on the TRANSITION only.
+
+    The sink's ``note_hold_observed`` / ``clear_hold_observed`` streak state
+    stays the authority for this arm (it already keys on
+    ``(task_id, reopen_at)``, which the veto signature does not see), so the
+    emission rides that transition rather than re-deriving one beside it.
+    """
+
+    async def test_hold_emits_recovery_vetoed_with_the_arbitration_reason(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(_conflict_escalation())
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True, 'a contested task is still WITHHELD, not flipped'
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        rows = _recovery_rows(h)
+        assert len(rows) == 1, f'expected one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value, (
+            'an open record actively withheld a dispatch — that is a VETO, '
+            'not a no-mapped-action fall-through'
+        )
+        assert rows[0]['task_id'] == '42'
+        assert rows[0]['data']['reason'] == 'provenance_arbitration'
+        assert rows[0]['data']['site'] == 'already_landed_gate'
+        assert sorted(
+            i for ids in rows[0]['data']['escalation_ids'].values() for i in ids
+        ) == ['esc-42-conflict'], 'the payload names the contesting record'
+
+    async def test_hold_repeats_emit_nothing_and_keep_the_log_cadence(
+        self, mock_orch_config, tmp_path, caplog,
+    ) -> None:
+        """The hold re-fires every tick; the structured row must not.
+
+        Also pins that the existing INFO-once/DEBUG-after cadence is PRESERVED
+        rather than replaced — the event is the machine-readable record, the
+        log stays the human one.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(_conflict_escalation())
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            for _ in range(3):
+                assert await h._already_landed_dispatch_gate('42') is True
+
+        assert len(_recovery_rows(h)) == 1, 'one hold, one row — not one per tick'
+        held = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness'
+            and 'under provenance arbitration' in r.getMessage()
+        ]
+        assert [r.levelno for r in held] == [
+            logging.INFO, logging.DEBUG, logging.DEBUG,
+        ], [(r.levelname, r.getMessage()) for r in held]
+
+    async def test_hold_released_then_returning_re_emits(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A hold that RETURNS is a new fact, exactly as it is for the log.
+
+        Without this the dedup would be strictly worse than the log line it
+        was promised to replace: the sink goes loud again on a returning hold,
+        and the event stream must not stay silent about it.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        queue = _queue_with_open(_conflict_escalation())
+        h._escalation_queue = queue
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=queue,
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is True
+
+        # The operator arbitrates: the record is resolved, the hold releases
+        # and the task flips as it would have all along.
+        queue.get_by_task = MagicMock(return_value=[])
+        assert await h._already_landed_dispatch_gate('42') is True
+        assert h._provenance_conflict_sink.note_hold_observed('42') is True, (
+            'the release must have dropped the sink state — otherwise this '
+            'test silently degrades into a repeat of the quiet-repeat case'
+        )
+        h._provenance_conflict_sink.clear_hold_observed('42')
+
+        # ... and the conflict comes back.
+        queue.get_by_task = MagicMock(return_value=[_conflict_escalation()])
+        assert await h._already_landed_dispatch_gate('42') is True
+
+        rows = _recovery_rows(h)
+        assert len(rows) == 2, f'a returning hold must re-announce: {rows}'
+        assert [r['data']['reason'] for r in rows] == [
+            'provenance_arbitration', 'provenance_arbitration',
+        ]
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateStoreUnavailableEmission:
+    """An unreadable store is the THIRD state, and it says so now.
+
+    The gate already vetoes on a failed read (task 3534) and logs a WARNING.
+    What it could not do was let a consumer COUNT how often dispatch decisions
+    are being made against an unreadable store.
+    """
+
+    async def test_read_failure_emits_recovery_left(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False, 'never phantom-done on an unreadable store'
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        rows = _recovery_rows(h)
+        assert len(rows) == 1, f'expected one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_left.value, (
+            'nothing was held back by a RECORD — the site could not read the '
+            'store to find out (the recovery_left half of the discriminator)'
+        )
+        data = rows[0]['data']
+        assert data['reason'] == 'escalation_store_unavailable'
+        assert data['store_unavailable'] is True
+        assert data['site'] == 'already_landed_gate'
+        assert data['shape'] == _GATE_UNREADABLE_SHAPE
+        assert data['escalation_ids'] == {
+            'dead_l0': [], 'queue_handoff': [], 'non_pinning': [],
+        }, 'an unreadable store yields NO ids — never a false empty pin set'
+
+    async def test_repeated_read_failure_emits_exactly_one_row(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A store outage lasts many ticks; it is one fact, not one per tick."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        for _ in range(4):
+            assert await h._already_landed_dispatch_gate('42') is False
+
+        assert len(_recovery_rows(h)) == 1
+
+
+def _matrix_pinned(h: Harness) -> None:
+    h._escalation_queue = _queue_with_open(_open_escalation('esc-42-9', level=2))
+
+
+def _matrix_info_only(h: Harness) -> None:
+    h._escalation_queue = _queue_with_open(
+        _open_escalation('esc-42-5', level=0, severity='info'),
+    )
+
+
+def _matrix_clean(h: Harness) -> None:
+    h._escalation_queue = _queue_with_open()
+
+
+def _matrix_no_queue(h: Harness) -> None:
+    h._escalation_queue = None
+
+
+def _matrix_store_failure(h: Harness) -> None:
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.get_by_task = MagicMock(
+        side_effect=OSError('escalation queue dir unreadable'),
+    )
+
+
+def _matrix_arbitration(h: Harness) -> None:
+    from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+    h._escalation_queue = _queue_with_open(_conflict_escalation())
+    h._provenance_conflict_sink = ProvenanceConflictSink(
+        escalation_queue=h._escalation_queue,
+    )
+
+
+#: name -> (wiring, expected gate return, expected _mark_in_progress_done awaits)
+_GATE_MATRIX = {
+    'l2_pin_abstains': (_matrix_pinned, False, 0),
+    'info_only_still_flips': (_matrix_info_only, True, 1),
+    'clean_read_flips': (_matrix_clean, True, 1),
+    'absent_queue_flips': (_matrix_no_queue, True, 1),
+    'unreadable_store_abstains': (_matrix_store_failure, False, 0),
+    'arbitration_withholds': (_matrix_arbitration, True, 0),
+}
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateZeroDispositionChange:
+    """THE load-bearing test of task 3535 at this site.
+
+    Task 3535's contract is emission BEFORE behavior (PRD
+    ``plans/task-escalation-state-graph-prd.md`` D5): an emission that moved a
+    disposition would be a defect no amount of correct payload could redeem.
+    So every arm of the gate matrix is re-run with ``recovery_emission.enabled``
+    flipped and must produce a byte-identical answer and an identical number of
+    done-writes.  ``info_only_still_flips`` is in the matrix deliberately: the
+    carve-out task 3534 landed must survive this task untouched.
+    """
+
+    @pytest.mark.parametrize('scenario', sorted(_GATE_MATRIX))
+    @pytest.mark.parametrize('enabled', [True, False])
+    async def test_disposition_is_identical_with_and_without_emission(
+        self, mock_orch_config, tmp_path, scenario, enabled,
+    ) -> None:
+        wire, expected_result, expected_marks = _GATE_MATRIX[scenario]
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h.config.recovery_emission = RecoveryEmissionConfig(enabled=enabled)
+        wire(h)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is expected_result, scenario
+        assert cast(
+            AsyncMock, h._mark_in_progress_done,
+        ).await_count == expected_marks, scenario
+        if not enabled:
+            assert _recovery_rows(h) == [], (
+                'the kill switch must actually silence the events it names'
+            )
+
+    async def test_emission_failure_never_breaks_the_gate(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Telemetry is never load-bearing: a broken event store must not turn
+        an abstain into a dispatch-gating exception (the scheduler's catch-all
+        would fail the WHOLE gate open, losing the veto)."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+        h.event_store = MagicMock()
+        h.event_store.emit = MagicMock(side_effect=RuntimeError('db is gone'))
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+
+class TestAlreadyLandedGateForwardReferencesAreHonoured:
+    """Task 3534's two in-code promises must not outlive the task that pays them.
+
+    A forward reference left behind after its owner landed is a stale lie in
+    the spine: the next reader chases task 3535 expecting unfinished work.
+    """
+
+    def test_no_stale_task_beta_forward_reference_remains(self) -> None:
+        # Whitespace-normalised: both promises are wrapped across comment
+        # lines, so a per-line scan would silently pass against either of them.
+        source = ' '.join(_HARNESS_SRC_PATH.read_text(encoding='utf-8').split())
+
+        assert 'task beta (3535) replaces' not in source, (
+            'this comment promises a future replacement that task 3535 has '
+            'now delivered — it must describe what exists instead'
+        )
