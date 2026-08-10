@@ -599,12 +599,26 @@ class TestEscalationResolutionClass:
         """RESOLUTION_CLASSES is a frozenset."""
         assert isinstance(RESOLUTION_CLASSES, frozenset)
 
-    def test_resolution_classes_contains_exactly_the_three_legal_values(self):
+    def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject'} — no extras. 'moot-terminal-subject' is the
-        distinct, non-benign stamp the task-2724 revalidation sweep writes."""
-        assert frozenset({'benign', 'actionable', 'moot-terminal-subject'}) == RESOLUTION_CLASSES
+        'moot-terminal-subject', 'stale-strand'} — no extras.
+
+        'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
+        revalidation sweep writes.
+
+        'stale-strand' (task 3172) is the distinguishable, NON-benign stamp the
+        startup restart dismissal (``EscalationQueue.dismiss_all_pending``)
+        writes for a level-0 escalation that had already been pending for
+        ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
+        task-2724 vocabulary rather than forking a second scheme, so a 20h
+        strand and a 90s restart artifact stop reading identically.
+        """
+        assert (
+            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            == RESOLUTION_CLASSES
+        )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES
+        assert 'stale-strand' in RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 
