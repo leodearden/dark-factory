@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import keyword
 import logging
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -149,10 +150,20 @@ def _tool_names(corpus: list[dict[str, Any]]) -> dict[tuple[str, tuple[str, ...]
     A tool observed with two different parameter sets across the archive gets
     two tools, because the schema is the thing under test: collapsing them would
     validate half the specimens against a schema they never arrived with.
+
+    Only EXPRESSIBLE records contribute a signature. A record whose parameter
+    names cannot be a Python signature is a counted, logged
+    :class:`Skip` — but the tools are built for the whole corpus up front, before
+    any per-record skip runs, so without this filter one inexpressible record
+    would take the entire harness down at construction instead of routing
+    through ``MAX_SKIPPED``.
     """
     names: dict[tuple[str, tuple[str, ...]], str] = {}
     seen: dict[str, int] = {}
-    for signature in sorted({_signature(record) for record in corpus}):
+    expressible = {
+        _signature(record) for record in corpus if _why_not_expressible(record) is None
+    }
+    for signature in sorted(expressible):
         base = _sanitized(signature[0])
         index = seen.get(base, 0)
         seen[base] = index + 1
@@ -172,15 +183,33 @@ def _synthetic_tool(name: str, params: tuple[str, ...], sink: Any) -> Any:
     Every parameter is optional so a record's ``supplied`` subset is a legal
     call, and typed ``str | None`` so a raw specimen validates unchanged rather
     than being coerced on its way in.
+
+    The "corpus identifiers only" property that makes the ``exec`` safe is
+    ASSERTED here, not merely asserted ABOUT here. *name* is sanitized by
+    :func:`_sanitized`, but the parameter names are interpolated straight into a
+    ``def`` signature — and the corpus is machine-generated from a live
+    transcript archive and explicitly expected to be refreshed. A refresh
+    yielding a name that is not a Python identifier, or that is a keyword
+    (``from``, ``class`` — both ``isidentifier()``-true and both a
+    ``SyntaxError`` in a signature), must fail by NAMING that name rather than
+    as an opaque error inside a fixture. :func:`_why_not_expressible` routes
+    such records to the counted skip path first; this is the backstop that
+    keeps the two in step.
     """
+    unusable = [p for p in params if not p.isidentifier() or keyword.iskeyword(p)]
+    assert not unusable, (
+        f'{name} cannot be synthesized: {unusable} are not usable Python '
+        'parameter names. _why_not_expressible must route these to a counted '
+        'Skip before the harness reaches here.'
+    )
     source = (
         f'def {name}(' + ', '.join(f'{p}: str | None = None' for p in params) + '):\n'
         '    sink({' + ', '.join(f'{p!r}: {p}' for p in params) + '})\n'
         "    return 'ok'\n"
     )
     namespace: dict[str, Any] = {'sink': sink}
-    exec(source, namespace)  # noqa: S102 — see the docstring; the source is built
-    return namespace[name]                # from corpus identifiers, never from a value
+    exec(source, namespace)  # noqa: S102 — see the docstring; every interpolated
+    return namespace[name]                # name is asserted to be an identifier
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +259,14 @@ def _why_not_expressible(record: dict[str, Any]) -> str | None:
     silently-shrinking replay ``MAX_SKIPPED`` exists to prevent.
     """
     names = [record['param'], *record['schema_params'], *record['supplied']]
-    unusable = [name for name in names if not name.isidentifier()]
+    # Keywords are ``isidentifier()``-true and still a SyntaxError in a ``def``
+    # signature, so ``from``/``class``/``lambda`` have to be excluded here or
+    # they reach :func:`_synthetic_tool`'s exec.
+    unusable = [
+        name for name in names if not name.isidentifier() or keyword.iskeyword(name)
+    ]
     if unusable:
-        return f'parameter name(s) are not Python identifiers: {sorted(set(unusable))}'
+        return f'parameter name(s) are not usable Python names: {sorted(set(unusable))}'
     if record['param'] not in record['supplied']:
         return 'the leaking param is not among the supplied arguments'
     if record['param'] not in record['schema_params']:
