@@ -121,10 +121,12 @@ Two eval axes, strictly isolated, all replay on **throwaway scratch graphs** (ne
 funnel-shaped to keep Leo's full candidate slate affordable:
 
 **LLM axis** (embedder held fixed at the incumbent): replay a committed episode corpus per arm
-through the real `GraphitiBackend` construction path onto scratch graphs. Funnel: all four
-candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
+through the real `GraphitiBackend` construction path onto scratch graphs. Funnel: all three
+remaining candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
 whisper-writer, prompt-length fit, throughput floor); at most three advance to **full corpus
-replay** under realistic concurrency on the busy box. Client-class parity: **every** arm — incumbent
+replay** under realistic concurrency on the busy box (was four candidates — Mistral-Small-3.2-24B
+was dropped 2026-08-06, so the ≤3 cap no longer binds while the absolute screening gates still do;
+see the consequence note at the candidate slate). Client-class parity: **every** arm — incumbent
 included — runs via `OpenAIGenericClient`, and a one-off control quantifies the
 `OpenAIClient → OpenAIGenericClient` delta on the incumbent itself, so the client-class change is
 measured, not confounded.
@@ -225,7 +227,9 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
    LLM involved.
 5. **Two retrieval configurations** on the embedding axis; *with-indices is primary* (future prod);
    the current-prod embedding-only configuration is reported alongside, with the confound stated.
-6. **Funnel**: LLM axis screens all 4, replays ≤3. Embedding axis runs all arms in full.
+6. **Funnel**: LLM axis screens all 3 (was 4 — Mistral-Small-3.2-24B dropped 2026-08-06), replays
+   ≤3 — the ≤3 cap is now non-binding; the absolute screening gates still are. Embedding axis runs
+   all arms in full.
 7. **Dims are a free variable**: the backfill is forced regardless, so candidates are compared at
    their native/MRL-best dims, not forced to 1536. (Mixed dims break cosine — but cutover atomicity
    is the follow-up PRD's problem; this eval only quantifies re-embed throughput to inform it.)
