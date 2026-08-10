@@ -44,12 +44,18 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
+from fused_memory.middleware.recon_claim_verification_guard import (
+    _GIT_PROBE_TIMEOUT_SECS,
+    _resolve_git_toplevel,
+)
 from fused_memory.reconciliation.task_filter import (
     _CLAUSE_SPLIT_RE,
     FUTURE_ASPIRATIONAL_RE,
@@ -69,6 +75,7 @@ __all__ = [
     'ClaimVerdict',
     'CompletionClaim',
     'build_unverified_flag',
+    'make_commit_probe',
     'extract_completion_claims',
     'verify_claims',
 ]
@@ -614,3 +621,77 @@ def build_unverified_flag(
     if not entries:
         return None
     return {'tag': UNVERIFIED_CLAIM_TAG, 'claims': entries}
+
+
+# --------------------------------------------------------------------------- #
+# Git-backed commit probe (the module's only impure export)
+# --------------------------------------------------------------------------- #
+
+#: Matches git's clean "no such object" report. `git cat-file -e` exits 128 for
+#: BOTH a missing object and a missing repository, so the exit code alone
+#: cannot tell "the writer named a commit that does not exist" from "git was
+#: unusable here" — and reporting the second as the first would put a false
+#: accusation in an escalation. The stderr text is the only discriminator git
+#: offers, so it is the one used, and anything it does not match degrades to
+#: UNRESOLVABLE rather than to a clean miss.
+_NOT_A_VALID_OBJECT_RE: re.Pattern[str] = re.compile(
+    r'not a valid object name', re.IGNORECASE,
+)
+
+
+def make_commit_probe(repo_root: Path | str) -> Callable[[str], bool | None]:
+    """Build a ``probe(sha) -> bool | None`` backed by *repo_root*'s git objects.
+
+    ``True`` the sha resolves to a commit, ``False`` git says no such object,
+    ``None`` git could not answer (not a repository, binary missing, timeout,
+    any other non-zero exit). NEVER raises.
+
+    Rooted at *repo_root*'s resolved git top level via the sibling guard's
+    :func:`~middleware.recon_claim_verification_guard._resolve_git_toplevel`, so
+    a package subdirectory probes the whole repository rather than nothing.
+
+    ``cat-file -e <sha>^{commit}`` (not ``rev-parse``) is the check: the
+    ``^{commit}`` peel means a sha that names a blob or a tree — or an
+    abbreviation that is ambiguous — is a miss rather than a spurious hit, and
+    ``-e`` keeps the output empty on success.
+
+    NOTE the return type differs from
+    :func:`~middleware.recon_claim_verification_guard.make_source_and_history_probe`,
+    which fails OPEN to ``True`` on a git error. That probe DROPS a candidate on
+    a False, so a hiccup must not manufacture a fabrication flag. This one only
+    labels, so its errors resolve to ``None`` -> ``'unverifiable'`` -> tagged.
+    """
+    resolved_root = _resolve_git_toplevel(Path(repo_root))
+
+    def probe(sha: str) -> bool | None:
+        try:
+            result = subprocess.run(
+                ['git', 'cat-file', '-e', f'{sha}^{{commit}}'],
+                cwd=resolved_root,
+                timeout=_GIT_PROBE_TIMEOUT_SECS,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                'completion_claim_gate: git cat-file failed for sha=%r under %s '
+                '— commit existence is UNRESOLVABLE: %s',
+                sha, resolved_root, exc,
+            )
+            return None
+
+        if result.returncode == 0:
+            return True
+
+        stderr = (result.stderr or '').strip()
+        if _NOT_A_VALID_OBJECT_RE.search(stderr):
+            return False
+
+        logger.warning(
+            'completion_claim_gate: git cat-file errored (exit=%d) for sha=%r '
+            'under %s — commit existence is UNRESOLVABLE: %s',
+            result.returncode, sha, resolved_root, stderr,
+        )
+        return None
+
+    return probe
