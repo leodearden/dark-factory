@@ -373,15 +373,35 @@ class TestNoStormForHealthyTasks:
 @pytest.mark.asyncio
 class TestQuietRepeats:
     async def test_second_sweep_with_identical_signature_adds_no_row(self, harness):
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            veto_streak_threshold=3,
+        )
         _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
 
-        await harness._reconcile_stranded_in_progress(mid_run=False)
         await harness._reconcile_stranded_in_progress(mid_run=False)
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
         assert len(_recovery_rows(harness)) == 1, (
             'an unchanged hold is the SAME fact re-observed; re-emitting it '
             'every sweep is the INV-4 storm this gating exists to prevent'
+        )
+
+    async def test_the_threshold_crossing_sweep_speaks_once_more(self, harness):
+        """should_emit_event's SECOND clause: the event store must record the
+        moment the streak reached the alarm threshold, even though the
+        signature has not changed since sweep 1."""
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            veto_streak_threshold=3,
+        )
+        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+
+        for _ in range(5):
+            await harness._reconcile_stranded_in_progress(mid_run=False)
+
+        rows = _recovery_rows(harness)
+        assert [r['data']['streak'] for r in rows] == [1, 3], (
+            'exactly two rows: the new hold, and the threshold crossing — '
+            'sweeps 4 and 5 must stay quiet forever after'
         )
 
     async def test_changed_pinning_id_set_re_emits(self, harness):

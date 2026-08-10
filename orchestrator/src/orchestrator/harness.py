@@ -90,6 +90,16 @@ from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
+from orchestrator.recovery_emission import (
+    LeaveReason,
+    Observation,
+    RecoverySite,
+    RecoveryVetoStreakTracker,
+    build_recovery_payload,
+    emit_recovery_event,
+    escalation_ages_secs,
+    should_emit_event,
+)
 from orchestrator.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -128,6 +138,8 @@ from orchestrator.task_ground_truth import (
     EscalationRef,
     RecoveryAction,
     TaskGroundTruth,
+    leave_reason,
+    recovery_shape_str,
 )
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
@@ -1763,6 +1775,22 @@ class Harness:
         # hardest during exactly the many-tasks-looping incident this detects.
         # Popped on recovery so a later recurrence re-files.
         self._zero_progress_filed_at: dict[str, int] = {}
+
+        # Per-(site, task) CONSECUTIVE identical-veto streaks (task 3535).
+        # Fed from _emit_recovery_disposition, the single adapter every veto
+        # site in this class emits through.  Deliberately in-memory and NOT
+        # durable: a fleet restart re-arms every signature, which is exactly
+        # the D5 signal that the first post-deploy sweep names each currently-
+        # stranded task's pinning escalation ids.  Entries are popped when a
+        # task stops being held, so this stays proportional to the number of
+        # CURRENTLY-held tasks rather than growing over a weeks-long run.
+        self._recovery_veto_tracker = RecoveryVetoStreakTracker()
+        # task_id -> streak at the last time we asked the escalation queue
+        # whether a veto-streak alarm was already open (same memo contract as
+        # _zero_progress_filed_at above: keeps has_open_l1's pending-queue
+        # glob+parse off the per-sweep path).  Popped on recovery so a later
+        # recurrence re-files.
+        self._recovery_streak_filed_at: dict[str, int] = {}
 
         # Consecutive terminal-status poll counts per task.  Incremented each
         # poll a workflow is terminal but still active; reset when it is no
@@ -5499,6 +5527,26 @@ class Harness:
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
 
+        # Task 3535 (beta) — THE chokepoint for this sweep's emission, sited
+        # here because `action` is final at this line: the table has spoken and
+        # both sweep-side upgrades above have had their say, so a LEAVE
+        # surviving to here is a genuine hold rather than a decision still in
+        # flight.  Describes only; `action` is never re-read from this call.
+        #
+        # A LEAVE with a live claimant is filtered inside the adapter, not
+        # here, so the two call sites cannot drift on that rule.
+        emitted_recovery = False
+        if action == RecoveryAction.LEAVE:
+            self._emit_recovery_disposition(
+                tid,
+                site=RecoverySite.reconcile_sweep,
+                reason=leave_reason(report),
+                shape=recovery_shape_str(report),
+                records=report.open_escalations,
+                store_unavailable=report.escalation_store_unavailable,
+            )
+            emitted_recovery = True
+
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
             # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
             # design decision): θ1's _RECOVERY table has no degenerate-branch
@@ -5839,6 +5887,22 @@ class Harness:
         # (L1-only), which missed an L2-only open escalation and fell
         # through to an incorrect revert.
         if report.open_escalations:
+            # Task 3535: the SAME hold the chokepoint above already described.
+            # Emitting unguarded here would DOUBLE every boundary-#9 row — this
+            # early-return and that chokepoint both see an on-main pinned
+            # in-progress task in the same pass.  Today `emitted_recovery` is
+            # always True by the time control reaches this line (every non-LEAVE
+            # action returns further up), so this arm is belt-and-braces for a
+            # future refactor that opens a new route here, not a live path.
+            if not emitted_recovery:
+                self._emit_recovery_disposition(
+                    tid,
+                    site=RecoverySite.reconcile_sweep,
+                    reason=leave_reason(report),
+                    shape=recovery_shape_str(report),
+                    records=report.open_escalations,
+                    store_unavailable=report.escalation_store_unavailable,
+                )
             return None
 
         # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
@@ -9485,6 +9549,118 @@ class Harness:
                 'Task %s: zero-progress requeue check failed (non-fatal): %s',
                 task_id, exc,
             )
+
+    def _emit_recovery_disposition(
+        self,
+        task_id: str,
+        *,
+        site: RecoverySite,
+        reason: LeaveReason | None,
+        shape: str,
+        records: Sequence[EscalationRef] | None = None,
+        store_unavailable: bool = False,
+    ) -> Observation | None:
+        """DESCRIBE one already-reached recovery disposition — never change it.
+
+        Thin config-reading adapter over ``orchestrator.recovery_emission``
+        (same shape as ``_maybe_zero_progress_requeue_alert`` above): the module
+        stays pure and injectable, this method supplies ``self.event_store``,
+        the tracker and the config.  Every caller has ALREADY decided; this only
+        writes down what it decided and why.  The canonical WHY for the whole
+        mechanism is ``recovery_emission``'s module docstring — not restated
+        here, and not restated at any call site.
+
+        Two facts are dropped rather than emitted:
+
+        * ``reason is None`` — the site took an ACTION.  ``leave_reason``
+          returns ``None`` for every non-LEAVE disposition precisely so a caller
+          can never mislabel an action as a hold.
+        * ``LeaveReason.live_claimant`` — the task is simply running.  That is
+          the healthy majority of every sweep, and emitting for it would bury
+          the strands this mechanism exists to surface.
+
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload; the
+        veto answer stays with the caller's own untouched predicate (rewiring
+        that is task eta / 3541).
+
+        Returns the :class:`Observation` (so a caller can charge the streak
+        alarm) or ``None`` when nothing was recorded.  Wholly wrapped in
+        try/except: telemetry must never be able to disturb a recovery sweep.
+        """
+        try:
+            cfg = getattr(self.config, 'recovery_emission', None)
+            if cfg is None or not cfg.enabled:
+                return None
+            if reason is None or reason is LeaveReason.live_claimant:
+                return None
+
+            # getattr-tolerant: several narrow-scope test harnesses build a
+            # Harness via Harness.__new__(Harness), bypassing __init__ and its
+            # seeding above (the documented hazard at _get_ground_truth).
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is None:
+                tracker = RecoveryVetoStreakTracker()
+                self._recovery_veto_tracker = tracker
+
+            from escalation.pins import classify_pins  # noqa: PLC0415
+
+            # records=None is classify_pins' store-unavailable third state —
+            # never collapsed into "no records", which would read as a task
+            # with nothing holding it.
+            pins = classify_pins(
+                task_id,
+                None if store_unavailable else list(records or ()),
+                live_claimant=False,
+            )
+            buckets = {
+                'dead_l0': list(pins.dead_l0),
+                'queue_handoff': list(pins.queue_handoff),
+                'non_pinning': list(pins.non_pinning),
+            }
+            signature = '|'.join((
+                str(reason), shape,
+                ','.join(sorted(i for ids in buckets.values() for i in ids)),
+            ))
+            observation = tracker.observe(site, task_id, signature)
+            if not should_emit_event(
+                observation, threshold=cfg.veto_streak_threshold,
+            ):
+                # A quiet repeat of a hold already on record.  Still OBSERVED
+                # (the streak above kept climbing) — just not re-stated.
+                return observation
+
+            now = datetime.now(UTC)
+            emit_recovery_event(
+                event_store=self.event_store,
+                # A record actively held something back -> vetoed.  Every other
+                # reason is a fall-through: nothing was held, the site simply
+                # had no mapped action (or could not read the store to find
+                # out).  See the EventType members for the full discriminator.
+                event_type=(
+                    EventType.recovery_vetoed
+                    if reason is LeaveReason.escalation_pinned
+                    else EventType.recovery_left
+                ),
+                task_id=task_id,
+                payload=build_recovery_payload(
+                    task_id=task_id,
+                    site=site,
+                    shape=shape,
+                    reason=reason,
+                    escalation_ids=buckets,
+                    ages_secs=escalation_ages_secs(records, now=now),
+                    store_unavailable=store_unavailable or pins.store_unavailable,
+                    streak=observation.streak,
+                    now=now,
+                ),
+            )
+            return observation
+        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+            logger.warning(
+                'Task %s: recovery-disposition emission failed (non-fatal): %s',
+                task_id, exc,
+            )
+            return None
 
     def _collect_done_reports(
         self, done: set[asyncio.Task], task_reports: list[TaskReport]
