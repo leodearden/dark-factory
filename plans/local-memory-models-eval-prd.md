@@ -349,6 +349,11 @@ artifacts (e.g. margin_m = max(2·σ_control(m), floor_m) with each floor justif
 per-metric pass/fail direction, the latency envelope (p95 < 120s with stated headroom factor), the
 decision rule per axis, and the survivor rule for the screening funnel. Candidate-arm artifacts
 missing a matching `preregistration_sha` are invalid by schema.
+**Constraint on that survivor rule (2026-08-06, task 3804):** it MUST be authored against the
+**three-arm** LLM slate as recorded in `scripts/local-model-serving/arms.yaml` (the authoritative
+slate), MUST NOT presume a 4 → 3 narrowing, and MUST state explicitly whether the ≤3 cap binds at
+all given three candidates — so η reports a substantive result rather than a vacuous "all candidates
+survived". This constrains *how* ζ writes the rule; it does not pre-empt *what* the rule says.
 
 **Failure/storm rule (INV-4)**: the replay engine aborts an arm run after 5 consecutive item
 failures with a structured error record (arm, item ids, error class) — no silent absorb-and-continue;
