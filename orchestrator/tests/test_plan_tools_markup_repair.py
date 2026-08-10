@@ -639,3 +639,113 @@ class TestRepairPlanFieldsRefuses:
         assert 'analysis' not in repaired
         assert repaired['reuse'][-1] == 'not a dict at all'
         assert repaired['steps'] == 'not a list at all'
+
+
+# ---------------------------------------------------------------------------
+# step-7 — the ABSORBED-SIBLING shape: fill a HOLE, never overwrite authored text.
+# ---------------------------------------------------------------------------
+
+#: A real, later-authored rationale, as the live worktree-3024 plans look after
+#: the agent noticed the truncation and retried. At read time this and a
+#: recovered tail are indistinguishable — which is precisely why one must win
+#: by rule rather than by luck.
+_AUTHORED_RATIONALE = (
+    'The agent retried the call and this rationale is the one it actually meant '
+    'to record, so nothing may clobber it.'
+)
+
+
+def _absorbed_decision(**record) -> dict:
+    """A plan whose ``design_decisions[0]`` absorbed its rationale sibling."""
+    return corrupt_plan(
+        design_decisions=[{'decision': ABSORBED_RATIONALE, **record}],
+    )
+
+
+class TestRepairPlanFieldsAbsorbedSibling:
+    """PRD section 2.4's headline damage, restated for the read-time surface.
+
+    The rationale was ABSORBED INTO decision, so the design rationale a future
+    architect reads is another field's text. Recovering it is the point of the
+    task — but only ever into an EMPTY or ABSENT sibling (boundary row B9).
+    """
+
+    def test_recovers_into_an_empty_sibling(self):
+        plan = _absorbed_decision(rationale='')
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['decision'] == _DECISION_PROSE
+        assert detect(item['decision']) is None
+        assert item['rationale'] == _RATIONALE_PROSE
+        # D5: the recovered text is a VERBATIM substring of the original value,
+        # never synthesised.
+        assert item['rationale'] in ABSORBED_RATIONALE
+        assert ABSORBED_RATIONALE.startswith(item['decision'])
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == ['rationale']
+        assert facts[0]['field'] == 'decision'
+        assert facts[0]['misclose'] == _close('decision')
+
+    def test_recovers_into_a_missing_sibling__key_is_created(self):
+        plan = _absorbed_decision()
+        assert 'rationale' not in plan['design_decisions'][0]
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['decision'] == _DECISION_PROSE
+        assert item['rationale'] == _RATIONALE_PROSE
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == ['rationale']
+
+    def test_whitespace_only_sibling_counts_as_a_hole(self):
+        plan = _absorbed_decision(rationale='   \n\t  ')
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['decision'] == _DECISION_PROSE
+        assert item['rationale'] == _RATIONALE_PROSE
+        assert facts[0]['outcome'] == 'repaired'
+        assert facts[0]['recovered_params'] == ['rationale']
+
+    def test_never_overwrites_a_non_blank_authored_sibling(self):
+        """The invariant: fill a hole, NEVER overwrite authored text.
+
+        A recovered tail and a later-retried real value are indistinguishable
+        at read time, so clobbering the authored one would be exactly the
+        silent-wrong-value failure this surface exists to prevent.
+        """
+        plan = _absorbed_decision(rationale=_AUTHORED_RATIONALE)
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert item['rationale'] == _AUTHORED_RATIONALE
+        # The WHOLE decision field is left byte-identical — not truncated to
+        # its clean prefix with the recovery merely suppressed.
+        assert item['decision'] == ABSORBED_RATIONALE
+        assert len(facts) == 1
+        assert facts[0]['outcome'] == 'unrepairable'
+        assert facts[0]['field'] == 'decision'
+        assert facts[0]['recovered_params'] == []
+
+    @pytest.mark.parametrize('sibling', ['', '   \n\t  ', None])
+    def test_recovered_value_is_always_a_slice_of_the_original(self, sibling):
+        plan = _absorbed_decision(rationale=sibling)
+
+        repaired, facts = plan_tools._repair_plan_fields(plan)
+
+        item = repaired['design_decisions'][0]
+        assert facts[0]['outcome'] == 'repaired'
+        assert item['rationale'] == _RATIONALE_PROSE
+        assert item['decision'] in ABSORBED_RATIONALE
+        assert item['rationale'] in ABSORBED_RATIONALE
+        assert item['decision'] + item['rationale'] != ABSORBED_RATIONALE, (
+            'the two slices must not simply re-concatenate to the input — the '
+            'mis-close and the re-opened tag are DROPPED, not re-homed'
+        )
