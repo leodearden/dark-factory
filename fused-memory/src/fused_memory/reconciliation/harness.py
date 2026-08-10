@@ -3333,6 +3333,14 @@ class ReconciliationHarness:
           ledger row's ``payload_json`` synchronously at call time (see
           ``write_cycle_summary``'s docstring), so this is the only way a
           successful re-attempt's OWN ledger row ends up carrying the marker.
+          It is corrected back to ``False`` immediately afterward if the
+          re-attempt did NOT actually land a row (``ledger_written`` falsy, or
+          the call raised). That correction cannot rewrite a ledger row — none
+          exists in either failure case — but it DOES reach the run's own
+          journal-persisted ``stage_reports`` copy
+          (``update_run_stage_reports``, called right after this method
+          returns), so that copy never falsely claims recovery succeeded to an
+          operator or dashboard keying on the marker.
           ``stage2_cycle_summary_ledger_written`` itself is left at its
           in-stage value of 0 either way — the ledger row's mere EXISTENCE is
           the authoritative presence signal ``get_cycle_summary_presence``
@@ -3379,28 +3387,46 @@ class ReconciliationHarness:
         if not write_recovered:
             return
 
-        # Stamped True *before* the call: write_stage2_cycle_summary
-        # serializes report.stats into the ledger row's payload_json
-        # synchronously, at call time — a post-call mutation can never
-        # retroactively reach an already-persisted row, so this is the only
-        # way a successful re-attempt's OWN ledger row carries the marker.
-        s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = True
-        # Shielded against a second cancellation arriving mid-write; the
-        # write keeps running to completion in its own Task.
-        ledger_written = await asyncio.shield(
-            write_stage2_cycle_summary(
-                self.memory, project_id, s2_report, run_id,
-                remediation=remediation,
+        try:
+            # Stamped True *before* the call: write_stage2_cycle_summary
+            # serializes report.stats into the ledger row's payload_json
+            # synchronously, at call time — a post-call mutation can never
+            # retroactively reach an already-persisted row, so this is the only
+            # way a successful re-attempt's OWN ledger row carries the marker.
+            s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = True
+            try:
+                # Shielded against a second cancellation arriving mid-write; the
+                # write keeps running to completion in its own Task.
+                ledger_written = await asyncio.shield(
+                    write_stage2_cycle_summary(
+                        self.memory, project_id, s2_report, run_id,
+                        remediation=remediation,
+                    )
+                )
+            except BaseException:
+                s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
+                raise
+            if not ledger_written:
+                s2_report.stats['stage2_cycle_summary_write_recovered_backstop'] = False
+            logger.warning(
+                'reconciliation.stage2_cycle_summary_write_recovered',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'ledger_written': ledger_written,
+                },
             )
-        )
-        logger.warning(
-            'reconciliation.stage2_cycle_summary_write_recovered',
-            extra={
-                'run_id': run_id,
-                'project_id': project_id,
-                'ledger_written': ledger_written,
-            },
-        )
+        except BaseException:
+            # BaseException (not Exception): also catches a second cancellation
+            # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
+            # narrow, bounded best-effort upsert, and letting any of those
+            # interrupt the finally risks skipping the update_run_stage_reports
+            # call that follows (see docstring).
+            logger.warning(
+                'reconciliation.stage2_cycle_summary_backstop_failed',
+                exc_info=True,
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
 
     # ── Remediation support ───────────────────────────────────────────
 
