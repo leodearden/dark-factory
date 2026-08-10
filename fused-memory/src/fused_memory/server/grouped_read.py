@@ -131,6 +131,10 @@ async def build_grouped_document(
         project_id=project_id,
         filters={PARENT_ID_KEY: canonical_id, 'kind': SIGHTING_KIND},
     )
+    amendment_count = await service.count_memories_by_metadata(
+        project_id=project_id,
+        filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
+    )
     rows = await service.get_memories_by_metadata(
         project_id=project_id,
         filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
@@ -141,8 +145,16 @@ async def build_grouped_document(
     # none of them is an amendment or a sighting — reporting an empty group for
     # a parent that demonstrably has children would be the silent under-report
     # the total probe exists to prevent.
-    return {
+    block: dict[str, Any] = {
         'amendments': digests,
-        'amendment_count': len(digests),
+        'amendment_count': amendment_count,
         'sighting_count': sighting_count,
     }
+    # Marked whenever the EXACT count outruns what the scroll returned — which
+    # covers both the cap and a write landing between the two reads, exactly as
+    # ``DescendantScan.truncated`` does on the delete path.  Omitted (never
+    # False) when the listing is complete, matching the search tool's
+    # fault-only degraded-key convention.
+    if amendment_count > len(digests):
+        block['truncated'] = True
+    return block
