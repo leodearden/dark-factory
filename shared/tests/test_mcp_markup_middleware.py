@@ -68,7 +68,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import detect
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
 
 # ---------------------------------------------------------------------------
 # Envelope-literal builders (same spelling as tests/test_toolcall_markup.py).
@@ -529,6 +529,93 @@ class TestB6DeliberateQuotingOverride:
         assert h.recorder.args['description'] == quoted
         assert json.loads(h.recorder.args['metadata']) == {'keep': 'this'}
         assert h.facts == []
+
+    # -- the hatch has to work on the tools that have no metadata ----------
+
+    @BOTH_POLICIES
+    async def test_the_override_works_on_a_tool_that_takes_no_metadata(self, policy):
+        """MEASURED FAILURE MODE: most guarded tools declare no ``metadata``.
+
+        ``escalate_info``, ``escalate_blocker``, ``add_reuse_item`` and most of
+        the escalation/orchestrator surface take none. Stripping the flag but
+        leaving ``metadata={}`` in the argument map forwards a parameter the
+        tool does not have, and fastmcp bounces it with ``ToolError: Unexpected
+        keyword argument`` — so an agent quoting envelope markup in an
+        escalation summary (a very likely topic, given DF 3083) would do exactly
+        what the hint told it to and land in a second, more confusing error.
+        The key is therefore DROPPED when stripping empties it.
+        """
+        quoted = 'The leak looks like ' + _closer('detail') + INVOKE_CLOSER
+        h = build_harness(policy)
+
+        await h.call(
+            'escalate_info',
+            {
+                'summary': 's',
+                'detail': quoted,
+                'metadata': {'allow_mcp_markup': True},
+            },
+        )
+
+        assert h.recorder.args['detail'] == quoted
+        assert h.facts == []
+
+    @BOTH_POLICIES
+    async def test_the_json_string_form_also_drops_to_nothing(self, policy):
+        """``json.dumps({})`` is ``'{}'``, which fails the same way ``{}`` does."""
+        quoted = 'quoting ' + _closer('detail')
+        h = build_harness(policy)
+
+        await h.call(
+            'escalate_info',
+            {
+                'summary': 's',
+                'detail': quoted,
+                'metadata': json.dumps({'allow_mcp_markup': True}),
+            },
+        )
+
+        assert h.recorder.args['detail'] == quoted
+
+    @BOTH_POLICIES
+    async def test_metadata_the_caller_also_sent_is_NOT_dropped(self, policy):
+        """Only the emptied case is dropped — the rest is the caller's payload.
+
+        Dropping a non-empty metadata map would silently discard data on a tool
+        that does declare the parameter, which is a far worse trade than the
+        failure being fixed.
+        """
+        h = build_harness(policy)
+
+        await h.call(
+            'submit_task',
+            {
+                'title': 't',
+                'description': 'quoting ' + _closer('content'),
+                'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
+            },
+        )
+
+        assert h.recorder.args['metadata'] == {'keep': 'this'}
+
+    def test_the_hint_spells_the_override_key_from_the_shared_constant(self):
+        """INV-5: the key is spelled ONCE, in ``shared.toolcall_markup``.
+
+        Both caller-facing hints instruct the bounced caller to set the flag, and
+        ``markup_tripwire._MARKUP_HINT`` interpolates the constant for exactly
+        this reason. A hardcoded copy here would survive a rename and go on
+        telling callers to set a flag that no longer exists — the lockstep
+        duplication promoting the key was meant to end.
+        """
+        from shared import mcp_markup_middleware as guard
+
+        for hint in (guard._REJECT_HINT, guard._UNREPAIRABLE_HINT):
+            assert MARKUP_OVERRIDE_KEY in hint
+        # Not merely "the string appears": it appears because the constant was
+        # interpolated. Rebinding it must move both hints.
+        assert guard._OVERRIDE_SENTENCE in guard._REJECT_HINT
+        assert guard._OVERRIDE_SENTENCE in guard._UNREPAIRABLE_HINT
+        assert MARKUP_OVERRIDE_KEY in guard._OVERRIDE_SENTENCE
 
 
 # ---------------------------------------------------------------------------
@@ -1568,6 +1655,88 @@ class TestINV2StructuredFacts:
             'independent channels and the payload only survives in one of them'
         )
 
+    # -- an ASYNC emitter is awaited, not dropped --------------------------
+
+    @BOTH_POLICIES
+    async def test_an_async_fact_sink_is_awaited(self, policy):
+        """The registration site (task 3690) may wire an ``async def`` emitter.
+
+        This repo's queue/escalation machinery is largely async, so that is a
+        legitimate thing to pass. A sink CALLED but not AWAITED records nothing
+        while handing back a coroutine that looks like a result, and the only
+        trace is a bare ``coroutine was never awaited`` RuntimeWarning — the
+        silent fail-soft this module exists to end, committed by the module.
+        """
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(fact):
+            recorded.append(fact)
+
+        h = build_harness(policy, fact_sink=sink)
+        payload = {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL}
+
+        if policy is RepairPolicy.FORWARD_REPAIR:
+            await h.call('escalate_info', payload)
+        else:
+            with pytest.raises(ToolError):
+                await h.call('escalate_info', payload)
+
+        assert [fact['outcome'] for fact in recorded] == [
+            'repaired' if policy is RepairPolicy.FORWARD_REPAIR else 'rejected'
+        ]
+
+    @BOTH_POLICIES
+    async def test_an_async_escalation_sink_is_awaited_and_its_id_reaches_the_caller(
+        self, policy
+    ):
+        """The path where dropping the coroutine would DESTROY the payload.
+
+        The residue escalation is the only surviving copy of an unrepairable
+        call's data. An unawaited coroutine queues nothing, and because it is not
+        a ``str`` the refusal reports ``escalation_id: null`` — so the caller is
+        told its data is preserved somewhere that does not exist.
+        """
+        recorded: list[dict[str, Any]] = []
+
+        async def sink(record):
+            recorded.append(record)
+            return 'esc-async-1'
+
+        h = build_harness(policy, escalation_sink=sink)
+        raw = specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value']
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_reuse_item', {'what': 'w', 'how': raw, 'where': 'shared/'})
+
+        assert [record['raw_value'] for record in recorded] == [raw]
+        assert _reject_payload(excinfo)['escalation_id'] == 'esc-async-1'
+
+    @BOTH_POLICIES
+    async def test_an_async_sink_that_raises_still_does_not_change_the_outcome(self, policy):
+        """The never-raises contract has to survive the await, not just the call."""
+        async def boom(record):
+            raise RuntimeError('queue unavailable')
+
+        h = build_harness(policy, fact_sink=boom, escalation_sink=boom)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['outcome'] == 'unrepairable'
+        assert payload['escalation_id'] is None, (
+            'a failed sink reports no id — the caller is better told nothing '
+            'than pointed at a record that was never queued'
+        )
+        assert h.recorder.calls == []
+
     # -- the two non-events ------------------------------------------------
 
     @BOTH_POLICIES
@@ -1836,6 +2005,46 @@ class TestB10StormEscape:
         storm = _reject_payload(excinfo)['storm']
         assert storm['count'] == 3
         assert storm['threshold'] == 3
+
+    async def test_the_storm_summary_is_folded_into_the_FORWARDED_result(self):
+        """The one tier whose callers cannot learn of the burst any other way.
+
+        A FORWARD_REPAIR caller is not bounced — its call SUCCEEDED — so the
+        ``meta['markup_repair']`` block is the only channel it has. Leaving the
+        burst out of exactly the tier that is invisible, while both refusal
+        payloads carry it, would make the storm escape blind on the path
+        ``_record_storm``'s own docstring argues is just as urgent.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(2):
+            await self._repair(h)
+            clock.advance(60)
+        result = await h.call(
+            self.STORM_TOOL,
+            {
+                'summary': 's',
+                'detail': TestB3StrandRiskTierForwards.DETAIL,
+                'project_root': '/srv/alpha',
+            },
+        )
+
+        storm = meta_of(result)['markup_repair']['storm']
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+        assert storm['outcome'] == 'repaired'
+
+    async def test_the_forwarded_storm_key_is_OMITTED_when_no_burst_fired(self):
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        result = await h.call(
+            self.STORM_TOOL,
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+        assert 'storm' not in meta_of(result)['markup_repair']
 
     async def test_the_storm_key_is_OMITTED_when_no_burst_fired(self):
         """Presence is the signal — markup_tripwire's convention.

@@ -79,10 +79,11 @@ the consumers that never touch the middleware.
 from __future__ import annotations
 
 import enum
+import inspect
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, NoReturn
 
 from fastmcp.exceptions import ToolError
@@ -98,6 +99,7 @@ from fastmcp.tools.base import ToolResult
 
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
+    MARKUP_OVERRIDE_KEY,
     detect,
     markup_override_requested,
     repair,
@@ -117,6 +119,22 @@ OUTCOMES: tuple[str, ...] = (_OUTCOME_REPAIRED, _OUTCOME_REJECTED, _OUTCOME_UNRE
 #: record's type from which callable it arrived on.
 FACT_MARKUP_DETECTED = 'markup_detected'
 
+#: The escape hatch, spelled ONCE and INTERPOLATED from the constant — exactly
+#: as ``markup_tripwire._MARKUP_HINT`` builds its own. Both guards can bounce a
+#: caller for the same reason, so a rename of the key must not leave either one
+#: instructing callers to set a flag that no longer exists: that is the same
+#: lockstep duplication (INV-5) promoting the key into ``shared.toolcall_markup``
+#: was meant to end.
+#:
+#: The claim it makes is true on EVERY tool, including the many that declare no
+#: ``metadata`` parameter at all — see :meth:`MarkupGuardMiddleware._apply_override`
+#: for why the key is dropped rather than forwarded empty.
+_OVERRIDE_SENTENCE = (
+    "override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}. The flag is "
+    'stripped before dispatch, and dropped entirely when it is the only '
+    'metadata you sent, so it works even on a tool that takes no metadata.'
+)
+
 #: Surfaced at the point of rejection, mirroring markup_tripwire's
 #: ``_MARKUP_HINT``: the remediation must be discoverable where the caller is
 #: bounced, not only in documentation it may never have read.
@@ -126,7 +144,7 @@ _REJECT_HINT = (
     '(see recovered_params). Do NOT reword the payload around the fragment: the '
     'leak is a serialization defect in your own tool-call envelope, not a '
     'content problem. If the markup is quoted DELIBERATELY (e.g. documenting '
-    "the leak itself), override with metadata={'allow_mcp_markup': True}."
+    'the leak itself), ' + _OVERRIDE_SENTENCE
 )
 
 #: Surfaced when the value's boundary is a GUESS. It deliberately does NOT
@@ -139,7 +157,7 @@ _UNREPAIRABLE_HINT = (
     'preserved verbatim in the escalation named above — resend it from your '
     'own copy once your tool-call envelope stops leaking, rather than '
     'reconstructing it from this error. If the markup is quoted DELIBERATELY, '
-    "override with metadata={'allow_mcp_markup': True}."
+    + _OVERRIDE_SENTENCE
 )
 
 #: The residue escalation's category, and the machine-readable owner that will
@@ -192,9 +210,11 @@ class MarkupGuardMiddleware(Middleware):
     fails open is worse than none (INV-1).
 
     *escalation_sink* and *fact_sink* are the injected channels described in the
-    module docstring. Both are invoked DEFENSIVELY: the call's outcome is
-    already decided by the time either runs, so a sink that raises is logged and
-    never changes what the caller sees.
+    module docstring. Either may be a plain function OR an ``async def`` — the
+    machinery a registration site will wire them to is largely async in this
+    repo — and both are invoked DEFENSIVELY: the call's outcome is already
+    decided by the time either runs, so a sink that raises is logged and never
+    changes what the caller sees. See :meth:`_call_sink`.
 
     The storm counter is held PER INSTANCE (like ``MarkupStormCounter``), so no
     burst state bleeds between servers, or between tests in one process.
@@ -205,8 +225,11 @@ class MarkupGuardMiddleware(Middleware):
         policy: RepairPolicy,
         exempt_tools: frozenset[str] | set[str] = frozenset(),
         *,
-        escalation_sink: Callable[[dict[str, Any]], Any] | None = None,
-        fact_sink: Callable[[dict[str, Any]], Any] | None = None,
+        # ``Awaitable`` spelled out in the annotation rather than left to
+        # ``Any``: a sync-looking type is exactly what invited the sink to be
+        # called without awaiting it. See :meth:`_call_sink`.
+        escalation_sink: Callable[[dict[str, Any]], Any | Awaitable[Any]] | None = None,
+        fact_sink: Callable[[dict[str, Any]], Any | Awaitable[Any]] | None = None,
         storm_threshold: int = 3,
         storm_window_seconds: float = 3600.0,
         time_provider: Callable[[], float] = time.time,
@@ -241,9 +264,10 @@ class MarkupGuardMiddleware(Middleware):
 
         Ordered so the overwhelmingly common path is cheapest. The corruption
         rate measured in PRD section 2.3 is 0.26%, and this sits on EVERY tool
-        call on the server, so a clean call costs one substring scan and
-        nothing else — in particular it never pays the awaited ``get_tool``
-        round-trip, which is deferred behind the :func:`detect` gate.
+        call on the server, so a clean call costs ONE scan per string argument
+        and nothing else: :func:`detect` searches the whole literal set in a
+        single compiled pass (not one pass per literal), and the awaited
+        ``get_tool`` round-trip is deferred behind that gate.
         """
         name = context.message.name
         arguments = context.message.arguments or {}
@@ -259,7 +283,7 @@ class MarkupGuardMiddleware(Middleware):
         # tool or be persisted) and forward, again with no fact: a declared
         # quote is not a detection.
         if markup_override_requested(arguments.get('metadata')):
-            arguments['metadata'] = strip_markup_override(arguments['metadata'])
+            self._apply_override(arguments)
             return await call_next(context)
 
         hit = self._first_markup_argument(arguments)
@@ -270,6 +294,42 @@ class MarkupGuardMiddleware(Middleware):
         return await self._handle_markup(
             context, call_next, name, arguments, param, value, pattern
         )
+
+    # -- the deliberate-quoting override (B6) ------------------------------
+
+    @staticmethod
+    def _apply_override(arguments: dict[str, Any]) -> None:
+        """Strip the write-time-only control flag, DROPPING empty metadata.
+
+        The flag must never reach the tool or be persisted, so stripping it is
+        not optional. Dropping the key when nothing is left, however, is what
+        makes the escape hatch UNIVERSAL rather than metadata-only.
+
+        MEASURED: most tools this guard sits in front of declare no ``metadata``
+        parameter at all — ``escalate_info``, ``escalate_blocker``,
+        ``add_reuse_item`` and most of the escalation/orchestrator surface.
+        Forwarding a stripped-to-empty ``metadata={}`` to one of those turns the
+        documented remediation into ``ToolError: Unexpected keyword argument``:
+        an agent legitimately quoting envelope markup in an escalation summary —
+        a very likely topic, given DF 3083 — would do exactly what
+        :data:`_OVERRIDE_SENTENCE` told it to and land in a second, more
+        confusing error with no working way out.
+
+        An empty metadata map carries nothing any tool could act on, so absent
+        and empty mean the same thing to every consumer, which is what makes
+        dropping it safe rather than merely convenient. Anything the caller sent
+        BESIDES the flag is preserved verbatim in its original shape (dict in /
+        dict out, JSON string in / JSON string out); an unknown-parameter
+        failure on THAT is the caller's own bug and is left visible.
+        """
+        stripped = strip_markup_override(arguments['metadata'])
+        # Both shapes of "nothing left": ``{}`` from a dict, and the ``'{}'``
+        # ``json.dumps`` emits for the JSON-string form the real
+        # submit_task/update_task also accept.
+        if stripped == {} or stripped == '{}':
+            del arguments['metadata']
+        else:
+            arguments['metadata'] = stripped
 
     # -- detection --------------------------------------------------------
 
@@ -383,12 +443,12 @@ class MarkupGuardMiddleware(Middleware):
             # Identity from the RAW arguments: no recovery validated, so
             # nothing from the tail may be believed.
             identity = self._identity(arguments)
-            self._emit_fact(
+            await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
-            storm = self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
-            self._refuse_unrepairable(name, identity, param, value, pattern, storm)
+            storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
+            await self._refuse_unrepairable(name, identity, param, value, pattern, storm)
 
         # Identity from the REPAIRED view. If the leak ate the caller's own
         # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
@@ -399,23 +459,64 @@ class MarkupGuardMiddleware(Middleware):
         identity = self._identity({**arguments, **fix.recovered})
 
         if self.policy is RepairPolicy.REJECT_WITH_REPAIR:
-            self._emit_fact(
+            await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
             )
-            storm = self._record_storm(_OUTCOME_REJECTED, identity[1])
+            storm = await self._record_storm(_OUTCOME_REJECTED, identity[1])
             return self._reject(name, arguments, param, fix, storm)
 
-        self._emit_fact(
+        await self._emit_fact(
             name, identity, param, pattern,
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
-        self._record_storm(_OUTCOME_REPAIRED, identity[1])
-        return await self._forward(context, call_next, arguments, param, fix)
+        storm = await self._record_storm(_OUTCOME_REPAIRED, identity[1])
+        return await self._forward(context, call_next, arguments, param, fix, storm)
+
+    # -- the injected channels --------------------------------------------
+
+    async def _call_sink(
+        self,
+        sink: Callable[[dict[str, Any]], Any | Awaitable[Any]],
+        record: dict[str, Any],
+        channel: str,
+    ) -> Any:
+        """Invoke one injected sink, AWAITING an async emitter, and never raise.
+
+        The whole point of injecting these is that a registration site (task
+        3690) wires the concrete emitters, and the queue/escalation machinery
+        they will wire to is largely async in this repo — so an ``async def``
+        emitter is a legitimate thing to be handed. Calling one without awaiting
+        it queues NOTHING while handing back a coroutine that looks like a
+        result: the residue escalation would report no id, the refusal payload
+        would name none, the caller's only surviving copy of an unrepairable
+        payload would be destroyed, and the sole trace would be a bare
+        ``coroutine was never awaited`` RuntimeWarning. That is precisely the
+        silent fail-soft this module exists to end, committed by the module
+        itself, so an awaitable is awaited rather than trusted to be a value.
+
+        Never raises. The call's outcome is already decided by the time either
+        sink runs, so both channels are purely ADDITIVE: a sink outage costs an
+        operator visibility rather than turning a working guard into an outage of
+        its own. Same never-raises contract
+        ``markup_tripwire.emit_markup_storm_escalation`` keeps, and for the same
+        reason. It is logged via ``logger.exception``, never swallowed.
+        """
+        try:
+            result = sink(record)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            logger.exception(
+                'markup guard: the %s sink failed for %r; the outcome stands',
+                channel, record.get('error_type') or record.get('fact'),
+            )
+            return None
+        return result
 
     # -- facts (INV-2) ----------------------------------------------------
 
-    def _emit_fact(
+    async def _emit_fact(
         self,
         tool: str,
         identity: tuple[str | None, str | None],
@@ -473,20 +574,11 @@ class MarkupGuardMiddleware(Middleware):
 
         if self._fact_sink is None:
             return
-        try:
-            self._fact_sink(fact)
-        except Exception:
-            # Additive, exactly like the escalation sink: the outcome is
-            # already decided, so a sink outage costs an operator visibility
-            # rather than turning a working guard into an outage of its own.
-            logger.exception(
-                'markup guard: the fact sink failed for %s on %s.%s; the '
-                'outcome stands', outcome, tool, param,
-            )
+        await self._call_sink(self._fact_sink, fact, 'fact')
 
     # -- the storm escape (INV-4) -----------------------------------------
 
-    def _record_storm(self, outcome: str, project: str | None) -> dict[str, Any] | None:
+    async def _record_storm(self, outcome: str, project: str | None) -> dict[str, Any] | None:
         """Count this outcome; escalate and return a summary iff a burst fired.
 
         Repair is a FAIL-SOFT path, so it owes the rate/streak escalation. One
@@ -544,10 +636,10 @@ class MarkupGuardMiddleware(Middleware):
             'serialization leak is ACTIVE (see DF 3083)',
             storm['count'], outcome, storm['window_seconds'], project,
         )
-        self._file_storm_escalation(storm)
+        await self._file_storm_escalation(storm)
         return storm
 
-    def _file_storm_escalation(self, storm: dict[str, Any]) -> None:
+    async def _file_storm_escalation(self, storm: dict[str, Any]) -> None:
         """Hand the burst to the injected sink; never change an outcome.
 
         No dedup here. ``emit_markup_storm_escalation`` dedups against an OPEN
@@ -557,13 +649,11 @@ class MarkupGuardMiddleware(Middleware):
         """
         if self._escalation_sink is None:
             return
-        try:
-            self._escalation_sink({'error_type': 'mcp_markup_storm', **storm})
-        except Exception:
-            logger.exception(
-                'markup guard: the escalation sink failed for storm %r; the '
-                'ERROR above still records the burst', storm,
-            )
+        await self._call_sink(
+            self._escalation_sink,
+            {'error_type': 'mcp_markup_storm', **storm},
+            'escalation',
+        )
 
     @staticmethod
     def _with_storm(payload: dict[str, Any], storm: dict[str, Any] | None) -> dict[str, Any]:
@@ -577,7 +667,9 @@ class MarkupGuardMiddleware(Middleware):
             payload['storm'] = storm
         return payload
 
-    def _refuse_unrepairable(self, name, identity, param, value, pattern, storm) -> NoReturn:
+    async def _refuse_unrepairable(
+        self, name, identity, param, value, pattern, storm
+    ) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
         The tiers disagree about what to do with a REPAIR. They do not disagree
@@ -603,7 +695,7 @@ class MarkupGuardMiddleware(Middleware):
         # leaking — an operator reading one and acting on the other would
         # otherwise be chasing two different callers.
         agent_id, project = identity
-        escalation_id = self._file_residue_escalation({
+        escalation_id = await self._file_residue_escalation({
             'error_type': 'mcp_markup_unrepairable',
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
@@ -652,19 +744,20 @@ class MarkupGuardMiddleware(Middleware):
             'hint': _UNREPAIRABLE_HINT,
         }, storm)))
 
-    def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
+    async def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
         """Hand the residue to the injected sink; never change the outcome.
 
         The refusal is already decided by the time this runs, so escalation is
-        purely ADDITIVE — the same never-raises contract
-        ``markup_tripwire.emit_markup_storm_escalation`` keeps, and for the same
-        reason: a queue I/O failure should cost the operator a heads-up, not
-        turn a clean refusal into an opaque middleware crash.
+        purely ADDITIVE — see :meth:`_call_sink` for the never-raises contract
+        and for why an ``async def`` emitter is awaited rather than left as an
+        unawaited coroutine, which on THIS path would destroy the only surviving
+        copy of the caller's payload.
 
         Returns the id the sink reports, so the refusal payload can name the
         record holding the caller's data. A sink that reports something other
         than a string reports no id — the caller is better told nothing than
-        pointed at a value it cannot look up.
+        pointed at a value it cannot look up. A sink that FAILED reports ``None``
+        for the same reason.
         """
         if self._escalation_sink is None:
             logger.warning(
@@ -672,14 +765,7 @@ class MarkupGuardMiddleware(Middleware):
                 '%r will not be preserved anywhere', record.get('tool'),
             )
             return None
-        try:
-            escalation_id = self._escalation_sink(record)
-        except Exception:
-            logger.exception(
-                'markup guard: the escalation sink failed for %r; the refusal '
-                'stands but the residue was not preserved', record.get('tool'),
-            )
-            return None
+        escalation_id = await self._call_sink(self._escalation_sink, record, 'escalation')
         if not isinstance(escalation_id, str):
             return None
         # Naming the queued record, exactly as emit_markup_storm_escalation
@@ -740,7 +826,7 @@ class MarkupGuardMiddleware(Middleware):
             'hint': _REJECT_HINT,
         }, storm)))
 
-    async def _forward(self, context, call_next, arguments, param, fix):
+    async def _forward(self, context, call_next, arguments, param, fix, storm):
         """Repair in place, let the call through, and say so.
 
         The mutation is IN PLACE on ``context.message.arguments``, which is
@@ -759,6 +845,13 @@ class MarkupGuardMiddleware(Middleware):
         True}}``, so the warning is FOLDED into whatever meta came back rather
         than replacing it — discarding FastMCP's own signalling to deliver our
         own would be a poor trade.
+
+        A FIRED burst rides along under the same ``storm`` key and the same
+        omit-when-absent convention both refusal payloads use. This tier is the
+        one whose callers cannot learn of the burst any other way — their calls
+        all SUCCEEDED — and :meth:`_record_storm` argues a burst of repairs is
+        exactly as urgent as a burst of rejections, so the one tier that is
+        invisible must not also be the one tier that is never told.
         """
         arguments[param] = fix.clean_value
         arguments.update(fix.recovered)
@@ -766,7 +859,7 @@ class MarkupGuardMiddleware(Middleware):
         result = await call_next(context)
 
         meta = dict(result.meta or {})
-        meta['markup_repair'] = {
+        meta['markup_repair'] = self._with_storm({
             'outcome': _OUTCOME_REPAIRED,
             'field': param,
             'matched_pattern': fix.pattern,
@@ -776,7 +869,7 @@ class MarkupGuardMiddleware(Middleware):
             # become a second copy of its payload.
             'recovered_params': sorted(fix.recovered),
             'hint': _FORWARD_HINT,
-        }
+        }, storm)
         return ToolResult(
             content=result.content,
             structured_content=result.structured_content,
