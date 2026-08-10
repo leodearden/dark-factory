@@ -606,3 +606,158 @@ class TestB2TotalDrift:
         for name, value in payload['repaired_call'].items():
             if isinstance(value, str):
                 assert detect(value) is None, f'{name} still carries envelope markup'
+
+
+# ---------------------------------------------------------------------------
+# B3, B4 — FORWARD_REPAIR.
+# ---------------------------------------------------------------------------
+
+
+class TestB3StrandRiskTierForwards:
+    """The tier where bouncing costs more than proceeding.
+
+    An escalation that reports a strand risk is exactly the call you cannot
+    afford to lose to a rejection the caller may never retry — so this tier
+    repairs in place and lets it through, warning that the arguments were
+    altered. INV-6/INV-7: the recovered parameter must actually LAND, not
+    merely be reported.
+    """
+
+    DETAIL = (
+        'Strand risk.'
+        + _closer('detail')
+        + '\n' + _opener('suggested_action') + 'do the thing' + _closer('suggested_action')
+        + INVOKE_CLOSER
+    )
+
+    async def _forward(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call(
+            'escalate_info', {'summary': 'It stranded', 'detail': self.DETAIL}
+        )
+        return h, result
+
+    async def test_the_tool_ran_exactly_once(self):
+        h, _ = await self._forward()
+
+        assert len(h.recorder.calls) == 1
+
+    async def test_the_tool_received_the_repaired_detail(self):
+        h, _ = await self._forward()
+
+        assert h.recorder.args['detail'] == 'Strand risk.'
+        assert detect(h.recorder.args['detail']) is None
+
+    async def test_the_recovered_parameter_actually_lands(self):
+        """Not merely reported — the whole point of this tier.
+
+        A forward that dropped the recovered parameter would deliver a call
+        the caller never made, silently missing the argument it did supply.
+        """
+        h, _ = await self._forward()
+
+        assert h.recorder.args['suggested_action'] == 'do the thing'
+
+    async def test_the_untouched_arguments_are_untouched(self):
+        h, _ = await self._forward()
+
+        assert h.recorder.args['summary'] == 'It stranded'
+
+    async def test_structured_content_is_byte_identical_to_the_unguarded_tool(self):
+        """The middleware must NOT reshape it.
+
+        A tool with a return annotation carries an output schema, and a
+        middleware-authored structured_content that does not satisfy it fails
+        validation outright — so the forward path passes it through untouched
+        and carries its warning somewhere else entirely.
+        """
+        _, guarded = await self._forward()
+        bare = build_harness(RepairPolicy.FORWARD_REPAIR)
+        unguarded = await bare.call(
+            'escalate_info', {'summary': 'It stranded', 'detail': 'clean'}
+        )
+
+        assert guarded.structured_content == unguarded.structured_content
+        assert guarded.data == 'esc_1'
+
+    async def test_meta_carries_the_repair_warning(self):
+        """Attached via meta, verified to survive to the client untouched.
+
+        Never by appending a content block, which would corrupt any caller
+        that indexes content[0].
+        """
+        _, result = await self._forward()
+
+        warning = result.meta['markup_repair']
+        assert warning['field'] == 'detail'
+        assert warning['recovered_params'] == ['suggested_action']
+        assert warning['outcome'] == 'repaired'
+
+    async def test_the_warning_names_the_pattern_and_the_misclose(self):
+        _, result = await self._forward()
+
+        warning = result.meta['markup_repair']
+        assert warning['matched_pattern'] == INVOKE_CLOSER
+        assert warning['misclose'] == _closer('detail')
+
+    async def test_fastmcps_own_meta_is_preserved_not_replaced(self):
+        """call_next's result already carries {'fastmcp': {'wrap_result': True}}.
+
+        Replacing meta wholesale would discard FastMCP's own signalling, so
+        the warning is FOLDED in.
+        """
+        _, result = await self._forward()
+
+        assert result.meta.get('fastmcp') == {'wrap_result': True}
+
+
+class TestB4LastParameterNothingDropped:
+    """The absorbing parameter was the LAST one, so there is nothing to recover.
+
+    An empty recovery is a SUCCESS — the value is cleanly separable and no
+    caller argument was lost — not a refusal. Treating it as one would bounce
+    the most benign specimen in the corpus.
+    """
+
+    CONTENT = 'A memory.' + _closer('content') + INVOKE_CLOSER
+
+    async def test_it_forwards_with_the_content_trimmed(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory', {'content': self.CONTENT})
+
+        assert h.recorder.args['content'] == 'A memory.'
+        assert detect(h.recorder.args['content']) is None
+
+    async def test_the_empty_recovery_is_reported_as_empty_not_omitted(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call('add_memory', {'content': self.CONTENT})
+
+        warning = result.meta['markup_repair']
+        assert warning['recovered_params'] == []
+        assert warning['outcome'] == 'repaired'
+
+    async def test_the_warning_still_appears(self):
+        """The caller's argument WAS altered, so it must still be told."""
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call('add_memory', {'content': self.CONTENT})
+
+        assert 'markup_repair' in result.meta
+
+    async def test_the_same_input_is_REJECTED_under_the_other_tier(self):
+        """The TIER decides, not the shape of the repair.
+
+        Same specimen, same repair, opposite outcome — which is what makes the
+        policy a declaration rather than something inferred from the damage.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory', {'content': self.CONTENT})
+
+        payload = _reject_payload(excinfo)
+        assert payload['outcome'] == 'rejected'
+        assert payload['repaired_call'] == {'content': 'A memory.'}
+        assert h.recorder.calls == []
