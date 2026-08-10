@@ -25,6 +25,7 @@ from shared.cli_invoke import (
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.task_metadata import RoutingState
+from shared.transcript_archive import durable_archive_path
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -1637,6 +1638,16 @@ class Harness:
         self._session_resume_fallback_streak: int = 0
         self._last_session_resume_fallback_at: float | None = None
 
+        # Rate limiter for _archive_available's fault WARNING (task 3727).
+        # The faults that reach that handler are PERSISTENT, not transient —
+        # overwhelmingly a config regression breaking the archive-root
+        # composition — so they would fire on every single fallback dispatch.
+        # One loud line per process is the signal; the rest drop to DEBUG so a
+        # fallback storm (exactly when a persistent fault fires hardest) cannot
+        # flood the log. Never reset: a repeat tells an operator nothing the
+        # first line did not.
+        self._archive_available_fault_logged: bool = False
+
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
             UsageGate(config.usage_cap) if config.usage_cap.enabled else None
@@ -3164,6 +3175,99 @@ class Harness:
                 pass  # unreadable/faulted != wiped — stay loud
             return (False, 'no_transcript')
         return (True, 'eligible')
+
+    def _archive_available(self, task_id: str, session_id: str | None) -> bool:
+        """Was *session_id* recoverable from the durable transcript archive?
+
+        Pure INSTRUMENTATION for the ``session_resume_fallback`` event (task
+        3727, plans/session-resume-eligibility-seam-prd.md §8 / D8): it reports
+        whether the session that just failed to resume still exists in the
+        durable archive, and changes NOTHING about what dispatches. Leaf δ is
+        what may later gate on this signal; task 3578 is what consumes
+        :func:`~shared.transcript_archive.durable_archive_path` for the actual
+        restore. Because it is an instrument, False-on-any-fault is the correct
+        degradation — an instrument must never be able to break dispatch — but
+        a fault is reported LOUDLY (one WARNING per process, then DEBUG) rather
+        than silently, so a broken instrument cannot masquerade as a genuinely
+        empty archive. See the handler below for why a plain miss never reaches
+        it and therefore cannot make that WARNING noisy.
+
+        Total, and the guard is NOT redundant with ``durable_archive_path``'s
+        own totality: the LOOKUP is total, but the archive-root COMPOSITION
+        feeding it is not. Under a config regression either operand of
+        ``project_root / transcript_archive.root`` can be a type
+        ``Path.__truediv__`` refuses (a ``None`` project_root, a non-str /
+        non-PathLike root from malformed YAML), and it then raises TypeError —
+        here, inside ``_run_slot``, on the production dispatch path. Unguarded,
+        a mere config regression would escalate into a dispatch fault. Same
+        reasoning git_ops.py already records for the identical composition at
+        its archival backstop.
+
+        CORRECTION, measured on this tree: the specific hazard this task's plan
+        recorded — the test conftest's spec_set ``mock_orch_config`` leaving
+        ``transcript_archive`` a bare MagicMock — does NOT in fact raise.
+        ``MagicMock`` implements ``__fspath__``, so that composition succeeds
+        into a nonsense path which simply matches nothing and yields False by
+        the ordinary miss route. The guard is still correct and still load
+        bearing (the TypeError routes above are real), but it is defence in
+        depth rather than the thing standing between the existing suite and
+        red. Recorded here because plan.json's rationale states the opposite,
+        and a future reader would otherwise trust it.
+
+        Deliberately does NOT consult ``transcript_archive.enabled``: with
+        archival off there is simply nothing on disk to find, so the lookup
+        already answers False. Gating on the flag would add a second source of
+        truth that can disagree with the filesystem (archival on last week
+        leaves recoverable archives behind today), and the config-derived
+        answer is the one that would mislead an operator triaging a storm.
+        """
+        try:
+            if not session_id:
+                return False  # nothing to look up
+            archive_root = self.config.project_root / self.config.transcript_archive.root
+            return durable_archive_path(archive_root, str(task_id), session_id) is not None
+        except Exception as exc:
+            # LOUD, once (design-invariants INV-2/INV-4). False-on-fault is the
+            # right DISPATCH behaviour — an instrument must never break what
+            # runs — but reporting it silently is not: "no archive" and "the
+            # instrument is broken" would then be the same observable `false`,
+            # and the measurement this task exists to produce would read
+            # "0% recoverable" with nothing above DEBUG saying otherwise.
+            #
+            # Note WHICH faults land here, because it is not the same
+            # population durable_archive_path logs. That function logs its own
+            # (glob/stat) faults at WARNING and returns None; what reaches THIS
+            # handler failed BEFORE the lookup — overwhelmingly the
+            # `project_root / transcript_archive.root` composition raising
+            # TypeError under a config regression. That is persistent, not
+            # transient: it recurs on every dispatch until someone fixes the
+            # config, which is precisely why it must be seen once and only once.
+            #
+            # Rate-limited to one WARNING per Harness (see the flag's comment in
+            # __init__): the storm that a persistent fault produces must not
+            # become a log flood. Subsequent occurrences stay at DEBUG with
+            # exc_info, so the detail is still recoverable at debug level.
+            if not self._archive_available_fault_logged:
+                self._archive_available_fault_logged = True
+                logger.warning(
+                    'archive_available: instrument faulted for task %s session %s '
+                    '(%s: %s) — the field now reports false for EVERY '
+                    'session_resume_fallback until this is fixed, so treat a 0%% '
+                    'recoverable rate as suspect. Further occurrences at DEBUG.',
+                    task_id,
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    'archive_available: lookup failed for task %s session %s',
+                    task_id,
+                    session_id,
+                    exc_info=True,
+                )
+            return False
 
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.
@@ -7710,6 +7814,15 @@ class Harness:
             #   GENUINE {stale, no_transcript} → session_resume_fallback, feeds
             #                                  the streak, storm-escape at
             #                                  fallback_storm_threshold (INV-4).
+            #
+            # Both session_resume_fallback emits also carry archive_available
+            # (task 3727) — was this session still recoverable from the durable
+            # transcript archive? That is INSTRUMENTATION ONLY (D8 / INV-3
+            # instrument-before-acting): it reports the recoverable population
+            # so it can be MEASURED in production before anything is gated on
+            # it, and changes nothing about what resumes here. Leaf δ is what
+            # may later gate on the signal; task 3578 is what consumes
+            # durable_archive_path to perform an actual restore.
             if recovered_session is not None:
                 eligible, reason = self._session_resume_eligible(
                     recovered_session, recovered_config_dir
@@ -7744,49 +7857,72 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data=resume_event_data,
                             )
-                    elif reason == 'reseeded':
-                        # By-design lane reseed (task 3256) — the acquire that
-                        # re-seeds from base wiped the transcript store, so this
-                        # fallback is EXPECTED, not a corroboration failure.
-                        # Keeps the session_resume_fallback event (the fallback
-                        # rate stays measurable — PRD open question 3) but, like
-                        # 'capped', neither feeds nor resets the storm streak:
-                        # a drip of reseeds must not mask a genuine systematic
-                        # failure interleaved between them.
+                    else:
+                        # Both remaining reasons emit session_resume_fallback:
+                        # 'reseeded' (by design) and {stale, no_transcript}
+                        # (genuine). The emit is shared by both — ONE archive
+                        # lookup, one filesystem glob per dispatch rather than
+                        # two, and no chance of the two sites drifting apart.
+                        #
+                        # Built INSIDE the event_store guard, not above it.
+                        # archive_available costs a filesystem glob, and with no
+                        # event store there is no consumer for it: the dict
+                        # would be built and dropped (the direct-_run_slot unit
+                        # path, and any event-store-less deployment). On the
+                        # fallback path only, so the eligible / capped /
+                        # disabled paths do no extra I/O and their events stay
+                        # byte-identical (D8).
+                        #
+                        # The session id comes off the snapshot taken above, NOT
+                        # off recovered_session — that was set to None at the top
+                        # of this else-branch, so re-reading it would raise.
                         if self.event_store:
                             self.event_store.emit(
                                 EventType.session_resume_fallback,
                                 task_id=assignment.task_id,
-                                data={**resume_event_data, 'reason': reason},
+                                data={
+                                    **resume_event_data,
+                                    'reason': reason,
+                                    'archive_available': self._archive_available(
+                                        assignment.task_id,
+                                        resume_event_data['session_id'],
+                                    ),
+                                },
                             )
-                    else:  # 'stale' / 'no_transcript' — genuine corroboration fail
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.session_resume_fallback,
-                                task_id=assignment.task_id,
-                                data={**resume_event_data, 'reason': reason},
-                            )
-                        # Rolling-window decay (task 3256): "consecutive" means
-                        # CHAINED within storm_window_secs, not merely
-                        # cumulative-per-boot — which is what makes this a
-                        # storm DETECTOR rather than a running total. A gap at
-                        # least as long as the window means the previous run
-                        # ended, so start counting over. Monotonic, not
-                        # wall-clock: 'stale' is itself produced by clock skew.
-                        now = time.monotonic()
-                        window = self.config.session_resume.storm_window_secs
-                        if (
-                            self._last_session_resume_fallback_at is not None
-                            and (now - self._last_session_resume_fallback_at) >= window
-                        ):
-                            self._session_resume_fallback_streak = 0
-                        self._last_session_resume_fallback_at = now
-                        self._session_resume_fallback_streak += 1
-                        if (
-                            self._session_resume_fallback_streak
-                            >= self.config.session_resume.fallback_storm_threshold
-                        ):
-                            self._file_session_resume_storm_escalation()
+                        if reason != 'reseeded':
+                            # 'stale' / 'no_transcript' — a GENUINE corroboration
+                            # failure, so it feeds the storm streak below.
+                            #
+                            # 'reseeded' deliberately falls past this (task 3256):
+                            # the acquire that re-seeds from base wiped the
+                            # transcript store, so that fallback is EXPECTED, not
+                            # a corroboration failure. It keeps the event (the
+                            # fallback rate stays measurable — PRD open question 3)
+                            # but, like 'capped', neither feeds NOR resets the
+                            # streak: a drip of reseeds must not mask a genuine
+                            # systematic failure interleaved between them.
+                            #
+                            # Rolling-window decay (task 3256): "consecutive" means
+                            # CHAINED within storm_window_secs, not merely
+                            # cumulative-per-boot — which is what makes this a
+                            # storm DETECTOR rather than a running total. A gap at
+                            # least as long as the window means the previous run
+                            # ended, so start counting over. Monotonic, not
+                            # wall-clock: 'stale' is itself produced by clock skew.
+                            now = time.monotonic()
+                            window = self.config.session_resume.storm_window_secs
+                            if (
+                                self._last_session_resume_fallback_at is not None
+                                and (now - self._last_session_resume_fallback_at) >= window
+                            ):
+                                self._session_resume_fallback_streak = 0
+                            self._last_session_resume_fallback_at = now
+                            self._session_resume_fallback_streak += 1
+                            if (
+                                self._session_resume_fallback_streak
+                                >= self.config.session_resume.fallback_storm_threshold
+                            ):
+                                self._file_session_resume_storm_escalation()
             # ──────────────────────────────────────────────────────────────────
 
             # Build steward factory — steward starts when the workflow
