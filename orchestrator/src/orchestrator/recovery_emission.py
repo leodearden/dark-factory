@@ -101,14 +101,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'RECOVERY_VETO_STREAK_SENTINEL_PREFIX',
     'LeaveReason',
     'Observation',
     'RecoverySite',
     'RecoveryVetoStreakTracker',
     'build_recovery_payload',
     'emit_recovery_event',
+    'emit_recovery_veto_streak_escalation',
     'escalation_ages_secs',
     'render_shape',
+    'resolve_recovery_veto_streak_escalation',
     'should_emit_event',
 ]
 
@@ -563,3 +566,302 @@ def should_emit_event(observation: Observation, *, threshold: int) -> bool:
     if observation.changed:
         return True
     return observation.streak == threshold
+
+
+#: Sentinel task_id prefix for the veto-streak alarm.
+#:
+#: **This is the canonical statement; other sites point here.**  The alarm MUST
+#: NOT be filed against the real task id.  An open escalation on the real id is
+#: immediately read by every veto predicate this mechanism observes —
+#: ``report.open_escalations`` in the reconcile sweep, ``get_by_task`` in the
+#: scheduler's blocked-redispatch phase, ``rows`` in the dispatch gate — so the
+#: act of REPORTING a hold would itself deepen that hold, at the very site that
+#: filed it.  That converts an observability signal into a disposition change
+#: and breaks this task's zero-behavior-change contract outright.  It could
+#: additionally suppress the stranded_blocked re-file.
+#:
+#: A synthetic id also matches what this record IS: a monitor signal ABOUT a
+#: task, not work ON one — no per-task steward can be dispatched for it.  Same
+#: shape and same reasoning as
+#: ``zero_progress_requeue.ZERO_PROGRESS_SENTINEL_PREFIX``.
+#:
+#: The alarm stays joinable against the task's ``recovery_vetoed`` rows because
+#: its body names the REAL task id.
+RECOVERY_VETO_STREAK_SENTINEL_PREFIX = '__recovery_veto_streak__'
+
+#: Category used for BOTH the filing and the ``has_open_l1`` signature filter.
+#: Filtering on category (task 2757's rationale) keeps an UNRELATED open L1 on
+#: this sentinel from silently suppressing the signal.
+_STREAK_CATEGORY = 'risk_identified'
+
+#: agent_role stamped on both the alarm and its resolution.
+_STREAK_ROLE = 'orchestrator-recovery-veto-streak'
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Render a span the way an operator reads it."""
+    if seconds < 90.0:
+        return f'{seconds:.0f}s'
+    if seconds < 5400.0:
+        return f'{seconds / 60.0:.1f} min'
+    return f'{seconds / 3600.0:.1f} h'
+
+
+def _flatten_ids(escalation_ids: Any) -> list[str]:
+    """Flatten a bucketed id mapping (or a bare sequence) to a sorted list."""
+    if isinstance(escalation_ids, dict):
+        flat: list[str] = []
+        for ids in escalation_ids.values():
+            flat.extend(str(i) for i in (ids or ()))
+        return sorted(set(flat))
+    return sorted({str(i) for i in (escalation_ids or ())})
+
+
+def emit_recovery_veto_streak_escalation(
+    *,
+    escalation_queue: Any,
+    task_id: str,
+    site: RecoverySite | str,
+    streak: int,
+    threshold: int,
+    span_seconds: float,
+    min_span_seconds: float,
+    reason: LeaveReason | str | None,
+    shape: str,
+    escalation_ids: Any,
+    ages_secs: Any = None,
+    filed_at: dict[str, int] | None = None,
+) -> bool:
+    """File ONE blocking L1 when a veto streak clears BOTH halves of the bar.
+
+    ``streak >= threshold`` AND ``span_seconds >= min_span_seconds``.  See
+    ``config.RecoveryEmissionConfig.veto_streak_min_span_secs`` for why a
+    streak count alone is not enough, and this module's docstring for why only
+    the sweep-frequency sites charge the counter at all.
+
+    Filed against the SENTINEL id — see
+    :data:`RECOVERY_VETO_STREAK_SENTINEL_PREFIX` for why that is load-bearing
+    rather than cosmetic.
+
+    Deliberately emits NO event of its own.  The payload key set both recovery
+    event types carry is closed, so a "paired" row here would be byte-identical
+    to the one :func:`should_emit_event`'s threshold clause already emits at
+    this exact crossing.  One row, not two.
+
+    Fully fail-open: every external call is individually guarded AND the whole
+    body is wrapped again, so this NEVER raises into a recovery sweep.
+
+    Args:
+        escalation_queue: The ``EscalationQueue``, or ``None`` (no-op).
+        task_id: The REAL task id being held.
+        site: Which veto site observed the streak.
+        streak: The current consecutive-identical-veto count.
+        threshold: ``config.recovery_emission.veto_streak_threshold``.
+        span_seconds: Seconds the streak has spanned
+            (``RecoveryVetoStreakTracker.span``).
+        min_span_seconds: ``config.recovery_emission.veto_streak_min_span_secs``.
+        reason: The :class:`LeaveReason` the site classified.
+        shape: The rendered ``_shape`` string.
+        escalation_ids: The pinning ids — a bucketed mapping or a bare sequence.
+        ages_secs: Optional ``{escalation_id: seconds}`` mapping, reported
+            inline so the operator does not need a second query to see how old
+            the hold is.
+        filed_at: Optional caller-owned memo (``task_id -> streak at last disk
+            check``).  Keyed on task_id — matching the SENTINEL's own
+            granularity — so the memo can never disagree with what
+            ``has_open_l1`` would answer.
+
+    Returns:
+        ``True`` only when a NEW escalation was filed.
+    """
+    if escalation_queue is None:
+        return False
+
+    # Fire on >= rather than ==: if an operator resolves the alarm while the
+    # hold persists, a later re-check re-files, so the signal cannot be
+    # permanently silenced by a premature resolve.
+    if streak < threshold:
+        return False
+
+    # Second half of the predicate, checked BEFORE any filesystem access so the
+    # common case stays free.
+    if span_seconds < min_span_seconds:
+        return False
+
+    sentinel = f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+
+    try:
+        # The memo answers the dedup for free on the sweep path; we only go to
+        # disk once every `threshold` further observations, which bounds the
+        # pending-queue scan rate while still re-filing (within `threshold`
+        # sweeps) if an operator resolves the alarm prematurely.
+        if filed_at is not None:
+            last_checked = filed_at.get(task_id)
+            if last_checked is not None and streak - last_checked < threshold:
+                return False
+
+        if escalation_queue.has_open_l1(sentinel, category=_STREAK_CATEGORY):
+            if filed_at is not None:
+                filed_at[task_id] = streak
+            return False
+
+        from escalation.models import Escalation  # noqa: PLC0415 — optional dep
+
+        ids = _flatten_ids(escalation_ids)
+        span_str = _fmt_duration(span_seconds)
+        ages = dict(ages_secs or {})
+        aged = ', '.join(
+            f'{i} ({_fmt_duration(ages[i])} old)' if ages.get(i) is not None else f'{i} (age unknown)'
+            for i in ids
+        ) or '(none recorded)'
+
+        summary = (
+            f'Task {task_id} has been held by the same recovery veto '
+            f'{streak} consecutive times over {span_str} at site {site} '
+            f'(threshold {threshold}) — reason {reason}'
+        )
+        detail = (
+            f'Task: {task_id}\n'
+            f'Veto site: {site}\n'
+            f'Consecutive IDENTICAL vetoes: {streak}\n'
+            f'Elapsed since the streak began: {span_str}\n'
+            f'Alert thresholds: {threshold} observations AND '
+            f'{_fmt_duration(min_span_seconds)} elapsed\n'
+            f'Recovery shape: {shape}\n'
+            f'Veto reason: {reason}\n'
+            f'Pinning escalations: {aged}\n'
+            '\n'
+            f'Every one of the last {streak} passes of {site} looked at task '
+            f'{task_id}, reached the same conclusion, and left it exactly '
+            'where it was.  The task is not progressing and no recovery sweep '
+            'will move it while this veto holds.\n'
+            '\n'
+            'This alarm is filed against a SYNTHETIC sentinel task id '
+            f'({sentinel}), never against {task_id} itself: an open record on '
+            'the real id would be read by every veto predicate and would '
+            'deepen the very hold it reports.  See '
+            'orchestrator/src/orchestrator/recovery_emission.py (module '
+            'docstring) for the full mechanism.'
+        )
+
+        esc = Escalation(
+            id=escalation_queue.make_id(sentinel),
+            task_id=sentinel,
+            agent_role=_STREAK_ROLE,
+            severity='blocking',
+            level=1,
+            category=_STREAK_CATEGORY,
+            summary=summary,
+            detail=detail,
+            suggested_action=(
+                f'Resolve or dismiss the pinning escalation(s) above if they '
+                f'are stale, or drive them to completion — task {task_id} '
+                'cannot move until they clear.  If the hold is legitimate and '
+                'long-running, this alarm is the noisy one: retune or silence '
+                'it live via the green-tier config section recovery_emission.'
+                '{veto_streak_threshold,veto_streak_min_span_secs,'
+                'streak_escalation_enabled} — no fleet restart needed.'
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+        logger.warning(
+            'recovery veto streak alarm for task %s could not be built '
+            '(non-fatal): %s', task_id, exc,
+        )
+        return False
+
+    try:
+        escalation_queue.submit(esc)
+    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+        logger.warning(
+            'recovery veto streak alarm for task %s could not be filed '
+            '(non-fatal): %s', task_id, exc,
+        )
+        return False
+
+    if filed_at is not None:
+        filed_at[task_id] = streak
+
+    logger.warning(
+        'Recovery veto streak alarm filed for task %s: %d identical vetoes at '
+        '%s over %s (threshold %d, reason=%s, pinned by %s)',
+        task_id, streak, site, _fmt_duration(span_seconds), threshold,
+        reason, ','.join(_flatten_ids(escalation_ids)) or '(none)',
+    )
+    return True
+
+
+def resolve_recovery_veto_streak_escalation(
+    *,
+    escalation_queue: Any,
+    task_id: str,
+    recovered_streak: int,
+    threshold: int,
+    filed_at: dict[str, int] | None = None,
+) -> bool:
+    """Resolve a filed veto-streak alarm once the veto stops.
+
+    NOT optional polish.  :func:`emit_recovery_veto_streak_escalation` dedups
+    on ``has_open_l1``, so an L1 left ``pending`` after the hold cleared would
+    (a) leave an operator holding a blocking alarm for a resolved condition and
+    (b) permanently suppress the alarm for a genuine LATER strand on the same
+    task — the detector would silence itself after one incident per task, for
+    the life of the queue.
+
+    Called on the transition where a task stops being vetoed (a sweep that
+    visits it and finds no hold).  Deliberately NOT gated on
+    ``config.recovery_emission.streak_escalation_enabled``: disabling the
+    detector must not strand an already-filed blocking alarm.
+
+    Returns ``True`` when at least one pending sentinel L1 was resolved.
+    """
+    if escalation_queue is None:
+        return False
+
+    # Cheap gate FIRST — every swept task calls this, and touching the
+    # filesystem here would make a healthy fleet pay a pending-queue scan per
+    # task per sweep.  Go to disk only when THIS process filed (memo hit), or
+    # when the streak that just broke was long enough that a PRIOR process
+    # could have filed for it before a restart.
+    was_filed = filed_at is not None and task_id in filed_at
+    if not was_filed and recovered_streak < threshold:
+        return False
+
+    if filed_at is not None:
+        filed_at.pop(task_id, None)
+
+    try:
+        sentinel = f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+        pending = escalation_queue.get_by_task(sentinel, status='pending')
+        resolved = 0
+        for esc in pending:
+            if getattr(esc, 'category', None) != _STREAK_CATEGORY:
+                continue
+            escalation_queue.resolve(
+                esc.id,
+                (
+                    f'Task {task_id} is no longer held: the '
+                    f'{recovered_streak}-observation recovery veto streak '
+                    'broke (the pinning escalation cleared, a claimant took '
+                    'the task, or the sweep reached a mapped action).  '
+                    'Auto-resolved by the recovery-emission detector; it will '
+                    're-file if the hold recurs.'
+                ),
+                resolved_by=_STREAK_ROLE,
+            )
+            resolved += 1
+    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+        logger.warning(
+            'recovery veto streak alarm for task %s could not be resolved '
+            '(non-fatal): %s', task_id, exc,
+        )
+        return False
+
+    if not resolved:
+        return False
+
+    logger.info(
+        'Recovery veto streak alarm resolved for task %s after a '
+        '%d-observation streak broke', task_id, recovered_streak,
+    )
+    return True
