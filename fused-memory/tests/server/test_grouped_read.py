@@ -242,6 +242,69 @@ class TestBuildGroupedDocument:
         )
 
 
+class TestZeroChildCommonPath:
+    """The whole live corpus today: a canonical with NO children.
+
+    Leaf α measured ``metadata.parent_id`` at zero live footprint, so this is
+    the branch every result on the current fleet takes.  It must cost exactly
+    one cheap exact count and emit NO ``grouped`` key at all — which is what
+    makes every existing search/get response byte-identical to today's.
+    """
+
+    @pytest.mark.asyncio
+    async def test_childless_canonical_returns_none(self):
+        """No children → None, so the caller emits no `grouped` key whatsoever."""
+        service = _stub_service([])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is None, (
+            'A childless canonical must return None (no grouped key, response '
+            f'byte-identical to today), got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_childless_canonical_costs_exactly_one_count_and_no_scroll(self):
+        """Count first; scroll only when it buys something a count cannot."""
+        service = _stub_service([])
+
+        await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert service.get_memories_by_metadata.await_count == 0, (
+            'A childless canonical must issue NO scroll — the amendment bodies '
+            'a scroll buys cannot exist. RED: build_grouped_document scrolls '
+            'unconditionally.'
+        )
+        assert service.count_memories_by_metadata.await_count == 1, (
+            'A childless canonical must cost EXACTLY ONE exact count '
+            f"({{'parent_id': cid}}), got "
+            f'{service.count_memories_by_metadata.await_count} count call(s): '
+            f'{service.count_memories_by_metadata.await_args_list!r}'
+        )
+        (only_call,) = service.count_memories_by_metadata.await_args_list
+        assert only_call.kwargs['filters'] == {'parent_id': _CANONICAL_ID}, (
+            'The single probe must be the un-kinded TOTAL child count, not a '
+            f"per-kind sub-count, got {only_call.kwargs['filters']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nonzero_total_proceeds_to_the_detail_reads(self):
+        """A non-zero total is what unlocks the sighting count and the scroll."""
+        service = _stub_service(_two_amendments_three_sightings())
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        issued = [c.kwargs['filters'] for c in service.count_memories_by_metadata.await_args_list]
+        assert issued[0] == {'parent_id': _CANONICAL_ID}, (
+            f'The TOTAL child count must be the FIRST read issued, got {issued!r}'
+        )
+        assert {'parent_id': _CANONICAL_ID, 'kind': SIGHTING_KIND} in issued, (
+            f'The exact sighting count must be issued for a parented canonical, got {issued!r}'
+        )
+        assert service.get_memories_by_metadata.await_count == 1
+
+
 class TestChildRecordSchema:
     """The add-only child-record representation, pinned as a contract."""
 
