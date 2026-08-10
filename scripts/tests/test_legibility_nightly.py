@@ -2488,11 +2488,25 @@ def _stateful_escalation_post(recorded, *, session_id='sid-nightly'):
     return _post
 
 
+def _recording_delete(deleted):
+    """A fake `httpx.delete` recording the MCP session-termination call the
+    transport makes after a handshake, so the long-lived escalation server does
+    not leak a session per trickle escalation."""
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeStatefulResponse(status_code=200)
+
+    return _delete
+
+
 def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
     """The DEFAULT poster (no `poster=` injection) must handshake and land."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
     recorded = []
-    install_fake_httpx(_stateful_escalation_post(recorded))
+    deleted = []
+    install_fake_httpx(
+        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    )
 
     assert nightly.post_escalation(cfg, 'summary text', 'detail text') is True
 
@@ -2506,3 +2520,36 @@ def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_
     params = (recorded[-1][1].get('json') or {})['params']
     assert params['name'] == 'escalate_info'
     assert params['arguments']['summary'] == 'summary text'
+    # ...and the session opened to file it is released again.
+    assert [(kw.get('headers') or {}).get('mcp-session-id') for _u, kw in deleted] == [
+        'sid-nightly'
+    ]
+
+
+def test_post_escalation_reports_false_on_a_tool_error_envelope(
+    tmp_path, install_fake_httpx, caplog
+):
+    """HTTP 200 is not success. `post_escalation` discards the response body
+    and reports True on "no exception", so a tool-level failure
+    (`result.isError: true`) would otherwise read as a landed escalation --
+    the same green-on-paper/nothing-filed failure task 3644 exists to close,
+    one layer up from the transport."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def _post(url, **kwargs):
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={'jsonrpc': '2.0', 'id': 1, 'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with caplog.at_level(logging.WARNING):
+        assert nightly.post_escalation(cfg, 'summary text', 'detail text') is False
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('escalation post failed' in m for m in warned), warned
+    assert any('isError' in m or 'reported an error' in m for m in warned), warned

@@ -646,9 +646,12 @@ _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_
 # Kept load-bearing-constant-single-sourced here (census_trigger is
 # already imported by census.py, nightly.py, and check_transcript_persistence.py)
 # so a future transport change is a one-line edit, not four lockstep edits
-# with a silent-406 risk on any one that's missed. See nightly._default_poster,
-# census._post_mcp_tool_call, and check_transcript_persistence._default_poster
-# for the other three consumers.
+# with a silent-406 risk on any one that's missed. All FOUR legibility MCP
+# consumers -- nightly._default_poster, census._post_mcp_tool_call,
+# check_transcript_persistence._default_poster and this module's own
+# default_status_fetcher -- now reach the wire only through
+# `post_mcp_envelope`/`post_mcp_tool_call` below, so this header pair (and the
+# session handshake, and SSE decoding) has exactly one definition.
 MCP_STREAMABLE_HTTP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",
@@ -751,6 +754,82 @@ _MCP_SESSION_HEADER = "mcp-session-id"
 _MCP_SESSION_REQUIRED_STATUS = 400
 
 
+def _sse_data_payloads(text: str) -> list[str]:
+    """Split an SSE body into one `data` payload per FRAME, per the SSE
+    framing rules -- not one per `data:` LINE.
+
+    Two rules matter here and both were got wrong by the first cut of this
+    code (review finding, task 3644 amendment pass):
+
+    * A frame is terminated by a BLANK line, and a single frame's `data`
+      field is the newline-JOIN of every `data:` line it contains. Parsing
+      only the first line of a multi-line payload feeds `json.loads` a
+      fragment, which raises on a response that was perfectly well-formed.
+    * A stream may carry MORE THAN ONE frame. FastMCP sends progress/log
+      notifications over the same `tools/call` stream whenever a tool takes a
+      `Context`, so the first frame is not necessarily the response. (The
+      escalation tools take no `Context` today, which is why this is latent
+      rather than live -- but the symptom would be a bogus "malformed MCP
+      response (no result)" on a call that SUCCEEDED server-side, i.e. this
+      exact investigation re-opened.)
+
+    Line endings are normalised first: a real server frames with CRLF, and
+    `"data: {...}\r"` would otherwise carry a stray `\r` into `json.loads`.
+    """
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+    payloads = []
+    for frame in normalised.split("\n\n"):
+        data_lines = [
+            line[len("data:"):].lstrip()
+            for line in frame.split("\n")
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            payloads.append("\n".join(data_lines))
+    return payloads
+
+
+def _decode_sse_body(text: str) -> dict:
+    """Return the first JSON-RPC RESPONSE object framed in an SSE body.
+
+    "Response" means an object carrying `result` or `error`: notification
+    frames (which have `method` and no `id`) are skipped rather than
+    returned, so a progress notification ahead of the real reply cannot be
+    mistaken for it.
+
+    Raises rather than returning `{}` when no frame qualifies -- a malformed
+    or notification-only stream is a real fault, and degrading it to an empty
+    result is precisely the silent-failure mode task 3644 exists to close.
+    Every reported body goes through `_bounded_repr` so one oversized stream
+    cannot turn a warning into a screenful.
+    """
+    payloads = _sse_data_payloads(text)
+    if not payloads:
+        raise StatusFetchUnavailable(
+            f"no SSE data line in MCP response body: {_bounded_repr(text)}"
+        )
+
+    undecodable = []
+    for payload in payloads:
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            # Do NOT fail here: a malformed NOTIFICATION frame must not
+            # destroy an otherwise-good response frame behind it. The error is
+            # kept and reported only if nothing usable is found at all.
+            undecodable.append(f"{_bounded_repr(payload)} ({exc})")
+            continue
+        if isinstance(decoded, dict) and ("result" in decoded or "error" in decoded):
+            return decoded
+
+    detail = f"; first undecodable frame: {undecodable[0]}" if undecodable else ""
+    raise StatusFetchUnavailable(
+        f"no MCP result/error frame in SSE response body ({len(payloads)} data "
+        f"frame(s), none carrying a JSON-RPC result or error{detail}): "
+        f"{_bounded_repr(text)}"
+    )
+
+
 def _decode_mcp_body(response) -> dict:
     """Decode an MCP `/mcp` response body into a JSON-RPC dict.
 
@@ -763,14 +842,9 @@ def _decode_mcp_body(response) -> dict:
       followed by `data: {json}`. `response.json()` raises a JSONDecodeError
       on it, which is the second half of the task-3644 defect: even a
       correctly handshaken client still dropped every escalation here.
+      Framing is handled by `_decode_sse_body` above.
     * `application/json` -- the STATELESS fused-memory server (:8002) shape;
       decoded by `response.json()` exactly as before, unchanged.
-
-    A `text/event-stream` body with no `data:` line raises rather than
-    returning `{}`: a malformed stream is a real fault, and degrading it to
-    an empty result is precisely the silent-failure mode this task exists to
-    close. The offending body is reported through `_bounded_repr` so one
-    oversized stream cannot turn a warning into a screenful.
 
     The 202 check is on the STATUS, and `response.text` is read only inside
     the SSE branch, so decoding a JSON reply never touches the body twice --
@@ -782,15 +856,80 @@ def _decode_mcp_body(response) -> dict:
 
     content_type = (response.headers or {}).get("content-type", "")
     if "text/event-stream" in content_type:
-        for line in response.text.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[len("data:"):].strip())
-        raise StatusFetchUnavailable(
-            f"no SSE data line in MCP response body: "
-            f"{_bounded_repr(response.text)}"
-        )
+        return _decode_sse_body(response.text)
 
     return response.json()
+
+
+def _raise_on_mcp_error(body: dict) -> dict:
+    """Return *body* unchanged unless it reports a failure, in which case
+    raise `StatusFetchUnavailable`.
+
+    HTTP 200 IS NOT SUCCESS on MCP (review finding, task 3644 amendment
+    pass). Both failure shapes ride a 200:
+
+    * a JSON-RPC-level `error` object (the request never reached a tool);
+    * `result.isError: true` (the tool ran and failed) -- FastMCP's shape for
+      a raised `ToolError`.
+
+    `post_escalation` / `post_findings` discard the decoded body entirely and
+    report True on "no exception", so without this check a tool-level failure
+    reads as a landed escalation: the same green-on-paper/nothing-filed
+    failure this task exists to close, moved one layer up from the transport.
+    Raising here drops both siblings into their existing best-effort WARNING +
+    `return False` path, and reaches `census`'s poster too. (The census path
+    was only ACCIDENTALLY protected, by `_extract_tool_result` choking on an
+    error envelope's non-JSON `content[0].text` -- relying on a JSONDecodeError
+    as an error check is exactly the kind of fragility this replaces.)
+    """
+    if not isinstance(body, dict):
+        return body
+
+    error = body.get("error")
+    if error is not None:
+        raise StatusFetchUnavailable(
+            f"MCP server returned a JSON-RPC error: {_bounded_repr(error)}"
+        )
+
+    result = body.get("result")
+    if isinstance(result, dict) and result.get("isError"):
+        raise StatusFetchUnavailable(
+            f"MCP tool reported an error: {_bounded_repr(result)}"
+        )
+    return body
+
+
+def _terminate_mcp_session(url: str, session_headers: dict, *, timeout: float) -> None:
+    """Best-effort DELETE releasing the server-side session behind
+    *session_headers*. Never raises.
+
+    A LEAK FIX, not a nicety (review finding, task 3644 amendment pass). MCP's
+    `StreamableHTTPSessionManager` keeps every session in
+    `self._server_instances[session_id]` with a live per-session `run_server`
+    task, and drops it ONLY on an explicit DELETE (the spec's session
+    termination) or at manager shutdown. The escalation server is a long-lived
+    uvicorn process serving the whole fleet (`harness.py`'s
+    `mcp_server.http_app()` -- the STATEFUL default), so without this every
+    legibility escalation ever posted -- nightly trickle, transcript-persistence
+    check, each census defer/fail-loud -- would permanently add one dict entry
+    plus one live anyio task to it. Slow, unbounded, and introduced by the very
+    handshake that fixed the 400.
+
+    Swallowing is deliberate and asymmetric with the rest of this module: the
+    envelope has ALREADY been delivered by the time this runs, so a failure to
+    tidy up must never turn a landed escalation into a reported failure. It is
+    logged at DEBUG so a leak is still diagnosable if one is ever suspected.
+    """
+    import httpx
+
+    try:
+        httpx.delete(url, headers=session_headers, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - tidy-up must never mask delivery
+        logger.debug(
+            "MCP session termination DELETE to %s failed (harmless for this "
+            "call; the server-side session is leaked until it restarts): %s",
+            url, exc,
+        )
 
 
 def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dict:
@@ -810,13 +949,14 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
     Raises whatever `response.raise_for_status()` raises on any other non-2xx
     (and any transport exception verbatim); callers wrap this best-effort.
 
-    IMPLEMENTATION CONSTRAINT (task 3376): only `httpx.post` may be used, and
-    the 400 must be detected by reading `response.status_code` BEFORE calling
-    `raise_for_status()` -- never via an httpx exception type and never via
-    `httpx.Client`. The shared `install_fake_httpx` test fixture
-    (scripts/tests/conftest.py) exposes only `post` and `pytest.fail`s loudly
-    on any other attribute, precisely so a future reach for `httpx.Timeout` or
-    `except httpx.HTTPError` cannot stay green off the stub's own miss.
+    IMPLEMENTATION CONSTRAINT (task 3376): only `httpx.post` and `httpx.delete`
+    may be used, and the 400 must be detected by reading `response.status_code`
+    BEFORE calling `raise_for_status()` -- never via an httpx exception type and
+    never via `httpx.Client`. The shared `install_fake_httpx` test fixture
+    (scripts/tests/conftest.py) exposes only the verbs a test opts into and
+    `pytest.fail`s loudly on any other attribute, precisely so a future reach
+    for `httpx.Timeout` or `except httpx.HTTPError` cannot stay green off the
+    stub's own miss.
     """
     import httpx
 
@@ -825,10 +965,19 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
     )
     if response.status_code != _MCP_SESSION_REQUIRED_STATUS:
         response.raise_for_status()
-        return _decode_mcp_body(response)
+        return _raise_on_mcp_error(_decode_mcp_body(response))
 
     # --- stateful server: handshake, then retry the original envelope once ---
     #
+    # Keep the 400's own body BEFORE discarding it. Not every 400 is about a
+    # missing session: a stateless server (fused-memory :8002, which
+    # `census.default_submit_fn` targets) answers a genuinely bad request with
+    # 400 too, then answers `initialize` with 200 and NO session id -- and the
+    # operator would otherwise get a session-protocol complaint with the real,
+    # server-stated reason thrown away, in a subsystem whose entire premise is
+    # legible failure (review finding, task 3644 amendment pass).
+    first_400 = _bounded_repr(getattr(response, "text", "") or "")
+
     # TRAP 1 (task 2491): `initialize` MUST be sent session-less. A stateful
     # server 404s "Session not found" if the client invents its own id -- and
     # the 400 above carries an `mcp-session-id` response header of its own
@@ -850,7 +999,13 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
         headers=MCP_STREAMABLE_HTTP_HEADERS,
         timeout=timeout,
     )
-    init.raise_for_status()
+    try:
+        init.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"MCP handshake with {url} failed at initialize ({exc}); the "
+            f"original session-less 400 said: {first_400}"
+        ) from exc
 
     # TRAP 2 (task 2491): capture the session id from the RESPONSE HEADER, and
     # do it before any 202/empty-body early return -- `initialize` carries a
@@ -860,24 +1015,45 @@ def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dic
         raise RuntimeError(
             f"MCP server at {url} demanded a session (HTTP "
             f"{_MCP_SESSION_REQUIRED_STATUS}) but assigned no "
-            f"{_MCP_SESSION_HEADER} on initialize"
+            f"{_MCP_SESSION_HEADER} on initialize; the original 400 said: "
+            f"{first_400}"
         )
 
     session_headers = {**MCP_STREAMABLE_HTTP_HEADERS, _MCP_SESSION_HEADER: session_id}
 
-    notified = httpx.post(
-        url,
-        json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-        headers=session_headers,
-        timeout=timeout,
-    )
-    notified.raise_for_status()
+    # From here the SERVER holds state on our behalf, so every exit path must
+    # release it -- hence the try/finally rather than a call after the return
+    # value is computed (review finding, task 3644 amendment pass).
+    try:
+        notified = httpx.post(
+            url,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized",
+                  "params": {}},
+            headers=session_headers,
+            timeout=timeout,
+        )
+        try:
+            notified.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"MCP handshake with {url} failed at notifications/initialized "
+                f"({exc}); the original session-less 400 said: {first_400}"
+            ) from exc
 
-    retried = httpx.post(
-        url, json=envelope, headers=session_headers, timeout=timeout,
-    )
-    retried.raise_for_status()
-    return _decode_mcp_body(retried)
+        retried = httpx.post(
+            url, json=envelope, headers=session_headers, timeout=timeout,
+        )
+        try:
+            retried.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"MCP {url} still rejected the envelope after a successful "
+                f"session handshake ({exc}); the original session-less 400 "
+                f"said: {first_400}"
+            ) from exc
+        return _raise_on_mcp_error(_decode_mcp_body(retried))
+    finally:
+        _terminate_mcp_session(url, session_headers, timeout=timeout)
 
 
 def post_mcp_tool_call(
@@ -916,10 +1092,11 @@ def default_status_fetcher(project_root: str | Path):
     that ImportError, along with
     any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
     so callers can catch fetch failures deterministically rather than a bare
-    Exception. The raw JSON-RPC `tools/call` response is unwrapped via
-    `_extract_tool_result` before returning, so the callable's return value
-    matches `compute_tasks_landed`'s expected `{"statuses": {...}}` shape
-    instead of the outer JSON-RPC envelope.
+    Exception. The call itself goes through :func:`post_mcp_tool_call`, so the
+    return value is the tool's own unwrapped result -- matching
+    `compute_tasks_landed`'s expected `{"statuses": {...}}` shape rather than
+    the outer JSON-RPC envelope -- and this consumer gets the session
+    handshake and SSE decoding for free along with the other three.
 
     *project_root* is resolved to an ABSOLUTE path before it crosses the
     wire: the MCP `get_statuses` argument is interpreted by the SERVER's
@@ -955,31 +1132,32 @@ def default_status_fetcher(project_root: str | Path):
 
     def _fetch() -> dict:
         try:
-            import httpx
+            # Availability probe only -- the POST itself goes out through
+            # `post_mcp_tool_call`, which does its own lazy import. Kept so an
+            # absent httpx still surfaces as the specific "httpx is not
+            # installed" StatusFetchUnavailable rather than as a generic
+            # "get_statuses unreachable" wrapped ImportError.
+            import httpx  # noqa: F401
         except ImportError as exc:
             raise StatusFetchUnavailable("httpx is not installed") from exc
 
         try:
-            response = httpx.post(
+            # Routed through the ONE shared transport (review finding, task
+            # 3644 amendment pass) rather than a hand-rolled POST: this is the
+            # fourth legibility MCP consumer, and the other three moved. The
+            # hand-rolled copy was byte-for-byte what `post_mcp_tool_call` does
+            # MINUS the session handshake and SSE decoding -- so it was the one
+            # remaining place where a fused-memory switch to a stateful
+            # `http_app()` (the same default the escalation server runs) would
+            # silently break the done-count baseline through
+            # `StatusFetchUnavailable`, i.e. reproduce this exact bug in the
+            # last unmigrated consumer.
+            return post_mcp_tool_call(
                 f"{url}/mcp",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "get_statuses",
-                        "arguments": {"project_root": project_root_str},
-                    },
-                },
-                # Required by the streamable-HTTP MCP transport (see
-                # MCP_STREAMABLE_HTTP_HEADERS above for why both values
-                # matter); omitting it 406s before the tools/call is
-                # dispatched.
-                headers=MCP_STREAMABLE_HTTP_HEADERS,
+                "get_statuses",
+                {"project_root": project_root_str},
                 timeout=10.0,
             )
-            response.raise_for_status()
-            return _extract_tool_result(response.json())
         except StatusFetchUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - any failure must fail safe
