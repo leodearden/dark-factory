@@ -1793,6 +1793,16 @@ def _plan_finalized(plan: dict) -> None:
 #: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
 #: absent on purpose: it overwrites the document wholesale, so it has no read to
 #: repair — guarding its INBOUND arguments belongs to the write-time middleware.
+#:
+#: THIS TABLE IS THE COVERAGE MECHANISM for read-path repair. Each row is
+#: exercised behaviourally by ``TestPlanToolsReadPathsRepair`` — the tool is
+#: called against a corrupted plan and the ON-DISK result is asserted — so a
+#: read site that skipped the repair would fail here, whatever it looked like in
+#: source. WHEN A NEW READ SITE IS ADDED, ADD A ROW HERE; that is the whole of
+#: the obligation. (A source-text pin over ``inspect.getsource`` used to sit
+#: alongside this and was deleted: it locked spelling rather than behaviour, so
+#: aliasing the read or moving it into a helper passed it silently while a
+#: harmless refactor failed it.)
 READ_PATH_CASES = [
     (
         'add_plan_step',
@@ -1962,45 +1972,44 @@ class TestPlanToolsReadPathsRepair:
         assert 'markup_repairs' not in response
 
 
-class TestNoReadPathBypassesTheRepair:
-    """A future read site must not be able to silently skip the repair."""
+# Deliberately NOT a method of TestPlanToolsReadPathsRepair: that class carries
+# a class-level parametrize over READ_PATH_CASES, so a method there would run
+# ten identical times with three unused arguments. Same section, same subject —
+# the ``_create_plan`` half of the read-path coverage story.
+class TestCreatePlanIsDeliberatelyNotHooked:
+    """``_create_plan`` does not repair, and the next read does. Both asserted.
 
-    @staticmethod
-    def _module_functions() -> dict:
-        return {
-            name: obj
-            for name, obj in vars(plan_tools).items()
-            if inspect.isfunction(obj) and obj.__module__ == plan_tools.__name__
-        }
+    This is a CHARACTERIZATION test of existing behaviour, replacing a deleted
+    ``inspect.getsource`` pin that asserted the same claim by grepping the
+    function's source text for two call spellings. The claim is real and worth
+    keeping; the source-text form of it was not, because renaming a local or
+    moving the read into a helper would satisfy it without the behaviour
+    holding, and a harmless refactor would break it without the behaviour
+    changing.
+    """
 
-    def test_no_function_calls_artifacts_read_plan_directly(self):
-        offenders = sorted(
-            name
-            for name, fn in self._module_functions().items()
-            if name != '_read_plan_repaired'
-            and 'artifacts.read_plan(' in inspect.getsource(fn)
-        )
-        assert offenders == [], (
-            'these read the plan directly and so skip the repair entirely — '
-            f'route them through _read_plan_repaired: {offenders}'
-        )
+    def test_inbound_arguments_are_not_repaired_but_the_next_read_repairs_them(
+        self, plan_artifacts
+    ):
+        """create_plan overwrites the document, so it has no read to repair.
 
-    def test_every_read_path_entry_point_goes_through_the_repair(self):
-        """The non-vacuous half: the guard above passes trivially if nobody reads."""
-        expected = {f'_{case_id}' for case_id in READ_PATH_IDS}
-        callers = {
-            name
-            for name, fn in self._module_functions().items()
-            if '_read_plan_repaired(' in inspect.getsource(fn)
-        } - {'_read_plan_repaired'}
-        assert expected <= callers, f'not routed through the repair: {expected - callers}'
-
-    def test_create_plan_is_deliberately_not_hooked(self):
-        """It overwrites the document wholesale, so it has no read to repair.
-
-        Guarding its INBOUND arguments is the write-time middleware's job, not
-        this surface's. Asserted so the omission reads as a decision.
+        Guarding its INBOUND arguments is the write-time middleware's job. The
+        residue therefore survives the call verbatim — and is then cleaned up
+        by whichever hooked entry point opens the plan next, which is exactly
+        the lazy-repair-on-read contract this task implements.
         """
-        source = inspect.getsource(plan_tools._create_plan)
-        assert '_read_plan_repaired(' not in source
-        assert 'artifacts.read_plan(' not in source
+        response = plan_tools._create_plan(
+            plan_artifacts, 'test-1', 'A title.', _TRAILING_ANALYSIS, ['a.py']
+        )
+
+        assert response == {'status': 'ok', 'task_id': 'test-1'}
+        assert 'markup_repairs' not in response
+        assert _on_disk(plan_artifacts)['analysis'] == _TRAILING_ANALYSIS
+
+        followup = plan_tools._add_design_decision(plan_artifacts, 'A decision.', 'A rationale.')
+
+        assert followup['status'] == 'ok'
+        assert [f['field'] for f in followup['markup_repairs']] == ['analysis']
+        analysis = _on_disk(plan_artifacts)['analysis']
+        assert analysis == 'Clean analysis prose describing the approach.'
+        assert detect(analysis) is None
