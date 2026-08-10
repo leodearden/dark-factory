@@ -1743,9 +1743,10 @@ class EscalationQueue:
         existing escalation, so the count may include those no-ops.  The counter
         is best read as "attempted dismissals, including no-ops for concurrent
         resolutions".  This function is single-writer in practice.  The count
-        does NOT distinguish the per-record outcomes (age-annotated vs
-        strand-stamped); a caller that needs that detail reads the resolved
-        records themselves.
+        does NOT distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)
@@ -1753,9 +1754,29 @@ class EscalationQueue:
         strands = 0
         for esc in (e for e in pending if e.level == 0):
             try:
-                age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
-                is_strand = strand_age_secs is not None and age_secs >= strand_age_secs
-                per_record = f'{resolution} [pending_secs={age_secs:.0f} severity={esc.severity}]'
+                # fallback=datetime.max: an unparseable timestamp sorts as
+                # NEWEST, never as infinitely stale (the dedupe.py sentinel
+                # rationale).  A corrupt record must not be promoted to
+                # 'stale-strand' by the sentinel alone.  parse_timestamp_or_warn
+                # stamps a naive timestamp UTC and logs a WARNING naming this
+                # escalation on failure — loud, not a silent skip.
+                parsed, ok = parse_timestamp_or_warn(
+                    esc.timestamp,
+                    fallback=datetime.max.replace(tzinfo=UTC),
+                    context=f'dismiss_all_pending:{esc.id}',
+                )
+                # An unknowable age claims no age and is never a strand; the
+                # record is still dismissed — clearing stale L0s at startup
+                # stays correct regardless of one bad timestamp.
+                if ok:
+                    age_secs = (now - parsed.astimezone(UTC)).total_seconds()
+                    is_strand = strand_age_secs is not None and age_secs >= strand_age_secs
+                    per_record = (
+                        f'{resolution} [pending_secs={age_secs:.0f} severity={esc.severity}]'
+                    )
+                else:
+                    is_strand = False
+                    per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
                 resolved = self.resolve(
                     esc.id,
                     per_record,
