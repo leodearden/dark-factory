@@ -12952,3 +12952,61 @@ async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
         assert row is not None and row['status'] == 'refused', (tid, row)
         assert row['task_id'] is None, (tid, row)
         assert 'cancelled-premise-blocklist:' in (row['reason'] or ''), (tid, row)
+
+
+# --------------------------------------------------------------------------- #
+# get_ticket_row — read-only ticket existence authority (task 3142)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_row_returns_the_stored_row(interceptor_facade):
+    """The completion-claim gate's third authority: a PK lookup that answers
+    'does this tkt_ id exist' exactly, and names its owning project so a
+    cross-project claim can be adjudicated without knowing the writer."""
+    ticket_id = await interceptor_facade._ticket_store.submit(
+        project_id='dark_factory',
+        candidate_json='{"title": "x"}',
+    )
+
+    row = await interceptor_facade.get_ticket_row(ticket_id)
+
+    assert row is not None
+    assert row['ticket_id'] == ticket_id
+    assert row['project_id'] == 'dark_factory'
+    assert row['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_row_is_a_pure_read(interceptor_facade):
+    """No wait, no mutation, no 7-day window — unlike resolve_ticket, which
+    blocks, and list_tickets, which would report an older ticket as absent."""
+    ticket_id = await interceptor_facade._ticket_store.submit(
+        project_id='dark_factory',
+        candidate_json='{"title": "x"}',
+    )
+
+    first = await interceptor_facade.get_ticket_row(ticket_id)
+    second = await interceptor_facade.get_ticket_row(ticket_id)
+
+    assert first['status'] == 'pending'
+    assert second['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_row_returns_none_for_an_absent_id(interceptor_facade):
+    absent = 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    assert await interceptor_facade.get_ticket_row(absent) is None
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_row_without_a_store_warns_and_returns_none(
+    interceptor, caplog,
+):
+    """A misconfigured store must not raise into the ingestion path — the gate
+    maps the None onto UNRESOLVABLE and tags rather than failing the write."""
+    with caplog.at_level(logging.WARNING):
+        assert await interceptor.get_ticket_row('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
+
+    assert any('ticket_store' in record.message for record in caplog.records)

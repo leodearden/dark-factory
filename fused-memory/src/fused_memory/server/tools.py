@@ -99,6 +99,15 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
+from fused_memory.services.completion_claim_gate import (
+    UNRESOLVABLE,
+    UNVERIFIED_CLAIM_TAG,
+    build_unverified_flag,
+    emit_unverified_claim_escalation,
+    extract_completion_claims,
+    make_commit_probe,
+    verify_claims,
+)
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -1534,6 +1543,241 @@ def create_mcp_server(
             'hint': _PREMATURE_COMPLETION_HINT,
         }
 
+    # ------------------------------------------------------------------ #
+    # Task 3142 / PRD leaf pi: completion-claim verification gate
+    # ------------------------------------------------------------------ #
+    #
+    # Verifies "the fix has been applied" / "re-filed as ticket tkt_..." claims
+    # against the live task, ticket-registry and git authorities, and TAGS the
+    # episode when a claim cannot be confirmed. Reify esc-5603-1 is the
+    # motivating incident (one unverified sentence fanned out by extraction into
+    # five false Graphiti edges); esc-3085-1 extended it to filing/dispatch
+    # claims and across projects.
+    #
+    # Deliberately unlike _premature_completion_block above in TWO ways:
+    #   * It LABELS instead of rejecting, so it runs for EVERY writer rather
+    #     than only recon-stage- agents — a false completion claim does the same
+    #     corpus damage whoever writes it, and the 2824 gate's blast radius (a
+    #     bounced write) is what confined it to recon agents in the first place.
+    #   * An unresolvable authority TAGS instead of failing open. See
+    #     completion_claim_gate.verify_claims for the full argument: this gate's
+    #     worst case on a false positive is one extra source_description prefix
+    #     on a kept episode, while its worst case on a false NEGATIVE is another
+    #     batch of false edges.
+
+    def _group_refs_by_project(
+        claims: list[Any], subject: str
+    ) -> dict[str | None, list[str]]:
+        """Group *subject* claims' refs by the project that ADJUDICATES them.
+
+        The grouping key is the claim's own resolved project, not the writer's:
+        esc-3085-1's whole point is that the two differ, and reading the
+        writer's tree for "dark_factory task 3142 has landed" answers a question
+        nobody asked — confidently, and with the wrong tree.
+        """
+        grouped: dict[str | None, list[str]] = {}
+        for claim in claims:
+            if claim.subject != subject:
+                continue
+            refs = grouped.setdefault(claim.project_id, [])
+            if claim.ref not in refs:
+                refs.append(claim.ref)
+        return grouped
+
+    async def _claim_task_statuses(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], str]:
+        """Live status for every task claim, keyed ``(project_id, ref)``.
+
+        One batched read per CLAIMED project — not per claim (which would
+        multiply authority traffic by the claim count for no gain) and not one
+        read scoped to the writer (which would consult the wrong tree for a
+        cross-project claim).
+
+        An ABSENT key is the unresolvable signal — the sync probe handed to
+        verify_claims returns None for it, which lands the claim on
+        'unverifiable' and therefore tagged. Every failure mode below (no
+        interceptor, unregistered project, a raising read) deliberately leaves
+        the key absent rather than fabricating a permissive answer.
+        """
+        grouped = _group_refs_by_project(claims, 'task')
+        if not grouped:
+            return {}
+        resolved: dict[tuple[str | None, str], str] = {}
+        for claimed_project, refs in grouped.items():
+            refs = sorted(refs)
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if not _taskmaster_configured or root is None:
+                logger.warning(
+                    'completion_claim_gate: live status unresolvable for %d task claim(s) '
+                    '(taskmaster_configured=%s claimed_project=%r registered=%s '
+                    'writer_project=%r)',
+                    len(refs), _taskmaster_configured, claimed_project,
+                    root is not None, project_id,
+                )
+                continue
+            try:
+                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
+                    project_root=root,
+                    ids=refs,
+                )
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_statuses failed for claimed_project=%r; '
+                    'the %d task claim(s) are UNVERIFIABLE and will be tagged',
+                    claimed_project, len(refs), exc_info=True,
+                )
+                continue
+            for key, value in (statuses or {}).items():
+                if isinstance(value, str):
+                    resolved[(claimed_project, str(key))] = value
+        return resolved
+
+    async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
+        """Registry row per ticket claim, keyed by ticket id.
+
+        A key mapped to None means the registry answered NO SUCH TICKET (a
+        mismatch — esc-3085-1 instance (2)); an ABSENT key means the registry
+        could not be consulted (unverifiable). Conflating the two would put a
+        false accusation in the flag, so they stay distinct (INV-2).
+        """
+        refs = [c.ref for c in claims if c.subject == 'ticket']
+        if not refs:
+            return {}
+        if not _taskmaster_configured:
+            logger.warning(
+                'completion_claim_gate: no task_interceptor; %d ticket claim(s) '
+                'are UNVERIFIABLE and will be tagged', len(refs),
+            )
+            return {}
+        rows: dict[str, Any] = {}
+        for ref in dict.fromkeys(refs):
+            try:
+                # A globally unique PK lookup over the one shared tickets.db —
+                # so it needs no project and answers a cross-project claim
+                # correctly (see TaskInterceptor.get_ticket_row).
+                rows[ref] = await task_interceptor.get_ticket_row(ref)  # type: ignore[union-attr]
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_ticket_row failed for %r; the claim '
+                    'is UNVERIFIABLE and will be tagged', ref, exc_info=True,
+                )
+        return rows
+
+    async def _claim_commit_presence(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], bool]:
+        """Commit existence per commit claim, keyed ``(project_id, sha)``.
+
+        An absent key is unresolvable (unregistered project, or the git probe
+        itself could not answer). The probe is a subprocess, so it runs under
+        asyncio.to_thread — a blocking git call on the event loop would stall
+        every other in-flight MCP request behind one episode's verification.
+        """
+        grouped = _group_refs_by_project(claims, 'commit')
+        if not grouped:
+            return {}
+        present: dict[tuple[str | None, str], bool] = {}
+        for claimed_project, refs in grouped.items():
+            # Rooted at the CLAIMED project's repository, same reason as the
+            # status read above: a sha claimed for dark_factory is not answered
+            # by reify's object store.
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if root is None:
+                logger.warning(
+                    'completion_claim_gate: claimed_project=%r is not registered; %d '
+                    'commit claim(s) are UNVERIFIABLE and will be tagged '
+                    '(writer_project=%r)',
+                    claimed_project, len(refs), project_id,
+                )
+                continue
+            probe = make_commit_probe(root)
+            for ref in refs:
+                answer = await asyncio.to_thread(probe, ref)
+                if answer is not None:
+                    present[(claimed_project, ref)] = answer
+        return present
+
+    async def _completion_claim_gate(
+        content: str, agent_id: str | None, project_id: str
+    ) -> dict[str, Any] | None:
+        """Return the structured unverified-claim flag for *content*, or None.
+
+        None means "nothing to say": either the content carries no completion
+        claim naming a concrete ref (the overwhelmingly common case, in which no
+        authority is consulted at all and the write is exactly as it was before
+        this gate existed), or every claim it does carry was CONFIRMED.
+
+        Never rejects and never mutates the write — the caller only stamps the
+        tag and echoes the flag.
+
+        DELIBERATE INVERSION, do not "fix" it into a fail-open: every
+        unresolvable authority above is mapped onto a MISSING map key, which the
+        probes below turn into None, which verify_claims turns into
+        'unverifiable', which tags. The sibling gate two definitions up
+        (_premature_completion_block, task 2824) does the opposite and is right
+        to — it REJECTS, so a transient status-read failure bouncing a
+        legitimate write is worse than the stale claim it would have caught.
+        Here the costs run the other way: a spurious tag is one extra
+        source_description prefix on an episode that is kept regardless, while a
+        missed tag is another batch of false extracted edges (reify esc-5603-1:
+        five, from one sentence). The argument is written out in full in
+        completion_claim_gate.verify_claims' docstring.
+
+        Total containment: the gate is advisory machinery bolted onto the write
+        path, so no defect in it may ever cost the caller their ingestion. The
+        exception is logged at ERROR rather than swallowed quietly — a silent
+        except is how a gate stops gating without anyone noticing.
+        """
+        try:
+            claims = extract_completion_claims(
+                content,
+                default_project_id=project_id,
+                known_project_ids=set(_kp),
+            )
+            if not claims:
+                return None
+            statuses = await _claim_task_statuses(claims, project_id)
+            tickets = await _claim_ticket_rows(claims)
+            commits = await _claim_commit_presence(claims, project_id)
+            # The three probes are pure lookups over the maps resolved above:
+            # verify_claims is sync (so it stays unit-testable with no I/O), and
+            # the authorities are async, so the awaiting happens here and the
+            # adjudication there. A MISSING key is the unresolvable signal in
+            # every map.
+            verdicts = verify_claims(
+                claims,
+                task_status_probe=lambda ref, pid: statuses.get((pid, ref)),
+                ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE),
+                commit_probe=lambda ref, pid: commits.get((pid, ref)),
+            )
+            return build_unverified_flag(verdicts, text=content)
+        except Exception:
+            logger.exception(
+                'completion_claim_gate: verification raised for agent_id=%r '
+                'project_id=%r — the episode is ingested UNTAGGED; the gate is '
+                'advisory and must never cost a caller their write',
+                agent_id, project_id,
+            )
+            return None
+
+    def _log_unverified_claims(flag: dict[str, Any], agent_id: str | None) -> None:
+        """Emit the grep-stable operator-facing line for a flagged episode.
+
+        One line per claim, each naming the ref, the authority consulted and
+        what was actually OBSERVED, so an operator reading logs can act without
+        re-deriving the verdict from the corpus (INV-2 / INV-4).
+        """
+        for entry in flag.get('claims') or []:
+            logger.warning(
+                'completion_claim_gate.unverified: %s claim about %s %r is %s '
+                '(agent_id=%r project_id=%r observed=%r) — episode INGESTED and '
+                'tagged %r, not rejected',
+                entry.get('kind'), entry.get('subject'), entry.get('ref'),
+                entry.get('status'), agent_id, entry.get('project_id'),
+                entry.get('observed'), UNVERIFIED_CLAIM_TAG,
+            )
+
     def _citation_gate_applies(store: str, project_id: str) -> bool:
         """Is the citation gate live for this (record, project)?
 
@@ -2397,6 +2641,20 @@ def create_mcp_server(
         enumerated once, in :mod:`shared.toolcall_markup`, and nothing in this
         package spells them.
 
+        Content asserting that concrete, NAMED work is complete ("task N's fix
+        has been applied", "re-filed as ticket tkt_...") is cross-checked
+        against the live task status / ticket registry / git, and TAGGED — not
+        rejected — when a claim is contradicted or cannot be confirmed. The
+        episode is always ingested; the tag rides through to the Graphiti
+        episodic ``source_description`` (prefixed ``'[unverified_claim] '``) and
+        to every derived Mem0 fact's metadata, and the structured flag is echoed
+        back under an ``unverified_claim`` response key naming what was claimed
+        and what was actually OBSERVED. Unlike the recon-stage-only
+        premature-completion gate, this applies to every writer, and an
+        authority that cannot be reached tags rather than passes — see
+        :mod:`fused_memory.services.completion_claim_gate` for why the fail
+        direction is inverted there.
+
         Args:
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
@@ -2526,7 +2784,44 @@ def create_mcp_server(
             premature_block = await _premature_completion_block(content, agent_id, project_id)
             if premature_block is not None:
                 return premature_block
+        # task 3142 / PRD leaf pi: verify completion claims naming a concrete
+        # task / commit / ticket against the live authorities and TAG the
+        # episode when one cannot be confirmed. Deliberately NOT under a
+        # recon-stage- guard like the 2824 gate immediately above: this one only
+        # labels, so it costs a non-recon writer nothing, and a false completion
+        # claim damages the corpus identically whoever writes it.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
+        extra: dict[str, Any] = {}
+        if unverified_flag is not None:
+            # Ride the same channel temporal_context does — a service parameter,
+            # then a durable-queue payload key, then the Graphiti
+            # source_description prefix and every derived Mem0 fact's metadata.
+            # A response-only flag would have labelled none of the artefacts that
+            # actually caused harm in esc-5603-1.
+            extra['unverified_claim'] = True
+            _log_unverified_claims(unverified_flag, agent_id)
+            # The tag labels the corpus; the escalation reaches an operator.
+            # Both, or the finding lives only in a WARNING nobody greps (INV-4).
+            # emit_unverified_claim_escalation is built never to raise, but a
+            # call site that RELIED on that promise would turn a future
+            # regression there into an outage on the write path — same reasoning
+            # as the markup gate's wrapping of its own emitter.
+            try:
+                esc_id = emit_unverified_claim_escalation(
+                    _kp.get(project_id), unverified_flag
+                )
+            except Exception:  # pragma: no cover — defensive only
+                logger.exception(
+                    'completion_claim_gate: emit_unverified_claim_escalation raised '
+                    'for project_id=%r; the episode is still ingested and tagged',
+                    project_id,
+                )
+                esc_id = None
+            if esc_id is not None:
+                # Echoed so the writer (or a reviewer reading the response) can
+                # find the filed record without grepping logs.
+                unverified_flag = {**unverified_flag, 'escalation_id': esc_id}
         result = await memory_service.add_episode(
             content=content,
             source=source,
@@ -2538,8 +2833,12 @@ def create_mcp_server(
             temporal_context=temporal_context,
             reference_time=parsed_reference_time,
             _source=op_source,
+            **extra,
         )
-        return result.model_dump()
+        payload = result.model_dump()
+        if unverified_flag is not None and isinstance(payload, dict):
+            payload[UNVERIFIED_CLAIM_TAG] = unverified_flag
+        return payload
 
     @mcp.tool()
     @mcp_tool_errors()

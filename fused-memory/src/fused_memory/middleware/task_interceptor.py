@@ -2980,6 +2980,38 @@ class TaskInterceptor:
             'rows': rows,
         }
 
+    async def get_ticket_row(self, ticket_id: str) -> dict | None:
+        """Return the ticket row for ``ticket_id``, or None if it does not exist.
+
+        A PURE READ: no wait, no mutation, no created_at window. It is the
+        existence authority for ``tkt_`` claims in the completion-claim
+        verification gate (task 3142,
+        :mod:`fused_memory.services.completion_claim_gate`).
+
+        Deliberately NOT :meth:`list_tickets`, which the task text named:
+        list_tickets defaults to a 7-day window and requires a project_root, so
+        it would report a genuine but older ticket as absent (a FALSE
+        unverified verdict) and would force a project-scoping choice.
+        :meth:`TicketStore.get` is a primary-key lookup over the single shared
+        ``tickets.db``, so it is window-free, exact and project-agnostic — and
+        the row it returns NAMES its owning ``project_id``, which is what lets
+        a cross-project claim (esc-3085-1 instance (2): a reify agent claiming
+        a dark_factory ticket) be adjudicated without knowing the writer's
+        project.
+
+        Returns None — never raises — when no ticket store is configured, so
+        the ingestion path can map that onto "unresolvable" and tag the episode
+        instead of failing the write.
+        """
+        if self._ticket_store is None:
+            logger.warning(
+                'get_ticket_row: ticket_store not configured; '
+                'existence of ticket %s is unresolvable',
+                ticket_id,
+            )
+            return None
+        return await self._ticket_store.get(ticket_id)
+
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
 

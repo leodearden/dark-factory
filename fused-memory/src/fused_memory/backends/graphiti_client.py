@@ -682,12 +682,24 @@ class GraphitiBackend:
         entity_types: dict | None = None,
         uuid: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
     ) -> Any:
-        """Add an episode to Graphiti and return the result."""
+        """Add an episode to Graphiti and return the result.
+
+        ``unverified_claim`` (task 3142) prefixes ``source_description`` with
+        ``'[unverified_claim] '``, exactly as ``temporal_context`` prefixes it
+        with ``'[temporal:X] '``. It is applied OUTERMOST so the caveat is the
+        first thing a reader of the episodic node sees, and so the two prefixes
+        compose rather than overwrite. This is the only channel that reaches
+        the persisted episode: the harm being labelled is the EDGES extracted
+        from it, not the tool response.
+        """
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
+        if unverified_claim:
+            source_description = f'[unverified_claim] {source_description}'
         return await asyncio.wait_for(
             client.add_episode(
                 name=name,

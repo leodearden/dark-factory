@@ -2300,6 +2300,10 @@ class MemoryService:
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
+        # task 3142: rides the same payload channel temporal_context does, so
+        # the tag reaches the persisted episodic node (and, via
+        # _dual_write_callback, every fact derived from it).
+        unverified_claim = bool(payload.pop('unverified_claim', False))
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
@@ -2341,6 +2345,7 @@ class MemoryService:
                     uuid=payload.get('uuid'),
                     temporal_context=temporal_context,
                     reference_time=reference_time,
+                    unverified_claim=unverified_claim,
                 ),
             )
             reconcile_stats = await self._reconcile_episode_identity(
@@ -2430,6 +2435,7 @@ class MemoryService:
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
         temporal_context = payload.get('temporal_context')
+        unverified_claim = bool(payload.get('unverified_claim', False))
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -2450,6 +2456,11 @@ class MemoryService:
             metadata['secondary_category'] = classification.secondary.value
         if temporal_context == 'planning':
             metadata['planned'] = True
+        # Omitted entirely when untagged (task 3142) rather than set False, so
+        # no existing record shape changes and a metadata filter for the key
+        # matches only genuinely flagged facts.
+        if unverified_claim:
+            metadata['unverified_claim'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -2561,6 +2572,11 @@ class MemoryService:
                         'session_id': payload.get('session_id'),
                         '_causation_id': payload.get('_causation_id'),
                         'temporal_context': payload.get('temporal_context'),
+                        # task 3142: the Mem0 half rides its own payload
+                        # channel, so the episode's tag must be copied onto
+                        # every derived fact explicitly — those facts ARE the
+                        # artefacts the incident produced.
+                        'unverified_claim': payload.get('unverified_claim', False),
                     },
                 }
                 for edge in edges
@@ -2602,9 +2618,18 @@ class MemoryService:
         source_description: str = '',
         causation_id: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
-        """Full ingestion pipeline — durably enqueue episode, return immediately."""
+        """Full ingestion pipeline — durably enqueue episode, return immediately.
+
+        ``unverified_claim`` (task 3142) marks an episode carrying a completion
+        claim that could not be confirmed against its live authority. It is a
+        LABEL, never a rejection: the episode is ingested either way, and the
+        flag follows the same payload -> backend path as ``temporal_context``
+        so both the Graphiti episodic node and every derived Mem0 fact carry
+        it.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         episode_id = str(uuid_mod.uuid4())
         write_op_id = str(uuid_mod.uuid4())
@@ -2638,6 +2663,7 @@ class MemoryService:
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
                     'temporal_context': temporal_context,
+                    'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
                 },
                 callback_type='dual_write_episode',
