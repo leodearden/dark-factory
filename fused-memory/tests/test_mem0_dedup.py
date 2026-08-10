@@ -336,3 +336,74 @@ async def test_find_prior_memories_search_failure_returns_empty_list_and_warns(c
         f'Expected a WARNING mentioning task 77 but got: '
         f'{[r.message for r in caplog.records]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 3129 (leaf δ) — the child-suppression filter must NOT leak into
+# MemoryService.search (task detail item 4 / docs/prds/memory-metadata-vocabulary.md).
+#
+# find_prior_memories post-filters RAW service results on task_id + kind.  If
+# grouped_read's suppression ever moved down into the service layer, amendment
+# and sighting rows would vanish before that loop ran — hiding duplicates from
+# the recon dedup detector and candidates from the near-duplicate write guard.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_child_records_survive_to_the_per_record_post_filter():
+    """Amendment/sighting rows must reach find_prior_memories' task_id/kind filter."""
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+
+    amendment = _make_memory_result(
+        {'task_id': '42', 'kind': 'amendment', 'parent_id': '11111111-1111-4111-8111-111111111111'}
+    )
+    sighting = _make_memory_result(
+        {'task_id': '42', 'kind': 'sighting', 'parent_id': '11111111-1111-4111-8111-111111111111'}
+    )
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[amendment, sighting])
+
+    amendments = await find_prior_memories(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'kind': 'amendment'},
+        query='q',
+    )
+    sightings = await find_prior_memories(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'kind': 'sighting'},
+        query='q',
+    )
+
+    assert amendments == [amendment], (
+        f'A child record must survive to the per-record post-filter, got {amendments!r}'
+    )
+    assert sightings == [sighting], (
+        f'A child record must survive to the per-record post-filter, got {sightings!r}'
+    )
+
+
+def test_memory_service_search_does_not_import_the_suppression_filter():
+    """The suppression filter has exactly ONE home: server/grouped_read.py.
+
+    A structural guard, so a future refactor that pushes grouping down a layer
+    fails here rather than silently hiding child records from every raw
+    ``MemoryService.search`` consumer.
+    """
+    import inspect
+
+    from fused_memory.services import memory_service as memory_service_module
+
+    source = inspect.getsource(memory_service_module)
+    assert 'grouped_read' not in source, (
+        'services/memory_service.py must not reference server/grouped_read — '
+        'grouping belongs at the MCP tool layer only (task 3129 / PRD V2 bullet 4)'
+    )
+    assert 'group_search_results' not in source, (
+        'MemoryService.search must return RAW results; grouping is applied by the '
+        'MCP tool wrappers only'
+    )
