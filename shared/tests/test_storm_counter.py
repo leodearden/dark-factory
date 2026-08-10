@@ -47,6 +47,31 @@ def counter(clock):
     return StormCounter(time_provider=clock)
 
 
+class TestReExportShim:
+    """The old home is the SAME class object, not a second implementation.
+
+    The re-export contract, in the shape task 3688 established for
+    ``MCP_MARKUP_PATTERNS``: promote to ``shared``, re-export from the old home,
+    public names unchanged, so fused-memory's importers
+    (``server/markup_tripwire.py``, ``services/memory_service.py``) need no edit.
+
+    This identity is the one thing the OLD suite is uniquely qualified to pin,
+    and it is what makes every contract assertion below cover both import paths
+    at once — ``fused-memory/tests/server/test_storm_counter.py`` re-tests the
+    same contract against the same object today, which is duplication that
+    belongs at the shim, not at the behaviour. Collapsing that suite is out of
+    this task's lock scope.
+
+    Guarded by importorskip so shared's suite stays independent of fused-memory
+    being installed — shared is the base layer and may not require it.
+    """
+
+    def test_the_old_home_re_exports_this_very_class(self):
+        shim = pytest.importorskip('fused_memory.server.storm_counter')
+
+        assert shim.StormCounter is StormCounter
+
+
 class TestThreshold:
     """(a) below threshold returns None; (b) at threshold returns the summary."""
 
@@ -243,3 +268,35 @@ class TestPruneSweepHook:
         clock.advance(101.0)
 
         assert counter.prune(100.0) == 0
+
+    def test_a_pruned_counter_decides_like_a_fresh_one(self, counter, clock):
+        """Why dropping an empty counter is behaviour-preserving, not just cheap.
+
+        The only state besides the deque is ``_last_fire_ts``, and it is stamped
+        while its own event is still inside the window — so an empty window
+        implies that fire has already aged past the rate limit. A caller that
+        evicts on ``prune() == 0`` and reconstructs later must therefore get the
+        same answer it would have got by keeping the object.
+
+        This is what licenses ``MarkupGuardMiddleware``'s dormant-key sweep:
+        it holds one counter per ``(project, outcome)`` key and deletes the ones
+        whose ``prune()`` reports zero, which is only sound if a reconstructed
+        counter cannot decide differently from the one it replaced.
+        """
+        for _ in range(3):
+            counter.record(threshold=3, window_seconds=100.0, label='p')
+        clock.advance(101.0)
+        assert counter.prune(100.0) == 0
+
+        kept = [
+            counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+        fresh_counter = StormCounter(time_provider=clock)
+        fresh = [
+            fresh_counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [f is not None for f in kept] == [f is not None for f in fresh]
+        assert kept[-1] == fresh[-1]
