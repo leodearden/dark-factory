@@ -11772,8 +11772,10 @@ class GitOps:
         # Reached only on COLD removals: warm/spec lanes returned above (they are
         # retained, not removed), and branch == task_id at every cold call site,
         # so it is the task_id the config-dir path and archive layout key on.
-        # Offloaded to a worker thread to keep the shared event loop free for the
-        # rare real-gzip path (mirrors the producer's loop-stall avoidance).
+        # Offloaded to a worker thread so the blocking file-copy I/O never stalls
+        # the shared event loop (mirrors the producer's loop-stall avoidance).
+        # Task 3619 (leaf 2) collapses the copy into a rename, at which point
+        # this offload can go too.
         if self.transcript_archive is not None and self.transcript_archive.enabled:
             config_dir = worktree / '.task' / f'claude-config-{branch}'
             # Fast-skip when the config dir is already gone (external worktrees,

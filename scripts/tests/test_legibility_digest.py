@@ -21,11 +21,8 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
-import gzip
-import io
 import json
 import logging
-import zlib
 
 import digest as mod
 import pytest
@@ -115,12 +112,12 @@ def _write_jsonl(tmp_path, records):
     return path
 
 
-def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
-    """Serialize *records* gzip-compressed to ``<tmp_path>/<name>``; return its
-    Path. Mirrors the on-disk form of an archived fleet session produced by
-    ``shared.transcript_archive`` (``<sid>.jsonl.gz``)."""
+def _write_archived_jsonl(tmp_path, records, name='archived.jsonl'):
+    """Serialize *records* to ``<tmp_path>/<name>``; return its Path.
+    Mirrors the on-disk form of an archived fleet session produced by
+    ``shared.transcript_archive`` (``<sid>.jsonl``, a verbatim copy)."""
     path = tmp_path / name
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         for r in records:
             f.write(json.dumps(r))
             f.write('\n')
@@ -129,82 +126,26 @@ def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
 
 # ---------------------------------------------------------------------------
 # Corruption scaffolding for the file-level contract tests below. A near-copy
-# of the pair in test_legibility_inventory.py, deliberately: pytest runs here
+# of the helper in test_legibility_inventory.py, deliberately: pytest runs here
 # under --import-mode=importlib (pyproject.toml), which does not make sibling
 # test modules importable by bare name, and scripts/tests/conftest.py is a
 # sys.path bootstrap with no fixtures. The coupling that matters — that both
 # readers answer the same way — is asserted directly by
-# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_a_truncated_file
+# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_an_undecodable_file
 # rather than implied by a shared helper.
 # ---------------------------------------------------------------------------
-
-def _gz_payload(n_records: int = 200) -> bytes:
-    """Serialize a multi-record JSONL body — the payload the helpers below
-    compress and then damage. Many padded records so a cut at the halfway
-    mark lands mid-stream rather than inside the 10-byte header."""
-    return ''.join(
-        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
-        for i in range(n_records)
-    ).encode('utf-8')
-
-
-def _write_truncated_gz(path):
-    """Write the first half of a valid gz stream — the interrupted-write
-    shape, which decompresses to ``EOFError`` (NOT an ``OSError``)."""
-    blob = gzip.compress(_gz_payload())
-    path.write_bytes(blob[: len(blob) // 2])
-    return path
-
-
-def _write_corrupt_body_gz(path):
-    """Write a gz whose DEFLATE body is damaged, so decompression raises
-    ``zlib.error`` (also NOT an ``OSError``).
-
-    Where a flipped byte lands decides which failure gzip reports — most
-    flips still decode and only trip the trailing checksum
-    (``gzip.BadGzipFile``, already an ``OSError``), a few truncate the bit
-    stream (``EOFError``), and only a flip that makes the DEFLATE stream
-    itself unparseable raises ``zlib.error``. So probe for the first flip
-    position producing that shape rather than assuming a byte. The probe runs
-    against STDLIB ``gzip``, never a reader under test, so it stays valid on
-    both sides of the normalization.
-    """
-    blob = gzip.compress(_gz_payload())
-    for index in range(10, len(blob)):
-        candidate = bytearray(blob)
-        candidate[index] ^= 0xFF
-        try:
-            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
-        except zlib.error:
-            path.write_bytes(bytes(candidate))
-            return path
-        except Exception:
-            continue  # a different corruption shape — keep probing
-    raise AssertionError('no single-byte flip produced a zlib.error body')
-
 
 _UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
 """A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8."""
 
 
-def _write_undecodable_gz(path):
-    """A structurally VALID gz whose payload is not valid UTF-8.
-
-    The fourth shape, unreachable by the two helpers above: they damage the
-    gzip container, and the ``_write_corrupt_body_gz`` probe decompresses in
-    BINARY mode, so neither can surface a decode fault. This file
-    decompresses cleanly and fails one layer up, at the reader's
-    ``encoding='utf-8'`` text wrapper, as ``UnicodeDecodeError`` — a
-    ``ValueError``, so it escapes ``except OSError`` however the gzip shapes
-    are handled.
-    """
-    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
-    return path
-
-
 def _write_undecodable_plain(path):
-    """The same bad byte with no gzip layer — the plain branch opens with the
-    same strict encoding, so the shape is reachable on ``.jsonl`` too."""
+    """The one file-level corruption shape a plain ``.jsonl`` archive still has.
+
+    The reader opens under strict ``encoding='utf-8'``, so a single bad byte
+    raises ``UnicodeDecodeError`` — a ``ValueError``, not an ``OSError`` —
+    and would escape every consumer's documented ``except OSError`` degrade
+    path unless the reader normalizes it."""
     path.write_bytes(_UNDECODABLE_BODY)
     return path
 
@@ -239,27 +180,16 @@ class TestLoadTranscript:
 
 
 # ---------------------------------------------------------------------------
-# load_transcript — gz transparency. Archived fleet sessions land on disk as
-# ``<sid>.jsonl.gz`` (shared.transcript_archive); load_transcript must read
-# them identically to a plain .jsonl so census/nightly RENDER their digests
-# rather than enumerate-then-drop the whole archive at build_digest time.
+# load_transcript — plain-corpus read. Archived fleet sessions land on disk as
+# ``<sid>.jsonl`` (shared.transcript_archive), a verbatim copy with no added
+# suffix, so load_transcript reads them with the same plain open it uses for a
+# live transcript — census/nightly RENDER their digests rather than
+# enumerate-then-drop the whole archive at build_digest time.
 # ---------------------------------------------------------------------------
 
-class TestLoadTranscriptGzAware:
-    def test_gz_transcript_parses_identically_to_plain_jsonl(self, tmp_path):
-        records = [_user_text('first'), _assistant(_text('second')), _user_text('third')]
-        gz_path = _write_jsonl_gz(tmp_path, records)
-        plain_path = _write_jsonl(tmp_path, records)
-
-        loaded_gz = mod.load_transcript(gz_path)
-
-        assert loaded_gz == mod.load_transcript(plain_path)
-        assert [r['message']['content'] for r in loaded_gz] == [
-            'first', [{'type': 'text', 'text': 'second'}], 'third',
-        ]
-
+class TestLoadTranscriptPlain:
     def test_plain_jsonl_still_parses_as_before(self, tmp_path):
-        # Byte-parity: the non-gz branch keeps the exact pre-existing read.
+        # Byte-parity: the reader keeps the exact pre-existing read.
         records = [_user_text('one'), _user_text('two')]
         path = _write_jsonl(tmp_path, records)
 
@@ -270,14 +200,14 @@ class TestLoadTranscriptGzAware:
 
 # ---------------------------------------------------------------------------
 # load_transcript — the FILE-level half of the degrade contract. This slurping
-# reader has the byte-identical gzip.open + iterate body as its streaming
+# reader has the byte-identical open + iterate body as its streaming
 # sibling inventory.iter_json_lines, so it has the identical hole: an
-# unreadable file surfaces as four different exception types, and only bad
-# magic (gzip.BadGzipFile) is already an OSError. A truncated stream raises
-# EOFError, a corrupt body raises zlib.error, and a non-UTF-8 byte raises
-# UnicodeDecodeError — none of which any consumer's documented
-# `except OSError` degrade path catches. The last is reachable on a plain
-# `.jsonl` as well, since both branches open under strict encoding='utf-8'.
+# unreadable file surfaces as the identical shape. With the archive stored
+# plain (task 3618) exactly one file-level shape survives: a non-UTF-8 byte
+# raises UnicodeDecodeError, which no consumer's documented `except OSError`
+# degrade path catches, since it is a ValueError subclass. It was always
+# reachable on a plain `.jsonl` — the reader opens under strict
+# encoding='utf-8' either way — which is why it outlives the gzip shapes.
 #
 # The corpus extractor's `--transcript` operator mode reads through THIS
 # function under `except OSError`, so an archived transcript whose write was
@@ -285,52 +215,6 @@ class TestLoadTranscriptGzAware:
 # ---------------------------------------------------------------------------
 
 class TestLoadTranscriptCorruptionShapes:
-    def test_truncated_gz_raises_oserror(self, tmp_path):
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(truncated)
-
-    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(corrupt)
-
-    def test_bad_magic_gz_raises_oserror(self, tmp_path):
-        # Already true (BadGzipFile subclasses OSError) — pinned here so the
-        # three shapes are asserted as one contract at this reader, and so a
-        # regression in the newly-added wrap cannot quietly change it.
-        corrupt = tmp_path / 'not-gzip.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip at all\n')
-        with pytest.raises(OSError):
-            mod.load_transcript(corrupt)
-
-    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
-        # Normalizing to one TYPE must not flatten them to one MESSAGE: the
-        # reason string is what a coverage-reporting caller discloses, and an
-        # operator has to tell a half-written transcript from a corrupted one
-        # without re-reading the file.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-
-        with pytest.raises(OSError) as truncated_exc:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as corrupt_exc:
-            mod.load_transcript(corrupt)
-
-        assert str(truncated_exc.value) != str(corrupt_exc.value)
-        assert 'end-of-stream' in str(truncated_exc.value)
-        assert 'decompressing' in str(corrupt_exc.value)
-
-    def test_undecodable_gz_raises_oserror(self, tmp_path):
-        # The FOURTH shape. The gz container is intact — the payload simply is
-        # not UTF-8 — so this arrives as UnicodeDecodeError, a ValueError
-        # subclass that no `except (EOFError, zlib.error)` tuple catches and no
-        # `except OSError` consumer sees. Un-normalized, one flipped byte in
-        # one archived transcript aborts the corpus extractor's whole run.
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(undecodable)
-
     def test_undecodable_plain_jsonl_raises_oserror(self, tmp_path):
         # Same byte, no gzip layer: this reader's plain branch opens with the
         # same strict encoding, so the shape is reachable there too.
@@ -338,28 +222,22 @@ class TestLoadTranscriptCorruptionShapes:
         with pytest.raises(OSError):
             mod.load_transcript(undecodable)
 
-    def test_the_decode_shape_is_distinguishable_from_the_gzip_shapes(self, tmp_path):
-        # Same rule as the two-shape test above, extended to the fourth: an
-        # encoding fault must not be disclosed as a gzip-stream fault, which
-        # would send an operator to audit the compressor instead of the bytes.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+    def test_the_decode_shape_names_the_offending_byte(self, tmp_path):
+        # One file-level shape survives, so the reason can no longer be
+        # triaged by contrast — the actionable detail is the offending byte.
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
 
-        with pytest.raises(OSError) as truncated_exc:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as undecodable_exc:
+        with pytest.raises(OSError) as exc:
             mod.load_transcript(undecodable)
 
-        message = str(undecodable_exc.value)
-        assert message != str(truncated_exc.value)
-        assert 'gzip' not in message
-        assert '0xff' in message.lower()
+        assert 'gzip' not in str(exc.value)
+        assert '0xff' in str(exc.value).lower()
 
     def test_both_readers_agree_on_an_undecodable_file(self, tmp_path):
         # The two-readers-one-contract property, asserted for the shape that
         # was leaking: whichever mode an operator reaches for, the same bad
         # byte must be reported the same way.
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
 
         with pytest.raises(OSError) as slurped:
             mod.load_transcript(undecodable)
@@ -369,31 +247,14 @@ class TestLoadTranscriptCorruptionShapes:
         assert type(slurped.value) is type(streamed.value)
         assert str(slurped.value) == str(streamed.value)
 
-    def test_both_readers_agree_on_a_truncated_file(self, tmp_path):
-        # The property the corpus extractor's design rests on: two readers,
-        # one core, ONE failure contract. Its scan mode reads via
-        # inventory.iter_json_lines and its --transcript mode via
-        # load_transcript; if the two disagreed here, the same corrupt archive
-        # would be reported differently depending on which mode an operator
-        # reached for.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-
-        with pytest.raises(OSError) as slurped:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as streamed:
-            list(inventory_mod.iter_json_lines(truncated))
-
-        assert type(slurped.value) is type(streamed.value)
-        assert str(slurped.value) == str(streamed.value)
-
-    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
-        # The line-level half, unchanged: a well-formed gz whose LAST line is
-        # a half-written record still yields every parseable record and still
-        # does not raise. A fix that wrapped the parse loop too broadly would
-        # collapse this into the file-level path and inflate a caller's
+    def test_corrupt_line_in_a_valid_file_still_degrades_silently(self, tmp_path):
+        # The line-level half, unchanged: a well-formed transcript whose LAST
+        # line is a half-written record still yields every parseable record and
+        # still does not raise. A fix that wrapped the parse loop too broadly
+        # would collapse this into the file-level path and inflate a caller's
         # unreadable-file count with ordinary trailing debris.
-        path = tmp_path / 'trailing-partial.jsonl.gz'
-        with gzip.open(path, 'wt', encoding='utf-8') as f:
+        path = tmp_path / 'trailing-partial.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(_user_text('one')) + '\n')
             f.write('\n')
             f.write('{not valid json,,,\n')
@@ -420,14 +281,6 @@ class TestLoadTranscriptCorruptionShapes:
 class TestAsUnreadableFileError:
     """The one place that answers 'which exceptions mean an unreadable file'."""
 
-    def test_normalizes_the_gzip_stream_shapes(self):
-        for exc in (EOFError('ended early'), zlib.error('bad block')):
-            normalized = inventory_mod.as_unreadable_file_error(exc)
-
-            assert isinstance(normalized, OSError)
-            assert 'corrupt or truncated gzip stream' in str(normalized)
-            assert str(exc) in str(normalized)
-
     def test_decode_shape_gets_its_own_wording(self):
         # Not a "gzip stream" failure: this shape is reachable on a plain
         # .jsonl path too, so that label would misdirect an operator reading
@@ -438,26 +291,24 @@ class TestAsUnreadableFileError:
 
         assert isinstance(normalized, OSError)
         assert 'undecodable transcript bytes' in str(normalized)
-        assert 'gzip stream' not in str(normalized)
+        assert 'gzip' not in str(normalized)
 
     def test_an_oserror_passes_through_unwrapped(self):
-        # gzip.BadGzipFile is ALREADY an OSError, so it needs no
+        # An OSError is ALREADY the target type, so it needs no
         # normalization. Returning it unchanged keeps the helper idempotent —
         # a caller can hand it anything it caught without first classifying
         # it, and a bad-magic message never acquires a misleading second
         # "corrupt or truncated gzip stream" prefix.
-        original = gzip.BadGzipFile('Not a gzipped file')
+        original = OSError('Not a readable file')
 
         assert inventory_mod.as_unreadable_file_error(original) is original
 
     def test_the_catch_tuple_omits_oserror_shapes(self):
         # UNREADABLE_FILE_ERRORS is exactly the set that is NOT already an
         # OSError. A shape wrongly added here would be caught and re-wrapped
-        # rather than propagating, and gzip.BadGzipFile in particular must
+        # rather than propagating, and an OSError in particular must
         # keep reaching callers by its own inheritance.
-        assert (
-            EOFError, zlib.error, UnicodeDecodeError,
-        ) == inventory_mod.UNREADABLE_FILE_ERRORS
+        assert (UnicodeDecodeError,) == inventory_mod.UNREADABLE_FILE_ERRORS
         assert not any(
             issubclass(exc_type, OSError)
             for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS
@@ -1640,9 +1491,9 @@ class TestEmitConsistencyGuard:
         assert body.strip() != ''
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
-    def test_build_digest_end_to_end_on_gz_orchestrated_session(self, tmp_path):
+    def test_build_digest_end_to_end_on_archived_orchestrated_session(self, tmp_path):
         # Already green off steps 2/4 -- the end-to-end acceptance check:
-        # a real orchestrated-looking gz transcript (briefing turn +
+        # a real orchestrated-looking archived transcript (briefing turn +
         # genuine human correction + tool_error + not_found) yields a
         # non-empty, briefing-free digest with an intact frontmatter
         # contract.
@@ -1653,7 +1504,7 @@ class TestEmitConsistencyGuard:
             _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
             _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
         ]
-        path = _write_jsonl_gz(tmp_path, records)
+        path = _write_archived_jsonl(tmp_path, records)
 
         digest = mod.build_digest(path)
 

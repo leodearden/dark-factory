@@ -2,7 +2,7 @@
 
 PRD ``plans/toolcall-markup-containment-prd.md`` task alpha, boundary row B13.
 
-TDD pair 4 (step 7/8): the extractor's pure functions, over SYNTHETIC gzipped
+TDD pair 4 (step 7/8): the extractor's pure functions, over SYNTHETIC plain
 transcripts written to ``tmp_path``. Nothing here reads the live archive, so
 these stay green after the retention window rotates it away (PRD section 11.4).
 
@@ -18,7 +18,6 @@ these tests pin. Leave it escaped.
 """
 from __future__ import annotations
 
-import gzip
 import json
 from pathlib import Path
 
@@ -78,9 +77,9 @@ def _tool_use(block_id: str, name: str, arguments: dict[str, object]) -> dict[st
 
 
 def _write_transcript(path: Path, records: list[dict[str, object]]) -> None:
-    """Write *records* as a gzipped JSONL transcript at *path*."""
+    """Write *records* as a plain JSONL transcript at *path*."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, 'wt', encoding='utf-8') as handle:
+    with open(path, 'w', encoding='utf-8') as handle:
         for record in records:
             handle.write(json.dumps(record) + '\n')
 
@@ -88,11 +87,12 @@ def _write_transcript(path: Path, records: list[dict[str, object]]) -> None:
 def _archive_leaf(root: Path, task_id: str, uuid: str) -> Path:
     """A leaf at the REAL archive depth: root/<task_id>/<project-dir>/<uuid>.
 
-    Mirrors the layout measured 2026-08-08 (prerequisite P3):
-    ``<root>/2474/-home-leo-src-dark-factory--worktrees-2474/<uuid>.jsonl.gz``.
+    Mirrors the layout measured 2026-08-08 (prerequisite P3), with the plain
+    suffix the archive has carried since task 3618:
+    ``<root>/2474/-home-leo-src-dark-factory--worktrees-2474/<uuid>.jsonl``.
     """
     project_dir = '-home-leo-src-dark-factory--worktrees-' + task_id
-    return root / task_id / project_dir / (uuid + '.jsonl.gz')
+    return root / task_id / project_dir / (uuid + '.jsonl')
 
 
 # A total-drift value: the tail ends at the invoke closer (predicate alt 1).
@@ -160,7 +160,7 @@ class TestCollectionPredicate:
 class TestArchiveWalk:
     """The revalidation finding (P3): the archive is NESTED, not flat.
 
-    A top-level ``*.jsonl.gz`` glob returns ZERO files against the real archive,
+    A top-level ``*.jsonl`` glob returns ZERO files against the real archive,
     so without this test a silently-empty corpus would look like a clean run.
     """
 
@@ -576,7 +576,7 @@ class TestExtractorRobustness:
         good = json.dumps(
             _tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})
         )
-        with gzip.open(leaf, 'wt', encoding='utf-8') as handle:
+        with open(leaf, 'w', encoding='utf-8') as handle:
             handle.write('{"type": "assistant", "tool_use": truncated mid-writ')
             handle.write('\n')
             handle.write('\n')
@@ -595,51 +595,48 @@ class TestExtractorRobustness:
 # split between the two is a contract, not an implementation detail.
 # ---------------------------------------------------------------------------
 
-#: One well-formed transcript, gzipped, as raw bytes — the base every
-#: corruption below is derived from, so each case differs in exactly one way.
-_GOOD_GZ_BYTES = gzip.compress(
-    (
-        json.dumps(_tool_use('toolu_good', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT}))
-        + '\n'
-    ).encode('utf-8')
-)
-
 #: A transcript carrying a raw non-UTF-8 byte INSIDE a tool_use argument. Under
 #: ``errors='replace'`` this decodes to a U+FFFD and parses, so the specimen
 #: enters the corpus with a replacement character standing in for real harness
 #: output. Strict decoding is what makes it an unreadable FILE instead.
-_UNDECODABLE_GZ_BYTES = gzip.compress(
+_UNDECODABLE_BYTES = (
     json.dumps(
         _tool_use('toolu_undecodable', 'submit_task', {'title': 'PLACEHOLDER', 'description': _TOTAL_DRIFT})
     ).encode('utf-8').replace(b'PLACEHOLDER', b't\xff') + b'\n'
 )
 
-#: The four shapes ``legibility.inventory.as_unreadable_file_error`` normalizes:
-#: bad magic (gzip.BadGzipFile), a truncated stream (EOFError), a corrupt body
-#: (zlib.error), and an undecodable byte (UnicodeDecodeError). All four are what
-#: a fire-and-forget writer produces when a unit is killed mid-write or a file
-#: is read while still being compressed — the archive is live-written AND
-#: concurrently pruned by scripts/gc_agent_transcripts.py, so these are expected
-#: states, not theoretical ones.
+#: The ONE shape ``legibility.inventory.as_unreadable_file_error`` still
+#: normalizes: an undecodable byte (``UnicodeDecodeError``). It is what a
+#: fire-and-forget writer produces when a unit is killed mid-write — the
+#: archive is live-written AND concurrently pruned by
+#: scripts/gc_agent_transcripts.py, so that is an expected state, not a
+#: theoretical one.
+#:
+#: WHY THE OTHER THREE ARE GONE (task 3618 stored the archive plain). This
+#: class originally parametrized over four shapes chosen to hit four DISTINCT
+#: gzip-container exceptions. With no gzip container, re-measured against the
+#: plain reader:
+#:   - ``truncated_stream`` and ``corrupt_body`` were gzip byte-strings; read
+#:     as plain UTF-8 they still raise ``UnicodeDecodeError``, i.e. they became
+#:     redundant re-spellings of the case below rather than distinct shapes,
+#:     and their names no longer describe what they test.
+#:   - ``bad_magic`` was literal ASCII ("plain text that was never gzipped");
+#:     read plain it is perfectly READABLE and merely yields zero records. It
+#:     changed class entirely, so it moved to the readable-file test below
+#:     rather than being deleted.
+#: The contract task 3688 pinned — skip-and-report, never fatal — is unchanged
+#: and is still exercised end-to-end by the surviving shape.
 _UNREADABLE_SHAPES = {
-    'truncated_stream': _GOOD_GZ_BYTES[:-5],
-    'bad_magic': b'plain text that was never gzipped at all\n',
-    'corrupt_body': (
-        _GOOD_GZ_BYTES[:12] + bytes([_GOOD_GZ_BYTES[12] ^ 0xFF]) + _GOOD_GZ_BYTES[13:]
-    ),
-    'undecodable_byte': _UNDECODABLE_GZ_BYTES,
+    'undecodable_byte': _UNDECODABLE_BYTES,
 }
 
 
 class TestUnreadableFilesAreSkippedAndCounted:
     """An unreadable transcript must be SKIPPED and REPORTED, never fatal.
 
-    Measured first-hand before this class was written: three of the four shapes
-    below abort the whole walk today (``EOFError``, ``gzip.BadGzipFile``,
-    ``zlib.error``) because gzip decompresses LAZILY at read time, so the
-    failure lands outside every existing handler. The fourth is worse than
-    fatal — ``errors='replace'`` silently turns a corrupt byte into U+FFFD and
-    commits it to the corpus as if it were real harness output.
+    The failure this guards is worse than a crash: under ``errors='replace'``
+    a corrupt byte silently becomes U+FFFD and is committed to the corpus as
+    if it were real harness output.
 
     One bad leaf must not cost the other 5688 files, and a run that loses files
     must be distinguishable from a clean one.
@@ -671,7 +668,7 @@ class TestUnreadableFilesAreSkippedAndCounted:
         root = tmp_path / 'agent-transcripts'
         bad = _archive_leaf(root, '2474', 'bad')
         bad.parent.mkdir(parents=True, exist_ok=True)
-        bad.write_bytes(_UNDECODABLE_GZ_BYTES)
+        bad.write_bytes(_UNDECODABLE_BYTES)
         _write_transcript(
             _archive_leaf(root, '2475', 'good'),
             [_tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})],
@@ -713,7 +710,7 @@ class TestUnreadableFilesAreSkippedAndCounted:
         root = tmp_path / 'agent-transcripts'
         bad = _archive_leaf(root, '2474', 'bad')
         bad.parent.mkdir(parents=True, exist_ok=True)
-        bad.write_bytes(_UNREADABLE_SHAPES['truncated_stream'])
+        bad.write_bytes(_UNREADABLE_SHAPES['undecodable_byte'])
 
         with caplog.at_level('WARNING'):
             extract.extract(root)
@@ -738,6 +735,30 @@ class TestUnreadableFilesAreSkippedAndCounted:
         assert extract.main(['--archive-root', str(root), '--out', str(out)]) == 1
         assert not out.exists()
 
+    def test_a_readable_file_yielding_no_records_is_not_unreadable(self, tmp_path):
+        """The successor to the old ``bad_magic`` shape, which changed class.
+
+        Pre-task-3618 this content ("plain text that was never gzipped at all")
+        was an UNREADABLE file: it hit gzip.BadGzipFile at the container layer.
+        Stored plain it is valid UTF-8 that simply parses to zero records, so
+        it is now the OPPOSITE case — and worth pinning from that side, because
+        conflating "read fine, had nothing" with "could not be read" is exactly
+        what would inflate the unreadable count until the alarm stops meaning
+        anything.
+        """
+        root = tmp_path / 'agent-transcripts'
+        leaf = _archive_leaf(root, '2474', 'aaaa')
+        leaf.parent.mkdir(parents=True, exist_ok=True)
+        leaf.write_bytes(b'plain text that was never gzipped at all\n')
+
+        report = extract.WalkReport()
+        records = extract.extract(root, report=report)
+
+        assert records == []
+        assert report.files_walked == 1
+        assert report.files_read == 1
+        assert report.unreadable == []
+
     def test_a_corrupt_trailing_line_is_not_an_unreadable_file(self, tmp_path):
         """(f) The line/file split, pinned from the side that must NOT alarm.
 
@@ -751,7 +772,7 @@ class TestUnreadableFilesAreSkippedAndCounted:
         good = json.dumps(
             _tool_use('toolu_01', 'submit_task', {'title': 't', 'description': _TOTAL_DRIFT})
         )
-        with gzip.open(leaf, 'wt', encoding='utf-8') as handle:
+        with open(leaf, 'w', encoding='utf-8') as handle:
             handle.write(good + '\n')
             handle.write('{"type": "assistant", "tool_use": truncated mid-writ')
 
