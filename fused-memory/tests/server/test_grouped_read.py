@@ -559,6 +559,268 @@ class TestNeverSuppressCarveOuts:
         }, f'The parent must still carry the loud fault marker, got {grouped[0]!r}'
 
 
+#: A matched child body deliberately LONGER than ``_DIGEST_CHARS``, so "the
+#: pinned entry carries the FULL text" cannot pass by accident on a short body.
+_MATCHED_TEXT = 'THE MATCHED TEXT — ' + ('the correction body says otherwise. ' * 20)
+
+
+class TestSuppressionRequiresRepresentation:
+    """A child is suppressed ONLY when its parent's block demonstrably represents it.
+
+    Two live paths break the "represented" claim, and in BOTH the matched text
+    and the matched id vanished from the response entirely — the
+    "retrieval-regression branch of Option B" the PRD closes by decision:
+
+    (a) TRUNCATED AMENDMENT LIST — the backend caps the scroll BEFORE this
+        module sorts, so which cap-sized sample comes back is arbitrary and a
+        matched amendment beyond the cap simply is not in ``amendments``;
+    (b) SIGHTING-ONLY MATCH — ``build_grouped_document`` scrolls
+        ``kind='amendment'`` only, so a matched sighting can never be listed.
+
+    The fix keeps BOTH goals: the canonical still absorbs its children
+    (esc-5541 stays closed) AND the matched text stays reachable (D6), by
+    pinning the swallowed child — full body, from the hit already in hand, at
+    zero extra backend reads — into a ``matched_children`` list on the block.
+    """
+
+    _FANOUT = 50
+    _MATCHED_INDEX = 30  # beyond _AMENDMENT_DIGEST_CAP: excluded from the scroll
+
+    @classmethod
+    def _fifty_amendments(cls) -> list[dict]:
+        return [
+            _child(
+                f'44444444-4444-4444-8444-{index:012d}',
+                _CANONICAL_ID,
+                AMENDMENT_KIND,
+                _MATCHED_TEXT if index == cls._MATCHED_INDEX else f'correction {index}',
+                f'2026-08-01T00:00:{index:02d}+00:00',
+            )
+            for index in range(cls._FANOUT)
+        ]
+
+    @classmethod
+    def _matched_amendment_id(cls) -> str:
+        return f'44444444-4444-4444-8444-{cls._MATCHED_INDEX:012d}'
+
+    @staticmethod
+    def _canonical_hit(score: float = 0.9) -> MemoryResult:
+        return _result(_CANONICAL_ID, 'the canonical claim', score, metadata={'kind': 'canonical'})
+
+    @staticmethod
+    def _matched_hit(memory_id: str, kind: str, score: float, created_at: str) -> MemoryResult:
+        return _result(
+            memory_id,
+            _MATCHED_TEXT,
+            score,
+            metadata={'parent_id': _CANONICAL_ID, 'kind': kind},
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _represented_ids(block: dict) -> set:
+        """Every child id the parent's block demonstrably accounts for."""
+        return {d.get('id') for d in block.get('amendments', [])} | {
+            e.get('id') for e in block.get('matched_children', [])
+        }
+
+    @pytest.mark.asyncio
+    async def test_matched_amendment_beyond_the_cap_is_pinned_not_swallowed(self):
+        """(a) The cap-sized digest sample excludes the match — pin it, don't lose it."""
+        service = _stub_service(self._fifty_amendments())
+        matched_id = self._matched_amendment_id()
+        hits = [
+            self._canonical_hit(0.9),
+            self._matched_hit(matched_id, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:30+00:00'),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        # (i) The collapse STILL happens — esc-5541 stays closed.
+        assert [r['id'] for r in grouped] == [_CANONICAL_ID], (
+            'The canonical must still absorb its child and be emitted exactly '
+            f'once, got {[r["id"] for r in grouped]!r}'
+        )
+        block = grouped[0]['grouped']
+        assert matched_id not in {d['id'] for d in block['amendments']}, (
+            'PRECONDITION: this test is only meaningful while the matched '
+            'amendment is beyond the digest cap and therefore absent from the '
+            f'sample the backend returned, got {block["amendments"]!r}'
+        )
+        # (ii) ...and the swallowed child is genuinely REPRESENTED.
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert matched_id in pinned, (
+            'A child suppressed into its parent must appear in the block that '
+            f'replaced it, got matched_children={block.get("matched_children")!r}. '
+            'RED: nothing pins the swallowed child yet, so its id AND its text '
+            'vanish from the response entirely.'
+        )
+        entry = pinned[matched_id]
+        assert entry['content'] == _MATCHED_TEXT, (
+            'The pinned entry must carry the child FULL body: that text was in '
+            'the response BEFORE grouping, so truncating it would itself be the '
+            f'retrieval regression, got {entry!r}'
+        )
+        assert 'digest' not in entry, (
+            f'A pinned match is a full body, not a _DIGEST_CHARS digest, got {entry!r}'
+        )
+        assert entry['kind'] == AMENDMENT_KIND
+        assert entry['matched'] is True
+        assert entry['created_at'] == '2026-08-01T00:00:30+00:00'
+
+    @pytest.mark.asyncio
+    async def test_pinning_an_amendment_does_not_corrupt_the_counts(self):
+        """The exact-count API still owns amendment_count / sighting_count / truncated."""
+        service = _stub_service(
+            self._fifty_amendments()
+            + [_child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-02T00:00:00+00:00')]
+        )
+        hits = [
+            self._canonical_hit(0.9),
+            self._matched_hit(
+                self._matched_amendment_id(), AMENDMENT_KIND, 0.8, '2026-08-01T00:00:30+00:00'
+            ),
+        ]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        assert block['amendment_count'] == self._FANOUT, (
+            'amendment_count must stay the EXACT count API value, not len(digests) '
+            f'and not len(digests) + pins, got {block!r}'
+        )
+        assert len(block['amendments']) == _AMENDMENT_DIGEST_CAP, (
+            f'Pinning must not widen the bounded digest list, got {block["amendments"]!r}'
+        )
+        assert block.get('truncated') is True, (
+            'truncated must still reflect count-vs-digests — a pin is not a digest, '
+            f'got {block!r}'
+        )
+        assert block['sighting_count'] == 1, (
+            f'The exact sighting count is unaffected by amendment pinning, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_matched_sighting_is_pinned_though_the_scroll_is_amendment_only(self):
+        """(b) A sighting can NEVER appear in an amendment-only digest scroll."""
+        sightings = [_SIGHT_1, _SIGHT_2, _SIGHT_3, '33333333-3333-4333-8333-333333333334']
+        service = _stub_service(
+            [_child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-01T00:00:00+00:00')]
+            + [
+                _child(sight_id, _CANONICAL_ID, SIGHTING_KIND, 'seen again', f'2026-08-0{n + 2}T00:00:00+00:00')
+                for n, sight_id in enumerate(sightings)
+            ]
+        )
+        hits = [
+            self._canonical_hit(0.9),
+            self._matched_hit(_SIGHT_2, SIGHTING_KIND, 0.8, '2026-08-03T00:00:00+00:00'),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert [r['id'] for r in grouped] == [_CANONICAL_ID], (
+            f'The collapse must still happen for a sighting, got {[r["id"] for r in grouped]!r}'
+        )
+        block = grouped[0]['grouped']
+        assert _SIGHT_2 not in {d['id'] for d in block['amendments']}, (
+            'PRECONDITION: the digest scroll filters kind=amendment, so a sighting '
+            f'is structurally unlistable there, got {block["amendments"]!r}'
+        )
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert _SIGHT_2 in pinned, (
+            'A matched SIGHTING is swallowed with nothing to represent it — it must '
+            f'be pinned, got matched_children={block.get("matched_children")!r}'
+        )
+        assert pinned[_SIGHT_2]['content'] == _MATCHED_TEXT
+        assert pinned[_SIGHT_2]['kind'] == SIGHTING_KIND, (
+            'A sighting must be recorded AS a sighting, never misfiled as an '
+            f'amendment, got {pinned[_SIGHT_2]!r}'
+        )
+        assert pinned[_SIGHT_2]['matched'] is True
+        assert block['amendment_count'] == 1, (
+            f'A pinned sighting must never inflate amendment_count, got {block!r}'
+        )
+        assert block['sighting_count'] == len(sightings), (
+            f'sighting_count stays the exact count API value, got {block!r}'
+        )
+        assert 'truncated' not in block, (
+            'The single amendment listed completely — pinning a sighting must not '
+            f'invent a truncation marker, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_cap_matched_amendment_is_marked_in_place_not_duplicated(self):
+        """Already in `amendments` → mark it there; do not copy it into matched_children."""
+        service = _stub_service(_two_amendments_three_sightings())
+        hits = [self._canonical_hit(0.9), _child_result(_AMEND_1, 0.8)]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        by_id = {d['id']: d for d in block['amendments']}
+        assert by_id[_AMEND_1].get('matched') is True, (
+            'An in-cap matched amendment must be marked matched: True IN PLACE, '
+            f'got {by_id[_AMEND_1]!r}'
+        )
+        assert 'matched' not in by_id[_AMEND_2], (
+            'Fault/signal-only loudness: an unmatched digest omits the key entirely, '
+            f'got {by_id[_AMEND_2]!r}'
+        )
+        assert 'matched_children' not in block, (
+            'A child already represented by a digest must NOT be duplicated into a '
+            f'second list, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_same_child_hit_twice_is_pinned_once(self):
+        """Pinning dedups by id — a duplicated hit must not duplicate the entry."""
+        service = _stub_service(self._fifty_amendments())
+        matched_id = self._matched_amendment_id()
+        hits = [
+            self._canonical_hit(0.9),
+            self._matched_hit(matched_id, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:30+00:00'),
+            self._matched_hit(matched_id, AMENDMENT_KIND, 0.7, '2026-08-01T00:00:30+00:00'),
+        ]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        assert [e['id'] for e in block['matched_children']] == [matched_id], (
+            f'The same swallowed child must be pinned exactly once, got '
+            f'{block["matched_children"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_swallowed_child_appears_in_its_parents_block(self):
+        """The general property both live cases instantiate."""
+        matched_id = self._matched_amendment_id()
+        service = _stub_service(
+            self._fifty_amendments()
+            + [
+                _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-02T00:00:00+00:00'),
+                _child(_SIGHT_2, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-03T00:00:00+00:00'),
+            ]
+        )
+        in_cap_id = '44444444-4444-4444-8444-000000000002'
+        hits = [
+            self._canonical_hit(0.95),
+            self._matched_hit(matched_id, AMENDMENT_KIND, 0.9, '2026-08-01T00:00:30+00:00'),
+            self._matched_hit(_SIGHT_2, SIGHTING_KIND, 0.85, '2026-08-03T00:00:00+00:00'),
+            self._matched_hit(in_cap_id, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:02+00:00'),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        by_id = {r['id']: r for r in grouped}
+        surviving = set(by_id)
+        for hit in hits:
+            parent_id = (hit.metadata or {}).get('parent_id')
+            if parent_id is None or hit.id in surviving:
+                continue
+            block = by_id[parent_id]['grouped']
+            assert hit.id in self._represented_ids(block), (
+                f'{hit.id} was suppressed but its parent block does not represent '
+                f'it — that is a silent retrieval regression, not a grouping. Block: {block!r}'
+            )
+
+
 class TestIsContestedChild:
     """The single home of the contested predicate (leaf γ's one constant to stamp)."""
 
