@@ -83,6 +83,14 @@ def test_build_claude_argv_resume_still_passes_system_prompt_file() -> None:
     under the stock Claude Code prompt with no role charter (task 3983).  The
     sysprompt temp file is therefore created on the resume path too, and holds
     the CURRENT ``system_prompt`` argument.
+
+    Scope: the resume-SPECIFIC facts only.  The full resumed argv — every flag,
+    in order, including where the ``['--resume', <id>]`` pair sits relative to
+    the ``--system-prompt-file <path>`` pair — is pinned once, as a delta against
+    the fresh argv, by
+    ``test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt``
+    below.  Do not re-add a hard-coded expected list here: two copies of the
+    same argv shape drift, and every future flag would need editing in both.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
@@ -110,16 +118,8 @@ def test_build_claude_argv_resume_still_passes_system_prompt_file() -> None:
         # Do not "helpfully" hoist --session-id out of the branch too.
         assert '--session-id' not in cmd
 
-        expected = _normalize([
-            'claude', '--print', '--output-format', 'json',
-            '--model', 'opus',
-            '--max-budget-usd', '5.0',
-            '--system-prompt-file', temp_files[0],
-            '--resume', 'resume-abc',
-            '--permission-mode', 'bypassPermissions',
-            '--max-turns', '10',
-        ], temp_files)
-        assert _normalize(cmd, temp_files) == expected, f'got {cmd!r}'
+        assert '--resume' in cmd
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc'
     finally:
         _cleanup(temp_files)
 
@@ -132,6 +132,11 @@ def test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt() -> N
     appending it) makes the resumed argv the fresh argv with a single
     ``['--resume', <id>]`` pair spliced in.  Both arms carry the same prompt
     text to disk.
+
+    This is the SINGLE site pinning that delta — including where the resume pair
+    sits in the argv.  ``test_build_claude_argv_resume_still_passes_system_prompt_file``
+    deliberately asserts only the resume-specific facts and keeps no expected-argv
+    list of its own, so the shape never has to be edited in two places.
     """
     kwargs: dict = dict(
         model='opus',
