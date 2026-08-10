@@ -25,9 +25,11 @@ import ast
 import copy
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -35,7 +37,7 @@ from typing import Any, NamedTuple
 from fastmcp import FastMCP
 from shared.toolcall_markup import detect, repair
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +329,66 @@ def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
                 facts.append(fact)
 
     return repaired, facts
+
+
+class PlanWriteError(OSError):
+    """An atomic plan write-back failed; the target was left UNTOUCHED.
+
+    Carries the path in its message so the failure is actionable without
+    log-scraping, and is chained (``raise ... from``) to the underlying cause.
+    """
+
+
+def _verify_plan_json(path: Path) -> None:
+    """Re-read *path* and confirm it parses as JSON. Raises if it does not.
+
+    A named seam, not an inlined ``json.load``: it is the last checkpoint
+    before the swap becomes irreversible, so it must be independently
+    exercisable by a test that injects a failure there.
+    """
+    with path.open(encoding='utf-8') as handle:
+        json.load(handle)
+
+
+def _atomic_write_plan(path: Path, plan: dict) -> None:
+    """Write *plan* to *path* atomically. Returns ``None``; raises on failure.
+
+    PRD contract C3 / boundary row B12: a concurrent reader must never observe
+    a partially written plan.json. Deliberately NOT routed through
+    ``TaskArtifacts._write_json``, which is ``path.write_text`` —
+    truncate-then-write, precisely the window B12 forbids. The byte format is
+    reproduced exactly (``_schema_version`` stamp, ``json.dumps(indent=2)``
+    plus a trailing newline) so a repair write-back cannot churn formatting.
+
+    Order: serialize, write to a temp file in the target's own directory,
+    flush, fsync, VERIFY it re-parses, and only then ``os.replace``. Any
+    failure unlinks the temp and leaves the original byte-identical, then
+    raises :class:`PlanWriteError` naming the path — loud, never a silent skip.
+    """
+    plan['_schema_version'] = PLAN_SCHEMA_VERSION
+    payload = json.dumps(plan, indent=2) + '\n'
+
+    target = path
+    fd, tmp_name = tempfile.mkstemp(
+        dir=target.parent, prefix='.plan.json.', suffix='.tmp'
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _verify_plan_json(tmp_path)
+        os.replace(tmp_path, target)
+    except Exception as exc:
+        raise PlanWriteError(
+            f'atomic plan write-back to {target} failed ({exc!r}); the '
+            'existing file was left untouched'
+        ) from exc
+    finally:
+        # os.replace consumed the temp on the success path; missing_ok makes
+        # this a no-op there and a guaranteed cleanup on every failure path.
+        tmp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
