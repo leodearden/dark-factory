@@ -2362,6 +2362,128 @@ class TestStage2CycleSummaryHarnessBackstop:
         assert run.stage_reports['_error']['stage2_cycle_summary_backstop_written'] is True
 
 
+class TestStage2CycleSummaryRemediationBackstop:
+    """_run_remediation_pass's finally block fires the Stage 2 backstop too —
+    the DELIBERATE divergence from Stage 1 (task 3732).
+
+    Stage 1's arm 2 excludes RunType.remediation because its own run()
+    early-returns before its summary write on such a pass, so firing there
+    would fabricate a spurious row. Stage 2 is the exact opposite and its
+    source says so explicitly (the cross-reference comment above
+    TaskKnowledgeSync.run()'s write: the call "is unconditional — it also
+    fires on remediation passes, not just full cycles. That is intentional,
+    not a missed guard ... Do not 'fix' this to mirror Stage 1's
+    full-cycle-only gating"). A lost Stage 2 ledger write on a remediation
+    pass is therefore a genuine gap this backstop must close.
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _build_harness(journal, event_buffer, mock_memory_service, ledger_store):
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    @staticmethod
+    async def _invoke_remediation(harness):
+        from fused_memory.reconciliation.harness import TierConfig
+
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        )
+
+    @staticmethod
+    def _stage2_report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=4,
+            tokens_used=400,
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_stage2_write_failure_is_recovered(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The row is recovered on a remediation pass (where Stage 1's arm
+        deliberately does NOT fire), and the recovered row is indistinguishable
+        from what the in-stage write would have stamped — payload['remediation']
+        is True, which get_cycle_summary_presence reads to disambiguate
+        expected-missing rows."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        await self._invoke_remediation(harness)
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the remediation run to be persisted by the journal'
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=recent[0].id,
+        )
+        assert record is not None, (
+            'a lost Stage 2 ledger write on a remediation pass is a genuine gap — '
+            "Stage 2's in-stage write is unconditional by explicit design"
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['remediation'] is True, (
+            'the recovered row must carry the same remediation flag the in-stage '
+            'write would have stamped'
+        )
+        assert payload['llm_calls'] == 4, (
+            'the re-attempt must reuse the REAL report, not a zeroed synth'
+        )
+        assert payload['stats'].get('stage2_cycle_summary_write_recovered_backstop') is True
+
+    @pytest.mark.asyncio
+    async def test_remediation_happy_path_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """No remediation-specific over-firing: a pass whose Stage 2 write
+        succeeded (stat == 1) still leaves the backstop silent."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=1)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await self._invoke_remediation(harness)
+
+        mock_write.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
     """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
