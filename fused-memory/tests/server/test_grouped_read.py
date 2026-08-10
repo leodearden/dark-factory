@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.memory_metadata import KIND_REGISTRY, validate_memory_metadata
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CHILD_KINDS,
@@ -29,6 +31,7 @@ from fused_memory.server.grouped_read import (
     _DIGEST_CHARS,
     _DIGEST_ELLIPSIS,
     build_grouped_document,
+    group_search_results,
 )
 
 _PROJECT_ID = 'dark_factory'
@@ -240,6 +243,200 @@ class TestBuildGroupedDocument:
         assert [d['id'] for d in block['amendments']] == [_AMEND_1, _AMEND_2], (
             'A None created_at must sort as the empty string, not raise a '
             'TypeError comparing None to str'
+        )
+
+
+def _result(
+    memory_id: str,
+    content: str,
+    score: float,
+    *,
+    metadata: dict | None = None,
+    created_at: str | None = None,
+    source_store: SourceStore = SourceStore.mem0,
+) -> MemoryResult:
+    """A search hit, exactly as ``MemoryService.search`` returns them."""
+    return MemoryResult(
+        id=memory_id,
+        content=content,
+        source_store=source_store,
+        relevance_score=score,
+        metadata=metadata or {},
+        created_at=created_at,
+    )
+
+
+def _child_result(memory_id: str, score: float, kind: str = AMENDMENT_KIND, **extra_meta) -> MemoryResult:
+    return _result(
+        memory_id,
+        'a correction',
+        score,
+        metadata={'parent_id': _CANONICAL_ID, 'kind': kind, **extra_meta},
+    )
+
+
+def _parent_record(memory_id: str = _CANONICAL_ID, text: str = 'the canonical claim') -> dict:
+    """A raw ``get_memory_by_id`` record for the parent."""
+    return {
+        'id': memory_id,
+        'content': text,
+        'metadata': {'data': text, 'kind': 'canonical', 'topic': 'merge-lane'},
+    }
+
+
+class TestGroupSearchResults:
+    """List-level collapse: children fold into their parent's grouped hit."""
+
+    @pytest.mark.asyncio
+    async def test_child_is_dropped_when_its_parent_is_also_a_hit(self):
+        """esc-5541: an untagged child must not outrank the canonical it amends."""
+        service = _stub_service(_two_amendments_three_sightings())
+        hits = [
+            _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'}),
+            _child_result(_AMEND_1, 0.8),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 1, (
+            f'The child must fold into its parent, leaving ONE hit, got {grouped!r}. '
+            'RED: group_search_results does not exist yet.'
+        )
+        assert grouped[0]['id'] == _CANONICAL_ID
+        assert grouped[0]['grouped']['sighting_count'] == 3
+        assert len(grouped[0]['grouped']['amendments']) == 2
+
+    @pytest.mark.asyncio
+    async def test_child_only_match_resolves_upward_to_the_parent(self):
+        """D6: a child's content is never unreachable — the group takes its rank."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            parents={_CANONICAL_ID: _parent_record()},
+        )
+        hits = [_child_result(_AMEND_1, 0.77)]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 1, f'Expected the parent to take the hit slot, got {grouped!r}'
+        promoted = grouped[0]
+        assert promoted['id'] == _CANONICAL_ID, (
+            f'A child-only match must resolve UPWARD to its parent, got {promoted!r}'
+        )
+        assert promoted['content'] == 'the canonical claim', (
+            'The promoted hit must carry the PARENT\'s content, not the child\'s'
+        )
+        assert promoted['grouped']['sighting_count'] == 3
+        assert promoted['relevance_score'] == pytest.approx(0.77), (
+            'The promoted parent occupies the CHILD\'s rank position and score'
+        )
+        service.get_memory_by_id.assert_awaited_once_with(
+            project_id=_PROJECT_ID, memory_id=_CANONICAL_ID
+        )
+
+    @pytest.mark.asyncio
+    async def test_parent_reached_twice_is_emitted_once_with_the_higher_score(self):
+        """Direct hit + upward resolution must not double-list the same parent."""
+        service = _stub_service(
+            _two_amendments_three_sightings(),
+            parents={_CANONICAL_ID: _parent_record()},
+        )
+        hits = [
+            _child_result(_AMEND_1, 0.95),
+            _result(_CANONICAL_ID, 'the canonical claim', 0.4, metadata={'kind': 'canonical'}),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 1, f'The parent must be emitted EXACTLY once, got {grouped!r}'
+        assert grouped[0]['id'] == _CANONICAL_ID
+        assert grouped[0]['relevance_score'] == pytest.approx(0.95), (
+            'Dedup must keep the HIGHER relevance_score of the two routes, got '
+            f"{grouped[0]['relevance_score']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_surviving_order_is_preserved_and_the_list_never_grows(self):
+        """Relative rank order survives; grouping only ever shortens the list."""
+        service = _stub_service(_two_amendments_three_sightings())
+        hits = [
+            _result('55555555-5555-4555-8555-555555555551', 'unrelated a', 0.99),
+            _child_result(_AMEND_1, 0.85),
+            _result(_CANONICAL_ID, 'the canonical claim', 0.8, metadata={'kind': 'canonical'}),
+            _result('55555555-5555-4555-8555-555555555552', 'unrelated b', 0.7),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) <= len(hits), 'Grouping must never GROW the result list'
+        assert [r['id'] for r in grouped] == [
+            '55555555-5555-4555-8555-555555555551',
+            _CANONICAL_ID,
+            '55555555-5555-4555-8555-555555555552',
+        ], (
+            'Survivors must keep their relative order, with the group occupying the '
+            f'best rank any of its members held, got {[r["id"] for r in grouped]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_grouping_is_keyed_strictly_on_parent_id_not_topic(self):
+        """D5: a shared `topic` is NOT a grouping key — only parent_id is."""
+        service = _stub_service([])
+        peer_a = '66666666-6666-4666-8666-666666666661'
+        peer_b = '66666666-6666-4666-8666-666666666662'
+        hits = [
+            _result(peer_a, 'first note', 0.9, metadata={'topic': 'merge-lane'}),
+            _result(peer_b, 'second note', 0.8, metadata={'topic': 'merge-lane'}),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert [r['id'] for r in grouped] == [peer_a, peer_b], (
+            'Two entries sharing only a topic are independent peers and must both '
+            f'survive as top-level hits, got {grouped!r}'
+        )
+        assert service.get_memory_by_id.await_count == 0, (
+            'A topic is not a parent pointer — no upward resolution may be attempted'
+        )
+
+    @pytest.mark.asyncio
+    async def test_result_dicts_keep_the_model_dump_shape(self):
+        """Grouped output is model_dump()-shaped, so the wire contract is unchanged."""
+        service = _stub_service([])
+        hit = _result('77777777-7777-4777-8777-777777777771', 'plain', 0.5)
+
+        grouped = await group_search_results(service, _PROJECT_ID, [hit])
+
+        assert grouped[0] == hit.model_dump(), (
+            'A childless, non-child result must dump EXACTLY as today — no grouped '
+            f'key, no reshaping, got {grouped[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_graphiti_results_cost_no_child_probe(self):
+        """Only Mem0 points can be parents, so a graph edge is never probed.
+
+        ``parent_id`` liveness resolves through ``Mem0Backend.get_point_by_id``
+        (memory_service's write seam, task 3197), so a Graphiti edge uuid can
+        never be a live parent — probing one would be a guaranteed-zero Qdrant
+        count per graph hit on every search.
+        """
+        service = _stub_service([])
+        hits = [
+            _result(
+                '88888888-8888-4888-8888-888888888881',
+                'an edge fact',
+                0.9,
+                source_store=SourceStore.graphiti,
+            )
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 1
+        assert 'grouped' not in grouped[0]
+        assert service.count_memories_by_metadata.await_count == 0, (
+            'A Graphiti-sourced hit must issue no child count at all, got '
+            f'{service.count_memories_by_metadata.await_args_list!r}'
         )
 
 
