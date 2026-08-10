@@ -1958,6 +1958,121 @@ class TestAlarmVerifyWorktreeContention:
 # ---------------------------------------------------------------------------
 # 1795/step-9 RED: RU branch of _finalize_inflight wired to tracker + alarm
 # ---------------------------------------------------------------------------
+#
+# task 3251/pre-1: the two builders below were promoted verbatim out of
+# ``TestFinalizeInflightRunnerUnavailableEscalation`` to module level so the
+# worktree-ledger class further down can reuse them instead of re-scaffolding a
+# worker/entry/allocator triple.  The class's methods now delegate here and its
+# tests are behaviourally unchanged; the only additions are the two defaulted
+# keyword args on ``_make_ru_entry`` (``merge_wt`` so a caller can supply a REAL
+# directory — MagicMock has no mtime for os.utime / no Path.resolve() — and
+# ``spec_warm`` so the warm ``_spec-``-lane RU case can be constructed).
+
+
+def _make_ru_worker(*, escalate_after_n=2):
+    """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
+    import asyncio
+
+    from orchestrator.merge_queue import SpeculativeMergeWorker
+
+    git_ops = _make_git_ops_mock()
+    git_ops.project_root = None  # no real git needed for this test
+    q: asyncio.Queue = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+    worker._unreachable_escalate_after_n = escalate_after_n
+
+    # Fake escalation queue
+    eq = _FakeEscalationQueue(open_l1=False)
+    worker._escalation_queue = eq
+
+    # Fake host allocator with async quarantine_and_release
+    fake_alloc = MagicMock()
+    fake_alloc.quarantine_and_release = AsyncMock()
+    fake_alloc.release = AsyncMock()
+    fake_alloc.cancel_and_release = AsyncMock()
+    worker._host_allocator = fake_alloc
+
+    return worker, eq, fake_alloc
+
+
+def _make_ru_entry(worker, host_name, *, reason='ssh timeout', merge_wt=None, spec_warm=False):
+    """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE.
+
+    Registers the item in ``worker._lifecycle`` at VERIFYING first (task
+    2169 kappa): production always reaches ``_finalize_inflight`` via the
+    registered DISPATCHING -> VERIFYING dispatch path, so an unregistered
+    entry here would spuriously fire the best-effort-loud
+    "rejected transition" escalation on every kappa-wired
+    ``_note_transition`` call inside the RUNNER_UNAVAILABLE branch,
+    polluting ``eq.submitted`` for tests that count escalations.
+
+    Args:
+        merge_wt: real ``Path`` to use as the item's merge worktree.  Defaults
+            to a ``MagicMock()`` (sufficient for the escalation-wiring tests,
+            which never touch the path); ledger tests pass a real directory so
+            ``os.utime`` / ``Path.resolve()`` / ``snapshot()`` are meaningful.
+        spec_warm: threaded into the ``InflightVerifyResult`` so the warm
+            ``_spec-``-lane RU case (LOCAL lease → pool INV-2 gate raises
+            ``RunnerUnavailable`` after the warm swap already ran) is buildable.
+    """
+    import asyncio
+
+    from orchestrator.merge_queue import (
+        InflightEntry,
+        InflightStatus,
+        InflightVerifyResult,
+        ItemLifecycleState,
+        MergeRequest,
+        RealMergeItem,
+    )
+    from orchestrator.verify_runner import HostLease
+
+    loop = asyncio.get_running_loop()
+    req = MergeRequest(
+        task_id='task-ru',
+        branch=QueuedBranch.parse('task/ru', 'task/'),
+        worktree=MagicMock(),
+        pre_rebased=False,
+        task_files=[],
+        module_configs=[],
+        config=_make_config(),
+        result=loop.create_future(),
+    )
+
+    fake_runner = MagicMock()
+    fake_runner.name = host_name
+    fake_runner.is_local = False
+    lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
+
+    merge_result = MagicMock()
+    merge_result.merge_commit = 'deadbeefdeadbeef1234'
+
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=MagicMock() if merge_wt is None else merge_wt,
+        base_sha='base123',
+        speculative=False,
+    )
+    worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+    async def _fake_ru_verify():
+        return InflightVerifyResult(
+            outcome=None,
+            merge_wt=item.merge_wt,
+            status=InflightStatus.RUNNER_UNAVAILABLE,
+            reason=reason,
+            spec_warm=spec_warm,
+        )
+
+    verify_task = asyncio.ensure_future(_fake_ru_verify())
+    return InflightEntry(
+        item=item,
+        lease=lease,
+        verify_task=verify_task,
+        merge_wt=item.merge_wt,
+        was_speculative=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -1968,98 +2083,12 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     """
 
     def _make_worker(self, *, escalate_after_n=2):
-        """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
-        import asyncio
-
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
-        git_ops = _make_git_ops_mock()
-        git_ops.project_root = None  # no real git needed for this test
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        worker._unreachable_escalate_after_n = escalate_after_n
-
-        # Fake escalation queue
-        eq = _FakeEscalationQueue(open_l1=False)
-        worker._escalation_queue = eq
-
-        # Fake host allocator with async quarantine_and_release
-        fake_alloc = MagicMock()
-        fake_alloc.quarantine_and_release = AsyncMock()
-        fake_alloc.release = AsyncMock()
-        fake_alloc.cancel_and_release = AsyncMock()
-        worker._host_allocator = fake_alloc
-
-        return worker, eq, fake_alloc
+        """Delegate to the module-level builder (task 3251/pre-1)."""
+        return _make_ru_worker(escalate_after_n=escalate_after_n)
 
     def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
-        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE.
-
-        Registers the item in ``worker._lifecycle`` at VERIFYING first (task
-        2169 kappa): production always reaches ``_finalize_inflight`` via the
-        registered DISPATCHING -> VERIFYING dispatch path, so an unregistered
-        entry here would spuriously fire the best-effort-loud
-        "rejected transition" escalation on every kappa-wired
-        ``_note_transition`` call inside the RUNNER_UNAVAILABLE branch,
-        polluting ``eq.submitted`` for tests that count escalations.
-        """
-        import asyncio
-
-        from orchestrator.merge_queue import (
-            InflightEntry,
-            InflightStatus,
-            InflightVerifyResult,
-            ItemLifecycleState,
-            MergeRequest,
-            RealMergeItem,
-        )
-        from orchestrator.verify_runner import HostLease
-
-        loop = asyncio.get_running_loop()
-        req = MergeRequest(
-            task_id='task-ru',
-            branch=QueuedBranch.parse('task/ru', 'task/'),
-            worktree=MagicMock(),
-            pre_rebased=False,
-            task_files=[],
-            module_configs=[],
-            config=_make_config(),
-            result=loop.create_future(),
-        )
-
-        fake_runner = MagicMock()
-        fake_runner.name = host_name
-        fake_runner.is_local = False
-        lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
-
-        merge_result = MagicMock()
-        merge_result.merge_commit = 'deadbeefdeadbeef1234'
-
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=MagicMock(),
-            base_sha='base123',
-            speculative=False,
-        )
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
-
-        async def _fake_ru_verify():
-            return InflightVerifyResult(
-                outcome=None,
-                merge_wt=item.merge_wt,
-                status=InflightStatus.RUNNER_UNAVAILABLE,
-                reason=reason,
-            )
-
-        verify_task = asyncio.ensure_future(_fake_ru_verify())
-        return InflightEntry(
-            item=item,
-            lease=lease,
-            verify_task=verify_task,
-            merge_wt=item.merge_wt,
-            was_speculative=False,
-        )
+        """Delegate to the module-level builder (task 3251/pre-1)."""
+        return _make_ru_entry(worker, host_name, reason=reason)
 
     async def test_quarantine_and_release_still_runs(self):
         """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
