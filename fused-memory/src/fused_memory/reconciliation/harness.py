@@ -3310,6 +3310,20 @@ class ReconciliationHarness:
         so BOTH arms are hard-gated on the ``task_knowledge_sync`` key being
         PRESENT in ``run.stage_reports``.
 
+        That presence gate is what makes fabrication structurally impossible,
+        and it is exact rather than heuristic: both drivers assign
+        ``run.stage_reports[key] = report`` strictly AFTER ``stage.run()``
+        RETURNS, and :meth:`~fused_memory.reconciliation.stages.base.BaseStage.run`
+        re-raises ``CancelledError`` without returning a partial report — so
+        an absent key is proof Stage 2 produced no report, never merely a
+        bookkeeping gap. (``_run_remediation_pass``'s scope-freshness
+        short-circuit returns before its ``try:`` block, so its ``finally``
+        is never reached on that path either.) A SECOND population the
+        presence gate alone would not exclude — a Stage 2 that started, was
+        recorded, but died before reaching its own write — is excluded by
+        :func:`_stage2_ledger_write_missing` treating an ABSENT
+        ``stage2_cycle_summary_ledger_written`` stat as no-fire.
+
         - **Write-recovered arm** — Stage 2 completed and DID return a real
           report, but its own in-stage ledger upsert failed transiently
           (``write_cycle_summary``'s ``ledger.upsert`` caught the failure,
