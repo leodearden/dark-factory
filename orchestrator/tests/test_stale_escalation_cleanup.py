@@ -87,6 +87,24 @@ class TestDismissStaleEscalations:
         resolution_msg = call_args[0][0]
         assert 'stale' in resolution_msg.lower() or 'prior' in resolution_msg.lower()
 
+    async def test_strand_age_threshold_anchored_to_orphan_l0_timeout(self, harness: Harness):
+        """The strand threshold reuses the operator-tuned orphan_l0_timeout_secs.
+
+        This is an ANCHOR, not a new guessed constant (task 3172): the repo
+        already ships an operator-tuned "an unattended L0 this old is overdue"
+        bound, and the sweep borrows its VALUE rather than minting a second
+        knob that would need its own reload tier.
+        """
+        mock_queue = MagicMock()
+        mock_queue.dismiss_all_pending.return_value = 0
+        harness._escalation_queue = mock_queue
+
+        await harness._dismiss_stale_escalations()
+
+        kwargs = mock_queue.dismiss_all_pending.call_args.kwargs
+        assert kwargs['strand_age_secs'] == harness.config.orphan_l0_timeout_secs
+        assert kwargs['strand_age_secs'] is not None
+
     async def test_dismissal_count_logged(self, harness: Harness, caplog):
         """When escalations are dismissed, count is logged at INFO level."""
         mock_queue = MagicMock()
