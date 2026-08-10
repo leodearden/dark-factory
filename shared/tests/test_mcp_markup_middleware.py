@@ -237,6 +237,9 @@ def build_harness(
         content: str,
         category: str | None = None,
         project_id: str | None = None,
+        # The real add_memory takes BOTH, which is what makes the identity
+        # precedence a real question rather than a hypothetical one.
+        project_root: str | None = None,
         agent_id: str | None = None,
     ) -> str:
         rec.record(
@@ -244,6 +247,7 @@ def build_harness(
             content=content,
             category=category,
             project_id=project_id,
+            project_root=project_root,
             agent_id=agent_id,
         )
         return 'mem_1'
@@ -1106,3 +1110,420 @@ class TestB9RecoveredNameCollidesWithASuppliedArgument:
             )
             assert h.recorder.args['agent_id'] == 'claude-from-the-tail'
         assert h.escalations == [], 'a repairable value is not residue'
+
+
+# ---------------------------------------------------------------------------
+# INV-2 — structured facts. No consumer log-scrapes.
+# ---------------------------------------------------------------------------
+
+
+#: The eight keys PRD section 6 contracts for ``markup_detected``, plus the key
+#: naming the fact itself. Asserted as an EXACT set, which catches drift in both
+#: directions: a missing key sends a consumer back to log-scraping, and an extra
+#: value-bearing key would turn the fact stream into a second copy of the
+#: caller's payload.
+FACT_KEYS = {
+    'fact',
+    'tool',
+    'param',
+    'pattern',
+    'misclose',
+    'outcome',
+    'recovered_params',
+    'agent_id',
+    'project',
+}
+
+
+class TestINV2StructuredFacts:
+    """Every outcome emits one ``markup_detected``, complete enough to consume.
+
+    PRD section 2.2's whole diagnosis failure was that the write-time guard's
+    account of a leak was ambiguous — it enumerated one closing tag, so a
+    mis-closed ``description`` could not report its own tag and the guard blamed
+    whatever followed. A fact stream that made an operator reconstruct that from
+    log lines would rebuild the same ambiguity one layer up.
+    """
+
+    # -- one fact per outcome, and the vocabulary is closed ----------------
+
+    async def test_a_forwarded_repair_emits_repaired(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info',
+            {'summary': 'It stranded', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+        assert [f['outcome'] for f in h.facts] == ['repaired']
+
+    async def test_a_rejected_repair_emits_rejected(self):
+        """SAME repair, other tier. The tier names the outcome, not the damage."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'escalate_info',
+                {'summary': 'It stranded', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+            )
+
+        assert [f['outcome'] for f in h.facts] == ['rejected']
+
+    @BOTH_POLICIES
+    async def test_an_unrepairable_value_emits_unrepairable_under_both_tiers(self, policy):
+        h = build_harness(policy)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert [f['outcome'] for f in h.facts] == ['unrepairable']
+
+    async def test_the_outcome_vocabulary_is_exactly_these_three(self):
+        """A closed vocabulary, exported so INV-2's facts and INV-4's storm key
+        read it from ONE place and cannot drift apart."""
+        from shared.mcp_markup_middleware import OUTCOMES
+
+        assert set(OUTCOMES) == {'repaired', 'rejected', 'unrepairable'}
+        assert len(OUTCOMES) == 3
+
+    async def test_every_emitted_outcome_is_in_the_declared_vocabulary(self):
+        """The vocabulary is not merely declared — it is what the code emits."""
+        from shared.mcp_markup_middleware import OUTCOMES
+
+        seen = set()
+        for policy in RepairPolicy:
+            forward = build_harness(policy)
+            try:
+                await forward.call(
+                    'escalate_info',
+                    {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+                )
+            except ToolError:
+                pass
+            refuse = build_harness(policy)
+            with pytest.raises(ToolError):
+                await refuse.call(
+                    'add_reuse_item',
+                    {
+                        'what': 'w',
+                        'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                        'where': 'shared/',
+                    },
+                )
+            seen |= {f['outcome'] for f in forward.facts + refuse.facts}
+
+        assert seen == set(OUTCOMES), 'every declared outcome is reachable, and only those'
+
+    # -- shape completeness on all three paths -----------------------------
+
+    async def test_the_repaired_fact_is_shape_complete(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info',
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+        assert set(h.facts[0]) == FACT_KEYS
+
+    async def test_the_rejected_fact_is_shape_complete(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call('submit_task', {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION})
+
+        assert set(h.facts[0]) == FACT_KEYS
+
+    async def test_the_unrepairable_fact_is_shape_complete(self):
+        """Complete even where the answer is ``None``.
+
+        There is no accepted mis-close on this path — that IS why it is
+        unrepairable — so ``misclose`` is present and null rather than absent. A
+        consumer must never have to distinguish "no mis-close" from "this
+        emitter forgot the key".
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert set(h.facts[0]) == FACT_KEYS
+        assert h.facts[0]['misclose'] is None
+        assert h.facts[0]['recovered_params'] == []
+
+    async def test_the_fact_names_itself(self):
+        """So a multiplexed sink does not have to infer the record's type."""
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info',
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+        assert h.facts[0]['fact'] == 'markup_detected'
+
+    async def test_the_fact_locates_the_leak_by_tool_and_param(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info',
+            {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL},
+        )
+
+        assert h.facts[0]['tool'] == 'escalate_info'
+        assert h.facts[0]['param'] == 'detail'
+
+    # -- recovered_params: NAMES, never values -----------------------------
+
+    async def test_recovered_params_carries_names_only(self):
+        """The fact stream must not become a second copy of the caller's payload.
+
+        Names are what a consumer needs to see WHICH parameters a leak is
+        eating; the values are the caller's data, and this stream is not the
+        place it survives — that is the residue escalation's job, on the one
+        path where the data would otherwise be lost.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'submit_task',
+                {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+            )
+
+        assert h.facts[0]['recovered_params'] == ['priority']
+        assert 'low' not in json.dumps(h.facts[0]), 'the recovered VALUE leaked into the fact'
+
+    async def test_recovered_params_never_carries_the_absorbing_value_either(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'submit_task',
+                {'title': 'A task', 'description': TestB2TotalDrift.DESCRIPTION},
+            )
+
+        assert sorted(h.facts[0]['recovered_params']) == ['agent_id', 'metadata', 'priority']
+        serialized = json.dumps(h.facts[0])
+        assert 'claude-x' not in serialized
+        assert 'Fix it.' not in serialized
+
+    async def test_recovered_params_is_empty_for_the_last_parameter_case(self):
+        """B4 recovers nothing, and an empty list is the honest report of that.
+
+        Omitting the key would make "nothing was swallowed" indistinguishable
+        from "this path forgot to say".
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory', {'content': TestB4LastParameterNothingDropped.CONTENT})
+
+        assert h.facts[0]['recovered_params'] == []
+        assert h.facts[0]['outcome'] == 'repaired'
+
+    # -- pattern vs misclose: the diagnostic 2.2 could not produce ---------
+
+    async def test_pattern_and_misclose_are_different_questions(self):
+        """``pattern`` is the literal detect() matched; ``misclose`` is the tag
+        that actually drifted — verbatim, INCLUDING the dialect blend's stray
+        quote, which is not an envelope literal at all.
+
+        PRD section 2.2: the old guard enumerated one closing tag, so a
+        mis-closed ``description`` could not report its own tag and the guard
+        blamed whatever happened to follow it. Collapsing these two into one
+        field would rebuild exactly that ambiguity.
+        """
+        blended = (
+            'Do the thing.'
+            + '\x3c/description">'
+            + '\n' + _canonical_opener('priority') + 'low'
+        )
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call('submit_task', {'title': 'A task', 'description': blended})
+
+        assert h.facts[0]['misclose'] == '\x3c/description">'
+        assert h.facts[0]['pattern'] == '\x3cparameter name='
+        assert h.facts[0]['pattern'] != h.facts[0]['misclose']
+
+    async def test_the_unrepairable_fact_still_names_the_matched_pattern(self):
+        """A refusal that could not say WHAT it saw would be unactionable."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert h.facts[0]['pattern'] == INVOKE_CLOSER
+
+    # -- identity: read from the call's own arguments -----------------------
+
+    async def test_agent_id_comes_from_the_calls_own_argument(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'add_memory',
+            {
+                'content': TestB4LastParameterNothingDropped.CONTENT,
+                'agent_id': 'claude-task-3689-implementer',
+            },
+        )
+
+        assert h.facts[0]['agent_id'] == 'claude-task-3689-implementer'
+
+    async def test_agent_id_is_none_when_the_caller_supplied_none(self):
+        """None, not a placeholder. An unattributed leak is a real state, and
+        inventing an attribution would point an operator at an innocent agent."""
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory', {'content': TestB4LastParameterNothingDropped.CONTENT})
+
+        assert h.facts[0]['agent_id'] is None
+
+    async def test_project_root_is_the_project(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info',
+            {
+                'summary': 's',
+                'detail': TestB3StrandRiskTierForwards.DETAIL,
+                'project_root': '/home/leo/src/dark-factory',
+            },
+        )
+
+        assert h.facts[0]['project'] == '/home/leo/src/dark-factory'
+
+    async def test_project_id_is_used_when_there_is_no_project_root(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'add_memory',
+            {
+                'content': TestB4LastParameterNothingDropped.CONTENT,
+                'project_id': 'dark_factory',
+            },
+        )
+
+        assert h.facts[0]['project'] == 'dark_factory'
+
+    async def test_project_root_WINS_when_both_are_supplied(self):
+        """A declared precedence, not an accident of dict order.
+
+        project_root is the label MarkupStormCounter already keys on and the one
+        an escalation queue is addressed by, so a burst attributed here lands in
+        the same queue attribution the write-time tripwire would have chosen.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'add_memory',
+            {
+                'content': TestB4LastParameterNothingDropped.CONTENT,
+                'project_id': 'dark_factory',
+                'project_root': '/home/leo/src/dark-factory',
+            },
+        )
+
+        assert h.facts[0]['project'] == '/home/leo/src/dark-factory'
+
+    async def test_project_is_none_when_neither_is_resolvable(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory', {'content': TestB4LastParameterNothingDropped.CONTENT})
+
+        assert h.facts[0]['project'] is None
+
+    # -- the sink is additive, on every path -------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_raising_fact_sink_does_not_change_a_repair(self, policy):
+        """The outcome is already decided by the time the fact is emitted.
+
+        A sink outage must cost an operator visibility, not turn a working
+        guard into an outage of its own.
+        """
+        def boom(fact):
+            raise RuntimeError('fact stream unavailable')
+
+        h = build_harness(policy, fact_sink=boom)
+        payload = {'summary': 's', 'detail': TestB3StrandRiskTierForwards.DETAIL}
+
+        if policy is RepairPolicy.FORWARD_REPAIR:
+            await h.call('escalate_info', payload)
+            assert h.recorder.args['suggested_action'] == 'do the thing'
+        else:
+            with pytest.raises(ToolError) as excinfo:
+                await h.call('escalate_info', payload)
+            assert _reject_payload(excinfo)['outcome'] == 'rejected'
+            assert h.recorder.calls == []
+
+    @BOTH_POLICIES
+    async def test_a_raising_fact_sink_does_not_change_a_refusal(self, policy):
+        def boom(fact):
+            raise RuntimeError('fact stream unavailable')
+
+        h = build_harness(policy, fact_sink=boom)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+        assert h.recorder.calls == []
+        assert len(h.escalations) == 1, (
+            'a failed fact must not suppress the residue escalation — they are '
+            'independent channels and the payload only survives in one of them'
+        )
+
+    # -- the two non-events ------------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_an_exemption_and_an_override_stay_out_of_the_fact_stream(self, policy):
+        """B7 and B6 re-asserted against the fact contract itself.
+
+        Both are DECLARATIONS that the markup is not a leak. The stream measures
+        leaks, so recording them would make it measure author intent instead —
+        and the 0.26% corruption rate it exists to track would be unreadable.
+        """
+        h = build_harness(policy, exempt_tools=frozenset({'scan_memory_content'}))
+
+        await h.call('scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER})
+        await h.call(
+            'submit_task',
+            {
+                'title': 't',
+                'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
+                'metadata': {'allow_mcp_markup': True},
+            },
+        )
+
+        assert h.facts == []
+        assert h.escalations == []
