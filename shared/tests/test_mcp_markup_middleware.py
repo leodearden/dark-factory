@@ -273,6 +273,21 @@ def build_harness(
     return Harness(mcp, rec, facts, escalations)
 
 
+def meta_of(result: Any) -> dict[str, Any]:
+    """The forwarded result's ``meta``, asserting there is one at all.
+
+    ``meta`` is Optional on the wire type — a tool result legitimately carries
+    none — so every read below goes through here rather than subscripting it
+    directly. That buys two things at once: the type checker stops reporting
+    ``reportOptionalSubscript`` on five call sites, and a middleware that
+    dropped meta wholesale fails with the sentence below instead of an
+    unattributable ``TypeError: 'NoneType' object is not subscriptable``.
+    """
+    meta = result.meta
+    assert meta is not None, 'the forwarded result carried no meta at all'
+    return meta
+
+
 BOTH_POLICIES = pytest.mark.parametrize(
     'policy',
     [RepairPolicy.REJECT_WITH_REPAIR, RepairPolicy.FORWARD_REPAIR],
@@ -750,7 +765,7 @@ class TestB3StrandRiskTierForwards:
         """
         _, result = await self._forward()
 
-        warning = result.meta['markup_repair']
+        warning = meta_of(result)['markup_repair']
         assert warning['field'] == 'detail'
         assert warning['recovered_params'] == ['suggested_action']
         assert warning['outcome'] == 'repaired'
@@ -758,7 +773,7 @@ class TestB3StrandRiskTierForwards:
     async def test_the_warning_names_the_pattern_and_the_misclose(self):
         _, result = await self._forward()
 
-        warning = result.meta['markup_repair']
+        warning = meta_of(result)['markup_repair']
         assert warning['matched_pattern'] == INVOKE_CLOSER
         assert warning['misclose'] == _closer('detail')
 
@@ -770,7 +785,7 @@ class TestB3StrandRiskTierForwards:
         """
         _, result = await self._forward()
 
-        assert result.meta.get('fastmcp') == {'wrap_result': True}
+        assert meta_of(result).get('fastmcp') == {'wrap_result': True}
 
 
 class TestB4LastParameterNothingDropped:
@@ -796,7 +811,7 @@ class TestB4LastParameterNothingDropped:
 
         result = await h.call('add_memory', {'content': self.CONTENT})
 
-        warning = result.meta['markup_repair']
+        warning = meta_of(result)['markup_repair']
         assert warning['recovered_params'] == []
         assert warning['outcome'] == 'repaired'
 
@@ -806,7 +821,7 @@ class TestB4LastParameterNothingDropped:
 
         result = await h.call('add_memory', {'content': self.CONTENT})
 
-        assert 'markup_repair' in result.meta
+        assert 'markup_repair' in meta_of(result)
 
     async def test_the_same_input_is_REJECTED_under_the_other_tier(self):
         """The TIER decides, not the shape of the repair.

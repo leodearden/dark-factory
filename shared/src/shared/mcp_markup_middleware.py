@@ -51,8 +51,17 @@ instead of by filesystem archaeology.
    ``tool.parameters['properties'].keys()`` — not the object itself.
 3. Middleware is BYPASSED by ``tool.fn(...)``, ``await tool.run({...})`` and
    ``server._tool_manager.call_tool(...)`` — the repo's two established
-   in-process idioms. Only a ``Client``-driven call exercises this module. See
-   ``shared/tests/test_mcp_markup_middleware.py``.
+   in-process idioms. Only a ``Client``-driven call exercises this module, so a
+   test written either of the established ways would pass while running none of
+   the code below.
+
+Both test modules therefore drive a Client over a toy server:
+``test_mcp_markup_middleware.py`` pins the hand-authored boundary rows B1-B10
+(where a human decided the right answer), and
+``test_mcp_markup_middleware_corpus.py`` replays the committed corpus of real
+leaked calls through this same boundary (where the expectations are
+machine-generated, so it pins regression-stability and the non-circular
+guarantee that nothing still tripping :func:`detect` ever escapes).
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
