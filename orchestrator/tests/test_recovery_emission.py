@@ -440,11 +440,17 @@ class TestRecoveryVetoStreakTrackerSpan:
         return _tracker(clock=lambda: next(seq))
 
     def test_span_measures_from_the_first_observation_of_the_streak(self):
+        """Not from the most recent one — the span is the whole hold.
+
+        A QUIET repeat reads no clock at all (the origin is stamped on the
+        streak, not per observation), so this sequence supplies exactly two
+        readings: the streak origin and the span measurement.
+        """
         from orchestrator.recovery_emission import RecoverySite
 
-        tracker = self._seq_tracker([100.0, 400.0, 1900.0])
+        tracker = self._seq_tracker([100.0, 1900.0])
         tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')  # t=100
-        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')  # t=400
+        tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')  # quiet repeat
         assert tracker.span(RecoverySite.reconcile_sweep, '3535') == 1800.0  # t=1900
 
     def test_span_is_zero_for_an_unknown_key(self):

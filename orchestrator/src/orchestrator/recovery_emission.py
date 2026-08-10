@@ -92,6 +92,9 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,11 +102,14 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'LeaveReason',
+    'Observation',
     'RecoverySite',
+    'RecoveryVetoStreakTracker',
     'build_recovery_payload',
     'emit_recovery_event',
     'escalation_ages_secs',
     'render_shape',
+    'should_emit_event',
 ]
 
 
@@ -377,3 +383,183 @@ def emit_recovery_event(
         )
         return False
     return True
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One site's observation of one task's veto, folded into its streak.
+
+    Returned by :meth:`RecoveryVetoStreakTracker.observe` so a caller can both
+    decide whether to emit (:func:`should_emit_event`) and charge the streak
+    alarm from a single call.
+    """
+
+    site: RecoverySite
+    task_id: str
+    #: The veto SIGNATURE — ``reason|shape|sorted ids``.  Two observations with
+    #: equal signatures are the SAME hold seen twice; an unequal one is a new
+    #: fact and restarts the streak.
+    signature: str
+    #: Consecutive observations of this identical signature, starting at 1.
+    streak: int
+    #: True when this observation started a streak (new key, or a signature
+    #: that differs from the one held).
+    changed: bool
+
+
+@dataclass
+class _Streak:
+    """One ``(site, task_id)``'s live veto streak."""
+
+    signature: str
+    count: int
+    #: Clock reading at the FIRST observation of this streak.  Held on the
+    #: streak (not per-observation) so the span measures the whole hold, and
+    #: dropped with it on reset.
+    started_at: float
+
+
+class RecoveryVetoStreakTracker:
+    """Counts CONSECUTIVE IDENTICAL vetoes, per ``(site, task_id)``, with span.
+
+    Pure in-memory state with no I/O — the harness and the scheduler each own
+    one instance for the life of the process.  Modelled member-for-member on
+    ``zero_progress_requeue.ZeroProgressRequeueTracker``; see this module's
+    docstring for why the mechanism exists at all.
+
+    Keyed on ``(site, task_id)`` rather than ``task_id`` alone because the five
+    sites run at wildly different frequencies: ``already_landed_gate`` and
+    ``scheduler_blocked_redispatch`` fire per dispatch TICK while the reconcile
+    sweep fires every ``stranded_reconcile_interval_secs``.  A shared counter
+    would let a tick site drive a sweep site's streak past the alarm threshold
+    within seconds of a strand appearing.
+
+    Deliberately NOT durable.  A fleet restart re-arms every signature, so the
+    first post-deploy sweep re-emits for every live strand — precisely the D5
+    "name each currently-stranded task's pinning escalation ids" signal, not a
+    lost-state bug.
+
+    Args:
+        clock: Monotonic seconds source, injected for testability.
+            ``time.monotonic`` (not wall clock) so a span cannot be corrupted
+            by an NTP step or a DST jump during a multi-week run.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        #: (site, task_id) -> live streak.  Entries are POPPED by :meth:`clear`
+        #: rather than zeroed, so the dict stays proportional to the tasks
+        #: CURRENTLY held (zero, on a healthy fleet) instead of growing one
+        #: entry per task ever swept over a weeks-long run.
+        self._streaks: dict[tuple[str, str], _Streak] = {}
+
+    @staticmethod
+    def _key(site: RecoverySite | str, task_id: str) -> tuple[str, str]:
+        return (str(site), str(task_id))
+
+    def observe(
+        self,
+        site: RecoverySite | str,
+        task_id: str,
+        signature: str,
+    ) -> Observation:
+        """Fold one observed veto into ``(site, task_id)``'s streak.
+
+        Args:
+            site: Which veto/LEAVE site is speaking.
+            task_id: The task being held.
+            signature: The veto signature (``reason|shape|sorted ids``).  Equal
+                signatures accumulate; an unequal one RESTARTS the streak, so
+                an alarm only ever describes N genuinely identical holds.
+
+        Returns:
+            The :class:`Observation`, carrying the new streak and whether this
+            observation was a transition.
+        """
+        key = self._key(site, task_id)
+        live = self._streaks.get(key)
+        if live is None or live.signature != signature:
+            self._streaks[key] = _Streak(
+                signature=signature, count=1, started_at=self._clock(),
+            )
+            changed = True
+            count = 1
+        else:
+            live.count += 1
+            changed = False
+            count = live.count
+        return Observation(
+            site=site if isinstance(site, RecoverySite) else RecoverySite(site),
+            task_id=str(task_id),
+            signature=signature,
+            streak=count,
+            changed=changed,
+        )
+
+    def streak(self, site: RecoverySite | str, task_id: str) -> int:
+        """Return the current streak for ``(site, task_id)`` — ``0`` if unheld."""
+        live = self._streaks.get(self._key(site, task_id))
+        return live.count if live is not None else 0
+
+    def span(self, site: RecoverySite | str, task_id: str) -> float:
+        """Return seconds elapsed since this streak began — ``0.0`` if unheld.
+
+        The second half of the alarm predicate (see
+        ``config.RecoveryEmissionConfig.veto_streak_min_span_secs``): a streak
+        that accrued in seconds is a per-tick site observing the same hold
+        rapidly, not a task stuck for a shift.  Never negative.
+        """
+        live = self._streaks.get(self._key(site, task_id))
+        if live is None:
+            return 0.0
+        return max(0.0, self._clock() - live.started_at)
+
+    def clear(self, site: RecoverySite | str, task_id: str) -> int:
+        """POP ``(site, task_id)``'s streak; return the count it dropped.
+
+        Called on the transition where a task STOPS being vetoed.  The return
+        value is what the resolve half reports as the streak that ended, and
+        the pop is the footprint contract: the reconcile sweep visits every
+        in-progress and blocked task, so a tracker that zeroed instead of
+        popping would grow one entry per task ever swept.
+        """
+        dropped = self._streaks.pop(self._key(site, task_id), None)
+        return dropped.count if dropped is not None else 0
+
+    def tracked(self) -> Iterable[tuple[str, str]]:
+        """Return the ``(site, task_id)`` keys currently holding a streak.
+
+        Introspection hook: exists so tests (and any future operator dump) can
+        assert the pop-on-reset footprint contract directly.
+        """
+        return tuple(self._streaks)
+
+
+def should_emit_event(observation: Observation, *, threshold: int) -> bool:
+    """Decide whether *observation* warrants an event row.
+
+    **This is the canonical statement of the emission cadence**; the five call
+    sites reference it rather than restating the rationale.
+
+    True in exactly two cases:
+
+    * ``observation.changed`` — a NEW or CHANGED veto signature.  That is a new
+      fact about the strand, and it is what makes the first post-restart sweep
+      name every live strand.
+    * ``observation.streak == threshold`` — the escalation moment, so the event
+      store records the instant the blocking L1 was filed.  ``==`` rather than
+      ``>=`` on purpose: a long-lived veto emits here ONCE and then goes quiet
+      forever, instead of appending a row on every later observation.
+
+    False for every other quiet repeat.  ``Scheduler._phase_redispatch_stranded
+    _blocked`` and ``Harness._already_landed_dispatch_gate`` run per dispatch
+    TICK, so unconditional emission would append one SQLite row per tick per
+    pinned task indefinitely — the INV-4 storm the dispatch gate's own
+    ``note_hold_observed`` / ``clear_hold_observed`` transition-gating already
+    exists to avoid at that very site.  The per-sweep operational cadence is
+    supplied instead by the reconcile sweep's always-logged summary line, at
+    one line per sweep rather than one row per task per tick.
+    """
+    if observation.changed:
+        return True
+    return observation.streak == threshold
