@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.memory_metadata import ParentHasChildrenError
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import DescendantScan
 
@@ -59,7 +60,7 @@ def _task(task_id, status, metadata):
     return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
 
 
-def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False):
+def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, children=()):
     """MemoryService whose awaited children are EXPLICIT AsyncMocks.
 
     Required by tests/test_check_bare_magicmock_config.py and
@@ -72,6 +73,11 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False):
     ``list_descendant_ids`` is the read-only enumeration the cascade
     pre-flight gates on (task 3197): what a ``cascade=True`` delete WOULD
     destroy, deepest-first, plus whether that answer is complete.
+
+    ``refuse_if_children`` is the non-cascade counterpart: the same child
+    gate ``delete_memory`` runs internally, exposed so the tool can ask
+    "would this be refused?" BEFORE the citation gate mutates anything.
+    *children* makes it raise, modelling a target that still has them.
     """
     svc = AsyncMock()
     svc.delete_memory = AsyncMock(
@@ -83,10 +89,17 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False):
             return {'id': memory_id, 'content': 'surviving canonical advice', 'metadata': {}}
         return None
 
+    async def _refuse_if_children(memory_id, *, project_id):
+        if children:
+            raise ParentHasChildrenError(
+                parent_id=memory_id, child_ids=list(children),
+            )
+
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
     svc.list_descendant_ids = AsyncMock(
         return_value=DescendantScan(ids=list(descendants), truncated=truncated),
     )
+    svc.refuse_if_children = AsyncMock(side_effect=_refuse_if_children)
     return svc
 
 
@@ -1425,6 +1438,133 @@ class TestCascadeCitationRepointPass:
         assert logged == {CHILD, GRANDCHILD}
 
     @pytest.mark.asyncio
+    async def test_repointed_before_refusal_excludes_dangled_records(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """A dangle rewrote NOTHING, so it must not be reported as a rewrite.
+
+        `allow_dangling_citations` returns its trace on the same success
+        channel a repoint does, so keying the "already mutated" list off
+        `per_id` told an operator three sets of citations had been rewritten
+        when zero had — the opposite of the honest-residual reporting this
+        field exists for.
+        """
+        calls = {'n': 0}
+        snapshot = {'tasks': [
+            _task('1501', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1502', 'pending', {'cited': GRANDCHILD}),
+        ]}
+
+        async def _blink(project_root):
+            calls['n'] += 1
+            # One scan per record per pass and no sweeps on the override
+            # arm: calls 1-3 are the pre-flight, 4 and 5 are GRANDCHILD's
+            # and CHILD's repoint-pass scans, so 6 is the target's.
+            if calls['n'] >= 6:
+                raise RuntimeError('task db blinked')
+            return snapshot
+
+        interceptor.get_tasks = AsyncMock(side_effect=_blink)
+
+        result = await _call_delete(
+            mcp_server, cascade=True,
+            metadata={'allow_dangling_citations': True},
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['blocked'][0]['error_type'] == 'CitationScanFailed'
+        # The refusal landed on the LAST record, so both descendants were
+        # dangled first — without this the empty list below could be vacuous.
+        assert result['blocked'][0]['memory_id'] == DOOMED
+        assert result['repointed_before_refusal'] == []
+        interceptor.update_task.assert_not_awaited()
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repointed_before_refusal_names_the_records_it_rewrote(
+        self, mock_service,
+    ):
+        """The positive half: ids whose citations DID move are named, in the
+        order they moved, so a retry is informed rather than blind."""
+        interceptor = _make_interceptor([
+            _task('1501', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1502', 'pending', {'cited': GRANDCHILD}),
+            _task('1504', 'pending', {'cited': DOOMED}),
+        ])
+
+        async def _refuse_the_targets_citer(**kwargs):
+            if kwargs['task_id'] == '1504':
+                return {'success': False, 'error_type': 'ReconTerminalWriteRejected'}
+            return {'success': True}
+
+        interceptor.update_task = AsyncMock(side_effect=_refuse_the_targets_citer)
+        mcp_server = create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['blocked'][0]['error_type'] == 'CitationRepointFailed'
+        # Deepest-first, the order the rewrites happened in.
+        assert result['repointed_before_refusal'] == [GRANDCHILD, CHILD]
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_each_record_reports_whether_it_was_repointed_or_dangled(
+        self, mcp_server, mock_service,
+    ):
+        """Opposite outcomes must not be told apart by shape-sniffing.
+
+        The gate returns a repoint's stats and an override's dangle trace on
+        the SAME success channel, so a caller reading the per-record map
+        needs an explicit discriminator to know whether a citation was
+        rewritten or knowingly stranded.
+        """
+        repointed = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+        assert {
+            v['outcome'] for v in repointed['cascade_citation_repoint'].values()
+        } == {'repointed'}
+
+        mock_service.delete_memory.reset_mock()
+        dangled = await _call_delete(
+            mcp_server, cascade=True,
+            metadata={'allow_dangling_citations': True},
+        )
+        assert {
+            v['outcome'] for v in dangled['cascade_citation_repoint'].values()
+        } == {'dangled'}
+
+    @pytest.mark.asyncio
+    async def test_the_replacement_is_probed_once_per_invocation(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """One point read for the replacement, not one per record per pass.
+
+        Both passes ask every cited record's gate the same question about the
+        same id, so a cascade of K cited records issued 2K identical Qdrant
+        point reads. Nothing this call does can change that answer —
+        `_cascade_replacement_outside_set` already proved the replacement is
+        not a record the cascade destroys — so it is memoized for the
+        invocation.
+        """
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        assert mock_service.get_memory_by_id.await_count == 1
+        # The citation scan is NOT memoized and must not become so: it is the
+        # fail-closed guarantee, and a task can begin citing a doomed id at
+        # any moment. Three pre-flight scans, three on the repoint pass, plus
+        # each sweep's own read.
+        assert interceptor.get_tasks.await_count >= 6
+
+    @pytest.mark.asyncio
     async def test_uncited_cascade_pays_for_no_writes(self, mock_service):
         """(e) The repoint pass must not manufacture writes.
 
@@ -1692,3 +1832,134 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
         assert result['status'] == 'deleted'
         service.list_descendant_ids.assert_not_awaited()
         service.delete_memory.assert_awaited_once()
+
+
+class TestChildRefusalPrecedesAnyRepoint:
+    """A delete refused for having children must not have mutated anything.
+
+    On the NON-cascade path the citation gate ran first and rewrote every
+    live citation to ``replacement_memory_id``; only then did the service
+    reach its child gate and raise ``ParentHasChildrenError``. So a refused
+    delete had already rewritten live task metadata — the mutation-on-failure
+    the cascade path avoids by enumerating before it gates, and a
+    contradiction of the service's own "a refused delete leaves nothing
+    claiming a deletion happened".
+    """
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1701', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+    def _server(self, service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cited_parent_is_refused_before_a_single_repoint(
+        self, interceptor,
+    ):
+        """The repoint pass never runs, so no task metadata is rewritten."""
+        service = _make_service(children=[CHILD])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(
+            mcp_server, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['error_type'] == 'ParentHasChildrenError'
+        # The wire envelope is the SERVICE's own refusal, verbatim — one home
+        # for its construction, so the caller cannot tell (and need not care)
+        # which layer raised it.
+        assert CHILD in result['error']
+        interceptor.update_task.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_arm_is_refused_before_it_claims_a_dangle(
+        self, interceptor, caplog,
+    ):
+        """`allow_dangling_citations` mutates no task, but it LOGS a WARNING
+        naming citations it has knowingly stranded — the one signal an
+        operator audits the escape by. Emitting it for a delete that is then
+        refused makes that audit trail claim a destruction that never
+        happened."""
+        service = _make_service(children=[CHILD])
+        mcp_server = self._server(service, interceptor)
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server, metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['error_type'] == 'ParentHasChildrenError'
+        service.delete_memory.assert_not_awaited()
+        assert not [
+            r for r in caplog.records if 'allow_dangling_citations' in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_plain_delete_pays_for_no_child_pre_flight(self, interceptor):
+        """Zero cost on the common path.
+
+        With no replacement and no override the gate has no mutating arm to
+        reach: it either allows the delete or refuses it having written
+        nothing. The service still runs its own child gate, so the refusal is
+        not weakened — only the pre-flight round trip is skipped.
+        """
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server)
+
+        # Cited with no replacement: today's refusal, unchanged.
+        assert result['error_type'] == 'CitationRepointRequired'
+        service.refuse_if_children.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uncited_delete_pays_for_no_child_pre_flight(self):
+        """The six in-repo recon callers' shape: uncited, no replacement."""
+        service = _make_service()
+        interceptor = _make_interceptor([
+            _task('1702', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server)
+
+        assert result['status'] == 'deleted'
+        service.refuse_if_children.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_childless_target_still_repoints_and_deletes(self, interceptor):
+        """The pre-flight is a gate, not a ban: a childless target with a
+        resolvable replacement takes exactly the path it did before."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(
+            mcp_server, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['status'] == 'deleted'
+        service.refuse_if_children.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+        service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pre_flight_is_skipped_when_the_gate_is_inactive(self):
+        """No task DB to gate against means no gate to run ahead of.
+
+        The service's own child refusal still fires on its own account, so
+        the protection is intact; what must not happen is a tool-layer round
+        trip for a project the gate would decline to check.
+        """
+        service = _make_service(children=[CHILD])
+        mcp_server = create_mcp_server(service)  # no task_interceptor at all
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        service.refuse_if_children.assert_not_awaited()

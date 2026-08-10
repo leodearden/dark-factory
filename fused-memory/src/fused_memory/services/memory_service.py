@@ -4282,8 +4282,20 @@ class MemoryService:
         await walk(memory_id)
         return DescendantScan(ids=ordered, truncated=truncated)
 
-    async def _refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
+    async def refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
         """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
+
+        PUBLIC and side-effect-free (it either raises or returns), for the
+        same reason :meth:`list_descendant_ids` is: the MCP tool layer needs
+        to ask "would this delete be refused?" BEFORE it runs the citation
+        gate, whose repoint pass mutates live task metadata.  Without that
+        pre-flight a delete of a cited PARENT rewrote every citation to the
+        replacement and only then hit this refusal — mutation left behind by
+        an operation that reported failure, and the exact asymmetry the
+        cascade path avoids by enumerating before it gates.  Exposing the
+        one gate (rather than a count the caller re-wraps in its own error)
+        keeps the refusal's construction — ids, count, ``truncated``,
+        registry pointer — with exactly one home (INV-5).
 
         Count FIRST, scroll only on a non-zero count: the count is exact and
         cheap while the scroll fetches full payloads, and ``delete_memory``
@@ -4555,7 +4567,7 @@ class MemoryService:
                     visited=_visited,
                 )
             else:
-                await self._refuse_if_children(memory_id, project_id=project_id)
+                await self.refuse_if_children(memory_id, project_id=project_id)
 
             del_result = await self._journaled_backend_call(
                 write_op_id=write_op_id,

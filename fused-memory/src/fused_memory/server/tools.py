@@ -1564,6 +1564,7 @@ def create_mcp_server(
         allow_dangling_citations: bool = False,
         *,
         scan_only: bool = False,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
 
@@ -1657,6 +1658,22 @@ def create_mcp_server(
         a copy is what keeps every rule with exactly one home (INV-5); a
         duplicated scanner would drift, and the drift would be silent
         because both halves would still "work".
+
+        ``replacement_cache`` memoizes ONE thing — the
+        ``replacement_memory_id`` existence probe — for the duration of ONE
+        ``delete_memory`` invocation, and nothing outside it (there is no
+        module-level cache, no TTL, no reuse across calls). A cascade of K
+        cited records otherwise re-reads the same Qdrant point 2K times,
+        once per record per pass, for an answer that cannot differ between
+        them. Do NOT confuse this with the citation snapshot, which is
+        deliberately uncached and must stay so: that read is the fail-closed
+        guarantee itself, because a task can begin citing a doomed id at any
+        moment. The replacement's liveness is not that racy quantity —
+        ``_cascade_replacement_outside_set`` has already proved the
+        replacement is not one of the records this call destroys, so no
+        write by this operation can change the answer mid-invocation. A
+        RAISED lookup is not cached, so the fail-closed arm keeps re-probing
+        rather than remembering a failure.
         """
         if not _citation_gate_applies(store, project_id):
             return None, None
@@ -1820,34 +1837,47 @@ def create_mcp_server(
         # THEN land the irreversible delete. get_memory_by_id is the same
         # Mem0/Qdrant point read verify_cited_memories uses, and the gate's
         # store == 'mem0' scoping already matches its Mem0-only contract.
-        try:
-            replacement_record = await memory_service.get_memory_by_id(
-                project_id, replacement_memory_id,
-            )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:
-            # Fail closed, exactly as the scan does: 'unknown' must not be read
-            # as 'resolves' immediately before an irreversible delete.
-            logger.warning(
-                'citation gate: replacement lookup failed for %s; failing closed',
-                replacement_memory_id,
-                exc_info=True,
-            )
-            return {
-                'error': (
-                    f'Could not determine whether replacement_memory_id '
-                    f'{replacement_memory_id} exists; refusing an irreversible '
-                    'delete rather than repointing to a possibly-absent entry.'
-                ),
-                'error_type': 'CitationReplacementCheckFailed',
-                'memory_id': memory_id,
-                'replacement_memory_id': replacement_memory_id,
-                'citing_tasks': citing_tasks,
-                'check_error': str(exc),
-                'check_error_type': type(exc).__name__,
-                'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
-            }, None
+        #
+        # Memoized per delete_memory invocation (see `replacement_cache` in the
+        # docstring): every cited record in a cascade, on both passes, asks
+        # this same question of the same id. The citation scan above stays
+        # LIVE — that one is the fail-closed guarantee.
+        cache_key = (project_id, replacement_memory_id)
+        if replacement_cache is not None and cache_key in replacement_cache:
+            replacement_record = replacement_cache[cache_key]
+        else:
+            try:
+                replacement_record = await memory_service.get_memory_by_id(
+                    project_id, replacement_memory_id,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                # Fail closed, exactly as the scan does: 'unknown' must not be
+                # read as 'resolves' immediately before an irreversible delete.
+                # NOT cached — a remembered failure would outlive its cause,
+                # and the next id in the set deserves its own live answer.
+                logger.warning(
+                    'citation gate: replacement lookup failed for %s; failing closed',
+                    replacement_memory_id,
+                    exc_info=True,
+                )
+                return {
+                    'error': (
+                        f'Could not determine whether replacement_memory_id '
+                        f'{replacement_memory_id} exists; refusing an irreversible '
+                        'delete rather than repointing to a possibly-absent entry.'
+                    ),
+                    'error_type': 'CitationReplacementCheckFailed',
+                    'memory_id': memory_id,
+                    'replacement_memory_id': replacement_memory_id,
+                    'citing_tasks': citing_tasks,
+                    'check_error': str(exc),
+                    'check_error_type': type(exc).__name__,
+                    'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
+                }, None
+            if replacement_cache is not None:
+                replacement_cache[cache_key] = replacement_record
 
         if not replacement_record:
             # Distinct from ...Invalid on purpose: the caller must be able to
@@ -2058,6 +2088,8 @@ def create_mcp_server(
         agent_id: str | None,
         replacement_memory_id: str | None,
         allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
     ) -> dict[str, Any] | None:
         """Refuse a cascade if ANY record it would destroy is still cited.
 
@@ -2109,6 +2141,13 @@ def create_mcp_server(
           is a MODE on the one gate precisely so every rule keeps one home
           (INV-5); N redundant reads is the price of that, and it is paid
           only on the ``cascade=True`` path.
+        * The ``replacement_memory_id`` existence probe IS shared across
+          both passes (``replacement_cache``), and is the only read that
+          is. It asks the same question of the same id every time, and
+          unlike the citation scan its answer cannot be changed by anything
+          this call does: ``_cascade_replacement_outside_set`` has already
+          proved the replacement lies OUTSIDE the set this cascade
+          destroys. Re-reading it 2K times bought nothing.
 
         *cascade_ids* is descendants-first with the target LAST, mirroring
         the children-before-parent order the cascade actually deletes in.
@@ -2123,6 +2162,7 @@ def create_mcp_server(
                 replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
                 scan_only=True,
+                replacement_cache=replacement_cache,
             )
             if rejection:
                 # Verbatim: the per-id envelope already names the citers,
@@ -2178,6 +2218,8 @@ def create_mcp_server(
         agent_id: str | None,
         replacement_memory_id: str | None,
         allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """The MUTATING second pass, after the pre-flight cleared the set.
 
@@ -2185,6 +2227,13 @@ def create_mcp_server(
         merging each record's stats under ITS OWN id: a cascade touches N
         records, and one anonymous stats blob would leave the caller unable
         to tell which descendant's citations were rewritten.
+
+        Each per-id entry carries an explicit ``outcome`` —
+        ``'repointed'`` or ``'dangled'`` — because the gate returns BOTH on
+        the same success channel and their payloads differ
+        (``citation_repoint`` stats vs ``dangled_citations``). Without it a
+        caller has to shape-sniff to tell a rewritten citation from one
+        knowingly stranded, which are opposite outcomes.
 
         Two residuals this two-pass design does NOT close, stated rather than
         left for a later reader to discover:
@@ -2196,7 +2245,10 @@ def create_mcp_server(
            citations now address the verified-live ``replacement_memory_id``
            while the original record still exists. A retry converges,
            because a repointed id no longer has live citers. The already-
-           repointed ids are named on the refusal rather than left implicit.
+           repointed ids are named on the refusal rather than left implicit
+           — and ONLY the genuinely repointed ones: a ``dangled`` record
+           rewrote nothing, so listing it would tell an operator citations
+           were rewritten when none were.
         2. The service's cascade re-reads its children LIVE, so a child
            written between this pass and the cascade is deleted without
            having passed the gate. That is the same write-after-scan race the
@@ -2206,6 +2258,12 @@ def create_mcp_server(
            on the one operation whose harm motivated the gate.
         """
         per_id: dict[str, Any] = {}
+        # Ids whose citations were actually REWRITTEN, in pass order. Kept
+        # separately from `per_id` because the gate returns dangles on the
+        # same success channel: under `allow_dangling_citations` every record
+        # yields stats while nothing is mutated at all, so `per_id`'s keys
+        # would report repoints that never happened.
+        repointed: list[str] = []
         for target in cascade_ids:
             rejection, stats = await _citation_repoint_gate(
                 target,
@@ -2214,6 +2272,7 @@ def create_mcp_server(
                 agent_id,
                 replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
             )
             if rejection:
                 return _cascade_gate_rejection(
@@ -2228,10 +2287,19 @@ def create_mcp_server(
                     # Honest residual: these were rewritten before the
                     # refusal. They point at the verified-live replacement,
                     # not at a destroyed record, and a retry is idempotent.
-                    repointed_before_refusal=sorted(per_id),
+                    # Deepest-first, the order the rewrites happened in.
+                    repointed_before_refusal=list(repointed),
                 ), None
             if stats:
-                per_id[target] = stats
+                # 'citation_repoint' is present iff the repoint sweep ran;
+                # the override arm returns 'dangled_citations' instead.
+                did_repoint = 'citation_repoint' in stats
+                per_id[target] = {
+                    **stats,
+                    'outcome': 'repointed' if did_repoint else 'dangled',
+                }
+                if did_repoint:
+                    repointed.append(target)
         return None, ({'cascade_citation_repoint': per_id} if per_id else None)
 
     async def _scan_task_citations(
@@ -3631,7 +3699,10 @@ def create_mcp_server(
         the child ids, rather than silently orphaning them. `cascade=true`
         is the explicit opt-in: the children are deleted first, then this
         record. The alternative is to reparent or delete the children
-        yourself first.
+        yourself first. That refusal is checked BEFORE the citation gate
+        repoints anything, so a delete refused for having children has not
+        rewritten any task's metadata either — nothing happened, in both
+        senses.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3734,6 +3805,13 @@ def create_mcp_server(
         rejection: dict[str, Any] | None = None
         repoint_stats: dict[str, Any] | None = None
         cascade_ids: list[str] = []
+        # Scoped to THIS invocation and passed by reference, so the two
+        # cascade passes share one answer about the replacement's existence
+        # instead of re-reading the same Qdrant point once per cited record
+        # per pass. It dies with the call — no module state, no TTL. The
+        # citation scan is deliberately NOT memoized (see
+        # `_scan_task_citations`); this read is not the racy one.
+        replacement_cache: dict[tuple[str, str], Any] = {}
         # A cascade destroys the whole subtree inside the SERVICE, below this
         # gate, so the gate has to be applied to the set BEFORE the call —
         # otherwise every descendant is deleted unchecked. The
@@ -3757,6 +3835,7 @@ def create_mcp_server(
                     cascade_ids, resolved_id, store, project_id, agent_id,
                     replacement_memory_id,
                     allow_dangling_citations=allow_dangling_citations,
+                    replacement_cache=replacement_cache,
                 )
         if rejection is None and cascade_ids:
             # The pre-flight proved the whole set is clearable; now clear it,
@@ -3764,8 +3843,34 @@ def create_mcp_server(
             rejection, repoint_stats = await _cascade_citation_repoint_pass(
                 cascade_ids, store, project_id, agent_id, replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
             )
         elif rejection is None:
+            # CHILD PRE-FLIGHT for the single-record path (task 3197 review),
+            # the non-cascade counterpart of `_cascade_enumerate` running
+            # before `_cascade_citation_preflight`. The gate below mutates
+            # live task metadata; the service's child refusal fires AFTER it.
+            # So a delete of a cited PARENT used to repoint every citation to
+            # the replacement and only then be refused with
+            # ParentHasChildrenError — mutation left behind by an operation
+            # that reported failure, contradicting the service's own "a
+            # refused delete leaves nothing claiming a deletion happened".
+            # The raise propagates to `mcp_tool_errors`, which produces the
+            # identical wire envelope the service's own refusal does, because
+            # it IS the same refusal (one home for its construction, INV-5).
+            #
+            # Charged only where the gate has something to lose: the mutating
+            # arm needs a replacement_memory_id, and the override arm logs a
+            # WARNING naming citations it claims to have dangled on a delete
+            # that then never happened. A plain uncited delete — the common
+            # path, and every one of the six in-repo recon callers — pays
+            # nothing extra.
+            if _citation_gate_applies(store, project_id) and (
+                replacement_memory_id is not None or allow_dangling_citations
+            ):
+                await memory_service.refuse_if_children(
+                    resolved_id, project_id=project_id
+                )
             rejection, repoint_stats = await _citation_repoint_gate(
                 resolved_id, store, project_id, agent_id, replacement_memory_id,
                 allow_dangling_citations=allow_dangling_citations,
