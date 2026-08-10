@@ -312,6 +312,28 @@ def _repair_one_field(
     The collision check itself is NOT re-implemented here: ``supplied`` is
     handed to ``repair()``, whose accept-time disjointness condition (PRD
     boundary row B9) does the refusing. One mechanism, per INV-5.
+
+    A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The repairable surface
+    distinguishes the TOOL's parameter vocabulary (``schema_params``) from the
+    PLAN's key vocabulary (``target_keys``), and for three parameters they
+    differ: ``prereq_id`` and ``step_id`` are stored as ``id``, ``step_type``
+    as ``type``. Two more name no prose key at all — ``files`` is a list and
+    ``task_id`` an identifier. Writing a recovered prose string into any of
+    them is silent-wrong-value corruption of the plan artifact that the lock
+    charter (``derive_modules`` / ``files_to_modules``) and the merge gate
+    (``plan_files_not_touched``) both consume, which is the exact damage class
+    this surface exists to end — so refusing conservatively there is the point,
+    not a limitation.
+
+    That rule is enforced through the SAME mechanism, not a second one: a
+    parameter with no prose target is placed in ``supplied`` UNCONDITIONALLY,
+    so ``repair()``'s existing B9 condition refuses any candidate whose tail
+    recovers it and the field is left byte-identical. A parameter WITH a prose
+    target has its authorship read from the key the plan actually uses
+    (``holder.get('type')``, never the always-absent ``holder.get('step_type')``)
+    — without which the fill-a-hole guard was inert for exactly those params,
+    because the lookup could never see the authored value it was meant to
+    protect.
     """
     value = holder.get(record.field)
     if not isinstance(value, str):
@@ -325,7 +347,13 @@ def _repair_one_field(
     supplied = frozenset(
         name
         for name in record.schema_params
-        if name != record.field and _is_authored(holder.get(name))
+        if name != record.field
+        and (
+            # No prose key to land on: ALWAYS supplied, so repair() refuses.
+            name not in record.target_keys
+            # Authorship read from the key the PLAN uses, not the tool's param.
+            or _is_authored(holder.get(record.target_keys[name]))
+        )
     )
     result = repair(
         value,
@@ -353,7 +381,21 @@ def _repair_one_field(
     # guaranteed by construction in ``repair``), and every target here was
     # proven a hole by the ``supplied`` set above.
     for name, recovered_value in result.recovered.items():
-        holder[name] = recovered_value
+        key = record.target_keys.get(name)
+        if key is None:
+            # Unreachable while ``supplied`` holds every non-target: repair()
+            # would have refused. Kept as total-safety so a future change to
+            # repair() can never make this walk write a junk key — NOT as a
+            # second policy, which is why it only declines and reports.
+            logger.warning(
+                'plan_markup_repair: refusing to write recovered %r — %s.%s '
+                'declares no plan key for it',
+                name,
+                record.collection,
+                record.field,
+            )
+            continue
+        holder[key] = recovered_value
     return {
         'tool': _COLLECTION_TOOL[record.collection],
         'param': record.field,
