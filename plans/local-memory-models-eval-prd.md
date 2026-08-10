@@ -70,8 +70,9 @@ not counted as G1 consumers of anything here.
 > - **This PRD**: the candidate-slate table (Mistral row struck through and annotated, **kept** as
 >   evidence of what was commissioned, plus a footnote closing the already-fixed quant defect and
 >   stating the re-admission condition); the funnel prose in §Sketch of approach; D6; D10's
->   Consequence bullet (arm count only); the Contract §Pre-registration clause constraining ζ's
->   survivor rule; α's and η's rows in the decomposition plan; the research appendix.
+>   Consequence bullet (arm count corrected, and the surviving `~6, ~9` estimates **marked stale —
+>   not refreshed**, which stays task 3973's pass); the Contract §Pre-registration clause
+>   constraining ζ's survivor rule; α's and η's rows in the decomposition plan; the research appendix.
 > - **`plans/local-memory-models-eval-prd.capability-manifest.md`** — η's `All four arms servable …
 >   PASS` row: that verdict was **falsified** by α's own gate (one arm proved unservable), and the
 >   row now says so rather than being quietly renumbered.
@@ -113,8 +114,8 @@ not counted as G1 consumers of anything here.
 > `tkt_0RS9PDHN212E4G1ZW924MMCV75`). Cite the **task** id: it resolves via `get_task` like every other
 > task reference in this document, whereas a `tkt_` id is a `submit_task` receipt that may resolve to
 > `combined` under a different id and is not addressable. Task 3973 is **wired to depend on this
-> task** (`dependencies: [3804]`, added 2026-08-10), so the sequencing below is enforced by the
-> scheduler rather than only asserted in prose.
+> task** (`dependencies: [3804]`, added 2026-08-10), so that sequencing is enforced by the scheduler
+> rather than only asserted in prose.
 
 ## Goal
 
