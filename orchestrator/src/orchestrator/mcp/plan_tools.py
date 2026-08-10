@@ -360,15 +360,41 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
     reproduced exactly (``_schema_version`` stamp, ``json.dumps(indent=2)``
     plus a trailing newline) so a repair write-back cannot churn formatting.
 
-    Order: serialize, write to a temp file in the target's own directory,
-    flush, fsync, VERIFY it re-parses, and only then ``os.replace``. Any
-    failure unlinks the temp and leaves the original byte-identical, then
-    raises :class:`PlanWriteError` naming the path — loud, never a silent skip.
+    Order: RESOLVE the target, serialize, write to a temp file in the resolved
+    target's own directory, flush, fsync, VERIFY it re-parses, and only then
+    ``os.replace``. Any failure unlinks the temp and leaves the original
+    byte-identical, then raises :class:`PlanWriteError` naming the path — loud,
+    never a silent skip.
+
+    RESOLVING FIRST IS LOAD-BEARING TWICE OVER, which is why it is the first
+    statement rather than an incidental normalisation.
+    ``TaskArtifacts.ensure_lane_plan_symlink`` makes the lane copy
+    ``<worktree>/.task/plan.json`` an ABSOLUTE symlink onto the durable
+    meta-root plan, and ``_artifacts_from_args`` still supports
+    ``meta_root=None`` where ``self.root`` IS ``<worktree>/.task`` — so the
+    path handed here can BE that symlink. ``os.replace`` onto a symlink
+    replaces the LINK with a regular file, which would silently re-fork the
+    lane and meta-root copies and recreate the esc-5205-9 stale-plan
+    divergence the symlink exists to prevent. Resolving also guarantees the
+    temp lands on the same filesystem as the real file, which is what makes
+    the replace a rename rather than a cross-device error.
+
+    A DANGLING link resolves to a path that does not exist (and whose parent
+    may not either). That fails loudly, naming both the original and resolved
+    paths, rather than materialising a stray regular file at the link path —
+    which would BE the divergence, not a recovery from it.
     """
+    target = Path(os.path.realpath(path))
+    if not target.parent.is_dir():
+        raise PlanWriteError(
+            f'atomic plan write-back to {path} failed: its resolved target '
+            f'{target} has no existing parent directory (a dangling symlink?) '
+            '— refusing to materialise a stray file at the link path'
+        )
+
     plan['_schema_version'] = PLAN_SCHEMA_VERSION
     payload = json.dumps(plan, indent=2) + '\n'
 
-    target = path
     fd, tmp_name = tempfile.mkstemp(
         dir=target.parent, prefix='.plan.json.', suffix='.tmp'
     )
@@ -382,8 +408,8 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
         os.replace(tmp_path, target)
     except Exception as exc:
         raise PlanWriteError(
-            f'atomic plan write-back to {target} failed ({exc!r}); the '
-            'existing file was left untouched'
+            f'atomic plan write-back to {path} (resolved to {target}) failed '
+            f'({exc!r}); the existing file was left untouched'
         ) from exc
     finally:
         # os.replace consumed the temp on the success path; missing_ok makes
