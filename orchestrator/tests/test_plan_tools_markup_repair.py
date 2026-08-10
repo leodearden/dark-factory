@@ -25,14 +25,22 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 
 from __future__ import annotations
 
+import copy
 import inspect
+import json
+import os
+import tempfile
 from pathlib import Path
 
 import pytest
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.mcp import plan_tools
+
+#: What a failed atomic write may raise. The helper's own declared error, plus
+#: the serialization errors that fire before the temp is ever opened.
+PLAN_WRITE_FAILURES = (OSError, TypeError, ValueError)
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -749,3 +757,185 @@ class TestRepairPlanFieldsAbsorbedSibling:
             'the two slices must not simply re-concatenate to the input — the '
             'mis-close and the re-opened tag are DROPPED, not re-homed'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 — the atomic write helper, contract C3 / boundary row B12.
+# ---------------------------------------------------------------------------
+
+
+class _AtomicSpies:
+    """Delegating spies over the three syscalls ``_atomic_write_plan`` uses.
+
+    Every spy DELEGATES to the real implementation, so the helper's behaviour
+    is observed rather than simulated; only the call record is added.
+    """
+
+    def __init__(self, monkeypatch):
+        self.mkstemp_dirs: list = []
+        self.replace_calls: list = []
+        self.fsync_calls: list = []
+        self.order: list[str] = []
+        self._real_mkstemp = tempfile.mkstemp
+        self._real_replace = os.replace
+        self._real_fsync = os.fsync
+
+        monkeypatch.setattr(plan_tools.tempfile, 'mkstemp', self._mkstemp)
+        monkeypatch.setattr(plan_tools.os, 'fsync', self._fsync)
+        monkeypatch.setattr(plan_tools.os, 'replace', self._replace)
+
+    def _mkstemp(self, *args, **kwargs):
+        self.mkstemp_dirs.append(kwargs.get('dir'))
+        self.order.append('mkstemp')
+        return self._real_mkstemp(*args, **kwargs)
+
+    def _fsync(self, fd):
+        self.fsync_calls.append(fd)
+        self.order.append('fsync')
+        return self._real_fsync(fd)
+
+    def _replace(self, src, dst):
+        # Capture the temp file's state AT REPLACE TIME.
+        src_path = Path(src)
+        self.replace_calls.append({
+            'src': src_path,
+            'dst': Path(dst),
+            'src_exists': src_path.exists(),
+            'src_document': (
+                json.loads(src_path.read_text()) if src_path.exists() else None
+            ),
+        })
+        self.order.append('replace')
+        return self._real_replace(src, dst)
+
+
+@pytest.fixture()
+def plan_dir(tmp_path):
+    """A directory holding exactly one pre-existing plan.json."""
+    directory = tmp_path / 'meta'
+    directory.mkdir()
+    (directory / 'plan.json').write_text(
+        json.dumps({'task_id': 'test-1', 'steps': []}, indent=2) + '\n'
+    )
+    return directory
+
+
+class TestAtomicWritePlan:
+    """A concurrent reader must never observe a partial plan.json (B12)."""
+
+    def test_temp_file_is_created_in_the_targets_own_directory(self, plan_dir, monkeypatch):
+        """Same directory => os.replace is an intra-filesystem RENAME.
+
+        A temp file in /tmp could land on a different filesystem, where
+        os.replace raises EXDEV instead of atomically swapping.
+        """
+        spies = _AtomicSpies(monkeypatch)
+        target = plan_dir / 'plan.json'
+
+        plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert spies.mkstemp_dirs == [target.parent]
+
+    def test_temp_is_written_and_verified_before_the_replace(self, plan_dir, monkeypatch):
+        spies = _AtomicSpies(monkeypatch)
+        target = plan_dir / 'plan.json'
+        plan = corrupt_plan()
+
+        plan_tools._atomic_write_plan(target, plan)
+
+        assert len(spies.replace_calls) == 1
+        call = spies.replace_calls[0]
+        assert call['src_exists'], 'the temp must be fully written before replace'
+        assert call['dst'] == target
+        # The complete document is already on disk at replace time.
+        assert call['src_document']['task_id'] == plan['task_id']
+        assert call['src_document']['design_decisions'] == plan['design_decisions']
+
+    def test_fsync_happens_before_the_replace(self, plan_dir, monkeypatch):
+        spies = _AtomicSpies(monkeypatch)
+
+        plan_tools._atomic_write_plan(plan_dir / 'plan.json', corrupt_plan())
+
+        assert spies.fsync_calls, 'the temp must be fsynced, not just flushed'
+        assert spies.order.index('fsync') < spies.order.index('replace')
+
+    def test_writes_the_document_and_stamps_the_schema_version(self, plan_dir):
+        target = plan_dir / 'plan.json'
+
+        plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        written = json.loads(target.read_text())
+        assert written['_schema_version'] == PLAN_SCHEMA_VERSION
+        assert written['task_id'] == 'test-1'
+
+    def test_byte_format_parity_with_task_artifacts_write_plan(self, tmp_path):
+        """The repair write-back must not churn the file's formatting.
+
+        Same bytes as the existing writer means a repaired plan diffs only
+        where it was repaired — no reindentation, no key-order noise.
+        """
+        via_artifacts = tmp_path / 'artifacts'
+        via_artifacts.mkdir()
+        artifacts = TaskArtifacts(via_artifacts)
+        artifacts.init('test-1', 'Test task', 'A test')
+        artifacts.write_plan(copy.deepcopy(corrupt_plan()))
+
+        via_atomic = tmp_path / 'atomic'
+        via_atomic.mkdir()
+        atomic_target = via_atomic / 'plan.json'
+        plan_tools._atomic_write_plan(atomic_target, copy.deepcopy(corrupt_plan()))
+
+        assert (
+            atomic_target.read_bytes()
+            == (artifacts.root / 'plan.json').read_bytes()
+        )
+
+    def test_verification_failure_leaves_the_original_untouched(self, plan_dir, monkeypatch):
+        target = plan_dir / 'plan.json'
+        before_bytes = target.read_bytes()
+        before_entries = set(plan_dir.iterdir())
+
+        def boom(_path):
+            raise json.JSONDecodeError('injected', 'doc', 0)
+
+        monkeypatch.setattr(plan_tools, '_verify_plan_json', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert str(target) in str(excinfo.value), (
+            'the failure must name the path — loud, not a silent skip'
+        )
+        assert target.read_bytes() == before_bytes
+        assert set(plan_dir.iterdir()) == before_entries, (
+            'no .plan.json.*.tmp residue may be left behind'
+        )
+
+    def test_replace_failure_leaves_the_original_untouched(self, plan_dir, monkeypatch):
+        target = plan_dir / 'plan.json'
+        before_bytes = target.read_bytes()
+        before_entries = set(plan_dir.iterdir())
+
+        def boom(_src, _dst):
+            raise OSError('injected replace failure')
+
+        monkeypatch.setattr(plan_tools.os, 'replace', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert str(target) in str(excinfo.value)
+        assert target.read_bytes() == before_bytes
+        assert set(plan_dir.iterdir()) == before_entries
+
+    def test_writing_a_plan_that_does_not_serialize_leaves_no_residue(self, plan_dir):
+        """An unserializable payload must not strand a temp file either."""
+        target = plan_dir / 'plan.json'
+        before_bytes = target.read_bytes()
+        before_entries = set(plan_dir.iterdir())
+
+        with pytest.raises(PLAN_WRITE_FAILURES):
+            plan_tools._atomic_write_plan(target, corrupt_plan(title=object()))
+
+        assert target.read_bytes() == before_bytes
+        assert set(plan_dir.iterdir()) == before_entries
