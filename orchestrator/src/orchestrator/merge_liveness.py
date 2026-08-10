@@ -457,8 +457,9 @@ def _alarm_verify_host_unreachable(
 
     * ``level=1`` (L1 blocking) — loud (steward→auto-watcher→human ladder)
       but NON-halting: the merge-halt gate fires only for categories
-      ``wip_conflict`` / ``unmerged_state``; ``verify_host_unreachable`` is
-      intentionally excluded so the serial-local fallback keeps flowing.
+      ``wip_conflict`` / ``unmerged_state`` / ``stash_failed``;
+      ``verify_host_unreachable`` is intentionally excluded so the
+      serial-local fallback keeps flowing.
     * ``category='verify_host_unreachable'``
     * ``task_id=_verify_host_unreachable_sentinel(host)``
 

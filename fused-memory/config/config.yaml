@@ -61,6 +61,48 @@ queue:
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
+  # Error-aware retry budget (task 1936, membership revised by task 3585).
+  # Errors whose class name matches any entry below — walked over the raised
+  # exception's __mro__, so subclasses match too — get transient_max_attempts
+  # instead of the plain max_attempts ceiling.
+  #
+  # The not-found family (NodeNotFoundError, EdgeNotFoundError,
+  # EdgesNotFoundError) is DELIBERATELY ABSENT: esc-3561-3 refuted the
+  # visibility-race premise it was added on. See
+  # DEFAULT_TRANSIENT_ERROR_NAMES in
+  # src/fused_memory/services/durable_queue.py for the evidence and for the
+  # clustered/read-routed-backend condition that would justify putting it back.
+  #
+  # RECORDED COST (task 3585). Spelling the list out here makes it a THIRD
+  # copy — schema.QueueConfig's default and durable_queue's frozenset are the
+  # other two — so a future membership change in code has to be made in three
+  # places, not two. That is accepted deliberately, for one reason: the policy
+  # is otherwise editable only by changing code, and an operator responding to
+  # an incident needs it visible and tunable in the DEPLOYED file. Retuning
+  # here is expected and supported; CI does not freeze this list to the code
+  # default. What it does enforce (test_config_schema.py::
+  # TestQueueConfigTransientErrorFields::
+  # test_deployed_config_transient_retry_policy) is the 3585 verdict plus the
+  # anti-drift floor: this list may ADD names, must contain every name in
+  # DEFAULT_TRANSIENT_ERROR_NAMES, and must not readmit the not-found family.
+  # Re-add one of those three only after re-deriving the argument from the
+  # durable_queue.py comment — the test will make you mean it.
+  #
+  # queue.* is NOT in reload.py's hot-reload allowlist, so mcp__fused-memory__
+  # reload_config reports a change here under restart_required rather than
+  # silently no-op'ing — the queue reads this config once, at construction.
+  # A change takes effect on restart.
+  #
+  # transient_error_names is spelled literally: _expand_env_vars substitutes
+  # per string and recurses INTO lists, so a whole-list ${VAR:default} would
+  # reach pydantic as one string and fail validation.
+  transient_max_attempts: ${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}
+  transient_error_names:
+    - TimeoutError
+    - ConnectionError
+    - ConnectionResetError
+    - ServerDisconnectedError
+    - OperationalError
 
 # ── Project isolation (task 1143) ────────────────────────────────────────────
 # The reconciliation harness hard-binds project_root per project_id via a
@@ -253,6 +295,33 @@ write_triage:
   # Report: calibration/write_triage_calibration_report.json
   # -- records the measured distributions and the deterministic band's
   # false-positive count. Re-run the script to change these values.
-  t_high: 0.8868293243724489
-  t_low: 0.522971590497168
+  t_high: 0.8868282526657318
+  t_low: 0.5229672433064231
   calibration_report_path: calibration/write_triage_calibration_report.json
+  # Per-category cutoffs, measured the same way over each category's
+  # OWN pairs. A category ABSENT here has no derived cutoff — see the
+  # report's per_category section for the refusal and its reason.
+  t_high_by_category:
+    procedural_knowledge: 0.839045608910388
+  # EVIDENCE STATUS (hand-added prose, task 3357 — no numbers here; the
+  # machine-readable record is the report's per_category section, which
+  # the calibration guard test binds. A later --write-config run rewrites
+  # this whole block and drops this note; the report survives it.)
+  # - procedural_knowledge: has its own cutoff above, derived from that
+  #   category's own 242 duplicate / 3328 negative labeled pairs.
+  # - observations_and_summaries: NO cutoff. Refusal reason
+  #   `insufficient_pairs` — 4 duplicate and 51 negative pairs, below the
+  #   20/20 minimum. Both band edges are fitted to a sample's observed
+  #   extreme, which a fresh pair clears with expected probability
+  #   1/(n+1), so a band fitted here is weaker evidence than the pooled
+  #   corpus it would displace.
+  # - preferences_and_norms: NO cutoff is derivable from this corpus.
+  #   Refusal reason `empty_class` — every one of its fixture records sits
+  #   in a single cluster, so the category has zero negative pairs and
+  #   there is nothing to separate a duplicate from.
+  # Both refused categories are therefore ABSENT above and fall back to
+  # the pooled t_high. That fallback is counted by audit_duplicate_memories
+  # (`ann_pooled_fallback_categories`), and their ANN-only clusters are
+  # withheld from `--apply` deletion (`ann_cutoff_not_evidenced_for_category`):
+  # still reported, never irreversibly acted on with a cutoff measured
+  # elsewhere.

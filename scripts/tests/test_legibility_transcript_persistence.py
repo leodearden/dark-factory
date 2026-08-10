@@ -17,21 +17,20 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
-from orchestrator import session_registry
 
+from orchestrator import session_registry
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
-FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -356,6 +355,91 @@ def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3272: underscore cwds must resolve to their REAL on-disk encoded dir
+#
+# ``find_matching_transcript`` uses ``inventory.encode_cwd`` as a DIRECT
+# LOOKUP KEY (``session_dir.is_dir()`` -> None), with no ``is_member``
+# re-check to save it — unlike inventory.py's two superset pre-filters. So an
+# encoder that drops a character silently turns every present transcript of
+# an underscore-bearing member cwd into a FALSE-POSITIVE "session ran, no
+# transcript" finding, which escalates, and reports a non-existent
+# ``expected_dir`` to the human reading it.
+#
+# The fixture dir below is a HARD-CODED literal copied from a real
+# ``~/.claude/projects`` entry. It is deliberately NOT built via
+# ``_write_transcript`` (which derives its dir through the encoder under
+# test): a fixture encoded by the buggy function lands in the same wrong
+# place the lookup looks, so the assertion passes vacuously. That is exactly
+# how this divergence survived a fully green suite.
+# ---------------------------------------------------------------------------
+
+_UNDERSCORE_MEMBER_CWD = "/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8"
+_UNDERSCORE_MEMBER_DIR = "-home-leo-src-dark-factory--eval-worktrees-df-task-12-run-5383f6a8"
+
+
+def _write_transcript_in_literal_dir(
+    projects_root: Path,
+    encoded_dir: str,
+    name: str,
+    first_user_text: str,
+    *,
+    cwd: str | None = None,
+) -> Path:
+    """Write a transcript into an EXPLICITLY NAMED encoded dir.
+
+    Sibling of :func:`_write_transcript` that takes the encoded dir name as a
+    literal instead of deriving it via ``inventory.encode_cwd``, so the
+    fixture cannot track a bug in the encoder it is meant to test.
+
+    When *cwd* is given it is recorded on the user line, the way a real
+    transcript carries its session's REAL cwd. That is the field
+    ``inventory.session_cwd`` reads, and the only evidence
+    ``mod.resolve_session_dir``'s degrade path will accept as confirmation
+    that an unexpectedly-named dir actually belongs to a cwd.
+    """
+    session_dir = projects_root / encoded_dir
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = session_dir / name
+    line: dict = {"type": "user", "message": {"content": first_user_text}}
+    if cwd is not None:
+        line["cwd"] = cwd
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    return path
+
+
+def test_find_matching_transcript_resolves_underscore_cwd(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-underscore", _UNDERSCORE_MEMBER_CWD, _USABLE_PROMPT)
+
+    match_path = _write_transcript_in_literal_dir(
+        projects, _UNDERSCORE_MEMBER_DIR, "sess-underscore.jsonl", _USABLE_PROMPT
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == match_path
+
+
+def test_find_missing_transcripts_no_false_positive_for_underscore_cwd(tmp_path):
+    # The live impact: a member session whose transcript IS on disk must not
+    # be reported MISSING just because its cwd contains an underscore.
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-underscore", _UNDERSCORE_MEMBER_CWD, _USABLE_PROMPT)
+
+    _write_transcript_in_literal_dir(
+        projects, _UNDERSCORE_MEMBER_DIR, "sess-underscore.jsonl", _USABLE_PROMPT
+    )
+
+    findings = mod.find_missing_transcripts(
+        [rec], projects, ["/home/leo/src/dark-factory"],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
 # step-9/10: pure preventer guard — payload_exports_force_persistence
 # (fixture strings ONLY — never the real committed spawn-claude.sh)
 # ---------------------------------------------------------------------------
@@ -489,7 +573,7 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
-) -> "mod.MissingTranscript":
+) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
         cwd=cwd,
@@ -515,25 +599,23 @@ class _FakeHttpxResponse:
         pass
 
 
-def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy (httpx is not importable in
-    this test env), so a fake `httpx` module is injected via sys.modules.
+    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
+    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable independent of any live listener.
     Mirrors nightly.py's identical test for its own `_default_poster`."""
-    import sys
-
     captured_kwargs = {}
-
-    fake_httpx = type(sys)('httpx')
 
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse()
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    install_fake_httpx(_fake_post)
 
     mod._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
 

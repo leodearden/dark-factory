@@ -75,8 +75,9 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     payload fields the render code also names.  A bare whole-file substring
     grep is therefore satisfied by a MENTION: delete the render site, leave the
     comment, and the assertion stays green.  That false-pass mode is not
-    hypothetical — it is exactly what `_PARITIES` (below) documents finding for
-    `alarmed_open`/`clear`, where the string existed only in prose.
+    hypothetical: `alarmed_open` and `clear` were once asserted present by a
+    whole-file grep that only ever matched the explanatory prose above
+    `verdictBadge` — the strings occurred nowhere in code.
 
     Field-presence assertions grep this code-only text instead, so a field only
     counts as "rendered" when it appears outside a comment.  Where the render
@@ -88,6 +89,43 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
     return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_memory_evals_jsx_body)
+
+
+@pytest.fixture(scope='module')
+def memory_evals_fmt_js_body(_client):
+    """`memory_evals_fmt.js` — the plain-JS module holding the pure helpers.
+
+    Task 3481 moved the six helpers and both parity tables out of the .jsx and
+    into a classic script node can actually EXECUTE
+    (dashboard/tests/js/memory_evals_fmt.test.mjs); WHY is recorded once, in
+    that module's own header.  What matters HERE is only that the assertions
+    node cannot make — cross-language completeness against the producer's
+    Python frozensets, and the source-level G6/INV-5 exclusion — must follow
+    the code they are about, so they read this fixture rather than the .jsx.
+
+    Served by the same static mount as the .jsx — that is how runtime_format.js
+    and spark_path.js are already loaded.
+
+    Every consumer reads the comment-stripped `memory_evals_fmt_js_code`
+    derivative below rather than this raw text.
+    """
+    return _client.get('/static/redux/memory_evals_fmt.js').text
+
+
+@pytest.fixture(scope='module')
+def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
+    """`memory_evals_fmt.js` with every comment stripped.
+
+    Same rationale as `tab_memory_evals_jsx_code`, and the same false-pass
+    mode: the extraction carried ~200 lines of explanatory prose across with
+    it, so a whole-file grep for a parity state is satisfied by a MENTION in
+    the comment above the table.  `alarmed_open` and `clear` were once
+    asserted present by exactly such a grep, matching only prose.
+
+    Safe to strip naively for the same reason: no `//` inside a string
+    literal and no regex literals in the source.
+    """
+    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', memory_evals_fmt_js_body)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +207,216 @@ def _extract_function_body(src: str, fn_name: str) -> str:
             if depth == 0:
                 return src[start : j + 1]
     return ''
+
+
+# ---------------------------------------------------------------------------
+# Helper: find the innermost `function` declaration enclosing an offset
+# ---------------------------------------------------------------------------
+
+
+def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
+    """Return ``(name, param_names)`` of the innermost ``function`` enclosing ``idx``.
+
+    Returns ``None`` when ``idx`` sits at module scope.
+
+    WHY A BRACE WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``function\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{[\\s\\S]{0,300}?<call>`` — silently
+    matches ACROSS function boundaries: with a short helper declared just above
+    the one that actually makes the call, the bounded ``[\\s\\S]`` span reaches
+    past the helper's closing brace and attributes the call to the WRONG
+    function, along with the wrong parameter list.  Measured, not argued: over
+    the shipped ``provOpenKey`` / ``readProvOpen`` pair that span attributes
+    ``localStorage.getItem(key)`` to ``provOpenKey(evalId)`` and reports the
+    key as not-a-parameter — a false FAILURE against correct code.  The walk
+    below is exact.
+    """
+    best: tuple[str, list[str]] | None = None
+    best_start = -1
+    for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', src):
+        paren_depth = 1
+        i = m.end()
+        while i < len(src) and paren_depth > 0:
+            if src[i] == '(':
+                paren_depth += 1
+            elif src[i] == ')':
+                paren_depth -= 1
+            i += 1
+        if paren_depth != 0:
+            continue
+        params_text = src[m.end() : i - 1]
+        start = src.find('{', i)
+        if start == -1:
+            continue
+        depth = 0
+        end = -1
+        for j in range(start, len(src)):
+            if src[j] == '{':
+                depth += 1
+            elif src[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            continue
+        if start < idx < end and m.start() > best_start:
+            best_start = m.start()
+            best = (
+                m.group(1),
+                [p.strip() for p in params_text.split(',') if p.strip()],
+            )
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract a module-scope `const <name> = { ... }` / `[ ... ]` literal
+# ---------------------------------------------------------------------------
+
+
+def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
+    """Return the literal assigned to ``const <name> =``, delimiters included.
+
+    Same depth walk as ``_extract_df_data_block``, re-anchored: that helper
+    only matches the ``key: {`` seed-object form used by data.js and so cannot
+    locate a module-scope ``const`` declaration.  ``open_char`` selects the
+    delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
+    and the ``PARITY_PLAIN`` array.
+
+    Returns the empty string if the declaration is not found — callers assert
+    on that explicitly, because "the declaration was deleted" and "the
+    declaration is empty" are different failures with different fixes.
+
+    Same string-literal caveat as ``_extract_df_data_block``: the walk does not
+    skip delimiters inside quoted strings.  Acceptable here for the same
+    reason — these two declarations hold short identifier keys and plain
+    prose values, neither of which embeds a brace or a bracket.
+    """
+    close_char = {'{': '}', '[': ']'}[open_char]
+    m = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*{re.escape(open_char)}', src)
+    if m is None:
+        return ''
+    start = m.end() - 1  # index of the opening delimiter
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return ''
+
+
+# ---------------------------------------------------------------------------
+# Helper: memory_evals_fmt.js's two parity declarations, parsed once
+# ---------------------------------------------------------------------------
+
+
+# One `'state': { ... }` entry of PARITY_REFINEMENT.  Declared once and shared:
+# it is the non-trivial invariant three tests depend on, and three verbatim
+# copies would have to be fixed three times.
+_PARITY_ENTRY_RE = r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}'
+
+
+def _parity_tables(code: str) -> tuple[dict[str, str], set[str]]:
+    """Parse memory_evals_fmt.js's parity vocabulary into ``(entries, declined)``.
+
+    Reads the .js MODULE, not the .jsx: task 3481 moved ``verdictBadge`` and
+    both parity tables there so node could execute them, and every message
+    below names that file, because a failure that sends the reader to
+    tab_memory_evals.jsx — which no longer contains either declaration — is the
+    wrong-file misdirection this migration set out to remove.
+
+    ``entries`` maps a refined parity state to the raw body of its
+    ``{ suffix, cls }`` object; ``declined`` is the set of states listed in
+    ``PARITY_PLAIN``.  Both declarations must exist and be non-empty, and every
+    ``PARITY_REFINEMENT`` value must be a ``{ suffix, cls }`` pair — those are
+    preconditions of every caller, so they are asserted HERE with one canonical
+    message rather than re-stated per test.
+
+    The shape check runs against the top-level keys of the literal, not against
+    what the entry regex happened to match: an entry written with a non-object
+    value would otherwise be silently absent from ``entries`` and get reported
+    by the vocabulary test as an *unhandled state*, sending the reader to look
+    for a missing declaration that is right there.
+    """
+    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
+    assert refinement, (
+        'memory_evals_fmt.js must declare `const PARITY_REFINEMENT = {...}` at '
+        'module scope in CODE (not in a comment). It is the one place the file '
+        'says which parity states change the badge, and what these tests '
+        'compare against memory_evals.PARITY_STATES.'
+    )
+    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
+    assert plain, (
+        'memory_evals_fmt.js must declare `const PARITY_PLAIN = [...]` at '
+        'module scope — the EXPLICIT opt-out list. Without it, a state that is '
+        'merely unhandled is indistinguishable from one deliberately left to '
+        'the plain verdict badge, and these tests cannot tell a considered '
+        'decision from an oversight.'
+    )
+
+    # Keys are quoted in the source (they are producer vocabulary strings, not
+    # JS identifiers), but the quotes are tolerated rather than required here:
+    # the presence grep in `test_verdict_badges_driven_by_persisted_verdict` is
+    # what enforces the quoted form, and it says so clearly. Requiring them
+    # here too would report a dropped quote as "the table holds no entries".
+    entries = dict(re.findall(_PARITY_ENTRY_RE, refinement))
+    declined = set(re.findall(r"'([^']*)'", plain))
+
+    # Top-level keys, found by deleting the one level of nesting the literal
+    # has (the `{ suffix, cls }` values) and reading what keys remain.
+    declared = set(
+        re.findall(r'[\'"]?(\w+)[\'"]?\s*:', re.sub(r'\{[^{}]*\}', '', refinement[1:-1]))
+    )
+    malformed = declared - set(entries)
+    assert malformed == set(), (
+        f'PARITY_REFINEMENT entr(ies) {sorted(malformed)} do not hold a '
+        '`{ suffix, cls }` object literal. Storing a whole label (or anything '
+        'else) would let a parity branch report a state the payload never '
+        'asserted — `_parity()` derives most states from (verdict class, '
+        'linked?), so the verdict must survive into the label.'
+    )
+    for key, value in entries.items():
+        keys = set(re.findall(r'(\w+)\s*:', value))
+        assert keys == {'suffix', 'cls'}, (
+            f"PARITY_REFINEMENT['{key}'] must be a {{ suffix, cls }} pair, got "
+            f'keys {sorted(keys)}. A `suffix` is composed onto the '
+            'verdict-derived base and a `cls` selects an existing badge class; '
+            'anything else is not consumed by verdictBadge at all.'
+        )
+
+    assert entries, 'PARITY_REFINEMENT is declared but holds no entries.'
+    assert declined, 'PARITY_PLAIN is declared but holds no states.'
+    return entries, declined
+
+
+def _return_label_exprs(badge_body: str) -> list[str]:
+    """Every `label:` expression in ``verdictBadge``'s ``return { ... }`` sites.
+
+    Each is captured to the END of its return object rather than to the first
+    comma: a label expression that legitimately contains one (a function call,
+    a string with a comma in it) would otherwise be silently truncated and the
+    assertions below would then hold — or fail — for the wrong reason.
+    """
+    exprs: list[str] = []
+    for m in re.finditer(r'return\s*\{', badge_body):
+        start = m.end() - 1
+        depth = 0
+        obj = ''
+        for i in range(start, len(badge_body)):
+            if badge_body[i] == '{':
+                depth += 1
+            elif badge_body[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    obj = badge_body[start + 1 : i]
+                    break
+        label = re.search(r'\blabel\s*:\s*', obj)
+        if label:
+            exprs.append(obj[label.end() :].strip().rstrip(',').strip())
+    return exprs
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +667,19 @@ def test_index_html_registers_tab_memory_evals_load_order(
             'shell.jsx',
             'tab_memory_evals.jsx uses window.DF_SHELL formatting helpers.',
         ),
+        (
+            '/static/redux/memory_evals_fmt.js',
+            'memory_evals_fmt.js',
+            'tab_memory_evals.jsx destructures chartForKind/trendGaps/dash/'
+            'ageText/verdictBadge/unmatchedReasonText off '
+            'window.DF_MEMORY_EVALS_FMT at MODULE TOP LEVEL (task 3481 moved '
+            'those pure helpers out of the .jsx so node can execute them). This '
+            'is the same load-order contract that binds this file to tabs.jsx, '
+            'one link further upstream: a later tag leaves the global undefined '
+            'at this file\'s evaluation time, which throws, which leaves '
+            'window.DF_MEMORY_EVALS undefined for tabs.jsx, which blanks every '
+            'tab defined there.',
+        ),
     ]:
         _assert_script_loads_before(
             index_html_body,
@@ -428,6 +689,31 @@ def test_index_html_registers_tab_memory_evals_load_order(
             'tab_memory_evals.jsx',
             why,
         )
+
+    # (b2) memory_evals_fmt.js specifically must be a CLASSIC script — no type
+    #      at all, not even text/babel. _assert_script_loads_before already
+    #      rejects defer/async/type=module; what this adds is the failure MODE a
+    #      `type="text/babel"` .js has, which is silence: Babel-standalone would
+    #      transform it out of the classic-script shared global scope, and
+    #      classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE (which matches only
+    #      `<script src="/static/redux/NAME.js?v=NN"></script>`) would stop
+    #      seeing the file at all. That suite does catch it — its registry entry
+    #      would go unmatched — but it reports a missing script, not a wrong
+    #      tag shape, so this names the actual cause.
+    fmt_found = _find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
+    assert fmt_found is not None, (
+        'No <script src="/static/redux/memory_evals_fmt.js..."> tag in '
+        'index.html — tab_memory_evals.jsx destructures window.DF_MEMORY_EVALS_FMT '
+        'at module top level.'
+    )
+    _fmt_pos, fmt_attrs = fmt_found
+    assert fmt_attrs.get('type') is None, (
+        'memory_evals_fmt.js is plain JS, so its <script> tag must carry NO type '
+        f'attribute; got type={fmt_attrs.get("type")!r}. A text/babel .js would be '
+        'handed to Babel-standalone and would not join the shared classic-script '
+        'global scope, and classic_script_scope.test.mjs would stop matching the '
+        'tag entirely.'
+    )
 
     # (c) THE load-bearing assertion — before tabs.jsx.
     _assert_script_loads_before(
@@ -449,23 +735,60 @@ def test_index_html_registers_tab_memory_evals_load_order(
         'app.jsx renders MemoryTab, which renders MemoryEvalsSection.',
     )
 
-    # (e) one uniform cache-buster across every /static/redux/* asset,
-    #     including the styles.css <link> — mirrors the guards in
-    #     test_index_html.py:593 (floor 37) and test_tab_escalations.py:487.
-    versions = set(
-        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    # NOTE: no cache-buster assertion here. The "all /static/redux/?v= share
+    # ONE version" check is asserted once, canonically, in test_index_html.py —
+    # it was replicated across five test modules, each with its own stale
+    # monotonic floor, so every dashboard change re-failed several byte-identical
+    # copies. The monotonic floor this task needs lives in
+    # test_index_html_cache_buster_floor below.
+
+
+def test_index_html_cache_buster_floor(index_html_body: str) -> None:
+    """Every /static/redux/* asset must be at or past this task's version.
+
+    Two of the three fixes in task 3470 are pure edits to .jsx bundles that an
+    already-open dashboard has ALREADY cached — tab_memory_evals.jsx (per-eval
+    provenance key, empty-trend state) and tab_escalations.jsx (focus-miss and
+    focus-pending feedback). Neither adds a route, a template or any other
+    server-side change that would force the browser to refetch. Without a bump
+    an open dashboard keeps running the buggy bundle indefinitely: the operator
+    sees every provenance <details> pop open on the next 3s poll, a blank 26px
+    box where an empty trend should name itself, and a dead cross-tab link,
+    while the fixed source sits on disk unread.
+
+    Bumping is therefore part of the fix, not a cosmetic afterthought, so it is
+    pinned by a test like every prior bump was.
+
+    Scope, deliberately: the FLOOR only. Whether the versions are UNIFORM is one
+    property of index.html, and asserting it here too made this the sixth
+    byte-identical copy of that check (test_index_html.py, test_esc_flow_diagram
+    .py, test_tab_escalation_analytics.py, test_scheduler_page.py, and twice in
+    this module) — so any partial bump failed six tests with six different stale
+    floors in the message, and a reader had to diff them to find the
+    authoritative one. Uniformity is now asserted once, in test_index_html.py.
+    A floor stated as `min(...)` needs no uniformity precondition to be sound:
+    it is the strictly stronger claim under mixed versions, since the oldest
+    asset is the one that would still serve stale module code.
+    """
+    versions = {
+        int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    }
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: '
-        f'{sorted(versions)} — bump all of them uniformly, the stylesheet '
-        '<link> included.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 38, (
-        f'index.html cache-buster version is {v}, expected >= 38 (proves the '
-        'uniform bump for the memory-evals section actually reaches '
-        'already-open browsers; the previous floor, 37, proved task 3332\'s '
-        '`const API` collision fix).'
+    assert min(versions) >= 43, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        "expected >= 43 so task 3481's extraction actually reaches already-open "
+        'browsers. That bump is not cosmetic here: the extraction adds a NEW '
+        'classic script (memory_evals_fmt.js) that tab_memory_evals.jsx '
+        'destructures at module top level, so a browser holding the cached '
+        'index.html would fetch neither the new tag nor the rewritten .jsx, and '
+        'one holding a cached tab_memory_evals.jsx alongside a fresh index.html '
+        'would run a .jsx whose helpers are defined twice. This floor supersedes '
+        "the three it subsumes: >= 42 (task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes), >= 41 (test_index_html.py) and >= 38 (the '
+        'memory-evals section landing in task 3216).'
     )
 
 
@@ -614,26 +937,16 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
             'both forbid a new chart library; use charts.jsx primitives only.'
         )
 
-    # (h) the kind vocabulary lives in the primitive-selection helper, with an
-    #     explicit unknown/null fallback
-    assert re.search(r'\bfunction\s+chartForKind\s*\(', body), (
-        'tab_memory_evals.jsx must define `function chartForKind(kind)` — the '
-        'single place the metric-kind vocabulary maps to a chart primitive.'
-    )
-    kind_body = _extract_function_body(body, 'chartForKind')
-    assert kind_body, 'could not extract the chartForKind body.'
-    for kind in ('tripwire', 'proportion', 'count', 'scalar'):
-        assert f"'{kind}'" in kind_body, (
-            f"chartForKind must name the '{kind}' metric kind — the payload's "
-            'vocabulary is exactly {tripwire, proportion, count, scalar}.'
-        )
-    assert 'return null' in kind_body.replace('  ', ' '), (
-        'chartForKind must fall back to `null` (value only, NO chart) for an '
-        'unknown-or-null kind. A kind outside the known set is a rendering gap '
-        "the payload already files an `unknown_kind` issue for; guessing a "
-        'primitive would render an unvalidated shape as though it were '
-        'understood.'
-    )
+    # (h) the kind vocabulary itself now lives in memory_evals_fmt.js and is
+    #     asserted EXECUTABLY by node — see memory_evals_fmt.test.mjs
+    #     'chartForKind: tripwire is step-shaped' and its three siblings (one
+    #     named test per kind), plus 'chartForKind: an unknown kind gets NO
+    #     chart, never a guessed primitive'. The remaining .jsx half — that the
+    #     tag this file receives is routed through a component lookup rather
+    #     than rendered raw — is asserted once, in
+    #     `test_pure_helpers_are_consumed_from_the_fmt_module`, which is where
+    #     the rest of this file's consumption contract lives. A second copy here
+    #     was two assertions about one fact.
 
     # (i) the truncation disclosure names both counts
     assert re.search(r'\btruncated\b', body), (
@@ -654,155 +967,576 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 # ---------------------------------------------------------------------------
 
 
-# The four persisted verdict strings, passed through unmapped by the builder.
-_VERDICTS = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
-
-# The server-derived display states that verdictBadge actually BRANCHES on.
-# memory_evals.py:660-661: `parity` "keeps the UI from re-deriving badge state
-# out of three separate fields, which is where the two sides would drift apart".
+# The verdict vocabulary is deliberately NOT restated here either, for the same
+# reason as the parity one below.  A local four-member tuple lived here until
+# task 3481's review pointed out it was the THIRD copy — alongside
+# `memory_evals_fmt.js`'s `VERDICT_BASES` table and the producer's
+# `memory_evals._KNOWN_VERDICTS` — of which only the producer's is
+# authoritative.  A fifth verdict added there would render as 'unreadable
+# verdict' with a `badge bad` while this file stayed green.  Tests that need the
+# vocabulary import the frozenset; `test_verdict_vocabulary_fully_covered` is
+# the completeness contract between it and the JS table.
 #
-# `alarmed_open` and `clear` are deliberately absent.  verdictBadge has no
-# branch for them by design — they agree with the verdict, so they fall through
-# to the plain verdict badge.  Asserting their string appears in the source
-# only ever matched the explanatory COMMENTS (tab_memory_evals.jsx:84 and :100);
-# the strings occur nowhere in code.  That pinned comment wording in place —
-# rewording it would fail this suite with nothing functionally changed — while
-# giving zero coverage of how those states render.  "Falls through to the plain
-# badge" is a claim about which branch does NOT execute, which a source-
-# substring test structurally cannot make; only a DOM/render test could.
-_PARITIES = (
-    'alarmed_unlinked',
-    'recovered_open',
-    'storm_collapsed',
-)
+# The parity vocabulary is deliberately NOT restated here.  It is imported from
+# the producer (`memory_evals.PARITY_STATES`) inside each test that needs it —
+# a local copy is exactly the rot this suite now exists to prevent, and one
+# lived here until task 3442: a hand-picked three-member tuple that could not
+# notice the six states task 3363 added.  See
+# `test_parity_vocabulary_fully_covered` for the completeness contract, and
+# test_memory_evals_data.py::TestParityVocabularyIsClosedAndExported for the
+# proof that the exported frozenset matches what the builder actually emits.
+
+
+def test_verdict_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
+    """`memory_evals_fmt.js`'s `VERDICT_BASES` is exactly `_KNOWN_VERDICTS`.
+
+    The verdict axis of the badge matrix, held to the same contract as the
+    parity axis below and for the same reason.  Both directions are separate
+    failures:
+
+    * a `_KNOWN_VERDICTS` member with no `VERDICT_BASES` entry is a verdict the
+      server persists today and the browser has never been told about — it
+      falls to the present-but-unreadable branch and renders 'unreadable
+      verdict' with a `badge bad`, i.e. a healthy metric displayed as broken
+      tooling, with nothing failing;
+    * a declared verdict OUTSIDE `_KNOWN_VERDICTS` is a dead branch no payload
+      can reach, since `memory_evals._verdict_class()` buckets anything not in
+      that frozenset to `unknown_verdict` before it ever reaches this table.
+
+    This is the half node cannot do — it cannot import a Python frozenset.  The
+    WELL-FORMEDNESS of the table (distinct base labels, no borrowed
+    'no verdict' / 'unreadable verdict', exactly one healthy badge) is asserted
+    executably in memory_evals_fmt.test.mjs instead, by CALLING verdictBadge.
+    """
+    from dashboard.data.memory_evals import _KNOWN_VERDICTS
+
+    table = _extract_const_object(memory_evals_fmt_js_code, 'VERDICT_BASES')
+    assert table, (
+        'memory_evals_fmt.js must declare `const VERDICT_BASES = {...}` at '
+        'module scope in CODE (not in a comment). It is the one place the file '
+        'says which verdicts it can render, and what this test compares against '
+        'memory_evals._KNOWN_VERDICTS.'
+    )
+
+    # Top-level keys only — same one-level-of-nesting removal `_parity_tables`
+    # uses, so the `base`/`cls` keys of each entry are not read as verdicts.
+    declared = set(
+        re.findall(r'[\'"](\w+)[\'"]\s*:', re.sub(r'\{[^{}]*\}', '', table[1:-1]))
+    )
+    assert declared, (
+        'VERDICT_BASES is declared but holds no quoted entries — this test '
+        'would pass vacuously in both directions. Keys are QUOTED on purpose '
+        '(producer vocabulary strings, greppable in the form the payload '
+        'carries); fix the quoting rather than loosening this parse.'
+    )
+
+    unhandled = _KNOWN_VERDICTS - declared
+    assert unhandled == set(), (
+        f'memory_evals._KNOWN_VERDICTS member(s) {sorted(unhandled)} have no '
+        'VERDICT_BASES entry in memory_evals_fmt.js. The server persists these '
+        'today, so each falls to the present-but-unreadable branch and renders '
+        "'unreadable verdict' with a `badge bad` — a judged metric displayed as "
+        'broken tooling. Add the base label and badge class it should earn.'
+    )
+
+    dead = declared - _KNOWN_VERDICTS
+    assert dead == set(), (
+        f'VERDICT_BASES in memory_evals_fmt.js declares {sorted(dead)}, which '
+        'are not in memory_evals._KNOWN_VERDICTS — `_verdict_class()` buckets '
+        'anything outside that frozenset to `unknown_verdict` before it reaches '
+        'this table, so these are dead branches no payload can reach. Delete '
+        'them, or fix the spelling if the producer renamed the verdict.'
+    )
+
+
+def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
+    """Every `PARITY_STATES` member is handled, and nothing else is.
+
+    `memory_evals_fmt.js` declares its whole view of the vocabulary in two
+    module-scope names — `PARITY_REFINEMENT` (states whose badge is refined)
+    and `PARITY_PLAIN` (states that deliberately decline refinement) —
+    precisely so this can be checked against the PRODUCER rather than against a
+    subset copied into this file.  Both directions are separate failures:
+
+    * a member in NEITHER declaration is a state the server can emit today and
+      the browser has never been told about;
+    * a declared state OUTSIDE `PARITY_STATES` is a dead branch the producer no
+      longer emits, which no render test would ever reach.
+
+    An explicit opt-out list is what makes the first check possible at all.
+    "Falls through to the plain badge" is otherwise a claim about which branch
+    does NOT execute — unobservable to a source-assertion test, which is why
+    the previous version of this suite simply omitted those states and went
+    blind to six of them.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = memory_evals_fmt_js_code
+
+    # `_parity_tables` also asserts both declarations exist and that every
+    # table value is a `{ suffix, cls }` pair — the composition invariant in
+    # its structural form: table values are SUFFIXES, never whole labels, so
+    # there is no expression in memory_evals_fmt.js capable of returning a
+    # label that discards the verdict-derived base.
+    entries, declined = _parity_tables(code)
+    handled = set(entries)
+
+    overlap = handled & declined
+    assert overlap == set(), (
+        f'{sorted(overlap)} appear in BOTH PARITY_REFINEMENT and PARITY_PLAIN. '
+        'A state is either refined or deliberately plain; declaring both makes '
+        'the opt-out list stop meaning "considered and declined".'
+    )
+
+    unhandled = PARITY_STATES - (handled | declined)
+    assert unhandled == set(), (
+        f'memory_evals.PARITY_STATES member(s) {sorted(unhandled)} appear in '
+        'neither PARITY_REFINEMENT nor PARITY_PLAIN in memory_evals_fmt.js. '
+        'The server can emit these today and that file has never been told '
+        'about them, so they render '
+        'through whatever the fall-through happens to be. Add each to the '
+        'table (with the fact its badge should carry) or to the plain list '
+        '(if the verdict badge already says everything there is to say).'
+    )
+
+    dead = (handled | declined) - PARITY_STATES
+    assert dead == set(), (
+        f'{sorted(dead)} are declared in memory_evals_fmt.js but are not in '
+        'memory_evals.PARITY_STATES — the producer cannot emit them, so they '
+        'are dead branches no render can reach. Delete them, or fix the '
+        'spelling if the producer renamed the state.'
+    )
+
+    badge_body = _extract_function_body(code, 'verdictBadge')
+    assert badge_body, 'could not extract the verdictBadge body.'
+    labels = _return_label_exprs(badge_body)
+    assert labels, 'verdictBadge returns no `label`.'
+    for expr in labels:
+        # `base\b`, not `startswith('base')`: the latter also accepts an
+        # unrelated identifier such as `baseline` or `baseLabel`, so it would
+        # not actually pin composition onto the verdict-derived `base`.
+        assert re.match(r'base\b', expr), (
+            f'verdictBadge returns the label {expr!r}, which does not '
+            'begin with the verdict-derived `base`. Every returned label must '
+            'compose onto it: a fixed label reports a state the payload never '
+            'asserted. `_parity()` is a three-case lookup over (verdict class, '
+            'linked?) that gives every class its OWN pair of states — a fixed '
+            'label collapses that back, e.g. reporting a metric nothing judged '
+            '(`unjudged_open`, `insufficient_data_open`) as having recovered.'
+        )
+    assert any('suffix' in e for e in labels), (
+        'no verdictBadge return composes a PARITY_REFINEMENT `suffix` onto '
+        '`base` — the table is declared but never consumed, so every refined '
+        'state renders as the plain verdict badge.'
+    )
+
+
+def test_every_open_parity_state_shows_the_escalation_affordance(
+    memory_evals_fmt_js_code: str,
+) -> None:
+    """A live escalation must be visible on the badge, for every `*_open` state.
+
+    The requirement is DERIVED from the producer — `{s for s in PARITY_STATES
+    if s.endswith('_open')}` — rather than listed here, which is the whole
+    point: `_parity()` suffixes `_open` onto the linked variant of every
+    non-alarm verdict class, so the next class the producer adds arrives with
+    an `_open` partner and fails here instead of rendering unaffordanced.
+
+    A `*_open` state falling through to the plain verdict badge tells the
+    operator nothing about the live escalation behind the row — the badge reads
+    exactly like the same metric with no escalation at all, which is the
+    distinction the parity field was derived to make.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = memory_evals_fmt_js_code
+    open_states = {s for s in PARITY_STATES if s.endswith('_open')}
+    assert open_states, (
+        'no member of memory_evals.PARITY_STATES ends in `_open` — the naming '
+        'convention this assertion derives from is gone, so it would pass '
+        'vacuously. Re-derive the affordance requirement from whatever '
+        'replaced the suffix before deleting this guard.'
+    )
+
+    entries, declined = _parity_tables(code)
+
+    for state in sorted(open_states):
+        assert state not in declined, (
+            f"'{state}' is in PARITY_PLAIN, so it renders as the bare verdict "
+            'badge. But an escalation is OPEN on that row: the badge is then '
+            'identical to the same verdict with nothing filed, and the '
+            'operator has no way to tell a live escalation from none. States '
+            'may decline refinement only when the verdict badge already says '
+            'everything there is to say, which is never true while an '
+            'escalation is open.'
+        )
+        assert state in entries, (
+            f"'{state}' has no PARITY_REFINEMENT entry, so nothing on its "
+            'badge discloses the open escalation the `_open` suffix asserts.'
+        )
+        suffix = re.search(r"suffix\s*:\s*'([^']*)'", entries[state])
+        assert suffix, f"PARITY_REFINEMENT['{state}'] has no `suffix` string."
+        assert 'escalation open' in suffix.group(1), (
+            f"PARITY_REFINEMENT['{state}'] renders the suffix "
+            f'{suffix.group(1)!r}, which never says the escalation is open. '
+            "Today only `recovered_open` carries that affordance; every "
+            '`_open` state means the same thing — an escalation is linked and '
+            'still live — and must say so in the same words, so the operator '
+            'reads one marker rather than learning six.'
+        )
+        # Severity follows the VERDICT, not the linkage — but never DOWN to
+        # healthy. Without this, flipping the four warn-level `_open` entries
+        # to 'badge ok' keeps the whole suite green while colouring a row that
+        # has a live open escalation the same green as one with nothing filed.
+        cls = re.search(r"cls\s*:\s*'([^']*)'", entries[state])
+        assert cls, f"PARITY_REFINEMENT['{state}'] has no `cls` string."
+        assert cls.group(1) != 'badge ok', (
+            f"PARITY_REFINEMENT['{state}'] renders 'badge ok'. An escalation is "
+            'OPEN on that row, so the badge may not be the healthy one: colour '
+            'is the first thing scanned and a green row is not looked at '
+            'twice, which would bury the very fact the suffix was added to '
+            'disclose. Severity may follow the verdict down to warn, never to '
+            'healthy.'
+        )
+
+
+def test_unknown_verdict_is_visibly_unrenderable(
+    memory_evals_fmt_js_code: str,
+) -> None:
+    """An unrecognised verdict must read as broken — not as absent, not as fine.
+
+    Server-side this is a NAMED issue kind: the reader files an
+    `unknown_verdict` issue naming the eval, metric and offending value,
+    precisely so a value outside the closed vocabulary fails toward "something
+    is wrong here".  This is the last render step and must not quietly undo it.
+
+    Two substitutions are refused, because an operator reads the rendered badge
+    and nothing else:
+
+    * the CLASS may borrow neither the healthy badge nor the neutral
+      not-measured one — the row is broken, not fine and not unmeasured;
+    * the LABEL may not say the verdict is MISSING.  It is present, just
+      unreadable, and the two are different facts.  Contrast `unjudged`, which
+      correctly stays plain and muted reading 'no verdict': nothing judged that
+      metric at all, so there that label is exactly true.
+
+    Asserted over RENDERED OUTPUT (badge class and the label the operator
+    reads), not over comment prose.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = memory_evals_fmt_js_code
+    unknown = {s for s in PARITY_STATES if s.startswith('unknown_verdict')}
+    assert unknown, (
+        'no member of memory_evals.PARITY_STATES starts with '
+        '`unknown_verdict` — this assertion would pass vacuously. Re-derive it '
+        'from whatever the producer renamed the out-of-vocabulary state to '
+        'before deleting this guard.'
+    )
+
+    entries, declined = _parity_tables(code)
+
+    for state in sorted(unknown):
+        assert state not in declined, (
+            f"'{state}' is in PARITY_PLAIN, so it renders as the plain verdict "
+            'badge — muted, with nothing marking the row as broken. That '
+            'reports a present-but-unreadable verdict as an unremarkable one, '
+            'which is the same substitution the absent-verdict guard exists to '
+            'prevent, running the other way. The producer files a named '
+            '`unknown_verdict` issue for this; the last render step must not '
+            'quietly undo it.'
+        )
+        assert state in entries, (
+            f"'{state}' has no PARITY_REFINEMENT entry, so it renders through "
+            'the fall-through with nothing marking the verdict as unreadable.'
+        )
+        cls = re.search(r"cls\s*:\s*'([^']*)'", entries[state])
+        assert cls, f"PARITY_REFINEMENT['{state}'] has no `cls` string."
+        assert cls.group(1) not in ('badge ok', 'badge muted'), (
+            f"PARITY_REFINEMENT['{state}'] renders {cls.group(1)!r}. It may "
+            'borrow neither the healthy badge nor the neutral not-measured '
+            'one: the value is present and outside the vocabulary, so the row '
+            'is broken, not fine and not unmeasured.'
+        )
+    # The condition is named by the BASE, not by a parity suffix. `base` is the
+    # verdict-derived half of every label, so it is the only half that can say
+    # what happened to the VERDICT; a suffix appended to 'no verdict' cannot
+    # un-say it, and the composed label would then assert both halves of the
+    # distinction at once ("no verdict · unrecognised verdict" — absent in the
+    # first clause, present-but-unreadable in the second).
+    badge_body = _extract_function_body(code, 'verdictBadge')
+    assert badge_body, 'could not extract the verdictBadge body.'
+    assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
+    assert assigned, 'verdictBadge assigns no literal `base` label.'
+    absent = assigned[0]  # the seed, in force until a verdict is recognised
+    unreadable = [v for v in assigned if re.search(r'unread|unrecognis|unknown', v, re.I)]
+    assert unreadable, (
+        'verdictBadge never assigns a `base` label naming an UNREADABLE '
+        f'verdict — the literals it can render are {sorted(set(assigned))}. A '
+        'verdict that is present but outside the closed vocabulary reaches '
+        f'parity {sorted(unknown)}, and the operator must be able to see that '
+        'from the label: memory_evals._verdict_class() buckets an absent value '
+        'to `unjudged` and a present-but-out-of-vocabulary one to '
+        '`unknown_verdict` precisely because they are different facts.'
+    )
+    assert absent not in unreadable, (
+        f'verdictBadge seeds `base` to {absent!r} and uses that same label for '
+        'an unreadable verdict, so the two states the producer distinguishes '
+        'render identically. Seed the genuinely-ABSENT label and overwrite it '
+        'on a present-but-unrecognised value.'
+    )
 
 
 def test_verdict_badges_driven_by_persisted_verdict(
     tab_memory_evals_jsx_body: str,
-    tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """Badges must name every persisted verdict and every server-derived
     parity state, and an absent verdict must render its own explicit state.
 
     Defaulting a null verdict to `no_alarm` would turn "we do not know" into
-    "we checked and it is fine" — the builder itself refuses that at
-    memory_evals.py:847-849, and the UI must not undo it.
+    "we checked and it is fine" — the builder itself refuses that in
+    `memory_evals._verdict_class()`, which buckets an absent value to
+    `unjudged` rather than to a verdict, and the UI must not undo it.
     """
     body = tab_memory_evals_jsx_body
-    code = tab_memory_evals_jsx_code
+    code = memory_evals_fmt_js_code
 
-    assert re.search(
-        r'window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bverdictBadge\b', body
-    ), (
-        'window.DF_MEMORY_EVALS must export a `verdictBadge` helper — the '
-        'single place badge state is decided, so the no-derivation guard below '
-        'has one function to check.'
+    export_m = re.search(r'window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}', body)
+    assert export_m, 'tab_memory_evals.jsx sets no window.DF_MEMORY_EVALS export.'
+    exported = {n.strip() for n in export_m.group(1).split(',') if n.strip()}
+    assert exported == {'MemoryEvalsSection'}, (
+        f'window.DF_MEMORY_EVALS must export exactly {{MemoryEvalsSection}}; got '
+        f'{sorted(exported)}. verdictBadge and chartForKind are owned by '
+        'window.DF_MEMORY_EVALS_FMT since task 3481 — re-exporting them here '
+        'would create two paths to the same function and invite drift. This '
+        'breaks no consumer: tabs.jsx destructures MemoryEvalsSection alone, '
+        'and the other two were exported only so this suite could see them.'
     )
+
+    # The per-VERDICT half of this loop moved to
+    # `test_verdict_vocabulary_fully_covered`, which makes the stronger claim:
+    # not merely that each persisted verdict appears somewhere in the code, but
+    # that VERDICT_BASES' keys are EXACTLY memory_evals._KNOWN_VERDICTS, in both
+    # directions. The vocabulary is passed through unmapped by the builder;
+    # there is no client-side translation table.
+    from dashboard.data.memory_evals import PARITY_STATES
 
     # Grepped against COMMENT-STRIPPED source: every one of these strings also
     # appears in the prose above verdictBadge, so a whole-file grep would stay
     # green after the branch itself was deleted.
-    for verdict in _VERDICTS:
-        assert f"'{verdict}'" in code, (
-            f"tab_memory_evals.jsx must name the persisted verdict '{verdict}' "
-            'in CODE (not merely in a comment). The vocabulary is passed '
-            'through unmapped by the builder; there is no client-side '
-            'translation table.'
-        )
-    for parity in _PARITIES:
+    for parity in sorted(PARITY_STATES):
         assert f"'{parity}'" in code, (
-            f"tab_memory_evals.jsx must name the server-derived parity state "
-            f"'{parity}' in CODE — the comment block above verdictBadge names "
-            'all of them, so a whole-file grep proves nothing.'
+            f'memory_evals_fmt.js must name the server-derived parity state '
+            f"'{parity}' in CODE, as a quoted string literal — the comment "
+            'block above verdictBadge names all of them, so a whole-file grep '
+            'proves nothing, and PARITY_REFINEMENT quotes its keys precisely '
+            'so they are greppable in the form the payload carries (this is '
+            'the assertion `_parity_tables` defers the quoted-form contract '
+            'to). Iterated from the PRODUCER, so a state added there fails '
+            'here rather than rendering through an unwritten branch.'
         )
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
     for cls in ('badge bad', 'badge ok', 'badge warn', 'badge info', 'badge muted'):
         assert cls in code, (
-            f"tab_memory_evals.jsx must use the existing '{cls}' class "
-            '(styles.css:239-261) rather than inventing badge styling.'
+            f"memory_evals_fmt.js must use the existing '{cls}' class "
+            '(styles.css:239-261) rather than inventing badge styling. The '
+            'badge tables moved there with verdictBadge (task 3481); the .jsx '
+            'renders whatever class they return.'
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
     badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
-    # (i) THE PARITY SHORT-CIRCUIT. Every parity branch must COMPOSE with the
-    #     verdict-derived label, never replace it.
+    # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
+    #     verdict-derived label — now lives in
+    #     `test_parity_vocabulary_fully_covered`, asserted structurally over
+    #     every `label:` in this body rather than per-branch. Storing suffixes
+    #     in PARITY_REFINEMENT is what makes the stronger form possible: there
+    #     is no longer an expression in the file CAPABLE of returning a label
+    #     that omits `base`, so the invariant holds for states this suite has
+    #     not enumerated as well as for the ones it has.
+
+    # (ii) the base label being verdict-DERIVED — not initialised to a real
+    #      verdict, 'badge ok' reachable only via an explicit
+    #      `verdict === 'no_alarm'` test, and a null verdict never defaulted to
+    #      no_alarm — was asserted here by three regexes over the function
+    #      SOURCE. All three are now asserted by CALLING the function, in two
+    #      named node tests:
+    #        memory_evals_fmt.test.mjs
+    #          'verdictBadge: each verdict alone yields its own base label and
+    #           class'  (null and undefined -> 'no verdict'/'badge muted', and
+    #           only no_alarm -> 'badge ok'), and
+    #          'verdictBadge: absent and unreadable are DIFFERENT, and
+    #           unreadable is never muted'.
     #
-    #     memory_evals.py:706-715 `_parity()` is a two-case lookup: alarm ->
-    #     alarmed_open/alarmed_unlinked, and everything else ->
-    #     `'recovered_open' if escalation else 'clear'`. So `recovered_open` is
-    #     derived for EVERY non-alarm verdict carrying a linked escalation —
-    #     `insufficient_data`, `grandfathered` and a NULL verdict included. A
-    #     parity branch that returned a hard-coded 'recovered ...' label would
-    #     therefore show a metric that was never measured as having recovered.
-    #
-    #     The previous version of this test could not see that: it inspected
-    #     only `badge_body[badge_body.rfind('insufficient_data'):]` — the tail,
-    #     which begins AFTER the parity branches — so a parity short-circuit
-    #     ahead of the verdict branches was structurally invisible to it.
-    #     Anchored per-branch instead, with no reliance on statement order.
-    for parity in _PARITIES:
-        m = re.search(
-            rf"parity\s*===\s*'{parity}'\s*\)\s*\{{\s*return\s*\{{([^}}]*)\}}",
-            badge_body,
-        )
-        assert m, (
-            f"could not locate the '{parity}' parity branch's return in "
-            'verdictBadge.'
-        )
-        label = re.search(r'label\s*:\s*([^,}]+)', m.group(1))
-        assert label, f"the '{parity}' branch's return has no `label`."
-        expr = label.group(1).strip()
-        assert not re.fullmatch(r"'[^']*'|\"[^\"]*\"|`[^`$]*`", expr), (
-            f"the '{parity}' parity branch returns the hard-coded label {expr} "
-            'and discards the verdict. `_parity()` derives this state from '
-            '(verdict, linked?) — for recovered_open that includes '
-            'insufficient_data, grandfathered and a NULL verdict — so a fixed '
-            'label reports a state the payload never asserted. Compose the '
-            'branch label with the verdict-derived base instead.'
+    #      Removed rather than retargeted for a second reason worth recording:
+    #      the last of the three grepped the .jsx BODY, which no longer contains
+    #      verdictBadge at all — so it had become vacuous, passing on a file
+    #      that cannot contain the defect either way. That is precisely the
+    #      blindness this migration exists to end, and leaving it would have
+    #      read as coverage.
+
+
+# The six pure helpers task 3481 moved out of the .jsx into memory_evals_fmt.js.
+_FMT_HELPERS = (
+    'chartForKind',
+    'trendGaps',
+    'dash',
+    'ageText',
+    'verdictBadge',
+    'unmatchedReasonText',
+)
+
+
+def test_pure_helpers_are_consumed_from_the_fmt_module(
+    tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
+) -> None:
+    """The .jsx must CONSUME the six pure helpers, never redefine them.
+
+    Task 3481 moved them into a plain-JS classic script so `node --test` can
+    execute their branching (dashboard/tests/js/memory_evals_fmt.test.mjs)
+    instead of this file grepping their source text.  Two copies would drift
+    silently: Babel-standalone downlevels .jsx top-level bindings out of the
+    classic-script shared global scope, so the "Identifier X has already been
+    declared" failure that protects the .js modules from each other
+    (dashboard/tests/js/classic_script_scope.test.mjs) would NOT fire here.
+    This test is the substitute for that protection.
+    """
+    code = tab_memory_evals_jsx_code
+
+    # (1) One module-top-level destructure naming all six.
+    destructure = re.search(
+        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_MEMORY_EVALS_FMT\s*;', code
+    )
+    assert destructure, (
+        'tab_memory_evals.jsx must destructure window.DF_MEMORY_EVALS_FMT at '
+        'module top level (the same idiom it already uses for DF_CHARTS and '
+        'DF_DATA, and the reason index.html must load memory_evals_fmt.js '
+        'first).'
+    )
+    named = {n.strip() for n in destructure.group(1).split(',') if n.strip()}
+    for helper in _FMT_HELPERS:
+        assert helper in named, (
+            f'`{helper}` is not destructured from window.DF_MEMORY_EVALS_FMT; '
+            f'got {sorted(named)}. A helper this file calls but does not bind '
+            'is a ReferenceError at render time.'
         )
 
-    # (ii) the base label is derived from `verdict`, and an unrecognised
-    #      verdict gets its own state rather than a defaulted one.
-    base_m = re.search(r'\b(?:let|const|var)\s+(\w+)\s*=\s*(.+?);', badge_body)
-    assert base_m, 'verdictBadge must compute a verdict-derived base label.'
-    assert not re.search(
-        r"\b(?:let|const|var)\s+\w+\s*=\s*'(no_alarm|alarm)'\s*;", badge_body
-    ), (
-        'the base label must not be INITIALISED to a real verdict — an '
-        'unrecognised verdict would then inherit it. Absent is absent: seed '
-        'the not-measured state and overwrite it only on a recognised verdict.'
+    # (2) None of the six may be REDEFINED here.
+    for helper in _FMT_HELPERS:
+        assert not re.search(rf'\bfunction\s+{helper}\s*\(', code), (
+            f'tab_memory_evals.jsx still defines `function {helper}(...)`. It '
+            'moved to memory_evals_fmt.js; a second copy here shadows the '
+            'destructured one and drifts from the version node tests.'
+        )
+
+    # (3) Neither parity table may be re-declared here — the node suite drives
+    #     its verdict x parity matrix off the module's exported tables, and a
+    #     copy in this file is exactly the drift that once left a hand-picked
+    #     three-member list blind to six states.
+    for table in ('PARITY_REFINEMENT', 'PARITY_PLAIN'):
+        assert not re.search(rf'\bconst\s+{table}\b', code), (
+            f'tab_memory_evals.jsx re-declares `{table}`. The parity vocabulary '
+            'lives in memory_evals_fmt.js, in ONE place.'
+        )
+        assert re.search(rf'\bconst\s+{table}\b', memory_evals_fmt_js_code), (
+            f'`{table}` is not declared in memory_evals_fmt.js — the vocabulary '
+            'has to live somewhere, and the cross-language completeness tests '
+            'in this file read it from there.'
+        )
+
+    # (4) The tag->component resolver. chartForKind returns 'step'/'spark'/null
+    #     since task 3481 (DD-1) — it used to return the component itself, and
+    #     that dependency on window.DF_CHARTS is what pinned it inside this .jsx
+    #     and out of reach of any runner — so the tag has to be routed back
+    #     through a component lookup rather than rendered as a bare string.
+    #
+    #     Asserted on the SHAPE of the call site, not on identifier spellings.
+    #     The lookup's name and the local chart aliases are renameable with zero
+    #     behaviour change, so pinning them would fail a test for a rename while
+    #     adding nothing over the claim actually being made here.
+    indexed = re.search(r'\b(\w+)\s*\[\s*chartForKind\s*\(', code)
+    assert indexed, (
+        "tab_memory_evals.jsx must use chartForKind's return value to INDEX a "
+        'component lookup (`SOMETABLE[chartForKind(m.kind)]`). Rendering the '
+        'tag directly would hand React a bare string where a component belongs.'
     )
-    assert not re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge ok'\s*,", badge_body) or \
-        re.search(r"verdict\s*===\s*'no_alarm'", badge_body), (
-        "the 'badge ok' styling may only be reached via an explicit "
-        "`verdict === 'no_alarm'` test — never as a fall-through."
+    tag_map = _extract_const_object(code, indexed.group(1))
+    assert tag_map, (
+        f'could not extract the `{indexed.group(1)}` object that chartForKind '
+        'is indexed into — it must be a module-scope `const NAME = {...}` '
+        'literal so this test can check it names every tag.'
     )
-    assert not re.search(
-        r"verdict\s*(\|\||\?\?)\s*['\"]no_alarm['\"]", body
-    ), (
-        'a null verdict must NOT be defaulted to no_alarm — that would report '
-        '"we did not measure" as "we measured and it is fine".'
-    )
+    #     The TAG vocabulary is still pinned, because it is a contract between
+    #     two files rather than a local name: a tag chartForKind can return but
+    #     this table does not name resolves to undefined and silently disables
+    #     the chart. The tags themselves are asserted executably in
+    #     memory_evals_fmt.test.mjs ('chartForKind: the tag vocabulary is
+    #     exactly {step, spark, null}').
+    for tag in ('step', 'spark'):
+        assert re.search(rf'\b{tag}\s*:', tag_map), (
+            f"the chart lookup must name the '{tag}' tag chartForKind can "
+            f'return; an unnamed tag resolves to undefined and silently '
+            f'disables the chart. Table was:\n' + tag_map
+        )
 
 
 def test_no_client_side_alarm_derivation(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """THE load-bearing exclusion (PRD section 8 / G6 / INV-5).
 
-    `verdict` and `parity` are the ONLY badge inputs.  memory_evals.py:660-661
-    records why: `parity` exists precisely so "the UI [does not] re-deriv[e]
-    badge state out of three separate fields, which is where the two sides
-    would drift apart".  A browser-side value-vs-limit comparison would be a
+    `verdict` and `parity` are the ONLY badge inputs.  The docstring of
+    `memory_evals._parity()` records why: `parity` exists precisely so "the UI
+    [does not] re-deriv[e] badge state out of three separate fields, which is
+    where the two sides would drift apart".  A browser-side value-vs-limit comparison would be a
     second, divergent alarm rule shipped next to the real one.
 
     Displaying `limits.alpha` is legal.  Comparing against it is the violation.
+
+    SCANS BOTH FILES, and must keep doing so.  Task 3481 moved `verdictBadge`
+    and the parity tables into memory_evals_fmt.js, which is precisely the
+    hazard this test has to survive: a guard retargeted at ONE file after a
+    split leaves the file that now holds all the branching logic unguarded,
+    and deleting the part that no longer resolves would remove the exclusion
+    from exactly where it matters most.  So the whole-file scans below loop
+    over both bodies, and part (1) follows `verdictBadge` to its new home.
+
+    Note the scans match on threshold-FIELD MEMBER ACCESS (`lim.alpha <`),
+    not on a bare `<`.  That shape is what lets them run over the new module
+    without false-firing on `ageText`'s legitimate `h < 1` / `h < 48` display
+    boundaries — which are unit thresholds for rendering, not comparisons of a
+    metric value against a limit.
+
+    Every scan below runs over COMMENT-STRIPPED source, for the reason part (1)
+    already gave: an operator-facing `<`/`>` in prose is not a comparison, and
+    failing on one would push the next author to reword a correct comment
+    rather than fix real code.  That matters most for memory_evals_fmt.js,
+    which is mostly explanatory prose ABOUT verdicts, limits, alarms and
+    thresholds — exactly the vocabulary these patterns hunt for.  Nothing is
+    given up: a violation is by definition executable, so it cannot hide in a
+    comment.
     """
-    body = tab_memory_evals_jsx_body
-    code = tab_memory_evals_jsx_code
+    # (file label, comment-stripped source) — the label is what a failure
+    # names, so a reader is told WHICH file violated the exclusion.
+    sources = (
+        ('tab_memory_evals.jsx', tab_memory_evals_jsx_code),
+        ('memory_evals_fmt.js', memory_evals_fmt_js_code),
+    )
+    # Anti-vacuity: these are all NEGATIVE assertions, so a fixture that came
+    # back empty (a 404 page, a renamed static route) would satisfy every one
+    # of them while scanning nothing at all.
+    for label, src in sources:
+        assert src.strip(), (
+            f'the {label} fixture is empty — every scan below is a negative '
+            'assertion and would pass vacuously. Check the static route before '
+            'trusting a green run here.'
+        )
+    code = memory_evals_fmt_js_code
 
     # (1) The badge helper reads verdict/parity and performs NO comparison.
     #     Extracted from COMMENT-STRIPPED source: the operator-facing `<`/`>`
@@ -810,7 +1544,12 @@ def test_no_client_side_alarm_derivation(
     #     are not comparisons, and failing on them would push the next author
     #     to reword a correct comment rather than fix real code.
     badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    assert badge_body, (
+        'could not extract the verdictBadge body from memory_evals_fmt.js. '
+        'This assertion is the anti-vacuity guard for everything below it: if '
+        'verdictBadge moves again, FOLLOW it here rather than deleting this '
+        'check, or the ordering-operator scan silently stops scanning anything.'
+    )
     assert 'parity' in badge_body, (
         'verdictBadge must read `parity` — the server-derived display state.'
     )
@@ -845,22 +1584,24 @@ def test_no_client_side_alarm_derivation(
         (rf'\.\s*({alternation})\b\s*(<=|>=|<|>)', 'field on the left'),
         (rf'(<=|>=|<|>)\s*\w*\.\s*({alternation})\b', 'field on the right'),
     ):
-        hit = re.search(pattern, body)
-        assert hit is None, (
-            f'tab_memory_evals.jsx compares a threshold-ish field '
-            f'({direction}): {hit.group(0)!r}. Alarm state comes from the '
-            'persisted `verdict` plus the server-derived `parity` and nothing '
-            'else; a value-vs-limit comparison here is a second, divergent '
-            'alarm rule (PRD section 8, G6/INV-5).'
-        )
+        for label, src in sources:
+            hit = re.search(pattern, src)
+            assert hit is None, (
+                f'{label} compares a threshold-ish field '
+                f'({direction}): {hit.group(0)!r}. Alarm state comes from the '
+                'persisted `verdict` plus the server-derived `parity` and nothing '
+                'else; a value-vs-limit comparison here is a second, divergent '
+                'alarm rule (PRD section 8, G6/INV-5).'
+            )
 
-    # (3) No statistics on the browser side at all.
+    # (3) No statistics on the browser side at all — in EITHER file.
     for ident in ('p_value', 'z_score', 'stddev', 'Math.sqrt', 'Math.log'):
-        assert ident not in body, (
-            f"tab_memory_evals.jsx references '{ident}'. The dashboard does no "
-            'statistics — the eval runner computed the verdict and the '
-            'dashboard displays it.'
-        )
+        for label, src in sources:
+            assert ident not in src, (
+                f"{label} references '{ident}'. The dashboard does no "
+                'statistics — the eval runner computed the verdict and the '
+                'dashboard displays it.'
+            )
 
 
 def test_trend_holes_are_never_handed_to_a_chart_primitive(
@@ -892,12 +1633,23 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
 
     # (iv) hole DETECTION must still exist and still run — the fix is to act on
     #      the count, not to stop counting.
-    assert re.search(r'\bfunction\s+trendGaps\s*\(', body), (
-        'tab_memory_evals.jsx must still define `trendGaps(values)` — hole '
-        'detection is required, not optional.'
+    assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
+        'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
+        'memory_evals_fmt.js (task 3481) so node can execute it. Two '
+        'definitions would drift, and the classic-script shared global scope '
+        'would not even catch it, since Babel downlevels .jsx top-level '
+        'bindings out of that scope.'
     )
-    assert len(re.findall(r'\btrendGaps\s*\(', body)) >= 2, (
-        '`trendGaps` is defined but never called. Detecting holes and then '
+    assert 'window.DF_MEMORY_EVALS_FMT' in code, (
+        'tab_memory_evals.jsx must obtain `trendGaps` from '
+        'window.DF_MEMORY_EVALS_FMT — hole detection is required, not '
+        'optional, and the destructure is now the only way this file has it. '
+        '(The exhaustive form of this check — all six helpers named in one '
+        'module-top-level destructure — is '
+        'test_pure_helpers_are_consumed_from_the_fmt_module.)'
+    )
+    assert len(re.findall(r'\btrendGaps\s*\(', code)) >= 1, (
+        '`trendGaps` is destructured but never called. Detecting holes and then '
         'ignoring the count is the defect this test exists to prevent.'
     )
 
@@ -955,6 +1707,151 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     )
 
 
+def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
+    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A metric with NO runs is a third suppression state, not a chart.
+
+    The defect: `trendGaps([])` counts zero holes in zero samples, so the
+    `Chart && gaps === 0` gate is TRUE for a metric that has never been
+    measured.  The empty series is then handed to a charts.jsx primitive —
+    and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
+    on a zero-length array.  The cell therefore renders an empty 26px <div>
+    plus a "0 pts" footer: a blank box that is indistinguishable from a
+    rendering bug, which is precisely the failure mode the gap-suppression
+    path already exists to avoid.  The deliberate 'no runs' text the row
+    ALREADY computes reaches only a `title=` on that invisible div, so the
+    state is never stated in the open.
+
+    Asserted on structure and on `data-testid` values, never on copy: a
+    rewording keeps this green, deleting a state does not.
+    """
+    body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
+
+    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (a) something must MEASURE the series length. Nothing did.
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
+        'it cannot tell an empty series from a populated one. `trendGaps([])` '
+        'is 0, so the gap check alone passes a no-runs metric straight to a '
+        'chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
+    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
+    #     the two tests cannot drift apart on what "the gate" means.
+    gate_decl = None
+    for decl in re.finditer(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+    ):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
+        'reaches a `{<local>` JSX position — see '
+        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
+        'the gate the same way.'
+    )
+    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
+        f'series-length local `{points_local}`. An empty series must never '
+        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
+        'null for a zero-length array, leaving a blank 26px box.'
+    )
+
+    # (c) FIVE structurally distinct trend states. A separate no-runs arm is
+    #     required rather than folding it into the gap message because
+    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
+    #     that reads as a bug — the very failure this suppression path exists
+    #     to prevent.  A separate mismatch arm is required for the same reason,
+    #     one payload shape further out: labels and values are PARALLEL arrays
+    #     (memory_evals.py:955,993), so a disagreement makes every other
+    #     sentence this cell could produce untrustworthy.
+    testids = (
+        'memory-eval-trend-chart',
+        'memory-eval-trend-no-kind',
+        'memory-eval-trend-mismatch',
+        'memory-eval-trend-no-runs',
+        'memory-eval-trend-gaps',
+    )
+    assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
+    for testid in testids:
+        assert f'data-testid="{testid}"' in code, (
+            f'the trend cell must render a `data-testid="{testid}"` arm. The '
+            'five states — drawn chart, unrenderable kind, labels/values length '
+            'disagreement, no runs yet, and holed series — must be structurally '
+            'distinguishable, so a rewording cannot silently collapse two of '
+            'them into one.'
+        )
+
+    # (d) the existing guards must SURVIVE, re-asserted here so a later
+    #     refactor to a `trendState()` discriminator cannot quietly drop them.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    assert bare is None, (
+        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
+        'a holed OR empty series would reach the primitive through it.'
+    )
+    assert re.search(r'\{\s*gaps\b', code), (
+        'the `gaps` count must still reach a render position — adding the '
+        'no-runs state must not cost the holed-series disclosure.'
+    )
+
+    # (e) ONE series count feeds every disclosure in this cell.  Measuring the
+    #     state from `trend.values` while the footer counts `trend.labels` lets
+    #     a payload where the two disagree render the mutually contradictory
+    #     pair "no runs yet — nothing to chart" next to "N pts": the same
+    #     reads-as-a-bug outcome this state was added to prevent, moved one
+    #     line down.
+    assert re.search(r'\{\s*' + re.escape(points_local) + r'\s*\}', row_body), (
+        f'the series-length local `{points_local}` never reaches a bare '
+        '`{<local>}` render position, so the footer count is derived from some '
+        'OTHER measurement than the one the trend states are gated on.'
+    )
+    stray = re.search(r'\{[^{}]*trend\.labels[^{}]*\.length[^{}]*\}', row_body)
+    assert stray is None, (
+        f'a render expression still counts `trend.labels` directly: '
+        f'{stray.group(0)!r}. Every count in this cell must read the single '
+        f'`{points_local}` local, or a labels/values disagreement prints two '
+        'contradictory sentences side by side.'
+    )
+
+    # ...and the disagreement itself is NAMED rather than silently reconciled
+    #    by picking one array's length over the other.
+    mismatch_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\.length\s*!==\s*[^;\n]*;', row_body
+    )
+    assert mismatch_decl is not None, (
+        'MemoryEvalMetricRow never compares the labels and values lengths. They '
+        'are parallel arrays built from one `runs` list server-side '
+        '(memory_evals.py:955,993); a payload where they disagree is malformed, '
+        'and nothing this cell says about the series would be trustworthy.'
+    )
+    mismatch_local = mismatch_decl.group(1)
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+        f'`{mismatch_local}`, so a malformed series is still drawn — against a '
+        'title derived from the other, differently-sized array.'
+    )
+    assert re.search(
+        re.escape(mismatch_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-mismatch"',
+        row_body,
+    ), (
+        f'`{mismatch_local}` does not gate the '
+        '`data-testid="memory-eval-trend-mismatch"` arm, so the disagreement is '
+        'measured but never stated.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-9 test: escalation links, storm aggregate banner, unmatched list
 # ---------------------------------------------------------------------------
@@ -963,6 +1860,7 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
 def test_escalation_links_and_storm_aggregate_banner(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """The escalation affordances must be real, built only from fields the
     projection actually carries, and read the banner from the top-level block.
@@ -998,15 +1896,17 @@ def test_escalation_links_and_storm_aggregate_banner(
     )
 
     # (c) fingerprints are rendered whole, never parsed.
-    #     memory_evals.py:576-579 — the fingerprint is the producer's private
-    #     construction; the dashboard must not depend on its substructure.
+    #     memory_evals._escalation_projection() — the fingerprint is the
+    #     producer's private construction; the dashboard must not depend on
+    #     its substructure.
     for field in ('dedupe_fingerprint', 'fingerprint'):
         for op in (r'\.split\(', r'\.slice\(', r'\.match\(', r'\.substring\('):
             assert not re.search(rf'{field}\s*{op}', body), (
                 f'`{field}` must be rendered whole — never split/sliced/matched. '
                 'The fingerprint is the producer\'s private construction '
-                '(memory_evals.py:576-579); parsing its substructure here would '
-                'couple the dashboard to a format it does not own.'
+                '(memory_evals._escalation_projection()); parsing its '
+                'substructure here would couple the dashboard to a format it '
+                'does not own.'
             )
 
     # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
@@ -1024,7 +1924,8 @@ def test_escalation_links_and_storm_aggregate_banner(
         r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
     ), (
         'the storm banner must read the TOP-LEVEL MEMORY_EVALS.storm_escape '
-        '(memory_evals.py:958-964). The identical object repeated on each eval '
+        '(memory_evals._build_payload() fills it; _empty_payload() declares it '
+        'on every return path). The identical object repeated on each eval '
         "row exists only to explain that row's missing link; electing an "
         'arbitrary eval row to read the banner from would break on a root with '
         'zero eval dirs.'
@@ -1046,54 +1947,36 @@ def test_escalation_links_and_storm_aggregate_banner(
         '`payload.unmatched_escalations` — anchored to the read, not the bare '
         'name, which the surrounding prose also uses.'
     )
+    # The reason VOCABULARY moved with unmatchedReasonText into
+    # memory_evals_fmt.js (task 3481), so this names the reasons where they now
+    # live. Kept in Python rather than left to node alone because it is the
+    # cross-file half: node proves each reason renders distinct wording, this
+    # proves the .jsx actually routes its rows through that branch.
     reasons = ('no_matching_verdict', 'storm_suppressed', 'no_fingerprint')
     for reason in reasons:
-        assert f"'{reason}'" in code, (
-            f"the unmatched-escalations block must name the '{reason}' reason. "
+        assert f"'{reason}'" in memory_evals_fmt_js_code, (
+            f"unmatchedReasonText (memory_evals_fmt.js) must name the "
+            f"'{reason}' reason. "
             'Collapsing the three into one undifferentiated "unexplained" list '
             'would fire on escalations that are in fact fully explained and '
             'train operators to ignore the one signal that catches a real '
-            'parity orphan (memory_evals.py:530-534).'
+            'parity orphan (memory_evals._unmatched_projection()).'
         )
-    # Distinct wording, not three branches sharing one string.
-    #
-    # Asserted UNCONDITIONALLY over the extracted function body. The previous
-    # form — `re.findall(r"reason === '(\w+)' \? '([^']+)'", body)` behind an
-    # `if wordings:` guard — matched only single-quoted TERNARY expressions,
-    # while unmatchedReasonText is written as sequential `if (...) return ...;`
-    # statements and one branch returns a DOUBLE-quoted string. It yielded zero
-    # matches against the real source, so the guard skipped the assertion in
-    # silence and the suite reported coverage it did not have: collapsing all
-    # three reasons onto one shared string — the exact regression this block
-    # exists to prevent — would have stayed green. A vacuous assertion is worse
-    # than no assertion, because it also stops anyone adding a real one.
-    fn_body = _extract_function_body(code, 'unmatchedReasonText')
-    assert fn_body, (
-        'could not extract `unmatchedReasonText` — the per-reason wording must '
-        'live in a named function so this contract is checkable.'
+    assert re.search(r'\bunmatchedReasonText\s*\(', code), (
+        'tab_memory_evals.jsx must CALL unmatchedReasonText on each unmatched '
+        'row — the per-reason wording existing in the fmt module is worthless '
+        'if this file renders the raw `reason` string instead.'
     )
-    texts = [
-        a or b
-        for a, b in re.findall(
-            r'return\s+(?:\'([^\']*)\'|"([^"]*)")', fn_body
-        )
-    ]
-    assert len(texts) >= 3, (
-        'unmatchedReasonText must return a distinct literal string for each of '
-        f'the three reasons; found {len(texts)}: {texts}. Asserted with a '
-        'floor so a refactor that DROPS branches fails loudly here rather '
-        'than passing vacuously on an empty match list.'
-    )
-    assert len(set(texts)) == len(texts), (
-        'each unmatched-escalation reason must get DISTINCT wording; '
-        f'found duplicates in {texts}. Collapsing them into one '
-        'undifferentiated "unexplained" list would fire on escalations that '
-        'are in fact fully explained and train operators to ignore the one '
-        'signal that catches a real parity orphan (memory_evals.py:530-534).'
-    )
-    assert all(t.strip() for t in texts), (
-        f'every reason wording must be non-empty; found a blank in {texts}.'
-    )
+    # The per-reason WORDING contract moved to node with the function:
+    # memory_evals_fmt.test.mjs 'unmatchedReasonText: each known reason gets
+    # its own non-blank wording' asserts the three texts are pairwise
+    # distinct, non-blank and non-fall-through by CALLING them, plus one
+    # named test per reason and one for the unrecognised/null/undefined
+    # branch. The Python form could not: its regex recognised only
+    # single-quoted TERNARIES, while the function is written as sequential
+    # `if (...) return ...;` statements with one double-quoted branch, so it
+    # matched zero strings and the `if wordings:` guard skipped the
+    # assertion in silence — the suite reported coverage it did not have.
 
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +2001,7 @@ _LIMITS_KEYS = (
 def test_limits_provenance_rendered(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """Every limits-provenance key must be rendered, the staleness of the
     provenance itself must be disclosed, and a null limits artifact must say so.
@@ -1141,7 +2025,7 @@ def test_limits_provenance_rendered(
 
     # stale_for_latest_run gates a VISIBLE disclosure — provenance stamped at an
     # older run must never be presented as governing a newer displayed run
-    # (memory_evals.py:237-241).
+    # (memory_evals._read_limits() stamps `stale_for_latest_run`).
     assert re.search(r'stale_for_latest_run\s*&&', code), (
         '`limits.stale_for_latest_run` must GATE a visible disclosure, not just '
         'be printed as one more field. Otherwise alpha/baseline provenance '
@@ -1178,17 +2062,161 @@ def test_limits_provenance_rendered(
 
     # Local re-assertion of the step-7 guard: alpha and min_samples appear only
     # in render position, never as an operand of a comparison.
+    #
+    # EXTENDED to both files for the same reason the primary guard is (task
+    # 3481): the badge logic now lives in memory_evals_fmt.js, so a scan of the
+    # .jsx alone would no longer cover the code most likely to grow a
+    # comparison.  COMMENT-STRIPPED for the same reason the primary guard is:
+    # both files discuss alpha and min_samples at length in prose, and a
+    # comparison is by definition executable, so it cannot hide in a comment.
     for field in ('alpha', 'min_samples'):
-        assert not re.search(rf'\.\s*{field}\b\s*(<=|>=|<|>)', body), (
-            f'`{field}` is compared somewhere in tab_memory_evals.jsx. '
-            'Provenance is DISPLAYED, never used to re-derive a verdict '
-            '(PRD section 8, G6/INV-5).'
-        )
-        assert not re.search(rf'(<=|>=|<|>)\s*\w*\.\s*{field}\b', body), (
-            f'`{field}` is compared somewhere in tab_memory_evals.jsx. '
-            'Provenance is DISPLAYED, never used to re-derive a verdict '
-            '(PRD section 8, G6/INV-5).'
-        )
+        for label, src in (
+            ('tab_memory_evals.jsx', code),
+            ('memory_evals_fmt.js', memory_evals_fmt_js_code),
+        ):
+            assert not re.search(rf'\.\s*{field}\b\s*(<=|>=|<|>)', src), (
+                f'`{field}` is compared somewhere in {label}. '
+                'Provenance is DISPLAYED, never used to re-derive a verdict '
+                '(PRD section 8, G6/INV-5).'
+            )
+            assert not re.search(rf'(<=|>=|<|>)\s*\w*\.\s*{field}\b', src), (
+                f'`{field}` is compared somewhere in {label}. '
+                'Provenance is DISPLAYED, never used to re-derive a verdict '
+                '(PRD section 8, G6/INV-5).'
+            )
+
+
+def test_limits_provenance_open_state_is_per_eval(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The provenance <details> open state must be PER EVAL and read once at mount.
+
+    The defect this pins, in two halves:
+
+    (1) A single module-global key.  `ME_PROV_OPEN_KEY = 'df.memevals.prov'`
+        was one string shared by every eval card, so expanding one card's
+        provenance wrote '1' and the next re-render expanded ALL of them.  The
+        open state of a <details> is per-disclosure UI state; keying it on the
+        section rather than on the eval makes one operator's click look like a
+        rendering bug across every other card.
+
+    (2) The attribute was a CALL: `<details open={readProvOpen()} ...>`.  A
+        function call in a JSX attribute re-runs on every render — here a
+        synchronous `localStorage.getItem` per eval card per 3s poll tick — and
+        makes the DOM's own open state unrecoverable, since the next poll
+        overwrites whatever the operator just toggled with the stored value.
+        The fix is React state seeded from storage exactly once at mount.
+
+    Every identifier below is DERIVED from the source, never pinned by
+    spelling: renaming the state local, the helpers, or the hook alias is not a
+    test failure.  What must hold is the structure.
+    """
+    code = tab_memory_evals_jsx_code
+
+    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    assert prov_body, 'could not extract the LimitsProvenance body.'
+
+    # (a) the `open=` attribute is a bare identifier, not a call.
+    open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
+    assert open_attr is not None, (
+        'the provenance <details> must take its open state from a bare '
+        'identifier (`open={someLocal}`). Not found — see (b): it must be '
+        'React state seeded from localStorage at mount.'
+    )
+    open_local = open_attr.group(1)
+
+    # ...and the NEGATIVE that is the actual defect: no call in the attribute.
+    call_attr = re.search(r'<details\s[^>]*open=\{\s*\w+\s*\(', code)
+    assert call_attr is None, (
+        f'the provenance <details> reads its open state from a function call '
+        f'in the attribute: {call_attr.group(0)!r}. That is a synchronous '
+        'localStorage read on EVERY render — once per eval card per 3s poll '
+        'tick — and it clobbers the operator\'s toggle on the next poll. Seed '
+        'React state from storage once at mount instead.'
+    )
+
+    # (b) that identifier is React useState, seeded by the read helper.
+    #     Any useState alias is accepted (the file uses ME-prefixed aliases:
+    #     MESpark / MEStep / MEC / MEDF), so the assertion is on the
+    #     destructuring SHAPE plus the initializer, not on the hook's spelling.
+    state_decl = re.search(
+        r'const\s*\[\s*' + re.escape(open_local) + r'\s*,\s*(\w+)\s*\]\s*=\s*(\w+)\(([\s\S]{0,200}?)\);',
+        prov_body,
+    )
+    assert state_decl is not None, (
+        f'`{open_local}` reaches the <details> `open=` attribute but is not '
+        f'declared as React state (`const [{open_local}, setX] = useState(...)`). '
+        'Holding the open state in the component is what makes it per-card '
+        'rather than per-section.'
+    )
+    initializer = state_decl.group(3)
+    read_helpers = sorted({
+        fn[0]
+        for m in re.finditer(r'localStorage\.getItem\(', code)
+        if (fn := _enclosing_function(code, m.start())) is not None
+    })
+    assert read_helpers, (
+        'no function in tab_memory_evals.jsx reads localStorage — the '
+        'provenance open state must still be PERSISTED across reloads.'
+    )
+    assert any(re.search(r'\b' + re.escape(h) + r'\s*\(', initializer) for h in read_helpers), (
+        f'the state initializer {initializer.strip()!r} does not call the '
+        f'localStorage read helper (one of {read_helpers}). The stored open '
+        'state must seed the component exactly once at mount.'
+    )
+
+    # (c) HOOK ORDER: the state declaration must precede the `if (!lim)` early
+    #     return LimitsProvenance already has for a null limits artifact. A
+    #     hook after a conditional return is a Rules-of-Hooks violation that
+    #     blanks the card at runtime the first time an eval has no limits.
+    lim_local = re.search(r'\b(\w+)\s*=\s*ev\.limits\b', prov_body)
+    assert lim_local is not None, (
+        'LimitsProvenance must read `ev.limits` into a local.'
+    )
+    guard = re.search(
+        r'if\s*\(\s*!\s*' + re.escape(lim_local.group(1)) + r'\s*\)', prov_body
+    )
+    assert guard is not None, (
+        'LimitsProvenance must keep its `if (!lim)` early-return guard for a '
+        'null limits artifact.'
+    )
+    assert state_decl.start() < guard.start(), (
+        'the provenance open-state hook is declared AFTER the `if (!lim)` '
+        'early return. That is a conditional hook (Rules of Hooks): the first '
+        'eval without a limits artifact changes the hook count and React '
+        'blanks the card. Move the hook above the guard.'
+    )
+
+    # (d) the persisted key is derived from the EVAL IDENTITY, so the key
+    #     expression reaching localStorage varies per card.
+    assert re.search(r'\bev\.eval_id\b', prov_body), (
+        'LimitsProvenance never reads `ev.eval_id`, so its persisted open-state '
+        'key cannot vary per eval — one card\'s toggle would expand every other '
+        'card on the next poll-driven re-render.'
+    )
+
+    # (e) the read and write helpers take the key as a PARAMETER rather than
+    #     closing over one module constant. This is what makes a single global
+    #     key structurally unrepresentable, not merely absent today.
+    for call in ('getItem', 'setItem'):
+        sites = list(re.finditer(
+            r'localStorage\.' + call + r'\(\s*([\w.]+)', code
+        ))
+        assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
+        for site in sites:
+            first_arg = site.group(1)
+            enclosing = _enclosing_function(code, site.start())
+            assert enclosing is not None, (
+                f'a `localStorage.{call}(` call sits at module scope — the '
+                'storage key must be a parameter of an enclosing helper.'
+            )
+            fn_name, param_names = enclosing
+            assert first_arg in param_names, (
+                f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
+                f'its parameters are {param_names}. The storage key must be a '
+                'PARAMETER, so a single module-global key shared by every eval '
+                'card is unrepresentable rather than merely not-currently-written.'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1247,33 +2275,21 @@ def test_staleness_empty_states_and_issues_notice(
         r'payload\.root_present\s*&&\s*evals\.length\s*===\s*0\s*&&', code
     ), (
         'root_present === true with zero evals is an empty-but-HEALTHY state '
-        '(memory_evals.py:972-974) and needs its OWN branch, gated on '
+        '(memory_evals._build_payload()) and needs its OWN branch, gated on '
         '`payload.root_present && evals.length === 0` — folding it into the '
         'root-absent message would report a working system as a broken one.'
     )
 
     # (c) missing scalars are em-dashes, never synthetic zeros.
-    #     Anchored to the dash() helper's own RETURN in comment-stripped source.
-    #     A bare `'—' in body` is the weakest possible form of this check: the
-    #     em-dash appears 30-odd times in this file's prose (it is the house
-    #     punctuation), so the assertion would survive deleting every dash the
-    #     UI actually renders.
-    #     Extracted brace-aware rather than matched with a bounded-window
-    #     regex: `ageText()` sits directly below `dash()` and returns the same
-    #     escape, so a `function dash\(...{0,200}?return '—'` window
-    #     happily matches ACROSS the function boundary and survives gutting
-    #     dash() entirely.
-    dash_body = _extract_function_body(code, 'dash')
-    assert dash_body, 'could not extract the dash() body.'
-    assert re.search(r"return\s*'(—|\\u2014)'", dash_body), (
-        'missing scalars must render the em-dash placeholder the Memory tab '
-        'already uses (tabs.jsx:589, :648-653), via a `dash()` helper that '
-        "returns the em-dash (literal or '\\u2014') for an absent value."
-    )
-    assert re.search(r'===\s*null|==\s*null|\?\?', dash_body), (
-        'dash() must actually TEST for the absent case — a helper that returns '
-        'the em-dash unconditionally, or never, is not a null guard.'
-    )
+    #     dash()'s own BEHAVIOUR — em-dash for null/undefined, and the
+    #     load-bearing dash(0) === 0 — is now asserted by node against the real
+    #     function (memory_evals_fmt.test.mjs, 'dash: an honest zero is
+    #     preserved as the number 0, never dashed' and its null/undefined
+    #     siblings), which is strictly stronger than the regex over its source
+    #     that used to live here.  What stays is the half node cannot see: that
+    #     this .jsx actually APPLIES the helper to payload scalars.  Defining a
+    #     correct dash() and then interpolating raw fields leaves the
+    #     synthetic-zero hole wide open.
     assert re.search(r'\bdash\s*\(\s*ev\.', code), (
         'the `dash()` helper must actually be APPLIED to payload scalars — '
         'defining it and then interpolating raw fields leaves the synthetic-'

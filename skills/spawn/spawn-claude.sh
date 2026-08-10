@@ -401,13 +401,25 @@ finish_failed_to_start() {
   exit "$code"
 }
 
-# Mirror session_registry.transcript_path_for_cwd's encoding byte-for-byte:
-# every '/' then every '.' maps to '-' (empirically re-verified 2026-07-07,
-# e.g. /home/leo/src/dark-factory -> -home-leo-src-dark-factory). Used to
-# locate this spawn's transcript directory under $CLAUDE_PROJECTS_DIR.
+# Mirror of orchestrator.session_registry.encode_cwd, THE canonical cwd
+# encoding: every '/', '.' and '_' maps to '-', and case is PRESERVED (no
+# lowercasing step). E.g. /media/leo/data_lv_1/leo/reify-build ->
+# -media-leo-data-lv-1-leo-reify-build. Used to locate this spawn's transcript
+# directory under $CLAUDE_PROJECTS_DIR.
+#
+# Do not restate this rule from memory. scripts/tests/test_legibility_inventory.py's
+# TestEncoderLockstep now pins THIS copy to the canonical and to real on-disk
+# dir names, by extracting the function below and running it (task 3464). That
+# extraction anchors on exactly two things: the definition must START at column
+# 0 as `_encode_cwd()` -- not indented, and not the `function _encode_cwd`
+# form -- and its body must END at a line that is a bare `}` at column 0.
+# Nothing else is pinned: where this function sits in the file does not matter,
+# and `()` and `{` need not share a line. Break either anchor and the
+# extraction fails loudly, rather than quietly ceasing to cover this copy.
 _encode_cwd() {
   local e="${1//\//-}"
-  printf '%s' "${e//./-}"
+  e="${e//./-}"
+  printf '%s' "${e//_/-}"
 }
 
 # Best-effort: is any process named `claude` a descendant of this script's

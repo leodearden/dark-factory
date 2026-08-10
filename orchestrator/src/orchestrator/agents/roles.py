@@ -289,29 +289,334 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 
 
 # Layer-1 guard against the headless --print background-task footgun (task
-# 2761).  A single source of truth concatenated into the IMPLEMENTER and
-# DEBUGGER system prompts (and injected into build_amender_prompt) — like
-# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND, it is anchored by a
+# 2761).  A single source of truth, no longer spliced on its own: task 3607
+# folded it into BACKGROUND_WAIT_GUIDANCE (below), which is what the seven
+# Bash-capable role prompts now embed — see constraint (b) there.  Like
+# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND it is anchored by a
 # regression test (test_roles_background_warning.py) so a prompt refactor can't
-# silently drop it.  Plain text, NO literal `{`/`}` braces, so it is safe both
-# concatenated via `+` and interpolated into build_amender_prompt's f-string.
+# silently drop it.
+#
+# The first bullet's "~25-minute threshold described below" forward-references
+# WAIT_PATTERN_GUIDANCE, and resolves ONLY because the two always ship together
+# as BACKGROUND_WAIT_GUIDANCE (constraint (b) already forbids splicing either
+# half alone).  Do NOT drop that qualifier back to the pre-3607 wording ("a
+# foreground command that legitimately runs long is fine", unqualified): in the
+# composed block it sat a few lines above the rule that a long FOREGROUND call
+# is exactly what gets the session killed, so the agent read "long foreground is
+# fine" immediately before "long foreground kills your session".
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing:
+# nothing interpolates this constant today (briefing.py takes
+# WAIT_PATTERN_REMINDER), and role prompts are plain `+` concatenation — see the
+# MANDATED_STAGING_COMMAND note above, they are deliberately NOT f-strings
+# because they contain literal braces.  Staying brace-free keeps it safe if a
+# future splice site does interpolate it.
 BACKGROUND_TASK_WARNING = """
 ## CRITICAL: Never end your turn while a backgrounded command is still running
 
 Do NOT launch a long-running command in the background (`Bash` with
 `run_in_background=true`) and then end your turn to "wait for it to finish" or
-"wait for the completion notification". This session is a headless, one-shot
-`claude --print` process: the moment you end your turn it exits reporting
-SUCCESS, and the still-pending background work is silently abandoned mid-task —
-leaving a half-done tree that is falsely recorded as a completed, successful run.
+"wait for the completion notification". This is a headless `claude --print`
+process: the moment you end your turn it exits reporting SUCCESS, and the
+still-pending background work is silently abandoned mid-task — leaving a
+half-done tree that is falsely recorded as a completed, successful run.
 
 - Run long commands (builds, full test suites, verification) in the FOREGROUND
-  and wait for them to complete. Per-role wall-clock ceilings exist for exactly
-  this — a foreground command that legitimately runs long is fine; an abandoned
-  background one is not.
+  and wait for them to complete — up to the ~25-minute threshold described
+  below, past which you must background it and poll instead. A foreground
+  command that legitimately runs that long is fine; an abandoned background one
+  never is.
 - If you genuinely must use `run_in_background=true`, you MUST poll it to
   completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
   your turn. Never end the turn with a background command still pending.
+"""
+
+
+# Census-R3 companion to BACKGROUND_TASK_WARNING (task 3607, census
+# 2026-08-02 §1.1).  2761 told agents what NOT to do; it never told them what
+# to do instead, so sessions kept improvising a wait — blocked `sleep` chains,
+# back-to-back tool calls as an ad-hoc delay, hand-rolled `until` busy-loops
+# that get SIGTERMed at the Bash timeout.  This states the sanctioned wait
+# paths.  Anchored by test_roles_wait_pattern.py, which pins two HARD
+# constraints:
+#   (a) NO literal `{`/`}` braces.  Defensive, NOT load-bearing, and the
+#       distinction matters to whoever edits these next: this constant reaches
+#       role prompts only by plain `+` concatenation, which is brace-safe by
+#       construction (role prompts are deliberately not f-strings — see the
+#       MANDATED_STAGING_COMMAND note above — precisely because they DO contain
+#       literal braces).  The one constant here that genuinely must stay
+#       brace-free is WAIT_PATTERN_REMINDER, which briefing.py interpolates into
+#       build_amender_prompt's f-string.  Keeping this one brace-free too costs
+#       nothing and keeps it interpolation-safe if a future splice site needs it.
+#   (b) BACKGROUND_WAIT_GUIDANCE (defined below) is the ONLY thing that may be
+#       spliced into a role prompt.  Splicing either half on its own reopens
+#       the exact footgun-trade the composition mandate exists to prevent: the
+#       prohibition without the pattern breeds busy-loops, the pattern without
+#       the prohibition breeds abandoned background work.
+#
+# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
+# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
+# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
+# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
+# allowlist -- what may run without a prompt -- not a tool-registry filter.
+# Built-in harness tools remain present and callable regardless.  Verified from
+# inside a dispatched implementer session whose cmdline was exactly
+# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
+# `ScheduleWakeup` were live in that session's tool list, and
+# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
+# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
+# since task 2761.  So do NOT "fix" this block by trimming those tools out of
+# it on the theory that the roles cannot reach them -- they can.
+#
+# THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
+# cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
+# by DISPATCH SITE, and the prompt text says so explicitly, because assuming it
+# is uniform is the error the task-3607 review caught (round 5).  Measured, not
+# assumed -- cli_invoke.py gates the whole idle regime on
+# `extension_engaged = seen_turn and working_idle_secs is not None and
+# absolute_cap_secs is not None`:
+#
+#   * workflow._invoke (workflow.py:11791-11792) passes BOTH extension params,
+#     so extension_engaged latches True and the watchdog measures IDLE time: it
+#     kills only after no NEW transcript turn for
+#     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
+#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
+#     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
+#   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
+#     extension param, so extension_engaged is False and cli_invoke takes the
+#     `else` arm: a FLAT `elapsed >= timeout_seconds` measured from
+#     watchdog_start, i.e. 1800s from session start.  Polling resets NOTHING
+#     for the steward.  Do not tell the steward otherwise.
+#   * review_checkpoint.py:211 passes no timeout_seconds at all, so the else
+#     arm's own `timeout_seconds is not None` guard is False and NO watchdog
+#     kill fires for deep_reviewer; only the harness Bash cap binds it.
+#
+# ~25 minutes is the safe default because 1800s = 30 min is the tightest real
+# ceiling among the roles that have one, and it is the FLAT one, so it has no
+# slack to reclaim.  The 120000 default / 3900000 max remain true harness facts
+# and are still stated as such -- they are just not the background-vs-foreground
+# decision threshold.
+#
+# Threading the extension params into the steward/deep_reviewer dispatch sites
+# so the idle mechanism engages uniformly is a deliberate NON-goal here: it
+# would change steward's effective budget from a flat 1800s to
+# invocation_timeout (7200s), a real operational change that belongs in its own
+# task rather than riding along in a prompt-wording one.
+# (Task 3607 review rounds 1 and 5, reviewer_comprehensive.)
+WAIT_PATTERN_GUIDANCE = """
+## CRITICAL: How to wait for something
+
+The rule above is one half of the contract — it tells you not to end your turn
+on pending background work. This is the other half: how to actually wait.
+
+SANCTIONED
+- Default, for anything that finishes inside ~25 minutes: run it in the
+  FOREGROUND with an explicit Bash `timeout` sized to the expected wall clock
+  plus margin. It is in MILLISECONDS and DEFAULTS to 120000 (2 minutes) when
+  omitted. A 5-minute command silently killed at that 2-minute default is the
+  exit-143 failure mode you will otherwise misdiagnose as a hung command.
+  Foreground-and-finished beats backgrounded-and-abandoned.
+- BACKGROUND anything that will not produce a NEW assistant turn for more than
+  ~25 minutes. Sizing a long run to a big foreground `timeout` does NOT buy you
+  that time. The binding constraint is not the harness Bash cap (3900000 ms /
+  65 minutes) — it is the orchestrator watchdog that kills your entire SESSION.
+  A blocking foreground Bash call emits NO turn while it runs, so a 45-minute
+  verify sized to a 2700000 timeout sits well under the harness cap and still
+  gets the session killed around 30 minutes, losing everything it observed —
+  the same lose-all-observations failure the `until`-loop bullet warns about.
+  KNOW WHICH CEILING YOU ARE UNDER, because it decides what polling buys you:
+  - architect, implementer, debugger, merger, simple_task are watched on IDLE
+    time — the kill fires only after no new transcript turn for
+    max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
+    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
+    that clock, which is what makes a long backgrounded run survivable.
+  - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
+    session start — and NOTHING resets it. Polling does not extend it. Work
+    that cannot finish inside that window must be sized down or handed off; no
+    wait strategy rescues it, so do not start a 40-minute job and plan to poll.
+  - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
+    cap binds you. The don't-end-your-turn rule above still applies in full.
+  So: `Bash` with `run_in_background=true`, then poll it to completion with
+  `BashOutput` and READ the result BEFORE ending your turn. Launching it
+  detached with `setsid` and polling its log file is the same sanctioned shape;
+  so is backgrounding a wait command that EXITS on its own when the condition
+  holds. Polling something you launched is NOT the ad-hoc wait prohibited
+  below: you have a real completion signal, and you stay until you have it.
+- `Monitor` streams ONE notification per matching output line, so it fits a
+  recurring event feed, not a single "tell me when this finishes" — for that,
+  background a command that exits when done. If you do reach for it, load its
+  schema with `ToolSearch("select:Monitor")` FIRST: it is a deferred tool, and
+  calling it cold is rejected client-side with `InputValidationError` for
+  invented parameter names.
+
+NEVER — each of these cost a real session a turn or an entire wait
+- `sleep N; tail ...` / `sleep N && cat ...` chained to poll background output.
+  The harness anti-polling guard BLOCKS foreground sleep and spends one of your
+  turns teaching you this. Do not retry with a different sleep spelling.
+- Back-to-back `Read`/`Bash` calls fired as an ad-hoc DELAY — re-reading an
+  unchanged file to "let some time pass". That is not waiting: it burns turns
+  and context and observes nothing new. (Polling a genuine completion signal,
+  as above, is a different thing and is fine.)
+- A hand-rolled FOREGROUND `until`/`while` busy-loop. It runs until the Bash
+  timeout SIGTERMs it (exit 143) and you lose EVERYTHING it had observed —
+  strictly worse than not waiting at all. The same loop is fine BACKGROUNDED,
+  where no foreground timeout applies.
+- `ScheduleWakeup` as a generic delay. It is scoped to `/loop` dynamic mode,
+  requires its `prompt` argument, and does nothing for a one-shot dispatched
+  session.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
+# composition so the two rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+
+
+# Pointer form for a TURN prompt whose role system_prompt already carries the
+# full block above.  Restating the whole block at the failure site would hand
+# the agent the identical text twice in one session -- the very double-splice
+# that test_combined_guidance_appears_exactly_once_per_role polices WITHIN a
+# system prompt, just spread across the system/turn pair where that test cannot
+# see it.  The point of the at-the-failure-site injection was always ADJACENCY
+# (put the rule next to the action item that trips it), and the pointer buys
+# that for ~15% of the block's bytes.
+#
+# THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
+# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
+# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# Re-derive rather than trust these after any edit to the strings:
+#   python -c "from orchestrator.agents.roles import *; \
+#              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
+# Every other mention of the block's size in roles.py and
+# test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
+# An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
+# file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
+# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
+# the string they describe does.  Do not reintroduce a number anywhere else --
+# cite this comment instead.
+#
+# Use this ONLY where the receiving role is statically known to carry
+# BACKGROUND_WAIT_GUIDANCE, or the pointer dangles and the agent is left with
+# neither half.  Today that is build_amender_prompt alone, which is invoked
+# under IMPLEMENTER at exactly one call site (workflow.py `_invoke(IMPLEMENTER,
+# ...)`).  Note precisely what is and is not machine-checked: the IMPLEMENTER
+# half of that precondition IS pinned (test_roles_wait_pattern.py asserts
+# IMPLEMENTER carries the block), but "the amender runs under IMPLEMENTER" is
+# NOT -- that call site is reachable only by reading workflow.py, and a
+# source-text scan for `_invoke(IMPLEMENTER` is exactly the brittle
+# literal-over-prose pin this feature's tests were twice told to drop.  So if
+# you re-point build_amender_prompt at another role, no test will stop you;
+# check that role carries the block yourself.  Same no-literal-braces rule as
+# the constants above.
+#
+# Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
+# rules at the failure site -- foreground with an explicit `timeout`, or else
+# background it and poll `BashOutput` to completion before ending the turn --
+# because that adjacency is the whole reason for the injection.  Do not let it
+# decay into a bare "see the rule above" cross-reference; a reader who follows
+# no cross-reference gets nothing.  This is an editorial expectation, so it
+# lives here rather than as an assertion: a length floor would pass on filler
+# and fail on a tighter, better-worded reminder.
+WAIT_PATTERN_REMINDER = """
+Reminder — verification is exactly where the wait rules above bite. If it will
+finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
+`timeout` (milliseconds; 120000 default). If it will run longer than that
+WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
+completion before you end your turn — the deciding limit is the working-regime
+watchdog, which kills this SESSION after ~30 minutes with no new turn, well
+short of the 3900000 harness ceiling, and each poll resets that clock. Never
+end this turn with verification still pending: this session is one-shot, and
+abandoned work is recorded as a successful run."""
+
+
+# Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
+# both STEWARD "Marking tasks done" call sites (kind="merged" and
+# kind="found_on_main"). Being a single shared constant IS the mechanism that
+# keeps the two sites consistent -- there is deliberately no test pinning the
+# splice count, since such a test is tautological with the concatenation below
+# and blocks a legitimate third call site. The prohibition on the two-outcome
+# `&& echo` idiom is stated normatively in the block itself, not enforced by a
+# regex over prompt prose. This is the roles.py analogue of the per-file
+# canonical ancestry check task 3281
+# (374468dbad) introduced in skills/merge-queue/SKILL.md and
+# skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
+# branch-ref subject: no rc=128 merge-marker search here, since that arm only
+# makes sense for a ref that merge-lane cleanup can delete out from under you.
+# It also diverges by echoing the captured rc (`echo "ancestry rc=$rc"`), which
+# the SKILL.md blocks' `cmd; rc=$?` form does not: a compound command's own
+# exit status is that of its LAST statement, so `cmd; rc=$?` always reports
+# exit 0 to the calling tool no matter what `cmd` did. The SKILL.md blocks
+# carry this identical silent-rc gap (confirmed against real git during task
+# 3406's step-8 amendment) but fixing them is outside this task's file scope.
+ANCESTRY_CHECK_INSTRUCTIONS = """\
+    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
+    # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+    # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+    # without it the tool reports exit 0 and identical empty output for "on
+    # main" and "NOT on main" -- silence you would have to guess at. Echoing the
+    # numeric rc is NOT the two-outcome `&& echo` idiom banned below: it prints
+    # on every path and keeps all three outcomes distinguishable. Do not "tidy"
+    # it away.
+    # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
+    # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
+    #           stands in THIS checkout. Usually the SHA is wrong (it is only on a
+    #           feature branch) -- but this checkout's `main` can also simply be
+    #           behind (a just-submitted merge, an unfetched <project_root>). If
+    #           that is plausible, run `git -C <project_root> fetch --all` and
+    #           re-run once before concluding. Still rc=1 after that -> the SHA
+    #           really is off main; re-derive the landing commit.
+    # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
+    #           valid object name". This is NOT "not on main" -- it is "not yet
+    #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
+    #           or a mistyped SHA. Run `git -C <project_root> fetch --all` and re-run;
+    #           if it still will not resolve, re-derive the SHA. Never record or report
+    #           "not on main" on a 128.
+    # Never guard this call with a trailing `&& echo on-main`: that renders rc=1
+    # and rc=128 as identical silence, and they need opposite remedies.
+"""
+
+
+# How the server-side backstop in fused-memory's task_interceptor actually
+# reports failure. Spliced ONCE, at the kind="merged" call site immediately
+# after ANCESTRY_CHECK_INSTRUCTIONS -- the backstop is identical for both
+# `done_provenance` kinds, so the kind="found_on_main" site just references it
+# by name instead of repeating ~1.1 kB of prose a second time. Kept factual
+# rather than aspirational: `_validate_done_provenance` rev-parses BEFORE it
+# merge-bases. Task 3455 made BOTH probes' failure wording honest --
+# `_resolve_commit_sha` and `_verify_commit_on_main` each return a
+# (confirmed, detail) NamedTuple, and the caller emits one of two distinct
+# prefixes per probe depending on it, rather than reporting every failure
+# mode (timeout, missing binary, unexpected error) under the single
+# assertive "not found" / "is not on main" wording. So the prefix is now
+# the verdict at BOTH steps and this note can describe it as such.
+SERVER_BACKSTOP_NOTE = """\
+The server runs the same checks as a backstop, in this order:
+
+1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
+   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
+   Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
+       rejected the ref against this checkout. This is the server's rc=128
+       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
+       so `git -C <project_root> fetch --all` and re-run before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` ->
+       rev-parse never rendered a verdict on the ref (5s timeout, missing git
+       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
+       checkout and retry.
+2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
+   accepts. Failure is likewise reported under one of two distinct prefixes,
+   so the prefix itself is the verdict at both steps -- no need to interpret
+   the trailing detail to tell them apart:
+     - `kind=<k> but commit <sha> is not on main: commit is not an ancestor of
+       main.` -> rc=1. Git affirmatively determined the SHA is off main;
+       re-derive the landing commit.
+     - `kind=<k> but commit <sha> could not be confirmed on main: <detail>.`
+       -> a non-1 git error, a 5s timeout, or a missing git binary. The check
+       never completed -- NOT-YET-CONFIRMED, not off-main. Treat it exactly
+       like rc=128 above: fetch and re-run, or fix the checkout, then retry.
 """
 
 
@@ -319,7 +624,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -431,7 +736,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -490,7 +795,7 @@ expansion rather than trying to work around the restriction.
 - Run tests frequently to verify your work.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -505,7 +810,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -554,7 +859,7 @@ expansion rather than trying to work around the restriction.
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -779,7 +1084,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1057,7 +1362,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -1182,8 +1487,23 @@ choose your response:
   Either the task is under-specified, the agent is thrashing, or the budget
   is too low. Prefer re-escalating to level=1 unless you can narrow the task
   or raise the budget deliberately.
-- **EMPTY_OUTPUT** — the agent returned nothing. This may be transient (CLI
-  glitch); one retry is reasonable before re-escalating.
+- **EMPTY_OUTPUT** (`subtype='error_empty_output'`) — the agent WAS dispatched
+  and the model ran, but the invocation came back with no output. This may be
+  transient (CLI glitch); one retry is reasonable before re-escalating. Do not
+  confuse this with CLI_INPUT_REJECTED below: here the agent was actually asked
+  the question, so turns/cost may be non-zero and partial work may exist.
+- **CLI_INPUT_REJECTED** (`subtype='error_cli_input_rejected'`) — the CLI
+  rejected the invocation *before any model turn*: turns=0, $0.00 billed, the
+  agent was never asked anything at all (esc-3118-1: the prompt never reached
+  the CLI's stdin, and it exited on argument validation before contacting the
+  API). The summary carries the CLI's real stderr cause — quote it when you
+  re-escalate. The orchestrator has ALREADY retried this automatically at the
+  transport layer (`invoke_with_cap_retry` re-dispatches once with a fresh
+  session), and for planning also at the workflow layer. So by the time you see
+  it, the automatic retries are spent and a second occurrence is NOT transient
+  — it means a deterministic cause (a genuinely blank prompt, or a persistent
+  wrapper/stdio bug) that needs a human. Re-escalate to level=1 with the stderr
+  cause rather than retrying again.
 - **API_ERROR** — HTTP error from the provider. Usually transient; account
   failover often helps. Retry is reasonable.
 - **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
@@ -1213,10 +1533,7 @@ the merge SHA. Required shape:
 
 Before calling, sanity-check the SHA is actually on main:
 
-    git -C <project_root> merge-base --is-ancestor <merge-sha> main && echo on-main
-
-The server runs the same check as a backstop; it will reject if the SHA is
-only on a feature branch.
+""" + ANCESTRY_CHECK_INSTRUCTIONS + '\n' + SERVER_BACKSTOP_NOTE + """
 
 ### `kind="found_on_main"` — the implementation is already on main from a sibling task
 
@@ -1237,11 +1554,10 @@ Both `commit` and `note` are required. Before calling, identify the
 impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
-    git -C <project_root> merge-base --is-ancestor <sha> main && echo on-main
-
-Cite the commit and the providing-task id (when known) in `note`. The
-server runs the same `git merge-base --is-ancestor` check as a backstop
-for this kind too (post-3092 phantom-done hardening, 2026-05-09).
+""" + ANCESTRY_CHECK_INSTRUCTIONS + """
+Cite the commit and the providing-task id (when known) in `note`. The same
+server-side backstop described above applies to this kind too (post-3092
+phantom-done hardening, 2026-05-09).
 
 ### Forbidden
 
@@ -1318,7 +1634,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -1438,7 +1754,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-
+""" + BACKGROUND_WAIT_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

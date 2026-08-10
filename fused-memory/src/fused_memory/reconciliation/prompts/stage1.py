@@ -3,6 +3,8 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -37,6 +39,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
@@ -96,6 +99,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
 
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
+
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
 mandatory two-step verification:
@@ -107,10 +112,35 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution. \
+IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+structured `ValidationError` that names the malformed id and tells you how to resolve the \
+real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
+are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
+
+**Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
+of a surviving entry, pass `replacement_memory_id=<the surviving entry's full 36-char UUID>` \
+to `delete_memory`. Task metadata that still cites the doomed entry is repointed to that \
+survivor BEFORE the delete runs — and the delete is REFUSED outright if any live \
+(non-terminal) task still cites it and you supplied no concrete replacement. Terminal \
+(done/cancelled) citers are reported back to you on the result, never rewritten.
+
+**COPY the survivor's UUID from the search result — never reconstruct it.** The value must \
+also (a) RESOLVE in the store and (b) differ from the id you are deleting. A well-formed \
+but nonexistent id is refused (`CitationReplacementNotFound`) rather than written into \
+every citation — repointing to a phantom strands those pointers exactly as the delete \
+itself would, and by then the original is gone. Passing the doomed id as its own \
+replacement is refused too (`CitationReplacementInvalid`): a self-repoint reports success \
+while every citation still addresses the entry you just destroyed. Same discipline as \
+step 2 above — read the full 36 characters out of the result's `id` field verbatim.
+
+**A `search(...)` instruction is never an acceptable replacement value.** Do not pass — or \
+write into any task's metadata — a value like `'re-derive the current canonical entry via \
+search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
+re-deriving at read time resolves back to the superseded cluster members the consolidation \
+was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
+Only a concrete UUID forwards. \
+(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \

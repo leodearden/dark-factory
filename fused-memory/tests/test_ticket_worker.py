@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until, pydantic_spec
+from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -134,8 +134,23 @@ async def test_worker_processes_create_decision(
         )
         ticket_id = result['ticket']
 
-        # Let the worker drain the queue
-        await asyncio.sleep(0.1)
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flakes under `-n auto` CPU oversubscription when
+        # the worker is scheduled late (observed: status still 'pending').
+        # Same cause and same fix as the oversize-ticket test below.  Waiting
+        # on 'pending' clearing rather than on 'created' directly keeps a
+        # genuine regression loud: a ticket resolved to 'failed' leaves the
+        # poll immediately and trips the status assertion below with the real
+        # status, instead of burning the whole timeout first.
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the create-decision ticket',
+        )
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
@@ -258,7 +273,11 @@ async def test_worker_processes_combine_decision(
     # Sentinel: track whether _execute_combine ran (it runs under write_lock)
     execute_combine_calls = []
 
-    async def fake_execute_combine(project_root, decision):
+    # **_kwargs absorbs the keyword-only arguments the real _execute_combine
+    # takes (candidate_metadata, task 3446). This stub is a write-lock
+    # sentinel, not a signature pin — asserting on the call shape here would
+    # duplicate test_task_interceptor.py's combine coverage.
+    async def fake_execute_combine(project_root, decision, **_kwargs):
         execute_combine_calls.append({'project_root': project_root, 'decision': decision})
         return {'updated': True, 'target_id': decision.target_id}
 
@@ -553,9 +572,47 @@ async def test_worker_created_path_emits_journal_event(
             description='Checking event emission',
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
 
-        # Let the worker drain
-        await asyncio.sleep(0.2)
+        # Bounded poll for the worker to resolve the ticket rather than a
+        # fixed sleep, which flaked under load (task 3854: observed failing
+        # in a 388s-wall full-suite run, passing in isolation and in a
+        # 226s-wall run). Waiting on the ticket leaving 'pending' rather
+        # than on journal_calls directly keeps a genuine regression loud: a
+        # ticket that resolves without emitting the event trips the
+        # assertions below immediately instead of burning the whole
+        # timeout first.
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(ticket_id)
+            return row is not None and row['status'] != 'pending'
+
+        await poll_until(
+            _ticket_resolved,
+            timeout=10.0,
+            message='worker did not resolve the ticket',
+        )
+
+        # SETTLE barrier, not a liveness poll: wait for the task_created count
+        # to STOP CHANGING, not merely to become non-zero.  The assertion below
+        # is an exact count, and a liveness poll returns at the *first* event —
+        # so a duplicate arriving milliseconds later would be structurally
+        # invisible.  The duplicate is concrete: task_created is emitted from
+        # two distinct paths (task_interceptor.py:3786-3795 and 4164-4173),
+        # both of which persist the terminal ticket row *before* emitting, so
+        # neither a ticket-row predicate nor a first-event predicate closes the
+        # emission window.  settle=0.2 restores exactly the width of the
+        # `asyncio.sleep(0.2)` this poll replaced — but measured from the first
+        # event rather than from submit_task, so a late-scheduled worker under
+        # `-n auto` no longer eats the window.
+        await poll_until_stable(
+            lambda: sum(
+                1 for e in journal_calls
+                if getattr(e, 'type', None) == EventType.task_created
+            ),
+            settle=0.2,
+            timeout=10.0,
+            message='worker did not journal a task_created event',
+        )
 
     # Exactly one task_created event must have been journalled
     task_created_events = [
@@ -1281,11 +1338,62 @@ async def test_resolve_ticket_returns_server_closed_when_store_closed_before_ini
 class TestDispatchTicketDecision:
     """Unit tests for the extracted _dispatch_ticket_decision helper.
 
-    The helper performs the drop/combine/create dispatch logic and returns a
-    (status, task_id, reason, result_dict, curator_degrade_reason) tuple.
-    It does NOT call mark_resolved or signal ticket events — those are the
-    caller's responsibility.
+    The helper performs the refuse/drop/combine/create dispatch logic and
+    returns a (status, task_id, reason, result_dict, curator_degrade_reason)
+    tuple.  It does NOT call mark_resolved or signal ticket events — those are
+    the caller's responsibility.
     """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_refuse_returns_refused_and_creates_nothing(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """action='refuse' → returns (refused, None, ...) and never calls add_task.
+
+        Distinct from 'drop': a drop folds the candidate into an existing target
+        and needs a target_id; a refusal creates NOTHING.  Before this action
+        existed the deterministic guards emitted a targetless 'drop', which
+        matched no guarded branch and fell through to tm.add_task — creating the
+        very candidate the guard refused.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        candidate = CandidateTask(title='Refused Task')
+        decision = CuratorDecision(
+            action='refuse',
+            target_id=None,
+            justification='cancelled-premise-blocklist: e: premise reverted',
+        )
+
+        taskmaster.add_task = AsyncMock()
+
+        with patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            status, task_id, reason, result_dict, degrade_reason = (
+                await interceptor_with_store._dispatch_ticket_decision(
+                    ticket_id='tkt_refuse',
+                    project_root='/p',
+                    project_id='p',
+                    candidate=candidate,
+                    decision=decision,
+                    kwargs={'title': 'Refused Task'},
+                    metadata=None,
+                    curator=None,
+                )
+            )
+
+        taskmaster.add_task.assert_not_awaited()
+        assert status == 'refused'
+        assert task_id is None
+        assert reason is not None and 'no task created' in reason
+        assert decision.justification in reason
+        assert isinstance(result_dict, dict)
+        assert result_dict.get('id') is None
+        assert result_dict.get('created') is False
+        assert result_dict.get('action') == 'refuse'
+        assert degrade_reason is None
 
     @pytest.mark.asyncio
     async def test_dispatch_create_decision_returns_created_status_and_task_id(
@@ -2450,6 +2558,10 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         queue = ti._ticket_queues.setdefault(project_id, asyncio.Queue())
         queue.put_nowait(t1)
 
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(t1)
+            return row is not None and row['status'] != 'pending'
+
         try:
             with patch.object(
                 type(ti), '_get_curator',
@@ -2459,7 +2571,20 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 new=AsyncMock(return_value=taskmaster),
             ):
                 ti._start_worker_if_needed(project_id)
-                await asyncio.sleep(0.5)
+                # Bounded poll for the worker to resolve the ticket rather
+                # than a fixed sleep, which flakes under `-n auto` CPU
+                # oversubscription when the worker is scheduled late — the
+                # same cause, and the same fix, as the sibling lookahead
+                # test above. Waiting on 'pending' clearing rather than on
+                # 'created' directly keeps a genuine regression loud: a
+                # ticket resolved to 'failed' leaves the poll immediately
+                # and trips the status assertion below with the real
+                # status, instead of burning the whole timeout first.
+                await poll_until(
+                    _ticket_resolved,
+                    timeout=10.0,
+                    message='worker did not resolve the oversize ticket',
+                )
         finally:
             for t in list(ti._worker_tasks.values()):
                 if not t.done():

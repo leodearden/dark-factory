@@ -1393,10 +1393,13 @@ class TestGetStatsScopedByGroup:
             await q.close()
 
 
-class FlakyVisibilityError(Exception):
-    """Module-local stand-in for graphiti_core's NodeNotFoundError — a
-    transient graph-visibility race that should receive an extended retry
-    budget instead of the plain ``max_attempts`` ceiling.
+class FlakyTransportError(Exception):
+    """Module-local stand-in for a genuinely-transient BACKEND TRANSPORT
+    failure — a reset connection or a backend timeout, i.e. the
+    ConnectionResetError / TimeoutError family that keeps the extended retry
+    budget. Such a failure is expected to clear on its own, so it should
+    receive ``transient_max_attempts`` rather than the plain ``max_attempts``
+    ceiling.
     """
 
 
@@ -1404,6 +1407,12 @@ class TestTransientErrorRetryPolicy:
     """Task 1936: known-transient errors get a longer retry budget
     (``transient_max_attempts``) than the plain ``max_attempts`` ceiling
     used for everything else.
+
+    Task 3585 removed the not-found family from the DEFAULT set. These tests
+    are unaffected: each passes an explicit ``transient_error_names={...}``
+    override, so they exercise the transient MECHANISM independently of which
+    names ship by default. Membership is covered by
+    TestNotFoundFamilyIsNotTransient.
     """
 
     @pytest.mark.asyncio
@@ -1420,7 +1429,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
@@ -1440,7 +1449,7 @@ class TestTransientErrorRetryPolicy:
     async def test_transient_error_uses_extended_budget(self, tmp_path):
         """A configured-transient error class dead-letters at transient_max_attempts,
         not the plain (smaller) max_attempts."""
-        execute = AsyncMock(side_effect=FlakyVisibilityError('node abc-123 not found'))
+        execute = AsyncMock(side_effect=FlakyTransportError('connection reset by peer'))
         q = DurableWriteQueue(
             data_dir=tmp_path / 'queue',
             execute_write=execute,
@@ -1450,7 +1459,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
@@ -1466,7 +1475,7 @@ class TestTransientErrorRetryPolicy:
             dead = await q.get_dead_items()
             assert len(dead) == 1
             assert dead[0]['attempts'] == 5
-            assert 'FlakyVisibilityError' in dead[0]['error']
+            assert 'FlakyTransportError' in dead[0]['error']
         finally:
             await q.close()
 
@@ -1483,7 +1492,7 @@ class TestTransientErrorRetryPolicy:
             nonlocal call_count
             call_count += 1
             if call_count <= 3:
-                raise FlakyVisibilityError('node abc-123 not found')
+                raise FlakyTransportError('connection reset by peer')
             return {'ok': True}
 
         q = DurableWriteQueue(
@@ -1495,7 +1504,7 @@ class TestTransientErrorRetryPolicy:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
             transient_max_attempts=5,
-            transient_error_names={'FlakyVisibilityError'},
+            transient_error_names={'FlakyTransportError'},
         )
         await q.initialize()
         try:
@@ -1517,5 +1526,473 @@ class TestTransientErrorRetryPolicy:
 
             assert stats['counts'].get('dead', 0) == 0
             assert call_count == 4
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
+# Not-found family membership (task 3585)
+#
+# _is_transient matches by class NAME walked over type(exc).__mro__, so a
+# module-local class named NodeNotFoundError IS the contract — importing
+# graphiti_core.errors here would test the identical code path while adding
+# exactly the dependency the name-based scheme exists to avoid. It is also the
+# honest model of production: fused-memory defines its own unrelated
+# NodeNotFoundError at graphiti_client.py:219, so two distinct classes already
+# answer to this name and a name-level assertion covers both.
+# ------------------------------------------------------------------
+
+
+class NodeNotFoundError(Exception):
+    """Stand-in for any class answering to this name (graphiti_core's, or
+    fused-memory's own at graphiti_client.py:219)."""
+
+
+class EdgeNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgeNotFoundError (live: raised in
+    edges.py and the neo4j edge driver ops)."""
+
+
+class EdgesNotFoundError(Exception):
+    """Stand-in for graphiti_core's EdgesNotFoundError (defined in
+    errors.py, never raised anywhere in the library)."""
+
+
+class TestNotFoundFamilyIsNotTransient:
+    """Task 3585: the not-found family is NOT in DEFAULT_TRANSIENT_ERROR_NAMES,
+    so it dead-letters at the plain ``max_attempts`` ceiling rather than the
+    extended ``transient_max_attempts`` budget.
+
+    Membership, not mechanism — every queue here is built WITHOUT a
+    ``transient_error_names=`` override precisely so the shipped default
+    governs. TestTransientErrorRetryPolicy covers the mechanism.
+    """
+
+    @staticmethod
+    def _queue(tmp_path, execute):
+        """The shared config: plain budget 5, extended budget 12, and no
+        transient_error_names= override so DEFAULT_TRANSIENT_ERROR_NAMES
+        decides which one applies."""
+        return DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            retry_max_delay_seconds=0.05,
+            write_timeout_seconds=2.0,
+            transient_max_attempts=12,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_cls',
+        [NodeNotFoundError, EdgeNotFoundError, EdgesNotFoundError],
+        ids=lambda c: c.__name__,
+    )
+    async def test_not_found_family_dead_letters_at_plain_max_attempts(
+        self, tmp_path, exc_cls
+    ):
+        """A not-found error gets max_attempts (5), not transient_max_attempts (12).
+
+        The esc-3561-3 evidence: 304 execution attempts across 28 recorded
+        add_episode calls produced 0 successes. A visibility race converges;
+        this never did at any budget.
+        """
+        execute = AsyncMock(side_effect=exc_cls('uuid abc-123 not found'))
+        q = self._queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            # 20s budget for slow CI runners, matching the rest of this file;
+            # 12 attempts at a 0.05s delay ceiling costs well under a second,
+            # so the pre-3585 behaviour fails on the COUNT, not by timing out.
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 5, (
+                f'{exc_cls.__name__} must dead-letter at the plain max_attempts (5); '
+                f'got {dead[0]["attempts"]} — it is still being treated as transient.'
+            )
+            assert exc_cls.__name__ in dead[0]['error']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_connection_reset_still_gets_extended_budget(self, tmp_path):
+        """Control: the removal is narrow. ConnectionResetError stays in the
+        default set (and matches twice over, via its ConnectionError base), so
+        under the identical config it must still reach transient_max_attempts.
+
+        This is what fails if a later edit prunes the set too broadly.
+        """
+        execute = AsyncMock(side_effect=ConnectionResetError('connection reset by peer'))
+        q = self._queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 12, (
+                'ConnectionResetError must keep the extended transient budget (12); '
+                f'got {dead[0]["attempts"]}.'
+            )
+            assert 'ConnectionResetError' in dead[0]['error']
+        finally:
+            await q.close()
+
+
+# ------------------------------------------------------------------
+# Terminal hook (task 3582)
+#
+# The queue's two terminal transitions — _mark_completed and the dead branch of
+# _handle_failure — are the ONE seam through which every enqueue site's
+# terminal outcome can be written back to the write journal. Putting it here
+# (rather than in each producer) makes the property queue-wide by construction.
+# ------------------------------------------------------------------
+
+
+class TestTerminalHook:
+    @staticmethod
+    def _recorder():
+        calls: list[tuple] = []
+
+        async def hook(write_op_id, status, error):
+            calls.append((write_op_id, status, error))
+
+        return calls, hook
+
+    @pytest.mark.asyncio
+    async def test_completed_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W1'},
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W1', 'completed', None)]
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        # RuntimeError is NOT in DEFAULT_TRANSIENT_ERROR_NAMES, so this takes
+        # max_attempts (2), not transient_max_attempts (12).
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=RuntimeError('always fails')),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W2'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W2'
+            assert status == 'dead'
+            assert error is not None and 'always fails' in error
+            # _execute_write itself failed, so the write did NOT land — this
+            # one is safe to replay and must not carry the post-execute flag.
+            assert not error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_post_execute_dead_is_flagged_in_the_reported_error(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        _process_item runs the registered callback AFTER _execute_write has
+        already returned, so a callback that keeps failing dead-letters an item
+        whose write DID land. Blind-replaying that duplicates the write, so the
+        two cases must be separable in whatever the hook journals.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W8'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W8'
+            assert status == 'dead'
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_callback_still_sees_journal_metadata_popped_by_execute(
+        self, tmp_path
+    ):
+        """_process_item parses once but must not hand that dict to the callback.
+
+        _execute_graphiti_write pops '_causation_id' / 'temporal_context' off
+        the payload it is given, and _dual_write_callback reads both back out
+        to propagate causation onto the facts it enqueues. Sharing one parsed
+        dict between the two would silently sever that.
+        """
+        calls, hook = self._recorder()
+        seen: list[dict] = []
+
+        async def popping_execute(_operation, payload):
+            payload.pop('_causation_id', None)
+            payload.pop('_write_op_id', None)
+            payload.pop('temporal_context', None)
+            return {'ok': True}
+
+        async def recording_callback(_ctype, _result, payload):
+            seen.append(payload)
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=popping_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', recording_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={
+                    'content': 'x',
+                    '_write_op_id': 'W9',
+                    '_causation_id': 'C9',
+                    'temporal_context': 'planning',
+                },
+                callback_type='dual_write_episode',
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert seen and seen[0]['_causation_id'] == 'C9'
+            assert seen[0]['temporal_context'] == 'planning'
+            # ...and the hook still got the join key captured before the pop.
+            assert calls == [('W9', 'completed', None)]
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_does_not_fire_terminal_hook(self, tmp_path):
+        """Never fired for an intermediate 'retry' — only terminal states."""
+        calls, hook = self._recorder()
+        attempts = {'n': 0}
+
+        async def flaky(_operation, _payload):
+            attempts['n'] += 1
+            if attempts['n'] <= 2:
+                raise RuntimeError('transient-ish failure')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=flaky,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W3'},
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W3', 'completed', None)]
+            assert attempts['n'] == 3
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_payload_without_write_op_id_skips_hook(self, tmp_path):
+        """replay_from_store / mem0_classify_and_add carry no _write_op_id."""
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'no join key here'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert calls == []
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_exception_does_not_affect_item(self, tmp_path):
+        """A journaling hiccup must never flip a landed write back to retry."""
+        seen: list[str] = []
+
+        async def exploding_hook(write_op_id, _status, _error):
+            seen.append(write_op_id)
+            raise RuntimeError('journal is on fire')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=exploding_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'a', '_write_op_id': 'W4'},
+            )
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'b', '_write_op_id': 'W5'},
+            )
+
+            async def _both_completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 2
+
+            # The worker keeps draining despite the hook raising on every item.
+            await poll_until(_both_completed, timeout=20.0, interval=0.05)
+            stats = await q.get_stats(group_id='proj1')
+            assert stats['counts'].get('retry', 0) == 0
+            assert stats['counts'].get('dead', 0) == 0
+            assert seen == ['W4', 'W5']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_runs_after_commit(self, tmp_path):
+        """The queue's durable state never depends on the journal write-back."""
+        observed: list[str | None] = []
+        q_ref: dict = {}
+
+        async def hook(_write_op_id, _status, _error):
+            stats = await q_ref['q'].get_stats(group_id='proj1')
+            observed.append(
+                'completed' if stats['counts'].get('completed', 0) >= 1 else 'not-yet'
+            )
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q_ref['q'] = q
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W6'},
+            )
+            await poll_until(lambda: len(observed) >= 1, timeout=20.0, interval=0.05)
+            assert observed == ['completed']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_no_hook_configured_is_noop(self, tmp_path):
+        """on_terminal defaults to None — existing behaviour unchanged."""
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            assert q._on_terminal is None
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W7'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
         finally:
             await q.close()

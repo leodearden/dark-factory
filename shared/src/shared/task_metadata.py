@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'BeforeDone',
     'DoneProvenance',
@@ -85,6 +86,23 @@ KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
 )
 
 
+# The human-curator-gate marker (task 3341), read by
+# TaskMetadata._deterministic_invariants below and blessed in
+# _BLESSED_METADATA_KEYS. It is an ``extra='allow'`` metadata key, NOT a typed
+# TaskMetadata field, and is deliberately kept that way (task 3369): a typed
+# ``bool`` would COERCE the fail-closed string 'true' to True in pydantic's
+# non-strict mode -- silently rewriting an author's value in the one direction
+# that makes it look intentional, breaking I1 -- and a concrete default would
+# add ``human_curator_gate: false`` noise to every task's model_dump(), the
+# same objection already documented for merge_retry_pending.
+#
+# This is the key's SINGLE definition codebase-wide (exported via __all__):
+# orchestrator.deterministic_runner — the only other module that acts on the
+# key — imports it from here rather than restating the literal, so the write
+# boundary's rejection and the runner's dispatch-time guard cannot drift apart.
+HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
+
+
 def validate_model_overrides(value: object) -> None:
     """Shape-validate a ``metadata.model_overrides`` value (PRD decision 9).
 
@@ -144,6 +162,26 @@ class DoneProvenance(BaseModel):
     ``kind`` is the *only* place the valid-kinds vocabulary is declared;
     fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
     importing this model (see PRD §5, I2).
+
+    ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
+    (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
+    by fused-memory's ``_validate_done_provenance`` chokepoint and is never
+    supplied by a caller — a caller-supplied value is discarded with a
+    warning. It exists because ``updatedAt`` is bumped by *any* later write
+    to the task (a re-tag, an audit annotation, a dependency edit), so it
+    cannot answer "when was this attribution asserted?"; the found_on_main
+    soak-gate predicate needs that question answered to distinguish a
+    genuinely new spurious stamp from legacy backlog.
+
+    It is deliberately OPTIONAL rather than conditionally-required for
+    ``found_on_main`` (i.e. ``_check_conditional_requirements`` is
+    deliberately NOT extended) for two reasons: ~193 historical stamps
+    predate the field and must keep validating at read time, and — more
+    importantly — its ABSENCE is itself load-bearing signal. Because every
+    write after task 3576 lands populates it at the chokepoint, a blob
+    lacking it provably predates that landing, which is exactly how
+    ``fused-memory/scripts/check_found_on_main_spurious_rate.py`` separates
+    legacy backlog from new stamps.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -163,6 +201,9 @@ class DoneProvenance(BaseModel):
     unit: str | None = None
     active_enter_timestamp: str | None = None
     escalation_id: str | None = None
+    # Server-written; see the class docstring. Optional by design — absence
+    # means "predates task 3576", which the soak-gate predicate relies on.
+    stamped_at: str | None = None
 
     @model_validator(mode='after')
     def _check_conditional_requirements(self) -> DoneProvenance:
@@ -469,6 +510,14 @@ class TaskMetadata(BaseModel):
     key this schema does not yet know about — a newer writer's field, a
     caller-private ``x_``-namespaced value — survives untouched through
     :func:`parse_metadata` rather than being silently dropped.
+
+    :meth:`_deterministic_invariants`' curator-gate clause is the *write-time*
+    counterpart to ``DeterministicRunner``'s dispatch WARNING (task 3341):
+    that WARNING fires when a record carrying both markers has already reached
+    the runner, whereas this rejects the record at the ``submit_task`` /
+    ``update_task`` boundary so it never lands (task 3369). The runner's
+    WARNING is deliberately retained as a defence-in-depth backstop for
+    records that did not pass through that boundary.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -513,6 +562,32 @@ class TaskMetadata(BaseModel):
             raise ValueError('deterministic task requires before_done or always_escalates')
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
+        # Read the marker from model_extra, NOT getattr: it is an extra='allow'
+        # key (see HUMAN_CURATOR_GATE_KEY), and pydantic v2 populates
+        # __pydantic_extra__ before mode='after' validators run. `or {}` keeps
+        # the clause total if model_extra is ever None.
+        #
+        # LAST clause deliberately: pydantic stops at the first raise, so a
+        # blob that is also malformed more fundamentally (e.g. task_kind
+        # 'normal' with a before_done) still reports that error instead of
+        # this narrower one.
+        #
+        # Plain TRUTHINESS, not `is True` — same fail-CLOSED posture as
+        # orchestrator.deterministic_runner._is_human_curator_gate, and for the
+        # same reason: this is a SAFETY marker whose false NEGATIVE is the
+        # expensive direction. A truthy-but-not-True value (the string 'true'
+        # from a hand edit or a JSON round-trip) must still be rejected here,
+        # because the runner's own guard structurally cannot catch it on the
+        # act-then-ask path.
+        # Pinned by test_truthy_but_not_true_curator_marker_still_rejected.
+        if self.before_done is not None and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY):
+            raise ValueError(
+                'human_curator_gate is only valid on a pure gate: a curator gate '
+                'declares that only a human content judgement closes this task, '
+                'while before_done is a machine step that closes it. Drop '
+                'before_done to make this a real curator gate, or drop the marker '
+                'if the machine step is what closes the task.'
+            )
         return self
 
 
@@ -529,6 +604,14 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
     *different* model is registered for a key that already has one — this is
     a loud, fail-fast conflict intended to surface at import time.
+
+    Registry keys are OWNED by the module that registers them. Tests must
+    register test-only keys (``<name>_stub``) — never a key a production
+    module registers — or a cross-package pytest co-run pre-registers the real
+    model and the conflict raise below fires spuriously (task 3352).
+    ``shared/tests/test_task_metadata.py`` enforces that convention in its
+    autouse fixture's teardown, which asserts every key a test added ends in
+    ``_stub``.
     """
 
     existing = _SUBMODEL_REGISTRY.get(key)
@@ -770,8 +853,17 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # carries the `human_curator_` prefix rather than the bare `curator_`
         # one above precisely so the human content curator is not conflated
         # with the automated task curator.
-        'human_curator_gate',
+        HUMAN_CURATOR_GATE_KEY,
         'human_curator_adjudicated_at',
+        # Orchestrator block-stamp (task 3697): written by workflow.py
+        # `_mark_blocked` on every block, read by agents/briefing.py for the
+        # stale-briefing check; 78 tasks carry it (census 2026-08-06). The
+        # writer symbol is named because that is what a future reader greps
+        # for when deciding whether the key is still machine-written.
+        # Promoted rather than x_-renamed because it is machine-written
+        # against a live reader — renaming it on one task would fork the
+        # vocabulary and be re-added on the next block.
+        'last_blocked_at',
     }
 )
 

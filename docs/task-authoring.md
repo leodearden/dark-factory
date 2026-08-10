@@ -116,7 +116,7 @@ marked `done` on the strength of an unverified claim.
 | `kind` | Meaning | Conditional requirements |
 |---|---|---|
 | `merged` | Landed via the normal merge queue | `commit` required |
-| `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required |
+| `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | — |
@@ -129,6 +129,42 @@ it is likewise exempt from the reopen-freshness gate (which only inspects
 callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
+
+#### `stamped_at` (server-written, `found_on_main` only)
+
+`found_on_main` stamps additionally carry `stamped_at`: an ISO-8601 UTC
+timestamp recording **when the attribution was asserted**.
+
+- **Never supply it.** It is written server-side by fused-memory's
+  `_validate_done_provenance` chokepoint, which every `found_on_main`
+  producer funnels through (the fresh `done` transition, the same-status
+  repair seam, agent `set_task_status` calls, and the orchestrator's
+  `Scheduler.mark_done`). A caller-supplied value is **discarded with a
+  warning**, not rejected — rejecting would break the repair seam, which
+  re-submits an already-stamped blob. A repair **refreshes** the stamp,
+  which is correct: a repair is a fresh assertion of the attribution.
+- **Scoped to `found_on_main`.** No other kind carries it. `merged`
+  already has independent landing evidence (merge-queue journal +
+  ancestor check + commit citation); `found_on_main` is the
+  attribution-by-inference kind that lacked any record of *when* the
+  inference was made.
+- **Its absence is load-bearing.** `updatedAt` cannot answer "when was
+  this asserted?" — any later write to the task bumps it. So stamps
+  written before task 3576 landed have no `stamped_at`, and because every
+  write through the chokepoint since then populates it, **absence proves
+  the stamp predates 3576**. The soak-gate predicate
+  (`fused-memory/scripts/check_found_on_main_spurious_rate.py`) uses
+  exactly this to separate legacy backlog (`stamp_class=legacy` —
+  reported but never gating) from genuinely new stamps
+  (`stamp_class=fresh` — which gate). For that reason the field is
+  optional, not conditionally required, and must stay that way.
+- **Absent ≠ unparseable.** That argument turns on the field being
+  *missing*. A `stamped_at` that is *present* but unparseable proves the
+  opposite — a post-3576 write whose freshness merely cannot be read — so
+  the predicate classes it `stamp_class=corrupt`, logs it at `WARNING`,
+  and **gates** on it. Only `legacy` is exempt from gating; silently
+  demoting a corrupt stamp would be a fail-open in exactly the direction
+  the gate exists to catch.
 
 ### Terminal-task write freeze (recon-stage boundary)
 
@@ -448,14 +484,17 @@ action); task goes `blocked` until resolved.
 | `before_done` | `always_escalates` | Behaviour | Use for |
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
-| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
+| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
 | absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
 with `before_done=None` and `always_escalates=false` is **rejected**
 ("ill-formed no-op"). `before_done` set on a `normal` task is also
-**rejected** ("before_done is only valid on deterministic tasks").
+**rejected** ("before_done is only valid on deterministic tasks"). A truthy
+`human_curator_gate` together with a non-null `before_done` is likewise
+**rejected** ("human_curator_gate is only valid on a pure gate") — see
+[The human-curator-gate contract](#the-human-curator-gate-contract).
 
 **Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}`
 and sentinel `agent_role='orchestrator-deterministic'`; the server retains
@@ -473,8 +512,10 @@ open (quiescence guard — no re-dispatch, no churn).
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
-`gate_escalated_at`, `done_provenance` (`kind='deterministic-deploy'`
-cross-unit; `kind='deterministic-deploy-scheduled'` self-restart).
+`gate_escalated_at`, and `done_provenance` (stamped for all four
+`deterministic-*` kinds — see the requirement table in §2 for
+per-kind semantics; `deterministic-milestone` is stamped on both the
+first-pass check and the post-escalation re-check described in §6).
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -737,7 +778,7 @@ gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
 cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at
+human_curator_adjudicated_at, last_blocked_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
@@ -770,6 +811,32 @@ machine step that closes the task, which contradicts "only a human's content
 judgement closes this" — a task carrying both takes the act-then-ask path
 with the marker unread, and `DeterministicRunner` logs a warning naming the
 authoring defect on every dispatch. Do not combine them.
+
+The combination is **rejected at `submit_task`/`update_task`** by
+`shared.task_metadata`'s cross-field validator whenever `task_metadata.enforce`
+is true (its production setting), so the contradiction cannot land in the first
+place. In warn-mode it degrades to a single `task_metadata.schema_warning`
+census line (whole-blob field `<metadata>`, code `invalid_metadata`) and the
+write proceeds. Note the write boundary treats that whole-blob field as
+*always* fatal regardless of which keys the delta names — so an `update_task`
+supplying only `human_curator_gate` is rejected even when `before_done` is an
+untouched legacy field. The `DeterministicRunner` warning above is deliberately
+**retained** as a defence-in-depth backstop for records that did not pass
+through that boundary: `task_metadata.enforce` is a red-tier restart-only flag,
+records predate the validator, and not every writer goes through
+`SqliteTaskBackend`.
+
+**Repairing a row that already carries both.** That same always-fatal rule cuts
+the other way once a contradictory row exists — written in warn-mode, or by a
+writer that bypassed `SqliteTaskBackend`. Every later `metadata_mode='merge'`
+`update_task` on it is rejected, including writes with nothing to do with the
+contradiction (`retry_ledger` updates, `files` edits), because the merged whole
+is what gets validated. To unstick such a row, clear the contradiction *in the
+same write*: merge an explicitly falsy `human_curator_gate` (a cleared marker no
+longer contradicts `before_done`), or pass `metadata_mode='replace'` with a blob
+that omits one of the two keys. No task on the live store is in this state today
+— the four rows carrying the marker all have `before_done` absent — so this is a
+forward hazard of a warn→enforce flip, not a live cleanup.
 
 **`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
 content-adjudication signal, stamped via `update_task` (with
@@ -816,6 +883,68 @@ the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
 
+### `allow_mcp_markup`: a write-time flag, not a metadata key
+
+`metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
+that **deliberately quotes the MCP envelope literals** — documenting the
+leak, pasting a specimen, quoting a rejection's `matched_pattern`. It is
+honoured at all four guarded write boundaries: `submit_task`,
+`update_task`, `add_memory`, `add_episode`.
+
+**Why it belongs in this section.** The convention that grew up instead —
+paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key such as `markup_tripwire_rejections_<date>` —
+manufactures *both* failure classes at once: a `code=unknown_key` census
+line (Tier-C, above) for every such key, and a bounced write for every
+author who quotes the literals without the flag. It was self-perpetuating
+because it was documented inside task 3083's own `details`, so each reader
+learned the workaround rather than the flag. Task 3697 retires it.
+
+**Scope of the gate.** The guard reads only the caller's *text* arguments,
+never the metadata blob: `title` / `description` / `details` / `prompt` on
+`submit_task` and `update_task`, and `content` on `add_memory` and
+`add_episode`. Metadata is handed to the guard for exactly one purpose —
+reading this flag. So it is a description that trips the tripwire, not a
+metadata *value* that happens to contain the literals. `update_task`'s own
+docstring states the same contract
+(`fused-memory/src/fused_memory/server/tools.py`).
+
+**Fail-closed: only a literal boolean `True`.** `'yes'`, `1` and `'true'`
+do not enable it — `markup_override_requested` tests
+`parsed.get(...) is True` (`markup_tripwire.py`). That strictness is the
+containment argument, not pedantry: the failure being contained is an
+accidental harness serialization leak, and an accidental leak never sets
+an explicit flag. A deliberate author can.
+
+**Write-time-only — it never persists.** `strip_markup_override`
+(`markup_tripwire.py`) removes the key at every one of the four
+boundaries before the metadata reaches storage, so the flag never lands in
+stored metadata and never mints an `unknown_key` census line of its own.
+It is non-mutating (the caller's own dict is left intact) and honours both
+accepted metadata shapes — dict in / dict out, JSON string in / JSON
+string out. Pinned by
+`fused-memory/tests/server/test_markup_tripwire_gate.py::test_override_flag_is_stripped_before_persistence`
+and `::test_override_flag_is_not_persisted_into_task_metadata`.
+
+**This is routine, not exotic.** The 2026-08-05 decompose session that
+filed the toolcall-markup-containment batch had its *first* `submit_task`
+rejected by this tripwire for quoting the literals, and needed the flag on
+seven of the nine tasks it filed. The guard was working as designed; the
+missing piece was the convention around it.
+
+**What it is not: an escape hatch for an accidental leak.** If you did not
+mean to quote the markup, strip the fragment and resubmit — do not reword
+the payload to sneak it past the guard, and report a recurrence per the
+hint the rejection itself carries. Using the flag to push an accidental
+leak through the boundary defeats the containment it exists to provide.
+
+The authoritative enumeration of the literals lives in exactly one place,
+`fused-memory/src/fused_memory/server/markup_tripwire.py`, and is
+deliberately **not** repeated here: restating them in this file would
+oblige every future task write quoting this section to set the override,
+which is precisely the loop this section exists to break. For the full
+picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -825,6 +954,52 @@ allowlist — an allowlist rather than typed optional fields, so
 there only for a genuinely load-bearing, stable convention; Tier-B/C drift
 should be fixed by renaming to the canonical key or moving under `x_`, not
 by blessing it.
+
+### Known gaps (measured 2026-08-06 — not fixed)
+
+Three `unknown_key` sources are known, measured, and deliberately left
+open. They are recorded here so the next reader does not re-measure them.
+All counts are a snapshot of a **growing** corpus (3553 tasks carried dict
+metadata at measurement), not an invariant.
+
+| Gap | Measured | Owner |
+|---|---|---|
+| `execution_class` is read by two live guards but is neither blessed nor typed | 272 tasks | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+
+**`execution_class`** is not in `_BLESSED_METADATA_KEYS`, is not a typed
+`TaskMetadata` field and is not a registered submodel — yet
+`execution_class_guard` and `routing_intent_guard` both read it, so every
+one of those 272 tasks plausibly emits this same warning class. It was
+deliberately **not** blessed by task 3697: 272 tasks and two live guards
+make it a broader vocabulary decision (bless / promote to a typed field /
+retire) than a single-task cleanup should settle. Originally recorded as
+Finding 5 of the toolcall-markup-containment capability manifest. The
+count is still climbing — 253 at that PRD's decompose, 272 here.
+
+**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
+a ~30-task metadata rewrite has a very different blast radius from one
+reserved task. `x_`-prefixed precedents for these same spellings already
+exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
+`x_related_df_tasks` 5), so the target spelling is not in doubt and the
+sweep is a mechanical per-task re-run of
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
+script's "no reader anywhere" grep argument covers only its six built-in
+default keys, so when you re-run it with your own `--keys` it validates
+them first and refuses an already-`x_`-prefixed key, a typed
+`TaskMetadata` field or a Tier-A blessed key — its read-back proves the
+rename *landed*, never that the rename was *safe*.
+
+**The write-path blocker** is why the third row is still open, and it
+bounds both of the others: `update_task` rejects any metadata payload
+containing `done_provenance` — a presence-only write-authority floor
+evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
+retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
+with no deletion sentinel. A whole-blob `'replace'` is therefore
+structurally impossible on any `done`/merged task, which is most of the
+corpus above. Check a target task's status before assuming its metadata is
+writable.
 
 ---
 

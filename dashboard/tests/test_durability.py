@@ -14,10 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
+import sqlite3
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import pytest
+from _dashboard_helpers import apply_isolated_env, live_aiosqlite_worker_threads
 from fastapi import FastAPI
 from shared.async_sqlite_base import CheckpointResult
 
@@ -416,4 +422,347 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
     assert checkpoint_count <= 1, (
         f'Expected checkpoint_count <= 1 with 3600s interval over 5 iterations, '
         f'got {checkpoint_count}. Interval gate not working correctly.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 3466: a DbPool.get() cancelled mid-connect must not orphan a worker thread
+# ---------------------------------------------------------------------------
+
+# How long the patched connect holds a landed read-only connection before
+# handing it back to DbPool.get().  Only has to outlast the lifespan teardown
+# path (a few cancel/await hops), and must stay well INSIDE
+# dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT so close_all()'s drain reaps it.
+_CONNECT_HOLD_SECONDS = 0.3
+
+
+def _create_metrics_loop_db_files(config: DashboardConfig) -> list[Path]:
+    """Materialise every database ``_metrics_loop`` read-only-opens via DbPool.
+
+    ``DbPool.get()`` short-circuits with ``return None`` when
+    ``resolved.exists()`` is False, so without real files on disk the connect
+    path is never reached and any leak assertion built on it passes VACUOUSLY.
+
+    Paths are derived from *config* rather than hardcoded so a moved property
+    stops covering the connect path LOUDLY (the ``landed`` event below never
+    fires → ``asyncio.wait_for`` TimeoutError) instead of silently.
+    """
+    paths = [
+        config.reconciliation_db,  # _metrics_loop._run_once, 1st pool.get
+        config.tickets_db,  # _metrics_loop._run_once, 2nd pool.get
+        config.project_root / 'data' / 'orchestrator' / 'runs.db',  # _project_scoped_dbs_labeled
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sqlite3.connect(str(path)).close()
+    return paths
+
+
+def _holding_readonly_connect(
+    landed: asyncio.Event, opened: list[aiosqlite.Connection]
+):
+    """Build an ``aiosqlite.connect`` replacement that stalls DbPool opens.
+
+    Delegates to the real connect FIRST — so the worker thread is provably
+    started and the ``Connection`` object provably exists — and only THEN
+    sleeps.  Sleeping *before* delegating would be a vacuous test: cancelling
+    during that sleep means no thread was ever created, so nothing could leak
+    and the guard would pass even on the broken tree.
+
+    Only read-only URI opens (``?mode=ro``, i.e. exactly the ``DbPool.get()``
+    opens) are stalled.  ``lifespan()``'s writable ``_BurndownStore`` /
+    ``_MetricsStore`` opens go through untouched; stalling those would delay
+    startup by the same window and the metrics loop would never reach a
+    ``pool.get()`` at all.
+
+    Every stalled connection is appended to *opened*, which the test then holds
+    for the duration.  That strong reference is LOAD-BEARING, not bookkeeping:
+    ``aiosqlite.Connection.__del__`` (>=0.22.x) calls ``stop()``, so CPython
+    refcounting would otherwise reap an abandoned connection the instant its
+    last frame unwinds and hide the leak.  Depending on that is exactly the
+    silent fail-soft this task removes — ``__del__`` announces itself only as a
+    ``ResourceWarning``, it is not guaranteed prompt (or to run at all) off
+    CPython, and when it fires *after* the loop has closed its ``stop()`` is
+    what produces the ``RuntimeError: Event loop is closed`` escape from
+    ``_connection_worker_thread`` that this whole task exists to eliminate.
+    The pool must close what it opened, deterministically, before shutdown
+    returns.
+    """
+    real_connect = aiosqlite.connect
+
+    async def wrapper(*args, **kwargs):
+        conn = await real_connect(*args, **kwargs)
+        if args and 'mode=ro' in str(args[0]):
+            opened.append(conn)
+            landed.set()
+            # Hold the connection hostage: DbPool.get() is now suspended
+            # inside `await aiosqlite.connect(...)` with a LIVE worker thread
+            # the pool has never seen.
+            await asyncio.sleep(_CONNECT_HOLD_SECONDS)
+        return conn
+
+    return wrapper
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
+    tmp_path: Path, monkeypatch
+):
+    """Cancelling ``_metrics_loop`` mid-``DbPool.get()`` must not leak a thread.
+
+    End-to-end reduction of the reported cross-file pytest ERROR (task 3466).
+    ``lifespan()`` cancels ``metrics_task`` at shutdown; when that task is
+    suspended awaiting a ``DbPool`` connect, the ``Connection`` is never
+    returned to ``DbPool.get()``, so it never lands in ``_conns`` and
+    ``close_all()`` cannot see it.
+
+    The exact window matters, because aiosqlite partly defends itself (verified
+    against 0.22.1).  A cancellation landing INSIDE ``Connection._connect()``
+    self-heals: ``_connect`` catches ``BaseException`` — not merely
+    ``Exception`` — and calls ``stop()`` before re-raising.  The window this
+    test drives is the one AFTER that: the connect COMPLETES, so a live worker
+    thread and a fully-built ``Connection`` exist, and only then is the awaiting
+    getter cancelled — leaving a running worker the pool has never seen.  And
+    even ``stop()`` is not a rescue once the loop is gone, because its STOP
+    sentinel is delivered by the worker calling
+    ``future.get_loop().call_soon_threadsafe(...)``: on a closed loop that
+    raises ``RuntimeError: Event loop is closed`` OUT of
+    ``_connection_worker_thread``, where pytest's ``threadexception`` plugin
+    attributes it to whatever test happens to be running at that instant —
+    hence "roaming target", "cross-file only", "passes standalone".  The worker
+    is also NON-daemon (``Thread(target=_connection_worker_thread, ...)`` with
+    no ``daemon=True``), so a stranded one additionally blocks process exit;
+    that is what the ``finally`` block below exists to stop.
+
+    Deterministic by construction: the patched connect signals ``landed`` only
+    after a real ``Connection`` (and therefore a real worker thread) exists,
+    and the test does not leave the lifespan block until that signal arrives.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    config = DashboardConfig.from_env()
+    assert config.project_root == tmp_path.resolve(), (
+        f'isolation failed: config.project_root={config.project_root} is not '
+        f'{tmp_path.resolve()} — this test would open ambient databases'
+    )
+    db_paths = _create_metrics_loop_db_files(config)
+
+    landed = asyncio.Event()
+    opened: list[aiosqlite.Connection] = []
+    baseline = set(live_aiosqlite_worker_threads())
+
+    local_app = FastAPI(lifespan=lifespan)
+    with (
+        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
+    ):
+        async with lifespan(local_app):
+            # Do not tear down until a read-only connect has provably landed —
+            # otherwise there is no thread to leak and this test is vacuous.
+            await asyncio.wait_for(landed.wait(), timeout=5.0)
+        # Lifespan teardown has now cancelled _metrics_loop mid-connect and run
+        # close_all().  Give the held connect time to land and be reaped.
+        await asyncio.sleep(_CONNECT_HOLD_SECONDS + 0.5)
+
+    try:
+        # Non-vacuity: a read-only connect must actually have happened.
+        assert opened, (
+            f'no read-only DbPool connect was observed for '
+            f'{[str(p) for p in db_paths]} — the metrics loop never reached '
+            f'aiosqlite.connect, so this guard asserted nothing'
+        )
+
+        leaked = [t for t in live_aiosqlite_worker_threads() if t not in baseline]
+        assert not leaked, (
+            f'cancelled DbPool.get() orphaned {len(leaked)} aiosqlite worker '
+            f'thread(s): {[t.name for t in leaked]}. Each will raise '
+            f"'Event loop is closed' out of _connection_worker_thread once this "
+            f'loop closes, which pytest attributes to an unrelated test. DbPool '
+            f'must own every in-flight connect for: {[str(p) for p in db_paths]}'
+        )
+
+        # Deterministic counterpart to the thread check: the pool must have
+        # CLOSED each connection it caused to be opened, while the loop was
+        # still running.  Verified against aiosqlite >=0.22.x — see the
+        # identical private-attribute pin in test_db.py.
+        for conn in opened:
+            assert conn._running is False, (
+                f'DbPool left a mid-flight connection running ({conn!r}); '
+                f'close_all() returned without draining its in-flight connects'
+            )
+    finally:
+        # MUST run even when the assertions above fail.  DbPool opens via plain
+        # `aiosqlite.connect`, whose worker thread inherits daemon=False from
+        # the main thread — so a surviving orphan does not merely leak, it
+        # blocks interpreter exit and hangs the whole pytest process AFTER the
+        # report is written.  Reap them here so a RED run fails fast and
+        # legibly instead of wedging CI.
+        for conn in opened:
+            if getattr(conn, '_running', False):
+                with contextlib.suppress(Exception):
+                    await conn.close()
+
+
+def test_metrics_loop_cancelled_mid_connect_reports_no_unhandled_thread_exception(
+    tmp_path: Path, monkeypatch
+):
+    """Nothing may escape an aiosqlite worker thread after its loop is closed.
+
+    This asserts the exact thing pytest's ``threadexception`` plugin reports —
+    an exception escaping ``_connection_worker_thread`` — so it fails for the
+    same reason the original suite ERROR fired, independently of test ordering.
+
+    SYNCHRONOUS on purpose.  The defect only manifests once the event loop that
+    owned the connect is CLOSED, and a test cannot close the loop it is running
+    on.  So this drives ``lifespan()`` on a loop it owns, closes it, and only
+    then drops the last reference to whatever the pool left behind.  That final
+    ``gc.collect()`` is the trigger: ``aiosqlite.Connection.__del__`` calls
+    ``stop()``, whose STOP sentinel makes the worker thread call
+    ``future.get_loop().call_soon_threadsafe(...)`` on the now-closed loop →
+    ``RuntimeError: Event loop is closed`` raised *inside the thread*, escaping
+    through ``_connection_worker_thread`` to ``threading.excepthook``, which
+    pytest then blames on whatever test is running at that instant.
+
+    Post-fix the trigger cannot fire: ``close_all()`` closed the connection
+    while the loop was still alive, so ``__del__`` finds ``_connection is None``
+    and returns without queueing anything.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    config = DashboardConfig.from_env()
+    db_paths = _create_metrics_loop_db_files(config)
+
+    escaped: list[threading.ExceptHookArgs] = []
+    original_hook = threading.excepthook
+
+    def _recording_hook(args) -> None:
+        thread_name = getattr(args.thread, 'name', '') or ''
+        target_name = getattr(getattr(args.thread, '_target', None), '__name__', '')
+        if '_connection_worker_thread' in (thread_name + target_name):
+            escaped.append(args)
+            return
+        original_hook(args)
+
+    landed = asyncio.Event()
+    opened: list[aiosqlite.Connection] = []
+
+    async def _drive_lifespan() -> None:
+        local_app = FastAPI(lifespan=lifespan)
+        with (
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+            patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
+        ):
+            async with lifespan(local_app):
+                await asyncio.wait_for(landed.wait(), timeout=5.0)
+            await asyncio.sleep(_CONNECT_HOLD_SECONDS + 0.5)
+
+    threading.excepthook = _recording_hook
+    loop = asyncio.new_event_loop()
+    # set_event_loop so Connection.stop()'s `asyncio.get_event_loop()` resolves
+    # to THIS (soon-closed) loop during the gc below — that is precisely the
+    # production condition being reproduced.
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_drive_lifespan())
+        assert opened, (
+            f'no read-only DbPool connect was observed for '
+            f'{[str(p) for p in db_paths]} — the metrics loop never reached '
+            f'aiosqlite.connect, so this guard asserted nothing'
+        )
+        survivors_before_gc = [c for c in opened if getattr(c, '_running', False)]
+
+        loop.close()
+        # Drop the last references and force finalisation NOW, while the closed
+        # loop is still the current one.
+        opened.clear()
+        del survivors_before_gc
+        gc.collect()
+        time.sleep(0.5)  # let any woken worker thread run to its escape
+    finally:
+        threading.excepthook = original_hook
+        if not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
+
+    assert not escaped, (
+        f'{len(escaped)} exception(s) escaped an aiosqlite worker thread after '
+        f'its event loop closed: '
+        f'{[repr(a.exc_value) for a in escaped]}. This is the roaming pytest '
+        f'ERROR — threading.excepthook attributes it to whichever test happens '
+        f'to be running. DbPool.close_all() must close every connection it '
+        f'caused to be opened while the loop is still alive.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_nested_lifespan_closes_the_stores_it_opened(tmp_path: Path, monkeypatch):
+    """Overlapping lifespans over one ``app`` must each close their OWN handles.
+
+    ``app.state`` is a single mutable namespace on the ``FastAPI`` instance, so
+    a second lifespan over the same ``app`` overwrites ``burndown_store`` /
+    ``metrics_store`` / ``db`` / ``http_client``.  A shutdown that read those
+    back from ``app.state`` therefore closed the INNER lifespan's (already
+    closed) handles — a silent no-op — and stranded the OUTER's two writable
+    WAL connections and its ``DbPool``.
+
+    This is not hypothetical: it is the second, independent source of the
+    roaming ``PytestUnhandledThreadExceptionWarning`` this task exists to
+    remove, measured in the full dashboard suite.  ~15 module-scoped
+    ``TestClient(app)`` fixtures coexist with the function-scoped ``client``
+    fixture in ``tests/conftest.py``, and starlette runs a full lifespan per
+    ``TestClient`` context — so every such module leaked exactly two writable
+    connections, which ``aiosqlite.Connection.__del__`` later finalised against
+    a closed loop.
+
+    Deliberately structural rather than ordering-dependent: it nests the two
+    lifespans directly, so it fails for the same reason the suite did without
+    depending on which fixtures happen to overlap.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+
+    shared_app = FastAPI(lifespan=lifespan)
+    with (
+        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+    ):
+        async with lifespan(shared_app):
+            outer = (
+                shared_app.state.burndown_store,
+                shared_app.state.metrics_store,
+                shared_app.state.db,
+            )
+            outer_http = shared_app.state.http_client
+            # The inner lifespan clobbers every one of those app.state slots.
+            async with lifespan(shared_app):
+                inner = (
+                    shared_app.state.burndown_store,
+                    shared_app.state.metrics_store,
+                    shared_app.state.db,
+                )
+                assert all(o is not i for o, i in zip(outer, inner, strict=True)), (
+                    'the nested lifespan reused the outer objects — this test no '
+                    'longer reproduces the app.state clobber it exists to pin'
+                )
+            # Inner shutdown has run; app.state still holds the inner handles.
+
+    outer_burndown, outer_metrics, outer_pool = outer
+    for store, name in ((outer_burndown, 'burndown'), (outer_metrics, 'metrics')):
+        assert store._conn is None, (
+            f'the outer lifespan did not close its own {name} store — it closed '
+            f'whatever app.state pointed at (the inner lifespan\'s, already '
+            f'closed). Its writable WAL connection is stranded, and '
+            f'aiosqlite.Connection.__del__ will queue work onto this now-dead '
+            f'loop and raise "Event loop is closed" out of '
+            f'_connection_worker_thread.'
+        )
+    assert outer_pool._closed, (
+        'the outer lifespan did not close its own DbPool — close_all() ran '
+        'against the inner lifespan\'s pool instead'
+    )
+    assert outer_http.is_closed, (
+        'the outer lifespan did not close its own httpx client — aclose() ran '
+        "against the inner lifespan's client instead"
     )

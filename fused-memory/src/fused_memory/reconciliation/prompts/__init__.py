@@ -17,7 +17,7 @@ _PROJECT_ID_GUIDELINE = (
 _STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
         'search, get_entity, get_episodes, get_status, add_memory, delete_memory, '
-        'update_edge'
+        'update_edge, update_memory, redact_episode_content, delete_episode'
     )
 )
 
@@ -27,6 +27,7 @@ _STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
 _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
         'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
+        'update_memory, redact_episode_content, delete_episode, '
         'get_tasks, get_task, set_task_status, submit_task, resolve_ticket, '
         'update_task, remove_task, add_dependency, remove_dependency'
     )
@@ -36,6 +37,102 @@ _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
 _STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
 )
+
+# ---------------------------------------------------------------------------
+# Shared memory-amend / episode-mutation tool listing (esc-3391-1)
+# ---------------------------------------------------------------------------
+# Stage 1 and Stage 2 can already call all three of these tools today — neither
+# STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds DISALLOW_MEMORY_WRITES
+# (cli_stage_runner.py) — but until now neither stage's "## Available Tools"
+# block named them, so the agent never learned they exist. `--disallowed-tools`
+# OMITS a denied tool rather than rejecting a call (cli_stage_runner.py:96-104),
+# so an unadvertised-but-held tool is just as invisible to the agent by the
+# mirror-image failure: nothing in its prompt ever mentions it.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Not an f-string: it is interpolated INTO f-strings, and
+# braces inside an interpolated value are not re-parsed by the enclosing
+# f-string, so its own text needs no {{/}} escaping.
+AMEND_AND_EPISODE_TOOLS_BLOCK = """\
+- `mcp__fused-memory__update_memory` — in-place Mem0 content amend / metadata patch. \
+The Qdrant point id and created_at are PRESERVED, so nothing citing the record dangles. \
+PREFER THIS over delete + re-add when consolidating a cluster: delete + re-add mints a \
+new UUID and strands any task metadata citing the old one. Call with `store="mem0"` \
+(`store="graphiti"` is rejected — use `update_edge` instead) and a non-empty `reason` \
+whenever you pass `content`; the record payload goes in `metadata_patch` — `metadata` is \
+the causation envelope and is never stored on the record.
+- `mcp__fused-memory__redact_episode_content` — in-place replacement of ONE episode's raw \
+content. NON-destructive: the episode's extracted edges are deliberately left untouched.
+- `mcp__fused-memory__delete_episode` — IRREVERSIBLE. `cascade=True` (the default) also \
+destroys entities and edges exclusively sourced from that episode.\
+"""
+
+# ---------------------------------------------------------------------------
+# Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
+# ---------------------------------------------------------------------------
+# States the precedence order for annotating superseded, wrong, or corrupted
+# knowledge across both stores — lightest-touch first, last-resort last — plus
+# the ruling's option (b) cross-check rule against trusting episode prose at
+# face value. Shared between Stage 1 and Stage 2 because both hold every tool
+# named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
+# DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
+# Placed in the prompt rather than CLAUDE.md because the recon stages are the
+# only consumer of raw episode prose.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. MUST NOT contain a bare `mcp__recon-report__` call
+# example — test_recon_report_guidance_drift.py scans the assembled prompts
+# and requires every such example to carry `run_id=`; this section introduces
+# none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
+# stage2.py has no such section; refer to `replacement_memory_id` by
+# parameter name instead, a tool-level fact true in both stages. Not an
+# f-string: it is interpolated INTO f-strings, and braces inside an
+# interpolated value are not re-parsed by the enclosing f-string, so its own
+# text needs no {{/}} escaping (there are none below regardless).
+STALE_KNOWLEDGE_ANNOTATION_NORM = """\
+## Annotating Stale or Wrong Knowledge
+When you find stale, superseded, or wrong knowledge, use the LIGHTEST-touch tool that \
+correctly resolves it — in this order:
+
+(a) **Stale or superseded FACT**: write a superseding edge, or call `update_edge` with \
+`invalid_at` set on the stale edge. This is the house pattern and is already in live use. \
+`search` returns EDGES, not raw episode prose — a superseding edge is the annotation that \
+is actually RETRIEVABLE; an annotation buried in episode text is not.
+(b) **Episode text wrong ON ITS FACE**: use `mcp__fused-memory__redact_episode_content` \
+ONLY for this case. In BOTH sub-cases below, first call `get_episodes` and copy the \
+episode's CURRENT content verbatim — `new_content` REPLACES the stored text in full and \
+the original is not recoverable; if you cannot retrieve the full current text, do not \
+redact. Leave the surrounding narrative untouched. The two sub-cases need DIFFERENT \
+edits, and confusing them gets your call refused:
+  - **Wrong claim** (a premature past-tense completion claim, a superseded assertion): \
+keep the text as-is and prefix a dated `[SUPERSEDED: ...]` marker. The wrong prose stays \
+readable as a record of what was believed at the time.
+  - **Corrupted or leaked fragment** (e.g. leaked serialized tool-call XML): you must \
+REPLACE the corrupted span ITSELF with a redaction marker such as \
+`[REDACTED: leaked tool-call fragment]`, not merely prefix a marker to the front. The \
+server re-runs its leak detector over your `new_content` and RAISES on a call that still \
+carries the fragment ("a redaction that re-introduces the leak is not a redaction"), so a \
+verbatim copy with a prefix added is rejected every time. A refusal here does NOT mean \
+you should fall through to (c) — it means your replacement text is not yet leak-free; \
+excise the fragment and retry.
+(c) **Last resort**: `mcp__fused-memory__delete_episode` — see the tool listing above \
+for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve the \
+problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
+exists precisely to avoid the cascade, so a rejected redaction means fix the \
+`new_content` and retry (b), never escalate to (c).
+(d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
+`mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
+delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
+delete and re-add the survivor.
+
+**Episode prose is a point-in-time narration, not current truth.** An episode's content \
+may assert work as complete that is still in progress by the time you read it. Before \
+acting on an episode's claim, cross-check current entity/edge state (`search` / \
+`get_entity`) or live task status (`get_task`) rather than trusting the prose at face \
+value.\
+"""
 
 # ---------------------------------------------------------------------------
 # Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)

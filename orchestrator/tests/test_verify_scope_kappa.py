@@ -45,6 +45,7 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
 from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
@@ -111,27 +112,35 @@ MIXED_ROOT_SUBPROJECT_DIFF: list[str] = [*FALLBACK_SUBPROJECT_DIFF, 'conftest.py
 # ruff-check clause — well-formed/never-OPAQUE even parsed whole — so a
 # second, genuinely multi-clause OPAQUE lint variant
 # (_FLEET_LINT_COMMAND_OPAQUE) is defined separately below for golden (f).
+#
+# The two constants immediately below are INTENTIONALLY HISTORICAL: neither is
+# the live YAML value, both are deliberately NOT drift-checked, and neither may
+# be migrated into `_verify_config_corpus.py`. _FLEET_TEST_COMMAND is the
+# 5-module chain as it stood at test_verify.py:4929 when tasks 2344/2355/2368
+# were fixed (today's live test_command adds --timeout=300 and sampler/cockpit/
+# tests-scripts segments); _FLEET_LINT_COMMAND is the deliberately single-clause
+# variant described above. Hoisting either would break this module's
+# byte-identical goldens, or leave test_verify_config_corpus.py permanently RED.
 _FLEET_TEST_COMMAND: str = (
     'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
     '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
     '&& cd ../dashboard && uv run pytest tests/'
 )
 _FLEET_LINT_COMMAND: str = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-_FLEET_TYPE_COMMAND: str = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
-    '&& cd ../dashboard && npx pyright'
-)
 
-# The real dark_factory lint_command verbatim (orchestrator/config.yaml) — a
-# genuine multi-clause OPAQUE chain (unlike _FLEET_LINT_COMMAND above). Reused
-# from TestBuildFallbackConfigWithNonDefaultCommands
+# The remaining two ARE the live values (byte-identical, and now drift-checked
+# at their definition site), so they alias the corpus rather than re-declaring
+# it. The _FLEET_* names are kept because they carry κ-specific meaning this
+# module's header documents — which shape is OPAQUE, which is single-clause —
+# that ROOT_* does not convey.
+_FLEET_TYPE_COMMAND: str = ROOT_TYPE_CHECK_COMMAND
+
+# The real dark_factory lint_command verbatim — a genuine multi-clause OPAQUE
+# chain (unlike _FLEET_LINT_COMMAND above). Reused from
+# TestBuildFallbackConfigWithNonDefaultCommands
 # .test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context
 # (test_verify.py) for the OPAQUE-fleet-chain golden (f) below.
-_FLEET_LINT_COMMAND_OPAQUE: str = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard '
-    '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
-    'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
+_FLEET_LINT_COMMAND_OPAQUE: str = ROOT_LINT_COMMAND
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +218,16 @@ class TestModuleConfigPlanAuthority:
 
     @pytest.mark.asyncio
     async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
-        """A touched test file + a plain source file under one registered module."""
+        """A touched test file + a plain source file under one registered module.
+
+        Since task 3294 this MIXED shape full-suites pytest at the default
+        role='task' (any touched SOURCE/STRUCTURAL file under the prefix runs
+        the owning module's whole test_command), so this pins the FULL_SUITE
+        arm of the plan→ModuleConfig mapping alongside lint/pyright's
+        FILE_SCOPED arms. The class's contract — executed == planned, with no
+        hand-mirrored decision tree in between — is unchanged; only which arm
+        the pytest slot exercises moved.
+        """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
         (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
@@ -252,9 +270,16 @@ class TestModuleConfigPlanAuthority:
         by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
 
         pytest_run = by_tool[ToolKind.PYTEST]
-        assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        # Task 3294: this MIXED shape (production file + co-committed test)
+        # full-suites pytest at role='task', so this now pins the FULL_SUITE
+        # arm of the plan→ModuleConfig mapping. The expectation is the
+        # VERBATIM configured command, not render(cmd): a FULL_SUITE slot is
+        # rendered by _executed_module_configs_from_plan as `getattr(mc, attr)`,
+        # while render() normalises `--directory` into a leading `cd` — so the
+        # render-based form would fail on a correct mapping.
+        assert pytest_run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
         assert pytest_run.cmd is not None
-        assert executed_mc.test_command == render(pytest_run.cmd)
+        assert executed_mc.test_command == module_configs[0].test_command
 
         ruff_run = by_tool[ToolKind.RUFF]
         assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
@@ -1003,6 +1028,7 @@ class TestFallbackPlanAuthorityGoldens:
             f'uv run --project shared ruff check {test_path}'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
             'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
         )
         assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
         # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.

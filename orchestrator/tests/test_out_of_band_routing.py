@@ -37,7 +37,6 @@ from orchestrator.event_store import EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults, RoutingDecision
 from orchestrator.routing_dispatch import resolve_and_record_route
-from orchestrator.steward import TaskSteward
 from orchestrator.verify import VerifyResult
 
 
@@ -71,49 +70,6 @@ def _fake_decision(*, model='sonnet', effort='low', budget_usd=1.23, max_turns=1
 # ---------------------------------------------------------------------------
 
 
-def _steward_config():
-    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    cfg.project_root = Path('/tmp/fake-project')
-    cfg.fused_memory.project_id = 'dark_factory'
-    cfg.fused_memory.url = 'http://localhost:8002'
-    cfg.models.steward = 'opus'
-    cfg.budgets.steward = 5.0
-    cfg.max_turns.steward = 100
-    cfg.effort.steward = 'high'
-    cfg.backends.steward = 'claude'
-    cfg.timeouts.steward = 1800.0
-    cfg.models.triage = 'sonnet'
-    cfg.budgets.triage = 2.0
-    cfg.max_turns.triage = 25
-    cfg.effort.triage = 'medium'
-    cfg.backends.triage = 'claude'
-    cfg.escalation.host = 'localhost'
-    cfg.escalation.port = 8102
-    stamp_stock_routing_config(cfg)
-    return cfg
-
-
-def _build_steward(worktree: Path, *, task: dict, event_store=None, cost_store=None):
-    briefing = AsyncMock()
-    briefing.build_steward_initial_prompt.return_value = 'Full briefing.'
-    briefing.build_steward_continuation_prompt.return_value = 'Continuation.'
-    mcp = MagicMock()
-    mcp.mcp_config_json.return_value = {'mcpServers': {}}
-    queue = MagicMock()
-    queue.get_by_task.return_value = []
-    return TaskSteward(
-        task_id=task['id'],
-        task=task,
-        worktree=worktree,
-        config=_steward_config(),
-        mcp=mcp,
-        escalation_queue=queue,
-        briefing=briefing,
-        event_store=event_store,
-        cost_store=cost_store,
-    )
-
-
 def _mk_escalation(**overrides) -> Escalation:
     defaults: dict = dict(
         id='esc-42-1', task_id='42', agent_role='orchestrator',
@@ -128,13 +84,11 @@ class TestStewardMainAdoptsResolveRoute:
     """steward main invoke (`_invoke_with_session`) resolves via the helper."""
 
     async def test_decision_feeds_invoke_and_keeps_budget_and_backend(
-        self, tmp_path: Path,
+        self, make_steward,
     ) -> None:
-        wt = tmp_path / 'wt'
-        wt.mkdir()
         task = {'id': '42', 'title': 't', 'description': 'd',
                 'metadata': {'dispatch_count': 2}}
-        steward = _build_steward(wt, task=task)
+        steward = make_steward(task=task)
         fake = _fake_decision(model='sonnet', effort='low', max_turns=17)
 
         with (
@@ -144,7 +98,7 @@ class TestStewardMainAdoptsResolveRoute:
                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
         ):
             await steward._invoke_with_session(
-                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                prompt='p', cwd=steward.worktree, mcp_config={'mcpServers': {}},
                 per_invocation_budget=3.0, escalation=_mk_escalation(),
             )
 
@@ -165,17 +119,15 @@ class TestStewardMainAdoptsResolveRoute:
         assert kwargs['max_budget_usd'] == pytest.approx(3.0)
         assert kwargs['backend'] == 'claude'
 
-    async def test_emits_one_routing_decision_event(self, tmp_path: Path) -> None:
-        wt = tmp_path / 'wt'
-        wt.mkdir()
+    async def test_emits_one_routing_decision_event(self, make_steward) -> None:
         rec = _RecordingEventStore()
         task = {'id': '42', 'title': 't', 'description': 'd'}
-        steward = _build_steward(wt, task=task, event_store=rec)
+        steward = make_steward(task=task, event_store=rec)
 
         with patch('orchestrator.steward.invoke_with_cap_retry',
                    new=AsyncMock(return_value=_stub_result())):
             await steward._invoke_with_session(
-                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                prompt='p', cwd=steward.worktree, mcp_config={'mcpServers': {}},
                 per_invocation_budget=3.0, escalation=_mk_escalation(),
             )
 
@@ -191,18 +143,16 @@ class TestStewardMainAdoptsResolveRoute:
         assert data['applied_budget_usd'] == pytest.approx(3.0)
         assert data['budget_usd_advisory'] is True
 
-    async def test_model_override_wins_boundary_test_9(self, tmp_path: Path) -> None:
-        wt = tmp_path / 'wt'
-        wt.mkdir()
+    async def test_model_override_wins_boundary_test_9(self, make_steward) -> None:
         rec = _RecordingEventStore()
         task = {'id': '42', 'title': 't', 'description': 'd',
                 'metadata': {'model_overrides': {'steward': 'haiku'}}}
-        steward = _build_steward(wt, task=task, event_store=rec)
+        steward = make_steward(task=task, event_store=rec)
 
         with patch('orchestrator.steward.invoke_with_cap_retry',
                    new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
             await steward._invoke_with_session(
-                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                prompt='p', cwd=steward.worktree, mcp_config={'mcpServers': {}},
                 per_invocation_budget=3.0, escalation=_mk_escalation(),
             )
 
@@ -234,18 +184,11 @@ class TestStewardTriageAdoptsResolveRoute:
         ]
         return _mk_escalation(detail=json.dumps(suggestions), category='review_suggestions')
 
-    def _wt(self, tmp_path: Path) -> Path:
-        wt = tmp_path / 'worktree'
-        wt.mkdir()
-        (wt / '.task').mkdir()
-        return wt
-
     async def test_decision_feeds_triage_invoke_and_keeps_backend(
-        self, tmp_path: Path,
+        self, make_steward,
     ) -> None:
-        wt = self._wt(tmp_path)
         task = {'id': '42', 'title': 't', 'description': 'd'}
-        steward = _build_steward(wt, task=task)
+        steward = make_steward(task=task)
         fake = _fake_decision(model='sonnet', effort='medium', budget_usd=2.5, max_turns=25)
 
         with (
@@ -266,11 +209,10 @@ class TestStewardTriageAdoptsResolveRoute:
         assert kwargs['max_turns'] == 25
         assert kwargs['backend'] == 'claude'
 
-    async def test_emits_one_routing_decision_event(self, tmp_path: Path) -> None:
-        wt = self._wt(tmp_path)
+    async def test_emits_one_routing_decision_event(self, make_steward) -> None:
         rec = _RecordingEventStore()
         task = {'id': '42', 'title': 't', 'description': 'd'}
-        steward = _build_steward(wt, task=task, event_store=rec)
+        steward = make_steward(task=task, event_store=rec)
 
         with patch('orchestrator.steward.invoke_with_cap_retry',
                    new=AsyncMock(return_value=_stub_result())):
@@ -659,19 +601,17 @@ class TestBoundaryTest9CombinedOverrides:
     _COMBINED = {'model_overrides': {'steward': 'haiku', 'deep_reviewer': 'haiku'}}
 
     async def test_steward_honors_only_its_own_override_key(
-        self, tmp_path: Path,
+        self, make_steward,
     ) -> None:
-        wt = tmp_path / 'wt'
-        wt.mkdir()
         rec = _RecordingEventStore()
         task = {'id': '42', 'title': 't', 'description': 'd',
                 'metadata': dict(self._COMBINED)}
-        steward = _build_steward(wt, task=task, event_store=rec)
+        steward = make_steward(task=task, event_store=rec)
 
         with patch('orchestrator.steward.invoke_with_cap_retry',
                    new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
             await steward._invoke_with_session(
-                prompt='p', cwd=wt, mcp_config={'mcpServers': {}},
+                prompt='p', cwd=steward.worktree, mcp_config={'mcpServers': {}},
                 per_invocation_budget=3.0, escalation=_mk_escalation(),
             )
 

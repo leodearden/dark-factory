@@ -1,0 +1,352 @@
+# Candidate serving arms for the local-memory-models eval.
+#
+# PRD-MARKER:local-memory-models-eval serving
+#
+# Task 3713 (LME-alpha) of plans/local-memory-models-eval-prd.md.
+# Slate transcribed from that PRD's candidate tables (lines 122-137); Leo
+# selected every entry.  This file is THE contract: lms_serve, lms_ctl,
+# lms_fetch_weights and lms_healthcheck all derive from it, and the downstream
+# eval tasks (eta screening, theta full runs, iota embedding arms) read
+# base_url / served_model_name / dims / structured_output_mode out of it.
+# Validated by lms_manifest.load_arms() — see scripts/tests/test_lms_manifest.py.
+#
+# PORT RESERVATION.  8410-8417 is reserved for this rig, one port per arm.
+# Chosen to clear the ports already in service on this host: 8002
+# (fused-memory MCP) and 8102 (escalation server).  Arms bind 127.0.0.1 only.
+# lms_manifest refuses a manifest whose arm lands outside this block.
+#
+# VRAM.  est_vram_gib is the arm's declared resident footprint and is checked
+# against MEASURED free VRAM before any arm starts (lms_vram / lms_ctl).  The
+# measured operating budget on this host is ~16.4 GiB, not PRD D10's nominal
+# 19-20 GiB -- whisper-writer holds 4050 MiB and the KDE/X11 desktop ~3.3 GB
+# more.  See README.md.
+#
+# TBD- values are decisions the PRD explicitly delegates to live measurement in
+# this task (Open Q1: embedding serving stack; Open Q3: MoE model + quant).
+# lms_manifest.ArmEntry.is_placeholder is True while they stand, and the tools
+# refuse to launch or fetch such an arm rather than 404ing on a literal "TBD".
+
+port_block: [8410, 8417]
+
+arms:
+
+  # ---------------------------------------------------------------------
+  # LLM axis -- dense arms, vLLM with structured outputs (PRD lines 124-126)
+  # ---------------------------------------------------------------------
+
+  - arm_id: qwen3.5-9b
+    axis: llm
+    stack: vllm
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: QuantTrio/Qwen3.5-9B-AWQ
+    quant: awq
+    port: 8410
+    served_model_name: qwen3.5-9b
+    structured_output_mode: json_schema
+    # MEASURED 2026-08-06. This model's chat template defaults thinking ON and
+    # ends the prompt with an OPEN `<think>` tag; vLLM then fills the xgrammar
+    # bitmask from token 0 and the model physically cannot write the thought it
+    # was just told to write. In that state it answers in 18 tokens with
+    # `entities: []`. With `--reasoning-parser qwen3` and reasoning: on it finds
+    # all four probe entities in 2639 tokens (~35 s). So the mode is NOT a
+    # detail here -- it is the difference between an extraction and an empty
+    # object, and the cost of the good one is ~100x the cost of the empty one.
+    # RULED `on` (Leo, 2026-08-06, esc-3713-10): alpha certifies each arm in the
+    # mode where it can actually do the job. This arm has exactly one such mode.
+    # Confirmed on the 13:50Z slate run at reasoning: off -- 39 tokens,
+    # `entities: []`, FAIL extraction_missed_entities, 0 of 4.
+    #
+    # Whether the EVAL crosses reasoning modes as a factor is zeta's separate
+    # call (task 3719); this field only states the mode alpha certified in, and
+    # the report row records it so nothing is inherited invisibly.
+    reasoning: 'on'
+    # Load-bearing, not decorative: _vllm_argv emits it only when reasoning is
+    # `on`, and lms_manifest REFUSES reasoning: on without it -- because without
+    # a parser vLLM fills the xgrammar bitmask from token 0 and the arm cannot
+    # reason at all, which would make this field a lie.
+    reasoning_parser: qwen3
+    # MEASURED 2026-08-06, correcting a ~2x understatement. The original 6.0 was
+    # a guess from the model's parameter count; vLLM reports 11.21 GiB FOR
+    # WEIGHTS ALONE at this quant, and the arm's live resident footprint was
+    # 14444 MiB. 12.0 is weights plus non-KV overhead -- the ADMISSION FLOOR,
+    # i.e. the least this arm can serve within. It is not the resident figure:
+    # a generate arm sizes its KV cache to fill the share `_memory_share_for`
+    # derives from FREE VRAM, so residency is share-driven and always higher.
+    #
+    # Why this matters despite being "decorative" for generate arms: `arm_fits`
+    # admits on this number. At 6.0 the pre-flight would have admitted the arm
+    # with 6.5 GiB free, and vLLM would then have failed 450 s later, loudly but
+    # expensively. At 12.0 it refuses up front. Same class of correction as
+    # qwen3-embedding-0.6b (2.0 -> 3.0) and -4b (9.0 -> 10.0).
+    #
+    # phi-4-14b almost certainly carries the same understatement (declares 9.0,
+    # measured 15517 MiB resident) but its weight-only figure was not captured,
+    # so it is left alone rather than guessed at.
+    est_vram_gib: 12.0
+    max_model_len: 32768
+    max_num_seqs: 8
+    notes: >-
+      IFEval 91.5 / BFCL-V4 66.1 (official card) -- best published
+      conformance-adjacent scores on the slate.  11.21 GiB of weights (vLLM
+      -reported, measured 2026-08-06 -- NOT the ~6 GiB originally estimated)
+      against a 16.4 GiB budget; the 32k context and the slate's highest
+      max_num_seqs are affordable but no longer the roomiest margin on the
+      slate.
+
+  # ---------------------------------------------------------------------
+  # mistral-small-3.2-24b -- DROPPED FROM THE SLATE (Leo, 2026-08-06).
+  #
+  # The PRD commissioned it (line 127). It is removed after live measurement,
+  # deliberately and on the record, rather than left in to fail forever.
+  #
+  # Its declared quant WAS wrong and that was fixed: `awq` -> `compressed-
+  # tensors`, measured from the downloaded weights' own config.json, and vLLM
+  # 0.26 then accepted the model and resolved max_model_len 16384. That defect
+  # is closed. The arm still never reached weight loading, for an unrelated
+  # reason: Mistral-Small-3.2-24B is a VISION-language model (mistral3.py,
+  # Pixtral tower), vLLM unconditionally sizes a multimodal encoder budget at
+  # startup by pushing a dummy `[IMG]` prompt through PixtralProcessor, and
+  # jeffcookio's repacked tokenizer encodes it to ZERO image tokens while the
+  # text carries one:
+  #
+  #   ValueError: Mismatch in `image` token count between text and `input_ids`.
+  #   Got ids=[0] and text=[1].
+  #
+  # transformers also warns that repo needs `fix_mistral_regex=True`, pointing
+  # at the same object. Root cause is the quantizer's tokenizer, not the quant
+  # and not the weights -- the card never moved (7212 -> 7221 MiB).
+  #
+  # Leo's ruling: drop it. "It was never a favourite, and I think this is the
+  # alpha gate working as intended" -- the serving substrate refused an arm it
+  # cannot actually serve, loudly, before the eval could attribute numbers to
+  # it. Re-admitting it needs a different quantized repo (or an upstream
+  # tokenizer fix), NOT a flag that suppresses the multimodal path: the eval
+  # would then be measuring a model configured differently from the one the
+  # PRD costed.
+  #
+  # The LLM slate is therefore THREE arms, not four. eta's funnel narrows
+  # 3 -> at most 3, so its selectivity on this axis is now near-nil -- flagged
+  # for zeta/eta rather than silently absorbed.
+  # ---------------------------------------------------------------------
+
+  - arm_id: phi-4-14b
+    axis: llm
+    stack: vllm
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: stelterlab/phi-4-AWQ
+    quant: awq
+    port: 8412
+    served_model_name: phi-4-14b
+    structured_output_mode: json_schema
+    # No thinking construct in this model's chat template (verified 2026-08-06
+    # against the on-disk snapshot -- the whole template is one 377-char line
+    # with no reasoning channel), so `off` is the only mode it has.
+    reasoning: 'off'
+    est_vram_gib: 9.0
+    max_model_len: 16384
+    max_num_seqs: 5
+    notes: >-
+      SOB Value Accuracy 0.798, top of the small-model group.  16K is the
+      MODEL's ceiling, not a tuning choice (PRD line 126) -- eta must verify
+      graphiti's longest prompts fit inside it before this arm is scored.
+
+  # ---------------------------------------------------------------------
+  # LLM axis -- MoE stretch arm, llama.cpp (PRD line 127)
+  #
+  # arm_id is deliberately generic and STABLE across the Open Q3 decision:
+  # resolving Q3 changes model_ref/quant/image/gguf_file only, so the port,
+  # the unit name, and every artifact already keyed on this arm stay valid.
+  # ---------------------------------------------------------------------
+
+  - arm_id: moe-stretch
+    axis: llm
+    stack: llamacpp
+    # Pinned in step 19 by tag AND digest.  Verified on this host:
+    # `llama-server --version` => version 10276 (6ea215d17), GNU 14.2.0 x86_64.
+    # The build tag is legible where the floating `server-cuda` tag is not, and
+    # both resolved to the same digest when measured (2026-08-06).
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b10276
+    image_digest: sha256:48a88af72b29e865d64f464e3dc1e4fbbad4a36c5e2298d72d13b690f9d17dd2
+    # Open Q3 RESOLVED from measured file sizes, step 22 (2026-08-06).
+    #
+    # Gemma-4-26B-A4B, not Qwen3.6-35B-A3B, and the reason is arithmetic rather
+    # than preference.  Real GGUF sizes pulled from the HF API:
+    #
+    #   Qwen3.6-35B-A3B  UD-IQ4_XS  16.51 GiB   <- the PRD's nominal IQ4 choice
+    #   Qwen3.6-35B-A3B  UD-IQ3_S   12.74 GiB
+    #   gemma-4-26B-A4B  UD-IQ4_XS  12.66 GiB
+    #   gemma-4-26B-A4B  qat UD-Q4_K_XL  13.27 GiB   <- pinned
+    #
+    # Qwen's smallest TRUE 4-bit quant is 16.51 GiB of weights alone, which
+    # exceeds the whole 16.4 GiB measured budget before a single KV byte.  It
+    # would have fitted PRD D10's nominal 19.5 GiB -- this is precisely the
+    # deviation D10's arithmetic hides.  Serving Qwen here would mean dropping
+    # to IQ3_S and paying a real quality tax on the eval's stretch arm.
+    #
+    # Gemma's QAT weights are quantization-aware TRAINED at 4-bit by Google, so
+    # Q4_K_XL is near-lossless rather than a post-training approximation: the
+    # arm that fits is also the one that does not trade quality to fit.
+    model_ref: unsloth/gemma-4-26B-A4B-it-qat-GGUF
+    gguf_file: gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf
+    quant: q4_k_xl
+    port: 8413
+    served_model_name: moe-stretch
+    # json_object ONLY, and this is enforced by lms_manifest, not merely
+    # documented: llama.cpp silently falls back to unconstrained output on the
+    # $ref/$defs schemas graphiti really emits (ggml-org/llama.cpp#21228).
+    # Alpha guarantees the endpoint; the forced client selection is beta's and
+    # the hard client-side validator is epsilon's.
+    structured_output_mode: json_object
+    # MEASURED 2026-08-06. This model's OWN template defaults thinking off and
+    # suppresses it by pre-closing the thought channel; llama.cpp b10276
+    # overrides that to ON, which is why the probe came back empty at the old
+    # 512-token cap -- 509 of 512 tokens went into an unterminated thought.
+    # Both modes work and BOTH extract all four probe entities:
+    #   off -> 236-276 tokens, 2.3-2.9 s
+    #   on  -> 1807 tokens (84% thought), 16.5-17.2 s
+    # So on this arm reasoning costs 6.4x the wall clock and buys nothing
+    # measurable. `off` restores the model author's own default; zeta (3719)
+    # owns whether it stays there.
+    reasoning: 'off'
+    est_vram_gib: 14.5
+    max_model_len: 16384
+    max_num_seqs: 4
+    notes: >-
+      PRD Open Q3, resolved from measurement in step 22.  Gemma-4-26B-A4B QAT
+      at UD-Q4_K_XL: 13.27 GiB of weights, chosen because Qwen3.6-35B-A3B's
+      smallest true 4-bit quant (IQ4_XS, 16.51 GiB) does not fit the measured
+      16.4 GiB budget at all.  est_vram_gib 14.5 is weights plus the KV cache
+      this arm's sliding-window attention actually needs: 25 of its 30 layers
+      use a 1024-token window, so 16k context costs ~0.82 GiB of KV rather
+      than the ~3.8 GiB a full-attention model of this shape would need.
+
+  # ---------------------------------------------------------------------
+  # Embedding axis (PRD lines 132-137)
+  #
+  # Open Q1 RESOLVED, step 22 (2026-08-06): stack: vllm for ALL FOUR.  Each was
+  # started through the committed chain and probed; all four loaded under the
+  # pooling runner and returned a valid vector of their declared length, so the
+  # preferred uniform stack is what measurement allowed -- one stack removes a
+  # serving-stack confound from iota's query-latency comparison.  TEI was never
+  # pulled; fallback_stack stays recorded but unused.
+  #
+  # RE-MEASURED 2026-08-06 AFTER the pooling KV bound landed, superseding the
+  # figures this comment used to carry (qwen3-0.6b 16603 MiB, qwen3-4b 16078
+  # MiB): granite 789 MiB/129 ms, gte-modernbert 788 MiB/115 ms, qwen3-0.6b
+  # 3584 MiB/507 ms, qwen3-4b 10114 MiB/630 ms.  The two ~790 MiB arms are
+  # encoder models; the other two are DECODERS that emit embeddings, and vLLM
+  # hands a decoder a paged KV cache sized to fill --gpu-memory-utilization
+  # whether a pooling model can use it or not.
+  #
+  # est_vram_gib is therefore NO LONGER decorative for those two -- that claim
+  # described the pre-bound world.  lms_serve bounds a pooling arm to
+  # est_vram_gib + 0.5, and the measurements above land within a few MiB of that
+  # bound (3.0+0.5, 10.0+0.5), which is what makes the number load-bearing again.
+  #
+  # NOTE for iota: L2 norms are NOT uniform across this slate.  Both Qwen arms
+  # return unit vectors; granite returns ~30.4 and gte-modernbert ~37.1.  All
+  # pass the health check (its floor is 1e-6), but a raw dot product used as a
+  # cosine proxy would score them on a different scale.  See README.
+  #
+  # max_model_len is 8192 uniformly: it is granite-r2's and gte-modernbert's
+  # native ceiling, memory texts are far shorter, and a uniform bound keeps
+  # input-length capacity from becoming a second confound.
+  # ---------------------------------------------------------------------
+
+  - arm_id: qwen3-embedding-0.6b
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: Qwen/Qwen3-Embedding-0.6B
+    quant: none
+    port: 8414
+    served_model_name: qwen3-embedding-0.6b
+    structured_output_mode: none
+    # MEASURED 2026-08-06, not estimated.  This arm is a DECODER that emits
+    # embeddings, so vLLM gives it a paged KV cache; lms_serve bounds a pooling
+    # arm's --gpu-memory-utilization to est_vram_gib + 0.5, which makes this
+    # number the arm's real ceiling rather than a decorative annotation.
+    # Breakdown at that bound: 1.64 GiB non-KV (1.12 weights + 0.30 peak
+    # activation + 0.05 non-torch + 0.07 CUDA graph) and 0.88 GiB of KV to hold
+    # one 8192-token sequence.  The original 2.0 guess granted only 0.86 GiB of
+    # KV and vLLM refused to start -- loudly, naming the 8032-token ceiling it
+    # could actually serve.  3.0 leaves ~1.9 GiB of KV, room to batch.
+    est_vram_gib: 3.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 1024
+    query_prefix: "Instruct: Given a search query, retrieve relevant memory records that answer the query\nQuery: "
+    notes: >-
+      MTEB(eng,v2) 70.70, Apache 2.0, ~1.2 GB.  TBD-Q1 stack.  The query-side
+      instruct prefix is REQUIRED by this family (PRD line 134) and is carried
+      here rather than at a call site so it cannot be silently dropped.
+
+  - arm_id: granite-embedding-english-r2
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: ibm-granite/granite-embedding-english-r2
+    quant: none
+    port: 8415
+    served_model_name: granite-embedding-english-r2
+    structured_output_mode: none
+    est_vram_gib: 1.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 768
+    notes: >-
+      149M, IBM 6-benchmark composite 59.5, fastest mid-size, no prefix.
+      TBD-Q1 stack.  At ~300 MB it is the cheapest arm on the slate, which is
+      why step 20 smokes the whole chain end to end on THIS arm before
+      committing to the full slate's downloads.
+
+  - arm_id: qwen3-embedding-4b
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: Qwen/Qwen3-Embedding-4B
+    quant: none
+    port: 8416
+    served_model_name: qwen3-embedding-4b
+    structured_output_mode: none
+    # MEASURED 2026-08-06 (see qwen3-embedding-0.6b for the mechanism): a
+    # decoder embedder, so the pooling bound above applies here too.  ~8.0 GiB
+    # of fp16 weights plus ~0.5 GiB of overhead leaves the original 9.0 guess
+    # only ~1.0 GiB of KV, under the ~1.2 GiB one 8192-token sequence needs.
+    est_vram_gib: 10.0
+    max_model_len: 8192
+    max_num_seqs: 8
+    dims: 2560
+    query_prefix: "Instruct: Given a search query, retrieve relevant memory records that answer the query\nQuery: "
+    notes: >-
+      MTEB(eng,v2) 74.60 -- the slate's quality ceiling.  No 2B variant exists
+      (family is 0.6B/4B/8B, verified 2026-08-05).  fp16 weights are ~8 GB;
+      if that will not squeeze, step 22 re-pins to the GGUF Q4 (~2.5 GB).
+      The eval runs this arm as a batch job with the LLM server stopped, so
+      residency only matters at cutover (PRD line 136).
+
+  - arm_id: gte-modernbert-base
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    model_ref: Alibaba-NLP/gte-modernbert-base
+    quant: none
+    port: 8417
+    served_model_name: gte-modernbert-base
+    structured_output_mode: none
+    est_vram_gib: 1.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 768
+    notes: >-
+      149M, the second small-model pole, no prefix.  TBD-Q1 stack.

@@ -57,7 +57,18 @@ if [[ "$mode" == "default" ]]; then
     while true; do
         body="$(curl -s --max-time "$CURL_MAX_TIME" "$HEALTH_URL" || true)"
         gate_output="$(printf '%s' "$body" | python3 "$SCRIPT_DIR/recon_busy_check.py" || true)"
-        verdict="$(printf '%s\n' "$gate_output" | head -n1)"
+        # Pure-bash first-line extraction (no pipeline): a `head -n1`
+        # consumer can lose the SIGPIPE race against a still-writing
+        # producer once gate_output exceeds the pipe buffer (many
+        # recon_busy_cycle lines), which under `pipefail` + `set -e` would
+        # abort this script with exit 141 mid-gate, before the restart,
+        # silently. A pipeline that can SIGPIPE at all has no business in a
+        # `set -euo pipefail` gate, so this is hardened defensively — the
+        # exact gate_output size behind the observed task 3838 exit-141
+        # incident is not yet confirmed (recon_busy_snapshot() emits one
+        # entry per concurrently in-flight full cycle, realistically 1-5;
+        # see task 3838 follow-up).
+        verdict="${gate_output%%$'\n'*}"
         elapsed=$((SECONDS - gate_start))
 
         if [[ "$verdict" != "busy" ]]; then
@@ -85,8 +96,16 @@ if [[ "$mode" == "drain" ]]; then
 
     drain_deadline=$((SECONDS + DRAIN_TIMEOUT))
     while [[ $SECONDS -lt $drain_deadline ]]; do
-        if journalctl --user -u "$SERVICE" --since "10 seconds ago" --no-pager -q \
-            | grep -q "$DRAIN_MARKER"; then
+        # Pure-bash substring match (no pipeline): `grep -q` exits the
+        # instant it finds a match, which can lose the SIGPIPE race against
+        # a still-writing journalctl on a burst larger than the pipe
+        # buffer (plausible during an active recon cycle — exactly when
+        # --drain is used). Since this pipeline is an `if` condition,
+        # `set -e` would not abort on that SIGPIPE — the condition would
+        # just silently evaluate false, missing a marker it actually saw
+        # and spinning to the full DRAIN_TIMEOUT (task 3838).
+        journal="$(journalctl --user -u "$SERVICE" --since "10 seconds ago" --no-pager -q || true)"
+        if [[ "$journal" == *"$DRAIN_MARKER"* ]]; then
             echo "${DRAIN_MARKER}."
             break
         fi

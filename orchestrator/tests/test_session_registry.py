@@ -11,6 +11,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -259,6 +260,17 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     concrete, distinguishable value so a round-trip test can catch a field
     being dropped/mis-typed; ``overrides`` lets a test tweak just the
     field(s) it cares about.
+
+    ONE DELIBERATE EXCEPTION: ``escalations_dir`` is absent from the map
+    below, so the DecisionRecord dataclass default ('' -- unset/legacy)
+    supplies it. It is the only field that is a GUARD INPUT to the reaper's
+    axis-2 queue check (``_run_reap_decisions._status``), so a non-empty
+    shared default here would make every _make_decision()-built decision
+    carry a queue FOREIGN to the tmp_path queue a reap test invokes the
+    reaper with -- short-circuiting _status before read_escalation_status
+    runs and collapsing the test into a vacuous ``assert state == OPEN``. Do
+    not add it here; a test needing a real queue passes ``escalations_dir=``
+    at its own call site.
     """
     fields: dict = {
         'id': 'dec-1',
@@ -277,6 +289,19 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     return sr.DecisionRecord(**fields)
 
 
+def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
+    """The fixture must not hand escalations_dir a non-'' default.
+
+    Guards the one exception documented on _make_decision: escalations_dir is
+    a control-flow guard input to ``_run_reap_decisions._status``, and a
+    non-empty shared default silently neuters every reap-decisions test that
+    does not override it (task 3528 -- it cost three live regression tests at
+    once, each still passing with its premise inverted). Omitting the key is
+    the structural fix; this is the one-line tripwire against re-adding it.
+    """
+    assert _make_decision().escalations_dir == ''
+
+
 def test_decision_state_enum_values() -> None:
     assert issubclass(sr.DecisionState, str)
     assert {m.value for m in sr.DecisionState} == {'open', 'answered', 'dropped'}
@@ -286,12 +311,16 @@ def test_decision_state_enum_values() -> None:
 
 
 def test_decision_record_dict_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    # escalations_dir is stated explicitly (the fixture deliberately omits it
+    # and lets the '' dataclass default stand): a dropped key would round-trip
+    # indistinguishably from '', so only a non-empty value keeps this test's
+    # field-drop catch power.
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_dict(d.to_dict()) == d
 
 
 def test_decision_record_json_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_json(d.to_json()) == d
 
 
@@ -300,7 +329,13 @@ def test_decision_record_round_trip_with_null_fields() -> None:
     project-level decision with no session/task/escalation context yet);
     the round trip must preserve that, not coerce it or drop the key.
     """
-    d = _make_decision(session_id=None, task_id=None, escalation_id=None, options=None)
+    d = _make_decision(
+        session_id=None,
+        task_id=None,
+        escalation_id=None,
+        options=None,
+        escalations_dir='/p/data/reconciliation/escalations',
+    )
     round_tripped = sr.DecisionRecord.from_dict(d.to_dict())
     assert round_tripped == d
     assert round_tripped.session_id is None
@@ -316,6 +351,7 @@ def test_decision_record_defaults() -> None:
     assert d.manual_boost == 0
     assert d.state == sr.DecisionState.OPEN
     assert d.severity == ''
+    assert d.escalations_dir == ''
 
 
 def test_decision_record_to_dict_includes_severity() -> None:
@@ -343,6 +379,53 @@ def test_decision_record_parses_pre_severity_dict_additive() -> None:
     }
     record = sr.DecisionRecord.from_dict(pre_severity)
     assert record.severity == ''
+
+
+def test_decision_record_parses_pre_escalations_dir_dict_additive() -> None:
+    """Every one of the ~300 decision records already on disk predates the
+    escalations_dir field (task 3528). Such a dict must still parse, yielding
+    the '' unset/legacy sentinel that makes the reaper fall back to today's
+    project-only scoping -- the backward-compatibility half of the fix.
+    """
+    pre_queue = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'escalation_id': 'esc-1',
+        'state': 'open',
+        'severity': 'blocking',
+    }
+    record = sr.DecisionRecord.from_dict(pre_queue)
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_parses_null_escalations_dir_as_empty() -> None:
+    """An explicit JSON null (a hand-edited or third-party-written record)
+    must also collapse to '', not None -- the annotation is `str`, and the
+    reaper's queue guard is a single `if decision_dir and ...` test with no
+    None-vs-''-vs-missing branching. Fail-soft, not a raise.
+    """
+    record = sr.DecisionRecord.from_dict(
+        {
+            'id': 'dec-1',
+            'project': 'df',
+            'text': 'approve?',
+            'filed_at': '2026-07-07T00:00:00+00:00',
+            'escalations_dir': None,
+        }
+    )
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_to_dict_always_includes_escalations_dir() -> None:
+    """The key is emitted unconditionally -- including for a queue-less
+    record -- so a round-tripped record never loses its queue stamp and the
+    cockpit's read-modify-write helpers carry it through untouched.
+    """
+    stamped = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
+    assert stamped.to_dict()['escalations_dir'] == '/p/data/reconciliation/escalations'
+    assert 'escalations_dir' in _make_decision().to_dict()
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
@@ -455,6 +538,58 @@ def test_transcript_path_for_cwd_encodes_dot() -> None:
     )
 
 
+def test_transcript_path_for_cwd_encodes_underscore() -> None:
+    # The third character (task 3272). Derived from 738 real (encoded-dir,
+    # decoded-cwd) pairs sampled off a live ~/.claude/projects tree, where
+    # two thirds of the dirs carried an underscore — the former two-character
+    # rule mismatched 492 of the 738.
+    assert (
+        sr.transcript_path_for_cwd('/media/leo/data_lv_1/leo/reify-build')
+        == '~/.claude/projects/-media-leo-data-lv-1-leo-reify-build'
+    )
+
+
+def test_encode_cwd_returns_bare_dir_name() -> None:
+    # encode_cwd is the bare encoded dir name — no '~/.claude/projects/'
+    # prefix — so callers that need a lookup key (not a display path) have
+    # one canonical source instead of string-slicing the prefix back off.
+    assert sr.encode_cwd('/home/leo/src/dark-factory') == '-home-leo-src-dark-factory'
+
+
+def test_encode_cwd_preserves_case() -> None:
+    # A real on-disk dir name with its capitals intact — the encoder does NOT
+    # lowercase, which rules out a case-folding step in the rule.
+    assert sr.encode_cwd('/opt/Auto-Claude/resources/backend') == (
+        '-opt-Auto-Claude-resources-backend'
+    )
+
+
+def test_encode_cwd_maps_all_three_characters() -> None:
+    # '/' , '.' and '_' all collapse to '-'; a leading '_' on a path component
+    # yields a doubled '--' just as a leading '.' does.
+    assert sr.encode_cwd('/home/leo/src/warm-lanes/worktrees/_lane-39') == (
+        '-home-leo-src-warm-lanes-worktrees--lane-39'
+    )
+    assert sr.encode_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12') == (
+        '-home-leo-src-dark-factory--eval-worktrees-df-task-12'
+    )
+
+
+def test_transcript_path_for_cwd_is_prefix_plus_encoding() -> None:
+    # Pins the '~/.claude/projects/' prefix AND the encoding together over a
+    # cwd exercising all three characters, as a hard-coded literal.
+    #
+    # Asserting `== f'~/.claude/projects/{sr.encode_cwd(cwd)}'` instead would
+    # be a character-for-character restatement of the one-line implementation
+    # — it could not fail while the implementation keeps that shape, so it
+    # would pin nothing. That is the same self-consistency trap task 3272
+    # calls out for fixtures built with the encoder under test.
+    assert (
+        sr.transcript_path_for_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12')
+        == '~/.claude/projects/-home-leo-src-dark-factory--eval-worktrees-df-task-12'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Step-5: single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
@@ -547,6 +682,134 @@ def test_set_manual_boost_persists(tmp_path: Path) -> None:
     assert reread.manual_boost == 3
 
 
+def test_set_decision_escalations_dir_persists_normalized(tmp_path: Path) -> None:
+    """The back-fill's writer (task 3640) normalizes ON THE WAY IN.
+
+    A non-canonical spelling passed by a caller must not be stored raw: the
+    reaper's axis-2 guard compares stored-value against reaper-value, and a
+    dotted/trailing-slash spelling stored verbatim would compare unequal to
+    the very queue it names -- the fail-open direction, so the record would
+    silently never close again. Normalizing here means every writer of this
+    field (write-decision, the back-fill) stores ONE spelling.
+    """
+    rec = _make_decision(id='dec-setescdir')
+    sr.write_decision(rec, root=tmp_path)
+    queue = tmp_path / 'escalations'
+    queue.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'escalations') + '/'
+    assert dotted != str(queue)
+
+    updated = sr.set_decision_escalations_dir(rec.id, dotted, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.normalize_escalations_dir(queue)
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(queue)
+
+
+def test_set_decision_escalations_dir_stores_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The composition that matters: sentinel in, sentinel on disk.
+
+    This is the one path the back-fill uses for every record whose owning
+    queue it could not determine. If the writer's normalize step turned the
+    sentinel into a cwd-relative path (the bug fixed in step-2), the live
+    fleet would end up with hundreds of records stamped
+    '/home/leo/src/dark-factory/.worktrees/3640/<unknown>' -- a value that
+    both lies about the record and varies with whoever ran the migration.
+    Running under chdir pins that the stored value is cwd-INdependent.
+    """
+    monkeypatch.chdir(tmp_path)
+    rec = _make_decision(id='dec-setescdir-unknown')
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.UNKNOWN_QUEUE
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.UNKNOWN_QUEUE
+
+
+def test_set_decision_escalations_dir_preserves_every_other_field(tmp_path: Path) -> None:
+    """A read-modify-write must modify exactly ONE field.
+
+    write_decision rewrites the whole file, so a dropped/defaulted field in
+    the round-trip is silent data loss -- and the back-fill runs this over the
+    entire open cockpit population at once, where losing e.g. `options` or
+    `manual_boost` would quietly degrade real human gates. _make_decision
+    gives every field a distinguishable value precisely so this can catch it.
+    """
+    rec = _make_decision(id='dec-setescdir-preserve', state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread == dataclasses.replace(rec, escalations_dir=sr.UNKNOWN_QUEUE)
+    # Spelled out as well as compared wholesale, so a failure names the field.
+    assert reread.state == sr.DecisionState.OPEN
+    assert reread.manual_boost == rec.manual_boost
+    assert reread.severity == rec.severity
+    assert reread.escalation_id == rec.escalation_id
+    assert reread.session_id == rec.session_id
+    assert reread.task_id == rec.task_id
+    assert reread.options == rec.options
+    assert reread.text == rec.text
+    assert reread.filed_at == rec.filed_at
+    assert reread.project == rec.project
+
+
+def test_set_decision_escalations_dir_fail_soft_on_unknown_id(tmp_path: Path) -> None:
+    """Same fail-soft contract as its two siblings: None, never a raise.
+
+    The back-fill reads the whole decision list and then writes each id back;
+    a record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+    """
+    assert sr.set_decision_escalations_dir('no-such-id', '/tmp/q', root=tmp_path) is None
+
+
+def test_set_decision_escalations_dir_fail_soft_on_corrupt_body(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt on-disk body returns None (logged at ERROR), not a traceback."""
+    corrupt_path = sr.decision_path_for_id('dec-setescdir-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.set_decision_escalations_dir('dec-setescdir-corrupt', '/tmp/q', root=tmp_path)
+
+    assert result is None
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_set_decision_escalations_dir_is_repeatable(tmp_path: Path) -> None:
+    """Called twice on the same id it simply succeeds twice (last write wins).
+
+    The back-fill is re-runnable by design, and the lock is a stable sidecar
+    the first call creates -- so a second call must not trip over its own
+    lock file. The locking contract itself is covered by TestDecisionIdLock;
+    this only pins that repeated calls compose.
+    """
+    rec = _make_decision(id='dec-setescdir-twice')
+    sr.write_decision(rec, root=tmp_path)
+
+    first = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+    second = sr.set_decision_escalations_dir(rec.id, tmp_path / 'q', root=tmp_path)
+
+    assert first is not None
+    assert second is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(tmp_path / 'q')
+
+
 def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
     """Distinct <id>.json paths are the whole isolation guarantee: writing or
     updating one decision must never touch another's file (no global index,
@@ -613,7 +876,7 @@ def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
-def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
+def test_all_decision_setters_fail_soft_when_lock_acquisition_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -625,6 +888,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     Regression guard for the `with decision_id_lock(...)` placement: if it
     were ever moved outside (or above) the helpers' existing try/except, this
     would start raising instead of returning None.
+
+    Covers ALL THREE writers, including task 3640's set_decision_escalations_dir
+    -- the back-fill iterates the whole live decision population, so a single
+    unabsorbed lock fault there would abort a migration mid-way and leave it
+    half-stamped.
     """
     rec = _make_decision(id='dec-lockfault', state=sr.DecisionState.OPEN, manual_boost=0)
     sr.write_decision(rec, root=tmp_path)
@@ -639,9 +907,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     with caplog.at_level(logging.ERROR):
         state_result = sr.update_decision_state('dec-lockfault', sr.DecisionState.ANSWERED, root=tmp_path)
         boost_result = sr.set_manual_boost('dec-lockfault', 5, root=tmp_path)
+        stamp_result = sr.set_decision_escalations_dir('dec-lockfault', '/tmp/q', root=tmp_path)
 
     assert state_result is None
     assert boost_result is None
+    assert stamp_result is None
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
@@ -712,8 +982,14 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state and set_manual_boost must each acquire
-    decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    must EACH acquire decision_id_lock for the correct decision id.
+
+    One case per public helper, deliberately, even though all three now share
+    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
+    that grows its own body (or a wrapper that mutates before delegating)
+    would slip past a single shared-implementation test. TestDecisionIdLock
+    covers the lock primitive itself; these cover its ADOPTION.
     """
 
     def test_update_decision_state_acquires_lock_for_decision_id(
@@ -757,6 +1033,36 @@ class TestDecisionHelpersAdoptLock:
         sr.set_manual_boost('dec-spy-2', 5, root=tmp_path)
 
         assert 'dec-spy-2' in acquired, f'Expected lock acquisition for dec-spy-2; got {acquired}'
+
+    def test_set_decision_escalations_dir_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The queue-stamp setter is the THIRD writer on a decision id.
+
+        Its docstring makes the lock the central claim -- the task-3640
+        back-fill runs against live records while the C8 watchers and the
+        cockpit are up, so an unserialized read-modify-write here would drop
+        a concurrent state transition. Without this spy, deleting the
+        `with decision_id_lock(...)` span would leave every other test in the
+        suite green.
+        """
+        rec = _make_decision(id='dec-spy-3', escalations_dir='')
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.set_decision_escalations_dir('dec-spy-3', '/tmp/some-queue', root=tmp_path)
+
+        assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
 
 @pytest.mark.timeout(30)
@@ -2797,6 +3103,64 @@ def test_main_write_decision_severity_defaults_empty(
     assert listed[0].severity == ''
 
 
+def test_main_write_decision_stamps_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A watcher stamps the queue its --escalation-id belongs to, so the
+    fleet-global decision can later be joined back to the right per-queue
+    escalation-id namespace (task 3528). The verb must store the NORMALIZED
+    form, not the raw argv string: a watcher invoking with a relative/dotted
+    spelling must still match a reaper passing the absolute one.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    recon = tmp_path / 'recon'
+    recon.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'recon') + '/'
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-q',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalation-id',
+            'esc-1',
+            '--escalations-dir',
+            dotted,
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert Path(listed[0].escalations_dir).is_absolute()
+
+
+def test_main_write_decision_escalations_dir_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Omitting --escalations-dir yields '' on the filed record: the flag is
+    optional, and a queue-less record keeps today's project-only-scoped
+    reaper behaviour (mirrors --severity's default at
+    test_main_write_decision_severity_defaults_empty).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == ''
+
+
 def test_main_write_decision_prints_filed_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2861,6 +3225,127 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
 # ---------------------------------------------------------------------------
 # Step-6: decision reaper (C8 close-on-resolve)
 # ---------------------------------------------------------------------------
+
+
+def test_normalize_escalations_dir_makes_a_relative_path_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queue passed relative to the watcher's cwd must be stored/compared as
+    an absolute path, so a reaper invoked from a different cwd still matches.
+    """
+    (tmp_path / 'esc').mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert sr.normalize_escalations_dir('esc') == str((tmp_path / 'esc').resolve())
+
+
+def test_normalize_escalations_dir_collapses_equivalent_spellings(tmp_path: Path) -> None:
+    """The whole point of the helper: two spellings of the SAME queue dir must
+    produce ONE identical string, so the reaper's queue guard compares equal
+    for a decision stamped via a dotted/trailing-slash spelling.
+    """
+    esc = tmp_path / 'esc'
+    esc.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'esc') + '/'
+
+    assert sr.normalize_escalations_dir(dotted) == sr.normalize_escalations_dir(esc)
+
+
+def test_normalize_escalations_dir_empty_and_blank_are_the_unset_sentinel() -> None:
+    """'' means "unset/legacy" and is never a path; a whitespace-only value
+    from a sloppy shell interpolation must collapse to the same sentinel
+    rather than normalizing to the cwd.
+    """
+    assert sr.normalize_escalations_dir('') == ''
+    assert sr.normalize_escalations_dir('   ') == ''
+    assert sr.normalize_escalations_dir('\t\n') == ''
+
+
+def test_normalize_escalations_dir_expands_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Watchers write queue paths as ~/... in SKILL.md snippets; those must
+    expand, or a stamped record would never match a reaper's absolute path.
+    """
+    monkeypatch.setenv('HOME', str(tmp_path))
+
+    assert sr.normalize_escalations_dir('~/data/escalations') == str(
+        (tmp_path / 'data' / 'escalations').resolve()
+    )
+
+
+def test_normalize_escalations_dir_nonexistent_dir_still_normalizes(tmp_path: Path) -> None:
+    """Path.resolve() is non-strict in Python 3.11+: a well-formed queue path
+    that does not exist yet (a project checked out but never escalated, or a
+    record migrated between machines) still normalizes rather than faulting.
+    """
+    missing = tmp_path / 'never' / 'created'
+
+    assert sr.normalize_escalations_dir(missing) == str(missing)
+
+
+def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
+    """Fail-soft, matching the module's contract for helpers a C8 watch loop
+    calls directly: a value the OS cannot resolve (embedded NUL) degrades to
+    the raw string instead of raising into the caller. The raw string simply
+    won't match any real queue, which is the fail-OPEN direction.
+    """
+    assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
+
+
+def test_unknown_queue_sentinel_is_distinguishable_from_the_unset_sentinel() -> None:
+    """UNKNOWN_QUEUE is a THIRD queue state (task 3640), not a respelling of ''.
+
+    '' means "nobody told us" (legacy/unset -- the reaper falls back to
+    project-only scoping and MAY close the record). UNKNOWN_QUEUE means "we
+    investigated and could not determine the owning queue" -- the reaper must
+    refuse to close it. Collapsing the two would silently hand every
+    back-filled undeterminable record back to the false-closure hazard task
+    3528 exists to remove, so the values must never compare equal, and the
+    sentinel must be TRUTHY (the reaper's axis-2 guard is gated on
+    `if decision_dir and ...`).
+
+    The angle brackets are load-bearing, not decoration: a resolved queue path
+    always begins with '/', so a real queue and this sentinel can never
+    collide no matter what a project is named.
+    """
+    assert sr.UNKNOWN_QUEUE
+    assert sr.UNKNOWN_QUEUE != ''
+    assert not sr.UNKNOWN_QUEUE.startswith('/')
+
+
+def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE RED DRIVER (task 3640): the sentinel must round-trip unchanged.
+
+    Without a special case, `'<unknown>'` is a bare word and falls through to
+    `Path(raw).expanduser().resolve()`, which resolves it RELATIVE TO THE
+    CALLING PROCESS'S CWD -- so the same record normalizes to
+    `<cwd-A>/<unknown>` in the back-fill script and `<cwd-B>/<unknown>` in a
+    watcher's reaper. A stamp whose value depends on who reads it is not a
+    contract at all: the two would never compare equal, and worse, whichever
+    accidental absolute path got STORED would be an outright lie about where
+    the record's escalation lives.
+
+    Asserting under two different cwds is the point -- a single call would
+    pass against a buggy implementation that merely happened to be invoked
+    from the right directory.
+    """
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+
+    monkeypatch.chdir(tmp_path / 'a')
+    from_a = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+    monkeypatch.chdir(tmp_path / 'b')
+    from_b = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+
+    assert from_a == sr.UNKNOWN_QUEUE
+    assert from_b == sr.UNKNOWN_QUEUE
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -3093,6 +3578,352 @@ def test_main_reap_decisions_scopes_to_project(
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
 
 
+def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
+    """Build the observed two-queue collision on disk (task 3528).
+
+    dark_factory runs TWO escalation queues over ONE ``esc-<taskid>-<n>`` id
+    namespace: the orchestrator's ``data/escalations`` and the reconciliation
+    watcher's ``data/reconciliation/escalations``. Here that is `orch` and
+    `recon`, both holding an *unrelated* escalation that happens to share the
+    id ``esc-3036-1`` -- RESOLVED (archived) in `orch`, still PENDING (queue
+    root) in `recon`, exactly as observed when a blocking recon gate sat
+    invisible in the cockpit for ~7 days.
+
+    Reuses the layout pinned by test_read_escalation_status_reads_queue_root_file
+    / ..._falls_back_to_archive: queue-root file = pending, dated
+    ``archive/YYYY-MM-DD/`` file = resolved.
+    """
+    orch = tmp_path / 'orch'
+    recon = tmp_path / 'recon'
+    orch_archive = orch / 'archive' / '2026-07-26'
+    orch_archive.mkdir(parents=True)
+    recon.mkdir(parents=True)
+    (orch_archive / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    (recon / 'esc-3036-1.json').write_text(json.dumps({'status': 'pending'}))
+    return orch, recon
+
+
+def test_main_reap_decisions_does_not_close_across_queues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3528), cases (a) + (d) in ONE reaper run.
+
+    (a) A decision stamped with the `recon` queue must NOT be closed by a
+    reaper scanning the `orch` queue, even though `orch` holds a RESOLVED
+    escalation with the same id -- they are unrelated escalations that merely
+    collide in the shared id namespace. Before this fix the join was scoped
+    on project alone, so this decision closed to ANSWERED and vanished from
+    the cockpit queue while its own escalation was still PENDING.
+
+    (d) In the SAME run, a queue-less (pre-change, escalations_dir='')
+    decision on the SAME escalation id still closes exactly as before -- so
+    one invocation proves the new guard is both blocking (a) and backward-
+    compatible (d), and that the only thing distinguishing them is the queue
+    stamp.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-recon-gate',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(recon),
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-queueless',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-recon-gate'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-queueless'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_does_not_close_across_queues_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (b): the guard is symmetric. A decision stamped with the `orch`
+    queue is equally protected from the recon watcher's reaper, which scans
+    `recon` and finds a RESOLVED escalation of the same id there. Neither
+    watcher is privileged; either one reaping the other's decisions is the
+    same bug.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    recon_archive = recon / 'archive' / '2026-07-26'
+    recon_archive.mkdir(parents=True)
+    (recon_archive / 'esc-mirror.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-gate',
+            project='df',
+            escalation_id='esc-mirror',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(recon)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-gate'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_same_queue_still_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (c): the guard must not over-block. A decision stamped with the
+    SAME queue the reaper is scanning still closes on its escalation's
+    terminal status -- otherwise queue-scoping would quietly turn the reaper
+    into a permanent no-op and every decision would need manual closure.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-same-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-same-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_queue_match_is_spelling_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e): the comparison normalizes BOTH sides, rather than doing a raw
+    string compare of whatever each side happened to store.
+
+    The decision here carries a dotted, trailing-slash spelling of the `orch`
+    queue -- what a hand-repaired record, a future writer, or a record
+    migrated between checkouts can hold, since it bypassed write-decision's
+    write-time normalization. A raw compare would treat it as a foreign
+    queue and fail OPEN forever; worse, the same laxness in reverse is how a
+    false NON-match would reintroduce silent divergence between writer and
+    reaper.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    dotted = str(orch.parent / 'x' / '..' / orch.name) + '/'
+    assert dotted != str(orch)
+    sr.write_decision(
+        _make_decision(
+            id='dec-dotted-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=dotted,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-dotted-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_normalizes_the_reapers_own_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e) MIRRORED: the REAPER's side of the compare is normalized too.
+
+    ..._queue_match_is_spelling_insensitive only exercises the DECISION side
+    -- it stores a dotted spelling and passes the already-canonical
+    ``str(orch)`` to the CLI, so the reaper-side normalize is a no-op there.
+    Here it is the other way round: the record carries the canonical form and
+    the CLI is handed a relative, dotted spelling of the same queue.
+
+    This is the real invocation shape, not a contrivance. Both SKILL.md files
+    now promise "stored normalized, so any spelling of the same directory
+    works", and the recon watcher's documented command is
+    ``--escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations``
+    where ``$DARK_FACTORY_ROOT`` may legitimately be relative or symlinked.
+    Drop the reaper-side normalize and EVERY stamped decision becomes a
+    permanent no-close -- fail-open, so invisible: nothing errors, decisions
+    just quietly stop closing. Running under monkeypatch.chdir also pins that
+    the reaper side resolves against the cwd, matching
+    normalize_escalations_dir's documented expanduser/resolve contract.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    monkeypatch.chdir(tmp_path)
+    relative = f'x/../{orch.name}/'
+    assert not Path(relative).is_absolute()
+    sr.write_decision(
+        _make_decision(
+            id='dec-canonical-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', relative])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canonical-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_stamped_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pins the acknowledged MODE-2 tradeoff (task 3528, raised in review).
+
+    A MODE-2 same-subject duplicate (esc-5914-1) collapses to ONE record by
+    design -- but ``escalations_dir`` is single-valued and write_decision
+    rewrites the whole file, so the survivor carries only the LAST filer's
+    queue (pinned by ..._same_id_from_two_queues_stays_one_decision). The
+    axis-2 guard then makes the OTHER queue's reaper skip it outright.
+
+    So if the escalation that actually reaches a terminal status is the one
+    in the NON-stamped queue -- entirely possible for two independently-filed
+    escalations covering the same gate -- the decision now stays OPEN and
+    needs human closure, where before this change either reaper would have
+    closed it. That is a real behaviour change for the MODE-2 population,
+    accepted because it is the fail-OPEN direction: an over-held decision is
+    a visible, human-triageable cockpit row, while a falsely closed one is
+    invisible (the ~7-day loss this task exists to prevent). Pinned here so
+    the tradeoff is explicit rather than latent; documented on
+    _run_reap_decisions and in the recon watcher's MODE-2 bullet.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    # The same gate is filed as a separate escalation in each queue; only the
+    # orchestrator's copy has resolved.
+    (orch / 'archive' / '2026-07-26' / 'esc-5914-1.json').write_text(
+        json.dumps({'status': 'resolved'})
+    )
+    (recon / 'esc-5914-1.json').write_text(json.dumps({'status': 'pending'}))
+    for queue in (orch, recon):  # two watchers, one collapsed record; recon files last
+        assert (
+            sr.main(
+                [
+                    'write-decision',
+                    '--id',
+                    'esc-5914-1',
+                    '--project',
+                    'df',
+                    '--text',
+                    'Adopt the reify plan?',
+                    '--escalation-id',
+                    'esc-5914-1',
+                    '--escalations-dir',
+                    str(queue),
+                ]
+            )
+            == 0
+        )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['esc-5914-1'] == sr.DecisionState.OPEN
+
+
+def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (f): MODE-2 same-subject collapse (task 3528 ADDENDUM, req. (b)).
+
+    Two collision modes must be kept apart. MODE 1 (esc-3036-1, the cases
+    above) is two UNRELATED escalations sharing an id -- cross-queue closing
+    there is a straight bug. MODE 2 (observed: esc-5914-1) is both queues
+    surfacing the SAME underlying human gate; those must collapse to ONE
+    cockpit decision, because a human asked the same question twice is a
+    regression of its own.
+
+    This design satisfies MODE 2 BY CONSTRUCTION: the queue is recorded as a
+    FIELD on the record and the decision id is left untouched, so a second
+    watcher filing the same question lands on the same id. This case passes
+    both before and after the fix by design -- it is the guard that a future
+    refactor to per-queue decision ids ('recon:esc-5914-1' vs
+    'orch:esc-5914-1') would double-file the same question and must not be
+    adopted. Complements test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    which pins the same-queue restart case.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(orch),
+        ]
+    )
+    rc2 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(recon),
+        ]
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    # The discriminator is a FIELD holding a normalized queue path, never a
+    # namespace prefix baked into the id.
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert listed[0].id == 'esc-5914-1'
+
+
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3120,3 +3951,109 @@ def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_refuses_unknown_queue_but_still_closes_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """REGRESSION GUARD, not a RED driver (task 3640) -- and deliberately so.
+
+    Probed against the merged 3528 code before this test was written: a
+    decision stamped with ANY truthy non-matching value already survives the
+    axis-2 `if decision_dir and decision_dir != reaper_dir` compare, so an
+    UNKNOWN_QUEUE stamp is ALREADY safe today. A test asserting "the reaper
+    closes unknown-stamped records" would therefore be doomed-green and could
+    never drive an implementation. What this pins instead is that the safety
+    SURVIVES: it is currently an accident of string inequality, and a future
+    simplification of that compare (or of the explicit by-name guard step-2
+    adds) would silently make every back-filled undeterminable record closable
+    again, restoring the exact ~7-day invisible-close failure 3528 removed.
+
+    Both arms run in ONE reaper invocation against a queue holding a RESOLVED
+    escalation with the shared id, so the ONLY thing distinguishing them is
+    the queue stamp:
+      - the UNKNOWN_QUEUE-stamped record stays OPEN (refuse, never default to
+        close -- it stays a visible cockpit row for human closure);
+      - the legacy `escalations_dir=''` record on the SAME id still closes to
+        ANSWERED. That second assertion is the load-bearing one: task 3640
+        must NOT redefine '' under the human. '' keeps its 3528 meaning
+        (fall back to project-only scoping); the back-fill DRAINS that
+        population instead of changing what it means.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-unset',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-queue'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-unset'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The degenerate case the string-inequality compare alone does NOT cover.
+
+    If a reaper is invoked with the sentinel as its own ``--escalations-dir``
+    (an operator copy-pasting a stamped value out of a record, or a wrapper
+    threading the field straight through), then `decision_dir == reaper_dir`
+    and the axis-2 guard does not fire at all. Today the record still survives
+    only because read_escalation_status finds no queue at that bogus path and
+    returns None -- safety by lucky accident, one directory named
+    ``<unknown>`` away from failing. Step-2's explicit by-name guard is what
+    makes the refusal intentional, and this pins it.
+
+    Note the sentinel must reach the record VERBATIM for this to be a real
+    test, which is exactly what step-2's normalize_escalations_dir case
+    guarantees.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    # A real directory literally named '<unknown>', holding a RESOLVED
+    # escalation for the shared id -- so a reaper that resolved the sentinel
+    # as a relative path WOULD find a close-worthy status there.
+    monkeypatch.chdir(tmp_path)
+    bogus = tmp_path / sr.UNKNOWN_QUEUE
+    bogus.mkdir()
+    (bogus / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    assert (orch / 'archive' / '2026-07-26' / 'esc-3036-1.json').is_file()
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-selfmatch',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', sr.UNKNOWN_QUEUE])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN

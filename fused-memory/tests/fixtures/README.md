@@ -336,3 +336,302 @@ re-derivable only against a live store; the curator-gate 20 are not.
   since the calibration session. They are kept deliberately: their
   content hashes are still valid, so they exercise the hash-primary /
   id-fallback matcher on real decay rather than on a synthetic case.
+
+---
+
+## `transcript_corpus/`
+
+A miniature **agent-transcript archive** for the retro replay-corpus
+extractor (`docs/prds/memory-eval-program.md` §5 leaf θ, decision D9, task
+3214). Consumed by `fused-memory/scripts/memory_eval_transcript_corpus.py`
+(via `--archive-root` and `--transcript`) and asserted end-to-end in
+`fused-memory/tests/test_memory_eval_transcript_corpus.py`.
+
+Unlike the two fixtures above this one is a directory of JSONL files, not a
+single file: the extractor's provenance parsing reads task/session/subagent
+identity **out of the path**, so a flat fixture could not exercise it.
+
+### Purpose
+
+The fixture is the committed, reviewable stand-in for the live archive at
+`<main-checkout>/data/orchestrator/agent-transcripts/` — untracked runtime
+state that exists on one machine, cannot be committed, and grows under the
+fleet. It is a hand-written miniature of the record **shapes** measured
+there, deliberately **not** a pasted real transcript: a real one carries
+incidental session content that would drift, bloat the diff, and make a
+failure hard to read.
+
+Its round-trip is one half of the capability manifest's
+`coverage-report-discloses-failures` check
+(`docs/prds/memory-eval-program.capability-manifest.yaml`); the other half is
+an all-unparseable-input case, which is built in a temp dir because a
+deliberately-corrupt transcript is not something to commit.
+
+### Layout
+
+Mirrors the two path shapes `shared/src/shared/transcript_archive.py`
+writes:
+
+```
+transcript_corpus/
+└── 4242/                                            # <task_id>
+    └── -home-leo-src-dark-factory--worktrees-4242/  # <encoded cwd>
+        ├── 11111111-…-555555555555.jsonl            # main session
+        └── 11111111-…-555555555555/
+            └── subagents/
+                └── agent-abc123def4567890.jsonl     # subagent session
+```
+
+Task id, session id, `is_subagent` and the subagent id are all recovered
+from these path components — never from the record bodies — so renaming a
+directory changes what the extractor reports.
+
+**Why plain `.jsonl` and not the live archive's `.jsonl.gz`.** The
+extractor accepts both suffixes (`scan_archive` globs `*.jsonl.gz` and
+`*.jsonl`; `load_transcript` / `iter_json_lines` pick the reader off the
+suffix), so the committed copy is uncompressed for two reasons. First,
+`.gz` is a binary blob: a fixture whose whole value is that its authored
+facts are *reviewable* must be readable in a diff, and the line-by-line
+table below is only auditable against a plain file. Second, the
+`gz` extension is absent from the α/γ lock-charter extension allowlist
+(`shared/src/shared/locking.py::CODE_EXTENSIONS`, mirrored in
+`fused_memory.middleware.lock_charter_guard` and reify's
+`scripts/lock-charter-guard.sh`), so committing a tracked `.gz` fails
+`fused-memory/tests/test_lock_charter_guard.py
+::test_every_tracked_extension_is_allowlisted` — widening that vector is a
+coordinated cross-repo change (α leads, γ mirrors) that this fixture does
+not need. The **gzip** read path is still covered end to end: every
+archive-scan test writes real gzipped transcripts into a temp tree
+(`_write_transcript`), including the corrupt-gz and partially-written
+cases.
+
+### What each line exercises
+
+The main transcript is 9 physical lines yielding 7 records; the two missing
+ones are the point:
+
+| line | record | exercises |
+|---|---|---|
+| 1 | `{"type": "queue-operation", …}` | a non-message record interleaved mid-session — must be skipped, not crashed on |
+| 2 | first `user` record | the briefing **Agent Identity** line, `agent_id:** ` + backticked `claude-task-4242-architect` — the only place caller identity is recoverable (see below) |
+| 3 | *(blank)* | reader-level skip — **not** a parse failure |
+| 4 | `{"type": "user", "message": {broken` | corrupt JSON — reader-level skip, **not** a parse failure. A fire-and-forget writer can truncate its last line; that must not lose the whole file, and must not inflate `parse_failures` (which counts unreadable **files**) |
+| 5 | `assistant` + `tool_use` | an `mcp__fused-memory__search` call: `input.query` / `project_id` / `limit` |
+| 6 | `user` + `tool_result` | its answer — `content` is a JSON **string** decoding to `{"results": [...]}`, two results at **distinct** `relevance_score`s so rank order is observable |
+| 7 | `{"type": "queue-operation", …}` | a second interleaved skip, *between* a search and its successor |
+| 8 | `assistant` + two `tool_use` | `Read` and `mcp__fused-memory__add_memory` — non-search tools that must contribute **nothing** |
+| 9 | `assistant` + `tool_use` | a second search with **no** matching `tool_result` anywhere: the truncated-transcript case, which must be emitted with `result_status: "missing"` rather than dropped |
+
+The subagent transcript is 3 records: a briefing whose agent_id
+(`claude-task-4242-code-reviewer`) has a **hyphenated role**, plus one
+answered search. Its records also carry `isSidechain` / `agentId` /
+`gitBranch`, mirroring the live shape — the extractor ignores them and
+derives `is_subagent` from the path, so the fixture keeps them available for
+a future cross-check without asserting one today.
+
+### The `caller` name collision
+
+Every search `tool_use` block in the fixture carries its own
+`"caller": {"type": "direct"}`, exactly as the live archive does. That is a
+Claude Code harness field, uniform across every measured call, and it is
+**not** agent identity — it is reproduced here precisely so the extractor is
+tested against the collision. The corpus record's `caller` field means *who
+issued the search*, recovered from the briefing text on line 2.
+
+### Record schema
+
+Unlike the two fixtures above, this fixture's own records are *transcripts*
+(shapes tabulated under "What each line exercises"). The schema worth stating
+here is the one the round-trip **produces** from them — the corpus record. The
+normative definition, field by field, lives in the extractor's module
+docstring (`fused-memory/scripts/memory_eval_transcript_corpus.py`, "Record
+schema"); this is the reader's-digest version, kept here because the
+round-trip test asserts against it.
+
+One JSON object per line, keys sorted:
+
+| field | meaning |
+|---|---|
+| `schema_version` | `SCHEMA_VERSION`, stamped per **record** (not in a header) so a consumer reading one line still knows what it holds. |
+| `transcript` | Archive-**relative** posix path (in `--transcript` mode, the bare file name), so the corpus is portable across machines. |
+| `task_id`, `session_id`, `is_subagent`, `subagent_id` | All derived from the archive **path** by `parse_archive_path` — never from record bodies. This is why the fixture must be a directory tree. |
+| `tool_use_id` | Correlates the `tool_use` call to its later `tool_result` answer. |
+| `tool_name` | The matched tool. A frozenset, widenable via `--tool-name`, because the archive spans months of tool-name history. |
+| `query` | `input.query`, lifted out so it stays greppable. |
+| `params` | Everything else that was passed (`project_id`, `limit`, …). |
+| `caller` | `{agent_id, task_id, role}` — *who issued the search*, from the briefing's Agent Identity line. **Not** the `tool_use` block's own `caller` key (see above). Its nested `task_id` is who the agent thinks it is; the top-level `task_id` is how the archive filed it — keeping both makes a disagreement visible. |
+| `result_status` | `ok` \| `error` \| `unparsed` \| `missing`. Only `ok` measures the store; the rest are gaps in the instrument, kept distinct from a genuine zero-hit search (`ok` with `result_count == 0`) so a decoding bug cannot read as a recall collapse. Line 9 of the main transcript pins `missing`. |
+| `result_count` | `len(results)`. |
+| `results[]` | `{rank, id, score, source_store, category, content_chars}`. `rank` is 1-based and positional — the order the agent **saw**. `content_chars` is a **length, never the text**: the corpus records what was retrieved and how well it scored, and copying result bodies would duplicate the live store into a gitignored file that stales the moment a memory is edited. Look the `id` up if you need text. |
+
+A run writes three artifacts (named here in text because the lock-charter file
+lint's extension allowlist has no `jsonl` entry, so they cannot be declared in
+`metadata.files`):
+
+```
+fused-memory/data/memory-evals/transcript-corpus/corpus-<STAMP>.jsonl
+fused-memory/data/memory-evals/transcript-corpus/coverage-<STAMP>.json
+fused-memory/data/memory-evals/transcript-corpus/report-<STAMP>.txt
+```
+
+`fused-memory/data/` is gitignored, so no run dirties a diff — and no artifact
+is committed. Declared consumers: PRD leaf η's **write-after-miss validation
+set**; **operators** reading `report-<STAMP>.txt` for how much of the archive a
+run covered and what it could not read; and future **E3 / E8 runners** and the
+**shadow-replay harness**, which need a fixed, re-runnable set of historical
+queries. Scope boundary (PRD §7): this leaf produces the corpus **only** — no
+shadow-replay harness, no E3 golden query set, no E8 re-derivation audit, and
+no write or mutation of the live memory corpus.
+
+### Regenerating
+
+The two `.jsonl` files are plain text and hand-authored (< 1 KB each) —
+edit them directly, no decompress/recompress step. Keep them uncompressed:
+see "Why plain `.jsonl` and not the live archive's `.jsonl.gz`" above.
+Changing a query, an id, or a score will fail the round-trip test by
+design — the test asserts the fixture's authored facts verbatim, which is
+what makes it a fixture rather than a smoke test.
+
+---
+
+## `e2_arm_claims.jsonl`, `e2_query_set.jsonl`, `e2_distractor_slab.jsonl`
+
+The three fixtures the **E2 storage-shape bake-off** (task 3199,
+`scripts/bake_off_storage_shape.py`, PRD `memory-metadata-vocabulary.md`
+leaf ζ / D9) is run over. They are documented together because they are
+one experiment's controlled inputs and are only meaningful as a set.
+
+E2 materialises the *same* knowledge in three storage shapes —
+`status_quo` / `c_peers` / `b_grouped`, each × the 3111 topic-anchor pin
+on or off — into seeded ephemeral collections, queries all of them with
+one shared query set, and emits a per-arm decision table to
+`plans/e2-storage-shape-bakeoff-report.{json,md}`.
+
+All three are **frozen**: this is what makes the experiment controlled
+and rerunnable (eval-design §5 E2, *"Drift: none — frozen fixture"*).
+Regenerating one silently would invalidate comparison against any report
+already committed.
+
+### Blind-authoring protocol (resolves PRD §10's open question)
+
+The eval doc names E2's own biggest weakness: *"arm quality reflects
+authoring skill — the experiment is gameable by authoring one arm well
+and another lazily."* PRD §10 left the mitigation open (two-agent
+cross-check vs single-author-blind-to-metrics).
+
+Resolved here as **single-author-blind-to-metrics, mechanized by commit
+ordering**: `e2_arm_claims.jsonl` (`2e365d5435`) and `e2_query_set.jsonl`
+(`600fd8441b`) were authored and committed as *prerequisites*, before a
+single metric function existed in `scripts/bake_off_storage_shape.py` —
+which at those commits was a docstring-only stub (`b1100b1856`). **Git
+history is the audit trail**: it proves no metric code was in the tree
+when the arms were decomposed, so the arms cannot have been tuned toward
+a number. The report records these SHAs.
+
+The anti-laziness floor is **claim-coverage parity** — every claim id
+must be realizable in every arm, asserted mechanically by the bake-off.
+It is deliberately **not** total-content-length parity: arm (a)'s long
+originals versus arm (c)'s short peers differ *by construction*, and that
+difference IS the tokens-per-query metric (D4). Asserting it away would
+delete the result.
+
+### Record schema
+
+`e2_arm_claims.jsonl` — 176 rows, the editorial decomposition of each
+cluster into short single-claim peers:
+
+| field | meaning |
+|---|---|
+| `claim_id` | `<topic>-NN`, contiguous per cluster |
+| `cluster_id` | the α cluster this claim was decomposed from |
+| `topic` | taken **verbatim** from the E1 registry entry whose `provenance.cluster_id` matches (PRD D4: one namespace — no slug is invented here) |
+| `text` | the short single-claim peer body (80–400 chars) |
+| `source_memory_id` | which original α record carries this claim; always a record of its **own** cluster. This is what makes claim-coverage parity checkable for the `status_quo` arm |
+| `canonical` | exactly one `true` per cluster — the short index claim |
+| `b_arm_role` | `canonical`, or a `KIND_REGISTRY` member (`amendment` 122, `sighting` 34) used as the `kind` of a `b_grouped` child |
+| `contested` | 18 rows, concentrated in the two `pseudo_contradiction` clusters — the data pinning PRD V2's *"a contested child is NEVER suppressed"* |
+
+`e2_query_set.jsonl` — 236 rows:
+
+| field | meaning |
+|---|---|
+| `query_id` | `<topic>-pNN` for a phrasing, `<claim_id>-q` for a claim query |
+| `kind` | `topic_phrasing` (60) or `claim` (176) |
+| `text` | the query as typed |
+| `topic`, `cluster_id` | the target topic and its cluster |
+| `expects_claim_ids` | the topic's canonical claim for a phrasing; the single targeted claim for a claim query |
+| `held_out` | 20 rows — one per topic, inherited from the registry |
+
+`e2_distractor_slab.jsonl` — 300 rows, `{distractor_id, content,
+category}` only. A distractor carries **no** vocabulary metadata key
+(`topic`, `canonical`, `kind`, `parent_id`, `supersedes`) — by
+construction it must never be topic-anchorable, or it would stop being a
+distractor.
+
+### Derivation provenance
+
+**Claims** — decomposed from the 20 curator-gate clusters of the
+charter-locked `write_triage_calibration.jsonl`, read **read-only**
+(`shared/tests/test_locking.py:122`,
+`tests/test_lock_charter_guard.py:191`). Topic slugs come read-only from
+`memory_eval_topic_registry.json`, whose 20 curator-gate cluster ids
+overlap the α fixture 20/20. Claim counts per cluster are 4–20, scaled to
+the canonical's length, not equalized — see the parity note above.
+
+**Queries** — the 60 `topic_phrasing` rows are seeded **verbatim** from
+the registry's `phrasings`, so E1 and E2 share phrasings and E2 inherits
+a held-out probe per topic for free. The 176 `claim` rows are authored,
+one per claim id: that per-claim coverage is what makes claim-recall@k
+measure *"does the specific claim a query targets surface"* rather than
+mere topic proximity.
+
+Claim queries are authored as **questions, never as restatements of the
+claim**. Copying claim text into a query would hand arm (c) a trivially
+exact lexical match against its own short peers and invalidate the
+comparison. Measured on the committed file: median query-vs-claim
+`SequenceMatcher` ratio **0.090**, max **0.538** (the max falls on the
+shortest claims, where a question unavoidably shares their small
+vocabulary). Each query carries at least one discriminating specific — a
+symbol, path, flag, error string or number — so it separates from its
+topic siblings.
+
+**Distractor slab** — the realistic contamination every arm's collection
+is seeded with (eval-design §5 E2: *"seed each arm's collection with a
+realistic slab of distractor entries — worth doing, the contamination
+result today says distractors matter"*). Sampled 2026-08-01 by read-only
+Qdrant payload scroll (no embedder, no writes) of the live `fused_reify`
+and `fused_dark_factory` collections. Exact sampling parameters:
+
+- categories `observations_and_summaries` and `procedural_knowledge`
+  only (the former is 16k of the 24k live corpus per PRD §2);
+- content length 200–4000 chars, so a distractor is realistic
+  competition rather than a stub;
+- survivors sorted by point id, then an **even stride** taken per
+  (project, category) cell to the quota below — deterministic, not
+  random, so the slab is re-derivable;
+- quotas 105/105 `observations_and_summaries` and 45/45
+  `procedural_knowledge` for `dark_factory`/`reify` = **300 rows**,
+  drawn from a survivor pool of 14 622 (dark_factory 4 430 + 1 656,
+  reify 6 633 + 1 903);
+- emitted sorted by `distractor_id`.
+
+### Exclusions
+
+A candidate distractor was dropped if **any** of these held — the point
+is that no distractor may accidentally be a right answer:
+
+- its point id appears in the α fixture as a `memory_id` **or** a
+  `cluster_id`;
+- its stored `hash`, or the md5 of its content, matches an α record's
+  content; or its whitespace-normalised content equals an α record's;
+- its content contains any registry `claim_queries[].needles` string
+  (≥5 chars) — those are the exact strings E1 probes for;
+- its content contains **≥2 distinctive tokens of a single fixture
+  topic**, where distinctive tokens are that topic's slug segments of ≥4
+  chars minus a stoplist of generic ones (`task`, `test`, `main`,
+  `gate`, `only`, …). Two topic-specific tokens co-occurring is the
+  signal that a candidate is about a fixture topic rather than merely
+  sharing a common word with it.
+
+Verified on the committed file: 300/300 ids unique, zero α id or content
+overlap, zero reserved vocabulary keys present.

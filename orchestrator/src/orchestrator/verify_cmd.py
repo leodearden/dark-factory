@@ -38,6 +38,7 @@ thing to the record as it did to the decision the record reports on.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 from collections.abc import Mapping
@@ -165,10 +166,23 @@ def _split_pytest_args(rest: list[str]) -> tuple[tuple[str, ...], tuple[str, ...
 
 # Unquoted tokens that mean *raw* is doing shell control flow beyond a plain
 # left-to-right `&&` chain. `split_chain_tail` refuses to carry a tail across
-# any of them: a `||` alternative, a `;` sequence, a `|` pipe or a `( ... )`
-# subshell all make "everything after segment 0" something other than "further
-# independent commands that would have run anyway".
-_NON_AND_CHAIN_TOKENS = frozenset({'||', ';', '|', '(', ')'})
+# any of them.
+#
+# The rule, rather than a re-typed member list: EVERY chain operator except
+# `&&`, plus the two paren tokens. `&&` is the sole exclusion because a plain
+# left-to-right `&&` chain is the one shape whose tail is "further independent
+# commands that would have run anyway" — every other operator makes the tail
+# conditional on the head (`||`), merely sequenced after it (`;`), or fed by it
+# (`|`), and a `( ... )` subshell groups it into a single unit that cannot be
+# split at all. Deriving this keeps it from silently diverging when a new
+# operator joins `_CHAIN_OPERATOR_TOKENS`: a delimiter recognised there but
+# missing here would have its tail carried across control flow it was never
+# safe to cross. `frozenset` arithmetic returns a `frozenset`, so the
+# token-equality membership test below is unaffected.
+#
+# `_has_shell_grouping_or_substitution` is the character-level companion to
+# this token-equality check — see its docstring for what equality cannot see.
+_NON_AND_CHAIN_TOKENS = (_CHAIN_OPERATOR_TOKENS - {'&&'}) | {'(', ')'}
 
 
 def _has_shell_grouping_or_substitution(raw: str) -> bool:
@@ -228,27 +242,36 @@ def _has_shell_grouping_or_substitution(raw: str) -> bool:
     return False
 
 
-def split_top_level_and(raw: str) -> list[str]:
-    """Split *raw* on `&&` at shell quote depth 0, returning segments VERBATIM.
+def _unquoted_chars(raw: str) -> tuple[list[tuple[int, str]], bool]:
+    """POSIX quote/escape walk: ``(index, char)`` for every char OUTSIDE quotes.
 
-    A character-scan state machine tracking single-quote / double-quote state
-    and backslash escapes (POSIX rules, matching ``shlex.split``: a backslash
-    escapes outside quotes and inside double quotes, but is literal inside
-    single quotes). A `&&` inside quotes is an argument value — pytest's
-    ``-k 'a && b'`` is the real case — not a chain operator, so it is not a
-    split point.
+    Returns ``(chars, unterminated)``. *chars* lists every position in *raw*
+    reached with no active quote context, left to right; quote delimiters,
+    everything between them, and backslash-escaped characters are never
+    included — a caller that only needs *raw*'s STRUCTURAL surface (chain
+    operators, parens, backticks) gets quote-safety for free by scanning
+    *chars* instead of *raw* itself, without hand-rolling the quote rules
+    again. *unterminated* is True when *raw* ends inside an unclosed quote.
 
-    Segments keep every byte between separators, boundary whitespace
-    included, so ``'&&'.join(split_top_level_and(raw)) == raw`` exactly. That
-    losslessness is the point: ``split_chain_tail``'s caller re-emits the tail
-    verbatim rather than re-rendering it, and can only do so safely if the
-    decomposition consumed nothing but the separators themselves.
+    Rules match ``shlex.split``: a backslash escapes (and is consumed along
+    with) the following character outside quotes and inside double quotes;
+    inside single quotes a backslash is a plain literal with no escaping
+    power; a quote closes only on its own kind.
+
+    The shared stepping rule under both ``_scan_and_chain`` (operator/paren
+    scanning for `&&`-chain splitting) and ``_split_at_unbalanced_close``
+    (paren-depth trimming for the pytest-invocation appender) — one home for
+    the POSIX quoting rules instead of two hand-maintained copies that could
+    silently disagree. Task 3338 applied this same one-scanner principle to
+    ``_scan_and_chain``'s own strict/non-strict split; the task 3650
+    amendment extends it across both consumers, which is also what makes
+    ``_split_at_unbalanced_close`` quote-AWARE (see its docstring) rather
+    than the quote-blind first cut that shipped with this task.
     """
-    segments: list[str] = []
-    start = 0
+    chars: list[tuple[int, str]] = []
     i = 0
-    quote: str | None = None
     n = len(raw)
+    quote: str | None = None
     while i < n:
         ch = raw[i]
         if quote is None:
@@ -259,11 +282,7 @@ def split_top_level_and(raw: str) -> list[str]:
                 quote = ch
                 i += 1
                 continue
-            if ch == '&' and raw[i + 1 : i + 2] == '&':
-                segments.append(raw[start:i])
-                i += 2
-                start = i
-                continue
+            chars.append((i, ch))
             i += 1
             continue
         # Inside quotes: only a double-quote context honours backslash escapes.
@@ -273,7 +292,104 @@ def split_top_level_and(raw: str) -> list[str]:
         if ch == quote:
             quote = None
         i += 1
-    segments.append(raw[start:])
+    return chars, quote is not None
+
+
+def _scan_and_chain(raw: str, *, strict: bool) -> list[str] | None:
+    """THE `&&`-chain scanner. Splits *raw* at quote depth 0, VERBATIM.
+
+    Walks ``_unquoted_chars(raw)`` — a character-scan state machine tracking
+    single-quote / double-quote state and backslash escapes (POSIX rules,
+    matching ``shlex.split``: a backslash escapes outside quotes and inside
+    double quotes, but is literal inside single quotes). A `&&` inside quotes
+    is an argument value — pytest's ``-k 'a && b'`` is the real case — not a
+    chain operator, so it is not a split point.
+
+    Clauses keep every byte between separators, boundary whitespace included,
+    so ``'&&'.join(...) == raw`` exactly in the non-strict mode. That
+    losslessness is the point: ``split_chain_tail``'s caller re-emits the tail
+    verbatim rather than re-rendering it, and ``split_and_chain_segments``
+    emits each segment as a byte-slice — both are only safe if the
+    decomposition consumed nothing but the separators themselves.
+
+    ONE scanner with a mode flag rather than two near-copies (task 3338
+    amendment): the quoting/escaping rules it encodes are the same shell rules
+    for both callers, and two hand-maintained copies of them are two places
+    for a POSIX-quoting fix to be applied to only one.
+
+    *strict* adds what ``split_and_chain_segments`` (the EXECUTION-layer
+    caller) additionally needs, and is the ONLY mode with a refusal path:
+
+    * paren-depth tracking — an `&&` inside a balanced ``( ... )`` group is
+      NOT a split point, so the group stays one atomic clause (the committed
+      fleet chain's cockpit subshell depends on this);
+    * ``None`` on a depth-0 control operator (`;`, `|`, `||`, a lone `&`, a
+      backtick) — each makes a clause's exit status no longer the clause's
+      OWN, so running it as an independent segment would attribute a wrong rc;
+    * ``None`` on an unbalanced quote or paren — a string this cannot even
+      scan was never safely decomposable.
+
+    Non-strict mode has NO refusal path and never returns ``None``: parens,
+    backticks and control operators are ordinary characters to it, exactly as
+    they were before this scanner was unified.
+    """
+    clauses: list[str] = []
+    start = 0
+    depth = 0
+    skip_next = False
+    chars, unterminated = _unquoted_chars(raw)
+    for i, ch in chars:
+        if skip_next:
+            # The second `&` of an `&&` this loop already consumed below.
+            skip_next = False
+            continue
+        if strict and ch == '(':
+            depth += 1
+            continue
+        if strict and ch == ')':
+            depth -= 1
+            if depth < 0:
+                # Unbalanced: a `)` with no opener. Refuse rather than
+                # slice a construct we have already mis-read.
+                return None
+            continue
+        if strict and ch == '`':
+            # Backtick substitution: this scanner does not track its
+            # interior, so an `&&` inside one could become a bogus split.
+            return None
+        if ch == '&' and raw[i + 1 : i + 2] == '&':
+            if depth == 0:
+                clauses.append(raw[start:i])
+                start = i + 2
+            skip_next = True
+            continue
+        if strict and depth == 0 and ch in ('&', ';', '|'):
+            # A lone `&` backgrounds the clause (its rc is the shell's, not
+            # the command's); `;` runs the next clause unconditionally; `|`
+            # and `||` reassign the clause's exit status. All three break
+            # per-segment rc attribution, which is the whole product here.
+            return None
+    if strict and (unterminated or depth != 0):
+        # Unbalanced quote or paren at end of scan.
+        return None
+    clauses.append(raw[start:])
+    return clauses
+
+
+def split_top_level_and(raw: str) -> list[str]:
+    """Split *raw* on `&&` at shell quote depth 0, returning segments VERBATIM.
+
+    The LOSSLESS, never-refusing view of :func:`_scan_and_chain`:
+    ``'&&'.join(split_top_level_and(raw)) == raw`` exactly, whatever *raw*
+    contains. ``split_chain_tail``'s caller re-emits the tail verbatim rather
+    than re-rendering it, and can only do so safely under that guarantee.
+    """
+    segments = _scan_and_chain(raw, strict=False)
+    # Non-strict mode has no refusal path (see _scan_and_chain): every `return
+    # None` there is guarded by `strict`. Asserting rather than falling back
+    # keeps a future scanner edit that leaks a refusal into this mode LOUD,
+    # instead of silently changing this helper's lossless contract.
+    assert segments is not None
     return segments
 
 
@@ -630,6 +746,217 @@ def describe_dropped_clauses(
         if remainder and has_unpreserved_chain_clauses(remainder, ''):
             dropped = (remainder,)
     return dropped, any(_segment_invokes_tool(clause, keyword) for clause in dropped)
+
+
+@dataclass(frozen=True)
+class ChainSegment:
+    """One independently-runnable clause of an `&&` chain, with its cwd resolved.
+
+    *cwd_rel* is POSIX-normalised and RELATIVE to the worktree root ('.' at the
+    root). *command* is a VERBATIM byte-slice of the chain it came from — never
+    re-rendered — so the runner hands the shell exactly what the operator wrote.
+    *label* is a unique, filename-safe token: it becomes the infix of the
+    segment's streamed log path, so two segments sharing a cwd must not collide.
+    """
+
+    cwd_rel: str
+    command: str
+    label: str
+
+
+def _label_for(cwd_rel: str, index: int) -> str:
+    """A unique, filename-safe label for the segment at 1-based *index*.
+
+    The index suffix is not cosmetic: the committed fleet chain has TWO
+    segments at cwd '.' (the cockpit subshell and the `tests/scripts/` clause),
+    and their streamed log paths are keyed by label.
+    """
+    base = 'root' if cwd_rel == '.' else re.sub(r'[^A-Za-z0-9_-]+', '-', cwd_rel).strip('-')
+    return f'{base or "root"}-{index}'
+
+
+def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
+    """Decompose an `&&` chain into independently-runnable segments, or REFUSE.
+
+    The EXECUTION-layer counterpart to ``split_chain_tail`` (tasks 3061/3218).
+    That one decides WHICH command a scoper renders; this one decides HOW an
+    already-decided chain is RUN — as N separate commands rather than one
+    shell string whose `&&` short-circuits at the first red. Task 3338 /
+    esc-3062-2: with a single `/bin/bash -c '<chain>'`, an unrelated earlier
+    subproject's failure means a task's OWN assigned-file tests are never
+    executed at all, and the orchestrator sees one rc with no way to tell
+    "skipped" from "passed".
+
+    **Fail-safe contract: returns ``None`` on ANYTHING it cannot faithfully
+    reproduce**, and the caller then runs *raw* unchanged — byte-identical to
+    the pre-change behaviour by construction. Same discipline as
+    ``split_chain_tail``'s REJECT path, which returns the whole untouched
+    original. A false REFUSE costs nothing but the status quo; a false ACCEPT
+    corrupts a command.
+
+    The scan extends ``split_top_level_and``'s state machine with a PAREN-DEPTH
+    counter alongside its single/double-quote and backslash-escape state: an
+    `&&` is a split point only at quote depth 0 AND paren depth 0. That is not
+    optional here — the committed fleet chain contains
+    ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ )``, and a
+    quote-only splitter would cut inside that group and emit two unbalanced
+    shell fragments, i.e. a spurious RED. A balanced ``( ... )`` group is one
+    ATOMIC segment, which is also semantically right: a subshell's own ``cd``
+    never escapes it.
+
+    A literal ``cd X`` clause is FOLDED into a running relative cwd rather than
+    emitted as a segment (start '.'; ``cd shared`` -> 'shared';
+    ``cd ../escalation`` -> 'escalation'; ``cd ..`` from 'sampler' -> '.'), so
+    each emitted segment carries the cwd the shell would have been in when it
+    ran. Segment commands are ``strip()``ed byte-slices of *raw*.
+
+    A clause that mutates SHELL STATE for the clauses after it is likewise a
+    REFUSE, not a segment. Each segment runs in its own ``/bin/bash -c``, so
+    an ``export``/``source``/``set -e``/``FOO=1`` clause's effect would be
+    silently DISCARDED and every later segment would run in a different
+    environment than the operator configured — a spurious red (or, for an
+    env-tightening clause, a wrong verdict) with no signal that the command
+    had been reinterpreted. The committed dark-factory chain has none of these
+    shapes, but this helper runs whatever ``test_command`` ANY targeted
+    project's ``dark-factory-orchestrator.yaml`` configures.
+
+    REFUSES (``None``) on: an unbalanced quote or paren; a depth-0 `;`, `|`,
+    `||`, lone `&` or backtick; a clause whose leading word is a
+    state-mutating builtin (``_STATE_MUTATING_BUILTINS``) or a ``NAME=value``
+    assignment prefix; a ``cd`` whose target is not a literal relative path
+    (``$VAR``, ``$(...)``, a glob, `~`, `-`, a quoted or absolute path, or the
+    wrong argument count); an accumulated cwd normalising above the worktree
+    root; and any chain yielding fewer than 2 runnable clauses — there is no
+    short-circuit to fix in a single command.
+    """
+    segments: list[ChainSegment] = []
+    cwd_rel = '.'
+    for clause in _scan_and_chain(raw, strict=True) or []:
+        stripped = clause.strip()
+        if not stripped:
+            return None
+        if _mutates_shell_state(stripped):
+            # State this runner cannot carry across segment boundaries. Checked
+            # BEFORE the `cd` fold on purpose: `FOO=1 cd shared` is not matched
+            # by _literal_cd_target (the assignment prefix hides the `cd`), so
+            # without this guard it would be emitted as a no-op segment and
+            # every LATER segment would silently run at the worktree root.
+            return None
+        is_cd, cd_target = _literal_cd_target(stripped)
+        if is_cd and cd_target is None:
+            # A `cd` whose target this cannot resolve LITERALLY. Refusing is
+            # the only safe disposition: guessing would run every LATER segment
+            # in the wrong directory — silently green, or spuriously red.
+            return None
+        if cd_target is not None:
+            cwd_rel = posixpath.normpath(posixpath.join(cwd_rel, cd_target))
+            if cwd_rel.startswith('..'):
+                # A chain whose accumulated cwd escapes the worktree root is
+                # not something this helper can run safely under `worktree / X`.
+                return None
+            continue
+        segments.append(
+            ChainSegment(cwd_rel=cwd_rel, command=stripped, label=_label_for(cwd_rel, len(segments) + 1)),
+        )
+    if len(segments) < 2:
+        # Nothing is gained by "segmenting" a single command, and the whole
+        # point is running LATER clauses that a red earlier one would skip.
+        return None
+    return segments
+
+
+# Leading words that mutate SHELL STATE for every clause AFTER them —
+# environment (`export`/`unset`/`source`/`.`), shell options (`set`/`shopt`),
+# the alias table, traps, the umask, or the directory stack
+# (`pushd`/`popd`, which `_literal_cd_target` deliberately does not model).
+# `split_and_chain_segments` runs each segment in its OWN `/bin/bash -c`, so
+# that state would be silently discarded and every later segment would run in
+# an environment the operator never configured. REFUSING is the honest
+# disposition: the caller then runs the raw chain in one shell, state intact.
+_STATE_MUTATING_BUILTINS = frozenset({
+    '.', 'alias', 'eval', 'export', 'popd', 'pushd', 'set', 'shopt',
+    'source', 'trap', 'umask', 'unset',
+})
+
+# A leading `NAME=value` shell assignment prefix. Two distinct hazards, both
+# fatal to segmentation: alone (`FOO=1 && ...`) it sets a variable for the rest
+# of the chain, and in FRONT of a directory change (`FOO=1 cd shared`) it hides
+# the `cd` from `_literal_cd_target`, which would leave every later segment
+# running at the worktree root instead.
+_ASSIGNMENT_PREFIX_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+
+def _mutates_shell_state(clause: str) -> bool:
+    """True if *clause*'s LEADING word changes shell state for later clauses.
+
+    Only the leading word is inspected, which is the point: ``./run.sh`` is a
+    program (not the `.` builtin), ``pytest --export-junit`` is a flag, and a
+    builtin INSIDE a balanced ``( ... )`` group cannot escape its subshell — so
+    a clause starting with `(` is correctly left runnable.
+    """
+    head = clause.split(maxsplit=1)
+    if not head:
+        return False
+    return head[0] in _STATE_MUTATING_BUILTINS or bool(_ASSIGNMENT_PREFIX_RE.match(head[0]))
+
+
+# Characters that make a `cd` argument non-LITERAL: parameter expansion,
+# command substitution, globbing, quoting, or tilde expansion. Any of them and
+# the directory this helper would compute is not necessarily the one the shell
+# would enter — `~/proj` passed through as a literal `cwd=` path names no
+# directory at all.
+_CD_HAZARD_CHARS = frozenset('$`*?"\'~')
+
+# `cd` arguments that are shell-special despite looking literal: `cd -` goes to
+# $OLDPWD and `cd --` (end-of-options with no operand) goes to $HOME. Both
+# would otherwise be folded in as if they were directory NAMES.
+_CD_NON_PATH_ARGUMENTS = frozenset({'-', '--'})
+
+# A clause whose first word is exactly `cd`. Requires a word boundary so
+# `cdk deploy` is a runnable segment, not a mis-read directory change.
+_CD_CLAUSE_RE = re.compile(r'\s*cd(?:\s|$)')
+
+
+def _literal_cd_target(clause: str) -> tuple[bool, str | None]:
+    """``(is_cd_clause, literal_relative_target)`` for one chain clause.
+
+    ``(False, None)`` — not a `cd` at all; the caller emits it as a runnable
+    segment. ``(True, <target>)`` — a `cd` the caller folds into the running
+    cwd. ``(True, None)`` — a `cd` whose target cannot be resolved LITERALLY,
+    on which the caller REFUSES the whole chain: a mis-resolved cwd would run
+    later segments in the WRONG directory, which is worse than not segmenting.
+    Concretely, ``_run_cmd`` swallows the resulting spawn ``OSError`` into
+    ``1, 'Command failed: ...', False``, so a bad fold reads as a subproject's
+    own red rather than as the mis-resolution it is.
+
+    Deliberately named apart from ``verify._cd_clause_target`` (task 3022),
+    which is a DIFFERENT contract in the same subsystem — ``str | None``, with
+    no refusal channel — so a reader landing on either one can tell which is
+    in play. That one is imported by ``tests/scripts/test_fallback_verify_config``
+    and is not this task's to rename.
+    """
+    if not _CD_CLAUSE_RE.match(clause):
+        return False, None
+    argument = clause.strip()[len('cd') :].strip()
+    if _CD_HAZARD_CHARS & set(argument):
+        # $VAR / $(...) / `...` / globs / quotes / `~` — not a literal path.
+        return True, None
+    try:
+        tokens = shlex.split(clause)
+    except ValueError:
+        # Unbalanced quoting inside the clause; nothing to resolve.
+        return True, None
+    if len(tokens) != 2:
+        # A bare `cd` goes $HOME and `cd a b` is bash's substitution form —
+        # neither is a foldable relative directory change.
+        return True, None
+    if tokens[1] in _CD_NON_PATH_ARGUMENTS:
+        # `cd -` / `cd --`: shell-special destinations, not directory names.
+        return True, None
+    if tokens[1].startswith('/'):
+        # Segments run under `worktree / cwd_rel`; an absolute cwd escapes it.
+        return True, None
+    return True, tokens[1]
 
 
 def parse_config_command(raw: str) -> VerifyCmd:
@@ -1014,7 +1341,68 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 # operator (&&, ||, ;) or end of string — the span serial_pytest's raw-chain
 # path rewrites. Word-bounded so it doesn't match inside 'pytest_xdist' etc.
 # Moved from verify.py's _PYTEST_INVOCATION_RE / _force_serial_pytest.
+#
+# Deliberately left broad — it does NOT exclude ')' — even though a matched
+# span can therefore run past a subshell-closing ')' (the committed fleet
+# test_command's cockpit clause is exactly this shape:
+# ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/
+# --timeout=300 )``). The tempting fix, adding ')' to the excluded class
+# (``[^&|;)]*``), was measured and REJECTED (task 3650): it repairs that one
+# chain but silently corrupts any invocation whose own arguments legitimately
+# contain a ')' — e.g. ``pytest -k "not (slow or integration)" tests/``
+# becomes ``pytest -k "not (slow or integration -p no:xdist -o
+# addopts='')" tests/``, which still passes ``bash -n`` while running the
+# wrong tests (the flags land inside the quoted expression and `tests/` is
+# orphaned outside the invocation). That trades today's loud syntax error for
+# a silent wrong-tests-run, which is strictly worse. Keep this pattern
+# byte-identical; fix placement in ``_append_to_raw_pytest_invocations``
+# instead, via ``_split_at_unbalanced_close``.
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
+    """Split *segment* at its first depth-0, UNQUOTED ')', or return it whole.
+
+    Scans *segment*'s unquoted characters only (via ``_unquoted_chars``,
+    shared with ``_scan_and_chain``) tracking paren depth (``(`` increments,
+    ``)`` decrements) and returns ``(body, closer)`` split at the first
+    ``)`` that would take depth below zero — i.e. a ``)`` NOT opened by a
+    ``(`` occurring earlier in *segment* itself, and not itself sitting
+    inside a quoted argument. Such a ``)`` closes a group that started
+    before *segment* (e.g. the subshell wrapping a pytest invocation), so it
+    and everything from it onward belong outside the invocation's own
+    arguments. A ``)`` that IS balanced within *segment* (e.g. inside a
+    ``-k "not (slow)"`` expression or a ``$(...)`` substitution) stays in
+    *body*; so does one that sits inside quotes at depth 0 (e.g.
+    ``-k "a)"`` — the quote makes it a literal character, never a
+    structural paren, regardless of surrounding depth). Returns
+    ``(segment, '')`` when *segment* contains no such unbalanced ``)``.
+
+    Quote-AWARE (task 3650 amendment). The first cut of this function was
+    quote-blind — counted every ``(``/``)`` regardless of quoting — on the
+    premise that parens inside quotes are themselves balanced in any sane
+    command. Measured wrong: a ``)`` INSIDE a quoted argument need not be
+    paired with a ``(`` at all (``-k "a)"`` is ordinary pytest usage), and a
+    quote-blind scan mistakes it for this invocation's own unbalanced close.
+    ``_append_to_raw_pytest_invocations('pytest -k "a)" tests/ && true', ...)``
+    then spliced the recovery suffix INSIDE the quotes and orphaned
+    ``tests/`` outside the invocation — ``bash -n`` still exits 0, so that
+    traded a loud syntax error for a silent wrong-tests-run, exactly the
+    failure mode this module's ``_PYTEST_INVOCATION_RE`` comment rejects the
+    char-class-widening fix for. Building on ``_unquoted_chars`` instead of a
+    second, weaker hand-rolled paren counter fixes this for free: a ``)``
+    inside quotes is never even offered to the depth check below.
+    """
+    chars, _unterminated = _unquoted_chars(segment)
+    depth = 0
+    for i, ch in chars:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            if depth == 0:
+                return segment[:i], segment[i:]
+            depth -= 1
+    return segment, ''
 
 
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
@@ -1022,16 +1410,43 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
 
     Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
     raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
-    strips trailing whitespace, appends *suffix*, then re-attaches the
-    trailing whitespace so an immediately-following chain operator (e.g.
+    then anchors the append to the end of the pytest invocation's own
+    ARGUMENTS rather than to the end of the matched span — the span can run
+    past a subshell-closing ')' (see ``_PYTEST_INVOCATION_RE``'s comment),
+    and appending there would produce an unparseable shell command. Each
+    matched span is split via ``_split_at_unbalanced_close`` into a ``body``
+    (the invocation's own arguments, ')'-free at depth 0) and a ``closer``
+    (a subshell-closing ')' onward, or ``''`` if none); *suffix* is appended
+    to ``body``, and ``closer`` is re-attached last. Within ``body``,
+    trailing whitespace is stripped, *suffix* appended, then the trailing
+    whitespace re-attached so an immediately-following chain operator (e.g.
     `` && ``) survives untouched. *suffix* should include its own leading
     space (e.g. ``' -n 16'``).
+
+    Tasks 3650 and 3478 diagnosed this defect independently and landed
+    competing fixes; the merge kept 3650's quote-aware
+    ``_split_at_unbalanced_close`` split over 3478's quote-blind peel, which
+    trimmed trailing ``)`` while ``count(')') > count('(')`` over the whole
+    span. Counting parens inside quotes as structural breaks it both ways: a
+    quoted ``(`` masks a real closer (measured — on ``( cd x && pytest -k
+    "foo(" tests/ )`` the span scores balanced, the peel never fires, and the
+    rewrite stays the ``) -n 4`` bash syntax error this function exists to
+    prevent), and symmetrically a quoted ``)`` is mistaken for one (see
+    ``_split_at_unbalanced_close``'s docstring). Scanning only unquoted
+    characters is what removes both halves of that failure.
+
+    3478's independently-derived regression tests are retained in
+    ``TestRawRewriteDoesNotSwallowSubshellTerminator`` and pass against this
+    implementation — the operational impact they pin (``serial_pytest``
+    drives the env-transient and flaky-scoped recovery re-runs, so this
+    fired at shipped defaults with no knob set) is recorded there.
     """
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
-        stripped = segment.rstrip()
-        trailing = segment[len(stripped) :]
-        return f'{stripped}{suffix}{trailing}'
+        body, closer = _split_at_unbalanced_close(segment)
+        stripped = body.rstrip()
+        trailing = body[len(stripped) :]
+        return f'{stripped}{suffix}{trailing}{closer}'
 
     return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
 

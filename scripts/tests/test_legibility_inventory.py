@@ -1,8 +1,9 @@
 """Tests for scripts/legibility/inventory.py — session enumeration (PRD §5.2 point 2).
 
-``inventory.encode_cwd`` mirrors
-``orchestrator.session_registry.transcript_path_for_cwd``'s cwd encoding
-(both ``/`` and ``.`` map to ``-``). A project's agents span many encoded
+``inventory.encode_cwd`` mirrors ``orchestrator.session_registry.encode_cwd``,
+the canonical cwd encoding (``/``, ``.`` and ``_`` all map to ``-``, and case
+is preserved); ``TestEncoderLockstep`` below holds every in-repo copy of that
+rule to the canonical AND to real on-disk dir names. A project's agents span many encoded
 dirs (57 for dark-factory today: main checkout + ``.worktrees``/
 ``.claude-worktrees`` children), so membership is resolved from the
 session's REAL ``cwd`` (read from a transcript line) via path-component
@@ -17,15 +18,162 @@ mechanics).
 from __future__ import annotations
 
 import gzip
+import importlib.util
+import io
 import json
+import re
+import subprocess
+import zlib
+from collections.abc import Callable
 from datetime import date as dt_date
+from functools import lru_cache
 from pathlib import Path
 
+import pytest
+from legibility import digest
 from legibility import inventory as mod
+
+from orchestrator import session_registry
+
+# Repo root from scripts/tests/ — the same parents[2] derivation
+# scripts/tests/conftest.py already uses.
+SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
 COCKPIT_CWD = '/home/leo/src/dark-factory-cockpit'
+
+# OBSERVED, not guessed (task 3272). Every right-hand side below is a real
+# directory name read off a live ``~/.claude/projects`` tree, or a cwd
+# confirmed against one. The rule was derived empirically from 738
+# (encoded-dir, decoded-cwd) pairs sampled from that tree: the only
+# substitutions observed were ``.`` -> ``-``, ``/`` -> ``-`` and
+# ``_`` -> ``-``, and the only non-alphanumeric characters appearing in ANY
+# sampled cwd were ``- . / _`` — so the three-character rule is complete
+# over the observed domain (it reproduces all 738 pairs; the former
+# two-character ``/``+``.`` rule mismatched 492 of them).
+#
+# These are STRING LITERALS on purpose. They must never be produced by
+# calling ``encode_cwd`` (or any mirror of it): a fixture built with the
+# function under test moves in lockstep with a bug in that function and can
+# never detect it, which is exactly why the missing ``_`` rule survived a
+# fully green suite. See TestEncoderLockstep below.
+REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
+    (MAIN_CWD, '-home-leo-src-dark-factory'),
+    (WORKTREE_CWD, '-home-leo-src-dark-factory--worktrees-2573'),
+    (
+        '/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8',
+        '-home-leo-src-dark-factory--eval-worktrees-df-task-12-run-5383f6a8',
+    ),
+    (
+        '/home/leo/src/reify/.claude/worktrees/printer-design-v01',
+        '-home-leo-src-reify--claude-worktrees-printer-design-v01',
+    ),
+    # Pins CASE PRESERVATION: the encoder does NOT lowercase. This dir name
+    # exists on disk with its capitals intact, ruling out a case-folding step.
+    ('/opt/Auto-Claude/resources/backend', '-opt-Auto-Claude-resources-backend'),
+    (
+        '/home/leo/src/warm-lanes/worktrees/_lane-39',
+        '-home-leo-src-warm-lanes-worktrees--lane-39',
+    ),
+    ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+)
+
+
+# ---------------------------------------------------------------------------
+# Corruption scaffolding — a gz payload plus the two damage shapes a
+# fire-and-forget archive writer really produces (a write interrupted by a
+# killed unit, or a file read while it is still being compressed). Kept local
+# to this file rather than hoisted into conftest: scripts/tests/conftest.py is
+# sys.path bootstrap only, and each test module here already carries its own
+# write helpers.
+# ---------------------------------------------------------------------------
+
+def _gz_payload(n_records: int = 200) -> bytes:
+    """Serialize a multi-record JSONL body — the payload the helpers below
+    compress and then damage. Deliberately many padded records so a cut at the
+    halfway mark lands mid-stream rather than inside the 10-byte header."""
+    return ''.join(
+        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
+        for i in range(n_records)
+    ).encode('utf-8')
+
+
+def _write_truncated_gz(path: Path) -> Path:
+    """Write the first half of a valid gz stream — the interrupted-write shape.
+
+    Decompression reaches the end of the bytes before the end-of-stream marker
+    and raises ``EOFError``, which is NOT an ``OSError``.
+    """
+    blob = gzip.compress(_gz_payload())
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body_gz(path: Path) -> Path:
+    """Write a gz whose DEFLATE body is damaged, so decompression raises
+    ``zlib.error`` — a THIRD distinct shape, and also not an ``OSError``.
+
+    Where a flipped byte lands decides which failure gzip reports: many flips
+    still decode and only trip the trailing checksum (``gzip.BadGzipFile``,
+    already an ``OSError``), a few truncate the bit stream (``EOFError``), and
+    only a flip that makes the DEFLATE stream itself unparseable raises
+    ``zlib.error``. So this probes for the first flip position that produces
+    that shape rather than assuming any particular byte does. The probe runs
+    against STDLIB ``gzip`` — never the reader under test — so the helper
+    stays valid both before and after the reader normalizes its exceptions.
+    """
+    blob = gzip.compress(_gz_payload())
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError('no single-byte flip produced a zlib.error body')
+
+
+_UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
+"""A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8.
+
+The first line is well-formed on purpose: a reader that degraded this
+per-LINE rather than per-FILE would be visibly distinguishable here (it
+would yield record 0 and skip record 1) instead of silently passing.
+"""
+
+
+def _write_undecodable_gz(path: Path) -> Path:
+    """Write a STRUCTURALLY VALID gz whose payload is not valid UTF-8.
+
+    The FOURTH shape, and the one the three helpers above structurally CANNOT
+    reach: each damages the gzip container, so a probe that decompresses in
+    BINARY mode (``gzip.GzipFile(...).read()``, as ``_write_corrupt_body_gz``
+    does) can see them. This file decompresses perfectly. The failure happens
+    one layer up — when the reader's ``encoding='utf-8'`` text wrapper meets
+    byte 0xFF and raises ``UnicodeDecodeError``, which is a ``ValueError``
+    subclass and therefore escapes an ``except OSError`` degrade path no
+    matter how the gzip shapes are normalized. A single flipped byte in
+    stored archive data produces exactly this.
+    """
+    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
+    return path
+
+
+def _write_undecodable_plain(path: Path) -> Path:
+    """The same bad byte in a PLAIN ``.jsonl`` — no gzip layer involved.
+
+    Pins the half of the decode shape that has no gzip analogue at all: both
+    reader branches open under strict ``encoding='utf-8'``, so an
+    uncompressed transcript is equally able to abort a walk. This is why the
+    normalized message says "undecodable transcript bytes" rather than
+    labelling it a gzip-stream failure.
+    """
+    path.write_bytes(_UNDECODABLE_BODY)
+    return path
 
 
 class TestEncodeCwd:
@@ -33,8 +181,27 @@ class TestEncodeCwd:
         assert mod.encode_cwd(MAIN_CWD) == '-home-leo-src-dark-factory'
 
     def test_worktrees_child_maps_slash_and_dot(self):
-        # Both '/' and '.' -> '-', mirroring transcript_path_for_cwd exactly.
+        # Two of the three characters; see test_underscore_maps_to_dash for
+        # the third. A leading '.' on a path component yields a doubled '--'
+        # (one dash from the preceding '/', one from the '.').
         assert mod.encode_cwd(WORKTREE_CWD) == '-home-leo-src-dark-factory--worktrees-2573'
+
+    def test_underscore_maps_to_dash(self):
+        # The character the mirror used to miss (task 3272). Two thirds of the
+        # real project dirs sampled contain an underscore.
+        assert mod.encode_cwd('/media/leo/data_lv_1/leo/reify-build') == (
+            '-media-leo-data-lv-1-leo-reify-build'
+        )
+
+    def test_round_trips_real_on_disk_dir_names(self):
+        """Every encoding matches a dir name observed on a live ~/.claude/projects tree.
+
+        Table-driven over REAL_ENCODED_DIR_PAIRS, whose expected values are
+        hard-coded literals rather than encoder output — the only kind of
+        assertion that can catch an encoder which is self-consistently wrong.
+        """
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            assert mod.encode_cwd(cwd) == expected_dir, cwd
 
     def test_cockpit_sibling_shares_literal_prefix(self):
         # This is exactly why a raw string-prefix match over-includes: the
@@ -43,6 +210,214 @@ class TestEncodeCwd:
         encoded_cockpit = mod.encode_cwd(COCKPIT_CWD)
         assert encoded_cockpit.startswith(encoded_main)
         assert encoded_cockpit != encoded_main
+
+
+def _load_sibling_test_module(name: str):
+    """Import a sibling scripts/tests module by file path.
+
+    ``scripts/tests`` is not on ``sys.path`` (its conftest inserts
+    ``scripts/`` and ``scripts/legibility``, not itself), so a bare
+    ``import test_legibility_nightly`` would not resolve under the suite's
+    ``--import-mode=importlib`` collection. Loading by path is the sanctioned
+    equivalent and avoids restructuring the nightly fixture.
+    """
+    spec = importlib.util.spec_from_file_location(
+        f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(maxsize=1)
+def _bash_encode_cwd_source() -> str:
+    """Extract spawn-claude.sh's ``_encode_cwd`` function block verbatim.
+
+    spawn-claude.sh is not sourceable — it runs ``set -u`` and an argument-count
+    usage check that exits 2 long before ``_encode_cwd``'s definition, and past
+    that point proceeds straight to launching a terminal. Rather than put a
+    test-only "library mode" branch into a production launcher on the incident
+    path, the four-line pure function is lifted out by an anchored regex and
+    eval'd in a throwaway shell (see :func:`_bash_encode_cwd`).
+
+    The regex anchors on exactly two properties, and it is worth stating them
+    as MEASURED rather than as remembered — a rule restated from memory in a
+    comment is the mechanism task 3272 traced this whole bug class to:
+
+      - the definition starts at column 0 as ``_encode_cwd()`` — the
+        ``function _encode_cwd`` form does not match, nor does an indented one;
+      - the body ends at a line that is a bare ``}`` at column 0, with no
+        earlier column-0 ``}`` inside it (the match is non-greedy, so an
+        earlier one truncates the extraction).
+
+    Nothing else is required. Verified against this file: ``\\s*`` spans
+    newlines, so ``()`` and ``{`` need NOT share a line (a brace-on-next-line
+    reformat still matches), and ``re.search`` scans the whole script, so the
+    function may be MOVED anywhere in it without breaking extraction. Neither a
+    move nor a brace-style reformat trips the assert below, and this docstring
+    must not claim they do.
+
+    The assert on a miss is load-bearing: if the function is renamed or its
+    definition stops starting at column 0, a tolerant ``if m:`` would return
+    nothing and the whole lockstep would pass VACUOUSLY — the exact class of
+    silent coverage loss this guard exists to prevent. A loud extraction
+    failure is the correct outcome.
+    """
+    source = SPAWN_SCRIPT.read_text()
+    match = re.search(r'^_encode_cwd\(\)\s*\{\n(?:.*\n)*?^\}$', source, re.M)
+    assert match is not None, (
+        f'could not extract the _encode_cwd() function block from {SPAWN_SCRIPT}. '
+        'Either it was renamed, or its definition no longer starts at column 0 '
+        'as `_encode_cwd()` (the `function _encode_cwd` form does not match), or '
+        'its body no longer ends at a bare column-0 `}`. Fix the regex here '
+        'rather than letting TestEncoderLockstep silently stop covering the '
+        'bash copy.'
+    )
+    return match.group(0)
+
+
+def _bash_encode_cwd(cwd: str) -> str:
+    """Run spawn-claude.sh's ``_encode_cwd`` on ``cwd`` and return its raw stdout.
+
+    stdout is returned UNSTRIPPED on purpose: the bash function ends in
+    ``printf '%s'`` (no trailing newline), so an exact ``==`` comparison is
+    valid and keeps a stray-whitespace regression detectable — stripping would
+    mask one.
+
+    Every guard in this bridge is deliberately loud-on-failure, and the two
+    below close the only paths that were not. ``timeout`` is not optional
+    belt-and-braces: an unavailable or wedged ``bash`` with no deadline HANGS
+    the suite instead of failing it, which would be the single silent
+    degradation in an otherwise fail-loud mechanism. And the returncode is
+    checked explicitly rather than with ``check=True``, because
+    ``CalledProcessError``'s default message does not include captured stderr —
+    a bash-level syntax error introduced while editing ``_encode_cwd`` would
+    surface as a bare "returned non-zero exit status 2" with the actual
+    diagnostic hidden in an unprinted attribute.
+    """
+    result = subprocess.run(
+        ['bash', '-c', _bash_encode_cwd_source() + '\n_encode_cwd "$1"', 'bash', cwd],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (
+        f'bash _encode_cwd exited {result.returncode} for cwd {cwd!r}. '
+        f'stderr: {result.stderr!r}'
+    )
+    return result.stdout
+
+
+@lru_cache(maxsize=1)
+def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
+    """(label, callable) for every in-repo copy of the cwd encoding.
+
+    Not only the Python ones: a copy in another language enters through a
+    bridge that presents it as a plain ``Callable[[str], str]``, so the
+    lockstep assertions need no special case for it. ``spawn-claude.sh``'s
+    bash copy is the first such entry (see :func:`_bash_encode_cwd`).
+
+    Cached, and resolved ONCE per session rather than per assertion row, for
+    two reasons that now compound: naming the nightly mirror requires exec'ing
+    that whole test module, which is not written to be executed repeatedly,
+    and the bash bridge reads and regex-scans spawn-claude.sh. An uncached
+    call inside the ``REAL_ENCODED_DIR_PAIRS`` loop paid both once per row
+    (growing with the table). Any future module-scope side effect there now
+    costs one execution, not N. Note the caching is of the mirror REGISTRY and
+    of the extracted bash SOURCE, never of an encoding result — every
+    assertion row still calls each encoder for real.
+
+    As of task 3464 no in-repo copy is deliberately omitted. If you add one,
+    add it here; if you add one that cannot be pinned to the canonical, say so
+    in :class:`TestEncoderLockstep`'s SCOPE note rather than leaving it
+    unlisted, which would let that docstring imply coverage it lacks.
+    """
+    nightly_tests = _load_sibling_test_module('test_legibility_nightly')
+    return (
+        ('legibility.inventory.encode_cwd', mod.encode_cwd),
+        ('legibility.digest._encode_cwd', digest._encode_cwd),
+        ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
+        ('skills/spawn/spawn-claude.sh:_encode_cwd', _bash_encode_cwd),
+    )
+
+
+class TestEncoderLockstep:
+    """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
+
+    The rule is duplicated five times across the repo (four Python, one bash),
+    and EVERY ONE was found to be missing the same character (``_`` -> ``-``)
+    at once — the four Python copies in task 3272, the bash copy in task 3464.
+    The old ``inventory.encode_cwd`` docstring asserted the mirrors were "kept
+    in lockstep with the canonical implementation" — a claim nothing checked,
+    and which was false in fact.
+
+    This class replaces that aspiration with an enforced invariant. Each
+    mirror is asserted equal to BOTH:
+
+      - ``session_registry.encode_cwd``, the canonical — so a mirror that
+        drifts from it fails loudly; and
+      - the hard-coded ``REAL_ENCODED_DIR_PAIRS`` dir names — so the
+        canonical drifting from REALITY fails too.
+
+    The second assertion is the load-bearing one. A mirror-only check would
+    have passed cleanly on the pre-3272 tree, because all four copies were
+    consistently wrong together. The same defect explains why 37 green tests
+    never caught it: every fixture built its session dirs by calling the
+    encoder under test, so the fixtures tracked the bug. Only literals read
+    off a real ``~/.claude/projects`` tree can detect an encoder that is
+    self-consistently wrong.
+
+    Every in-repo copy is now inside this guard — the two that task 3272 had
+    to leave outside it were closed by task 3464:
+
+      - ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd`` (bash) is covered
+        via :func:`_bash_encode_cwd`, a subprocess bridge: the function block
+        is lifted out of the script with an anchored regex and eval'd in a
+        throwaway shell, then registered as an ordinary :func:`_mirrors`
+        entry. 3272 left it out for want of a mechanism (no Python test can
+        import bash), not for want of will. The extraction ASSERTS on a miss,
+        so losing the function fails loudly instead of silently dropping
+        coverage and letting this class pass vacuously — see
+        :func:`_bash_encode_cwd_source` for precisely what that extraction does
+        and does not anchor on.
+      - ``tests/scripts/test_spawn_claude.py``'s fixture is no longer a copy
+        of the rule at all: it now CALLS ``session_registry.encode_cwd``, so
+        it is pinned to the canonical by construction and needs no entry
+        here. (It could never have been listed as a mirror anyway — it names
+        the dir a fake ``claude`` creates for spawn-claude.sh's own probe to
+        find, so it was pinned to the BASH copy, and while bash was wrong,
+        asserting it equal to the canonical would have asserted the wrong
+        thing. Both moved in one commit, as this note previously required.)
+
+    SCOPE — what this still does NOT cover. This class verifies encoder
+    AGREEMENT and nothing more. That spawn-claude.sh's ``_started_evidence``
+    (or any other caller) USES the encoded value correctly — as a lookup key
+    against a directory that exists, at the right moment — is outside it;
+    ``test_spawn_claude.py``'s ``test_transcript_appearance_suppresses_flag``
+    is what exercises that end to end. Nor does it extend the rule's
+    validated domain: the pairs below are complete only over the punctuation
+    actually observed (``- . / _``), per ``session_registry.encode_cwd``.
+
+    Best of all is not to add a copy: prefer CALLING
+    ``session_registry.encode_cwd``, as the spawn test's fixture now does.
+    Where a copy is genuinely unavoidable, add it to :func:`_mirrors` — being
+    in another language is no longer an exemption, since a bridge can present
+    it as a plain callable. Only if a copy truly cannot be pinned to the
+    canonical, say so in the SCOPE note above rather than leaving it silently
+    unlisted and letting this docstring imply coverage it lacks.
+    """
+
+    def test_every_mirror_agrees_with_canonical_and_with_reality(self):
+        canonical = session_registry.encode_cwd
+        mirrors = _mirrors()
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            # The canonical itself must match the real on-disk dir name.
+            assert canonical(cwd) == expected_dir, f'canonical drifted from reality: {cwd}'
+            for label, mirror in mirrors:
+                got = mirror(cwd)
+                assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
+                assert got == expected_dir, f'{label} drifted from reality: {cwd}'
 
 
 def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
@@ -147,7 +522,7 @@ class TestSessionCwd:
 
 
 class TestGzAwareReader:
-    """The single low-level reader (``_iter_json_lines``, via
+    """The single low-level reader (``iter_json_lines``, via
     ``_session_cwd_and_date`` / ``session_cwd``) transparently reads
     gzip-compressed ``.jsonl.gz`` transcripts — the archived fleet-transcript
     format (shared.transcript_archive) — keeping byte-parity for plain
@@ -183,6 +558,186 @@ class TestGzAwareReader:
         corrupt = tmp_path / 'corrupt.jsonl.gz'
         corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
         assert mod.session_cwd(corrupt) is None
+
+
+class TestPublicIterJsonLines:
+    """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
+
+    The memory-eval retro corpus extractor
+    (``fused-memory/scripts/memory_eval_transcript_corpus.py``) consumes it
+    from a DIFFERENT package, which is why the name is public: a cross-package
+    consumer of an underscore name is a standing invitation for the next
+    author to copy the function instead — the outcome the reuse invariant
+    exists to prevent.
+    """
+
+    RECORDS = [
+        {'type': 'user', 'cwd': MAIN_CWD, 'seq': 1},
+        {'type': 'assistant', 'seq': 2},
+    ]
+
+    def _lines(self) -> str:
+        # A blank line and a syntactically-corrupt line interleaved between the
+        # two good records: both are LINE-level degradations a fire-and-forget
+        # writer really produces, and neither may abort the read.
+        return (
+            json.dumps(self.RECORDS[0])
+            + '\n\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(self.RECORDS[1])
+            + '\n'
+        )
+
+    def test_public_name_exists(self):
+        assert callable(mod.iter_json_lines)
+
+    def test_plain_jsonl_skips_blank_and_corrupt_lines(self, tmp_path):
+        path = tmp_path / 'session.jsonl'
+        path.write_text(self._lines(), encoding='utf-8')
+        assert list(mod.iter_json_lines(path)) == self.RECORDS
+
+    def test_gz_round_trips_identically(self, tmp_path):
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(gz_path)) == self.RECORDS
+
+    def test_plain_and_gz_yield_the_same_records(self, tmp_path):
+        plain = tmp_path / 'session.jsonl'
+        plain.write_text(self._lines(), encoding='utf-8')
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(plain)) == list(mod.iter_json_lines(gz_path))
+
+    def test_corrupt_gz_raises_oserror(self, tmp_path):
+        # The documented file-level contract the corpus extractor's coverage
+        # accounting depends on: an unreadable FILE raises OSError
+        # (gzip.BadGzipFile subclasses it), so `except OSError` counts one
+        # parse failure — as distinct from the corrupt LINES above, which are
+        # skipped silently and must NOT inflate that count.
+        corrupt = tmp_path / 'corrupt.jsonl.gz'
+        corrupt.write_bytes(b'this is not gzip at all\n')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
+
+
+class TestIterJsonLinesCorruptionShapes:
+    """ALL FOUR corruption shapes must raise ``OSError`` at the FILE level.
+
+    ``test_corrupt_gz_raises_oserror`` above covers only bad MAGIC, which
+    happens to be an ``OSError`` already (``gzip.BadGzipFile``). Measured, the
+    other three shapes are not::
+
+        truncated stream  -> EOFError            ("ended before the end-of-stream marker")
+        corrupt body      -> zlib.error          ("Error -3 while decompressing data")
+        undecodable byte  -> UnicodeDecodeError  ("codec can't decode byte 0xff")
+
+    None derives from ``OSError``, so all escape every consumer's documented
+    ``except OSError`` degrade path — ``sampling.py``,
+    ``check_transcript_persistence.py``, and the cross-package corpus
+    extractor alike — and abort the whole walk with a traceback. All are
+    exactly what a fire-and-forget archive writer produces on a killed unit or
+    a flipped stored byte, and the archive is live fleet runtime state, so
+    none is a theoretical shape.
+
+    The fourth is worth calling out separately, because a fix aimed at the
+    gzip LAYER misses it: the container decompresses cleanly and the fault is
+    at the strict ``encoding='utf-8'`` text wrapper one level up, so it is
+    reachable on a plain ``.jsonl`` too, and being a ``ValueError`` rather
+    than anything gzip raises it survives an
+    ``except (EOFError, zlib.error)`` widening.
+
+    These tests pin the contract the docstring already advertises: one
+    documented degrade path covers every way a FILE can be unreadable.
+    """
+
+    def test_truncated_gz_raises_oserror(self, tmp_path):
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(truncated))
+
+    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
+
+    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
+        # The reason string is what a coverage-reporting caller puts in its
+        # disclosed `examples` list, so an operator must be able to tell a
+        # half-written transcript from a corrupted one without re-reading the
+        # file. Normalizing to a single TYPE must not flatten them to a single
+        # MESSAGE.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            list(mod.iter_json_lines(truncated))
+        with pytest.raises(OSError) as corrupt_exc:
+            list(mod.iter_json_lines(corrupt))
+
+        assert str(truncated_exc.value) != str(corrupt_exc.value)
+        assert 'end-of-stream' in str(truncated_exc.value)
+        assert 'decompressing' in str(corrupt_exc.value)
+
+    def test_undecodable_gz_raises_oserror(self, tmp_path):
+        # The FOURTH shape. The gz container is intact — the payload simply
+        # is not UTF-8 — so this arrives as UnicodeDecodeError, a ValueError
+        # subclass that no `except (EOFError, zlib.error)` tuple can catch and
+        # no `except OSError` consumer can see. Un-normalized it aborts a
+        # whole-archive walk over one flipped byte, which is the exact class
+        # of failure the three tests above exist to prevent.
+        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(undecodable))
+
+    def test_undecodable_plain_jsonl_raises_oserror(self, tmp_path):
+        # Same byte, no gzip layer: the plain branch opens with the same
+        # strict encoding, so this shape is reachable there too and must
+        # normalize identically.
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(undecodable))
+
+    def test_the_decode_shape_is_distinguishable_from_the_gzip_shapes(self, tmp_path):
+        # Same rule as the two-shape test above, extended: the disclosed
+        # reason must not call an encoding fault a gzip-stream fault, since
+        # that would send an operator to audit the compressor rather than the
+        # bytes. The offending byte stays in the message.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            list(mod.iter_json_lines(truncated))
+        with pytest.raises(OSError) as undecodable_exc:
+            list(mod.iter_json_lines(undecodable))
+
+        message = str(undecodable_exc.value)
+        assert message != str(truncated_exc.value)
+        assert 'gzip' not in message
+        assert '0xff' in message.lower()
+
+    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
+        # The other half of the split, and the one a too-broad fix would
+        # destroy: a well-formed gz whose LAST line is a half-written record
+        # (the line-level analogue of a truncated file) still yields every
+        # parseable record and still does NOT raise. If the file-level wrap
+        # swallowed the parse loop as well, this read would start raising and
+        # the coverage counters would double-count ordinary trailing debris as
+        # unreadable files.
+        good = [{'type': 'user', 'seq': 1}, {'type': 'assistant', 'seq': 2}]
+        body = (
+            json.dumps(good[0]) + '\n'
+            + '\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(good[1]) + '\n'
+            + '{"type": "assistant", "message": {"content": "cut mid-writ'
+        )
+        path = tmp_path / 'trailing-partial.jsonl.gz'
+        with gzip.open(path, 'wt', encoding='utf-8') as f:
+            f.write(body)
+
+        assert list(mod.iter_json_lines(path)) == good
 
 
 class TestResolveAgentTranscriptRoots:

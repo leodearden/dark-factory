@@ -62,6 +62,36 @@ class TestRecoverRecordedAction:
         assert action == 'drop'
         assert target_id == 'task-5'
 
+    def test_refused_status_recovers_refuse(self) -> None:
+        """task 3126 RED: a deterministic refusal is recoverable eval signal.
+
+        Refusals are the ONE action the corpus can recover unambiguously --
+        drop and combine both persist status='combined' and need result_json to
+        disambiguate, but only the deterministic guards ever emit 'refused'.
+        Skipping the row would drop the refuse decision out of the very corpus
+        that trains the curator on it."""
+        result_json = '{"id": null, "action": "refuse", "created": false, '\
+                      '"justification": "cancelled-premise-blocklist: e: r"}'
+        recovered = recover_recorded_action('refused', result_json, None)
+        assert recovered == ('refuse', None, None)
+
+    def test_refused_status_with_no_result_json_recovers_refuse(self) -> None:
+        """Status alone is sufficient -- 'refused' is unambiguous."""
+        assert recover_recorded_action('refused', None, None) == ('refuse', None, None)
+
+    def test_refuse_is_not_a_proposable_frontier_action(self) -> None:
+        """A frontier model must never be able to PROPOSE a refusal: refusal is
+        an operator-curated deterministic verdict, not a judgement call. This
+        pins that 'refuse' stays out of the frontier label enum even though
+        recover_recorded_action now recovers it from persisted rows."""
+        from orchestrator.evals.prompt_opt.curator_corpus import (
+            _FRONTIER_CURATOR_LABEL_SCHEMA,
+            _parse_frontier_label,
+        )
+
+        assert 'refuse' not in _FRONTIER_CURATOR_LABEL_SCHEMA['properties']['action']['enum']
+        assert _parse_frontier_label({'action': 'refuse', 'justification': 'x'}) is None
+
     def test_failed_status_with_no_result_json_is_unactionable(self) -> None:
         assert recover_recorded_action('failed', None, None) is None
 
@@ -454,6 +484,54 @@ class TestBuildCuratorCorpus:
 
         coverage = log.coverage(item.ticket_id for item in manifest.items)
         assert coverage.ok
+
+    @pytest.mark.asyncio
+    async def test_refused_rows_are_excluded_from_the_labeled_corpus(
+        self, tmp_path: Path,
+    ) -> None:
+        """A deterministic refusal is provenance, never a labeled corpus item.
+
+        `recover_recorded_action` recovers status='refused' -> 'refuse' so the
+        verdict stays readable, but every gold label comes from
+        *frontier_proposer* (PRD D-6) and no proposer can emit 'refuse' -- its
+        schema is drop/combine/create. A refused row admitted to the corpus
+        would therefore carry a definitionally-wrong gold label, take a
+        round-robin stratum's share of a bounded n, and spend human spot-check
+        budget -- all for a candidate the curator LLM never sees in production
+        (both guards short-circuit pre-LLM)."""
+        rows = [
+            {'ticket_id': f't{i}', 'status': 'created', 'task_id': f'task-{i}'}
+            for i in range(6)
+        ] + [
+            {
+                'ticket_id': f'r{i}', 'status': 'refused', 'task_id': None,
+                'result': {
+                    'id': None, 'action': 'refuse', 'created': False,
+                    'justification': 'cancelled-premise-blocklist: e: r',
+                },
+            }
+            for i in range(6)
+        ]
+        db_path = make_synthetic_tickets_db(tmp_path / 'tickets.db', rows)
+        proposed: list[dict] = []
+
+        async def _tracking_proposer(candidate: dict) -> FrontierLabel:
+            proposed.append(candidate)
+            return await _fake_frontier_proposer(candidate)
+
+        manifest, log = await build_curator_corpus(
+            db_path, n=12, seed=1, spot_check_size=10, frontier_proposer=_tracking_proposer,
+        )
+
+        ticket_ids = {item.ticket_id for item in manifest.items}
+        assert ticket_ids == {f't{i}' for i in range(6)}, (
+            'refused rows must not reach the labeled corpus'
+        )
+        assert all(item.recorded_action != 'refuse' for item in manifest.items)
+        # No frontier label was even PROPOSED for a refusal (no wasted call,
+        # and no wrong gold label), and none reached the spot-check budget.
+        assert len(proposed) == 6
+        assert not any(entry.diff_id.startswith('r') for entry in log.spot_check_subset())
 
     @pytest.mark.asyncio
     async def test_no_real_db_or_llm_touched_beyond_the_injected_fake(self, tmp_path: Path) -> None:

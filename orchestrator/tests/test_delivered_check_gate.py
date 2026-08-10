@@ -18,8 +18,9 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
@@ -28,7 +29,9 @@ from pydantic import ValidationError
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredCheckResult,
+    DeliveredChecksBlock,
     DeliveredChecksVerdict,
+    gate_mark_done_on_delivered_checks,
     run_delivered_check,
     verify_delivered_checks_on_main,
 )
@@ -3060,3 +3063,387 @@ class TestVerifyDeliveredChecksOnMain:
         )
 
         assert verdict.outcome == 'errored'
+
+
+# ---------------------------------------------------------------------------
+# TestGateMarkDoneOnDeliveredChecks (task 3057 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+#: The caller-supplied logger every row below passes as ``log=``. The helper
+#: MUST log on THIS logger (not ``orchestrator.delivered_checks``) so each
+#: adopting seam keeps its own module logger and its existing
+#: caplog-addressable name — that is the contract task 2794's stranded-arm
+#: caplog assertions (logger='orchestrator.harness') depend on surviving the
+#: step-20 refactor onto this helper.
+_SEAM_LOGGER = logging.getLogger('test.orchestrator.gate_seam')
+
+_VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+
+class TestGateMarkDoneOnDeliveredChecks:
+    """``gate_mark_done_on_delivered_checks`` — the ONE shared mark-done
+    decision routed through by all eleven attribution-shaped stamp seams
+    (task 3057).
+
+    ``None`` <=> "mark-done may proceed"; a :class:`DeliveredChecksBlock`
+    <=> "do NOT stamp done here". Pins task 2794's six-row acceptance matrix
+    AT SOURCE, so the ten adopting seams only have to pin their own
+    delegation + recovery rather than re-deriving the decision.
+
+    ``verify_delivered_checks_on_main`` is patched throughout: this class
+    pins the DECISION layer. The check-runner semantics it delegates to are
+    pinned by ``TestVerifyDeliveredChecksOnMain`` above — the helper must
+    reuse that function VERBATIM and never fork a second check runner.
+    """
+
+    _SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
+    _SITE = 'unit-test-seam'
+
+    # -- fixtures ----------------------------------------------------------
+
+    def _grep_check(self, name: str = 'cap-x', pattern: str = 'SomePattern') -> dict:
+        return {'name': name, 'kind': 'grep', 'pattern': pattern, 'expect': 'present'}
+
+    def _script_check(
+        self, name: str = 'cap-s', script: str = 'scripts/verify_cap.sh'
+    ) -> dict:
+        return {'name': name, 'kind': 'script', 'script': script, 'timeout_secs': 5.0}
+
+    def _meta(self, checks: list[dict] | None = None) -> dict:
+        return {'delivered_checks': checks if checks is not None else [self._grep_check()]}
+
+    def _git_ops(self, sha: str | None = None, raises: bool = False):
+        """Stub git_ops exposing ONLY ``get_main_sha`` (the sole attribute the
+        helper is permitted to touch — a wider stub would let an accidental
+        second git call pass unnoticed)."""
+        stub = AsyncMock()
+        if raises:
+            stub.get_main_sha = AsyncMock(side_effect=RuntimeError('git exploded'))
+        else:
+            stub.get_main_sha = AsyncMock(
+                return_value=self._SHA if sha is None else sha
+            )
+        return stub
+
+    def _warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _SEAM_LOGGER.name
+        ]
+
+    async def _call(self, metadata, *, verify_mock, **kwargs):
+        """Invoke the helper with ``verify_delivered_checks_on_main`` patched."""
+        kwargs.setdefault('project_root', '/proj')
+        kwargs.setdefault('check_timeout_secs', 5.0)
+        kwargs.setdefault('site', self._SITE)
+        kwargs.setdefault('log', _SEAM_LOGGER)
+        with patch(_VERIFY_TARGET, verify_mock):
+            return await gate_mark_done_on_delivered_checks('t-1', metadata, **kwargs)
+
+    # -- Row 1: hollow-done regression / FAILED ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_verdict_blocks_and_warns(self, caplog):
+        """Row 1 — the hollow-done regression this task exists to close.
+
+        A FAILED verdict must yield a ``reason='failed'`` block carrying the
+        SHA and the offending descriptor, and emit exactly ONE WARNING on the
+        CALLER's logger naming task id / check name / pattern / main SHA /
+        site — everything an operator needs to see WHY a done was withheld.
+        """
+        failed_check = self._grep_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+        git_ops = self._git_ops()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=git_ops,
+            )
+
+        assert isinstance(block, DeliveredChecksBlock)
+        assert block.reason == 'failed'
+        assert block.main_sha == self._SHA
+        assert block.failed_check == failed_check
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
+        text = warnings[0].getMessage()
+        assert 't-1' in text
+        assert 'cap-x' in text
+        assert 'SomePattern' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 2: FAILED, script kind ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_script_check_warning_names_the_script(self, caplog):
+        """Row 2 — pins the is_grep branch of the WARNING: a script-kind
+        descriptor has no ``pattern``, so the message must name the SCRIPT
+        (naming a ``None`` pattern would be useless to an operator)."""
+        failed_check = self._script_check()
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=failed_check,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta([failed_check]),
+                verify_mock=verify,
+                git_ops=self._git_ops(),
+            )
+
+        assert block is not None and block.reason == 'failed'
+        text = self._warnings(caplog)[0].getMessage()
+        assert 'scripts/verify_cap.sh' in text
+        assert 'cap-s' in text
+
+    # -- Row 3: all_delivered ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_all_delivered_returns_none_and_is_silent(self, caplog):
+        """Row 3 — the capability IS on main: mark-done proceeds (``None``),
+        and nothing is logged at WARNING (a verified done is not an event
+        worth warning about)."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is None
+        assert self._warnings(caplog) == []
+
+    # -- Row 4: no delivered_checks (inertness) ----------------------------
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param({}, id='empty-metadata'),
+            pytest.param(None, id='none-metadata'),
+            pytest.param({'delivered_checks': []}, id='empty-checks-list'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_no_delivered_checks_is_inert_with_zero_io(self, metadata):
+        """Row 4 — check-less tasks (the overwhelmingly common case) keep
+        their exact pre-guard behavior with ZERO I/O: no git call, no check
+        run. This inertness lives HERE, in one place, which is why every
+        adopting seam is allowed to delegate unconditionally."""
+        verify = AsyncMock()
+        git_ops = self._git_ops()
+
+        block = await self._call(metadata, verify_mock=verify, git_ops=git_ops)
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- Row 5: check-runner ERROR/timeout ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_errored_verdict_blocks_fail_safe(self, caplog):
+        """Row 5 — the checks could not be evaluated: make no claim either
+        way. Still a BLOCK (never stamp on unknown capability state), but
+        ``reason='errored'`` so callers can tell it apart from a definitive
+        absence."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='errored', main_sha=self._SHA,
+        ))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+        assert block.failed_check is None
+
+        text = self._warnings(caplog)[0].getMessage()
+        assert 't-1' in text
+        assert self._SHA in text
+        assert self._SITE in text
+
+    # -- Row 6: kill switch ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_enabled_false_is_the_single_kill_switch(self):
+        """Row 6 — ``enabled=False`` disarms the guard even with a FAILED
+        verdict staged, and costs ZERO I/O. Every seam FORWARDS the config
+        flag here rather than short-circuiting locally, so one hot-reload of
+        ``delivered_checks.enabled`` disarms all eleven guards at once."""
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=self._SHA, failed_check=self._grep_check(),
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, enabled=False,
+        )
+
+        assert block is None
+        verify.assert_not_awaited()
+        git_ops.get_main_sha.assert_not_awaited()
+
+    # -- main-SHA resolution fail-safe arms (kept DISTINCT) ----------------
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_raising_is_fail_safe(self, caplog):
+        """``get_main_sha()`` raising (git error) -> ``main_sha_unresolved``
+        with a ``None`` SHA, and the checks are NEVER run (there is no ref to
+        run them against)."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(raises=True),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+        assert 't-1' in self._warnings(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_get_main_sha_empty_is_fail_safe_with_distinct_warning(self, caplog):
+        """``get_main_sha()`` returning ``''`` -> the same block class, but a
+        DISTINCT warning text. Kept separate from the raising arm so a
+        regression that drops either one is caught: an empty SHA is a silent
+        git-state anomaly, not an exception."""
+        verify = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(sha=''),
+            )
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        assert block.main_sha is None
+        verify.assert_not_awaited()
+
+        empty_text = self._warnings(caplog)[0].getMessage()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            await self._call(
+                self._meta(), verify_mock=AsyncMock(),
+                git_ops=self._git_ops(raises=True),
+            )
+        raising_text = self._warnings(caplog)[0].getMessage()
+        assert empty_text != raising_text
+
+    # -- never-raises -------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_verify_raising_degrades_to_errored_block(self, caplog):
+        """Defence in depth: ``verify_delivered_checks_on_main`` documents
+        "Never raises", but if that contract is ever broken the guard must
+        still not be able to CRASH a mark-done path. It degrades to a
+        fail-safe ``errored`` block instead of propagating."""
+        verify = AsyncMock(side_effect=RuntimeError('verify exploded'))
+
+        with caplog.at_level(logging.WARNING, logger=_SEAM_LOGGER.name):
+            block = await self._call(
+                self._meta(), verify_mock=verify, git_ops=self._git_ops(),
+            )
+
+        assert block is not None
+        assert block.reason == 'errored'
+        assert block.main_sha == self._SHA
+
+    # -- pre-resolved main_sha mode ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_short_circuits_git(self):
+        """The two seams that already hold a main SHA (``reconcile_landed_row``
+        RC-2 and ``_handle_already_done_report``) pass it through.
+
+        Not merely an optimization — a CORRECTNESS requirement: both have
+        already made an ancestry decision against that exact SHA, and
+        re-resolving could audit a DIFFERENT (newer) main than the decision
+        being gated.
+        """
+        supplied = 'f' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+        git_ops = self._git_ops()
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=git_ops, main_sha=supplied,
+        )
+
+        assert block is None
+        git_ops.get_main_sha.assert_not_awaited()
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_supplied_main_sha_permits_no_git_ops(self):
+        """In pre-resolved mode ``git_ops=None`` is acceptable — merge_queue's
+        module-level ``reconcile_landed_row`` has no git_ops handle at all."""
+        supplied = 'e' * 40
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=supplied,
+        ))
+
+        block = await self._call(
+            self._meta(), verify_mock=verify, git_ops=None, main_sha=supplied,
+        )
+
+        assert block is None
+        assert verify.await_args is not None
+        assert verify.await_args.kwargs['main_sha'] == supplied
+
+    @pytest.mark.asyncio
+    async def test_no_git_ops_and_no_main_sha_is_fail_safe(self):
+        """Conversely: no git_ops AND no pre-resolved SHA means the guard
+        cannot resolve a ref at all -> fail-safe block, never a silent pass."""
+        verify = AsyncMock()
+
+        block = await self._call(self._meta(), verify_mock=verify, git_ops=None)
+
+        assert block is not None
+        assert block.reason == 'main_sha_unresolved'
+        verify.assert_not_awaited()
+
+    # -- delegation contract ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_forwards_project_root_timeout_and_runner_verbatim(self):
+        """The helper is a DECISION layer, not a second check runner: the
+        checks list, project_root, check_timeout_secs and the injected runner
+        all reach ``verify_delivered_checks_on_main`` verbatim."""
+        checks = [self._grep_check('a', 'PatA'), self._grep_check('b', 'PatB')]
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=self._SHA,
+        ))
+
+        async def _custom_runner(argv, **kwargs):
+            return (0, '', '')
+
+        block = await self._call(
+            self._meta(checks),
+            verify_mock=verify,
+            git_ops=self._git_ops(),
+            project_root='/some/main/checkout',
+            check_timeout_secs=17.5,
+            runner=_custom_runner,
+        )
+
+        assert block is None
+        verify.assert_awaited_once()
+        assert verify.await_args is not None
+        assert verify.await_args.args[0] == checks
+        assert verify.await_args.kwargs['project_root'] == '/some/main/checkout'
+        assert verify.await_args.kwargs['check_timeout_secs'] == 17.5
+        assert verify.await_args.kwargs['main_sha'] == self._SHA
+        assert verify.await_args.kwargs['runner'] is _custom_runner

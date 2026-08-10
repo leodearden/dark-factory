@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -761,6 +762,55 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reason'] == 'no_transcript'
+
+
+# ── B4': the lane was reseeded → EXPECTED fallback, no escalation ────────────
+@pytest.mark.asyncio
+async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Harness):
+    """B4' — the reseeded-lane case is an EXPECTED fallback, not an escalation
+    (task 3256).
+
+    Unlike B4 (where the transcript never existed, so boot recovery stashed no
+    config dir at all), here the transcript DOES corroborate at boot — the
+    config dir is genuinely stashed — and the whole ``<lane>/.task/`` tree is
+    then wiped between adoption and re-dispatch, exactly as warm-lane acquire's
+    always-reseed-from-base invariant does (``git clean -xfd`` on RECYCLE,
+    ``rmtree(lane/'.task')`` on RESET_IN_PLACE_REATTACH).
+
+    Two-way: β genuinely stashed the config dir AND γ independently reclassified
+    the vanished store as ``reason='reseeded'`` — emitting the measurement event
+    but filing NO L1, even with ``fallback_storm_threshold=1`` where any genuine
+    fallback would fire immediately. The recovered plan still flows through as
+    ``initial_plan`` (I3 — the wipe costs the resume, never the plan).
+    """
+    task_id, session_id = '444', 'uuid-b4b-reseeded'
+    lane = _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_transcript=True,
+    )
+    harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
+    harness._escalation_queue = _storm_queue()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): the transcript corroborated, so a config dir IS stashed ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_session_config_dirs
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # The next acquire re-seeds the lane from base, wiping .task/ wholesale —
+    # the stashed config dir now points at a path that no longer exists.
+    shutil.rmtree(lane / '.task')
+    assert not Path(harness._recovered_session_config_dirs[task_id]).exists()
+
+    # ── INJECT side (γ): expected fallback — event yes, escalation no ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    assert kwargs['data']['reason'] == 'reseeded'
+    assert harness._escalation_queue.submit.call_count == 0
 
 
 # ── B5: stale sidecar beyond the freshness window ────────────────────────────

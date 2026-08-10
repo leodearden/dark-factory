@@ -22,6 +22,17 @@
 # NOT "the /proc scan is too costly for ε": task 5572 moved the lane guard's own
 # per-entry scan onto exactly that path, cost measured and accepted.
 #
+# Protect glob (task 3292): this sweep carries NONE of its own, deliberately and
+# by inheritance rather than by omission. It has no --protect-glob flag and never
+# had one; its terminal `exec "$GC_SCRIPT" "${args[@]}"` passes reclaim --mount
+# (plus an optional --disk-pressure), so warm-lane-gc.sh's default reaches it
+# unchanged — and that default is now RENDERED from dark-factory's
+# PROTECTED_PREFIXES registry (see lane_protect_glob in lib_lane_state.sh, and
+# Delta 9 in this directory's README). Rendering it here as well would double the
+# cost — one python3 start with a pydantic import per invocation — on the one
+# production path that runs from a systemd timer, for no behaviour change. The
+# question is settled; please do not re-open it.
+#
 # Live-consumer lane guard (task 5378 → MOVED INTO warm-lane-gc.sh by task 5572):
 # this sweep no longer computes a live-lane CSV and no longer passes
 # --extra-protect-glob. The guard now lives in the PRIMITIVE, checked per lane

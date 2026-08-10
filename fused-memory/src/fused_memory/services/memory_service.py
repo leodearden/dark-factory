@@ -28,8 +28,11 @@ from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
     PARENT_ID_DEAD_CODE,
     PARENT_ID_UNAVAILABLE_CODE,
+    CanonicalUniquenessViolation,
     MemoryMetadataValidationError,
+    MetadataViolation,
     ParentHasChildrenError,
+    is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
 )
@@ -74,6 +77,7 @@ from fused_memory.services.memory_metadata_census import (
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.validation import require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -416,6 +420,8 @@ async def _apply_memory_metadata_validation(
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
+    count_canonical: Callable[[str, dict], Awaitable[int]],
+    find_canonical: Callable[..., Awaitable[list[dict]]],
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
@@ -429,7 +435,7 @@ async def _apply_memory_metadata_validation(
     is a second write path that a tools-layer validator would leak past.
     Two call sites with drifting behaviour would reopen that hole.
 
-    Discharges four obligations:
+    Discharges five obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
        in-place mutation is ``supersedes`` scalar→list, PRD D2).
@@ -438,6 +444,11 @@ async def _apply_memory_metadata_validation(
     4. **Reject** — but ONLY when ``enforce`` is on AND at least one
        violation is fatal.  Unknown keys are never fatal, so flipping
        ``enforce`` cannot turn the 1,627-key long tail into an outage.
+    5. **Re-check ``canonical`` UNIQUENESS** (task 3198, leaf ε) via
+       :func:`_check_canonical_uniqueness`, which raises its own
+       :class:`CanonicalUniquenessViolation`.  It runs AFTER the reject arm
+       above: malformed metadata is refused on shape before any live-state
+       probe is spent on it.
 
     LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
     ``validate_memory_metadata`` a pure synchronous function taking only a
@@ -532,33 +543,248 @@ async def _apply_memory_metadata_validation(
                 parent_liveness_violation(meta['parent_id'], code=liveness_code)
             )
 
-    if not violations:
+    # NOTE: this is `if violations:`, not an early `return` — the canonical
+    # uniqueness re-check below must still run for metadata that is
+    # perfectly well-formed, which is the overwhelmingly common case for a
+    # canonical write.  An early return here would make the whole check
+    # dead code that still looked wired up.
+    if violations:
+        emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+
+        unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
+        if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
+            if project_root:
+                await asyncio.to_thread(
+                    file_unknown_key_storm_escalation,
+                    project_root,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    keys=unknown_keys,
+                )
+            else:
+                # No configured taskmaster.project_root means no project queue to
+                # file into. The census lines are already out, so the signal is
+                # not lost — only the escalation.
+                logger.debug(
+                    'memory_metadata: unknown-key storm from project_id=%r '
+                    'agent_id=%r but no project_root is configured; not escalating',
+                    project_id, agent_id,
+                )
+
+        if config.enforce and any(v.fatal for v in violations):
+            raise MemoryMetadataValidationError([v for v in violations if v.fatal])
+
+    await _check_canonical_uniqueness(
+        meta,
+        project_id=project_id,
+        agent_id=agent_id,
+        config=config,
+        count_canonical=count_canonical,
+        find_canonical=find_canonical,
+    )
+
+
+#: Returned as the incumbent id when the count says an incumbent exists but
+#: the follow-up scroll comes back empty (a concurrent delete between the two
+#: round-trips).  A structured rejection with an unresolvable id beats an
+#: IndexError on the live write path.
+_CANONICAL_INCUMBENT_UNKNOWN = '<unknown>'
+
+
+async def _check_canonical_uniqueness(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    config: MemoryMetadataConfig,
+    count_canonical: Callable[[str, dict], Awaitable[int]],
+    find_canonical: Callable[..., Awaitable[list[dict]]],
+) -> None:
+    """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
+
+    The live half of ``canonical``.  It lives HERE rather than in
+    :func:`~fused_memory.memory_metadata.validate_memory_metadata` because
+    it needs store state, and that validator is pure by construction — the
+    shape half (``canonical_without_topic``) stays there.
+
+    Collaborators are injected as bound callables rather than as ``self``,
+    matching how this seam already takes ``storm_detector``/``config``: the
+    module-level helper stays decoupled from ``MemoryService`` and trivially
+    stubbable.
+
+    SCOPE — THE INVARIANT IS MEM0-SCOPED (3198 amendment, stated because
+    the silence read as coverage).  Both probes go to Mem0/Qdrant payload
+    filters, but this seam deliberately runs BEFORE the
+    ``write_graphiti``/``write_mem0`` branching so that no write path can
+    bypass the vocabulary rules.  The consequence, spelled out rather than
+    left to be discovered: for a Graphiti-primary category
+    (``entities_and_relations``, ``temporal_facts``,
+    ``decisions_and_rationale``) a ``canonical: True`` record never lands
+    in Mem0, so the count cannot see a previously-written Graphiti-primary
+    canonical and the <=1-per-``(project, topic)`` rule does NOT hold for
+    those categories.  This matches the PRD, whose whole vocabulary is
+    framed as the Mem0 metadata vocabulary.
+
+    The probe is nonetheless issued for every canonical write rather than
+    skipped for Graphiti-primary ones, deliberately: ``dual_write`` can
+    route any category into Mem0 too, so a category-based skip would be
+    wrong exactly when it mattered, and a Graphiti-primary canonical that
+    DOES have a Mem0 twin still gets caught.  The cost is one count that
+    can only return 0 on a Graphiti-only canonical write — a rare write on
+    a rare key.  ``TestCanonicalUniquenessAtSeam`` pins this behaviour for
+    ``decisions_and_rationale`` so a later reader cannot mistake it for
+    coverage.  Closing the gap properly needs a Graphiti-side count, which
+    the PRD does not specify — do not fake it here.
+
+    PROBE FAILURE (3198 amendment).  Both probes talk to Qdrant and
+    ``Mem0Backend.count_by_metadata`` propagates a read timeout by
+    contract, so the probe can fail for reasons that have nothing to do
+    with the write — including for a Graphiti-primary write that would
+    never have touched Mem0 at all.  Explicitly decided, not incidental:
+
+    * a failure is ALWAYS censused, under ``code``
+      ``canonical_uniqueness_check_unavailable`` — degradation is loud, and
+      an operator can grep the same census stream they already watch;
+    * ``enforce = False`` (the shipped default) → the write PROCEEDS.  Warn
+      mode's whole contract is "census the violation and let the write
+      through"; failing a valid write because the *complaint machinery* was
+      unavailable would be strictly worse than the duplicate it is trying to
+      prevent, and would contradict this seam's promise that everything but
+      the enforce-raise is best-effort;
+    * ``enforce = True`` → FAIL CLOSED: the original backend error is
+      re-raised.  An operator who turned enforcement on asked for the
+      invariant to hold; admitting an unverifiable canonical would be the
+      silent fail-soft the house norm forbids.  The error surfaces as
+      itself (bare ``raise``, traceback intact) rather than being dressed up
+      as a :class:`CanonicalUniquenessViolation`, because "the store was
+      unreachable" and "a duplicate exists" are different facts and a caller
+      must be able to tell them apart.
+
+    Ordering and guards are load-bearing — the ORDINARY write path must
+    issue ZERO extra round-trips:
+
+    1. not an asserted canonical → return.  Every non-canonical write, i.e.
+       almost all of them, stops here having done no I/O.
+    2. ``topic`` missing or not slug-valid → return.  The shape violation
+       was already reported by the pure validator, and we must never build
+       a query on a malformed key (``count_by_metadata`` also rejects an
+       empty filter).
+    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+       count and never scrolls.
+    4. otherwise resolve the incumbent's id and reject.
+
+    WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
+    as the INV-3 mechanism, but also requires the error to name the existing
+    canonical's id — which an ``int`` structurally cannot carry.  Counting
+    first honours both, and confines the second round-trip to a path that is
+    already failing the write, where its cost is irrelevant.
+
+    WHY THE EXISTING ``enforce`` FLAG AND NOT A NEW ONE: measured, not
+    assumed.  When this was written the live ``dark_factory`` corpus held
+    exactly ONE ``canonical: true`` record, and its ``topic`` was
+    ``eval_worktree_plan_tools_missing`` — snake_case, which fails
+    ``TOPIC_SLUG_RE``.  Enforcing uniqueness on day one over a topic key
+    whose own live values still only warn would be the census-refuted-premise
+    outage the warn default exists to prevent, and would make uniqueness the
+    single fatal check that ignores the flag every sibling check honours.
+
+    THAT SPECIFIC HAZARD IS NOW CLEARED, AND θ WAS NOT ACTUALLY THE GATE
+    (measured 2026-08-04).  Two corrections to the paragraph above, both
+    recorded because the original wording sent a reader to the wrong check:
+
+    * ``retro_stamp_topics.py`` has now been RUN (``--apply``), and the
+      residual records outside its id-bounded manifest were normalized too,
+      so ``legacy_topic_spelling_remains`` is empty and every live
+      ``canonical: true`` topic conforms in BOTH projects.  Note the trap
+      this sentence used to set: task 3201 was ``done`` for months meaning
+      the SCRIPT had landed, while the sweep had never been applied
+      (``stamped_total: 0``).  "Has θ landed?" is the wrong question —
+      re-run the script and read ``legacy_topic_spelling_remains``.
+    * θ was necessary bookkeeping but nearly irrelevant to blast radius.
+      ``enforce`` rejects WRITES and never re-validates the corpus, so
+      normalizing records at rest moved the measured false-rejection rate
+      by ~1/week (~20 → ~19).  Rejections come from NEW writes by writers
+      who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
+      no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
+
+    Task 3626 is the gate that re-measures and decides the flip; it carries
+    the full model and the re-measurement recipes.  Do not flip from this
+    docstring alone.
+
+    RESIDUAL — this check is inherently TOCTOU-windowed: two concurrent
+    first-canonical writes for one topic can both observe 0 and both
+    succeed.  The PRD specifies no locking and Qdrant has no unique
+    constraint, so the window is stated plainly rather than papered over
+    with an implication of atomicity.  ``pick_survivor``
+    (``fused-memory/scripts/audit_duplicate_memories.py``) remains the
+    after-the-fact backstop that resolves a duplicate pair.  Do NOT add
+    locking here — that would be an unreviewed scope expansion.
+    """
+    if meta.get('canonical') is not True:
         return
 
-    emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+    topic = meta.get('topic')
+    if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
 
-    unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
-    if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
-        if project_root:
-            await asyncio.to_thread(
-                file_unknown_key_storm_escalation,
-                project_root,
-                project_id=project_id,
-                agent_id=agent_id,
-                keys=unknown_keys,
-            )
-        else:
-            # No configured taskmaster.project_root means no project queue to
-            # file into. The census lines are already out, so the signal is
-            # not lost — only the escalation.
-            logger.debug(
-                'memory_metadata: unknown-key storm from project_id=%r '
-                'agent_id=%r but no project_root is configured; not escalating',
-                project_id, agent_id,
-            )
+    filters = {'topic': topic, 'canonical': True}
 
-    if config.enforce and any(v.fatal for v in violations):
-        raise MemoryMetadataValidationError([v for v in violations if v.fatal])
+    def _census(code: str, message: str) -> None:
+        """Emit one uniqueness census line.
+
+        Routed through the SAME ``emit_schema_warnings`` path the shape
+        violations use, so every code this check can produce is
+        grep-anchored in the one census format operators already know
+        (V1: "grep-anchored, never renamed").
+        """
+        emit_schema_warnings(
+            [MetadataViolation(key='canonical', code=code, message=message, fatal=True)],
+            project_id=project_id,
+            agent_id=agent_id,
+        )
+
+    try:
+        if await count_canonical(project_id, filters) == 0:
+            return
+        records = await find_canonical(project_id, filters, limit=1)
+    except Exception as exc:
+        # The PROBE failed, not the write — a Qdrant timeout/outage, which
+        # `count_by_metadata` propagates by contract.  Always censused
+        # (degradation is loud); fail-open under the shipped warn default
+        # because failing a valid write when only the complaint machinery
+        # broke is worse than the duplicate it guards against; fail-closed
+        # under `enforce` because an unverifiable canonical must not be
+        # admitted silently.  Re-raised bare so the caller sees the real
+        # backend error rather than a CanonicalUniquenessViolation that
+        # would assert a duplicate we never actually observed.  Full
+        # reasoning under PROBE FAILURE in the docstring.
+        _census(
+            'canonical_uniqueness_check_unavailable',
+            f'could not verify <=1 canonical per (project, topic) for '
+            f'project_id={project_id!r} topic={topic!r}: '
+            f'{type(exc).__name__}: {exc}',
+        )
+        if config.enforce:
+            raise
+        return
+
+    incumbent_id = (
+        records[0].get('id', _CANONICAL_INCUMBENT_UNKNOWN)
+        if records
+        else _CANONICAL_INCUMBENT_UNKNOWN
+    )
+    error = CanonicalUniquenessViolation(
+        project_id=project_id, topic=topic, incumbent_id=incumbent_id
+    )
+
+    # `config.enforce` is read PER CALL off the shared config object, never
+    # captured, so a config edit takes effect on the next write — the same
+    # note this seam already makes about the shape-check enforce flag.
+    if config.enforce:
+        raise error
+
+    # Warn mode: census the violation and let the write proceed.
+    _census('canonical_uniqueness_violation', str(error))
 
 
 def _apply_cycle_summary_metadata_tagging(
@@ -1051,6 +1277,7 @@ class MemoryService:
             write_timeout_seconds=qcfg.write_timeout_seconds,
             transient_max_attempts=qcfg.transient_max_attempts,
             transient_error_names=qcfg.transient_error_names,
+            on_terminal=self._record_queue_terminal_outcome,
         )
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
@@ -1188,6 +1415,35 @@ class MemoryService:
                     error=str(e),
                 )
             raise
+
+    async def _record_queue_terminal_outcome(
+        self,
+        write_op_id: str,
+        terminal_status: str,
+        error: str | None = None,
+    ) -> None:
+        """Write a durable-queue terminal outcome back onto its write_op row.
+
+        Passed to ``DurableWriteQueue(on_terminal=...)`` in ``initialize()``.
+        Because it lives at the queue seam, every enqueue site inherits the
+        write-back: ``add_episode``, ``add_memory``'s Graphiti leg, and the
+        retained ``mem0_add`` dispatcher alike.
+
+        This is a BOUND METHOD rather than a captured ``WriteJournal``
+        reference so ``self._write_journal`` is resolved at CALL time — the
+        same lazy-collaborator idiom as ``execute_write=self._execute_durable_write``.
+        It has to be: ``server/main.py`` calls ``memory_service.initialize()``
+        (which constructs the queue) BEFORE ``set_write_journal()``, so the
+        journal is still ``None`` when the hook is wired.
+        """
+        journal = self._write_journal
+        if journal is None:
+            return
+        await journal.record_terminal_outcome(
+            write_op_id=write_op_id,
+            terminal_status=terminal_status,
+            terminal_error=error,
+        )
 
     @staticmethod
     def _mem0_payload_digest(
@@ -2106,37 +2362,52 @@ class MemoryService:
             session_id=payload.get('session_id'),
         )
         metadata = payload.get('metadata', {})
+        # Resolved once, outside the try, so every attempt journals against a
+        # stable id when the payload carries no '_write_op_id'.
+        journal_write_op_id = write_op_id or str(uuid_mod.uuid4())
 
-        result = await self._journaled_backend_call(
-            write_op_id=write_op_id,
-            causation_id=causation_id,
-            backend='mem0',
-            operation='add',
-            payload={'content': payload['content'][:200]},
-            coro=self.mem0.add(
-                content=payload['content'], scope=scope, metadata=metadata
-            ),
-        )
-
-        # Log Layer 1 for the queued write
-        if self._write_journal:
-            await self._write_journal.log_write_op(
-                write_op_id=write_op_id or str(uuid_mod.uuid4()),
+        result = None
+        error_msg = None
+        try:
+            result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
                 causation_id=causation_id,
-                source='durable_queue',
-                operation='add_memory',
-                project_id=payload['project_id'],
-                agent_id=payload.get('agent_id'),
-                session_id=payload.get('session_id'),
-                params={
-                    'content': payload['content'][:200],
-                    'category': metadata.get('category', ''),
-                },
-                result_summary=str(result)[:500] if result else None,
-                success=True,
+                backend='mem0',
+                operation='add',
+                payload={'content': payload['content'][:200]},
+                coro=self.mem0.add(
+                    content=payload['content'], scope=scope, metadata=metadata
+                ),
             )
-
-        return result
+            return result
+        except Exception as e:
+            error_msg = f'{type(e).__name__}: {e}'
+            raise
+        finally:
+            # Log Layer 1 for the queued write on BOTH paths (task 3582). This
+            # used to run only after a successful await, so a mem0_add that
+            # dead-lettered never produced a write_ops row at all — leaving the
+            # queue's terminal write-back nothing well-formed to land on, and
+            # the failure invisible to the journal. The `finally` mirrors
+            # add_episode's, and log_write_op is an upsert, so the retries of a
+            # single item converge on one row whose last attempt wins.
+            if self._write_journal:
+                await self._write_journal.log_write_op(
+                    write_op_id=journal_write_op_id,
+                    causation_id=causation_id,
+                    source='durable_queue',
+                    operation='add_memory',
+                    project_id=payload['project_id'],
+                    agent_id=payload.get('agent_id'),
+                    session_id=payload.get('session_id'),
+                    params={
+                        'content': payload['content'][:200],
+                        'category': metadata.get('category', ''),
+                    },
+                    result_summary=str(result)[:500] if result else None,
+                    success=error_msg is None,
+                    error=error_msg,
+                )
 
     async def _execute_mem0_classify_and_add(
         self, payload: dict[str, Any]
@@ -2460,7 +2731,12 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            # Bound methods, not `self`: the module-level helper stays
+            # decoupled from MemoryService and trivially stubbable, matching
+            # how it already takes storm_detector/config as collaborators.
             parent_lookup=self.get_memory_by_id,
+            count_canonical=self.count_memories_by_metadata,
+            find_canonical=self.get_memories_by_metadata,
         )
 
         write_graphiti = (
@@ -2827,7 +3103,12 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            # Bound methods, not `self`: the module-level helper stays
+            # decoupled from MemoryService and trivially stubbable, matching
+            # how it already takes storm_detector/config as collaborators.
             parent_lookup=self.get_memory_by_id,
+            count_canonical=self.count_memories_by_metadata,
+            find_canonical=self.get_memories_by_metadata,
         )
 
         mem0_result = None
@@ -3576,6 +3857,60 @@ class MemoryService:
         _normalize_task_id_metadata(filters)
         return await self.mem0.count_by_metadata(scope, filters)
 
+    async def scan_memory_content(
+        self,
+        project_id: str,
+        needles: list[str] | None = None,
+        *,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Literal substring scan over Mem0 payload TEXT (task 3083, WORK b).
+
+        Thin passthrough to ``Mem0Backend.scan_payload_text``. Neither semantic
+        (``search``) nor metadata equality
+        (``count_memories_by_metadata``/``get_memories_by_metadata``) — it
+        matches the memory TEXT itself, which is the capability whose absence
+        made the tool-call XML leak corpus unsweepable: a leaked serialized
+        fragment carries almost no semantic signal, so a live 2026-07-26
+        semantic probe for it returned zero.
+
+        *needles* and *filters* of ``None`` are passed through AS ``None``;
+        the backend supplies the default needle set from
+        ``fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`` so the
+        sentinels are defined in exactly one place. The caller's collections
+        are copied before use and never mutated.
+
+        A ``task_id`` filter is normalized to str on the COPY, exactly as
+        ``count_memories_by_metadata``/``get_memories_by_metadata`` do — see
+        ``_normalize_task_id_metadata``'s docstring. The backend turns every
+        filter entry into a ``MatchValue`` equality condition and Qdrant's
+        payload filter is TYPE-SENSITIVE, so without this an int ``task_id``
+        would match nothing and return an empty scan with no error: a
+        silently-wrong clean verdict, which is the exact failure class this
+        tool exists to eliminate.
+
+        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
+
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
+        returned as an empty match list — a timed-out scan must never be
+        mistaken for a clean corpus — and is surfaced at the MCP boundary as
+        ``{'error', 'error_type': 'TimeoutError'}`` by ``@mcp_tool_errors``.
+        """
+        scope = Scope(project_id=project_id)
+        scan_filters = None
+        if filters is not None:
+            scan_filters = dict(filters)
+            _normalize_task_id_metadata(scan_filters)
+        return await self.mem0.scan_payload_text(
+            scope=scope,
+            needles=list(needles) if needles is not None else None,
+            filters=scan_filters,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+
     async def get_memories_by_metadata(
         self,
         project_id: str,
@@ -4036,6 +4371,31 @@ class MemoryService:
         CHILDREN FIRST and the parent last, then re-checks.  See
         :meth:`_cascade_delete_children`.
 
+        ``memory_id`` is validated for SHAPE ONLY: it must be a canonical
+        36-character UUID. A truncated id (e.g. an 8-char hex prefix lifted out
+        of a search-result snippet) raises rather than silently no-opping —
+        both backends treat a miss as "already deleted", so without this guard
+        such a call got a confirming ``{'status': 'deleted'}`` envelope, a
+        ``success=True`` journal entry and a ``memory_deleted`` event while
+        nothing was removed.
+
+        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
+        well-formed UUID that no longer resolves — a stale id copied out of an
+        old report, a survivor id from an earlier consolidation — still reports
+        ``deleted``, for exactly the same backend reason. Closing that half
+        needs a per-store existence read: ``update_memory`` below already does
+        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
+        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
+        not-found from already-deleted. Deliberately out of scope here — task
+        3132 closes the malformed-shape half only.
+
+        The guard sits above the store branch so ONE check covers both the
+        Graphiti and Mem0 paths, and above the journal write and event emission
+        so a rejected delete leaves no false audit trail. It sits BELOW
+        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        bad store first — the same store-then-shape precedence the MCP boundary
+        gives agents, rather than the inverse for internal callers.
+
         Raises:
             ParentHasChildrenError: the target still has children and
                 ``cascade`` was not requested — or a child SURVIVED a
@@ -4044,6 +4404,8 @@ class MemoryService:
         """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        require_full_uuid(memory_id, field_name='memory_id')
+
         write_op_id = str(uuid_mod.uuid4())
         cascaded_child_ids: list[str] = []
 
@@ -4784,6 +5146,70 @@ class MemoryService:
             )
 
         return {'status': 'deleted', 'episode_id': episode_id, 'cascade': cascade}
+
+    async def redact_episode_content(
+        self,
+        episode_uuid: str,
+        new_content: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Replace one Graphiti episode's raw content in place, preserving its edges.
+
+        The non-destructive counterpart to ``delete_episode`` for an episode
+        whose text carries a leaked serialized tool-call fragment (task 3083).
+        ``delete_episode(cascade=True)`` would destroy the entities and edges
+        exclusively sourced from that episode — which for the known residual
+        ``d12b0eb4`` includes demonstrably-valid collateral — so the leak is
+        neutralised in the raw text and the extracted knowledge is left alone.
+
+        See ``GraphitiBackend.redact_episode_content`` for the full rationale
+        and for the loud refusals (blank replacement, or a replacement that
+        still carries a leak, or an absent episode uuid).
+
+        Returns:
+            ``{status, store, uuid, old_content, new_content}``.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+
+        result_data = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='redact_episode_content',
+            payload={'episode_uuid': episode_uuid},
+            coro=self.graphiti.redact_episode_content(
+                episode_uuid, group_id=project_id, new_content=new_content,
+            ),
+        )
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='redact_episode_content',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                # Truncated copies for the journal only — the full strings are
+                # returned to the caller for audit.
+                params={
+                    'episode_uuid': episode_uuid,
+                    'new_content': new_content[:200],
+                },
+                result_summary={'status': 'redacted'},
+                success=True,
+            )
+
+        return {
+            'status': 'redacted',
+            'store': 'graphiti',
+            **(result_data or {}),
+        }
 
     async def refresh_entity_summary(
         self,

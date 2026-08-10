@@ -76,10 +76,18 @@ six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
 from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
 The get_statuses done-count fetch is injected (`status_fetcher`), not a
-hardcoded MCP/HTTP client: the scripts/ test env (`uv run --project
-shared`) has no httpx and no MCP client available (see
-shared/pyproject.toml), so the pure decision core stays fully unit-testable
-and "a failing get_statuses fails SAFE" is testable with a raising fake.
+hardcoded MCP/HTTP client. The seam exists for DETERMINISM, and it is not a
+workaround for a missing package: httpx IS installed here -- a direct
+dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`, task 2965) --
+so `default_status_fetcher`'s lazy `import httpx` below resolves to the real
+library and really does POST to $FUSED_MEMORY_MCP_URL (default
+localhost:8002). On any box running the fused-memory stack that POST
+SUCCEEDS, so a test leaning on ambient unreachability flaps with the host's
+listener state (task 3291). Injecting therefore matters MORE now, not less:
+it keeps the pure decision core fully unit-testable and makes "a failing
+get_statuses fails SAFE" testable with a raising fake regardless of what is
+listening. (No MCP client library is available in that env either, so a
+hardcoded MCP client could not be exercised there at all.)
 `default_status_fetcher` provides a best-effort glue implementation for the
 standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
@@ -101,26 +109,40 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import overload
 
 import yaml
-
 from legibility import codebook
 from legibility.config import Census as _LegibilityCensus
 
 logger = logging.getLogger("legibility.census_trigger")
 
 
+@overload
+def _as_utc(value: datetime) -> datetime: ...
+
+
+@overload
+def _as_utc(value: None) -> None: ...
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """Normalize a datetime to timezone-aware UTC. A naive datetime (e.g.
     parsed from a bare `YYYY-MM-DD` codebook date) is assumed to already be
-    UTC. `None` passes through unchanged."""
+    UTC. `None` passes through unchanged.
+
+    Overloaded because the pass-through is exactly correlated with the input:
+    the plain `datetime | None -> datetime | None` signature discarded that,
+    so `evaluate`'s `now` (declared non-Optional) came back Optional and made
+    every subsequent arithmetic on it a type error. The overloads state what
+    the body already does; the runtime implementation is unchanged."""
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +176,7 @@ class CensusConfig:
     floor_days: int = _CENSUS_DEFAULTS.floor_days
 
     @classmethod
-    def from_mapping(cls, mapping: dict | None) -> "CensusConfig":
+    def from_mapping(cls, mapping: dict | None) -> CensusConfig:
         """Build a CensusConfig by merging `mapping` (shaped like §7.4's
         `census:` block, e.g. `{"max_interval_days": 3, "novelty_spike":
         {"count": 9}}`) over the defaults. Keys absent from `mapping`
@@ -237,10 +259,7 @@ def evaluate(
         reasons.append("tasks-landed: delta unavailable (no baseline/fetcher) -> N/A")
     elif days_since is None or days_since < config.tasks_landed_min_days:
         reasons.append(
-            "tasks-landed: {} landed but only {:.1f}d elapsed (min {}d) -> N/A".format(
-                tasks_landed, days_since if days_since is not None else 0.0,
-                config.tasks_landed_min_days,
-            )
+            f"tasks-landed: {tasks_landed} landed but only {days_since if days_since is not None else 0.0:.1f}d elapsed (min {config.tasks_landed_min_days}d) -> N/A"
         )
     else:
         reasons.append(
@@ -270,9 +289,7 @@ def evaluate(
     )
     if floor_blocks:
         reasons.append(
-            "floor: only {:.1f}d since last census (floor {}d) -> BLOCKS all conditions".format(
-                days_since, config.floor_days
-            )
+            f"floor: only {days_since:.1f}d since last census (floor {config.floor_days}d) -> BLOCKS all conditions"
         )
     elif never_censused:
         reasons.append("floor: never censused -> exempt")
@@ -305,7 +322,7 @@ def load_census_state(path: str | Path) -> tuple[str, dict | None]:
         return "missing", None
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("census state at %s is malformed: %s", path, exc)
@@ -407,7 +424,7 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
         return CensusConfig()
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as exc:
         logger.warning("legibility config at %s is malformed: %s", path, exc)
@@ -693,8 +710,10 @@ def default_status_fetcher(project_root: str | Path):
     `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
     nightly trickle instead -- see module docstring). Reads the fused-memory
     MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
-    `http://localhost:8002`. `httpx` is imported lazily since it is not a
-    scripts/ dependency (see module docstring); that ImportError, along with
+    `http://localhost:8002`. `httpx` is imported lazily so importing this
+    module for its pure core never needs it, and so tests can substitute a
+    stub for the real POST -- not for availability (see module docstring);
+    that ImportError, along with
     any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
     so callers can catch fetch failures deterministically rather than a bare
     Exception. The raw JSON-RPC `tools/call` response is unwrapped via
@@ -794,7 +813,7 @@ def decide_for_project(
     has already logged its one WARNING, so nothing else needs to.
     """
     project_root = Path(project_root)
-    now = now if now is not None else datetime.now(timezone.utc)
+    now = now if now is not None else datetime.now(UTC)
 
     config = load_census_config(project_root)
 

@@ -14,11 +14,10 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
-
 from legibility import codebook as mod
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -756,14 +755,24 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
 # in the mutation logic — mirrors validate()'s isinstance guard.
 # ---------------------------------------------------------------------------
 
+# Both functions are DECLARED `codebook: dict`, and these two tests
+# deliberately violate that to exercise the runtime isinstance guard — the
+# point being that an empty codebook file loads via yaml.safe_load as None,
+# so this is a real production input, not a synthetic one. The Any-typed
+# local states "statically unconstrained on purpose" without suppressing the
+# diagnostic, and without widening the production signature (which would
+# weaken it for every legitimate caller).
+_NOT_A_CODEBOOK: Any = None
+
+
 def test_migrate_v1_to_v2_raises_on_non_dict_codebook():
     with pytest.raises(ValueError):
-        mod.migrate_v1_to_v2(None)
+        mod.migrate_v1_to_v2(_NOT_A_CODEBOOK)
 
 
 def test_apply_coding_record_raises_on_non_dict_codebook():
     with pytest.raises(ValueError):
-        mod.apply_coding_record(None, _match_record())
+        mod.apply_coding_record(_NOT_A_CODEBOOK, _match_record())
 
 
 # ---------------------------------------------------------------------------

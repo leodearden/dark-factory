@@ -22,12 +22,16 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.models import Escalation
 
+from orchestrator.config import DeliveredChecksConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.harness import Harness
 from orchestrator.landing_evidence import LandingEvidenceVerdict
 
@@ -120,19 +124,6 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
     trips exactly one guard — the gate must return False and must NOT
     call _mark_in_progress_done.
     """
-
-    async def test_open_l1_vetoes_flip(self, mock_orch_config) -> None:
-        """An open L1 escalation is a deliberate human handoff — never
-        second-guessed, even though is_ancestor is True.
-        """
-        h = _wired_ancestry_harness(mock_orch_config)
-        h._escalation_queue = MagicMock()
-        h._escalation_queue.has_open_l1 = MagicMock(return_value=True)
-
-        result = await h._already_landed_dispatch_gate('42')
-
-        assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
     async def test_degenerate_branch_vetoes_flip(self, mock_orch_config) -> None:
         """A degenerate branch (tip == branch_base_sha) carries zero task
@@ -362,6 +353,223 @@ class TestAlreadyLandedDispatchGateAncestryDelegatesToHelper:
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
+def _open_escalation(
+    esc_id: str, *, level: int, severity: str = 'blocking',
+) -> Escalation:
+    """A pending escalation row as ``get_by_task(tid, status='pending')`` yields.
+
+    ``filing_claimant_run_id`` is left at its default ``None`` (the shape every
+    legacy row and most current producers carry) — irrelevant for L1/L2, and
+    for L0 the gate passes ``live_claimant=False``, which classifies
+    ``dead_l0`` identity-independently.
+    """
+    return Escalation(
+        id=esc_id,
+        task_id='42',
+        agent_role='implementer',
+        severity=severity,
+        category='design_concern',
+        summary='an open handoff on task 42',
+        level=level,
+    )
+
+
+def _queue_with_open(*records: Escalation) -> MagicMock:
+    """An escalation queue whose ANY-LEVEL pending read yields *records*.
+
+    ``has_open_l1`` is pinned False on purpose: after task 3534 the gate's veto
+    no longer consults the L1-only read at all, so a sub-case that vetoes here
+    proves it went through ``get_by_task(..., status='pending')``.  The stub
+    stays because ``landing_evidence._file_unattributed_landing_escalation``
+    still consumes ``has_open_l1`` for escalation dedup.
+    """
+    queue = MagicMock()
+    queue.has_open_l1 = MagicMock(return_value=False)
+    queue.get_by_task = MagicMock(return_value=list(records))
+    queue.make_id = MagicMock(return_value='esc-42-1')
+    return queue
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateAnyLevelVeto:
+    """The escalation veto is ANY-LEVEL, not L1-only (task 3534 / PRD eta-0).
+
+    Spec ``docs/task-escalation-state-spec.md`` E8: the gate's veto read was
+    ``has_open_l1(task_id)``, which silently missed an L2-only (or L0-only)
+    open escalation while its own docstring claimed parity with
+    ``_reconcile_one_stranded``, which went any-level in W10.  The veto now
+    asks the shared ``escalation.pins.classify_pins(...).vetoes_done_flip``
+    predicate over the same ``get_by_task(tid, status='pending')`` rows the
+    resolver's row (f) reads.
+
+    Every sub-case starts from an otherwise-flipping ancestry setup and
+    overrides only ``_escalation_queue``.
+    """
+
+    async def test_open_l2_only_vetoes_flip(self, mock_orch_config) -> None:
+        """PRD boundary row #10: an L2-ONLY open escalation must veto the
+        auto-done flip.  This is the exact record the old L1-only read missed.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_with(
+            '42', status='pending',
+        )
+        # "Neither layer costs an extra store read": the durable arbitration
+        # hold and this veto both decide from the SAME single read.
+        assert cast(MagicMock, h._escalation_queue).get_by_task.call_count == 1
+
+    async def test_open_l0_only_vetoes_flip(self, mock_orch_config) -> None:
+        """An L0-ONLY open escalation also vetoes the flip.
+
+        Under ``live_claimant=False`` it classifies ``dead_l0`` — which does
+        NOT pin recovery (spec S4) but DOES veto a done-flip (PRD D3: "any
+        non-info open record still vetoes MARK_DONE").  Pins the liveness-
+        independence this call site relies on: both ``dead_l0`` and
+        ``queue_handoff`` set ``vetoes_done_flip``, so the gate never has to
+        resolve the task's live claimant.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-3', level=0),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_open_l1_still_vetoes_flip(self, mock_orch_config) -> None:
+        """An open L1 escalation is a deliberate handoff — never second-guessed,
+        even though is_ancestor is True.  Migrated off the ``has_open_l1``
+        stub (dead wiring once the gate stops reading it) onto the any-level
+        pending read, so "existing L1 behaviour unchanged" stays verified.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-7', level=1),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_veto_logs_the_pinning_escalation_ids(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """The veto is LOUD: it names the task and the pinning escalation ids.
+
+        The "not silently" half of boundary row #10 — a task that stops
+        auto-flipping must say which record pinned it.  (Task beta/3535
+        replaces this log line with the structured ``recovery_vetoed``
+        emission plus streak dedup.)
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness'
+        ]
+        # ``'task 42'``, not ``'42'``: the bare id is already a substring of
+        # ``'esc-42-9'``, so asserting on it verified nothing about task
+        # attribution — a line that dropped the task entirely would pass.
+        assert any('esc-42-9' in m and 'task 42' in m for m in messages), messages
+
+    async def test_info_severity_only_does_not_veto(
+        self, mock_orch_config,
+    ) -> None:
+        """PRD D3 / boundary row #8: an ``info``-severity record NEVER pins.
+
+        Guards the choice of predicate rather than the change itself: green
+        both before and after, but RED against a naive ``bool(pending_rows)``
+        veto — under which a genuinely-landed task carrying one
+        ``escalate_info`` annotation would never auto-flip and would
+        re-dispatch every tick forever.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-5', level=0, severity='info'),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+    async def test_no_open_records_flips_as_today(self, mock_orch_config) -> None:
+        """A read that succeeded and found nothing is not a veto — the flip
+        happens exactly as it does today.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open()
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+    async def test_escalation_store_read_failure_vetoes_flip(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """A FAILED read is the third state, not "no open escalations".
+
+        The caller-side half of ``classify_pins``'s STORE-CORRECTNESS
+        CONTRACT (obligation 2: "Pass ``records=None`` when that read could
+        not be performed or failed. Never substitute ``[]``") — substituting
+        ``[]`` here would be the exact esc-3163 collapse the contract exists
+        to forbid.  So an unreadable store must veto, must not raise, and
+        must say so.
+
+        Letting the exception propagate instead would make the disposition
+        invisible: the scheduler's generic ``_consult_already_landed``
+        catch-all logs a traceback and fails open for the WHOLE gate, so
+        "never phantom-done on an unreadable store" would be incidental
+        rather than local and testable.
+
+        Note this is distinct from ``_escalation_queue is None``, which keeps
+        failing OPEN — a deliberately-absent queue (escalations disabled) is
+        not the same thing as a failed read.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        # ``'task 42'``, not ``'42'``: the bare id is satisfied by any message
+        # merely mentioning an escalation id or the queue dir path, so the
+        # task-attribution half of this assertion could never fail.
+        assert any(
+            'task 42' in m and ('store' in m.lower() or 'read' in m.lower())
+            for m in messages
+        ), messages
+
+
 def _wired_marker_harness(
     mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
 ) -> Harness:
@@ -377,6 +585,11 @@ def _wired_marker_harness(
     landing) and ``_escalation_queue`` is a wired MagicMock with
     ``has_open_l1`` defaulting False — callers flip either to exercise the
     CANDIDATE-mode reject-and-escalate path (task 2678).
+
+    ``get_by_task`` returns ``[]`` EXPLICITLY (task 3534): the gate's veto now
+    reads the any-level pending rows, and leaving that to
+    ``MagicMock.__iter__``'s empty default would make "no open escalations"
+    an accident of the mock rather than a stated precondition.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -404,6 +617,7 @@ def _wired_marker_harness(
     h._mark_in_progress_done = AsyncMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
@@ -485,9 +699,11 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
-        # has_open_l1 is also consulted by the gate's pre-existing top-of-
-        # method open-L1 veto (unrelated to this dedup check) — assert the
-        # dedup call happened (most recent call), not an exact call count.
+        # Since task 3534 the gate's own veto reads get_by_task(..., pending)
+        # instead of has_open_l1, so the escalation helper's dedup check is
+        # the ONLY has_open_l1 caller left — but assert on the most recent
+        # call rather than an exact count, so a future dedup site added
+        # elsewhere in the path doesn't turn this into a brittle failure.
         cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
         cast(MagicMock, h._escalation_queue).submit.assert_called_once()
         esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
@@ -571,6 +787,7 @@ def _wired_content_harness(
     h._mark_in_progress_done = AsyncMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
     return h
 
@@ -850,6 +1067,344 @@ class TestAlreadyLandedDispatchGateStaleEvidenceConflict:
         assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
 
 
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
+    """A contested task stays withheld even when the sink's memo is COLD.
+
+    ``TestAlreadyLandedDispatchGateStaleEvidenceConflict`` above only ever
+    exercises the WARM path: tick 1 files the conflict in the same process,
+    so tick 2 short-circuits on ``should_skip``'s in-memory memo.  That memo
+    is in-memory ONLY (``provenance_conflict.py``'s class docstring:
+    "an in-memory per-task memo ... Lost on restart"), so it is empty on any
+    process that did not itself file the conflict — after a fleet
+    redeploy / watchdog restart, or when a DIFFERENT writer site filed it
+    (``merge_queue.py``'s two ``ProvenanceConflictSink`` call sites).
+
+    With the memo cold, the task-3534 any-level veto is what sees the
+    pending ``provenance_conflict`` record — and its answer is ``return
+    False``, which means "I abstain; dispatch normally".  For a task under
+    arbitration that is precisely the outcome this gate's docstring forbids
+    ("a contested task must never dispatch while under arbitration"), so the
+    hold has to be decided from DURABLE store state, ordered above that
+    veto.  Ordering alone cannot deliver the invariant; durability can.
+    """
+
+    async def test_cold_sink_memo_still_withholds_contested_task(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A restart clears the memo but not the escalation store."""
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        result_1 = await h._already_landed_dispatch_gate('42')
+
+        assert result_1 is True, 'a contested task must not dispatch'
+        conflicts = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts) == 1, f'expected exactly one pending L2, got {len(conflicts)}'
+        assert conflicts[0].level == 2
+        assert conflicts[0].severity == 'urgent'
+
+        # SIMULATE THE RESTART: a brand-new sink (empty memo) over the SAME
+        # durable queue — exactly what a fleet redeploy leaves behind.
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+        assert h._provenance_conflict_sink.should_skip(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is False, (
+            'the fresh sink must have a COLD memo — otherwise this test '
+            'silently degrades into a re-run of the warm-memo case above'
+        )
+
+        result_2 = await h._already_landed_dispatch_gate('42')
+
+        assert result_2 is True, (
+            'a contested task must never dispatch while under arbitration — '
+            'including on a cold memo'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 1, (
+            'the durable hold must short-circuit BEFORE re-attempting the '
+            'already-rejected done-write, not merely re-derive it'
+        )
+        conflicts_after = [
+            e for e in h._escalation_queue.get_by_task('42', status='pending')
+            if e.category == 'provenance_conflict'
+        ]
+        assert len(conflicts_after) == 1, 'must not file a duplicate escalation'
+
+    async def test_conflict_filed_by_a_different_writer_site_still_withholds(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """The hold is decided from store state, with no write attempt at all.
+
+        The second half of the cold-memo finding, which a restart-only test
+        would miss: the conflict was filed by a sink instance this harness
+        has never owned (mirroring the merge-queue writer sites), so the
+        harness's own memo has never held task 42 at any point.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        # A writer site the harness does not own files the conflict.
+        foreign_sink = ProvenanceConflictSink(escalation_queue=h._escalation_queue)
+        foreign_sink.record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+
+        # The harness's own sink has never seen task 42.
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True, (
+            'a conflict filed by another writer site binds this gate too'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 0, (
+            'the hold is decided purely from durable store state — no doomed '
+            'write attempt at all'
+        )
+
+    async def test_repeated_hold_logs_info_once_then_debug(
+        self, mock_orch_config, tmp_path, caplog,
+    ) -> None:
+        """The hold is loud ONCE, then quiet (amendment,
+        reviewer_comprehensive observability_log_volume).
+
+        The any-level veto does not need this — it abstains, so the task
+        dispatches and stops being a gate candidate.  The hold does: it
+        re-fires on every dispatch tick for as long as the arbitration
+        stands, and on this (cold-memo) path it short-circuits above
+        ``_mark_in_progress_done``, so nothing ever re-warms ``should_skip``
+        to quiet it.  Unconditional INFO would be one line per scheduler
+        tick, indefinitely, until a human resolved the L2 — the log spam
+        INV-4 forbids.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            assert await h._already_landed_dispatch_gate('42') is True
+            assert await h._already_landed_dispatch_gate('42') is True
+            assert await h._already_landed_dispatch_gate('42') is True
+
+        held = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness'
+            and 'under provenance arbitration' in r.getMessage()
+        ]
+        assert len(held) == 3, [r.getMessage() for r in held]
+        assert [r.levelno for r in held] == [
+            logging.INFO, logging.DEBUG, logging.DEBUG,
+        ], [(r.levelname, r.getMessage()) for r in held]
+        assert 'task 42' in held[0].getMessage()
+
+    async def test_hold_released_then_returning_is_loud_again(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Quieting the repeats must not silence a hold that RETURNS.
+
+        The streak state is dropped whenever the hold does not bind (here:
+        the operator resolves the arbitration), so a later conflict on the
+        same task announces itself at INFO rather than being folded into a
+        stale streak.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        foreign_sink = ProvenanceConflictSink(escalation_queue=h._escalation_queue)
+        escalation_id = foreign_sink.record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        assert escalation_id is not None
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is True
+        assert h._provenance_conflict_sink.note_hold_observed(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is False, 'the first tick must have registered the streak'
+
+        # The operator arbitrates: the hold releases, and the streak state
+        # goes with it on the next tick that observes the release.
+        h._escalation_queue.resolve(escalation_id, 'operator arbitrated')
+        await h._already_landed_dispatch_gate('42')
+
+        assert h._provenance_conflict_sink.note_hold_observed(
+            '42', reopen_at=_STALE_REOPEN_AT,
+        ) is True, 'a returning hold must be loud again, not silently folded'
+
+    async def test_moved_on_reopen_at_dispatches_instead_of_flipping(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """A re-reopened task escapes the hold by DISPATCHING, never by flipping.
+
+        Pins the whole composition.  The hold inherits ``should_skip``'s
+        reopen_at invalidation arm, so a task reopened AFTER its conflict was
+        recorded releases it — otherwise fixing the cold-memo bug would
+        install a permanent wedge (no dispatch, no flip, until a human
+        resolves the L2).  But releasing the hold does NOT mean "flip to
+        done": the still-pending urgent L2 is then caught by the any-level
+        veto, so the gate abstains and the task dispatches.
+
+        Both the pre-3534 behaviour (auto-flip past a pending L2 — defect E8
+        itself) and a reopen_at-agnostic hold (wedge forever) are wrong here.
+        Only this composition is right.
+        """
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        later_reopen_at = '2026-07-20T00:00:00+00:00'
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': later_reopen_at}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+
+        # The conflict was recorded against the EARLIER reopen_at.
+        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False, (
+            'a re-reopened task must escape by dispatching, not by the gate '
+            'flipping it past a still-pending L2'
+        )
+        assert cast(AsyncMock, h.scheduler.mark_done).await_count == 0, (
+            'the any-level veto must catch the still-pending L2 before any '
+            'done-write is attempted'
+        )
+
+    async def test_plain_l2_pin_still_dispatches(self, mock_orch_config) -> None:
+        """A pending non-provenance L2 belongs to the any-level VETO, not the
+        hold — so the gate abstains (``False``) rather than withholding.
+
+        Regression fence against broadening the hold into the veto's cases.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_store_unavailable_still_vetoes_without_holding(
+        self, mock_orch_config, caplog,
+    ) -> None:
+        """The hold cannot see an unreadable store, and must not pretend to.
+
+        ``records=None`` is the caller's ``store_unavailable`` disposition
+        (task 3534 step-4) — the gate still ABSTAINS with its WARNING rather
+        than the hold silently upgrading a failed read into a withhold.
+        """
+        h = _wired_ancestry_harness(mock_orch_config)
+        h._escalation_queue = MagicMock()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        h._escalation_queue.get_by_task = MagicMock(
+            side_effect=OSError('escalation queue dir unreadable'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        # ``'task 42'``, not ``'42'``: the bare id is satisfied by any message
+        # merely mentioning an escalation id or the queue dir path, so the
+        # task-attribution half of this assertion could never fail.
+        assert any(
+            'task 42' in m and ('store' in m.lower() or 'read' in m.lower())
+            for m in messages
+        ), messages
+
+
 def _wired_absent_branch_harness(mock_orch_config) -> Harness:
     """Bare harness with resolve_branch_sha -> None (branch ref does not
     exist, e.g. a fresh task never dispatched).  is_ancestor and
@@ -957,3 +1512,300 @@ class TestAlreadyLandedDispatchGateInstall:
             'Harness must wire scheduler._already_landed_gate = '
             'harness._already_landed_dispatch_gate after construction'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAlreadyLandedGateDeliveredChecksGuard (task 3057 — step-3 RED / step-4 GREEN)
+#
+# Seam 2 of the eleven attribution-shaped mark-done seams. This gate's three
+# evidence arms (git ancestry / merge marker / content equivalence) each prove
+# only that SOMETHING of this branch reached main — never that THIS task's
+# declared capability survived to it. All three are covered, in one
+# parametrized matrix, so no single arm can regress unguarded.
+# ---------------------------------------------------------------------------
+
+_GATE_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
+
+#: (arm id, reason/site label, expected evidence sha) for the three stamp arms.
+_ARMS = [
+    pytest.param('ancestry', id='ancestry-arm'),
+    pytest.param('marker', id='marker-arm'),
+    pytest.param('content', id='content-equivalent-arm'),
+]
+
+_ARM_REASON = {
+    'ancestry': 'dispatch-gate-already-on-main',
+    'marker': 'dispatch-gate-marker-found',
+    'content': 'dispatch-gate-content-equivalent',
+}
+
+_CITATION_SHA = 'a' * 40
+_MARKER_SHA = 'b' * 40
+_BRANCH_BASE_SHA = '9' * 40
+
+_ARM_EVIDENCE_SHA = {
+    'ancestry': _CITATION_SHA,
+    'marker': _MARKER_SHA,
+    'content': _CITATION_SHA,
+}
+
+_DC_CHECK = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present'}
+
+
+def _arm_harness(
+    mock_orch_config, arm: str, *, metadata: dict | None = None,
+) -> tuple[Harness, dict[str, Any]]:
+    """Build a harness wired so *arm* is the arm that reaches a stamp.
+
+    Reuses this module's existing per-arm wiring helpers verbatim, then
+    overlays the task metadata (each arm's helper hard-codes its own) and a
+    real ``delivered_checks`` config section so the guard has live knobs to
+    forward.
+    """
+    if arm == 'ancestry':
+        h = _wired_ancestry_harness(mock_orch_config)
+        base_meta: dict = {}
+    elif arm == 'marker':
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=_MARKER_SHA,
+            branch_base_sha=_BRANCH_BASE_SHA,
+            marker_is_ancestor_of_base=False,
+        )
+        base_meta = {'branch_base_sha': _BRANCH_BASE_SHA}
+    elif arm == 'content':
+        h = _wired_content_harness(
+            mock_orch_config, citation_sha=_CITATION_SHA, content_in_main=True,
+        )
+        base_meta = {}
+    else:  # pragma: no cover - guard against a typo in the parametrization
+        raise AssertionError(f'unknown arm {arm!r}')
+
+    meta = dict(base_meta)
+    meta.update(metadata if metadata is not None else {'delivered_checks': [_DC_CHECK]})
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': meta})
+    h.config.delivered_checks = DeliveredChecksConfig(
+        enabled=True, check_timeout_secs=11.0,
+    )
+    return h, meta
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateDeliveredChecksGuard:
+    """The delivered-capability guard on the pre-dispatch already-landed gate.
+
+    Task 2794's six-row acceptance matrix, applied to seam 2 and replicated
+    across ALL THREE evidence arms. The recovery on every block is this
+    gate's OWN existing "no landing evidence" path — ``return False``, i.e.
+    deliberately the pre-2313 behavior (dispatch normally) rather than gating.
+    A ``False`` return can never wedge a task the way a permanent gate could,
+    and the invariant being defended is "never stamp a hollow done".
+    """
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_failed_block_withholds_stamp_and_dispatches(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """FAILED: the branch reached main but the declared capability did
+        NOT. No stamp, and the gate returns False so the task DISPATCHES and
+        an agent actually delivers it."""
+        h, meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_DC_CHECK,
+        ))
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.args[0] == '42'
+        assert guard.await_args.args[1] == meta
+        kwargs = guard.await_args.kwargs
+        assert kwargs['project_root'] == str(h.config.project_root)
+        assert kwargs['check_timeout_secs'] == 11.0
+        assert kwargs['enabled'] is True
+        assert kwargs['site'] == _ARM_REASON[arm]
+        # The git_ops HANDLE, not merely a truthy sentinel: without it the
+        # guard cannot resolve a main SHA and every check-carrying task
+        # collapses to `main_sha_unresolved`, i.e. a fleet-wide silent
+        # disarm-into-wedge. Pinning identity here is what makes
+        # `git_ops=self.git_ops` -> `git_ops=None` a failing mutation.
+        assert kwargs['git_ops'] is h.git_ops
+
+    # --- row 2: all_delivered -> byte-identical stamp ----------------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_all_delivered_stamps_exactly_as_today(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """The capability IS on main -> the arm's existing stamp fires with
+        its exact evidence sha / note / reason, and the gate returns True."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        mark.assert_awaited_once()
+        assert mark.await_args is not None
+        assert mark.await_args.args[0] == '42'
+        assert mark.await_args.args[1] == _ARM_EVIDENCE_SHA[arm]
+        assert mark.await_args.args[3] == _ARM_REASON[arm]
+
+    # --- row 3: no delivered_checks -> unchanged, but still DELEGATED -----
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_check_less_task_delegates_and_stamps(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """A check-less task must not gain a new requirement.
+
+        The harness DELEGATES unconditionally (passing the metadata through)
+        rather than short-circuiting itself — the inertness lives in the
+        helper, pinned at source in test_delivered_check_gate.py. Duplicating
+        it here would be a second place for the kill-switch/inertness rule to
+        drift.
+        """
+        h, meta = _arm_harness(mock_orch_config, arm, metadata={})
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert 'delivered_checks' not in guard.await_args.args[1]
+
+    # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_also_withhold_and_dispatch(
+        self, mock_orch_config, arm, reason,
+    ) -> None:
+        """ERRORED / main_sha_unresolved take the SAME recovery as FAILED.
+
+        Deliberate: a malformed delivered_checks descriptor ERRORs forever, so
+        a "wait and retry" degradation could WEDGE the task permanently. An
+        extra dispatch of an already-landed task is the strictly better
+        failure — it always terminates.
+        """
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented -------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_kill_switch_is_forwarded_not_short_circuited(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """``delivered_checks.enabled=False`` is forwarded to the helper, which
+        owns the kill switch. The harness must NOT branch on it locally, or
+        one hot reload would stop disarming all eleven seams at once."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.config.delivered_checks = DeliveredChecksConfig(
+            enabled=False, check_timeout_secs=11.0,
+        )
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        guard.assert_awaited_once()
+        assert guard.await_args is not None
+        assert guard.await_args.kwargs['enabled'] is False
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_kill_switch_with_real_helper_stamps_as_today(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """End-to-end with the REAL helper: disabled -> the stamp is
+        byte-identical to today, with zero check work."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.config.delivered_checks = DeliveredChecksConfig(
+            enabled=False, check_timeout_secs=11.0,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        mark.assert_awaited_once()
+        assert mark.await_args is not None
+        assert mark.await_args.args[3] == _ARM_REASON[arm]
+
+    # --- ordering: no wasted check work on landings already refused -------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_rejected_landing_evidence_never_reaches_the_guard(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """A REJECTED validate_landing_evidence verdict already means "no
+        usable landing evidence" — the guard must not pay for a git-grep on a
+        landing that is being refused anyway."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=None)
+        rejected = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='no_citation', probe={},
+        )
+
+        with patch(_GATE_TARGET, guard), \
+                patch(
+                    'orchestrator.harness.validate_landing_evidence',
+                    AsyncMock(return_value=rejected),
+                ):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        guard.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_degenerate_branch_never_reaches_the_guard(
+        self, mock_orch_config,
+    ) -> None:
+        """The ancestry arm's degenerate-branch veto returns False BEFORE any
+        evidence is derived — the guard must sit downstream of it."""
+        h, _meta = _arm_harness(mock_orch_config, 'ancestry')
+        h._branch_is_degenerate = AsyncMock(return_value=True)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        guard.assert_not_awaited()
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_stale_conflict_skip_never_reaches_the_guard(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """The task-2677 provenance-conflict memo short-circuits BEFORE the
+        git work; the guard must not resurrect that cost."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h._provenance_conflict_sink = MagicMock()
+        h._provenance_conflict_sink.should_skip = MagicMock(return_value=True)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        guard.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()

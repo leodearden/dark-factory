@@ -17,6 +17,12 @@ import shutil
 import subprocess
 
 import pytest
+from systemd_unit_invariants import (
+    assert_restart_backoff_effective as _assert_restart_backoff_effective,
+)
+from systemd_unit_invariants import (
+    restart_directive as _restart_directive,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
@@ -30,6 +36,49 @@ TEMPLATE_EXPECTED_ENV_LINE = (
 HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
     "/home/leo/src/dark-factory"
+)
+
+# WorkingDirectory= is load-bearing on its own terms: ExecStart runs
+# `uv run --project dashboard python -m uvicorn dashboard.app:app`, and
+# `--project dashboard` is a RELATIVE path resolved against the unit's
+# process cwd. systemd sets that cwd only from WorkingDirectory= (it does not
+# inherit an interactive shell's), so dropping or repointing this directive
+# makes uv resolve the wrong project directory, or fail outright. Both files
+# also pin an ABSOLUTE path, which systemd requires: an unsubstituted
+# __REPO_ROOT__ sentinel trips a fatal "WorkingDirectory= path is not
+# absolute" error, corroborated in this file's
+# test_systemd_analyze_verify_reports_no_ignored_directives.
+# check_dashboard_unit_parity.py treats WorkingDirectory as presence-only by
+# design (it compares committed-vs-installed, where the directive's value can
+# legitimately diverge across hosts), so it does not guard the
+# template/hardcoded pair asserted below — that guard is
+# _assert_exact_unit_line, an anchored check (not a substring check),
+# so a repointed or commented-out directive still fails.
+TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
+
+HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
+    "WorkingDirectory=/home/leo/src/dark-factory"
+)
+
+# DASHBOARD_PROJECT_ROOT is declared EXPLICITLY (task 3572) because
+# dashboard/src/dashboard/config.py's `project_root` falls back to Path.cwd()
+# when it is unset — so without the line asserted below the dashboard's entire
+# data root is an undeclared SIDE EFFECT of WorkingDirectory=.  The units carry
+# that rationale on the line itself; the full version, including why the
+# installed copy cannot be value-compared, is on
+# scripts/check_dashboard_unit_parity.py's UnitSpec.env_matches_directive.
+#
+# What is pinned HERE is the two-part shape: each file declares the line
+# verbatim (these constants), AND the value equals WorkingDirectory= — a
+# separate assertion, since both lines can be individually well-formed while
+# one has been repointed.  See
+# test_project_root_env_matches_working_directory_in_both_unit_files below.
+TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__"
+)
+
+HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=/home/leo/src/dark-factory"
 )
 
 # These are the literal paths baked into the committed hardcoded service file;
@@ -79,6 +128,94 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     )
 
 
+def _assert_exact_unit_line(path: pathlib.Path, expected_line: str) -> None:
+    """Assert *expected_line* appears in *path* as a whole, anchored line.
+
+    Generic by construction — it asserts nothing about WHICH directive it is
+    given, so it serves every unit line whose exact value is load-bearing.  It
+    is used here for both ``WorkingDirectory=`` and
+    ``Environment=DASHBOARD_PROJECT_ROOT=``; see the module comments above
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and
+    TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why each of those is
+    load-bearing.
+
+    A plain substring check (``expected_line in content``) is satisfied by a
+    repointed value that merely starts with the expected text — e.g.
+    ``WorkingDirectory=__REPO_ROOT__/dashboard`` still contains
+    ``WorkingDirectory=__REPO_ROOT__`` — and by the same text sitting inside a
+    ``#`` comment, which systemd never parses as a directive.  Both leave the
+    unit's real cwd (or data root) wrong or unset while a substring check stays
+    green.  Anchoring the full line with ``^...$`` under ``re.MULTILINE``
+    rejects both: a suffix breaks the ``$`` boundary, and a leading ``#``
+    breaks the ``^`` boundary.
+    """
+    content = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{re.escape(expected_line)}\s*$", re.MULTILINE)
+    assert pattern.search(content) is not None, (
+        f"No line matching {expected_line!r} found in {path}. See the "
+        "rationale comments above TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why these directives are "
+        "load-bearing."
+    )
+
+
+def _assert_project_root_env_matches_working_directory(path: pathlib.Path) -> None:
+    """Assert DASHBOARD_PROJECT_ROOT equals WorkingDirectory= WITHIN *path*.
+
+    This is the relation the two directives must satisfy, checked INSIDE a
+    single file rather than across the template/hardcoded pair.  The exact-line
+    assertions above already pin each file's literal value; what they cannot
+    catch is one of the two being repointed while the other stays put, since
+    each remains individually well-formed.
+
+    Checking the relation intra-file (rather than comparing one file's value to
+    the other's) is also what makes it host-invariant: the committed unit
+    hardcodes /home/leo/src/dark-factory while setup-host.sh renders the
+    installed copy with that host's real $REPO_ROOT, so the VALUES legitimately
+    differ per host while this EQUALITY holds on every one of them.
+    scripts/check_dashboard_unit_parity.py's env_matches_directive applies the
+    same relation to the installed copy for exactly that reason.
+
+    Both directives are matched anchored (``^...$`` under ``re.MULTILINE``), so
+    a commented-out or suffixed line does not satisfy either half — the same
+    property _assert_exact_unit_line's docstring records.
+    """
+    content = path.read_text(encoding="utf-8")
+
+    env_match = re.search(
+        r"^Environment=DASHBOARD_PROJECT_ROOT=(.*)$", content, re.MULTILINE
+    )
+    assert env_match is not None, (
+        f"No Environment=DASHBOARD_PROJECT_ROOT= line found in {path}. Without "
+        "it the dashboard's data root falls back to Path.cwd() and is an "
+        "undeclared side effect of WorkingDirectory= — see the comment above "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE."
+    )
+    wd_match = re.search(r"^WorkingDirectory=(.*)$", content, re.MULTILINE)
+    assert wd_match is not None, (
+        f"No WorkingDirectory= line found in {path}; the DASHBOARD_PROJECT_ROOT "
+        "relation cannot be established without it."
+    )
+
+    project_root = env_match.group(1).strip()
+    working_directory = wd_match.group(1).strip()
+    assert project_root != "", (
+        f"DASHBOARD_PROJECT_ROOT is empty or whitespace-only in {path}. "
+        "config.py would then treat the empty string as the declared root "
+        "rather than falling back to cwd."
+    )
+    assert working_directory != "", (
+        f"WorkingDirectory= is empty or whitespace-only in {path}."
+    )
+    assert project_root == working_directory, (
+        f"DASHBOARD_PROJECT_ROOT ({project_root!r}) does not equal "
+        f"WorkingDirectory ({working_directory!r}) in {path}. The dashboard "
+        "would then read its databases from one directory while `uv run "
+        "--project dashboard` resolves relative paths against another. Repoint "
+        "whichever of the two moved."
+    )
+
+
 def test_template_sets_known_project_roots() -> None:
     """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
 
@@ -106,6 +243,60 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
+
+
+def test_working_directory_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must pin WorkingDirectory= to the repo root, exactly.
+
+    See the module comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above
+    for why the directive is load-bearing, and
+    _assert_exact_unit_line's docstring for why the check is anchored
+    rather than a substring match.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    file's WorkingDirectory= line broke without inspecting a full-file diff.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE),
+    ):
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must declare DASHBOARD_PROJECT_ROOT explicitly (task 3572).
+
+    See the module comment on TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE above for
+    why the variable is declared rather than left to config.py's Path.cwd()
+    fallback, and _assert_exact_unit_line's docstring for why the check is
+    anchored rather than a substring match.
+
+    The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
+    so setup-host.sh's `sed 's|__REPO_ROOT__|$REPO_ROOT|g'` makes the installed
+    value track the real checkout — the same treatment
+    DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE),
+    ):
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_matches_working_directory_in_both_unit_files() -> None:
+    """DASHBOARD_PROJECT_ROOT must equal WorkingDirectory= within each unit file.
+
+    Distinct from the exact-line tests above, which pin each directive's literal
+    value independently: this pins the RELATION between them, so repointing one
+    without the other fails even though both lines remain individually
+    well-formed.  See _assert_project_root_env_matches_working_directory's
+    docstring for why the relation is checked intra-file (it is host-invariant
+    that way), and scripts/check_dashboard_unit_parity.py's env_matches_directive
+    for the same relation applied to the installed copy.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_project_root_env_matches_working_directory(path)
 
 
 def test_comma_separator_helper_rejects_empty_value(
@@ -170,6 +361,120 @@ def test_comma_separator_helper_detects_colon_in_any_position(
         encoding="utf-8",
     )
     _assert_known_project_roots_comma_separated(good_file)
+
+
+def test_working_directory_helper_rejects_suffix_or_comment(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_exact_unit_line must not be satisfied by a substring match.
+
+    A plain ``expected in content`` check stays green if WorkingDirectory= is
+    repointed to a subdirectory (``.../dashboard``) or survives only inside a
+    ``#`` comment — both leave the unit's real cwd wrong while every
+    substring-based assertion keeps passing.  This pins the anchored check
+    against exactly those two regressions.
+    """
+    expected_line = "WorkingDirectory=/home/leo/src/dark-factory"
+
+    # Bad: repointed to a subdirectory — `expected_line in content` is still
+    # True, but the unit's cwd is now wrong.
+    suffixed = tmp_path / "suffixed.service"
+    suffixed.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory/dashboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_exact_unit_line(suffixed, expected_line)
+
+    # Bad: directive only present inside a comment — systemd never parses it.
+    commented = tmp_path / "commented.service"
+    commented.write_text(
+        "[Service]\n# WorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_exact_unit_line(commented, expected_line)
+
+    # Good: exact, uncommented line — helper must not raise.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_exact_unit_line(good, expected_line)
+
+
+def test_project_root_env_helper_rejects_a_mismatch(tmp_path: pathlib.Path) -> None:
+    """_assert_project_root_env_matches_working_directory must not silently no-op.
+
+    Same convention as test_working_directory_helper_rejects_suffix_or_comment
+    above: a relational assertion helper earns its own negatives.  Without them
+    a helper whose regexes stopped matching — say after a directive was renamed
+    — would find nothing, assert nothing, and keep
+    test_project_root_env_matches_working_directory_in_both_unit_files green
+    forever against units that had actually drifted apart.  Every case pins its
+    own failure mode with ``match=`` so a bad case cannot "pass" by tripping a
+    different branch than the one it names.
+    """
+    # Bad: the two directives disagree — the dashboard would read its databases
+    # from one directory while uv resolves --project against another.
+    mismatched = tmp_path / "mismatched.service"
+    mismatched.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/tmp/wrong\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="does not equal"):
+        _assert_project_root_env_matches_working_directory(mismatched)
+
+    # Bad: the Environment= line is absent entirely — the relation cannot hold,
+    # and silence here would read as agreement.
+    missing_env = tmp_path / "missing_env.service"
+    missing_env.write_text(
+        "[Service]\nWorkingDirectory=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(missing_env)
+
+    # Bad: the Environment= line is present only inside a comment, which systemd
+    # never parses — the anchored match must reject it rather than reading the
+    # value out of the comment.
+    commented_env = tmp_path / "commented_env.service"
+    commented_env.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "# Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(commented_env)
+
+    # Bad: WorkingDirectory= absent — the other half of the relation.
+    missing_wd = tmp_path / "missing_wd.service"
+    missing_wd.write_text(
+        "[Service]\nEnvironment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="No WorkingDirectory= line"):
+        _assert_project_root_env_matches_working_directory(missing_wd)
+
+    # Good: the two agree at a path that is NOT this host's — the relation is
+    # host-invariant, so a correctly-configured foreign checkout must pass.
+    # This is what makes the check safe to apply to an installed copy.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_project_root_env_matches_working_directory(good)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
@@ -768,95 +1073,22 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
 # ---------------------------------------------------------------------------
 # Restart backoff
 #
-# RestartMaxDelaySec= is silently INERT unless RestartSteps= accompanies it.
-# systemd parses the cap, logs "Service has RestartMaxDelaySec= but no
-# RestartSteps= setting. Ignoring." at load time, and then discards it — so the
-# interpolated 5s -> 60s backoff the unit's own comment advertises never
-# happens and every restart waits exactly RestartSec, forever.  Nothing in the
-# unit's text reveals this; the only signal is a load-time warning nobody reads.
+# The invariant and its directive reader now live in systemd_unit_invariants,
+# imported at the top of this module under the private aliases this file has
+# always used.  They were lifted out of here by task 3408 so that the
+# fleet-wide sweep in test_systemd_restart_backoff.py applies the SAME
+# assertion rather than a second copy of it — see that module's docstring.
 #
-# The invariant below is RELATIONAL and CONDITIONAL, mirroring
-# _assert_drain_bounded above: the defect is the missing PAIRING, not the
-# absence of either directive on its own.  RestartSteps= alone is meaningless
-# and RestartMaxDelaySec= alone is thrown away, while a unit that deliberately
-# declares no cap is not in violation of anything.
+# Nothing asserts that the sharing holds, deliberately: the `from
+# systemd_unit_invariants import (...)` at the top of this module IS the
+# sharing, structurally, and a drifted private copy would be caught by that
+# fleet sweep failing on whichever unit the copy stopped checking.  An earlier
+# meta-test pinning it by object identity was dropped as testing the shape of
+# the refactor rather than any behaviour of a systemd unit.
+#
+# The negative-case guard for the helper stays here, below, next to the
+# drain-bound guard it is modelled on.
 # ---------------------------------------------------------------------------
-
-
-def _restart_directive(path: pathlib.Path, name: str) -> str | None:
-    r"""Return the effective value of ``<name>=`` in *path*, or None if absent.
-
-    Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
-    captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
-    spelling (``RestartMaxDelaySec=60s``, ``RestartSec=1min``) is reported as the
-    present directive it is rather than misdiagnosed as a missing line.  Matching
-    ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
-    skip the pairing invariant silently — the worst possible failure for a guard
-    whose entire job is to notice a directive that is being ignored.
-
-    LAST occurrence wins, not the first, which is why this uses ``findall`` and
-    not ``search`` (the same reasoning _success_exit_statuses below applies to
-    repeated directives, reaching the opposite conclusion only because
-    SuccessExitStatus= is one of the few systemd directives that ACCUMULATES).
-    These restart directives are scalars, and systemd overwrites on each repeat.
-    Measured on this host (systemd 255.4): a unit carrying ``RestartSteps=4``
-    followed by ``RestartSteps=0`` draws the pairing warning "Service has
-    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." — i.e. systemd
-    applied the trailing 0 — while the reverse order (0 then 4) is silent.  A
-    first-match read would report 4, and this guard would bless a unit whose
-    backoff systemd has in fact discarded.  Repeats are not hypothetical: a
-    drop-in under <unit>.d/ is merged by appending, so an override that pins one
-    of these values lands as exactly this shape.
-    """
-    matches = re.findall(
-        rf"^{re.escape(name)}=(.*)$",
-        path.read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    return matches[-1].strip() if matches else None
-
-
-def _assert_restart_backoff_effective(path: pathlib.Path) -> None:
-    """Assert *path*'s restart backoff actually engages, given that it declares a cap.
-
-    Conditional on RestartMaxDelaySec= being present: a unit that asks for no
-    backoff cap violates nothing.  But once the cap is written down, systemd
-    needs RestartSteps= to interpolate between RestartSec and that cap; without
-    it the cap is parsed, warned about, and dropped.
-    """
-    cap = _restart_directive(path, "RestartMaxDelaySec")
-    if cap is None:
-        return
-
-    steps = _restart_directive(path, "RestartSteps")
-    assert steps is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} but no RestartSteps=. "
-        "systemd logs 'Service has RestartMaxDelaySec= but no RestartSteps= "
-        "setting. Ignoring.' at unit load and then drops the cap entirely, so "
-        "the backoff this unit advertises never engages — every restart waits "
-        "exactly RestartSec and the delay never grows. Add RestartSteps= to "
-        "make the cap effective; scripts/jcodemunch-watcher.service.template "
-        "already carries this fix for the identical restart shape."
-    )
-    assert steps.isdigit(), (
-        f"could not parse RestartSteps={steps!r} in {path} as an integer; "
-        "systemd accepts only a plain unsigned integer here."
-    )
-    assert int(steps) >= 1, (
-        f"RestartSteps={steps} in {path} produces no backoff curve at all: with "
-        "zero steps there is nothing to interpolate between RestartSec and "
-        f"RestartMaxDelaySec={cap}, leaving the cap as inert as if it had been "
-        "omitted. Use at least 1 step."
-    )
-
-    floor = _restart_directive(path, "RestartSec")
-    assert floor is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} and RestartSteps={steps} but "
-        "no RestartSec=. The curve is interpolated FROM RestartSec TO "
-        "RestartMaxDelaySec, so without an explicit floor the unit silently "
-        "starts from systemd's 100ms default and the backoff that runs is not "
-        "the one the file describes."
-    )
 
 
 def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
@@ -959,6 +1191,30 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     )
     with pytest.raises(AssertionError, match="but no RestartSteps="):
         _assert_restart_backoff_effective(suffixed_no_steps)
+
+    # Bad: the same inert cap, spelled with the leading and around-separator
+    # whitespace systemd.syntax permits.  This is a VALID unit whose cap systemd
+    # parses and discards, so it must be caught — a column-0-only anchor reads
+    # it as declaring no cap at all and returns early, skipping the invariant
+    # without a word.  That is the one failure direction this guard cannot
+    # afford: it masks the very defect the helper exists to surface, unlike the
+    # opaque-value capture above, which errs toward checking MORE.
+    spaced_no_steps = _write_restart_unit(
+        tmp_path / "spaced_no_steps.service",
+        "Restart=on-failure\n  RestartSec = 5\n\tRestartMaxDelaySec\t=\t60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(spaced_no_steps)
+    assert _restart_directive(spaced_no_steps, "RestartMaxDelaySec") == "60"
+
+    # Good: the whitespace-tolerant read is complete, not just detection-only —
+    # a properly paired unit in that same spelling must not raise.
+    spaced_good = _write_restart_unit(
+        tmp_path / "spaced_good.service",
+        "Restart=on-failure\n  RestartSec = 5\n  RestartSteps = 4\n"
+        "  RestartMaxDelaySec = 60",
+    )
+    _assert_restart_backoff_effective(spaced_good)
 
 
 def test_restart_backoff_is_effective_in_both_unit_files() -> None:

@@ -70,6 +70,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
     SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     build_task_count_snapshot_content,
@@ -87,6 +88,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
+    is_pure_gate_metadata,
 )
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
@@ -280,6 +282,127 @@ async def _acknowledge_resolved_stage1_markers(
             exc_info=True,
         )
         return 0
+
+
+#: resolve_ticket statuses that constitute a confirmed task creation (task 3046).
+_TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
+
+
+def _count_valid_task_created_records(
+    records: object,
+    default_project_id: str | None = None,
+) -> int:
+    """Return the deduped count of confirmed task creations in *records* (task 3046).
+
+    *records* is ``report.stats['task_created_records']`` — the action-shaped
+    ground truth the '## Task-Creation Accounting' prompt section mandates
+    Stage 2 append to at the moment each ``resolve_ticket`` call confirms a
+    creation, modeled directly on ``flag_deleted_records``. A record counts
+    only when its ``status`` (case/whitespace-insensitive) is ``created`` or
+    ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
+    counted regardless of whether a ``task_id`` is present.
+
+    This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
+    Operations' confirmation rule, not the whole of it: that section also lets
+    an agent count a creation via a ``get_task`` fallback when
+    ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
+    ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
+    verifies it. That fallback path has no dedicated ``task_created_records``
+    status value and is intentionally NOT counted here — it still
+    contributes to the agent's own self-reported ``tasks_created``, and this
+    helper's result is only ever used to raise that self-report, never lower
+    it, so a ``get_task``-verified creation is never double-counted and never
+    suppressed by this helper (task-3046 amendment: '## Verifying Task
+    Operations' intentionally covers a strictly larger set of countable
+    creations than this Python subset does — the two are not claimed to be
+    equivalent).
+
+    Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
+    ``task_id`` alone: Cross-Project Routing means the same numeric id can
+    legitimately be filed under two different projects in the same cycle
+    (Taskmaster ids are per-project), and that is two distinct tasks, not a
+    duplicate report of one. ``project_id`` is normalised the same way as
+    ``task_id`` — ``str(...).strip()`` — so ``' dark_factory'`` and
+    ``'dark_factory'`` collapse to one key instead of inflating the count
+    (task-3046 amendment). A record with no ``project_id`` (or one that is
+    blank after stripping) falls back to *default_project_id* — typically
+    the caller's own ``self.project_id`` — so an omitted field cannot
+    masquerade as a second, distinct cross-project filing of the same task.
+
+    Best-effort and non-raising throughout, mirroring
+    ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
+    non-empty ``list`` or this returns ``0``; non-``dict`` entries and
+    entries that raise while being inspected are silently skipped rather
+    than aborting the count — a malformed record degrades to "not counted",
+    never to an exception that would corrupt an otherwise-good stage report.
+    """
+    if not isinstance(records, list) or not records:
+        return 0
+
+    seen: set[tuple[str | None, str]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            status = record.get('status')
+            if (
+                not isinstance(status, str)
+                or status.strip().lower() not in _TASK_CREATED_SUCCESS_STATUSES
+            ):
+                continue
+            task_id = record.get('task_id')
+            if task_id is None:
+                continue
+            task_id_str = str(task_id).strip()
+            if not task_id_str:
+                continue
+            project_id = record.get('project_id')
+            if project_id is None:
+                project_id_str = default_project_id
+            else:
+                project_id_str = str(project_id).strip() or default_project_id
+        except Exception:
+            continue
+        seen.add((project_id_str, task_id_str))
+
+    return len(seen)
+
+
+def _coerce_tasks_created_count(value: object) -> int:
+    """Best-effort int coercion for a self-reported ``tasks_created`` value (task 3046).
+
+    Stage 2 self-reports ``tasks_created`` as free-form LLM JSON, so it can
+    plausibly arrive as a clean ``int``, a numeric ``str`` (``"3"``), or a
+    ``float`` (``3.0``) instead. This coerces all three to ``int``. A
+    ``bool`` is explicitly rejected — never trusted as a count, even though
+    ``isinstance(True, int)`` holds in Python — and anything that fails
+    coercion (``None``, a non-numeric string, a list, ...) falls back to
+    ``0``, exactly like an absent value.
+
+    Without this, a non-``int`` self-report would collapse to ``0`` under a
+    bare ``isinstance(x, int)`` check, and a smaller record-derived
+    ``observed`` count could then look like an UNDERCOUNT and overwrite a
+    legitimately larger self-report — a silent downward move the
+    upward-only repair is explicitly designed never to make (task 2230 /
+    W5-mu).
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return int(stripped)
+        except ValueError:
+            pass
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
@@ -2517,6 +2640,20 @@ def _render_live_workflow_section(
     orchestrator lock also has the signal dropped (task 2409 — closes the
     repeated re-deferral loop this caused for tasks 2335/2196).
 
+    A PENDING deterministic PURE GATE — ``always_escalates`` truthy with no
+    ``before_done``, classified by :func:`is_pure_gate_metadata` and forwarded
+    as ``pure_gate`` — likewise has the project-wide signal dropped (task
+    3751).  Its entire ``DeterministicRunner`` run is "file one born-at-L2
+    escalation, stamp ``gate_escalated_at``, set status blocked": no script, no
+    systemd, no ``git_ops``, and (like every deterministic task) no
+    worktree/branch, so the bare lock can never be task-specific evidence for
+    it.  A pending deterministic task carrying a ``before_done`` KEEPS the
+    signal: that path runs a blocking deploy/predicate script while the status
+    is still ``'pending'`` (``Harness._run_deterministic_slot`` never flips it
+    to ``'in-progress'``) with no git evidence to reveal it.  Confirmed
+    incident: task 3845 was listed here with ONLY the bare ``orchestrator``
+    signal for 3+ consecutive reconciliation cycles, blocking its disposition.
+
     **In-progress corroboration gate (task 2963).** For an ``in-progress`` task
     whose only live signals are a lingering registered worktree and/or the
     project-wide orchestrator lock (no ``recent_commit``), a fleet redeploy that
@@ -2593,6 +2730,10 @@ def _render_live_workflow_section(
         raw_metadata = task.get('metadata')
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         task_kind = metadata.get('task_kind')
+        # `metadata` is already the isinstance-guarded dict above, so a task
+        # with absent/non-dict metadata yields pure_gate=False — fail-safe
+        # toward live. See the docstring's pending-pure-gate paragraph.
+        pure_gate = is_pure_gate_metadata(metadata)
 
         # Per-task corroboration gate (task 2963). For an IN-PROGRESS task,
         # compute an explicit corroboration verdict so the detector can downgrade
@@ -2620,6 +2761,7 @@ def _render_live_workflow_section(
             liveness = detect_live_workflow(
                 task_id, project_root,
                 status=task.get('status'), task_kind=task_kind,
+                pure_gate=pure_gate,
                 corroborated=corroborated, **kwargs
             )
         except Exception:
@@ -2962,7 +3104,7 @@ class TaskKnowledgeSync(BaseStage):
                 self.memory, self.project_id, run_window_start,
             )
         if task_count_snapshot_written is not None:
-            report.stats['task_count_snapshot_written'] = (
+            report.stats[SNAPSHOT_WRITTEN_STAT_KEY] = (
                 1 if task_count_snapshot_written else 0
             )
 
@@ -3086,6 +3228,33 @@ class TaskKnowledgeSync(BaseStage):
         class is now rejected pre-write, server-side, by ``ReconWritePolicy``
         (task 2224), so post-hoc detection is redundant.
 
+        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
+        plus repaired — UPWARD ONLY — against ``report.stats['task_created_records']``,
+        the action-shaped ground truth the '## Task-Creation Accounting' prompt
+        section mandates Stage 2 append to at the moment each ``resolve_ticket``
+        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
+        journaled, so unlike the flag counters above, ``tasks_created`` has no
+        write-journal-derived ground truth to fall back on; a self-reported
+        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
+        Cross-Project Routing, as in run 507bc25b) would otherwise stand
+        uncorrected. The self-reported value is coerced to ``int`` via
+        :func:`_coerce_tasks_created_count` (a numeric-``str``/``float`` self-report
+        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
+        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
+        (e.g. ``"3"``) can never look like an undercount and get overwritten
+        downward — the coerced value is always what ends up in
+        ``report.stats['tasks_created']``, so normalization is real even when no
+        repair fires. The deduped valid-record count (project-scoped via
+        :func:`_count_valid_task_created_records`'s ``default_project_id``, so a
+        record with an omitted ``project_id`` collapses onto this stage's own
+        ``self.project_id`` rather than masquerading as a second cross-project
+        filing) is always published as ``report.stats['task_created_records_valid']``;
+        when it exceeds the coerced self-reported ``tasks_created``, the pre-repair
+        raw value is stashed under ``report.stats['tasks_created_reported']``,
+        ``tasks_created`` is overwritten, and a WARNING is logged. Never clamped
+        downward — task 2230 (W5-mu) deliberately removed symmetric clamping of
+        Stage 2's self-reported counters from this method.
+
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
@@ -3117,6 +3286,41 @@ class TaskKnowledgeSync(BaseStage):
         # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
+
+        # ── tasks_created accounting repair (task 3046) ─────────────────────
+        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
+        # are not journaled (TaskInterceptor._journal_around covers only
+        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
+        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
+        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
+        # action-shaped ground truth the prompt now mandates — mirroring
+        # flag_deleted_records — so an increment missed on a mid-cycle
+        # proactive/cross-project filing is recovered here instead of lost
+        # (run 507bc25b reported tasks_created=0 while filing task 3045).
+        report.stats.setdefault('tasks_created', 0)
+        observed = _count_valid_task_created_records(
+            report.stats.get('task_created_records'),
+            default_project_id=self.project_id,
+        )
+        report.stats['task_created_records_valid'] = observed
+        reported = report.stats.get('tasks_created')
+        # Coerce before comparing (task-3046 amendment): a non-int self-report
+        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
+        # relative to `observed` — that would silently move a legitimately
+        # larger self-report DOWN, which the upward-only contract forbids.
+        # The coerced value is written back unconditionally so the "normalize"
+        # half of this block is real even when no repair fires.
+        reported_int = _coerce_tasks_created_count(reported)
+        report.stats['tasks_created'] = reported_int
+        if observed > reported_int:
+            report.stats['tasks_created_reported'] = reported
+            report.stats['tasks_created'] = observed
+            logger.warning(
+                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
+                'self-reported tasks_created=%r but %d confirmed task_created_records were '
+                'emitted — repairing upward to %d.',
+                run_id, self.project_id, reported, observed, observed,
+            )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.

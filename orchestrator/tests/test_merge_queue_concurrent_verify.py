@@ -24,21 +24,27 @@ This file starts with shared scaffolding only (pre-1).
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import collections
 import contextlib
+import dataclasses
+import logging
+import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import HostAllocator
+from orchestrator.verify_runner import HostAllocator, HostLease
 
 # ---------------------------------------------------------------------------
 # (a) Temp-repo GitOps + branch-with-file builders
@@ -126,6 +132,253 @@ def _make_request(
     )
 
 
+async def _await_outcome(
+    fut: asyncio.Future[MergeOutcome],
+    *,
+    label: str,
+    timeout: float = MERGE_RESULT_TIMEOUT,
+) -> MergeOutcome:
+    """Await a ``MergeRequest.result`` future, failing LOUDLY -- by name --
+    on deadline instead of letting a real timeout masquerade as ``None``
+    (task 3477).
+
+    The shape this replaces --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang or a missing cascade into a confusing
+    ``outcome is None`` assertion failure. That shape is exactly what
+    flaked in TestRunnerUnavailableHeadCascade and
+    TestCascadeFiresRemoteCancel: under load, the fixed real-time deadline
+    was reached before the merge pipeline resolved, TimeoutError was
+    swallowed, and the next hard assertion fired on a still-None outcome --
+    reporting a timeout as if it were a wrong-value bug.
+
+    The default *timeout* (45s) is ``_orch_helpers.MERGE_RESULT_TIMEOUT``
+    (task 2376's shared, never-narrow merge-pipeline result-wait ceiling),
+    not a fresh literal -- so callers inherit the same generous,
+    load-tolerant budget already established for test_merge_queue.py,
+    test_merge_speculation.py and test_concurrent_verify_boundary.py.
+    """
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except TimeoutError:
+        pytest.fail(
+            f'{label}: MergeOutcome never resolved within {timeout}s -- '
+            f'the merge pipeline never completed this request. This is a '
+            f'real hang or a genuinely missing cascade, NOT a None outcome.'
+        )
+
+
+# task 3477 amend: both cascade classes below perform the SAME five sequential
+# real-time waits (2 gates + 2 _await_outcome + 1 worker_task teardown) at
+# MERGE_RESULT_TIMEOUT (45s) each -- a 225s worst case -- plus git-fixture setup
+# and an unbounded worker.stop(). 180 was too tight: it would itself os._exit()
+# the xdist worker (pyproject timeout_method = "thread", --max-worker-restart=0)
+# before the loud _await_outcome failure this task added could ever report. The
+# class mark MUST clear the full 225s budget, not just the pyproject 60s default.
+# Derived, not literal, so the two marks cannot drift apart the way they just did.
+# task 3492: generalized CASCADE_TEST_TIMEOUT -> HEAVY_BARRIER_TEST_TIMEOUT --
+# this same derived ceiling also covers the non-cascade heavy-barrier classes
+# audited by 3492, whose worst per-method budget is 205s
+# (TestCascadeErrorContainment), still comfortably under the 300s value below.
+HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+
+
+# task 3492: two classes are deliberately left WITHOUT a HEAVY_BARRIER_TEST_TIMEOUT
+# mark, so the omission reads as a decision, not an oversight:
+#   - TestRunInflightVerifyAbortPoll: four test_* methods at 45s each -- 45s
+#     worst-METHOD, under the 60s pyproject ceiling (why per-method, not a
+#     class-wide sum: see _worst_per_method_wait_budget's docstring below).
+#   - TestAwaitOutcomeHelper: 45s nominal (_await_outcome's default), but the
+#     future under test is pre-resolved, so real elapsed time is ~0.
+
+
+# task 3492: known-name table for _worst_per_method_wait_budget below. These
+# are this module's own numeric constants -- referenced directly (not
+# re-derived) so the audit helper can never drift from the values the marks
+# themselves use.
+_KNOWN_WAIT_CONSTANTS: dict[str, float] = {
+    'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
+    'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+}
+
+
+def _resolve_wait_value(node: ast.expr | None) -> float:
+    """Resolve a single AST expression to a wait-budget number, or 0.0.
+
+    Conservative by construction: a literal number resolves directly; a
+    name reference resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything
+    else (a local variable, an attribute access, an arithmetic expression,
+    an unknown name) resolves to 0.0. Unknown means ignore, never guess.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        return _KNOWN_WAIT_CONSTANTS.get(node.id, 0.0)
+    return 0.0
+
+
+def _call_wait_budget(call: ast.Call) -> float:
+    """Return the wait-budget contribution of a single ``ast.Call`` node.
+
+    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    (the attribute's value must itself be the ``asyncio`` name, so
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
+    when no ``timeout=`` kwarg is given). Every other call shape --
+    ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
+    non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
+    unknown names -- contributes 0.0 and is skipped silently (this is a
+    conservative FLOOR over call *shapes*: an unrecognised shape can only
+    under-count, never fabricate a wait; see the plan's floor/superset
+    design decision, and ``_method_wait_budget`` below for the orthogonal
+    over-count risk from control flow).
+    """
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'wait_for'
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    ):
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        if len(call.args) >= 2:
+            return _resolve_wait_value(call.args[1])
+        return 0.0
+    if isinstance(func, ast.Name) and func.id == '_await_outcome':
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    return 0.0
+
+
+def _method_wait_budget(fn: ast.AST) -> float:
+    """Sum every recognised wait-call contribution anywhere in *fn*'s body.
+
+    Control-flow-BLIND by construction: ``ast.walk`` visits every call in
+    the subtree regardless of branch, so waits in mutually exclusive
+    ``if``/``else`` arms or ``try``/``except`` handlers are summed
+    together rather than maxed -- the computed total can OVER-count
+    relative to any single real execution path (pinned by
+    ``TestWaitBudgetAuditHelper.test_mutually_exclusive_branches_are_summed_not_maxed``).
+    This is a deliberate, tolerated imprecision, not a design goal: it runs
+    in the opposite direction from ``_call_wait_budget``'s shape-based
+    under-count (an unrecognised call shape contributes 0.0), so the
+    "conservative FLOOR" framing used elsewhere in this module applies to
+    shape recognition only, not to control flow. The combined result is a
+    same-ballpark estimate meant to catch gross under-marking, not a
+    number that is exactly load-bearing.
+    """
+    return sum(
+        _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
+    )
+
+
+def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
+    """Statically scan *source* and compute, per top-level ``Test*`` class,
+    the MAX over its ``test_*`` methods of that method's summed sequential
+    real-time wait budget (task 3492's audit engine).
+
+    pytest-timeout applies a class-level ``@pytest.mark.timeout`` mark to
+    EACH test method independently, not to the class total -- so the unit
+    that matters is per-method, not a class-wide sum (see the plan's design
+    decision: summing would false-positive on many-light-methods classes
+    like ``TestRunInflightVerifyAbortPoll`` and could dilute one heavy
+    method below the threshold).
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file. Unparseable source returns {}.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    budgets: dict[str, float] = {}
+    for node in ast.iter_child_nodes(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.startswith('Test')):
+            continue
+        method_budgets = [
+            _method_wait_budget(item)
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name.startswith('test_')
+        ]
+        if method_budgets:
+            budgets[node.name] = max(method_budgets)
+    return budgets
+
+
+# task 3492: the pyproject-configured default per-test timeout ceiling that
+# every heavy-wait class in this module must clear. This is a hand-mirrored
+# copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60) -- it is still a literal and CAN drift if that setting
+# changes without a matching edit here; there is no automated link between
+# the two.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+
+def _timeout_mark_offenders(
+    budgets: dict[str, float],
+    resolve: Callable[[str], object | None],
+) -> list[str]:
+    """Pure offender-accumulation for the timeout-mark coverage guard.
+
+    For each ``class_name -> budget`` pair at or above
+    ``PYPROJECT_DEFAULT_TIMEOUT``, resolve *class_name* via *resolve* and
+    check it carries a ``timeout`` mark whose value clears *budget*.
+    Returns one formatted offender string per failing class; an empty list
+    means every heavy class is adequately marked.
+
+    Extracted as a pure function (independent of ``globals()`` and this
+    module's real classes) so its three failure branches -- unresolvable
+    class name, missing mark, mark value too tight -- are each directly
+    testable with synthetic stubs, rather than only ever exercised by the
+    happy path over this module's own (now fully-marked) classes.
+    """
+    offenders: list[str] = []
+    for class_name, budget in sorted(budgets.items()):
+        if budget < PYPROJECT_DEFAULT_TIMEOUT:
+            continue
+
+        cls = resolve(class_name)
+        if cls is None:
+            offenders.append(
+                f'{class_name}: computed budget {budget}s, but the '
+                f'class could not be resolved from module globals to '
+                f'inspect its marks.'
+            )
+            continue
+
+        mark = next(
+            (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
+            None,
+        )
+        if mark is None:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s (>= the '
+                f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
+                f'the class carries no @pytest.mark.timeout mark at '
+                f'all.'
+            )
+            continue
+
+        mark_value = mark.args[0] if mark.args else None
+        if mark_value is None or mark_value < budget:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s, but its @pytest.mark.timeout '
+                f'mark is only {mark_value!r} -- too tight to clear '
+                f'it.'
+            )
+    return offenders
+
+
 # ---------------------------------------------------------------------------
 # (d) OrchestratorConfig builders: single-host vs two-host
 # ---------------------------------------------------------------------------
@@ -172,9 +425,74 @@ def _mock_verify_result(passed: bool) -> VerifyResult:
     )
 
 
+_VERIFY_RESULT_FIELD_NAMES = {f.name for f in dataclasses.fields(VerifyResult)}
+
+
+def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
+    """Return a MagicMock(spec=VerifyResult) seeded from a REAL VerifyResult's
+    field defaults, with **overrides layered on top (task 3477).
+
+    Why not a bare ``MagicMock(passed=..., summary=..., ...)``: an
+    unconfigured attribute READ on a bare MagicMock auto-vivifies a truthy
+    child Mock rather than returning a real default. Every one of this
+    file's inline VerifyResult-shaped doubles omitted ``cause_hint``, so
+    merge_disposition.py's ``_extract_failing_tests_and_candidate_files``
+    (:218-221) joins ``verify_result.cause_hint`` and
+    ``verify_result.test_output`` via ``str.join`` — which raised
+    ``TypeError: sequence item 0: expected str instance, MagicMock found``
+    on every FAILING double. ``classify_merge_failure_disposition``
+    (:710-719) swallows that into a silent fail-open (WARNING +
+    INDETERMINATE), so the affected tests only APPEARED to exercise
+    disposition classification.
+
+    Why ``spec=VerifyResult``: it makes a future unknown-attribute READ
+    fail loudly (``AttributeError``) instead of auto-vivifying — the
+    root-cause fix, not just a ``cause_hint=''`` patch for today's one
+    known field. Seeding from ``dataclasses.fields(VerifyResult)`` (rather
+    than a hardcoded attr list) means a field added to VerifyResult in
+    future is picked up automatically, so this factory does not itself
+    drift out of sync the way the file's inline doubles did.
+
+    Why this stays a MagicMock and not a real VerifyResult instance: a real
+    dataclass would also make ``.failure_report()`` return a real string
+    instead of a Mock. merge_queue.py:703's ``isinstance(s, str)`` filter
+    currently discards the Mock; a real string would pass through and
+    append a ``## Test Failures`` block to the rendered ``reason`` at
+    merge_queue.py:3020/3041/3078 — assertion churn well beyond this
+    factory's fidelity-only scope. Seeding a MagicMock from real defaults
+    confines the behaviour delta to exactly the fields callers read.
+
+    Deliberately does NOT special-case a ``verify_skipped`` kwarg: that
+    field lives on MergeOutcome (merge_types.py:945), not VerifyResult, and
+    is never read off a VerifyResult anywhere in src/ — callers migrating
+    off the old inline doubles should simply drop it rather than pass it
+    through **overrides.
+
+    **overrides are validated against VerifyResult's real field names
+    before being applied (task 3477 amend). ``spec=`` alone only makes
+    unconfigured *reads* fail loudly; a ``spec=`` (not ``spec_set=``) mock
+    still accepts an unknown attribute WRITE via plain ``setattr`` — so a
+    typo'd override (or a leftover ``verify_skipped=``) would silently
+    produce a double whose real field keeps its seeded default instead of
+    raising, which is exactly the class of silent drift this factory
+    exists to eliminate.
+    """
+    if unknown := set(overrides) - _VERIFY_RESULT_FIELD_NAMES:
+        raise TypeError(
+            f'_fake_verify_result: not VerifyResult fields: {sorted(unknown)}'
+        )
+    real = _mock_verify_result(passed)
+    fake = MagicMock(spec=VerifyResult)
+    for f in dataclasses.fields(VerifyResult):
+        setattr(fake, f.name, getattr(real, f.name))
+    for key, value in overrides.items():
+        setattr(fake, key, value)
+    return fake
+
+
 def _mock_verify_pass() -> AsyncMock:
     """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
+    return AsyncMock(return_value=_fake_verify_result(passed=True, summary=''))
 
 
 def _gated_runner(
@@ -1696,6 +2014,7 @@ class TestFinalizeInflightNonPass:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 60s worst case (30+30) -- exactly AT the 60s pyproject ceiling with zero headroom, plus unbounded worker.stop()/worker_task teardown
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
@@ -1852,6 +2171,7 @@ class TestSingleHostSerialByteIdentical:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 160s worst case per the automated scan (a control-flow-aware hand count over the mutually-exclusive try/except paths in test_both_verifies_enter_before_either_released would land at 135s; the scan sums both branches -- see _method_wait_budget's branch-summing note)
 class TestOverlapSignal:
     """Two-host overlap: both verifies enter before either is released.
 
@@ -1913,8 +2233,7 @@ class TestOverlapSignal:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(passed=True, summary='', test_output='', lint_output='',
-                             type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # ── Branches ───────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/ov-a', 'ov_a.py', 'a = 1\n')
@@ -2065,8 +2384,7 @@ class TestLastItemOfBurstFinalizes:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_entered.set()
             await gate_release.wait()
-            return MagicMock(passed=True, summary='', test_output='',
-                             lint_output='', type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # Remote runner exists (→ free_host_count()>1 so the fill loop continues
         # past the local dispatch) but is never used by this single-item burst.
@@ -2131,6 +2449,7 @@ class TestLastItemOfBurstFinalizes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 200s worst case (task 2350 widened this region to 45.0)
 class TestChainInvalidationUnderOverlap:
     """N's verify fails while N+1 is in-flight: N+1 aborted, re-merged, re-verifies done.
 
@@ -2182,27 +2501,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (GREEN step-20 cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2364,27 +2670,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2543,6 +2836,7 @@ class TestChainInvalidationUnderOverlap:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case
 class TestHaltAndUnavailable:
     """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
 
@@ -2582,11 +2876,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote verify: gated (passes when released)
         gated_remote = _gated_runner(
@@ -2697,11 +2987,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote runner: gates on entered, then raises RunnerUnavailable
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -3332,6 +3618,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3394,16 +3681,7 @@ class TestRunnerUnavailableHeadCascade:
                 await gate_a_release.wait()
                 raise RunnerUnavailable('simulated host failure for cascade test')
             # Re-dispatched verifies (N and N+1 after cascade re-merge): pass
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── Branches ─────────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/rucascade-a', 'rucascade_a.py', 'a=1\n')
@@ -3430,9 +3708,6 @@ class TestRunnerUnavailableHeadCascade:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_a: MergeOutcome | None = None
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _local_verify_side_effect):
             worker_task = asyncio.create_task(worker.run())
 
@@ -3441,8 +3716,11 @@ class TestRunnerUnavailableHeadCascade:
 
             # Wait for N's local verify to enter AND N+1's remote verify to enter.
             # This confirms both are in-flight simultaneously.
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # Both verifies are now in-flight.  Release N's gate → RunnerUnavailable.
             # _finalize_inflight(N) returns False → head-failure cascade fires:
@@ -3455,19 +3733,20 @@ class TestRunnerUnavailableHeadCascade:
             # can unblock even if cancel() arrives slightly late.
             gate_b_release.set()
 
-            # Wait for both to resolve.
-            with contextlib.suppress(TimeoutError):
-                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # Wait for both to resolve. A real timeout now fails loudly by
+            # name (task 3477) instead of leaving outcome_X as a confusing
+            # None that the assertions below would misreport.
+            outcome_a = await _await_outcome(req_a.result, label='N (RUNNER_UNAVAILABLE head)')
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (speculative downstream)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N (RUNNER_UNAVAILABLE head): must land 'done' after re-dispatch ──
-        assert outcome_a is not None and outcome_a.status == 'done', (
+        assert outcome_a.status == 'done', (
             f'Expected N (RUNNER_UNAVAILABLE head) to resolve "done" after '
             f're-merge re-dispatch, got {outcome_a!r}. '
             'The head-failure cascade should re-merge N onto actual main '
@@ -3475,7 +3754,7 @@ class TestRunnerUnavailableHeadCascade:
         )
 
         # ── N+1 (speculative downstream): must land 'done' after cascade ─────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 (speculative downstream) to resolve "done" after '
             f'cascade re-merge re-dispatch, got {outcome_b!r}. '
             'If the cascade did not fire, N+1 would stay in _inflight with a '
@@ -3505,6 +3784,7 @@ class TestRunnerUnavailableHeadCascade:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 90s worst case
 class TestRunInflightVerifyRemoteCancelOnAbort:
     """_run_inflight_verify abort paths fire remote cancel before cancelling verify.
 
@@ -3879,6 +4159,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
@@ -3926,27 +4207,14 @@ class TestCascadeFiresRemoteCancel:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1 re-dispatched locally after cascade (pass immediately)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: id-liveness fake ────────────────────────────
         gate_b_release = asyncio.Event()
@@ -3980,8 +4248,6 @@ class TestCascadeFiresRemoteCancel:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
             worker_task = asyncio.create_task(worker.run())
 
@@ -3989,14 +4255,19 @@ class TestCascadeFiresRemoteCancel:
             await q.put(req_b)
 
             # Wait for both verifies to enter (true concurrent overlap)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # N's verify fails → triggers head-failure cascade for N+1
             gate_a_release.set()
 
-            # N must resolve with a fail status
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            # N must resolve with a fail status. Routed through _await_outcome
+            # (task 3477) so a real timeout reports by name instead of raising
+            # a bare TimeoutError, matching outcome_b's wait below.
+            outcome_a = await _await_outcome(req_a.result, label='N (gated local fail)')
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -4006,17 +4277,20 @@ class TestCascadeFiresRemoteCancel:
             # run_merge_verify coroutine so the test can complete cleanly).
             gate_b_release.set()
 
-            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=10.0)
+            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify.
+            # A real timeout now fails loudly by name (task 3477) instead of
+            # leaving outcome_b as a confusing None that the assertion below
+            # would misreport.
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (cascade re-merge/re-verify)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N+1 must resolve done (cascade re-merged and re-verified) ────────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after cascade re-merge/re-verify, '
             f'got {outcome_b!r}.'
         )
@@ -4041,6 +4315,7 @@ class TestCascadeFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 205s worst case (task 2350 widened this region to 45.0)
 class TestCascadeErrorContainment:
     """Per-entry exception in the head-failure cascade MUST NOT kill _verifier_loop.
 
@@ -4092,27 +4367,14 @@ class TestCascadeErrorContainment:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # Any subsequent call (req_c's local verify) passes immediately.
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -4308,26 +4570,13 @@ class TestCascadeErrorContainment:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated ────────────────────────────────────────
         gate_b_release = asyncio.Event()
@@ -4487,6 +4736,473 @@ class TestCascadeErrorContainment:
 
 
 # ---------------------------------------------------------------------------
+# task 3204 step-3 RED / step-4 GREEN: the verify-abort teardown has a single
+# CHOKEPOINT — `SpeculativeMergeWorker._teardown_verify_task`.
+#
+# The remote-abort-BEFORE-cancel ordering is currently stated only in prose on
+# `_abort_remote_verify`, and re-typed at six sites. Because the helper always
+# cancels AFTER aborting, making it the SOLE caller of `_abort_remote_verify`
+# turns that ordering from a convention into a property of the code: there is
+# no code path that can abort without also cancelling afterwards.
+#
+# The guard scans BOTH halves of the recipe — the abort AND
+# `verify_task.cancel()` — because sole-callership of the abort alone only
+# closes one direction. The converse (a local cancel with no prior remote
+# abort, the exact defect task 1757 fixed) needs the cancel half guarded too;
+# see `_teardown_chokepoint_offenders`.
+#
+# The `cancel_verify` call-count/ordering classes above (
+# TestRunInflightVerifyRemoteCancelOnAbort, TestStopDrainFiresRemoteCancel,
+# TestCascadeFiresRemoteCancel, TestCascadeErrorContainment) are deliberately
+# left UNTOUCHED — they are the behavioural regression net that proves the
+# step-4 extraction is behaviour-neutral.
+# ---------------------------------------------------------------------------
+
+_MQ_CHOKEPOINT_CLASS = 'SpeculativeMergeWorker'
+_MQ_TEARDOWN_CHOKEPOINT = '_teardown_verify_task'
+_MQ_GUARDED_ABORT = '_abort_remote_verify'
+_MQ_GUARDED_CANCEL_RECEIVER = 'verify_task'
+
+
+def _chokepoint_ranges(tree: ast.Module, cls_name: str, method_name: str) -> list[tuple[int, int]]:
+    """Line ranges of every *method_name* defined DIRECTLY on ``class cls_name``.
+
+    Copied from test_lock_release_single_writer_guard.py:134 per the per-file
+    duplication convention for orchestrator test helpers (the same recursion
+    now also backs the requeue chokepoint guard in
+    test_merge_queue_lifecycle_registry.py — duplicated rather than
+    cross-imported between test modules, which this repo does not do).
+
+    Tracks the nearest *directly enclosing* ClassDef and resets it to None
+    inside a function body, so neither a same-named method on another class
+    nor a closure nested within the method can accidentally sanction a site.
+    """
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, enclosing_class: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name == method_name and enclosing_class == cls_name:
+                    ranges.append((child.lineno, getattr(child, 'end_lineno', child.lineno)))
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
+def _is_teardown_step_call(node: ast.AST) -> TypeGuard[ast.Call]:
+    """True for either HALF of the verify-abort teardown recipe.
+
+    The abort half is any ``<something>._abort_remote_verify(...)``; the name
+    exists solely for this recipe, so it needs no receiver anchor. The cancel
+    half is anchored on the receiver instead — ``verify_task.cancel()`` or
+    ``<expr>.verify_task.cancel()`` — because a bare ``.cancel()`` is far too
+    common in this module (loop tasks, heartbeat/reprobe tasks, request
+    futures) to guard unanchored. Exact-matching ``cancel`` also keeps the
+    neighbouring ``verify_task.cancelled()`` / ``.done()`` / ``.result()``
+    peeks out of the offender list.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so a True result
+    narrows the walked ``ast.AST`` to ``ast.Call`` at the call site — the
+    offender list reads ``.lineno``, which lives on ``ast.expr``, not on the
+    ``ast.AST`` base that :func:`ast.walk` yields.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    if node.func.attr == _MQ_GUARDED_ABORT:
+        return True
+    if node.func.attr != 'cancel':
+        return False
+    receiver = node.func.value
+    if isinstance(receiver, ast.Name):
+        return receiver.id == _MQ_GUARDED_CANCEL_RECEIVER
+    if isinstance(receiver, ast.Attribute):
+        return receiver.attr == _MQ_GUARDED_CANCEL_RECEIVER
+    return False
+
+
+def _teardown_chokepoint_offenders(source: str) -> list[str]:
+    """Every verify-abort-teardown call site outside the teardown helper, as
+    ``'<enclosing_fn>:<lineno> <call_src>'``.
+
+    Scans BOTH halves of the recipe — ``self._abort_remote_verify(...)`` and
+    ``<...>verify_task.cancel()`` — exactly as the sibling requeue guard in
+    test_merge_queue_lifecycle_registry.py scans both ``_queue.put_nowait``
+    and ``on_requeued``. Scanning only the abort half would enforce "every
+    abort is followed by a cancel" while leaving the CONVERSE — the actual
+    defect class task 1757 fixed — unguarded: a ``verify_task.cancel()`` fired
+    without a prior remote abort silently orphans the remote verify-merge
+    process, because the verify coroutine's finally clause has by then cleared
+    ``_inflight_request_id``. Guarding both halves is what makes the pairing
+    AND the ordering properties of the code (task 3204 amend, reviewer finding
+    test-coverage).
+
+    ``ast.Call``-only, so ``_abort_remote_verify``'s own ``async def``
+    DEFINITION is not reported — the invariant is about call sites, not about
+    the implementation they call. Pure (takes source text, not a path) so the
+    scanner self-tests can drive it on synthetic modules; returns ``[]`` rather
+    than raising on source that cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, _MQ_TEARDOWN_CHOKEPOINT)
+
+    parent: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cur = parent.get(id(cur))
+        return getattr(cur, 'name', '<module>')
+
+    calls = [node for node in ast.walk(tree) if _is_teardown_step_call(node)]
+    offenders = [
+        f'{_enclosing_fn(call)}:{call.lineno} {ast.unparse(call)}'
+        for call in calls
+        if not any(start <= call.lineno <= end for start, end in ranges)
+    ]
+    # ast.walk is breadth-first; sort so the offender list reads top-to-bottom.
+    offenders.sort(key=lambda entry: int(entry.split(':', 1)[1].split(' ', 1)[0]))
+    return offenders
+
+
+def _never_finishes() -> asyncio.Task:
+    """A real, never-completing asyncio.Task to stand in for a live verify."""
+    return asyncio.get_running_loop().create_task(asyncio.Event().wait())
+
+
+class TestVerifyTeardownChokepoint:
+    """``_teardown_verify_task`` is the SOLE caller of BOTH teardown steps —
+    ``_abort_remote_verify`` and ``verify_task.cancel()`` (task 3204 step-3
+    RED; the cancel half added by the step-3 amend).
+
+    Sync-only, and deliberately NOT marked ``@pytest.mark.asyncio``: this
+    repo runs pytest warnings-as-errors, and pytest-asyncio raises on a sync
+    test carrying that mark. The async helper-contract tests live in
+    :class:`TestVerifyTeardownHelper` below.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_a_compliant_chokepoint(self) -> None:
+        """POSITIVE control: both steps are inside the helper -> no offenders."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        if lease is not None:\n'
+            '            await self._abort_remote_verify(lease, task_id)\n'
+            '        if verify_task is not None:\n'
+            '            verify_task.cancel()\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_an_abort_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS (abort half): an abort typed at a call site is flagged."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+            '        verify_task.cancel()\n'
+            '\n'
+            '    async def _sneaky(self, entry):\n'
+            '        await self._abort_remote_verify(entry.lease, entry.task_id)\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_sneaky:'), offenders
+
+    def test_scanner_flags_a_cancel_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS (cancel half): this is the task-1757 defect class —
+        a local cancel with NO prior remote abort orphans the remote verify.
+
+        Both receiver shapes must be caught: the bare ``verify_task`` local
+        the helper itself uses, and the ``<entry>.verify_task`` attribute the
+        call sites hold.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+            '        verify_task.cancel()\n'
+            '\n'
+            '    async def _sneaky(self, entry, verify_task):\n'
+            '        entry.verify_task.cancel()\n'
+            '        verify_task.cancel()\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 2, offenders
+        assert all(entry.startswith('_sneaky:') for entry in offenders), offenders
+
+    def test_scanner_ignores_unrelated_cancels_and_verify_task_peeks(self) -> None:
+        """ANCHORING: the cancel half is receiver-anchored on ``verify_task``.
+
+        merge_queue.py cancels plenty of OTHER tasks (merger/verifier loop
+        tasks, heartbeat, reprobe, request futures) and peeks at a verify
+        task's ``.cancelled()`` / ``.done()`` / ``.result()`` right next to the
+        teardown — none of those are teardown steps, and flagging them would
+        make the ratchet unsatisfiable.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _elsewhere(self, entry, t):\n'
+            '        t.cancel()\n'
+            '        self._heartbeat_task.cancel()\n'
+            '        entry.item.request.result.cancel()\n'
+            '        if entry.verify_task.done() and not entry.verify_task.cancelled():\n'
+            '            entry.verify_task.result()\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_a_same_named_method_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: a ``_teardown_verify_task`` on some OTHER class
+        does not sanction its body.
+        """
+        src = (
+            'class SomethingElse:\n'
+            '    async def _teardown_verify_task(self, lease, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_teardown_verify_task:'), offenders
+
+    def test_scanner_ignores_docstring_and_comment_mentions(self) -> None:
+        """AST-not-regex: prose naming a guarded symbol is not a call site.
+
+        merge_queue.py genuinely carries such mentions (the module-level
+        teardown narrative and the back-pointer on ``_abort_remote_verify``,
+        which spells ``verify_task.cancel()`` in its own docstring), so a
+        grep-based guard would flag them forever. The bare ``async def``
+        definition must not be flagged either.
+        """
+        src = (
+            '"""Prose naming self._abort_remote_verify(lease, task_id)."""\n'
+            '\n'
+            '# self._abort_remote_verify(lease, task_id) in a comment.\n'
+            'class SpeculativeMergeWorker:\n'
+            '    async def _abort_remote_verify(self, lease, task_id):\n'
+            '        """See self._abort_remote_verify, called before '
+            'verify_task.cancel()."""\n'
+            '        return None\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _teardown_chokepoint_offenders('async def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_teardown_steps_are_only_called_from_the_teardown_helper(self) -> None:
+        """STRUCTURAL: sole-callership of BOTH steps is what makes the pairing
+        and the ordering unviolatable.
+
+        ``_abort_remote_verify`` must fire BEFORE ``verify_task.cancel()``,
+        because the verify coroutine's finally clause clears
+        ``_inflight_request_id`` on cancellation, which makes a later
+        ``cancel_verify()`` a silent no-op that orphans the remote
+        verify-merge process (task 1757). Since the helper always cancels
+        after aborting, a caller that cannot abort on its own cannot get the
+        order wrong — and since it cannot cancel on its own either, it cannot
+        skip the abort altogether, which is the direction the abort-only
+        form of this guard left open.
+        """
+        import orchestrator.merge_queue as _mq  # module-local import convention
+
+        offenders = _teardown_chokepoint_offenders(Path(_mq.__file__).read_text())
+        assert offenders == [], (
+            f'`{_MQ_GUARDED_ABORT}` and `{_MQ_GUARDED_CANCEL_RECEIVER}.cancel()` '
+            f'must only be called from `{_MQ_CHOKEPOINT_CLASS}.'
+            f'{_MQ_TEARDOWN_CHOKEPOINT}`, which always aborts the remote verify '
+            'FIRST and cancels the local task second — that sole-callership is '
+            'what makes the abort-before-cancel ordering a property of the code '
+            'rather than a convention re-typed at every site. Route these '
+            'through `await self._teardown_verify_task(lease, verify_task, '
+            f'task_id)` instead. Offenders: {offenders!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestVerifyTeardownHelper:
+    """``_teardown_verify_task`` aborts the remote verify, THEN cancels and
+    awaits the local task, no-oping either step whose argument is None
+    (task 3204 step-3 RED).
+    """
+
+    async def test_aborts_before_cancelling_the_local_task(self, git_ops: GitOps) -> None:
+        """ORDER: the remote abort is awaited while verify_task is still live."""
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        calls: list[str] = []
+        verify_task = _never_finishes()
+        cancel_requested_at_abort: int | None = None
+
+        runner = MagicMock()
+
+        async def _cancel_verify() -> int:
+            nonlocal cancel_requested_at_abort
+            calls.append('abort')
+            # OBSERVE ONLY — never assert in here (task 3204 amend, reviewer
+            # finding test-quality). This coroutine is awaited from inside
+            # `_abort_remote_verify`'s `try/except Exception` block, and an
+            # AssertionError IS an Exception: an inline assertion is swallowed
+            # and merely logged as a WARNING, so it can never fail the test.
+            # `.cancelled()` would also be the wrong probe — cancellation is
+            # not DELIVERED until the task next runs, so it reads False right
+            # after `.cancel()`. `.cancelling()` counts cancel REQUESTS and is
+            # non-zero the moment `.cancel()` returns, which is exactly the
+            # ordering fact this test is about: the remote cancel must land
+            # while the local task is still live, or it arrives after the
+            # verify coroutine's finally has cleared _inflight_request_id.
+            cancel_requested_at_abort = verify_task.cancelling()
+            return 0
+
+        runner.cancel_verify = _cancel_verify
+        lease = HostLease(name='remote', runner=runner, is_local=False)
+
+        real_cancel = verify_task.cancel
+
+        def _spy_cancel(*a: Any, **k: Any) -> bool:
+            calls.append('cancel')
+            return real_cancel(*a, **k)
+
+        verify_task.cancel = _spy_cancel  # type: ignore[method-assign]
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-order')
+
+        assert calls == ['abort', 'cancel'], calls
+        # Asserted OUT HERE, where nothing can swallow it.
+        assert cancel_requested_at_abort == 0, (
+            f'the remote abort must land while the local verify task is still '
+            f'live; verify_task.cancelling() was {cancel_requested_at_abort!r} '
+            f'when cancel_verify() ran (None = the abort never fired at all), '
+            f'so the remote cancel would be a no-op against an already-cleared '
+            f'_inflight_request_id'
+        )
+        assert verify_task.done(), 'the helper must AWAIT the cancelled task'
+
+    async def test_awaits_the_cancelled_task(self, git_ops: GitOps) -> None:
+        """AWAITED: no pending task is left behind after the helper returns."""
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited')
+
+        assert verify_task.done()
+        assert verify_task.cancelled()
+
+    async def test_none_lease_skips_only_the_remote_abort(self, git_ops: GitOps) -> None:
+        """``lease=None`` no-ops THAT STEP internally — the caller must not
+        have to branch (task 3204 requirement 2) — but still cancels + awaits.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+        verify_task = _never_finishes()
+
+        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease')
+
+        worker._abort_remote_verify.assert_not_awaited()
+        assert verify_task.cancelled()
+
+    async def test_none_verify_task_skips_only_the_cancel(self, git_ops: GitOps) -> None:
+        """``verify_task=None`` no-ops THAT STEP — the abort still fires and
+        there is no AttributeError.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        runner = MagicMock()
+        runner.cancel_verify = AsyncMock(return_value=0)
+        lease = HostLease(name='remote', runner=runner, is_local=False)
+
+        await worker._teardown_verify_task(lease, None, 'df3204-notask')
+
+        runner.cancel_verify.assert_awaited_once()
+
+    async def test_both_none_is_a_clean_no_op(self, git_ops: GitOps) -> None:
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+
+        await worker._teardown_verify_task(None, None, 'df3204-both-none')
+
+        worker._abort_remote_verify.assert_not_awaited()
+
+    async def test_swallows_an_exception_from_awaiting_the_verify_task(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The ``await verify_task`` is unconditionally suppressed — as it is at
+        all six sites today — so a verify that died with an exception cannot
+        derail the teardown.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        async def _boom() -> None:
+            raise RuntimeError('verify blew up')
+
+        verify_task = asyncio.get_running_loop().create_task(_boom())
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser')
+
+        assert verify_task.done()
+
+    async def test_shutdown_defensive_swallows_a_raising_abort(
+        self, git_ops: GitOps,
+    ) -> None:
+        """``shutdown_defensive=True``: a BaseException out of the remote abort
+        (e.g. a SIGTERM-driven CancelledError) must not abort the drain loop,
+        and the teardown still proceeds to cancel.
+
+        This is the one genuine per-site difference: the two stop() drain sites
+        wrap the abort in ``contextlib.suppress(BaseException)``.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock(  # type: ignore[method-assign]
+            side_effect=asyncio.CancelledError(),
+        )
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(
+            lease, verify_task, 'df3204-defensive', shutdown_defensive=True,
+        )
+
+        worker._abort_remote_verify.assert_awaited_once()
+        assert verify_task.cancelled(), 'must still cancel after swallowing the abort'
+
+    async def test_default_lets_a_raising_abort_propagate(self, git_ops: GitOps) -> None:
+        """DEFAULT (``shutdown_defensive=False``): the exception PROPAGATES.
+
+        The head-failure cascade deliberately does not suppress — a
+        CancelledError there must stop the verifier loop, which is correct
+        behaviour. Collapsing the flag either way would be a silent behaviour
+        change on one path or the other.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock(  # type: ignore[method-assign]
+            side_effect=asyncio.CancelledError(),
+        )
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await worker._teardown_verify_task(lease, verify_task, 'df3204-propagates')
+
+        # Clean up the task this deliberately-aborted teardown left behind.
+        verify_task.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_task
+
+
+# ---------------------------------------------------------------------------
 # task 2063: _redispatch-parked speculative permit accounting (signal test)
 # ---------------------------------------------------------------------------
 
@@ -4513,6 +5229,7 @@ class _FakeEscalationQueue:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case, includes a loop.time() + 15.0 deadline-bounded poll loop (~4670-4672) invisible to the automated scan -- a deliberate over-mark the guard alone would not have demanded
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
     parked on ``_redispatch`` must stay counted by
@@ -4551,11 +5268,17 @@ class TestRedispatchSpeculativeConservation:
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The I4 speculation-slot identity holds at every heartbeat-observable
         point while a genuinely speculative item sits parked on
         ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+
+        Also (task 3477): the disposition classifier must not silently
+        degrade to its fail-open path while processing this test's failing
+        VerifyResult double — see the caplog guard at the end of this test.
         """
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         _local_calls: list[int] = [0]
@@ -4567,16 +5290,14 @@ class TestRedispatchSpeculativeConservation:
                 # A's verify: gate, then FAIL.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
+                return _fake_verify_result(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    category='test_failure',
                 )
             # B's re-dispatched local verify (after the previous_failed remerge).
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok', lint_output='',
-                type_output='', category='', timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         wt_a = await _make_branch_with_file(git_ops, 'task/rc-a', 'rc_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/rc-b', 'rc_b.py', 'b = 2\n')
@@ -4740,6 +5461,30 @@ class TestRedispatchSpeculativeConservation:
         assert 'rc_b.py' in main_files, 'B (rc_b.py) must land on main after remerge'
         assert 'rc_a.py' not in main_files, 'A (rc_a.py) must NOT land (verify failed)'
 
+        # task 3477: A's VerifyResult double (passed=False) reaches
+        # classify_merge_failure_disposition via the real post-merge-verify
+        # path. That classifier must complete honestly, not silently degrade
+        # to its fail-open path (merge_disposition.py:710-719) because the
+        # double's cause_hint/test_output shape confused
+        # _extract_failing_tests_and_candidate_files. This guard is what
+        # proves the (b) fidelity fix actually reached this call site — any
+        # future double built without a real cause_hint re-trips it.
+        fail_open_records = [
+            r for r in caplog.records
+            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
+        ]
+        assert fail_open_records == [], (
+            'classify_merge_failure_disposition degraded to the silent '
+            'fail-open path while classifying A\'s failing verify — the '
+            'VerifyResult double reached _extract_failing_tests_and_'
+            'candidate_files and raised instead of returning a real '
+            'disposition. Offending record(s):\n' + '\n'.join(
+                ''.join(traceback.format_exception(*r.exc_info))
+                if r.exc_info else r.message
+                for r in fail_open_records
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2096: _finalizing_head speculative-permit accounting THROUGHOUT the
@@ -4901,4 +5646,576 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         assert worker.speculation_accounting_violations() == [], (
             'speculation-slot identity must hold after the finalizing head '
             'releases its permit in the finally clause.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-1 RED: _fake_verify_result factory contract
+# ---------------------------------------------------------------------------
+#
+# None of the 18 inline VerifyResult-shaped `MagicMock(passed=..., summary=...,
+# test_output=..., ...)` doubles in this file set `cause_hint`, so an
+# unconfigured attribute read on a bare MagicMock auto-vivifies a truthy
+# child Mock instead of a real string. Every FAILING double reaches
+# merge_disposition.py:218-221's
+# `'\n'.join(part for part in (verify_result.cause_hint, verify_result.test_output) if part)`,
+# which raises `TypeError: sequence item 0: expected str instance, MagicMock
+# found`. classify_merge_failure_disposition (merge_disposition.py:710-719)
+# swallows that into a silent fail-open — WARNING
+# "classify_merge_failure_disposition: internal error; degrading to
+# INDETERMINATE (fail-open, I3)" — so the affected tests only APPEAR to
+# exercise disposition classification. `_fake_verify_result` (GREEN:
+# task 3477 step-2, added beside `_mock_verify_result` above) fixes this at
+# the source: a `MagicMock(spec=VerifyResult)` seeded from a REAL
+# VerifyResult's field defaults, so `cause_hint` (and every other field) is
+# authoritative and future fields are picked up automatically.
+# ---------------------------------------------------------------------------
+
+
+class TestFakeVerifyResultFidelity:
+    """`_fake_verify_result` doubles must survive the real disposition-
+    classification extraction path, unlike a bare `MagicMock(passed=...)`.
+    """
+
+    def test_failing_double_survives_disposition_extraction(self) -> None:
+        """A failing `_fake_verify_result` double must not TypeError inside
+        `_extract_failing_tests_and_candidate_files`.
+
+        RED (pre task-3477 step-2): NameError: name '_fake_verify_result' is
+        not defined.
+        """
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        double = _fake_verify_result(
+            passed=False,
+            summary='test_failure',
+            test_output='FAILED',
+            category='test_failure',
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            double,
+        )
+        assert (failing_tests, candidate_files) == ((), ()), (
+            f'Expected an uninformative failing double to degrade to the '
+            f'honest empty-candidate-set return, not raise or manufacture a '
+            f'false candidate; got {(failing_tests, candidate_files)!r}.'
+        )
+
+        # Root-cause pin: a bare MagicMock auto-vivifies `.cause_hint` as a
+        # truthy child Mock (not a str) — that is the whole bug. The factory
+        # must seed a real string default (VerifyResult's own default: '')
+        # instead.
+        assert isinstance(double.cause_hint, str), (
+            f'Expected double.cause_hint to be a real str (the VerifyResult '
+            f'default is \'\'), not an auto-vivified MagicMock child; got '
+            f'{double.cause_hint!r} ({type(double.cause_hint)!r}). This is '
+            f'the root cause of the file-wide fail-open: '
+            f'_extract_failing_tests_and_candidate_files joins '
+            f'(cause_hint, test_output) and str.join rejects a non-str item.'
+        )
+
+    def test_rejects_unknown_override_field(self) -> None:
+        """An override key that is not a real VerifyResult field must raise
+        immediately, not silently no-op (task 3477 amend).
+
+        ``spec=VerifyResult`` alone only guards unconfigured *reads*; a
+        plain ``setattr`` on a ``spec=`` (not ``spec_set=``) mock still
+        accepts an unknown attribute WRITE. Without this validation, a
+        typo'd override (e.g. ``categoy=`` for ``category=``) or a
+        leftover ``verify_skipped=`` would silently produce a double whose
+        real field keeps its seeded default instead of raising -- the same
+        class of silent drift this factory exists to eliminate.
+        """
+        with pytest.raises(TypeError, match='verify_skipped'):
+            _fake_verify_result(passed=False, verify_skipped=True)
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-5: _await_outcome loud-timeout contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAwaitOutcomeHelper:
+    """`_await_outcome` must report a real timeout AS a timeout.
+
+    The previous shape in this file --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang into a confusing ``outcome is None`` assertion
+    failure, hiding whether the pipeline actually hung or the cascade never
+    fired. ``_await_outcome`` closes that gap by failing loudly, by name,
+    at the deadline instead.
+    """
+
+    async def test_await_outcome_returns_resolved_outcome(self) -> None:
+        """An already-resolved future's value is returned unchanged."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        sentinel = object()
+        fut.set_result(sentinel)
+
+        result = await _await_outcome(fut, label='N (already resolved)')
+
+        assert result is sentinel, (
+            f'Expected _await_outcome to return the resolved future value '
+            f'unchanged, got {result!r}.'
+        )
+
+    async def test_await_outcome_fails_loudly_on_deadline(self) -> None:
+        """A future that never resolves must pytest.fail -- by name, with
+        the deadline -- rather than let the caller observe a bare None.
+
+        RED (pre task-3477 step-6): NameError: name '_await_outcome' is not
+        defined.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+
+        with pytest.raises(pytest.fail.Exception, match='cascade-N-await') as exc_info:
+            await _await_outcome(fut, label='cascade-N-await', timeout=0.05)
+
+        assert '0.05' in str(exc_info.value), (
+            f'Expected the failure message to name the deadline (0.05s), '
+            f'got {exc_info.value!r}. A real timeout must report AS a '
+            f'timeout -- naming the label and the deadline -- not surface '
+            f'as a confusing `outcome is None`.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-1: wait-budget audit helper (source-level AST scan)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitBudgetAuditHelper:
+    """Unit tests for `_worst_per_method_wait_budget`, task 3492's audit
+    engine -- see ITS docstring for the full per-method-vs-class-wide-sum
+    and shape-floor/branch-blind rationale; this class only pins the
+    observable behaviour case by case.
+
+    Every case here is driven from a SYNTHETIC source string, not this
+    module's own source, so these tests are provably non-vacuous and do not
+    shift when this file is later edited.
+    """
+
+    def test_two_sequential_wait_for_calls_sum_within_one_method(self) -> None:
+        """Two sequential `asyncio.wait_for(..., timeout=45.0)` calls in the
+        SAME method sum to 90.0 -- pytest-timeout enforces the whole method
+        body, so sequential waits stack.
+        """
+        source = '''
+class TestTwoSequentialWaits:
+    async def test_two_waits(self):
+        await asyncio.wait_for(x, timeout=45.0)
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoSequentialWaits': 90.0}, (
+            f'Expected two sequential 45.0s waits in one method to sum to '
+            f'90.0, got {budgets!r}.'
+        )
+
+    def test_mutually_exclusive_branches_are_summed_not_maxed(self) -> None:
+        """Two 45.0s waits in opposite arms of an `if`/`else` -- which can
+        never both execute in a single real run -- sum to 90.0, not the
+        45.0 a control-flow-aware count would give.
+
+        This pins a deliberate, tolerated LIMITATION, not a design goal:
+        `_method_wait_budget` walks the whole method body via `ast.walk`
+        with no awareness of branches, so mutually exclusive arms over-count
+        relative to any real execution path (see `_method_wait_budget`'s
+        docstring). It is what makes `TestOverlapSignal`'s computed 160.0s
+        exceed a control-flow-aware hand count of 135.0s for the same
+        method's try/except paths.
+        """
+        source = '''
+class TestBranchesSummed:
+    async def test_branches(self, cond):
+        if cond:
+            await asyncio.wait_for(x, timeout=45.0)
+        else:
+            await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBranchesSummed': 90.0}, (
+            f'Expected mutually exclusive if/else branches to be SUMMED '
+            f'(90.0), not maxed (45.0) -- this pins the branch-blind '
+            f'limitation documented on _method_wait_budget, not a design '
+            f'goal; got {budgets!r}.'
+        )
+
+    def test_non_asyncio_wait_for_is_not_counted(self) -> None:
+        """A `.wait_for(...)` call on something other than `asyncio` (e.g.
+        `gate.wait_for(x, timeout=999.0)`) contributes 0.0 -- the match is
+        deliberately narrowed to `asyncio.wait_for` specifically, so an
+        unrelated same-named method can't be mistaken for the real thing.
+        """
+        source = '''
+class TestNonAsyncioWaitFor:
+    async def test_it(self, gate):
+        await gate.wait_for(x, timeout=999.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestNonAsyncioWaitFor': 0.0}, (
+            f'Expected a non-asyncio .wait_for(...) call to contribute 0.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_takes_max_over_methods_not_class_wide_sum(self) -> None:
+        """A class with TWO methods, each with one 45.0 wait, budgets at
+        45.0 -- the MAX over methods, NOT the 90.0 class-wide sum.
+
+        This is the distinction that makes the audit correct: pytest-timeout
+        applies the class mark to each method independently. Summing across
+        methods would misidentify a class like
+        `TestRunInflightVerifyAbortPoll` (four 45s methods, a 180s
+        class-wide sum but only a 45s worst method) as a false-positive
+        breach.
+        """
+        source = '''
+class TestTwoLightMethods:
+    async def test_one(self):
+        await asyncio.wait_for(x, timeout=45.0)
+
+    async def test_two(self):
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoLightMethods': 45.0}, (
+            f'Expected the MAX over methods (45.0), not the class-wide sum '
+            f'(90.0); got {budgets!r}. Summing across methods would '
+            f'misidentify the breaching set the guard is meant to compute.'
+        )
+
+    def test_bare_await_outcome_contributes_hidden_default_budget(self) -> None:
+        """A bare `_await_outcome(req, label='x')` call with no explicit
+        `timeout=` contributes the hidden default, MERGE_RESULT_TIMEOUT
+        (45.0) -- invisible to a naive `timeout=` grep, which is exactly
+        why the guard must special-case this call shape.
+        """
+        source = '''
+class TestBareAwaitOutcome:
+    async def test_bare_default(self):
+        await _await_outcome(req, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBareAwaitOutcome': 45.0}, (
+            f'Expected a bare _await_outcome() call to contribute the '
+            f'hidden MERGE_RESULT_TIMEOUT default (45.0), got {budgets!r}.'
+        )
+
+    def test_await_outcome_explicit_timeout_overrides_default(self) -> None:
+        """`_await_outcome(req, label='x', timeout=10.0)` contributes its
+        explicit 10.0, not the 45.0 default -- proves the explicit
+        `timeout=` kwarg is read, not just assumed.
+        """
+        source = '''
+class TestExplicitAwaitOutcome:
+    async def test_explicit_timeout(self):
+        await _await_outcome(req, label='x', timeout=10.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestExplicitAwaitOutcome': 10.0}, (
+            f'Expected an explicit timeout=10.0 kwarg to override the '
+            f'hidden default, got {budgets!r}.'
+        )
+
+    def test_dynamic_timeout_value_contributes_zero_and_does_not_raise(self) -> None:
+        """A non-literal/dynamic timeout such as `timeout=some_var`
+        contributes 0.0 and does NOT raise -- the helper is conservative:
+        unknown means ignore, never guess.
+        """
+        source = '''
+class TestDynamicTimeout:
+    async def test_dynamic(self):
+        await asyncio.wait_for(x, timeout=some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestDynamicTimeout': 0.0}, (
+            f'Expected an unresolvable dynamic timeout to contribute 0.0 '
+            f'without raising, got {budgets!r}.'
+        )
+
+    def test_merge_result_timeout_name_resolves_to_45(self) -> None:
+        """`timeout=MERGE_RESULT_TIMEOUT` resolves the name reference to
+        its known numeric value, 45.0.
+        """
+        source = '''
+class TestMergeResultTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=MERGE_RESULT_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestMergeResultTimeoutName': 45.0}, (
+            f'Expected timeout=MERGE_RESULT_TIMEOUT to resolve to 45.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_heavy_barrier_test_timeout_name_resolves_to_300(self) -> None:
+        """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
+        to its known numeric value, 300.0.
+        """
+        source = '''
+class TestHeavyBarrierTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=HEAVY_BARRIER_TEST_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHeavyBarrierTimeoutName': 300.0}, (
+            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
+            f'300.0, got {budgets!r}.'
+        )
+
+    def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
+        """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
+        OUT of the counted shape set (the guard is a conservative floor,
+        not a full audit; see the floor/superset design decision).
+        """
+        source = '''
+class TestSleepNotCounted:
+    async def test_sleeps(self):
+        await asyncio.sleep(999)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestSleepNotCounted': 0.0}, (
+            f'Expected asyncio.sleep(...) to contribute 0.0 (not a counted '
+            f'call shape), got {budgets!r}.'
+        )
+
+    def test_non_test_methods_do_not_contribute(self) -> None:
+        """A non-`test_*` method (a private helper or a fixture) contributes
+        nothing -- only real test methods drive the budget.
+        """
+        source = '''
+class TestHelperMethodsIgnored:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=999.0)
+
+    @pytest.fixture
+    def some_fixture(self):
+        return object()
+
+    async def test_actual(self):
+        await asyncio.wait_for(y, timeout=5.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHelperMethodsIgnored': 5.0}, (
+            f'Expected only test_* methods to contribute to the budget '
+            f'(5.0), with the 999.0s wait in a non-test helper ignored; '
+            f'got {budgets!r}.'
+        )
+
+    def test_class_with_no_test_methods_is_zero_or_absent(self) -> None:
+        """A class with no test methods at all budgets 0.0 (or is absent
+        from the result) -- no crash.
+        """
+        source = '''
+class TestNoTestMethods:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoTestMethods', 0.0) == 0.0, (
+            f'Expected a class with no test_* methods to budget 0.0 (or be '
+            f'absent), got {budgets!r}.'
+        )
+
+    def test_class_with_no_waits_is_zero(self) -> None:
+        """A class whose test methods never wait budgets 0.0 -- no crash."""
+        source = '''
+class TestNoWaits:
+    async def test_nothing(self):
+        x = 1 + 1
+        return x
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoWaits', 0.0) == 0.0, (
+            f'Expected a class with no waits at all to budget 0.0, got '
+            f'{budgets!r}.'
+        )
+
+    def test_syntactically_odd_but_parseable_input_does_not_raise(self) -> None:
+        """A syntactically odd but still-parseable module -- no `Test*`
+        classes at all, only module-level and conditionally-nested code --
+        does not raise.
+        """
+        source = '''
+x = 1
+def free_function():
+    return 42
+if x:
+    class NotATestClass:
+        def method(self):
+            pass
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {}, (
+            f'Expected a module with no Test* classes to yield an empty '
+            f'result without raising, got {budgets!r}.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 amend: cover _timeout_mark_offenders' failure branches directly
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkOffenders:
+    """`_timeout_mark_offenders` is the pure offender-accumulation loop
+    behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
+    stub classes (not this module's own, now fully-marked, classes) so its
+    failure branches -- no mark at all, a mark too tight for the budget,
+    and an unresolvable class name -- are each independently non-vacuous,
+    rather than only ever exercised by the happy path.
+    """
+
+    def test_class_with_no_pytestmark_is_one_offender(self) -> None:
+        """A resolved class with no `timeout` mark at all yields exactly
+        one offender naming the missing mark.
+        """
+
+        class _NoMark:
+            pass
+
+        offenders = _timeout_mark_offenders({'_NoMark': 200.0}, {'_NoMark': _NoMark}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_NoMark' in offenders[0]
+        assert 'no @pytest.mark.timeout mark' in offenders[0]
+
+    def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
+        """A class carrying `@pytest.mark.timeout(60)` against a 200s
+        computed budget yields exactly one offender naming the too-tight
+        value -- this is the exact failure mode task 3477 hit (a mark
+        present but too tight to clear the real wait profile).
+        """
+
+        @pytest.mark.timeout(60)
+        class _TooTight:
+            pass
+
+        offenders = _timeout_mark_offenders({'_TooTight': 200.0}, {'_TooTight': _TooTight}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_TooTight' in offenders[0]
+        assert '60' in offenders[0]
+
+    def test_unresolvable_class_name_is_one_offender(self) -> None:
+        """A budgeted class name that *resolve* cannot look up (e.g. it was
+        renamed or removed after the scan ran) yields exactly one offender
+        rather than raising -- the guard degrades to a loud failure, never
+        a silent skip.
+        """
+        offenders = _timeout_mark_offenders({'DoesNotExist': 200.0}, {}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert 'DoesNotExist' in offenders[0]
+        assert 'could not be resolved' in offenders[0]
+
+    def test_adequate_mark_yields_no_offenders(self) -> None:
+        """A class whose mark value clears its computed budget yields no
+        offenders -- pins the happy path so it stays non-vacuous too.
+        """
+
+        @pytest.mark.timeout(300)
+        class _Adequate:
+            pass
+
+        offenders = _timeout_mark_offenders({'_Adequate': 200.0}, {'_Adequate': _Adequate}.get)
+
+        assert offenders == [], f'Expected no offenders, got {offenders!r}.'
+
+    def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
+        """A class computing below `PYPROJECT_DEFAULT_TIMEOUT` is skipped
+        entirely, even carrying no mark at all -- only heavy classes are
+        subject to the guard.
+        """
+
+        class _LightNoMark:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_LightNoMark': PYPROJECT_DEFAULT_TIMEOUT - 1},
+            {'_LightNoMark': _LightNoMark}.get,
+        )
+
+        assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-3: enforced coverage invariant over THIS module's own source
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a `@pytest.mark.timeout` mark whose value clears that budget.
+
+    This is what stops the recurrence task 3492 exists to fix: task 2350
+    widened a wait region without adding a mark, task 2376 widened five more
+    sites without a mark, and task 3477 then found its own two marks had
+    drifted too tight for the wait profile they were guarding ("was a bare
+    180, too tight"). Literal values can still drift, but a class going
+    under-marked can no longer land silently -- this guard recomputes the
+    audit from the module's own source on every run.
+
+    The guard is a conservative FLOOR, not the whole audit -- see
+    `_call_wait_budget`'s docstring for exactly which call shapes are
+    counted and why under-demanding (never over-demanding) is the
+    deliberate failure direction.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a `timeout` mark whose value clears its own computed budget.
+
+        First run (task 3492 step-3, before step-4 added marks) flagged six
+        classes computing >= 60s with no timeout mark at all --
+        TestSingleHostSerialByteIdentical, TestOverlapSignal,
+        TestChainInvalidationUnderOverlap, TestHaltAndUnavailable,
+        TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
+        Marks were added for those six (plus TestRedispatchSpeculativeConservation,
+        over-marked on the strength of a wait shape this scan cannot see) in
+        the same change; the two task-3477 cascade classes already passed
+        (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s budget).
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+        offenders = _timeout_mark_offenders(budgets, globals().get)
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure. Add '
+            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (or another '
+            'value clearing the computed budget) directly above each '
+            'offending class.'
         )

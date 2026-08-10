@@ -29,6 +29,24 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+# Self-bootstrap for standalone `python scripts/legibility/digest.py` runs —
+# must run BEFORE the `legibility.*` import below, since a direct script
+# invocation puts only scripts/legibility/ (not scripts/) on sys.path.
+# Skipped under pytest/normal package import: __name__ is 'legibility.digest'.
+# Verbatim the sampling.py:43-48 / census.py / nightly.py guard.
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The ONE import this module takes from a sibling, and a deliberate narrowing
+# of the "self-contained" claim inventory.py's own docstring makes about the
+# alpha/beta split: these two names are the shared definition of "this
+# transcript is unreadable", and the alternative to importing them is a second
+# copy of that answer in each reader — the duplication this replaces.
+from legibility.inventory import (  # noqa: E402
+    UNREADABLE_FILE_ERRORS,
+    as_unreadable_file_error,
+)
+
 logger = logging.getLogger('legibility.digest')
 
 
@@ -41,27 +59,57 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
     for byte-parity. This lets census/nightly RENDER digests for archived gz
     sessions rather than enumerate-then-drop them (the same gz idiom as
-    ``inventory._iter_json_lines``).
+    ``inventory.iter_json_lines``).
 
-    Blank lines and lines that fail to parse as JSON are skipped rather
-    than raising: fire-and-forget transcript writers can leave a truncated
-    or corrupt trailing line, and one bad line must not abort the whole
-    read (mirrors analyze_speculation_depth.load_events).
+    Degradation splits at the file/line boundary, and that split is a
+    contract rather than an implementation detail. A corrupt LINE degrades
+    silently: blank lines and lines that fail to parse as JSON are skipped,
+    because fire-and-forget transcript writers can leave a truncated or
+    corrupt trailing line and one bad line must not abort the whole read
+    (mirrors analyze_speculation_depth.load_events). An unreadable FILE
+    raises ``OSError``, so a caller reporting coverage counts it once
+    instead of aborting its walk.
+
+    Making the ``OSError`` half true takes explicit normalization: an
+    unreadable file surfaces as four different exception types, only one of
+    which is already an ``OSError``. This reader does NOT answer that
+    question itself — it funnels through
+    ``inventory.as_unreadable_file_error``, the one place that enumerates the
+    shapes and explains why each is expected, which is also what
+    ``inventory.iter_json_lines`` (the streaming sibling cited above) uses.
+    The two readers are therefore interchangeable at this boundary by
+    construction rather than by two copies kept in sync;
+    ``test_legibility_digest.TestLoadTranscriptCorruptionShapes`` asserts the
+    agreement directly, including that they share the one implementation.
     """
     records: list[dict[str, Any]] = []
+    # noqa SIM115 x2: the branch only PICKS the opener; the handle is closed by
+    # the `with f:` two lines down. Collapsing it into the `with` would mean
+    # duplicating the loop body, and the plain-path call is kept verbatim for
+    # the byte-parity this docstring pins.
     if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
+        f = gzip.open(path, 'rt', encoding='utf-8')  # noqa: SIM115
     else:
-        f = open(path, encoding='utf-8')
+        f = open(path, encoding='utf-8')  # noqa: SIM115
     with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        # Wrap only the read/decompress iteration — decompression happens
+        # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError
+        # skip inside the loop so the file-level vs line-level split above is
+        # preserved. Catch tuple and wrapping are BOTH the shared inventory
+        # helpers, not local copies: that is what makes this reader and
+        # iter_json_lines agree structurally instead of by two edits landing
+        # together.
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except UNREADABLE_FILE_ERRORS as exc:
+            raise as_unreadable_file_error(exc) from exc
     return records
 
 
@@ -84,10 +132,16 @@ def _user_turn_text(content: Any) -> str | None:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        # The `isinstance(..., str)` guard already excludes None and non-str at
+        # runtime, but binding it with a walrus is what carries that narrowing
+        # into the element expression — pyright cannot narrow an unbound
+        # `.get()` CALL across the guard, so the un-bound spelling inferred
+        # list[Unknown | None] and rejected the join. Same iteration, same
+        # filter, same values.
         texts = [
-            block.get('text') for block in content
+            block_text for block in content
             if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block.get('text'), str)
+            and isinstance(block_text := block.get('text'), str)
         ]
         if texts:
             return '\n'.join(texts)
@@ -106,8 +160,8 @@ def _content_to_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            block.get('text') for block in content
-            if isinstance(block, dict) and isinstance(block.get('text'), str)
+            block_text for block in content
+            if isinstance(block, dict) and isinstance(block_text := block.get('text'), str)
         ]
         return '\n'.join(parts)
     return ''
@@ -423,7 +477,12 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
     canonical-JSON input, again".
     """
-    groups: dict[tuple[str, str], list[int]] = {}
+    # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
+    # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
+    # None here and always has. The declared type is corrected to match rather
+    # than the value coerced, which would change what a nameless block renders
+    # as in the report for no benefit.
+    groups: dict[tuple[str | None, str], list[int]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
         groups.setdefault(key, []).append(index)
@@ -697,12 +756,19 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
 def _encode_cwd(cwd: str) -> str:
     """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
 
-    Both '/' and '.' map to '-' (same rule as
-    orchestrator/src/orchestrator/session_registry.py:transcript_path_for_cwd,
-    reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk).
+    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
+    orchestrator.session_registry.encode_cwd, the canonical implementation,
+    which carries the authoritative statement of the rule and the record of
+    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
+    Reused here as the fallback when the real transcript path isn't
+    available to read the ground-truth encoded dir name off disk.
+
+    Agreement with the canonical is not left to goodwill: it is asserted
+    row-for-row against real on-disk dir names by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
+    (task 3272, which found this copy and three others all missing '_').
     """
-    return cwd.replace('/', '-').replace('.', '-')
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:

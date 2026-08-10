@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
 
 from orchestrator.artifacts import TaskArtifacts
@@ -25,6 +26,8 @@ class _Fixture:
     update_task: AsyncMock
     invocation_count: list[int]
     event_emit: MagicMock
+    # Opt-in merge-faithful backend (task 3579); None unless the test passed one.
+    metadata_backend: FakeMetadataBackend | None = None
 
 
 def _make_result(
@@ -62,6 +65,8 @@ def _make(
     write_unactionable: bool = False,
     blast_radius_grants: bool = True,
     task_metadata: dict | None = None,
+    modules: list[str] | None = None,
+    metadata_backend: FakeMetadataBackend | None = None,
 ) -> _Fixture:
     worktree.mkdir(parents=True, exist_ok=True)
     project_root.mkdir(parents=True, exist_ok=True)
@@ -69,15 +74,20 @@ def _make(
     artifacts = TaskArtifacts(worktree)
     artifacts.init(task_id, 'Document foo', 'd', base_commit='base123')
 
+    # `files` first so a caller-supplied task_metadata CAN override it (task
+    # 3579 needs to seed a dispatch-time files list); the three existing
+    # task_metadata= callers pass routing/complexity only, never files.
+    task_md = {'files': ['mod_a/foo.py'], **(task_metadata or {})}
+
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {
         'id': task_id,
         'title': 'Document foo',
         'description': 'Add a docstring to foo.',
-        'metadata': {**(task_metadata or {}), 'files': ['mod_a/foo.py']},
+        'metadata': task_md,
     }
-    assignment.modules = ['mod_a']
+    assignment.modules = list(modules) if modules is not None else ['mod_a']
 
     _spec = pydantic_spec(OrchestratorConfig)
     config = MagicMock(spec_set=_spec)
@@ -96,6 +106,11 @@ def _make(
     scheduler.set_task_status = AsyncMock()
     scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
     scheduler.update_task = update_task
+    if metadata_backend is not None:
+        handle_blast_radius_expansion, update_task = wire_metadata_backend(
+            scheduler, metadata_backend,
+            seed=task_md, grants=blast_radius_grants,
+        )
 
     git_ops = MagicMock()
     git_ops.is_ancestor = AsyncMock(return_value=True)
@@ -145,6 +160,7 @@ def _make(
         update_task=update_task,
         invocation_count=invocation_count,
         event_emit=event_emit,
+        metadata_backend=metadata_backend,
     )
 
 
@@ -185,12 +201,19 @@ async def test_simple_task_success_returns_planned(tmp_path: Path):
     assert data['reason'] == 'architect_skipped_simple_task'
     assert data['classifier_signals']['title'] == 'Document foo'
 
-    # optimistic_path stamped for auto-eval
+    # optimistic_path stamped for auto-eval, as a narrow single-key merge
+    # write (task 3579) — a positional payload, NOT the whole metadata blob.
     update_calls = [
         c for c in f.update_task.call_args_list
-        if c.kwargs.get('metadata', {}).get('optimistic_path') == 'simple_task'
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and c.args[1].get('optimistic_path') == 'simple_task'
+        and c.kwargs.get('metadata_mode') == 'merge'
     ]
     assert update_calls
+    # Single-key payload: a regression that re-broadens it to a whole blob
+    # would clobber sibling keys such as metadata.files.
+    assert set(update_calls[-1].args[1]) == {'optimistic_path'}
 
 
 @pytest.mark.asyncio
@@ -409,3 +432,102 @@ async def test_should_run_simple_task_false_when_saturated(tmp_path: Path):
     f.wf.initial_plan = None
 
     assert f.wf._should_run_simple_task() is False
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
+    """Task 3579: the optimistic_path stamp must not write back the stale
+    dispatch-time metadata blob — at shallow-merge mode its ``files`` key
+    overwrites the NARROWED set ``_reconcile_scope_locks`` just persisted."""
+    plan = _good_plan()
+    plan['files'] = ['mod_a/src/foo.py']
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': ['mod_a/src/foo.py', 'mod_b/src/bar.py']},
+        modules=['mod_a/src', 'mod_b/src'],
+        metadata_backend=backend,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    # The reconcile ran and persisted the narrowed set.
+    assert backend.blast_radius_calls
+    assert backend.blast_radius_calls[-1][2] == ['mod_a/src/foo.py']
+    # ...and the stamp did NOT revert it.
+    assert backend.blob['files'] == ['mod_a/src/foo.py']
+    # The stamp itself still landed, in the backend and in memory — so a
+    # failure above is the clobber, not a missing stamp.
+    assert backend.blob['optimistic_path'] == 'simple_task'
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_preserves_widened_files(tmp_path: Path):
+    """Task 3579, the other direction: the stale dispatch-time blob written
+    back at shallow-merge mode also re-NARROWS a scope the reconcile just
+    widened."""
+    plan = _good_plan()
+    plan['files'] = ['mod_a/src/foo.py', 'mod_b/src/bar.py']
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': ['mod_a/src/foo.py']},
+        modules=['mod_a/src'],
+        metadata_backend=backend,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert backend.blast_radius_calls
+    assert backend.blast_radius_calls[-1][2] == [
+        'mod_a/src/foo.py', 'mod_b/src/bar.py',
+    ]
+    assert backend.blob['files'] == ['mod_a/src/foo.py', 'mod_b/src/bar.py']
+    assert backend.blob['optimistic_path'] == 'simple_task'
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_mirrors_in_memory_when_persist_fails(
+    tmp_path: Path,
+):
+    """Task 3579: the in-memory mirror sits OUTSIDE the scheduler-write try, so
+    a failed persist must still leave optimistic_path readable in-process (the
+    harness auto-eval hook reads it there) and must not change the outcome."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_good_plan(),
+    )
+    f.wf.scheduler.update_task = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=RuntimeError('backend down'),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    # Non-vacuity: the raising write really was attempted.
+    assert f.wf.scheduler.update_task.await_count >= 1  # type: ignore[attr-defined]
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_optimistic_stamp_survives_non_dict_metadata(tmp_path: Path):
+    """Task 3579: the mirror normalises a None/non-dict metadata before
+    assigning. ``setdefault`` would return the existing None and raise
+    TypeError — which, sitting outside the try, would escape this
+    fire-and-forget stamp into its caller."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    for corrupt in (None, '{"files": []}', ['not', 'a', 'dict']):
+        f.wf.task['metadata'] = corrupt
+
+        await f.wf._stamp_optimistic_path('simple_task')
+
+        assert f.wf.task['metadata'] == {'optimistic_path': 'simple_task'}

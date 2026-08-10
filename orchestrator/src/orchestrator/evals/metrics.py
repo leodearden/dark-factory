@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -57,7 +58,12 @@ class EvalMetrics:
     # Efficiency
     cost_usd: float = 0.0
     # Cost provenance (Invariant P5): one of 'price_table' | 'cli' |
-    # 'unpriced_proxy' — see :func:`resolve_cost_usd`. Defaults to 'cli' (the
+    # 'unpriced_proxy' | 'mixed'. The first three are what
+    # :func:`resolve_cost_usd` resolves for a SINGLE invocation's spend.
+    # 'mixed' is producible only by the ARCHITECT path, whose cost_usd is a
+    # TWO-COMPONENT sum (architect spend + plan-judge spend): when those two
+    # components' sources disagree, :func:`compose_cost_source` says so rather
+    # than letting one label silently describe both. Defaults to 'cli' (the
     # trustworthy native-cloud source) so a result JSON persisted before this
     # field existed reads back sanely.
     cost_source: str = 'cli'
@@ -66,8 +72,19 @@ class EvalMetrics:
     iterations: int = 0          # implementer re-invocations
     debug_cycles: int = 0        # debugger invocations
 
-    # Completion judge (ζ) — judge_cost_usd is a SUBSET of cost_usd, not
-    # disjoint. Report generators should not double-count.
+    # Judge spend, populated by TWO producers: ``collect_metrics`` copies it
+    # from ``workflow.metrics`` on the implementer path (the completion judge,
+    # ζ), and ``run_architect_eval`` sets it from the plan judge's verdict on
+    # the architect path (θ, eval-revival υ). judge_cost_usd is a SUBSET of
+    # cost_usd on BOTH paths, not disjoint — report generators should not
+    # double-count. A $0.00 judge_cost_usd on an architect cell does not mean
+    # the judge ran for free; it means the judge was either SKIPPED (tainted,
+    # refused-with-a-plan, or an unscorable plan — judge_invocations reads 0)
+    # or RAISED after being asked (judge_invocations ALSO reads 0 there,
+    # because whether ``invoke_agent`` was ever reached before the raise
+    # isn't determinable from the runner — but ``invocation_error`` then
+    # names ``judge:raised: ...``, so the cell is legible as "judge raised,
+    # spend unknown", not silently byte-indistinguishable from a skip).
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
@@ -202,13 +219,14 @@ def produced_a_plan(metrics: dict[str, Any]) -> bool:
     ``report._has_plan_quality_score`` was written to close).
 
     **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
-    3302): the two plan scorers disagree exactly on a stepless artifact.
+    3302): the two plan scorers disagreed exactly on a stepless artifact.
     :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
-    ANTI-FABRICATION guard, while the LLM plan judge has no such guard and can
-    score the same artifact nonzero (Graphiti episode e2066ec6). So a nonzero
-    ``plan_quality`` is not evidence a plan exists, and a zero one is not
-    evidence it does not — the number is the thing being decided, not the
-    evidence for it.
+    ANTI-FABRICATION guard; the LLM plan judge used to have no such guard and
+    could score the same artifact nonzero (Graphiti episode e2066ec6) — closed
+    at the instrument by task 3303, which gave ``judge_plan_quality`` the same
+    floor. Regardless of which scorer produced it, a nonzero ``plan_quality``
+    is not evidence a plan exists, and a zero one is not evidence it does not
+    — the number is the thing being decided, not the evidence for it.
 
     **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
     and blocked-with-a-good-plan cells both occur, so the workflow outcome
@@ -467,6 +485,26 @@ def blend_composite(
     return round(min(max(blended, 0.0), 1.0), 4)
 
 
+def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
+    """Whether *env_overrides* points the CLI at a PROXIED endpoint.
+
+    ``ANTHROPIC_BASE_URL`` is the single leaf that tells a vLLM/proxy candidate
+    apart from a native-cloud one, and THREE sites key on it: ``runner
+    .build_eval_orch_config`` (which seeds :func:`claude_endpoint_price_table`
+    into ``config.prices`` for a proxied candidate, task 2820),
+    :func:`collect_metrics` and ``runner.run_architect_eval`` (both of which
+    pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost flag).
+    Those three MUST agree — a seeded price table beside a "native, trust the
+    CLI figure" flag would resolve one candidate's cost two different ways — so
+    the predicate gets ONE home rather than three copies a future change to the
+    proxy signal (an additional env leaf, say) could silently desynchronise
+    (the single-home discipline of task 2459; reviewer: code-reuse).
+
+    Total: ``None``, an empty mapping and an empty URL are all native-cloud.
+    """
+    return bool((env_overrides or {}).get('ANTHROPIC_BASE_URL'))
+
+
 # ``_FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
 # PROXIED endpoint whose model is unlisted — Invariant P5 / the
 # loud-over-silent-degradation norm) and ``_rate`` (the PriceEntry-or-dict
@@ -531,6 +569,117 @@ def resolve_cost_usd(
     return cost, 'unpriced_proxy'
 
 
+def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
+    """Collapse a TWO-COMPONENT cost sum's provenance to ONE honest label.
+
+    :func:`resolve_cost_usd` answers "where did THIS figure come from?" for a
+    single invocation. ``run_architect_eval``'s ``cost_usd`` is not a single
+    invocation: it is the architect's spend PLUS the plan judge's spend. Only
+    the ARCHITECT component is resolved — the plan judge is always a
+    native-cloud opus call (``judge_plan_quality`` does not take the
+    candidate's model or ``env_overrides``), so its CLI figure is trustworthy
+    by construction and re-resolving it against the candidate's price table
+    would price opus tokens at a vLLM rate.
+
+    That is the mixed-provenance problem this helper exists to solve: the
+    moment the architect side resolves to ``'price_table'`` or
+    ``'unpriced_proxy'``, a single ``cost_source`` would silently describe two
+    differently-sourced components. Rather than let one label stand in for two
+    sources (the defect one level up, just quieter) or persist a second
+    ``judge_cost_source`` field (which every result JSON written before it
+    would read back as a default, mislabelling the existing corpus), the label
+    COMPOSES:
+
+    - *secondary_cost_usd* ``<= 0`` — no second component entered the sum, so
+      the label describes the primary alone. This is every judge-SKIPPED
+      architect branch (tainted, refused-with-a-plan, unscorable plan), plus
+      the defensive negative case: :func:`coerce_cost_usd` already floors a
+      nonsense figure to ``0.0`` upstream, and spend that did not happen must
+      never MANUFACTURE a ``'mixed'`` label.
+    - the two sources AGREE — that source. Today's architect cell is a native
+      candidate resolving ``'cli'`` beside a ``'cli'`` judge, so a spending
+      judge leaves it ``'cli'``, byte-identical to what already landed.
+    - they DISAGREE — ``'mixed'``.
+
+    ``'mixed'`` is deliberately the SAME label
+    :func:`~orchestrator.evals.report._summarize_cost_source` already emits for
+    the structurally identical situation one aggregation level up ("this figure
+    blends more than one distinct cost source, so no single source honestly
+    labels it"). Reusing the word keeps ONE vocabulary across the cell and the
+    report row, needs zero report-side change (a single distinct cell label
+    passes straight through ``_summarize_cost_source``), and means an operator
+    reading ``mixed`` need not learn which level produced it.
+
+    The second component's source is ``'cli'`` BY CONSTRUCTION (the judge's
+    native-cloud opus call), so it is NOT a parameter: a ``secondary=`` keyword
+    would be speculative generality with no caller to justify it (reviewer:
+    over-engineering). A future caller whose second component IS differently
+    sourced adds the keyword then — a non-breaking change, since every call
+    site today means ``'cli'``.
+
+    Pure: no I/O, no config, mirroring :func:`resolve_cost_usd`.
+    """
+    if secondary_cost_usd <= 0.0:
+        return primary
+    return primary if primary == 'cli' else 'mixed'
+
+
+def coerce_cost_usd(value: object) -> float:
+    """Safely coerce an untrusted ``cost_usd``-shaped *value* to a valid,
+    non-negative float, defaulting to ``0.0`` for anything that is not one.
+
+    Amendment (eval-revival υ, reviewer robustness + design-coherence): the
+    ONE shared home for the "is this actually a usable dollar figure?"
+    check, used at BOTH the plan judge's producer boundary
+    (:class:`~orchestrator.evals.judge.PlanQualityVerdict` construction, all
+    four POST-invoke return paths) and the architect runner's defensive read
+    (``runner._verdict_cost_usd``) — so a Mock, ``None``, NaN, Infinity, or
+    negative value degrades to ``0.0`` in exactly ONE place rather than two
+    independently maintained checks that could drift apart. This closes the
+    gap where the dataclass declared ``cost_usd: float`` but only the
+    RUNNER's read enforced it — a second future consumer (a backfill
+    script, ``prompt_opt``, ``verdict.to_dict()`` persisted anywhere) reading
+    the verdict directly would otherwise inherit an untrusted value with no
+    guard, the same "the instrument's coherence rests on its ONE caller
+    remembering" shape task 3303 already closed for the scorability gate.
+
+    isinstance-gated rather than a bare ``float(value or 0.0)`` coercion:
+    ``unittest.mock.MagicMock`` configures ``__float__`` to return ``1.0`` by
+    default, so a naive ``float()`` call would silently FABRICATE a dollar
+    figure for any test double that never set the attribute (verified: a
+    bare ``MagicMock()``'s ``float()`` returns ``1.0`` without raising) —
+    the opposite of loud-over-silent-degradation, and worse than the status
+    quo it would replace. ``isinstance`` correctly recognizes an
+    unconfigured Mock (or ``None``, or any other non-numeric placeholder) as
+    "not a real number" and returns the honest ``0.0`` default instead. This
+    is also why the ~20 pre-existing judge tests that construct a bare
+    ``MagicMock`` invoke result and never set ``cost_usd`` need no changes:
+    they now read back ``cost_usd=0.0`` instead of a raw ``Mock`` instance,
+    and none of them asserted on the field's value either way.
+
+    A numeric-but-nonsense value (NaN, +/-Infinity, negative) is caught too
+    — any of them would otherwise poison every downstream sum
+    (``EvalMetrics.cost_usd = arch_cost_usd + judge_cost_usd``) and mean
+    (report.py's per-config cost aggregation), and ``json.dump`` emits bare
+    ``NaN``/``Infinity`` tokens that strict JSON consumers reject on the
+    persisted result file. Logged, per the loud-over-silent norm — the
+    caller still gets a usable ``0.0`` back, but an operator can see that an
+    invocation answered with a nonsense cost rather than the figure quietly
+    vanishing into a plausible-looking zero.
+    """
+    if not isinstance(value, (int, float)):
+        return 0.0
+    v = float(value)
+    if not math.isfinite(v) or v < 0.0:
+        logger.warning(
+            f'cost_usd coercion received a non-finite or negative value '
+            f'({v!r}) — degraded to 0.0 rather than poisoning a downstream '
+            f'sum/mean or persisting invalid JSON.'
+        )
+        return 0.0
+    return v
+
+
 async def collect_metrics(
     workflow: TaskWorkflow,
     worktree: Path,
@@ -563,14 +712,21 @@ async def collect_metrics(
     # Inference speed metrics
     duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
     tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
-    is_local = bool(workflow.config.env_overrides.get('ANTHROPIC_BASE_URL'))
+    # Via the shared predicate, NOT an inline env read: the same signal decides
+    # whether build_eval_orch_config seeds the proxied price table, so the two
+    # must not be able to drift apart (see is_proxied_endpoint).
+    is_local = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
     # model, tracking which source was used. collect_metrics is the IMPLEMENTER
-    # path (run_eval), so the model under test is config.models.implementer; the
-    # architect eval builds EvalMetrics directly in run_architect_eval (out of
-    # scope here).
+    # path (run_eval), so the model under test is config.models.implementer.
+    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
+    # the leaves that actually produced its tokens — and then composes its
+    # two-component (architect + plan-judge) label via ``compose_cost_source``.
+    # So both eval paths share ONE cost-provenance seam rather than one
+    # resolving and one copying the raw CLI number.
     run_model = workflow.config.models.implementer
     resolved_cost, cost_source = resolve_cost_usd(
         wf_metrics.total_input_tokens,

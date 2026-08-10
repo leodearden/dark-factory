@@ -2,6 +2,21 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
+// Sparkline/StepSpark scale+path math lives in the plain-JS sibling
+// /static/redux/spark_path.js, where it is behaviourally testable under
+// `node --test` (dashboard/tests/js/spark_path.test.mjs) — this file is JSX
+// behind CDN Babel with no node_modules, so nothing in it can be executed by a
+// test. spark_path.js is also what makes a MISSING sample stay missing instead
+// of being drawn as a measured zero (task 3436).
+//
+// Destructured, with no `|| {}` fallback, deliberately: if spark_path.js is
+// missing or 404s this throws at load with a clear message, rather than
+// deferring to a TypeError inside a render or silently degrading into charts
+// that draw nothing. Matches the DF_GRAPH_LAYOUT / DF_RUNTIME_FMT precedent.
+// index.html loads that classic script before this file; test_index_html.py
+// pins both the load order and that it is actually served.
+const { sparkPaths: sparkSmoothPaths, stepPaths: sparkStepPaths } = window.DF_SPARK_PATH;
+
 const PALETTE = {
   accent:  'oklch(0.72 0.14 230)',
   accent2: 'oklch(0.62 0.12 200)',
@@ -41,21 +56,15 @@ const PALETTE = {
 
 function Sparkline({ values, width = 100, height = 28, area = true, color = PALETTE.accent, strokeWidth = 1.5 }) {
   if (!values || values.length === 0) return null;
-  const max = Math.max(...values, 1);
-  const min = Math.min(...values, 0);
-  const range = max - min || 1;
-  const stepX = width / Math.max(values.length - 1, 1);
-  const points = values.map((v, i) => {
-    const x = i * stepX;
-    const y = height - ((v - min) / range) * height;
-    return [x, y];
-  });
-  const linePath = points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
-  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  const { line, area: areaPath } = sparkSmoothPaths(values, width, height);
+  // No plottable samples at all (an all-hole series) — draw NOTHING rather
+  // than a flat line along the chart floor, which would assert measurements
+  // that were never taken.
+  if (!line) return null;
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
-      {area && <path d={areaPath} fill={color} fillOpacity={0.15} />}
-      <path d={linePath} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
+      {area && areaPath && <path d={areaPath} fill={color} fillOpacity={0.15} />}
+      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   );
 }
@@ -65,35 +74,15 @@ function Sparkline({ values, width = 100, height = 28, area = true, color = PALE
 // state transitions are visible as sharp steps rather than smoothed lines.
 function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, strokeWidth = 1.5, area = false }) {
   if (!values || values.length === 0) return null;
-  const max = Math.max(...values, 1);
-  const min = Math.min(...values, 0);
-  const range = max - min || 1;
-  const stepX = width / Math.max(values.length - 1, 1);
-  const points = values.map((v, i) => {
-    const x = i * stepX;
-    const y = height - ((v - min) / range) * height;
-    return [x, y];
-  });
-  // Build horizontal-then-vertical path: move to each x at the PREVIOUS y,
-  // then drop/rise to the new y — this creates sharp step edges.
-  const parts = [`M${points[0][0]},${points[0][1]}`];
-  if (points.length === 1) {
-    // Single data point: draw a full-width horizontal tick so something is visible.
-    // Without this, the path contains only a Move command and renders nothing.
-    parts.push(`L${width},${points[0][1]}`);
-  }
-  for (let i = 1; i < points.length; i++) {
-    // Horizontal segment to the new x, keeping old y
-    parts.push(`L${points[i][0]},${points[i - 1][1]}`);
-    // Vertical segment to the new y
-    parts.push(`L${points[i][0]},${points[i][1]}`);
-  }
-  const linePath = parts.join(' ');
-  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  // The horizontal-then-vertical edge construction — and the single-data-point
+  // full-width tick, which exists because a path holding only a Move command
+  // renders nothing — now live in spark_path.js, reproduced there exactly.
+  const { line, area: areaPath } = sparkStepPaths(values, width, height);
+  if (!line) return null;
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
-      {area && <path d={areaPath} fill={color} fillOpacity={0.15} />}
-      <path d={linePath} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="square" />
+      {area && areaPath && <path d={areaPath} fill={color} fillOpacity={0.15} />}
+      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="square" />
     </svg>
   );
 }

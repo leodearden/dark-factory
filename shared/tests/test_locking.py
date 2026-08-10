@@ -26,7 +26,7 @@ from shared.locking import (
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
     'diff', 'envrc', 'example', 'example-systemd-config',
     'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
@@ -55,7 +55,7 @@ _CANONICAL_EXTENSIONS = [
 # would defeat the point of independent pinning.  Duplication + the two drift
 # guards below is the cheaper and more faithful trade.
 #
-# One real tracked path per canonical extension (58 extensions / 61 paths) —
+# One real tracked path per canonical extension (59 extensions / 62 paths) —
 # dark-factory unless the comment says reify.  Enforced by
 # TestIsFilePath::test_accept_corpus_covers_every_canonical_extension.
 # ---------------------------------------------------------------------------
@@ -94,6 +94,7 @@ _ACCEPT_PATHS = [
     'src/comp.cjs',
     'src/mod.cts',
     'src/styles.css',
+    'plans/evidence/scheduler-scoring-2026-08-06/candidates_scored.csv',
     'src/styles.scss',
     'src/icon.svg',
     'Cargo.toml',
@@ -293,7 +294,7 @@ class TestIsFilePath:
     def test_accept_corpus_paths_are_files(self, path: str):
         """Every canonical extension is run through the α copy of the predicate.
 
-        One representative path per canonical extension (all 58, not just the 22
+        One representative path per canonical extension (all 59, not just the 22
         added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
         but four spot-checks in ``test_code_extensions_is_frozenset`` — leaving
@@ -310,7 +311,7 @@ class TestIsFilePath:
         """
         assert is_file_path(path) is True, (
             f'{path!r} must classify as a file — its extension is on the '
-            f'canonical allowlist (58 entries as of reify #5726 / #3117)'
+            f'canonical allowlist (59 entries as of dark_factory #3715 hotfix)'
         )
 
     @pytest.mark.parametrize('path', _REJECT_PATHS)

@@ -32,42 +32,43 @@ import sys
 from pathlib import Path
 
 # Both modules live in <repo>/scripts, which tests/scripts/conftest.py puts on
-# sys.path at collection time. scripts/ is a flat script directory, not a
-# package src root, so it is deliberately absent from [tool.pyright] extraPaths
-# in the root pyproject.toml — hence the targeted ignore, matching the same
-# convention at tests/scripts/test_reviewer_redundancy_diagnostic.py:6.
-from audit_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
+# sys.path at collection time. As of task 3456, scripts/ and scripts/legibility/
+# are ALSO listed in [tool.pyright] extraPaths in the root pyproject.toml — a
+# precondition for the `scripts` module's own declared type gate — so these
+# imports resolve statically too and need no ignore. This comment previously
+# asserted the opposite ("deliberately absent from extraPaths"); 3456 falsified
+# it. Same correction in tests/scripts/test_migrate_metadata_modules_to_files.py.
+from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
-    AuditCoverage,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    AuditCoverage,
     WipeCandidate,
 )
-
-from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
+from repair_wiped_metadata_files import (
+    ALL_DISPOSITIONS,
     CLIENT_NAME,
-    EXIT_NOTHING_SCANNED,
     EXIT_NO_ROOT,
+    EXIT_NOTHING_SCANNED,
     EXIT_OK,
     EXIT_SERVER_UNREACHABLE,
+    FAILED,
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
-    SKIP_FILES_PRESENT,
-    SKIP_MISSING,
-    SKIP_NOT_TERMINAL,
-    ALL_DISPOSITIONS,
-    FAILED,
     SKIP_CONTRADICTED,
+    SKIP_FILES_PRESENT,
     SKIP_LOCK_CHARTER,
     SKIP_LOCK_LEVEL_FIDELITY,
+    SKIP_MISSING,
+    SKIP_NOT_TERMINAL,
     RepairOutcome,
-    _make_client,
     RepairResult,
+    _make_client,
     build_repair_payload,
     classify_live_task,
     format_summary,
@@ -1256,6 +1257,140 @@ def test_make_client_is_attributable_to_this_repair_not_the_migration():
 
     assert client._client_name == CLIENT_NAME
     assert client._client_name != "migrate-metadata"
+
+
+# ---------------------------------------------------------------------------
+# The repair client INHERITS the parent's handshake rather than restating it.
+#
+# Task 3329 shipped RepairFusedMemoryClient with a full clone of
+# FusedMemoryClient._initialize, because the parent baked clientInfo.name in as
+# a literal and scripts/migrate_metadata_modules_to_files.py was outside 3329's
+# lock scope. Task 3437 gave the parent a `_client_name` seam and deleted the
+# clone; the two tests below are what keep it deleted.
+#
+# BOTH ASSERT ON CONSTRUCTED CLIENTS, NEVER ON ANYONE'S SOURCE TEXT. That
+# distinction is not stylistic. 3329's first attempt at this guard scraped the
+# parent's source for `protocolVersion` and was deleted at 57eb02b53f as a
+# BLOCKING review fix (esc-3329-5) with three findings: it asserted on the
+# source text of a file the task did not own; it guarded one leaf while reading
+# as a whole-handshake guard; and — decisively — it went RED exactly when the
+# clone was correctly removed. A guard that fires when the defect is fixed is
+# worse than no guard.
+# ---------------------------------------------------------------------------
+
+
+def _record_handshake(client) -> list[dict]:
+    """Run ``_initialize`` against a stubbed ``_post`` and return the payloads.
+
+    NO SERVER, NO SOCKET, NO TRANSPORT. ``_initialize`` only ever calls
+    ``self._post``, which is replaced here on the INSTANCE (an instance
+    attribute shadows the class's method), so the real ``_post`` — and its
+    ``assert self._client is not None`` — never runs. Clients are constructed
+    directly, never via ``async with``, so ``__aenter__``, the only thing that
+    builds an ``httpx.AsyncClient``, never fires either.
+
+    Deliberately a twin of the helper in
+    tests/scripts/test_migrate_metadata_modules_to_files.py rather than a shared
+    import: importing one test module from another couples their collection, and
+    a two-caller double does not belong in a conftest.py that 20 unrelated
+    modules in this directory also load.
+
+    THE COPIES NEVER STRADDLE A SINGLE ASSERTION, which is what makes the
+    duplication safe rather than merely cheap. Every recording in this file goes
+    through THIS copy — including both sides of
+    ``test_repair_handshake_is_the_parents_with_only_the_name_substituted``,
+    which records the repair client and the parent client through the same
+    function and compares the results. So the two copies drifting apart cannot
+    silently change what any test here means; at worst one file's tests keep
+    passing while the other's recording is broken, which that file's own tests
+    would show.
+    """
+    posts: list[dict] = []
+
+    async def _fake_post(payload: dict) -> dict:
+        posts.append(payload)
+        return {}
+
+    client._post = _fake_post
+    asyncio.run(client._initialize())
+    return posts
+
+
+def test_repair_client_does_not_restate_the_parents_handshake():
+    """THE STRUCTURAL GUARD: the subclass inherits ``_initialize``, not a copy.
+
+    This is what makes drift IMPOSSIBLE rather than merely currently-absent. A
+    payload comparison alone would go green again the moment someone
+    reintroduced a clone that happened to be accurate on the day they wrote it;
+    method identity cannot be satisfied by a copy at all, however faithful.
+
+    The clone this replaces was a real silent-drift hazard, recorded as such in
+    its own docstring: bump the parent's ``protocolVersion`` and the copy keeps
+    handshaking with the stale one, with nothing going red.
+
+    Asserted on ``type(client)``, i.e. on the class actually constructed by
+    ``_make_client`` — not on a grep of the script that defines it.
+
+    IT IS A PROHIBITION ON ANY OVERRIDE, INCLUDING A LEGITIMATE ONE. The
+    behavioural guard below (payload equivalence) subsumes this one for accurate
+    clones and only fires once a clone has actually drifted; this one refuses
+    the copy up front. The cost is that a future override with a real reason —
+    a repair-specific header, an extra initialize param — goes red with no
+    defect present. The assertion message below says what to do about that, so
+    nobody reaches for the one bad way out of the pair.
+    """
+    from migrate_metadata_modules_to_files import (
+        FusedMemoryClient,
+    )
+
+    client = _make_client("http://127.0.0.1:9")
+
+    assert type(client)._initialize is FusedMemoryClient._initialize, (
+        "RepairFusedMemoryClient has its own _initialize again. If that is "
+        "deliberate and justified, DELETE THIS TEST in the same commit and say "
+        "why in the message — do NOT satisfy it by copying the parent's "
+        "handshake into the override, which is the exact silent-drift clone "
+        "task 3437 removed. The payload-equivalence test below stays either "
+        "way; it is what catches a clone that has drifted."
+    )
+
+
+def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
+    """THE BEHAVIOURAL GUARD: same handshake on the wire, different name.
+
+    Covers what the deleted source-scraping guard aimed at but could not reach —
+    BOTH JSON-RPC posts, the ``protocolVersion``, the capabilities block and the
+    method names — by recording what each client actually posts and comparing
+    the two lists once ``clientInfo.name`` is normalised out.
+
+    It has NO FALSE-POSITIVE MODE, which is the property esc-3329-5 found the
+    regex version lacked: a legitimate parent change (a ``protocolVersion`` bump,
+    a new capability) moves BOTH sides together, so this stays green when it
+    should. It goes red only for the defect it names — a repair client whose
+    handshake stops being the parent's.
+
+    The name itself is still checked directly on each side, so normalising it
+    away cannot hide the attribution property that
+    ``test_make_client_is_attributable_to_this_repair_not_the_migration`` exists
+    for.
+    """
+    from migrate_metadata_modules_to_files import (
+        FusedMemoryClient,
+    )
+
+    repair_posts = _record_handshake(_make_client("http://127.0.0.1:9"))
+    parent_posts = _record_handshake(FusedMemoryClient("http://127.0.0.1:9"))
+
+    assert repair_posts[0]["params"]["clientInfo"]["name"] == CLIENT_NAME
+    assert parent_posts[0]["params"]["clientInfo"]["name"] == "migrate-metadata"
+
+    def _name_normalised(posts: list[dict]) -> list[dict]:
+        # Deep copy so the assertions above stay true of the recorded payloads.
+        copied = json.loads(json.dumps(posts))
+        copied[0]["params"]["clientInfo"]["name"] = "<normalised>"
+        return copied
+
+    assert _name_normalised(repair_posts) == _name_normalised(parent_posts)
 
 
 def test_main_project_root_is_repeatable(tmp_path):

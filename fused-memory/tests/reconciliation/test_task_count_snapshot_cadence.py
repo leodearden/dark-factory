@@ -36,6 +36,9 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.stages import (
+    task_knowledge_sync as task_knowledge_sync_module,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _prune_task_count_snapshots,
@@ -44,6 +47,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
+    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
@@ -78,6 +82,47 @@ def _stage_report(stats: dict) -> StageReport:
     )
 
 
+@pytest.fixture
+def mock_deps():
+    """Stage-2 constructor kwargs for the run()-level test harnesses below.
+
+    Shared by TestRunRecordsTaskCountSnapshotWrittenStat and
+    TestSnapshotWrittenStatKeyIsConstantDriven, which exercise the same
+    ``super().run()``-for-real harness and had byte-identical copies of this
+    fixture (code-duplication finding, task-3045 amendment round): two
+    copies drift the moment run()'s dependencies change, and only one gets
+    updated. Classes needing a different shape still define their own
+    ``mock_deps``, which shadows this one.
+    """
+    config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+    memory_service = AsyncMock()
+    # count==1 short-circuits the unrelated stage2-summary verify/repair/
+    # reconstruct chain so these tests stay isolated to the snapshot stat.
+    memory_service.count_memories_by_metadata.return_value = 1
+    memory_service.delete_memory = AsyncMock(return_value=None)
+    memory_service.search.return_value = []
+    memory_service.add_memory.return_value = {'memory_ids': []}
+    taskmaster = AsyncMock()
+    taskmaster.get_tasks.return_value = {'tasks': []}
+    return {
+        'memory_service': memory_service,
+        'taskmaster': taskmaster,
+        'journal': AsyncMock(),
+        'config': config,
+    }
+
+
+def _fake_cli_result():
+    """Canned run_stage_via_cli result — the CLI leg is patched out so these
+    tests target run()'s own pre/post-flight wiring, not the subprocess."""
+    return MagicMock(
+        success=True,
+        report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+        llm_calls=1, tokens_used=0, cost_usd=0.0,
+        model='test-model', error=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -90,13 +135,24 @@ class TestConstants:
         assert TASK_COUNT_SNAPSHOT_KIND == 'task_count_snapshot'
 
     def test_stat_key_value(self):
-        assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+        """Exact-value pin — also the anti-regression guard for the task-3045
+        rename: the un-namespaced spelling read as a persistence claim about
+        Graphiti, which is what drove Stage 3 / the judge to report a
+        "rejected write" for a snapshot that is Mem0-only BY DESIGN (see
+        Snapshot Discipline, prompts/stage1.py). Pinning the exact value is
+        what stops a future edit from quietly restoring a Graphiti-implying
+        spelling.
+        """
+        assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_mem0_written'
 
     def test_prune_enumerated_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY == 'task_count_snapshot_prune_enumerated'
 
     def test_pruned_stat_key_value(self):
-        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_pruned'
+        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_mem0_pruned'
+
+    def test_legacy_written_stat_key_value(self):
+        assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
 
     def test_prune_enumeration_ok_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
@@ -125,11 +181,11 @@ class TestExtractSnapshotWritten:
     """
 
     def test_stats_1_is_true_on_stage_report(self):
-        report = _stage_report({'task_count_snapshot_written': 1})
+        report = _stage_report({SNAPSHOT_WRITTEN_STAT_KEY: 1})
         assert extract_snapshot_written(report) is True
 
     def test_stats_0_is_false_on_stage_report(self):
-        report = _stage_report({'task_count_snapshot_written': 0})
+        report = _stage_report({SNAPSHOT_WRITTEN_STAT_KEY: 0})
         assert extract_snapshot_written(report) is False
 
     def test_missing_key_is_none_on_stage_report(self):
@@ -137,11 +193,11 @@ class TestExtractSnapshotWritten:
         assert extract_snapshot_written(report) is None
 
     def test_stats_1_is_true_on_raw_dict(self):
-        report = {'stats': {'task_count_snapshot_written': 1}}
+        report = {'stats': {SNAPSHOT_WRITTEN_STAT_KEY: 1}}
         assert extract_snapshot_written(report) is True
 
     def test_stats_0_is_false_on_raw_dict(self):
-        report = {'stats': {'task_count_snapshot_written': 0}}
+        report = {'stats': {SNAPSHOT_WRITTEN_STAT_KEY: 0}}
         assert extract_snapshot_written(report) is False
 
     def test_missing_key_is_none_on_raw_dict(self):
@@ -153,6 +209,51 @@ class TestExtractSnapshotWritten:
 
     def test_none_report_is_none(self):
         assert extract_snapshot_written(None) is None
+
+    # --- legacy-key back-compat (task 3045) ---------------------------------
+    #
+    # harness._maybe_escalate_stale_task_count_snapshot recomputes its
+    # consecutive-miss streak from journal.get_recent_runs -- i.e. from
+    # stage_reports blobs persisted by cycles that ran BEFORE the rename.
+    # Without a fallback every such row reads as None,
+    # compute_snapshot_miss_streak stops at the first one, and the
+    # recon_stale_task_count_snapshot escalation goes silently dead instead
+    # of loudly wrong.
+
+    def test_legacy_key_1_is_true_on_stage_report(self):
+        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1})
+        assert extract_snapshot_written(report) is True
+
+    def test_legacy_key_0_is_false_on_stage_report(self):
+        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0})
+        assert extract_snapshot_written(report) is False
+
+    def test_legacy_key_1_is_true_on_raw_dict(self):
+        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1}}
+        assert extract_snapshot_written(report) is True
+
+    def test_legacy_key_0_is_false_on_raw_dict(self):
+        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0}}
+        assert extract_snapshot_written(report) is False
+
+    def test_new_key_wins_over_legacy_when_both_present_new_0(self):
+        """Precedence is deterministic: the new key wins, both directions."""
+        report = _stage_report({
+            SNAPSHOT_WRITTEN_STAT_KEY: 0,
+            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1,
+        })
+        assert extract_snapshot_written(report) is False
+
+    def test_new_key_wins_over_legacy_when_both_present_new_1(self):
+        report = _stage_report({
+            SNAPSHOT_WRITTEN_STAT_KEY: 1,
+            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0,
+        })
+        assert extract_snapshot_written(report) is True
+
+    def test_neither_key_present_is_still_none(self):
+        report = _stage_report({'some_unrelated_stat': 1})
+        assert extract_snapshot_written(report) is None
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +767,7 @@ class TestPruneSnapshotStats:
         assert result == 3
         assert observed == {
             'task_count_snapshot_prune_enumerated': 3,
-            'task_count_snapshot_pruned': 3,
+            SNAPSHOT_PRUNED_STAT_KEY: 3,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -691,7 +792,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 3,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -714,7 +815,7 @@ class TestPruneSnapshotStats:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -738,7 +839,7 @@ class TestPruneSnapshotStats:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -769,7 +870,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 1,
         }
@@ -794,7 +895,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -842,7 +943,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -869,7 +970,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -891,7 +992,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -917,7 +1018,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -1422,7 +1523,7 @@ class TestWriteThreadsPruneStats:
         assert result is True
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -1445,7 +1546,7 @@ class TestWriteThreadsPruneStats:
 
 
 # ---------------------------------------------------------------------------
-# TaskKnowledgeSync.run() wiring — report.stats['task_count_snapshot_written']
+# TaskKnowledgeSync.run() wiring — report.stats[SNAPSHOT_WRITTEN_STAT_KEY]
 # ---------------------------------------------------------------------------
 
 
@@ -1457,34 +1558,10 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
     while the module-level helper is patched directly, so these tests target
     only the run()-level wiring — not _verify_task_count_snapshot_written's
     own internals (covered by TestVerifyTaskCountSnapshotWritten above).
+
+    Consumes the module-level ``mock_deps`` fixture and ``_fake_cli_result``
+    helper, shared with TestSnapshotWrittenStatKeyIsConstantDriven below.
     """
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        memory_service = AsyncMock()
-        # count==1 short-circuits the unrelated stage2-summary verify/repair/
-        # reconstruct chain so these tests stay isolated to the new stat.
-        memory_service.count_memories_by_metadata.return_value = 1
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.search.return_value = []
-        memory_service.add_memory.return_value = {'memory_ids': []}
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks.return_value = {'tasks': []}
-        return {
-            'memory_service': memory_service,
-            'taskmaster': taskmaster,
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _fake_cli_result(self):
-        return MagicMock(
-            success=True,
-            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
-            llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
-        )
 
     async def _run_with_snapshot_check(self, mock_deps, snapshot_result, run_id):
         stage = TaskKnowledgeSync(
@@ -1496,7 +1573,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
         with (
             patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
+                new=AsyncMock(return_value=_fake_cli_result()),
             ),
             patch(
                 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -1512,17 +1589,17 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
     @pytest.mark.asyncio
     async def test_helper_true_sets_stat_to_1(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, True, 'run-snap-true')
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
 
     @pytest.mark.asyncio
     async def test_helper_false_sets_stat_to_0(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, False, 'run-snap-false')
-        assert report.stats['task_count_snapshot_written'] == 0
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 0
 
     @pytest.mark.asyncio
     async def test_helper_none_omits_stat_key(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, None, 'run-snap-none')
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
 
     @pytest.mark.asyncio
     async def test_run_window_start_is_forwarded_to_verify_helper(self, mock_deps):
@@ -1576,14 +1653,14 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=self._fake_cli_result()),
+            new=AsyncMock(return_value=_fake_cli_result()),
         ):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='dark_factory'),
                 prior_reports=[], run_id='run-window-fwd',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         snapshot_calls = [
             call for call in get_memories.await_args_list
             if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
@@ -1614,19 +1691,89 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=self._fake_cli_result()),
+            new=AsyncMock(return_value=_fake_cli_result()),
         ):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='dark_factory'),
                 prior_reports=[], run_id='run-window-none',
             )
 
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
         snapshot_calls = [
             call for call in get_memories.await_args_list
             if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
         ]
         assert snapshot_calls == []
+
+
+# ---------------------------------------------------------------------------
+# TaskKnowledgeSync.run() wiring — the freshness stat is emitted under the
+# shared module constant, never a hardcoded literal (task 3045 step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotWrittenStatKeyIsConstantDriven:
+    """run() must emit the freshness stat under SNAPSHOT_WRITTEN_STAT_KEY.
+
+    Rename-hazard guard (task 3045). The producer and the sole reader
+    (``extract_snapshot_written``) live in different modules: the reader
+    resolves the key via the shared constant, so if the producer hardcodes
+    the string literal instead, a rename of the constant reaches the reader
+    but NOT the producer. Nothing would go red — the harness cadence check
+    at ``harness._maybe_escalate_stale_task_count_snapshot`` would simply
+    read ``None`` (inconclusive) forever and the
+    ``recon_stale_task_count_snapshot`` escalation would go silently dead
+    rather than loudly wrong.
+
+    Rebinding the constant on the *producer's* module namespace is what
+    proves the coupling: it only takes effect if the producer looks the
+    name up at call time. ``raising=True`` (the default) additionally pins
+    that the producer imports the constant at all.
+
+    Shares TestRunRecordsTaskCountSnapshotWrittenStat's harness above via the
+    module-level ``mock_deps`` fixture and ``_fake_cli_result`` helper:
+    super().run() executes for real via a patched run_stage_via_cli while
+    the module-level freshness helper is patched directly.
+    """
+
+    SENTINEL_KEY = '__sentinel_written_key__'
+
+    @pytest.mark.asyncio
+    async def test_stat_is_emitted_under_the_rebound_constant(
+        self, mock_deps, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            task_knowledge_sync_module,
+            'SNAPSHOT_WRITTEN_STAT_KEY',
+            self.SENTINEL_KEY,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('dark_factory', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-snap-constant-driven',
+            )
+
+        assert report.stats[self.SENTINEL_KEY] == 1
+        # The real spelling must NOT also appear — that would mean the
+        # producer still carries a hardcoded literal alongside the constant.
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
 
 
 # ---------------------------------------------------------------------------
@@ -1702,7 +1849,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-write',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         mock_write.assert_awaited_once()
         mock_verify.assert_not_awaited()
 
@@ -1745,7 +1892,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-write-fallback',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         mock_write.assert_awaited_once()
         mock_verify.assert_awaited_once()
 
@@ -1781,7 +1928,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-blocked',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 0
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 0
         mock_write.assert_not_awaited()
         mock_verify.assert_awaited_once()
 
@@ -1877,7 +2024,7 @@ class TestRunSurfacesPruneObservability:
             )
 
         assert report.stats['task_count_snapshot_prune_enumerated'] == 2
-        assert report.stats['task_count_snapshot_pruned'] == 2
+        assert report.stats[SNAPSHOT_PRUNED_STAT_KEY] == 2
         assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 1
         mock_deps['memory_service'].add_memory.assert_awaited_once()
 
@@ -1963,7 +2110,7 @@ class TestRunSurfacesPruneObservability:
         mis-read the empty page as a CONFIRMED miss (False), spuriously
         growing the harness's consecutive-miss streak
         (_maybe_escalate_stale_task_count_snapshot). report.stats must
-        instead leave 'task_count_snapshot_written' absent (inconclusive)."""
+        instead leave SNAPSHOT_WRITTEN_STAT_KEY absent (inconclusive)."""
 
         def _get_memories_by_metadata(*, project_id, filters, **kwargs):
             if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
@@ -1997,7 +2144,7 @@ class TestRunSurfacesPruneObservability:
                 prior_reports=[], run_id='run-prune-live-timeout-no-verify',
             )
 
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
         mock_verify.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2033,4 +2180,79 @@ class TestRunSurfacesPruneObservability:
             )
 
         mock_verify.assert_awaited_once()
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 prompt coupling — the stat-vs-edge guidance names the LIVE keys
+# (task 3045 step-7/8)
+# ---------------------------------------------------------------------------
+
+
+class TestStage3PromptNamesMem0SnapshotStats:
+    """STAGE3_SYSTEM_PROMPT must name the stat keys Stage 3 actually receives.
+
+    _format_report dumps the WHOLE stats dict verbatim
+    (``json.dumps(report.stats)``) into Stage 3's payload, so the renamed
+    keys land in front of the model unfiltered. The rename fixes the NAME;
+    the model still has to be told the invariant, or it can reconstruct the
+    same "stat claims a write but there is no Graphiti edge" false positive
+    from a differently-spelled key.
+
+    Deliberately a COUPLING test, not a prose pin, following the established
+    assembled-prompt drift-guard convention (tests/test_recon_report_guidance_drift.py,
+    tests/test_standing_decision_prompt_drift.py): every assertion is keyed
+    off the imported constants, so a future rename cannot orphan the
+    guidance — leaving the prompt warning about a key the model never sees
+    while the false positive quietly returns.
+
+    The contract is PRESENCE-ONLY. No assertion is made about wording,
+    sentence structure, section ordering, or what the prompt must NOT say —
+    the prompt stays free to mention the legacy spelling if a future cycle
+    wants to explain the rename to the model during the back-compat window
+    that extract_snapshot_written's legacy fallback keeps open.
+    """
+
+    def test_prompt_names_the_written_stat_key(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        assert SNAPSHOT_WRITTEN_STAT_KEY in STAGE3_SYSTEM_PROMPT
+
+    def test_prompt_names_the_pruned_stat_key(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        assert SNAPSHOT_PRUNED_STAT_KEY in STAGE3_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Judge prompt coupling — same guidance, same drift guard (task 3045,
+# amendment round: architecture-coherence finding)
+# ---------------------------------------------------------------------------
+
+
+class TestJudgePromptNamesMem0SnapshotStats:
+    """JUDGE_SYSTEM_PROMPT must name the stat keys the judge actually receives.
+
+    Same contract and same rationale as TestStage3PromptNamesMem0SnapshotStats
+    above, for the OTHER reader of Stage 2's stats: judge.py puts report.stats
+    in the judge prompt, and JUDGE_SYSTEM_PROMPT explicitly instructs the model
+    to "cross-reference stage report stats against MCP Actions to verify
+    consistency" -- which is the instruction that manufactures the false
+    positive this task exists to kill. Renaming the keys without telling the
+    judge the invariant leaves it free to read
+    ``task_count_snapshot_mem0_written=1`` with no matching Graphiti edge as a
+    stats-vs-reality mismatch.
+
+    PRESENCE-ONLY, keyed off the imported constants -- no assertion about
+    wording, ordering, or what the prompt must NOT say.
+    """
+
+    def test_prompt_names_the_written_stat_key(self):
+        from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+
+        assert SNAPSHOT_WRITTEN_STAT_KEY in JUDGE_SYSTEM_PROMPT
+
+    def test_prompt_names_the_pruned_stat_key(self):
+        from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+
+        assert SNAPSHOT_PRUNED_STAT_KEY in JUDGE_SYSTEM_PROMPT

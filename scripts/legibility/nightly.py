@@ -25,7 +25,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
@@ -38,9 +38,19 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
-    census_trigger, codebook, coder, digest, inventory, sampling, trickle_state,
+    census_trigger,
+    codebook,
+    coder,
+    digest,
+    inventory,
+    sampling,
+    trickle_state,
 )
-from legibility.config import LegibilityConfig, configure_logging, load_config  # noqa: E402
+from legibility.config import (  # noqa: E402
+    LegibilityConfig,
+    configure_logging,
+    load_config,
+)
 
 logger = logging.getLogger('legibility.nightly')
 
@@ -442,9 +452,15 @@ def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str
 def _default_poster(url: str, envelope: dict) -> None:
     """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
 
-    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency
-    -- mirrors ``census_trigger.default_status_fetcher``. Raises on any
-    network/HTTP failure; :func:`post_escalation` wraps this best-effort.
+    ``httpx`` is imported lazily so that importing this module -- for its
+    unit-tested pure core -- never needs it, and so the tests can substitute
+    a stub for the real POST. It is NOT lazy for availability: httpx is a
+    direct dependency of ``shared`` (``shared/pyproject.toml``,
+    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
+    ``uv run --frozen --project shared``, so it is always importable in
+    production. Mirrors ``census_trigger.default_status_fetcher``. Raises on
+    any network/HTTP failure; :func:`post_escalation` wraps this
+    best-effort.
     """
     import httpx
 
@@ -799,7 +815,7 @@ def _record_trickle_progress(
     mode.
     """
     record = recorder if recorder is not None else trickle_state.record_run
-    recorded_at = now if now is not None else datetime.now(timezone.utc)
+    recorded_at = now if now is not None else datetime.now(UTC)
     try:
         doc = record(
             cfg.project_id,
@@ -968,7 +984,7 @@ def run_nightly(
     cfg = load_config(resolved_config_path)
 
     if target_date is None:
-        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if projects_root is None:
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only

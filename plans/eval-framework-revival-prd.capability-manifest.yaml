@@ -22,3 +22,82 @@ tasks:
     delivered_check:
       kind: manual
       reason: dispatch-branch generality is exercised by π's test over ofat_candidates()
+- label: ρ
+  task_id: 3627
+  title: architect-fable-max effort-matched candidate config
+  capabilities:
+  - name: architect-eval-configs-list
+    binding: capability→producer (wired) — ARCHITECT_EVAL_CONFIGS in configs.py, searched
+      by get_config_by_name; π precedent (2861)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: architect-fable-max
+      paths:
+      - orchestrator/src/orchestrator/evals/configs.py
+      expect: present
+- label: σ
+  task_id: 3628
+  title: reference back-fill + judged_without_reference marker
+  capabilities:
+  - name: backfill-source-shas-present
+    binding: capability→producer — post_task_commit present, reference absent, in
+      all three fixtures (verified by JSON load 2026-08-04)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"reference"'
+      paths:
+      - orchestrator/src/orchestrator/evals/tasks/reify_task_12.json
+      - orchestrator/src/orchestrator/evals/tasks/reify_task_27.json
+      - orchestrator/src/orchestrator/evals/tasks/df_task_18.json
+      expect: present
+  - name: empty-reference-marker-wired
+    binding: capability→producer — per-config report accumulator is the established
+      aggregation point (cap_excluded precedent 3118/3302/3379)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: judged_without_reference
+      paths:
+      - orchestrator/src/orchestrator/evals/
+      expect: present
+- label: υ
+  task_id: 3629
+  title: record judge cost on architect cells
+  capabilities:
+  - name: judge-cost-field-populated
+    binding: field-population — metrics.judge_cost_usd exists (metrics.py:72) and
+      report aggregates it (report.py:722,808); gap is runner.py never setting it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: judge_cost_usd
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      expect: present
+- label: φ
+  task_id: 3630
+  title: UsageGate on run_architect_eval via invoke_with_cap_retry
+  capabilities:
+  - name: cap-retry-wrapper-exists
+    binding: capability→producer (wired) — invoke_with_cap_retry (cli_invoke.py:1009),
+      standalone caller precedent dry_run_unblock.py:340; scoped_cap_models default
+      ['claude-fable-5'] (config_models.py:74)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: invoke_with_cap_retry
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      expect: present
+  - name: tainted-predicate-byte-identical
+    binding: rejection-mechanism (must-not-touch pin) — the predicate survives the
+      edit
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: tainted = arch_unmeasurable and not is_scorable_plan
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      expect: present

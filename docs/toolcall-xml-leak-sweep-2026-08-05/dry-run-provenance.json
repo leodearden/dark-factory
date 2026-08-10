@@ -1,0 +1,26 @@
+{
+  "collection": "fused_dark_factory",
+  "collection_points_before": 21079,
+  "collection_points_after": 21087,
+  "git_sha": "411f453063306a76466134a32e42221d4a9fd9e0",
+  "swept_at": "2026-08-05T10:27:11Z",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/sweep_toolcall_xml_leak.py",
+    "--exhaustive"
+  ],
+  "exit_code": 0,
+  "cwd": "fused-memory/",
+  "finished_at": "2026-08-05T10:27:26Z",
+  "points_measured_before_at": "2026-08-05T10:14:27Z",
+  "points_measured_after_at": "2026-08-05T10:45:17Z",
+  "task_id": "3567",
+  "notes": [
+    "collection is recorded here because the sweep's own report emits collection='' -- new_progress() seeds the field to the empty string and it landed blank in dry-run-report.json. That is the defect task 3243 (pending) fixes upstream; this sidecar closes the gap for THIS capture without editing the sweep script.",
+    "git_sha is the sha HEAD actually pointed at when the sweep ran (411f4530, committed 10:24:07Z, three minutes before the 10:27:11Z run), NOT the earlier 2594e14fb5 read during the pre-flight at 10:14:27Z -- HEAD moved in between when the step-1 validator was committed. Verified byte-identical production code between the two shas: `git diff 2594e14fb5 411f4530 -- fused-memory/scripts/sweep_toolcall_xml_leak.py fused-memory/src/` is empty, so the sweep behaviour is the same either way. CAVEAT ON REACHABILITY: both 411f4530 and 2594e14fb5 are branch-local shas from before the merge lane rebased task/3567, so neither is expected to be reachable from main. git_sha is a record of the run environment, NOT a durability pin -- nothing recoverable is stored only at that sha. The one thing that must stay fetchable, this report's payload for the deleted record 7d073281, is pinned by repo-relative path plus sha256 in recovery-tracking.json precisely so it survives the rebase.",
+    "The two point counts BRACKET the run rather than pinning it: before was measured at 10:14:27Z, 13 minutes AHEAD of the 10:27:11Z sweep, and after at 10:45:17Z, 18 minutes BEHIND its 10:27:26Z finish. The +8 net drift (21079 -> 21087) across that ~31-minute window is concurrent live traffic on a shared corpus. Neither count is the population the sweep actually walked, which is why no ratio between these counts and report.scanned is asserted anywhere -- see investigation.md for how far the denominator can be trusted.",
+    "Qdrant payload_schema at capture time indexed agent_id/run_id/user_id/actor_id and NOT 'data', so the MatchText-semantics hazard in runbook section 7 was not live for this run. The run was --exhaustive regardless, which is what makes it authoritative."
+  ]
+}

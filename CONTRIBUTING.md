@@ -101,7 +101,7 @@ Other top-level dirs:
   `<prd-stem>.capability-manifest.yaml` sidecar — schema in
   `shared/src/shared/capability_manifest.py`). This is the durable record;
   `plans/` is not.
-- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-5, gates
+- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-8, gates
   `/prd` decompose and `/review` phase 2 — see §6) plus its calibration
   fixtures and the confusion-codebook incident taxonomy.
 - **`dashboard/`** — web UI for task/escalation state.
@@ -134,7 +134,40 @@ Other top-level dirs:
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard`
+<!-- lint-command-mirror:begin
+     Mirrors the `ruff check` leg of `lint_command` in
+     dark-factory-orchestrator.yaml. Pinned by
+     tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
+     head and this line goes red until it is updated to match. -->
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills`
+<!-- lint-command-mirror:end -->
+  That bullet mirrors the `ruff check` leg only; `lint_command` chains one
+  more leg the merge gate also runs —
+  `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
+  `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
+  the full chain.
+- **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
+  of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
+  not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
+
+  As of task 3441, 1125 of 1357 first-party package `.py` files (83%) are not
+  `ruff format`-clean. **That is the expected steady state, not debt.** A task
+  proposing to "fix formatting" over some subset of files is correctly closable
+  as won't-fix. A repo-wide sweep was considered and declined for three
+  reasons: it reverses the deliberate `ignore = ["E501"]` that every package
+  sets, which tolerates long lines on purpose while the formatter exists to
+  rewrap them; a 1125-file diff conflicts with every in-flight branch in a repo
+  whose normal mode is many concurrent agent branches against a
+  continuously-draining merge queue; and it rewrites the blame history that
+  this repo's incident forensics and reconciliation lean on.
+
+  The `[tool.ruff.format]` block in each package's `pyproject.toml` is **style
+  config, not a gate**. It is retained so that an ad-hoc or editor-on-save
+  `ruff format` produces a single-quoted, repo-consistent diff — measured
+  ~4.5x smaller than the same run under ruff's own defaults.
+
+  Reversing this decision means updating this section, `CLAUDE.md` and
+  `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
   ```bash
@@ -234,10 +267,12 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
 - **G6** premise validity — numeric bounds, exactness claims, and rejection
   assertions must be substantiated, not guessed.
 - **G7** design invariants — re-checked against
-  `docs/legibility/design-invariants.md` (**INV-1..INV-5**:
+  `docs/legibility/design-invariants.md` (**INV-1..INV-8**:
   `contracts-machine-checked`, `structured-facts-at-failure`,
   `corroborate-before-acting`, `storm-escape-required`,
-  `no-lockstep-duplication`). An unresolved, unwaived hit blocks the batch;
+  `no-lockstep-duplication`, `status-matches-liveness`,
+  `holds-owned-and-bounded`, `loop-thread-occupancy-bounded`). An
+  unresolved, unwaived hit blocks the batch;
   a deliberate exception is a `G7 waiver: <slug> — <rationale>` line in the
   PRD plus `metadata.g7_waivers` on the filed task.
 - **Capability manifest** — mechanizes G3/G6 per leaf task, committed
@@ -246,7 +281,7 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   oversight, produce a complete, coherent, good design?"
 
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
-it's the single normative copy of the five invariants; don't restate them
+it's the single normative copy of the eight invariants; don't restate them
 elsewhere. If you're hand-writing a task (not going through `/prd`) for a
 nontrivial design change, walk it against the same checklist yourself
 before filing.

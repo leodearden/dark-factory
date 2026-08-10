@@ -7,27 +7,17 @@ the vocabulary.  A second copy of any constant in this module is a bug.
 
 Contents
 --------
-* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` — the shared ``topic`` slug
-  shape (PRD D4: ``ProceduralTopicCluster.topic_id`` and
-  ``metadata.topic`` are one namespace with one regex).
+* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` / ``is_valid_topic_slug`` —
+  the shared ``topic`` slug shape (PRD D4:
+  ``ProceduralTopicCluster.topic_id`` and ``metadata.topic`` are one
+  namespace with one regex).  **Defined in**
+  :mod:`fused_memory.topic_slug` (task 3198, leaf ε) and re-exported here
+  bound to the *same objects*, so this registry remains the advertised
+  import site while ``config/schema.py`` — which cannot import this
+  module without a cycle — validates through the identical rule.  See
+  that module's docstring for the measured ``ImportError`` behind the
+  split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
-
-Measured basis for the slug shape
----------------------------------
-Derived from leaf α's census
-(``plans/memory-metadata-census-report.json`` @ ``b5af3e4b03``,
-``coverage.complete = true``) rather than guessed:
-
-* accepts all **5** seeded ``ProceduralTopicCluster.topic_id`` values
-  (PRD §10's one hard requirement); longest is 52 chars;
-* accepts **254 of 352** distinct live ``topic`` values (355 of 491
-  records); the longest conforming live value is 69 chars, so the
-  100-char cap bounds the key while rejecting nothing observed;
-* the 98 non-conforming live values are all snake_case.  Under the
-  warn-mode default (``memory_metadata.enforce = False``) these emit a
-  census line and the write proceeds — leaf θ's bounded retro-stamping
-  sweep is the intended normalizer.  This is why the warn default is
-  load-bearing rather than merely cautious.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -65,17 +55,43 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import re
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
+# Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
+# *same objects* the leaf module defines, so this registry remains the
+# advertised import site for the vocabulary while ``config/schema.py`` —
+# which cannot import this module without the measured
+# ``ImportError: cannot import name 'FusedMemoryConfig'`` cycle — validates
+# through the identical rule.  Per INV-5 there is one copy of the pattern
+# and the cap in the tree; ``tests/test_topic_slug_namespace.py`` asserts
+# that by ``is``, so retyping either here fails by design.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
+# The canonical-full-UUID predicate that used to live here (task 3132, leaf η).
+# It moved to ``utils/validation.py`` so the delete_memory guards, recon_report's
+# citation gate and citation_verifier's forwarding-pointer guard all answer
+# "is this a canonical full UUID" from ONE definition (INV-5).
+from fused_memory.utils.validation import is_full_uuid
+
+#: Back-compat alias for the pre-move private spelling; import
+#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
+# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
+# tests/test_retro_stamp_topics.py import the predicate directly (both are
+# outside this task's locked file scope).
+_is_full_uuid = is_full_uuid
+
 __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
+    'CanonicalUniquenessViolation',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'PARENT_ID_DEAD_CODE',
@@ -86,6 +102,7 @@ __all__ = [
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'classify_unknown_keys',
+    'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
     'validate_memory_metadata',
@@ -99,29 +116,28 @@ __all__ = [
 EXPERIMENTAL_KEY_PREFIX = 'x_'
 
 
-#: Shared ``topic`` slug shape (PRD D4 — one namespace for
-#: ``ProceduralTopicCluster.topic_id`` and ``metadata.topic``).
-#:
-#: Lowercase alphanumeric segments joined by single hyphens.  Anchored at
-#: both ends with ``\Z`` rather than ``$`` so a trailing newline cannot
-#: sneak past (``$`` matches before a final ``\n``).
-TOPIC_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*\Z')
-
-#: Maximum ``topic`` slug length.  See the module docstring for the
-#: measured basis (longest conforming live topic 69, longest seeded
-#: cluster id 52 — 100 has headroom and rejects nothing observed).
-TOPIC_SLUG_MAX_LEN = 100
-
-
 def normalize_supersedes(value: Any) -> list[Any]:
     """Normalize a ``supersedes`` metadata value to a list (PRD D2).
 
+    This docstring is the SINGLE HOME of the ``supersedes`` writer/reader
+    map; the other sites that touch the key point here instead of
+    re-deriving it, and name SYMBOLS rather than line numbers (a pinned
+    line number is falsified by the next edit made above it — the churn
+    that motivated this consolidation).
+
     ``supersedes`` is a list in V1, but the corpus carries 81 records with
-    a **scalar** value and 65 with a list.  The live scalar writer is
-    ``reconciliation/harness.py:1167``; the readers are
-    ``reconciliation/targeted.py:1464`` (truthiness discriminator) and
-    leaf 3112's closure predicate.  Both go through this helper so the
-    legacy scalar shape stays tolerated on read.
+    a **scalar** value and 65 with a list.  The writer —
+    ``ReconciliationHarness._reconcile_status_correction`` in
+    ``reconciliation/harness.py`` — emitted a scalar until task 3196
+    migrated it to the canonical list shape; the 81 measured records
+    predate that migration and are not rewritten by it (PRD D2 defers
+    retro normalization to leaf θ's stamping sweep), which is why read
+    tolerance for the legacy scalar stays.  The readers are
+    ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
+    discriminator, which tests ``any()`` of the normalized members — see
+    ITS docstring for why member-level and not container truthiness) and
+    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
     non-``str`` sequence (→ list copy).  The returned list is always a
@@ -514,7 +530,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # `enforce_kind_registry` flips.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
-    'project_status_correction',      # reconciliation/harness.py:1166 (same dict as the scalar `supersedes` at :1167)
+    # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
+    'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
     # No live Mem0 writer found — retained per esc-3194-1 pending the
     # PRD §10 open questions.  `entity_standing_decision` is a SQLite
@@ -764,6 +781,49 @@ class ParentHasChildrenError(Exception):
         )
 
 
+class CanonicalUniquenessViolation(Exception):
+    """A second ``canonical`` write for a ``(project, topic)`` already taken.
+
+    V1 contract-fixes this type alongside
+    :class:`MemoryMetadataValidationError`, and requires the message to
+    NAME the incumbent's id -- counting is not enough, because an operator
+    who trips this needs to go look at the record that already holds the
+    topic. That obligation is why the seam counts first and only then
+    scrolls: ``count_memories_by_metadata`` is the contracted INV-3 gate
+    but returns an ``int``, which structurally cannot carry an id.
+
+    Deliberately **NOT** a subclass of
+    :class:`MemoryMetadataValidationError`. The two are separate rejection
+    contracts -- one is "your metadata is malformed", the other is "your
+    metadata is well-formed but collides with live state" -- and a caller
+    must be able to tell them apart at the ``except``. Subclassing would
+    also let the pre-existing
+    ``pytest.raises(MemoryMetadataValidationError)`` sites silently
+    swallow a uniqueness violation, i.e. pass for the wrong reason. The
+    structured fields below satisfy INV-2's structured-rejection
+    obligation without needing inheritance.
+
+    Raised ONLY from
+    :func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`,
+    never from :func:`validate_memory_metadata`: the check needs live
+    store state, and the pure validator structurally cannot perform a
+    store lookup. Look for it at the seam, not in the shape validator.
+    """
+
+    def __init__(self, *, project_id: str, topic: str, incumbent_id: str) -> None:
+        self.project_id = project_id
+        self.topic = topic
+        self.incumbent_id = incumbent_id
+        super().__init__(
+            f'canonical uniqueness violated: memory {incumbent_id} is already '
+            f'canonical for topic {topic!r} in project {project_id!r}; at most '
+            f'one canonical memory is allowed per (project, topic). Update or '
+            f'supersede that memory instead of adding a second canonical -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # The shape validator
 # ---------------------------------------------------------------------------
@@ -847,29 +907,6 @@ def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation
     )
 
 
-def _is_full_uuid(value: Any) -> bool:
-    """True iff *value* is a canonical full-UUID string.
-
-    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
-    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
-    prefixes.  Requiring the canonical 36-char dashed rendering is what
-    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
-    members) and truncated hex generally — a bare parse would let a
-    32-hex-digit string through as "well formed" while no store would
-    resolve it in that spelling.
-
-    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
-    a rendering choice, not a different identifier.
-    """
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return str(parsed) == value.lower()
-
-
 def validate_memory_metadata(
     meta: dict[str, Any], *, enforce_kind_registry: bool
 ) -> list[MetadataViolation]:
@@ -898,11 +935,22 @@ def validate_memory_metadata(
       :data:`PARENT_ID_DEAD_CODE` and :data:`PARENT_ID_UNAVAILABLE_CODE` —
       so the rule has exactly one home even though its two halves run in
       two layers;
-    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's.
+    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's, and
+      lives at that same async seam
+      (:func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`)
+      because it needs live store state.
 
-    Making the boundary structural rather than a comment means a later leaf
-    must add liveness at the seam and cannot accidentally grow a second
-    implementation of it in here (INV-5).
+    Leaf ε (task 3198) split ``canonical`` along exactly that line.  Its
+    SHAPE half — a canonical assertion requires a ``topic`` (§2b's
+    ``canonical_without_topic``) — is checked HERE, because it needs
+    nothing but the dict.  Its UNIQUENESS half stays at the seam.  The
+    boundary moved no work into this function that a store lookup could
+    have been needed for.
+
+    Making the boundary structural rather than a comment is what forced
+    both later leaves to add their live-state checks at the seam, and kept
+    either from accidentally growing a second implementation in here
+    (INV-5).
 
     Ordering inside the function is load-bearing:
 
@@ -926,19 +974,28 @@ def validate_memory_metadata(
 
     # 1. supersedes — NORMALIZE, never reject the container shape.
     #
-    # The β-before-γ hazard: PRD §9 sequences γ after β, and
-    # `reconciliation/harness.py:1167` writes a SCALAR `supersedes` today
-    # (81 live records).  Rejecting the scalar form here would break the
-    # recon harness's own writes for the entire window until γ migrates it.
-    # Coercing at the write boundary mirrors `_normalize_task_id_metadata`,
-    # which already does exactly this for the same class of problem in the
-    # same two functions, and is compatible with V1's "legacy scalar
-    # tolerated on read".  Only malformed MEMBERS are rejected.
+    # The β-before-γ hazard: PRD §9 sequenced γ after β, and
+    # `reconciliation/harness.py` wrote a SCALAR `supersedes` (81 live
+    # records) for that whole window.  Rejecting the scalar form here would
+    # have broken the recon harness's own writes until γ migrated it.  That
+    # window is now CLOSED — task 3196 (γ) migrated that writer
+    # (`ReconciliationHarness._reconcile_status_correction`) to the canonical
+    # list shape.
+    #
+    # The in-place coercion below is nonetheless RETAINED as
+    # defense-in-depth, not left over: no corpus rewrite shipped with γ, so
+    # the 81 pre-migration records still carry scalars (PRD D2 defers retro
+    # normalization to leaf θ's stamping sweep), and out-of-repo writers are
+    # not bound by the in-repo migration.  Coercing at the write boundary
+    # mirrors `_normalize_task_id_metadata`, which already does exactly this
+    # for the same class of problem in the same two functions, and is
+    # compatible with V1's "legacy scalar tolerated on read".  Only malformed
+    # MEMBERS are rejected.
     if 'supersedes' in meta:
         members = normalize_supersedes(meta['supersedes'])
         meta['supersedes'] = members
         for member in members:
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 violations.append(_violation(
                     'supersedes',
                     'invalid_supersedes_member',
@@ -958,7 +1015,16 @@ def validate_memory_metadata(
                 f'topic must be a str, got {type(topic).__name__}',
                 fatal=True,
             ))
-        elif not TOPIC_SLUG_RE.match(topic) or len(topic) > TOPIC_SLUG_MAX_LEN:
+        # `is_valid_topic_slug`, NOT an inlined `TOPIC_SLUG_RE.match(...) or
+        # len(...) >` — the predicate is THE shared verdict (D4: one
+        # namespace, one answer), and the config-side validator and the
+        # seam's uniqueness guard both call it.  Re-expressing the rule here
+        # would split the closure the moment the predicate gains a step
+        # (a normalization pass, a reserved-prefix rule): the other two call
+        # sites would get it and the shape validator would not.  The
+        # `isinstance(topic, str)` branch above already separated the type
+        # defect from the shape defect, so both violation codes survive.
+        elif not is_valid_topic_slug(topic):
             violations.append(_violation(
                 'topic',
                 'invalid_topic_slug',
@@ -982,6 +1048,24 @@ def validate_memory_metadata(
                 f'canonical must be a bool, got {type(canonical).__name__} '
                 f'({canonical!r}); the check is isinstance(x, bool), not '
                 f'truthiness, so 1/0 do not pass as True/False',
+                fatal=True,
+            ))
+        # `is True`, not truthiness — for the reason 2b already documents
+        # above (`1 == True`), and so a non-bool value reports only the TYPE
+        # defect rather than being double-counted here.
+        #
+        # Only the `topic` KEY's presence is tested: when it is present but
+        # malformed, 2a's invalid_topic_slug already describes that defect,
+        # and emitting both would report one defect twice while implying the
+        # writer forgot a key they did supply.
+        elif canonical is True and 'topic' not in meta:
+            violations.append(_violation(
+                'canonical',
+                'canonical_without_topic',
+                'canonical=True requires a topic: the marker asserts "this is '
+                'THE entry for its topic", so outside a topic there is no set '
+                'for it to be canonical of and the <=1-per-(project, topic) '
+                'uniqueness rule has no key to check',
                 fatal=True,
             ))
 
@@ -1016,7 +1100,7 @@ def validate_memory_metadata(
     # no store could resolve.  See the SCOPE section of the docstring.
     if 'parent_id' in meta:
         parent_id = meta['parent_id']
-        if not _is_full_uuid(parent_id):
+        if not is_full_uuid(parent_id):
             violations.append(_violation(
                 'parent_id',
                 'invalid_parent_id_shape',

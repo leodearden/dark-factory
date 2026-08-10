@@ -27,7 +27,11 @@ WorkingDirectory=/home/leo/src/dark-factory
 # Gate startup on fused-memory's MCP port (8002) being live. Pairs with Wants=
 # above: waits cleanly instead of crash-looping while fused-memory comes up.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/solar-challenge/orchestrator.yaml
+# --config MUST name the canonical `dark-factory-orchestrator.yaml` -- CLAUDE.md
+# calls it "the canonical, required filename" that the dashboard's escalation-URL
+# discovery keys on. The legacy `orchestrator.yaml` / `orchestrator-config.yaml`
+# spellings are a discovery fallback only; do NOT restore them here (task 3512).
+ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/solar-challenge/dark-factory-orchestrator.yaml
 
 # PATH replicated from the working manual process so verify subprocesses find
 # cargo / node / npm / sccache. (A systemd user service otherwise gets a
@@ -41,8 +45,11 @@ Environment=LANG=en_US.UTF-8
 Environment=ORCH_UNIT=orchestrator-my-solar-challenge.service
 
 # Auto-restart on crash; back off up to 60s.
+# RestartSteps makes RestartMaxDelaySec effective (without it systemd warns and
+# ignores the cap): backoff 10s -> 60s over 4 steps.
 Restart=on-failure
 RestartSec=10
+RestartSteps=4
 RestartMaxDelaySec=60
 
 # Orchestrator shutdown cancels in-flight tasks, reaps agent subprocesses, and

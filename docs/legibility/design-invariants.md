@@ -1,16 +1,18 @@
 # Design invariants
 
-A gate checklist, not an essay. These five invariants encode
+A gate checklist, not an essay. INV-1..INV-5 encode
 the agent-legibility survey's cross-cutting root causes
 (`plans/agent-legibility-survey-2026-07-13.md` §3) as named,
-checkable design-time questions. They will gate `/prd` decompose (G7,
-`skills/prd/references/gates.md`) and `/review` phase 2's cross-module
-audit — both consumers Read this doc at run time once sibling tasks
-β/γ wire the G7 section and phase-2 step (neither lands with this doc);
+checkable design-time questions; INV-6..INV-7 were added 2026-08-02
+from the task/escalation strand investigation
+(`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
+the reconciliation loop-blocking incident (task 3778). They gate `/prd`
+decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
+cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
 ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
 the confusion census's optional `invariant_violated` field all reference
-them. Numeric aliases INV-1..INV-5 are prose convenience only.
+them. Numeric aliases INV-1..INV-8 are prose convenience only.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -100,10 +102,112 @@ twice in one file.
 **House pattern**: Extract helper (`canonical_queued_branch_name`); render
 prompts/examples from live schemas (2559) with drift/pinning tests.
 
+## INV-6 `status-matches-liveness`
+
+**Rule**: A status implying active ownership (`in-progress`) is legal only
+while a live claimant exists. Every exit from a claimed state writes its
+successor status through the transition's designated choke point *before*
+the claim is released, and any operator-facing aggregate of "active work"
+reconciles against the enforcing ground truth (live slots / claimants),
+alarming on divergence. Sweeps are crash backstops — never a path's
+designed exit.
+
+**Checkable design question(s)**: Does any exit/bail/park/requeue path in
+this feature leave a task in a status whose implied owner is gone
+(claimant released, no steward)? Which choke point writes the successor
+status, and what test pins every exit? If the feature counts or surfaces
+"active" tasks, can a stranded row be counted as active without an alarm?
+
+**Evidence**: Path B merge-entry bail — 9 tasks stranded 13-52h, 7 pinned
+by their own dead-steward L0 (`docs/task-escalation-state-spec.md`
+§8-E1); `_OUTCOME_ALLOWED`'s IN_PROGRESS-bearing entries as documented
+strand windows (E10); burndown `in_progress` exceeded
+`max_concurrent_tasks` in 859/7871 snapshots (peak 33 vs 24) with no
+parity alarm (E12).
+
+**House pattern**: claimant columns + `is_stranded` oracle
+(task-status-authority D4); `_mark_blocked` sole-writer choke point; W9
+SM-2 run()-exit consistency check, made loud per spec §5; spec §5
+outcome contract.
+
+## INV-7 `holds-owned-and-bounded`
+
+**Rule**: Every hold on a non-terminal task — a parked status, an open
+escalation pinning recovery, a wait loop — names a machine-readable owner
+(the actor that will exit it unprompted) and carries a bound: a deadline
+or progress-refreshed idle window for automation waits, a streak/cap
+escalation for repeating suppressions, or a supervised consumer plus age
+surfacing for queue-backed handoffs. `park` is the only sanctioned
+unbounded hold. A hold that vetoes recovery emits a structured fact
+naming the pinning record (INV-2 applied to holds).
+
+**Checkable design question(s)**: For each held state this feature
+introduces or touches: who exits it, what bounds it, and where does an
+operator see the hold with its reason? If the exit owner dies (process
+exit, the 8h fleet redeploy), which mechanism notices — and does the
+hold's record survive or expire coherently across restart?
+
+**Evidence**: the any-level recovery veto held tasks 13-52h in silence —
+211 `reverted` log lines, zero non-revert explanations
+(`docs/task-escalation-state-spec.md` §8-E7/E12); the merge-halt
+unbounded `_escalation_event.wait()` (E3); an L2 queue at 70 pending and
+not draining turns "held pending human" into "held indefinitely" with no
+age alarm.
+
+**House pattern**: steward-wait idle window (task 3170) —
+progress-refreshed deadline + escalation-of-escalation; orphan-L0 reaper
+(`orphan_l0_timeout_secs`); watcher-outage L2 tripwire; `park` →
+`blocked` + open L2 as the explicit unbounded marker (task 1792);
+gate-backlog age reporting (tasks 3520-3522).
+
+## INV-8 `loop-thread-occupancy-bounded`
+
+**Rule**: In a long-lived async process, no coroutine occupies the
+event-loop thread for an unbounded time. Any call that can block
+(subprocess, network, filesystem, lock, sleep) is either non-blocking or
+offloaded (`asyncio.to_thread`/executor); AND any per-item work that can
+block or whose per-item cost is non-trivial, fanned out over a collection
+whose size is not already bounded by an upstream contract (pagination, a
+config cap, a fixed enum), has its loop-invariant part hoisted out of the
+body and its item count explicitly bounded. Neither limb alone bounds
+occupancy — offloading an unbounded fan-out still burns unbounded wall
+clock, and capping a still-blocking fan-out still stalls the loop — so a
+fan-out tripping both needs both fixes. A cheap, fully non-blocking loop
+over an upstream-bounded collection trips neither.
+
+**Checkable design question(s)**: For each coroutine this feature adds or
+touches: what is the worst-case wall time it holds the loop thread, and
+what makes that case worst rather than typical? If it iterates a
+collection doing work that can block or is non-trivial per item, who
+bounds that collection's size — "already bounded upstream, by pagination
+or a config cap or a fixed enum" is a complete answer — and which work
+inside the body is invariant across iterations? If it shells out, does
+the process spawn itself (fork/exec) run on the loop thread?
+
+**Evidence**: `_render_live_workflow_section`
+(`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`
+— a sync `def` called from `async def assemble_payload`) fanned three
+blocking `subprocess.run(['git', ...])` calls over the uncapped
+`filtered.active_tasks`: 56.7 ms/task × 514 (dark_factory) and
+82.7 ms/task × 525 (reify) => 29-43 s per render on the loop thread.
+`/health` went 12-35 ms idle -> 31-43 s under recon load; 184 freezes
+>=12 s over Aug 02-05. `asyncio.timeout(5)` could not fire because the
+loop enforcing it *was* the blocked thread. 726 of the sampled
+subprocesses were a byte-identical, render-invariant
+`git worktree list --porcelain`. (task 3778)
+
+**House pattern**: `asyncio.to_thread` at the boundary
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
+`middleware/task_curator.py::curate_batch_prepared`); the async
+subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
+hoist the loop-invariant probe out of the body and bound the fan-out with
+an explicit cap that logs what it dropped (no silent truncation); loop-lag
+heartbeat firing above a threshold (INV-4 applied to scheduling).
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
-The slug vocabulary is *this* doc — the five ids above. The coding pipeline
+The slug vocabulary is *this* doc — the eight ids above. The coding pipeline
 that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census
@@ -112,6 +216,6 @@ batches is an enforcement gap: file a guard task.
 ## Fixtures
 
 Calibration fixtures — two seeded violations per invariant plus a rehearsal
-verdict table exercising the as-landed G7 and `/review` phase-2 text — will
-live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε
-lands (file not yet present as of this doc's landing).
+verdict table exercising the as-landed G7 and `/review` phase-2 text — live
+at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
+INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06).

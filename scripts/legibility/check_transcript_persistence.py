@@ -49,6 +49,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
 from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+
 from orchestrator import session_registry  # noqa: E402
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
@@ -201,7 +202,7 @@ def _first_user_turn(path: Path) -> dict[str, Any] | None:
     ``except OSError`` contract.
     """
     try:
-        for record in inventory._iter_json_lines(path):
+        for record in inventory.iter_json_lines(path):
             if (
                 record.get('type') == 'user'
                 and not record.get('isSidechain')
@@ -239,8 +240,22 @@ def find_matching_transcript(
     """Find the transcript file under *projects_root* that belongs to *record*, or None.
 
     The expected dir is ``projects_root/<encoded-cwd>`` (via
-    ``inventory.encode_cwd`` — the same lossy ``/``/``.`` -> ``-`` encoding
-    Claude Code itself uses). Missing dir -> ``None``.
+    ``inventory.encode_cwd`` — the same lossy ``/``/``.``/``_`` -> ``-``
+    encoding Claude Code itself uses). Missing dir -> ``None``.
+
+    THIS IS THE ONE CONSUMER THAT USES ``encode_cwd`` AS A DIRECT LOOKUP KEY.
+    Everywhere else in ``inventory.py`` the encoding is only a cheap superset
+    pre-filter over a directory listing, re-checked against the session's real
+    ``cwd`` by ``inventory.is_member``; here there is no such backstop. An
+    encoder that renders even one character differently from Claude Code
+    resolves to a directory that does not exist, this function returns
+    ``None``, and :func:`find_missing_transcripts` emits a FALSE-POSITIVE
+    "session ran, no transcript" finding — which escalates — naming an
+    ``expected_dir`` that was never going to exist. That is why the encoder
+    must be exact, and why it is pinned to real on-disk dir names by
+    ``test_legibility_inventory.py``'s ``TestEncoderLockstep`` (task 3272,
+    which found the ``_`` rule missing and this detector alarming on
+    dark-factory's own ``.eval-worktrees/df_task_<N>/`` sessions).
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir):
@@ -483,9 +498,14 @@ def _build_escalation_arguments(
 def _default_poster(url: str, envelope: dict) -> None:
     """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
 
-    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency —
-    mirrors ``nightly._default_poster``. Raises on any network/HTTP failure;
-    :func:`post_findings` wraps this best-effort.
+    ``httpx`` is imported lazily so that importing this module -- for its
+    unit-tested pure core -- never needs it, and so the tests can substitute
+    a stub for the real POST. It is NOT lazy for availability: httpx is a
+    direct dependency of ``shared`` (``shared/pyproject.toml``,
+    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
+    ``uv run --frozen --project shared``, so it is always importable in
+    production. Mirrors ``nightly._default_poster``. Raises on any
+    network/HTTP failure; :func:`post_findings` wraps this best-effort.
     """
     import httpx
 

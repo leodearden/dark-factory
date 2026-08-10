@@ -26,7 +26,11 @@ Three independent early-return gates in :func:`check`:
    :func:`is_terminal_annotation_exempt` — the single-parse combined form of
    the two predicates. It never loosens Gates 2/3.
 2. ``op == 'set_task_status'`` AND a live workflow is detected for the task
-   -> ``ReconLiveWorkflowWriteRejected``.
+   -> ``ReconLiveWorkflowWriteRejected``. The caller's ``live_status`` and
+   (optionally) the task's ``task_metadata`` are forwarded to the detector
+   as ``status``/``task_kind``/``pure_gate``, so the project-wide
+   orchestrator-lock signal is dropped for tasks it is not evidence for
+   (task 3751 — see :func:`check`'s Gate 2 paragraph).
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
    (op-agnostic) -> ``ReconStaleSnapshotRejected``.
 
@@ -50,7 +54,10 @@ from typing import Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    is_pure_gate_metadata,
+    is_workflow_live_for_task,
+)
 
 # Metadata keys carrying the snapshot status a recon-stage caller observed
 # before writing. Promoted (Open Q3) from
@@ -267,6 +274,7 @@ def check(
     live_status: str,
     snapshot_token: str | None,
     is_annotation_clear: bool = False,
+    task_metadata: object = None,
 ) -> Verdict:
     """Decide whether a recon-stage caller may perform *op* on *task_id*.
 
@@ -295,6 +303,56 @@ def check(
     suppressed for tasks in a status the orchestrator never actively
     dispatches (done/cancelled/deferred) — see
     ``live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES``.
+
+    ``task_metadata`` (task 3751) is the task's raw ``metadata`` payload, as
+    the caller already holds it. It is OPTIONAL and defaults to ``None``, in
+    which case the derived ``task_kind=None`` / ``pure_gate=False``
+    reproduce the prior behavior EXACTLY — every caller that does not pass
+    it is unaffected. It is coerced once via :func:`_coerce_metadata_dict`
+    (dict or JSON-object string; anything else — invalid JSON, a list, a
+    number — degrades to ``None``), so a malformed blob fails safe TOWARD
+    live rather than raising. The coercion happens only inside the
+    ``set_task_status`` branch, so no other gate pays for it. Two detector
+    inputs are derived from it:
+
+    * ``task_kind`` — forwarding this makes ``live_workflow_detector``'s
+      PRE-EXISTING rule 2 (blocked + deterministic, task 2067) reachable
+      from this gate for the first time, but is BEHAVIOR-PRESERVING here.
+      It widens nothing, for two reasons:
+
+      1. Rule 3 (blocked + normal/absent + no git evidence, task 2409) was
+         already reachable. Its task_kind clause is ``task_kind in (None,
+         NORMAL_TASK_KIND)``, and the previously-omitted kwarg defaulted to
+         ``None`` — so a blocked task with no worktree and no recent commit
+         was already exempt from the bare orchestrator lock at this gate,
+         before any metadata was plumbed through.
+      2. Rule 2's only delta over rule 3 is being unconditional on the git
+         signals, i.e. it also fires when a worktree or recent commit
+         exists. This gate consumes only
+         :func:`~fused_memory.services.live_workflow_detector.is_workflow_live_for_task`
+         — ``is_live = worktree_registered or recent_commit or
+         orchestrator_live`` — so in exactly that case ``is_live`` stays
+         True on the per-task evidence and the write is still rejected.
+         Rule 2 zeroes ``orchestrator_live``, which this gate never reads
+         on its own.
+
+      The one narrowing is that a blocked task carrying some THIRD
+      ``task_kind`` value (neither ``'normal'`` nor ``'deterministic'``)
+      no longer matches rule 3's clause, so it keeps the lock — the
+      fail-safe-toward-live direction. All of the above is pinned by
+      ``TestGate2TaskKindForwardingIsBehaviorPreserving`` in
+      tests/test_recon_write_policy.py, including the differential
+      worktree case, so the argument fails loudly if a detector rule
+      changes underneath it.
+    * ``pure_gate`` — :func:`is_pure_gate_metadata`, carrying task 3751's
+      rule 5 (pending + deterministic + pure gate). This is the ONLY
+      behavior change task 3751 makes at this gate. A pure gate
+      (``always_escalates`` truthy, no ``before_done``) never acquires a
+      worktree or branch, so the bare lock is never evidence for it; a
+      pending deterministic task WITH ``before_done`` keeps the signal
+      because it may be mid-deploy inside ``DeterministicRunner``. See
+      :func:`is_pure_gate_metadata` for the residual escalate-then-block
+      write window this accepts.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
@@ -331,30 +389,42 @@ def check(
             corrective_path=TERMINAL_CORRECTIVE_PATH,
         )
 
-    if op == 'set_task_status' and is_workflow_live_for_task(
-        task_id, project_root, status=live_status,
-    ):
-        return _reject(
-            op=op,
-            task_id=task_id,
-            agent_id=agent_id,
-            error_type='ReconLiveWorkflowWriteRejected',
-            reason=(
-                f'recon-stage write blocked: task {task_id} has a live '
-                'workflow (worktree/branch or orchestrator lock active); '
-                'recon-stage agents may not write status while a workflow '
-                'is live.'
-            ),
-            hint=(
-                'A live orchestrator workflow (worktree, recent commit, or '
-                'project-level lock) is active for this task. Recon-stage '
-                'status writes would race the pipeline and are rejected; '
-                'wait for the workflow to complete.'
-            ),
-            live_status=live_status,
-            target_status=target_status,
-            snapshot_token=snapshot_token,
-        )
+    if op == 'set_task_status':
+        # Derived inside this branch only — no other gate pays for the
+        # coercion. `_coerce_metadata_dict` yields None for anything that is
+        # not a dict / JSON-object string, so a malformed or absent blob
+        # degrades to task_kind=None / pure_gate=False: fail-safe TOWARD
+        # live. See this function's Gate 2 docstring paragraph for what the
+        # two derived values unlock (detector rules 2/3/5).
+        parsed_metadata = _coerce_metadata_dict(task_metadata)
+        if is_workflow_live_for_task(
+            task_id,
+            project_root,
+            status=live_status,
+            task_kind=(parsed_metadata or {}).get('task_kind'),
+            pure_gate=is_pure_gate_metadata(parsed_metadata),
+        ):
+            return _reject(
+                op=op,
+                task_id=task_id,
+                agent_id=agent_id,
+                error_type='ReconLiveWorkflowWriteRejected',
+                reason=(
+                    f'recon-stage write blocked: task {task_id} has a live '
+                    'workflow (worktree/branch or orchestrator lock active); '
+                    'recon-stage agents may not write status while a workflow '
+                    'is live.'
+                ),
+                hint=(
+                    'A live orchestrator workflow (worktree, recent commit, or '
+                    'project-level lock) is active for this task. Recon-stage '
+                    'status writes would race the pipeline and are rejected; '
+                    'wait for the workflow to complete.'
+                ),
+                live_status=live_status,
+                target_status=target_status,
+                snapshot_token=snapshot_token,
+            )
 
     if snapshot_token is not None and snapshot_token != live_status:
         return _reject(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from escalation.queue import EscalationQueue
 
@@ -277,3 +278,220 @@ class TestProvenanceConflictSinkRecordFromRejection:
         assert detail['gate_source'] == 'dispatch-gate'
         assert detail['evidence_commit'] == 'abc'
         assert sink.should_skip('42') is True
+
+
+class TestArbitrationPendingReopenAtArm:
+    """``arbitration_pending`` inherits ``should_skip``'s invalidation arm.
+
+    ``should_skip`` deliberately RELEASES when the task's current
+    ``reopen_at`` no longer matches the recorded one — "the task was
+    reopened again since the conflict was recorded — a fresh write attempt
+    is warranted" — and ``merge_queue.py`` names that arm as its self-heal.
+    A reopen_at-agnostic durable hold would OVERRIDE it and wedge a
+    re-reopened task forever (no dispatch, no flip) until a human resolved
+    the L2, i.e. fixing a restart bug by installing a permanent one.
+
+    The data for doing it durably is already on the record: ``record()``
+    serialises ``reopen_at`` into the escalation's ``detail`` JSON.  Records
+    here are built through the real ``record()`` against a real
+    ``EscalationQueue`` so the ``detail`` shape is never hand-faked.
+
+    Deliberate asymmetry, pinned below: EVERY ambiguity resolves to HOLD.
+    Releasing is the action that lets a contested task move, so it must
+    require positive evidence that the arbitration is stale; the absence of
+    evidence is never enough.
+    """
+
+    _R1 = '2026-07-15T00:00:00+00:00'
+    _R2 = '2026-07-20T00:00:00+00:00'
+
+    def _sink_with_conflict(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+        _record(sink)
+        return sink, queue.get_by_task('42', status='pending')
+
+    def test_moved_on_reopen_at_releases_the_hold(self, tmp_path):
+        """The task was reopened after the conflict — the hold must release."""
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows, reopen_at=self._R2) is False
+
+    def test_same_reopen_at_holds(self, tmp_path):
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows, reopen_at=self._R1) is True
+
+    def test_iso8601_drift_still_holds(self, tmp_path):
+        """``...Z`` vs ``...+00:00`` is the drift ``_reopen_at_matches``
+        exists to absorb — a naive ``==`` would wrongly RELEASE here.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(
+            rows, reopen_at='2026-07-15T00:00:00Z',
+        ) is True
+
+    def test_omitted_reopen_at_holds(self, tmp_path):
+        """No ``reopen_at`` kwarg (the ``_UNKNOWN_REOPEN`` sentinel) — the
+        same "caller has no metadata handy" arm ``should_skip`` already has.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        assert sink.arbitration_pending(rows) is True
+
+    def test_unparseable_detail_holds(self, tmp_path):
+        """A record whose ``detail`` cannot yield a recorded ``reopen_at``
+        carries no evidence that the arbitration is stale, so it HOLDS.
+        """
+        sink, rows = self._sink_with_conflict(tmp_path)
+
+        # ``Escalation.detail`` is declared ``str``, so ``None`` is deliberately
+        # OFF-CONTRACT here: it pins the sink's ``getattr(record, 'detail', None)
+        # or '{}'`` defensive arm, which exists for records rehydrated from a
+        # store that serialized ``detail`` as JSON ``null``.  Annotated ``Any``
+        # so the type checker permits the off-contract assignment.
+        bad_detail: Any
+        for bad_detail in ('not json', None):
+            rows[0].detail = bad_detail
+            assert sink.arbitration_pending(
+                rows, reopen_at=self._R2,
+            ) is True, f'detail={bad_detail!r} must hold'
+
+    def test_non_provenance_records_never_hold(self, tmp_path):
+        """A pending blocking L2 in another category is the ANY-LEVEL veto's
+        business, not the arbitration hold's.
+        """
+        from escalation.models import Escalation
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+        )
+        rows = [
+            Escalation(
+                id='esc-42-1',
+                task_id='42',
+                agent_role='implementer',
+                severity='blocking',
+                category='design_concern',
+                summary='an open handoff on task 42',
+                level=2,
+            ),
+        ]
+
+        assert sink.arbitration_pending(rows) is False
+
+    def test_none_records_do_not_hold(self, tmp_path):
+        """An unreadable store is the CALLER's disposition (store_unavailable),
+        not something this method may quietly convert into a hold.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink = ProvenanceConflictSink(
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+        )
+
+        assert sink.arbitration_pending(None) is False
+
+    def test_resolved_conflict_row_does_not_hold(self, tmp_path):
+        """A RESOLVED conflict released the task — mirrors ``should_skip``'s
+        ``_escalation_pending`` arm (amendment, reviewer_comprehensive
+        robustness_api_contract).
+
+        The parameter is named ``pending_records`` and the only in-tree
+        caller passes ``get_by_task(tid, status='pending')``, but the method
+        accepts an arbitrary iterable and the sink is shared with the
+        merge-queue writer sites.  A caller handing over an UNFILTERED
+        ``get_by_task(tid)`` (which also scans the archive tier, so it yields
+        long-resolved rows) must not thereby wedge the task forever: the
+        documented release path — an operator resolves the L2 — has to keep
+        releasing.
+        """
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        sink = ProvenanceConflictSink(escalation_queue=queue)
+        escalation_id = _record(sink)
+        assert escalation_id is not None
+        assert queue.resolve(escalation_id, 'operator arbitrated') is not None
+
+        # The unfiltered read: the resolved row now lives in the archive tier.
+        unfiltered = queue.get_by_task('42')
+        assert [e.status for e in unfiltered] == ['resolved'], unfiltered
+
+        assert sink.arbitration_pending(unfiltered, reopen_at=self._R1) is False
+        assert sink.arbitration_pending(unfiltered) is False
+
+
+class TestArbitrationHoldLogStreak:
+    """``note_hold_observed`` / ``clear_hold_observed`` keep the hold's log
+    line loud on a TRANSITION and quiet on the repeats (amendment,
+    reviewer_comprehensive observability_log_volume).
+
+    The hold re-fires on every dispatch tick for as long as the arbitration
+    stands — and on a cold-memo process it short-circuits before
+    ``record()``, so nothing re-warms ``should_skip`` to quiet it.  Logging
+    it unconditionally at INFO would emit one line per tick until a human
+    resolved the L2, which is the log spam INV-4 forbids.
+    """
+
+    _R1 = '2026-07-15T00:00:00+00:00'
+    _R2 = '2026-07-20T00:00:00+00:00'
+
+    def _sink(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        return ProvenanceConflictSink(
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+        )
+
+    def test_first_observation_is_loud_then_quiet(self, tmp_path):
+        sink = self._sink(tmp_path)
+
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is True
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is False
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is False
+
+    def test_moved_on_reopen_at_is_a_new_transition(self, tmp_path):
+        """A re-reopen is genuinely new hold state — an operator wants it."""
+        sink = self._sink(tmp_path)
+
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is True
+        assert sink.note_hold_observed('42', reopen_at=self._R2) is True
+        assert sink.note_hold_observed('42', reopen_at=self._R2) is False
+
+    def test_absent_reopen_at_dedupes_too(self, tmp_path):
+        """A caller with no task metadata handy still gets ONE loud line."""
+        sink = self._sink(tmp_path)
+
+        assert sink.note_hold_observed('42') is True
+        assert sink.note_hold_observed('42') is False
+        assert sink.note_hold_observed('42', reopen_at=None) is False
+
+    def test_streaks_are_per_task(self, tmp_path):
+        sink = self._sink(tmp_path)
+
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is True
+        assert sink.note_hold_observed('43', reopen_at=self._R1) is True
+
+    def test_release_makes_a_returning_hold_loud_again(self, tmp_path):
+        """Also the pruning arm: the dict stays bounded by CURRENTLY-held
+        tasks rather than every task ever contested in this process.
+        """
+        sink = self._sink(tmp_path)
+
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is True
+        sink.clear_hold_observed('42')
+        assert sink._hold_logged == {}
+
+        assert sink.note_hold_observed('42', reopen_at=self._R1) is True
+
+    def test_clearing_an_unheld_task_is_a_no_op(self, tmp_path):
+        sink = self._sink(tmp_path)
+
+        sink.clear_hold_observed('42')  # must not raise
+        assert sink._hold_logged == {}

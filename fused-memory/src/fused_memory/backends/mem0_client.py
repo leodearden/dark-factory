@@ -11,6 +11,25 @@ from fused_memory.models.scope import Scope
 
 logger = logging.getLogger(__name__)
 
+# The canonical Qdrant payload key for a memory's text, with the historical
+# fallbacks. Mirrors memory_service._MEM0_CONTENT_KEYS and
+# scripts/clear_malformed_empty_memory._CONTENT_KEYS so "what counts as a
+# memory's content" is judged identically everywhere.
+_MEM0_TEXT_KEY = 'data'
+_MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
+
+# How much of a matching record's text to echo back in a scan hit.
+_EXCERPT_LEN = 240
+
+
+def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+    """Return a Qdrant payload's memory text, in canonical key order."""
+    for key in _MEM0_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
 
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
@@ -614,6 +633,180 @@ class Mem0Backend:
             )
 
         return result
+
+    async def scan_payload_text(
+        self,
+        scope: Scope,
+        needles: list[str] | None = None,
+        *,
+        filters: dict[str, Any] | None = None,
+        exhaustive: bool = False,
+        page_size: int = 256,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Literal substring scan over Qdrant payload TEXT for leaked tool-call XML.
+
+        (a) THIS IS NOT SEMANTIC SEARCH AND NOT METADATA EQUALITY. It is the
+        gap that made the corpus unsweepable: :meth:`search` ranks by
+        embedding similarity, and a leaked serialized tool-call fragment
+        carries almost no semantic signal, so it is unfindable that way (a
+        live 2026-07-26 probe returned zero). :meth:`count_by_metadata` /
+        :meth:`scroll_by_metadata` match payload KEYS by equality, which
+        cannot see inside the memory text at all. This method walks the
+        records and applies the shared detector to their content.
+
+        (b) PREFILTER. Unless *exhaustive*, one
+        ``FieldCondition(key='data', match=MatchText(text=needle))`` per
+        needle is OR-combined via ``Filter(should=[...])`` and pushed to
+        Qdrant. On an UN-INDEXED payload field, ``MatchText`` performs a
+        literal, case-sensitive, order-preserving SUBSTRING match — measured
+        on qdrant 1.17.1 over 19,321 points at ~70-90 ms for an exact count.
+
+        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every returned record is
+        RE-VERIFIED with :func:`find_toolcall_xml_leak`, which is the
+        authoritative verdict. This matters because those are un-indexed-field
+        FALLBACK semantics: creating a text payload index on ``data`` would
+        SILENTLY flip ``MatchText`` to tokenized word-matching. That failure is
+        safe here rather than merely unlikely — tokenized matching is strictly
+        MORE permissive for these needles (a record containing a literal
+        serialized opening tag necessarily contains its constituent word
+        tokens), so the prefilter remains a superset and the Python detector
+        still yields the exact answer. Only speed degrades, never correctness.
+        ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
+        is the tripwire that fails loudly if those semantics ever change.
+
+        (d) ``exhaustive=True`` skips the prefilter entirely and walks the
+        whole collection. Use it when the answer must not depend on prefilter
+        semantics at all — notably when establishing the TRUE incidence rate,
+        so that claim rests on nothing but the shared detector.
+
+        Both modes PAGINATE, looping on the ``next_page_offset`` that
+        :meth:`scroll_by_metadata` discards. That method's single-shot
+        ``limit=1000`` cap is deliberately not reused: a silently-capped scan
+        would report a plausible-looking undercount, which is the same
+        silent-wrong-value class this scan exists to measure.
+
+        Args:
+            scope: Project/agent/session scope (selects the collection).
+            needles: Literal substrings for the prefilter. ``None`` or empty
+                defaults to
+                :data:`~fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+                — never to "no needles", which would scan for nothing and
+                report a clean corpus. Ignored when *exhaustive*.
+            filters: Optional key→value payload equality filters, AND-ed in
+                via ``must`` exactly as :meth:`count_by_metadata` builds them,
+                to narrow the scan (e.g. ``{'category': ...}``). Applies in
+                both modes.
+            exhaustive: Skip the prefilter and walk every point.
+            page_size: Points per scroll request.
+            limit: Maximum number of points to WALK. Must be strictly positive
+                when given. When the walk stops early, ``truncated`` is True
+                and a WARNING is logged — the truncation is never silent.
+
+        Raises:
+            ValueError: If *limit* is non-positive. A ``limit`` of 0 would make
+                every scroll page request 0 points, so the walk would return
+                ``{'matches': [], 'scanned': 0, 'truncated': False}`` — a
+                result INDISTINGUISHABLE from a genuinely clean corpus, and one
+                that a caller's exit-code predicate reads as a complete,
+                successful sweep. Rejecting it is the same no-silent-wrong-value
+                rule that makes a scan timeout propagate rather than collapse
+                into an empty list.
+
+        Returns:
+            ``{'matches': [...], 'scanned': int, 'truncated': bool}`` where
+            each match is ``{'id', 'created_at', 'matched_fragments',
+            'excerpt', 'metadata'}``. ``scanned`` counts every point walked,
+            including non-matching ones, so it is a correct denominator for an
+            incidence rate.
+
+        Raises:
+            TimeoutError: If any scroll page exceeds the read timeout —
+                PROPAGATED (never swallowed into an empty result), matching
+                count_by_metadata/scroll_by_metadata/get_point_by_id. A
+                timed-out scan must never be mistaken for a clean corpus.
+        """
+        if limit is not None and limit <= 0:
+            raise ValueError(
+                f'scan_payload_text limit must be strictly positive, got {limit}; a '
+                'non-positive limit walks zero points and would report an empty '
+                'result as a clean corpus'
+            )
+
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        from fused_memory.utils.toolcall_xml_leak import (  # noqa: PLC0415
+            PREFILTER_NEEDLES,
+            find_toolcall_xml_leak,
+        )
+
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in (filters or {}).items()
+        ]
+        should: list[qmodels.Condition] = []
+        if not exhaustive:
+            should = [
+                qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+                for needle in (needles or PREFILTER_NEEDLES)
+            ]
+        scroll_filter = qmodels.Filter(must=must, should=should) if (must or should) else None
+
+        matches: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        offset: Any = None
+        while True:
+            page_limit = page_size
+            if limit is not None:
+                page_limit = min(page_size, limit - scanned)
+            points, next_offset = await asyncio.wait_for(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=page_limit,
+                    offset=offset,
+                ),
+                timeout=self._read_timeout,
+            )
+
+            for point in points:
+                scanned += 1
+                payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+                hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                if not hits:
+                    continue
+                text = _extract_payload_text(payload) or ''
+                matches.append({
+                    'id': point.id,
+                    'created_at': payload.get('created_at'),
+                    'matched_fragments': [hit.fragment for hit in hits],
+                    'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
+                    'metadata': payload,
+                })
+
+            if next_offset is None:
+                break
+            if limit is not None and scanned >= limit:
+                truncated = True
+                logger.warning(
+                    'Mem0 scan_payload_text stopped at limit=%d (collection=%s, '
+                    'exhaustive=%s) with more pages available — results are '
+                    'TRUNCATED and any incidence rate derived from them is an '
+                    'undercount. Re-run without --limit for the true rate.',
+                    limit,
+                    collection_name,
+                    exhaustive,
+                )
+                break
+            offset = next_offset
+
+        return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
 
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.

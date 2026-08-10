@@ -47,12 +47,11 @@ import contextlib
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
 from audit_wiped_metadata_files import (
-    discover_project_roots,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     AuditCoverage,
@@ -60,6 +59,7 @@ from audit_wiped_metadata_files import (
     _coerce_file_list,
     _format_coverage,
     audit_project,
+    discover_project_roots,
 )
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -728,7 +728,7 @@ _DRY_RUN_BANNER = (
 )
 
 
-def _counts(result: "RepairResult") -> dict[str, int]:
+def _counts(result: RepairResult) -> dict[str, int]:
     """Count EVERY disposition, seeding the zero ones explicitly."""
     counts = dict.fromkeys(ALL_DISPOSITIONS, 0)
     for outcome in result.outcomes:
@@ -736,7 +736,7 @@ def _counts(result: "RepairResult") -> dict[str, int]:
     return counts
 
 
-def format_summary(result: "RepairResult") -> str:
+def format_summary(result: RepairResult) -> str:
     """Render one project's repair run as a human-readable summary.
 
     Three properties this owes its reader, each of them tested:
@@ -789,7 +789,7 @@ def format_summary(result: "RepairResult") -> str:
     return "\n".join(lines)
 
 
-def format_json_summary(results: list["RepairResult"]) -> str:
+def format_json_summary(results: list[RepairResult]) -> str:
     """Render *results* as a JSON OBJECT carrying dispositions AND coverage.
 
     An object rather than a bare array, mirroring
@@ -869,58 +869,27 @@ def _make_client(server_url: str):
 
     ``migrate_metadata_modules_to_files`` imports httpx at module scope, so
     importing it at the top of this module would make a dry run depend on a
-    transport library it never uses. Subclassed rather than edited: that file
-    is outside this task's lock scope, and the migrate script's update_task
-    recipe is the proven one — only the mode differs (merge, not replace).
+    transport library it never uses.
+
+    Subclassed because the migrate script's update_task recipe is the proven
+    one — only the mode differs (merge, not replace) — and the subclass exists
+    ONLY to set :attr:`~FusedMemoryClient._client_name`. It overrides nothing
+    else, and must not: everything but the name is inherited.
     """
     from migrate_metadata_modules_to_files import FusedMemoryClient
 
     class RepairFusedMemoryClient(FusedMemoryClient):
         """FusedMemoryClient with an attributable clientInfo.name.
 
-        THE OVERRIDE BELOW IS A CLONE, AND KNOWINGLY SO. Only ``clientInfo.name``
-        varies, but the parent bakes that string into the middle of its
-        ``_initialize``, so the whole procedure — both JSON-RPC posts, the
-        ``protocolVersion``, the capabilities block — has to be restated to
-        change one leaf. That is a silent-drift clone: bump the parent's
-        protocolVersion and this client keeps handshaking with the stale one.
+        ONE ATTRIBUTE, NO OVERRIDDEN METHODS — the handshake is INHERITED, so a
+        parent ``protocolVersion`` bump or a new capability reaches this client
+        automatically and there is no copy here to go stale. The name is
+        load-bearing, not cosmetic: see :data:`CLIENT_NAME`.
 
-        :attr:`_client_name` is the seam that retires it. ``scripts/`` is
-        outside this task's lock scope, so the parent cannot be edited here;
-        DF 3437 owns that change — give the parent's ``_initialize`` a
-        ``getattr(self, '_client_name', 'migrate-metadata')`` read and DELETE
-        this override entirely, since the attribute alone then does the job.
-
-        THE DRIFT IS NOT GUARDED BY A TEST, DELIBERATELY. A guard would have to
-        compare this body against the parent's source text, and the parent is a
-        file this task does not own — so it would break on an unrelated rename
-        with no defect present, and it would fail the moment DF 3437 landed,
-        i.e. exactly when the clone was correctly removed. The clone is
-        recorded here instead, with its deletion condition, and
-        ``test_make_client_is_attributable_to_this_repair_not_the_migration``
-        pins the one thing that must hold either way: the constructed client
-        reports THIS repair's name, not the migration's. That test is written
-        against the attribute, so it survives DF 3437 unchanged.
+        Guarded in tests/scripts/test_repair_wiped_metadata_files.py.
         """
 
         _client_name = CLIENT_NAME
-
-        async def _initialize(self) -> None:
-            await self._post({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "clientInfo": {"name": self._client_name, "version": "1.0"},
-                    "capabilities": {},
-                },
-            })
-            await self._post({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            })
 
     return RepairFusedMemoryClient(server_url)
 
@@ -993,7 +962,7 @@ async def main_async(args: argparse.Namespace) -> int:
         )
         return EXIT_NO_ROOT
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
     results: list[RepairResult] = []
     unreadable: list[str] = []
 

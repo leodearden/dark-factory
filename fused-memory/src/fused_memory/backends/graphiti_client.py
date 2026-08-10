@@ -24,12 +24,16 @@ from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
+from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_indices import resolve_header_positions
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
+from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
@@ -259,7 +263,7 @@ def _normalize_fact_for_grouping(fact: str | None) -> str:
 
 
 class _MultiTenantFalkorDriver(FalkorDriver):
-    """FalkorDriver that suppresses auto-indexing.
+    """FalkorDriver that suppresses auto-indexing and hardens fulltext queries.
 
     Upstream ``__init__`` schedules ``build_indices_and_constraints()``
     against ``_database`` as a fire-and-forget task.  In multi-tenant
@@ -268,12 +272,66 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     CREATE INDEX commands from saturating FalkorDB's single-threaded
     execution.
 
+    ``build_fulltext_query`` is overridden (task 3334) because upstream's
+    assembly emits operands RediSearch cannot parse, which dead-lettered the
+    ``add_episode`` write path — dead-letter 9950, plus an identical 2026-04-02
+    occurrence.  See :mod:`fused_memory.backends.falkor_fulltext` for the root
+    cause and the empirical validation.
+
     ``clone()`` is overridden to return another ``_MultiTenantFalkorDriver``
-    so cloned per-graph drivers also suppress auto-indexing.
+    so cloned per-graph drivers also suppress auto-indexing — and, since task
+    3334, so they inherit the fulltext hardening too.  That matters more than it
+    looks: every per-group driver handed out by ``_driver_for()`` /
+    ``_client_for()`` comes from ``clone()``, including the one behind
+    ``get_relevant_nodes``' per-node dedup query on the ``add_episode`` write
+    path, which is exactly where 9950 originated.  If ``clone()`` ever returns a
+    plain ``FalkorDriver`` again, the hardening silently stops applying
+    everywhere that matters while the unit tests still pass.
     """
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
+
+    def build_fulltext_query(
+        self,
+        query: str,
+        group_ids: list[str] | None = None,
+        max_query_length: int = 128,
+    ) -> str:
+        """Assemble a RediSearch fulltext query that the parser will accept.
+
+        Upstream's version emits operands RediSearch cannot parse, which
+        dead-lettered the ``add_episode`` write path (dead-letter 9950, plus an
+        identical 2026-04-02 occurrence).  The reported error —
+        ``Syntax error at offset N near <word>`` — names the token *preceding*
+        the fault, so it reads as a reserved-word collision; it is not one.  See
+        :mod:`fused_memory.backends.falkor_fulltext` for the full root cause.
+
+        CHANGED vs upstream (both only ever *remove* unparseable operands, so
+        recall for every query that already worked is unchanged):
+
+        * tokens containing no alphanumeric character are dropped — they are
+          reduced to nothing by RediSearch's own tokenizer, which leaves the
+          ``|`` union operator with no right-hand operand;
+        * an empty term list short-circuits to ``''`` instead of emitting the
+          equally-unparseable empty operand group ``()``;
+        * ``\\``, ``"`` and ``-`` are escaped inside the ``(@group_id:"...")``
+          filter — upstream's comment claims bare quoting handles hyphens, which
+          was measured false against a live FalkorDB.
+
+        PRESERVED from upstream, deliberately:
+
+        * ``validate_group_ids`` is still called first, so graphiti's fail-fast
+          on invalid group_ids is not silently lost;
+        * ``self.sanitize()`` still does the character-class stripping — only
+          term assembly is replaced, so the rules stay upstream's;
+        * ``STOPWORDS`` is imported rather than re-declared;
+        * the over-length word-count arithmetic, quirks included;
+        * ``''`` as the "no query" sentinel, which every fulltext caller in
+          ``graphiti_core.search.search_utils`` already short-circuits on.
+        """
+        validate_group_ids(group_ids)
+        return build_query(self.sanitize(query), group_ids, max_query_length)
 
     def clone(self, database: str) -> 'GraphDriver':
         if database == self._database:
@@ -736,6 +794,109 @@ class GraphitiBackend:
             node.delete(driver),
             timeout=self._write_timeout,
         )
+
+    @_canonicalize_group_args
+    async def redact_episode_content(
+        self, episode_uuid: str, *, group_id: str, new_content: str,
+    ) -> dict[str, Any]:
+        """Replace ONE EpisodicNode's ``content`` in place, preserving everything else.
+
+        The remediation primitive for an episode whose raw text carries a
+        leaked serialized tool-call fragment (task 3083). Three design
+        commitments, each of which is why this method exists at all rather
+        than the caller reaching for an existing one:
+
+        1. **Redact, never cascade-delete.** ``delete_episode(cascade=True)``
+           would destroy the entities and edges exclusively sourced from this
+           episode — for the known residual
+           ``d12b0eb4-f027-4d0c-a26c-096ccd0e75c2`` that includes
+           demonstrably-VALID collateral such as edge ``ea4072dc``. Deleting
+           real knowledge to fix appearance is strictly worse than the leak.
+           So this issues exactly one scoped ``SET e.content`` and no removal
+           of any kind.
+        2. **No vector is invalidated.** EpisodicNodes carry no embedding
+           property of their own (graphiti_core's episode save query writes
+           none), so unlike the Mem0 sweep — which must delete and re-add so
+           the repaired text is re-embedded — an in-place content SET here
+           leaves nothing stale behind.
+        3. **The extracted edges are deliberately left untouched.** They were
+           extracted from the CLEAN portion of the text, before the harness
+           truncated it; the fragment contributed no facts. Rewriting them
+           would be a second mutation with no evidence behind it.
+
+        Both the before-read and the write are scoped by ``uuid`` AND
+        ``group_id``, so a uuid belonging to another project's graph can
+        neither be read nor redacted through this call.
+
+        NOT PROVIDED HERE: Graphiti-side DISCOVERY — enumerating which
+        episodes across a graph carry a leak. That needs a full episode scan
+        with no payload index to lean on, and is tracked as follow-up work.
+        This is the remediation primitive for an episode you have ALREADY
+        identified, by hand or from the Mem0 sweep's report.
+
+        Args:
+            episode_uuid: UUID of the EpisodicNode to redact.
+            group_id: Project graph to target.
+            new_content: Replacement text. Must be non-empty and must not
+                itself carry a leak per the shared detector.
+
+        Returns:
+            ``{uuid, group_id, old_content, new_content}`` so the caller can
+            audit exactly what was neutralised.
+
+        Raises:
+            ValueError: if *new_content* is blank, or still carries a leaked
+                tool-call fragment (a redaction that re-introduces the
+                fragment is not a redaction).
+            NodeNotFoundError: if no Episodic node with that UUID exists in
+                *group_id* — a typo can never be mistaken for a success.
+            RuntimeError: if the backend is not initialized.
+        """
+        if not new_content or not new_content.strip():
+            raise ValueError(
+                'redact_episode_content requires non-empty new_content — '
+                'redaction is content-preserving, not content-erasing'
+            )
+        if has_toolcall_xml_leak(new_content):
+            raise ValueError(
+                'redact_episode_content refuses new_content that still carries a '
+                'leaked tool-call XML fragment (a redaction that re-introduces '
+                'the leak is not a redaction)'
+            )
+
+        graph = self._graph_for(group_id)
+        result = await asyncio.wait_for(
+            graph.ro_query(
+                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+                'RETURN e.content',
+                {'uuid': episode_uuid, 'group_id': group_id},
+            ),
+            timeout=self._read_timeout,
+        )
+        if not result.result_set:
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {episode_uuid}'
+            )
+        old_content = result.result_set[0][0] or ''
+
+        await asyncio.wait_for(
+            graph.query(
+                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+                'SET e.content = $content',
+                {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
+            ),
+            timeout=self._write_timeout,
+        )
+        logger.info(
+            'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
+            episode_uuid, group_id, len(old_content), len(new_content),
+        )
+        return {
+            'uuid': episode_uuid,
+            'group_id': group_id,
+            'old_content': old_content,
+            'new_content': new_content,
+        }
 
     @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:
@@ -2134,6 +2295,98 @@ class GraphitiBackend:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
         return survivor['uuid']
 
+    @_canonicalize_group_args
+    async def ensure_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        The resolve-or-MINT sibling of :meth:`_resolve_or_create_entity`, whose
+        documented 0-match behaviour is a no-op ("node minting stays
+        graphiti_core's job"). That contract is deliberately left intact —
+        callers like ``_dedup_episode_nodes`` depend on a stray extracted name
+        never becoming a permanent node — so the mint lives here instead, and
+        only on that method's None branch. The resolve/collapse half is
+        delegated to it unchanged, so both primitives share one identity rule.
+
+        Exists for names graphiti_core will never mint on its own. The
+        motivating case (task 3335) is a cross-project task reference
+        ``<project_id>:<task_number>``: LLM extraction is exactly what discards
+        the qualifier and collapses the reference onto a bare ``Task N`` node,
+        so waiting for extraction to produce the qualified node is waiting for
+        the bug not to happen.
+
+        LOCK CONTRACT (inherited from ``_resolve_or_create_entity``): callers
+        MUST hold ``_identity_lock_for(group_id)``. This method performs no
+        locking of its own, and a concurrent same-group writer between the
+        resolve and the mint would produce exactly the duplicate-name pair the
+        identity gate exists to prevent.
+
+        Idempotent: once the node exists, every later call for the same
+        (name, group_id) takes the resolve path and mints nothing.
+
+        The minted property set mirrors graphiti_core's own FalkorDB
+        ``get_entity_node_save_query`` minus ``name_embedding``, which that
+        query wraps in ``vecf32()`` and which this repo writes separately via
+        ``update_node_embedding``. ``created_at`` is written as
+        ``datetime.now(UTC).isoformat()`` — byte-identical to what
+        graphiti_core produces, since FalkorDB has no datetime type and
+        ``FalkorDriver.convert_datetimes_to_strings`` stores ``isoformat()``.
+        That matters because ``find_duplicate_entity_nodes`` orders survivors
+        DB-side on the stored string (``ORDER BY ... n.created_at ASC``), a
+        lexicographic compare that is chronologically correct only for
+        same-format, same-offset ISO strings; ``helpers.parse_db_date`` reads
+        the value back with ``datetime.fromisoformat``.
+
+        Args:
+            name: Exact name of the Entity to resolve or mint.
+            group_id: Project graph to target.
+            summary: Summary property for a newly minted node. Ignored on the
+                resolve path — an existing node's summary is never overwritten.
+
+        Returns:
+            The UUID of the single canonical Entity node with this name in
+            *group_id*'s graph — resolved, collapsed-to, or newly minted.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        resolved = await self._resolve_or_create_entity(name, group_id=group_id)
+        if resolved is not None:
+            return resolved
+
+        node_uuid = str(uuid.uuid4())
+        graph = self._graph_for(group_id)
+        await graph.query(
+            'CREATE (n:Entity {uuid: $uuid, name: $name, group_id: $group_id, '
+            'summary: $summary, created_at: $created_at})',
+            {
+                'uuid': node_uuid,
+                'name': name,
+                'group_id': group_id,
+                'summary': summary,
+                'created_at': datetime.now(UTC).isoformat(),
+            },
+        )
+        logger.info(
+            'ensure_entity_node: minted node=%s name=%r group_id=%s',
+            node_uuid, name, group_id,
+        )
+        try:
+            embedding = await self._require_client().embedder.create(name)
+            await self.update_node_embedding(node_uuid, embedding, group_id=group_id)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Best-effort, mirroring rename_entity_node: the node itself (the
+            # primary result, which keeps exact-name Cypher lookups correct)
+            # already exists; a missing embedding only affects fuzzy hybrid
+            # node search.
+            logger.warning(
+                'ensure_entity_node: failed to generate name_embedding for '
+                'node=%s name=%r; the node was still minted',
+                node_uuid, name, exc_info=True,
+            )
+        return node_uuid
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
@@ -2762,6 +3015,43 @@ class GraphitiBackend:
 
         Each record is a dict with keys: label, field, type, entity_type.
 
+        Columns are resolved BY NAME from ``result.header``, not positionally.
+        The measured live header (2026-08-06, task 3706) is 9 two-tuples::
+
+            [label, properties, types, options, language, stopwords,
+             entitytype, status, info]
+
+        This method previously bound ``entity_type`` to ``row[3]`` — the
+        ``options`` column, an ``OrderedDict`` like ``{'uuid': {}}`` — instead of
+        ``entitytype`` (``row[6]``, the string ``'NODE'``/``'RELATIONSHIP'``).
+        The fix is by-name resolution rather than a corrected index: switching to
+        ``row[6]`` would repair today's symptom while leaving the same silent
+        degradation armed for the next FalkorDB column reorder.
+
+        The resolution is delegated to
+        ``fused_memory.backends.falkor_indices.resolve_header_positions`` rather
+        than hand-rolled here, so the next reader of ``CALL db.indexes()``
+        (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
+        implementation instead of re-forking the build-names / check-missing /
+        ``.index()`` sequence — re-forking is how the positional read survived.
+        ``tests/_fm_helpers.await_index_operational`` still carries its own copy
+        (it resolves ``status`` by name for exactly this reason); collapsing that
+        third copy onto this helper is filed as a follow-up, as ``_fm_helpers``
+        is outside task 3706's locked scope.
+
+        A missing required column — or a header entry that is not a
+        ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
+        subclass, preserving this method's historical contract) rather than
+        returning a record with a silently-wrong or absent value.
+
+        Note the returned ``type`` value is the ``types`` COLUMN — a dict of
+        property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
+        NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
+        models that shape.  (``drop_vector_indices`` still compares that dict
+        against the string ``'VECTOR'`` and is therefore a latent no-op; that is
+        pre-existing, deliberately out of scope for task 3706, and filed as a
+        separate follow-up.)
+
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
         read-only path in this file — all other ``ro_query`` callers use plain
@@ -2781,14 +3071,24 @@ class GraphitiBackend:
         # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
         # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
+
+        # Resolve columns by name, so a FalkorDB column reorder fails loudly
+        # here instead of silently reading the wrong column (see the docstring).
+        # The resolution itself lives in falkor_indices so this is not a second
+        # hand-rolled copy of it -- see resolve_header_positions.
+        positions = resolve_header_positions(
+            result.header,
+            {
+                'label': 'label',
+                'field': 'properties',
+                'type': 'types',
+                'entity_type': 'entitytype',
+            },
+        )
+
         indices = []
         for row in (result.result_set or []):
-            indices.append({
-                'label': row[0],
-                'field': row[1],
-                'type': row[2],
-                'entity_type': row[3],
-            })
+            indices.append({key: row[idx] for key, idx in positions.items()})
         return indices
 
     @_canonicalize_group_args

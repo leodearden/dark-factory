@@ -33,7 +33,7 @@ class TestDeleteMemoryIdAlias:
         """Mock MemoryService for tool registration."""
         svc = AsyncMock()
         svc.delete_memory = AsyncMock(
-            return_value={'status': 'deleted', 'store': 'mem0', 'id': 'm1'}
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': '00000000-0000-4000-8000-00000000000a'}
         )
         return svc
 
@@ -47,11 +47,11 @@ class TestDeleteMemoryIdAlias:
         """Calling with `id` delegates to memory_service.delete_memory(memory_id=...)."""
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'
         assert call_kwargs.get('store') == 'mem0'
         assert call_kwargs.get('project_id') == 'dark_factory'
 
@@ -60,11 +60,11 @@ class TestDeleteMemoryIdAlias:
         """Backward compat: memory_id alone still calls the service correctly."""
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'memory_id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'
 
     @pytest.mark.asyncio
     async def test_neither_id_nor_memory_id_returns_validation_error(
@@ -106,11 +106,19 @@ class TestDeleteMemoryIdAlias:
         """
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'id': 'm1', 'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'id': '00000000-0000-4000-8000-00000000000a', 'memory_id': '00000000-0000-4000-8000-00000000000a', 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
-        assert call_kwargs.get('memory_id') == 'm1'
+        assert call_kwargs.get('memory_id') == '00000000-0000-4000-8000-00000000000a'
+
+
+# Full 36-char UUIDs, not short handles: the tool boundary validates id shape
+# (`validate_full_uuid`) BEFORE it reaches the service, so a truncated 'm1'
+# would be refused by the prologue and never exercise the cascade path.
+_PARENT_ID = '00000000-0000-4000-8000-0000000000a1'
+_CHILD_1 = '00000000-0000-4000-8000-0000000000c1'
+_CHILD_2 = '00000000-0000-4000-8000-0000000000c2'
 
 
 class TestDeleteMemoryCascadeTool:
@@ -125,7 +133,7 @@ class TestDeleteMemoryCascadeTool:
     def mock_service(self):
         svc = AsyncMock()
         svc.delete_memory = AsyncMock(
-            return_value={'status': 'deleted', 'store': 'mem0', 'id': 'm1'}
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': _PARENT_ID}
         )
         return svc
 
@@ -137,7 +145,7 @@ class TestDeleteMemoryCascadeTool:
     async def test_cascade_defaults_to_false_on_the_wire(self, mcp_server, mock_service):
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'memory_id': _PARENT_ID, 'store': 'mem0', 'project_id': 'dark_factory'},
         )
         assert mock_service.delete_memory.call_args.kwargs['cascade'] is False
 
@@ -146,7 +154,7 @@ class TestDeleteMemoryCascadeTool:
         await mcp_server._tool_manager.call_tool(
             'delete_memory',
             {
-                'memory_id': 'm1', 'store': 'mem0',
+                'memory_id': _PARENT_ID, 'store': 'mem0',
                 'project_id': 'dark_factory', 'cascade': True,
             },
         )
@@ -164,18 +172,18 @@ class TestDeleteMemoryCascadeTool:
 
         mock_service.delete_memory = AsyncMock(
             side_effect=ParentHasChildrenError(
-                parent_id='m1', child_ids=['c1', 'c2']
+                parent_id=_PARENT_ID, child_ids=[_CHILD_1, _CHILD_2]
             )
         )
 
         parsed = _parse_result(await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+            {'memory_id': _PARENT_ID, 'store': 'mem0', 'project_id': 'dark_factory'},
         ))
 
         assert parsed['error_type'] == 'ParentHasChildrenError'
-        assert 'c1' in parsed['error']
-        assert 'c2' in parsed['error']
+        assert _CHILD_1 in parsed['error']
+        assert _CHILD_2 in parsed['error']
         assert 'cascade' in parsed['error']
 
     @pytest.mark.asyncio
@@ -186,7 +194,7 @@ class TestDeleteMemoryCascadeTool:
         tests/test_mcp_boundary_canonicalization.py sweeps."""
         parsed = _parse_result(await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'm1', 'store': 'not-a-store', 'project_id': 'dark_factory',
+            {'memory_id': _PARENT_ID, 'store': 'not-a-store', 'project_id': 'dark_factory',
              'cascade': True},
         ))
         assert parsed['error_type'] == 'ValidationError'

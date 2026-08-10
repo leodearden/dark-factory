@@ -21,6 +21,13 @@ import logging
 from pathlib import Path
 
 import pytest
+from _verify_config_corpus import (
+    FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
+    ROOT_LINT_COMMAND,
+    ROOT_TEST_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -45,55 +52,11 @@ from orchestrator.verify_plan import (
     reverse_dependent_test_targets,
 )
 
-# ---------------------------------------------------------------------------
-# Real config command strings, verbatim from the repo's orchestrator configs
-# (verified byte-identical to the live YAML). Every subproject's lint_command
-# chains a `python3 fused-memory/scripts/check_*.py <dir>` sibling checker, so
-# these are the corpus that decides whether the pre-merge scoper preserves a
-# trailing clause or truncates at the keyword.
-# ---------------------------------------------------------------------------
-
-# fused-memory/orchestrator.yaml:11 — the only 3-segment chain (two checkers)
-_FM_LINT_COMMAND = (
-    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
-    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
-)
-
-# cockpit/dashboard/escalation/orchestrator/sampler/shared orchestrator.yaml —
-# each the same 2-segment shape, differing only in the module name.
-_MODULE_LINT_COMMANDS = {
-    module: (
-        f'uv run --project {module} --directory {module} ruff check src/ tests/'
-        f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
-    )
-    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
-}
-
-# dark-factory-orchestrator.yaml:50
-_ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
-
-# dark-factory-orchestrator.yaml:51
-_ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright'
-)
-
-# dark-factory-orchestrator.yaml:41
-_ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
-)
+# The real config command strings this suite exercises live in
+# `_verify_config_corpus.py` (one definition site, shared with test_verify_cmd.py
+# and test_verify_scope_kappa.py); `test_verify_config_corpus.py` checks them
+# against the live YAML — the executable form of the "verified byte-identical"
+# claim this comment block used to make in prose.
 
 # Task 3218: not a config in this repo (yet), but the shape the pytest slot
 # must never tail-preserve. Mirrors test_verify_cmd.py's pair — the sibling
@@ -601,6 +564,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
     instead; role='merge' (and the fallback branch, out of scope here) keep
     the legacy SKIPPED shape (R4 — pinned by the merge+scoped counterparts
     added alongside the migrated goldens in TestDeriveVerifyPlanModulePath).
+
+    Task 3294 widened WHEN the floor fires: it now sits ABOVE the
+    collectable-test branch, so at role='task' ANY touched SOURCE/STRUCTURAL
+    file under the prefix full-suites the owning module — a test-tree-ONLY
+    diff is what keeps FILE_SCOPED selection, not "no test file was touched".
+    The cases in this class are all production-file diffs, so every outcome
+    below is unchanged by 3294; the mixed case it DID change is pinned next
+    door in TestDeriveVerifyPlanTaskRoleFloorMixedDiff.
     """
 
     def test_source_only_diff_full_suites_pytest_at_task_role(self):
@@ -624,9 +595,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert 'not run' in run.reason.lower()
 
     def test_touched_test_only_diff_stays_file_scoped_at_task_role(self):
-        """(b) A real collectable test file keeps FILE_SCOPED selection — the
-        floor only fires on the pytest else-branch (no touched test file),
-        never overriding the existing collectable-test selection."""
+        """(b) A test-tree-ONLY diff keeps FILE_SCOPED selection.
+
+        The floor is PRODUCTION-triggered, not blanket: it fires whenever a
+        SOURCE/STRUCTURAL file is touched under the prefix, and this diff has
+        none. (Pre-3294 the floor sat below the collectable-test branch and
+        this outcome followed from "a test file was touched" instead — same
+        assertion, different reason. The distinction is what
+        TestDeriveVerifyPlanTaskRoleFloorMixedDiff exists to pin.)"""
         mc = ModuleConfig(
             prefix='shared',
             test_command='uv run --directory shared pytest tests/',
@@ -708,6 +684,233 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
         assert mc.type_check_command is not None
         assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+
+# ---------------------------------------------------------------------------
+# derive_verify_plan: the MIXED-diff case the λ floor left open (task 3294)
+# ---------------------------------------------------------------------------
+
+# task 3294: the 3033-shaped MIXED diff — a production file plus a
+# co-committed collectable test file under the SAME module prefix. Pre-3294
+# this hit _derive_module_runs' `elif collectable_tests:` branch (which sat
+# ABOVE the λ floor) and narrowed pytest to just the touched test file, so
+# adding a test to a source-only diff REMOVED coverage. Synthetic paths,
+# matching SOURCE_ONLY_DIFF's invented-path convention.
+MIXED_SOURCE_DIFF: list[str] = [
+    'orchestrator/src/orchestrator/some_module.py',
+    'orchestrator/tests/test_new_thing.py',
+]
+
+# The same shape with the production file being a STRUCTURAL one — the REAL
+# orchestrator/src/orchestrator/workflow.py case, which classify_file returns
+# STRUCTURAL (not SOURCE) for whenever content is read, because it defines
+# `class _McpLike(Protocol)`. A SOURCE-only widening predicate would miss the
+# exact file that motivated this task.
+MIXED_STRUCTURAL_DIFF: list[str] = [
+    STRUCTURAL_DIFF[0],
+    'orchestrator/tests/test_new_thing.py',
+]
+
+
+class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
+    """Task 3294: at role='task', a touched PRODUCTION file full-suites the
+    owning module even when a test file is co-committed.
+
+    λ (task 2589, R3) placed the task-role floor BELOW the collectable-test
+    branch, so it only ever fired when the module's touched files contained no
+    collectable test at all. That made coverage non-monotone in the diff: a
+    source-only diff paid the owning module's full suite, but the SAME diff
+    plus a test file narrowed to that one test file. Task 3033 is the
+    incident — its diff touched orchestrator/src/orchestrator/workflow.py plus
+    tests, the plan file-scoped to 36 items instead of the module's ~13188,
+    and a regression in test_workflow_resume_on_progress.py (a DIFFERENT
+    consumer of workflow.py) was structurally invisible.
+
+    The rule pinned here: ANY touched SOURCE/STRUCTURAL file under the prefix
+    runs the owning module's full test_command at role='task'; only a
+    test-tree-ONLY diff keeps FILE_SCOPED selection (PRD R3). role='merge' is
+    untouched (PRD R4).
+    """
+
+    def test_mixed_source_plus_touched_test_full_suites_at_task_role(self):
+        """(a) SOURCE production file + co-committed collectable test ->
+        FULL_SUITE at role='task'. The co-committed test must NOT narrow the
+        run: the command is the module's verbatim test_command and carries no
+        scoped_targets, so the whole owning package is collected."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert run.scoped_targets == ()
+        # The widened run targets the package, never the touched test file.
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in run.cmd.targets
+
+    def test_mixed_structural_plus_touched_test_full_suites_at_task_role(self):
+        """(b) The REAL workflow.py case: the production file classifies
+        STRUCTURAL (Protocol-bearing content, read because type_check_command
+        is configured), not SOURCE. It must widen pytest exactly as the SOURCE
+        variant does — the predicate is SOURCE ∪ STRUCTURAL, so pytest breadth
+        never becomes silently type-check-config-dependent. Control: pyright
+        is still FULL_SUITE via the untouched D2 rule."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(
+            MIXED_STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert pytest_run.cmd == parse_config_command(mc.test_command)
+        assert pytest_run.scoped_targets == ()
+        assert pytest_run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in pytest_run.cmd.targets
+
+        # Control: D2 is role-independent and untouched by this task.
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+    def test_mixed_diff_stays_file_scoped_at_merge_role(self):
+        """(c) PRD R4 rollback golden: the SAME mixed diff at role='merge'
+        (breadth 'scoped') keeps the byte-identical legacy FILE_SCOPED shape.
+        The widening is role='task'-gated and never reaches the merge gate."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert run.scoped_targets == ('orchestrator/tests/test_new_thing.py',)
+
+    def test_touched_test_only_diff_still_file_scoped_at_task_role(self):
+        """(d) The widening is PRODUCTION-triggered, not blanket: a
+        test-tree-ONLY diff at role='task' still file-scopes (PRD R3,
+        "touched-test-only diffs keep file-scoped selection")."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            ['orchestrator/tests/test_new_thing.py', 'orchestrator/tests/test_other.py'],
+            [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert 'orchestrator/tests/test_other.py' in run.cmd.targets
+
+    # -- WHY the run widened, and how far it did NOT reach -------------------
+
+    def test_mixed_diff_reason_names_the_production_trigger(self):
+        """(e) VerifyResult.plan is the operator-facing record of WHY a scope
+        decision was made, and this codebase already names the trigger in its
+        widening reasons (``pytest: conftest touched ({conftest_trigger})``).
+        The mixed case must do the same: name the production file that
+        triggered the widening, say the co-committed tests did NOT narrow it
+        (otherwise the widened run reads as a scoper bug), and NOT claim the
+        diff was "source-only" — factually false about a diff that touched
+        tests, and the pre-3294 floor's wording.
+
+        Only these are asserted. The role gating is pinned structurally by
+        ``test_mixed_diff_stays_file_scoped_at_merge_role``, and a substring
+        check for a word as common as "task" would discriminate nearly
+        nothing."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert 'orchestrator/src/orchestrator/some_module.py' in run.reason
+        assert 'narrow' in run.reason.lower()
+        assert 'source-only' not in run.reason.lower()
+
+    def test_mixed_diff_in_one_module_never_widens_a_sibling(self):
+        """(f) PRD R1, asserted rather than merely claimed in a reason string:
+        the widening changes each module's own BREADTH, never the SET of
+        modules. Three registered modules, one diff — 'orchestrator' mixed
+        (production + test), 'shared' test-ONLY, 'escalation' untouched.
+
+        This is the case the single-module tests structurally cannot fail on.
+        If the production predicate were computed over the whole
+        *existing_files* list instead of the prefix-filtered ``scoped`` one,
+        'shared' would widen to its full suite off ORCHESTRATOR's production
+        file — and every other test in this class would still pass, because
+        no sibling module is in their plan at all."""
+        mc_orch = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        mc_shared = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        mc_esc = ModuleConfig(
+            prefix='escalation',
+            test_command='uv run --directory escalation pytest tests/',
+            lint_command='uv run --directory escalation ruff check src/',
+        )
+        plan = derive_verify_plan(
+            [*MIXED_SOURCE_DIFF, 'shared/tests/test_sibling.py'],
+            [mc_orch, mc_shared, mc_esc], None, fake_worktree_reader, role='task',
+        )
+
+        # The touched-production module widens...
+        orch_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert orch_run is not None
+        assert orch_run.scope_kind is ScopeKind.FULL_SUITE
+
+        # ...its test-ONLY sibling does not: FILE_SCOPED to its own test file.
+        shared_run = _run_for(plan, 'shared', 'pytest:')
+        assert shared_run is not None
+        assert shared_run.scope_kind is ScopeKind.FILE_SCOPED, (
+            f"'shared' has no touched production file — a mixed diff in "
+            f'orchestrator must not widen it; got {shared_run.reason!r}'
+        )
+        assert shared_run.scoped_targets == ('shared/tests/test_sibling.py',)
+
+        # ...and the untouched module contributes no pytest run at all.
+        assert _run_for(plan, 'escalation', 'pytest:') is None
+        esc_runs = [r for r in plan.runs if r.module_prefix == 'escalation']
+        assert [r.scope_kind for r in esc_runs] == [ScopeKind.SKIPPED]
+        assert esc_runs[0].reason == 'no files under prefix'
 
 
 # ---------------------------------------------------------------------------
@@ -910,11 +1113,11 @@ class TestDeriveVerifyPlanMergeBreadth:
 # pairings, which exercise the keyword-absent and keyword-in-a-later-segment
 # rejections.
 _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
-    *((f'{module}-lint', cmd) for module, cmd in _MODULE_LINT_COMMANDS.items()),
-    ('fm-lint', _FM_LINT_COMMAND),
-    ('root-lint', _ROOT_LINT_COMMAND),
-    ('root-type-check', _ROOT_TYPE_CHECK_COMMAND),
-    ('root-test', _ROOT_TEST_COMMAND),
+    *((f'{module}-lint', cmd) for module, cmd in MODULE_LINT_COMMANDS.items()),
+    ('fm-lint', FM_LINT_COMMAND),
+    ('root-lint', ROOT_LINT_COMMAND),
+    ('root-type-check', ROOT_TYPE_CHECK_COMMAND),
+    ('root-test', ROOT_TEST_COMMAND),
     ('ruff-trailing-value-flag', 'ruff check src/ --select E'),
     ('opaque-mypy', 'mypy src/'),
     ('no-op-true', 'true'),
@@ -965,7 +1168,7 @@ class TestScoperTrailingClausePreservation:
         byte-identically, still pointed at the whole ``fused-memory/tests``
         directory they assert an invariant over.
         """
-        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
@@ -977,15 +1180,16 @@ class TestScoperTrailingClausePreservation:
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
-            assert checker in _FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
+            assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
-        """dark-factory-orchestrator.yaml:50 — the fallback path's own command."""
-        scoped = verify._scope_to_keyword(_ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
+        scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
             ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
         )
 
     def test_trailing_value_flag_still_truncates_at_the_keyword(self):
@@ -1008,22 +1212,33 @@ class TestScoperTrailingClausePreservation:
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
 
-        ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
-        pyright && cd ../orchestrator && npx pyright && cd ../dashboard &&
-        npx pyright``. Preserving that tail would (a) run pyright fully
-        UNSCOPED over two more subprojects, defeating scoping entirely, and
-        (b) break correctness — scoping applies ``strip_cwd``, which removes
-        the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
-        would resolve relative to the worktree ROOT and escape the repo.
+        ``dark-factory-orchestrator.yaml::type_check_command`` is a ``cd <dir>
+        && npx pyright`` sequence over every subproject; its live text is
+        ``ROOT_TYPE_CHECK_COMMAND`` (deliberately not restated here — a
+        hand-copy in prose is exactly the drift ``test_verify_config_corpus.py``
+        exists to prevent, and this docstring's old ``:51`` line-number label
+        is how the previous copy rotted). Preserving that tail would (a) run
+        pyright fully UNSCOPED over every remaining subproject, defeating
+        scoping entirely, and (b) break correctness — scoping applies
+        ``strip_cwd``, which removes the leading ``cd fused-memory``, so a
+        surviving ``cd ../orchestrator`` would resolve relative to the
+        worktree ROOT and escape the repo.
         """
-        scoped = verify._scope_to_keyword(_ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
         assert 'cd ../orchestrator' not in scoped
         assert 'cd ../dashboard' not in scoped
 
     def test_root_test_fan_out_still_truncates(self):
-        """Same hazard for ``dark-factory-orchestrator.yaml:41``'s 8-segment fan-out."""
-        scoped = verify._scope_to_keyword(_ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        """Same hazard for ``dark-factory-orchestrator.yaml::test_command``'s fan-out.
+
+        Labelled by yaml KEY, not line number: the old ``:41`` label pointed at
+        a line the key has long since moved off (it is line 72 today) — the
+        drift that motivated task 3495. ``ROOT_TEST_COMMAND``'s exact text is
+        pinned against the live yaml by ``test_verify_config_corpus.py``, so
+        this docstring names the key and leaves the value to the gate.
+        """
+        scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
@@ -1148,7 +1363,7 @@ class TestTailPreservationAllowlist:
 
     def test_lint_slot_still_preserves_its_sibling_checker(self):
         """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
-        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped is not None
         assert (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
@@ -1227,8 +1442,8 @@ class TestDroppedChainClausesAreLogged:
     # entirely, which is exactly what let it emit at INFO claiming a dropped
     # sibling check when every clause it drops is a pytest fan-out.
     _DROP_CASES = [
-        (_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG),
-        (_ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
+        (ROOT_TYPE_CHECK_COMMAND, 'pyright', 12, logging.DEBUG),
+        (ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
         (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),
@@ -1305,7 +1520,7 @@ class TestDroppedChainClausesAreLogged:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (_FM_LINT_COMMAND, 'ruff check'),
+            (FM_LINT_COMMAND, 'ruff check'),
             ('ruff check src/ --select E', 'ruff check'),
             ('mypy src/ && python3 x.py', 'ruff check'),
             ('true && python3 x.py', 'pytest'),
@@ -1355,11 +1570,11 @@ class TestDroppedChainClausesAreLogged:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
-            (_ROOT_TEST_COMMAND, 'pytest'),
+            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (ROOT_TEST_COMMAND, 'pytest'),
             (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
             (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
-            (_FM_LINT_COMMAND, 'ruff check'),
+            (FM_LINT_COMMAND, 'ruff check'),
             ('ruff check src/ --select E', 'ruff check'),
             ('mypy src/', 'ruff check'),
             ('true', 'pytest'),
@@ -1454,7 +1669,7 @@ class TestReprojectStrChainTail:
 
     @pytest.mark.parametrize(
         'raw',
-        [_ROOT_TYPE_CHECK_COMMAND, _ROOT_TEST_COMMAND],
+        [ROOT_TYPE_CHECK_COMMAND, ROOT_TEST_COMMAND],
         ids=['root-type-check-cd-fan-out', 'root-test-subshell-fan-out'],
     )
     def test_gate_reject_cases_still_no_op(self, raw):
@@ -1489,23 +1704,23 @@ class TestReprojectStrChainTail:
         — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
         file" -> a spurious RED verify on a clean tree.
         """
-        result = verify._reproject_str(_FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
-        assert result == _FM_LINT_COMMAND
+        result = verify._reproject_str(FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        assert result == FM_LINT_COMMAND
         assert 'fused-memory/fused-memory' not in (result or '')
 
     @pytest.mark.parametrize(
         'raw',
         [
-            _FM_LINT_COMMAND,
-            *_MODULE_LINT_COMMANDS.values(),
-            _ROOT_LINT_COMMAND,
-            _ROOT_TYPE_CHECK_COMMAND,
-            _ROOT_TEST_COMMAND,
+            FM_LINT_COMMAND,
+            *MODULE_LINT_COMMANDS.values(),
+            ROOT_LINT_COMMAND,
+            ROOT_TYPE_CHECK_COMMAND,
+            ROOT_TEST_COMMAND,
             'uv run --directory sub pyright src/ && python3 tools/check.py d',
         ],
         ids=[
             'fused-memory-lint',
-            *(f'{module}-lint' for module in _MODULE_LINT_COMMANDS),
+            *(f'{module}-lint' for module in MODULE_LINT_COMMANDS),
             'root-lint',
             'root-type-check-cd-fan-out',
             'root-test-subshell-fan-out',
@@ -1869,7 +2084,7 @@ class TestReverseDependentTestTargets:
 # PlannedRun.scoped_targets: the D3 plan record's scoping provenance (task 3219)
 # ---------------------------------------------------------------------------
 
-# The single-clause counterpart of _MODULE_LINT_COMMANDS' chained shape — the
+# The single-clause counterpart of MODULE_LINT_COMMANDS' chained shape — the
 # UNIFORMITY control for test_unchained_lint_records_the_same_scoped_targets.
 # Nothing in the live configs looks like this today (every subproject chains a
 # sibling checker), which is exactly why the chained path's record loss went
@@ -1892,14 +2107,14 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
     ('real-chained', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_MODULE_LINT_COMMANDS['orchestrator'],
-        type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-        test_command=_ROOT_TEST_COMMAND,
+        lint_command=MODULE_LINT_COMMANDS['orchestrator'],
+        type_check_command=ROOT_TYPE_CHECK_COMMAND,
+        test_command=ROOT_TEST_COMMAND,
     )),
     # The only 3-segment chain in the live configs (two sibling checkers).
     ('fm-three-segment-lint', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_FM_LINT_COMMAND,
+        lint_command=FM_LINT_COMMAND,
         type_check_command='npx pyright',
         test_command='uv run pytest tests/ --timeout=300',
     )),
@@ -1907,7 +2122,7 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # (cmd.targets-populated) control the pre-3219 fixtures were all built from.
     ('root-lint-bare-tools', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_ROOT_LINT_COMMAND,
+        lint_command=ROOT_LINT_COMMAND,
         type_check_command='pyright',
         test_command='pytest',
     )),
@@ -1942,9 +2157,9 @@ _FULL_BREADTH_CONFIG = OrchestratorConfig(
 _BARE_FALLBACK_CONFIG = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
 _REAL_SUITE_FALLBACK_CONFIG = OrchestratorConfig(
     project_root=Path('/fake'),
-    lint_command=_ROOT_LINT_COMMAND,
-    type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-    test_command=_ROOT_TEST_COMMAND,
+    lint_command=ROOT_LINT_COMMAND,
+    type_check_command=ROOT_TYPE_CHECK_COMMAND,
+    test_command=ROOT_TEST_COMMAND,
 )
 
 # The branches derive_verify_plan can take, split by whether a ModuleConfig is
@@ -2002,6 +2217,14 @@ class TestPlanRecordScopedTargets:
     path (_scope_prefix_to_keyword) produces for EVERY subproject — each
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
+
+    The field's contract is "non-empty EXACTLY for FILE_SCOPED", so task
+    3294's widening moved a slot rather than changing the contract: a mixed
+    diff's pytest slot is FULL_SUITE at role='task' and therefore records
+    NOTHING (it narrowed to nothing), while the same slot is still
+    FILE_SCOPED-with-a-record at role='merge'. The parametrised sweep
+    (test_module_path_scoped_targets_nonempty_exactly_for_file_scoped_runs)
+    is what pins the contract itself across both.
     """
 
     def test_chained_lint_records_scoped_targets(self):
@@ -2013,7 +2236,7 @@ class TestPlanRecordScopedTargets:
         two are the actual deliverable: the D3 record can now answer "which
         files was this scoped to?".
         """
-        mc = ModuleConfig(prefix='fused-memory', lint_command=_FM_LINT_COMMAND)
+        mc = ModuleConfig(prefix='fused-memory', lint_command=FM_LINT_COMMAND)
         plan = derive_verify_plan([_FM_TEST_FILE], [mc], None, fake_worktree_reader)
         run = _run_for(plan, 'fused-memory', 'lint:')
         assert run is not None
@@ -2057,32 +2280,58 @@ class TestPlanRecordScopedTargets:
         pyright records the full touched-.py list (``scoped``); pytest
         records only the collectable tests — the two legitimately DIFFER, so
         one shared field per run, not one per plan, is the right shape.
+
+        Task 3294 migrated the ROLE this is exercised at: at role='task' a
+        mixed diff now widens pytest to FULL_SUITE, and a widened slot
+        records NO scoped_targets (it narrowed to nothing), so the differing
+        pair is pinned at role='merge' — where the legacy FILE_SCOPED shape
+        is preserved byte-identically (PRD R4). The task-role half below
+        pins the complementary record: pyright still narrows, pytest does
+        not, and the widened slot's scoped_targets is empty.
         """
         source_file = 'orchestrator/src/orchestrator/some_module.py'
         test_file = 'orchestrator/tests/test_x.py'
         mc = ModuleConfig(
             prefix='orchestrator',
-            type_check_command=_MODULE_LINT_COMMANDS['orchestrator'].replace(
+            type_check_command=MODULE_LINT_COMMANDS['orchestrator'].replace(
                 'ruff check', 'npx pyright',
             ),
             test_command='uv run pytest tests/ --timeout=300',
         )
-        plan = derive_verify_plan(
-            [source_file, test_file], [mc], None, fake_worktree_reader,
+
+        # -- role='merge': both slots FILE_SCOPED, and their records differ. --
+        merge_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='merge',
         )
 
-        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
-        assert pyright_run is not None
-        assert pyright_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert set(pyright_run.scoped_targets) == {source_file, test_file}
+        merge_pyright = _run_for(merge_plan, 'orchestrator', 'pyright:')
+        assert merge_pyright is not None
+        assert merge_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(merge_pyright.scoped_targets) == {source_file, test_file}
 
-        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
-        assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert pytest_run.scoped_targets == (test_file,)
+        merge_pytest = _run_for(merge_plan, 'orchestrator', 'pytest:')
+        assert merge_pytest is not None
+        assert merge_pytest.scope_kind is ScopeKind.FILE_SCOPED
+        assert merge_pytest.scoped_targets == (test_file,)
 
         # The two slots' records legitimately differ — the point of the assertion.
-        assert set(pyright_run.scoped_targets) != set(pytest_run.scoped_targets)
+        assert set(merge_pyright.scoped_targets) != set(merge_pytest.scoped_targets)
+
+        # -- role='task': pyright still narrows; the widened pytest slot
+        # records nothing, because it narrowed to nothing (task 3294). --
+        task_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='task',
+        )
+
+        task_pyright = _run_for(task_plan, 'orchestrator', 'pyright:')
+        assert task_pyright is not None
+        assert task_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(task_pyright.scoped_targets) == {source_file, test_file}
+
+        task_pytest = _run_for(task_plan, 'orchestrator', 'pytest:')
+        assert task_pytest is not None
+        assert task_pytest.scope_kind is ScopeKind.FULL_SUITE
+        assert task_pytest.scoped_targets == ()
 
     def test_full_suite_and_skipped_runs_record_no_scoped_targets(self):
         """The negative half of the invariant: empty is CORRECT, and meaningful.

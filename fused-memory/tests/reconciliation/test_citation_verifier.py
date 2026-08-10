@@ -10,11 +10,23 @@ plan for the full three-way contract (keep / drop+mark / keep+mark).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, call
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from fused_memory.reconciliation.citation_verifier import verify_cited_memories
+from fused_memory.reconciliation.citation_verifier import (
+    X_CITATION_TOMBSTONE_KEY,
+    build_citation_tombstone,
+    find_citation_occurrences,
+    find_live_citation_occurrences,
+    is_concrete_memory_id,
+    repoint_metadata,
+    repoint_task_citations,
+    repoint_tombstone_chain,
+    verify_cited_memories,
+)
 
 
 @pytest.mark.asyncio
@@ -226,3 +238,949 @@ async def test_multiple_findings_processed_independently():
     assert stats['stage1_citations_verified'] == 1
     assert stats['stage1_phantom_citations_dropped'] == 1
     assert stats['stage1_citation_verification_errors'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# find_citation_occurrences — the mechanical all-keys metadata scan (task 3108)
+# --------------------------------------------------------------------------- #
+
+# Two distinct canonical UUIDs that deliberately SHARE an 8-char prefix, so the
+# prefix-collision guard (case g) exercises the truncated-UUID hazard that
+# ``prompts/stage1.py`` warns about at :99-113.
+_DOOMED = '2531b4d8-1111-4aaa-8bbb-000000000001'
+_PREFIX_TWIN = '2531b4d8-2222-4ccc-8ddd-000000000002'
+_SURVIVOR = '9f3ac071-3333-4eee-8fff-000000000003'
+
+
+class TestFindCitationOccurrences:
+    """``find_citation_occurrences`` is a pure recursive scan over ALL keys.
+
+    It exists because incident failure mode (1) was a hand-written enumeration
+    of citation-bearing tasks that found 3 of 8 — the 5 it missed included the
+    pending/dispatchable ones. A key allowlist cannot be trusted, so the scan
+    descends every dict key, every list index and every free-text string.
+    """
+
+    def test_top_level_scalar_value_is_the_uuid(self):
+        """(a) A top-level scalar whose value IS the UUID yields its bare key."""
+        metadata = {'mem0_canonical_entry': _DOOMED}
+
+        assert find_citation_occurrences(metadata, _DOOMED) == ['mem0_canonical_entry']
+
+    def test_uuid_nested_in_a_list_of_dicts_yields_indexed_path(self):
+        """(b) A UUID nested in a list of dicts yields a dotted+indexed path."""
+        metadata = {
+            'x_memory_write_caution': [
+                {'entry': _SURVIVOR, 'note': 'survivor'},
+                {'entry': _DOOMED, 'note': 'doomed'},
+            ],
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == [
+            'x_memory_write_caution[1].entry',
+        ]
+
+    def test_uuid_embedded_as_substring_of_free_text_query(self):
+        """(c) A UUID embedded INSIDE free text is found — the real
+        ``memory_hints.queries[0]`` shape (shared/task_metadata.py:185,193-194)
+        that the incident actually hit."""
+        metadata = {
+            'memory_hints': {
+                'entities': ['MemoryConsolidator'],
+                'queries': [f'see canonical entry {_DOOMED} for the consolidated advice'],
+            },
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == ['memory_hints.queries[0]']
+
+    def test_every_occurrence_in_one_blob_is_returned(self):
+        """(d) Multiple occurrences across unrelated keys are ALL returned."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'entities': [], 'queries': [f'prose about {_DOOMED} here']},
+            'mem0_cluster_entries': [_SURVIVOR, _DOOMED],
+            'unrelated': {'deep': {'deeper': [{'k': _DOOMED}]}},
+        }
+
+        paths = find_citation_occurrences(metadata, _DOOMED)
+
+        assert sorted(paths) == sorted([
+            'mem0_canonical_entry',
+            'memory_hints.queries[0]',
+            'mem0_cluster_entries[1]',
+            'unrelated.deep.deeper[0].k',
+        ])
+
+    def test_absent_uuid_yields_empty_list(self):
+        """(e) A blob that does not cite the id yields no paths."""
+        metadata = {'mem0_canonical_entry': _SURVIVOR, 'memory_hints': {'queries': ['x']}}
+
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+
+    @pytest.mark.parametrize('metadata', [{}, None, 'a string', 42, ['a', 'list']])
+    def test_malformed_or_empty_input_yields_empty_list_without_raising(self, metadata):
+        """(f) ``{}`` / ``None`` / non-dict input returns ``[]`` and never raises."""
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+
+    def test_prefix_twin_uuid_is_not_matched(self):
+        """(g) A DIFFERENT uuid sharing an 8-char prefix is NOT a citation.
+
+        Guards the truncated-prefix hazard: matching on `'2531b4d8'` would
+        falsely repoint an unrelated entry.
+        """
+        metadata = {
+            'mem0_canonical_entry': _PREFIX_TWIN,
+            'memory_hints': {'queries': [f'mentions {_PREFIX_TWIN} only']},
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+
+        # And when BOTH ids are present, only the doomed one is a citation —
+        # the twin is never dragged along by its shared prefix.
+        mixed = {
+            'twin': _PREFIX_TWIN,
+            'doomed': _DOOMED,
+            'prose': f'{_PREFIX_TWIN} and {_DOOMED} are different entries',
+        }
+        assert find_citation_occurrences(mixed, _DOOMED) == ['doomed', 'prose']
+
+
+class TestRepointMetadata:
+    """``repoint_metadata`` rewrites every occurrence to the survivor.
+
+    Pure and deep-copying: the caller's blob is never mutated, so a failed
+    write can never leave a half-rewritten object behind.
+    """
+
+    def test_exact_scalar_occurrence_is_replaced(self):
+        """(a) A scalar whose whole value is the doomed id becomes the survivor."""
+        metadata = {'mem0_canonical_entry': _DOOMED}
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed == {'mem0_canonical_entry': _SURVIVOR}
+        assert count == 1
+
+    def test_free_text_substring_rewritten_with_prose_preserved(self):
+        """(b) An embedded id is rewritten in place; the surrounding prose is
+        preserved verbatim."""
+        metadata = {
+            'memory_hints': {
+                'entities': ['MemoryConsolidator'],
+                'queries': [f'see canonical entry {_DOOMED} for the consolidated advice'],
+            },
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed['memory_hints']['queries'] == [
+            f'see canonical entry {_SURVIVOR} for the consolidated advice',
+        ]
+        assert repointed['memory_hints']['entities'] == ['MemoryConsolidator']
+        assert count == 1
+
+    def test_nested_list_and_dict_occurrences_all_rewritten(self):
+        """(c) Occurrences at every depth are rewritten, not just top-level ones."""
+        metadata = {
+            'x_memory_write_caution': [
+                {'entry': _DOOMED},
+                {'entry': _SURVIVOR},
+            ],
+            'deep': {'deeper': {'deepest': [_DOOMED, 'unrelated']}},
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed['x_memory_write_caution'] == [
+            {'entry': _SURVIVOR},
+            {'entry': _SURVIVOR},
+        ]
+        assert repointed['deep']['deeper']['deepest'] == [_SURVIVOR, 'unrelated']
+        assert count == 2
+
+    def test_count_agrees_with_find_citation_occurrences(self):
+        """(d) The two functions cannot drift: the rewrite count equals the
+        number of paths the scanner reports for the same blob."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'entities': [], 'queries': [f'prose {_DOOMED} prose']},
+            'mem0_cluster_entries': [_SURVIVOR, _DOOMED],
+            'unrelated': {'deep': [{'k': _DOOMED}]},
+        }
+
+        paths = find_citation_occurrences(metadata, _DOOMED)
+        _, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert count == len(paths) == 4
+
+    def test_input_metadata_is_not_mutated(self):
+        """(e) Deep-copy semantics — the caller's object still cites the doomed id."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'queries': [f'prose {_DOOMED}']},
+        }
+
+        repointed, _ = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert metadata['mem0_canonical_entry'] == _DOOMED
+        assert metadata['memory_hints']['queries'] == [f'prose {_DOOMED}']
+        # ...and the returned blob is a genuinely separate object graph.
+        assert repointed['memory_hints'] is not metadata['memory_hints']
+
+    def test_absent_uuid_leaves_blob_unchanged(self):
+        """(f) Nothing to repoint -> an equal blob and a zero count."""
+        metadata = {'mem0_canonical_entry': _SURVIVOR, 'memory_hints': {'queries': ['x']}}
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed == metadata
+        assert count == 0
+
+    def test_unrelated_keys_and_values_are_identical_afterwards(self):
+        """(g) Everything that is not a citation round-trips byte-identically,
+        including non-string scalars the walk must not coerce."""
+        metadata = {
+            'cited': _DOOMED,
+            'priority': 'high',
+            'attempts': 3,
+            'flag': True,
+            'nothing': None,
+            'ratio': 0.5,
+            'nested': {'list': ['a', 'b'], 'twin': _PREFIX_TWIN},
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert count == 1
+        assert repointed['cited'] == _SURVIVOR
+        untouched = {k: v for k, v in repointed.items() if k != 'cited'}
+        assert untouched == {k: v for k, v in metadata.items() if k != 'cited'}
+        # The prefix twin is emphatically not collateral damage.
+        assert repointed['nested']['twin'] == _PREFIX_TWIN
+
+    def test_empty_old_id_copies_without_corrupting_any_string(self):
+        """(h) An empty ``old_id`` must short-circuit BEFORE the rewrite path.
+
+        ``''.replace('', x)`` inserts ``x`` between every character, so routing
+        a degenerate id into the rewrite would silently mangle every string in
+        the blob while still reporting ``count == 0`` — a caller trusting the
+        count would write the corrupted blob back. This is the silent
+        corruption the guard exists to prevent.
+        """
+        metadata: dict[str, Any] = {'a': 'hello', 'b': {'c': 'world'}, 'd': ['e', 7]}
+        original = {'a': 'hello', 'b': {'c': 'world'}, 'd': ['e', 7]}
+
+        repointed, count = repoint_metadata(metadata, '', _SURVIVOR)
+
+        assert count == 0
+        assert repointed == original
+        assert metadata == original
+        # Equal but not an alias — the deep-copy contract still holds.
+        assert repointed is not metadata
+        assert repointed['b'] is not metadata['b']
+        assert repointed['d'] is not metadata['d']
+
+    def test_non_str_old_id_returns_copy_rather_than_raising(self):
+        """(i) A non-string ``old_id`` returns a copy with a zero count.
+
+        Matches ``find_citation_occurrences``, which returns ``[]`` rather than
+        raising on a malformed id; previously this leaked a bare ``TypeError``
+        from ``None in node``.
+        """
+        metadata: dict[str, Any] = {'a': 'hello', 'b': {'c': 'world'}}
+        original = {'a': 'hello', 'b': {'c': 'world'}}
+
+        # Annotated ``list[Any]`` because these deliberately violate the
+        # ``old_id: str`` signature: the guard is a RUNTIME defence against a
+        # malformed id reaching the sweep from unvalidated task metadata, so
+        # the test must pass exactly the values the annotation forbids.
+        bad_ids: list[Any] = [None, 42, ['not', 'an', 'id']]
+
+        for bad_id in bad_ids:
+            repointed, count = repoint_metadata(metadata, bad_id, _SURVIVOR)
+
+            assert count == 0
+            assert repointed == original
+            assert repointed is not metadata
+            assert repointed['b'] is not metadata['b']
+        assert metadata == original
+
+
+# The literal string Stage 2 wrote as a "correction" during the incident.
+# Running that query live returned only superseded cluster members and routed
+# dispatch straight back into the contradictory advice consolidation existed
+# to collapse. It must never be accepted as a forwarding pointer.
+_INCIDENT_SEARCH_INSTRUCTION = 're-derive the current canonical entry via search(query=...)'
+
+
+class TestConcreteReplacementPointer:
+    """A forwarding pointer is only valid if it is a concrete id.
+
+    This is the mechanical guard against incident failure mode (2): UUID-shape
+    is a hard precondition of the tombstone builder, not advice in a prompt.
+    """
+
+    def test_canonical_uuid_is_concrete(self):
+        """(a) A canonical 36-char UUID is a concrete pointer."""
+        assert is_concrete_memory_id(_SURVIVOR) is True
+        assert is_concrete_memory_id(_DOOMED) is True
+
+    def test_incident_search_instruction_is_not_concrete(self):
+        """(b) The incident's re-derive-via-search prose is NOT a pointer."""
+        assert is_concrete_memory_id(_INCIDENT_SEARCH_INSTRUCTION) is False
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            _SURVIVOR[:8],          # truncated 8-char prefix
+            '',                     # empty
+            '   ',                  # whitespace
+            None,                   # missing
+            12345,                  # non-str
+            ['a-uuid'],             # non-str container
+            _SURVIVOR + 'x',        # 37 chars
+            _SURVIVOR[:-1],         # 35 chars
+            'ZZZZZZZZ-3333-4eee-8fff-000000000003',  # non-hex
+        ],
+    )
+    def test_non_uuid_values_are_not_concrete(self, value):
+        """(c) Prefixes, empties, None, non-strs and malformed UUIDs are rejected."""
+        assert is_concrete_memory_id(value) is False
+
+    def test_trailing_newline_is_not_concrete(self):
+        """(c') A canonical UUID with a trailing newline is NOT a pointer.
+
+        The anchored `^...$` regex this predicate used to apply with `.match()`
+        ACCEPTED it, because Python's `$` matches immediately before a trailing
+        newline. That mattered here more than anywhere: this is the delete-side
+        guard on `replacement_memory_id`, so such a value would be written into
+        every repointed citation and then resolve to nothing — stranding exactly
+        the citations the repoint gate exists to protect (task 3132).
+        """
+        assert is_concrete_memory_id(_SURVIVOR + '\n') is False
+
+    def test_tombstone_refuses_a_trailing_newline_replacement(self):
+        """(e') ...and the tombstone builder refuses it too."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=_SURVIVOR + '\n',
+                paths=['mem0_canonical_entry'],
+                run_id='run-abc',
+            )
+
+    def test_tombstone_names_both_ids_paths_and_run(self):
+        """(d) The tombstone record preserves the old->new mapping explicitly."""
+        record = build_citation_tombstone(
+            superseded_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            paths=['mem0_canonical_entry', 'memory_hints.queries[0]'],
+            run_id='run-abc',
+        )
+
+        assert record['superseded_memory_id'] == _DOOMED
+        assert record['replacement_memory_id'] == _SURVIVOR
+        assert record['paths'] == ['mem0_canonical_entry', 'memory_hints.queries[0]']
+        assert record['run_id'] == 'run-abc'
+
+    def test_tombstone_refuses_a_search_instruction_replacement(self):
+        """(e) A search instruction can never become a forwarding pointer."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=_INCIDENT_SEARCH_INSTRUCTION,
+                paths=['mem0_canonical_entry'],
+                run_id='run-abc',
+            )
+
+    @pytest.mark.parametrize('bad', [_SURVIVOR[:8], '', None, 12345])
+    def test_tombstone_refuses_any_non_concrete_replacement(self, bad):
+        """(e) ...and the same refusal covers every non-concrete shape."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=bad,
+                paths=[],
+                run_id='run-abc',
+            )
+
+
+# --------------------------------------------------------------------------- #
+# repoint_task_citations — the pre-delete task-DB sweep (task 3108)
+# --------------------------------------------------------------------------- #
+
+_RECON_AGENT_ID = 'recon-stage-memory_consolidator'
+
+# The 7-member non-terminal set (shared.task_statuses.ACTIVE). The incident's
+# missed tasks were PENDING — the ones that were still dispatchable — so the
+# sweep must cover every one of these, not just in-progress.
+_NON_TERMINAL_STATUSES = [
+    'pending',
+    'in-progress',
+    'blocked',
+    'deferred',
+    'review',
+    'merge-deferred',
+    'infra-hold',
+]
+
+
+def _make_task_interceptor(tasks, update_result=None):
+    """Build a fake TaskInterceptor with EXPLICIT AsyncMock children.
+
+    ``get_tasks``/``update_task`` must be declared rather than left as
+    MagicMock auto-attributes: tests/test_check_bare_magicmock_config.py and
+    tests/test_check_asyncmock_assertion_style.py lint for exactly that.
+    """
+    interceptor = MagicMock()
+    interceptor.get_tasks = AsyncMock(return_value={'tasks': tasks})
+    interceptor.update_task = AsyncMock(
+        return_value=update_result if update_result is not None else {'success': True},
+    )
+    return interceptor
+
+
+def _task(task_id, status, metadata):
+    return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
+
+
+class TestRepointTaskCitations:
+    """The sweep repoints live pointers and REPORTS terminal ones."""
+
+    @pytest.mark.asyncio
+    async def test_pending_task_is_repointed_through_the_interceptor(self):
+        """(a) A pending citer is rewritten via a single merge-mode write."""
+        interceptor = _make_task_interceptor([
+            _task('101', 'pending', {'mem0_canonical_entry': _DOOMED, 'priority': 'high'}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor,
+            '/tmp/root',
+            memory_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            run_id='run-abc',
+        )
+
+        interceptor.get_tasks.assert_awaited_once_with('/tmp/root')
+        interceptor.update_task.assert_awaited_once()
+        kwargs = interceptor.update_task.call_args[1]
+
+        # Merge mode is mandatory: 'replace' would clobber the whole blob and
+        # 'additive' is scalar-collision OLD-wins so it structurally cannot
+        # overwrite a citation. A bare append=False write is rejected outright
+        # by the backend after the task-2180 metadata-wipe incident.
+        assert kwargs['metadata_mode'] == 'merge'
+        assert kwargs['agent_id'] == _RECON_AGENT_ID
+        assert kwargs['task_id'] == '101'
+        assert kwargs['project_root'] == '/tmp/root'
+
+        # The payload is a JSON STRING, per the update_task metadata contract.
+        assert isinstance(kwargs['metadata'], str)
+        payload = json.loads(kwargs['metadata'])
+
+        assert payload['mem0_canonical_entry'] == _SURVIVOR
+        tombstones = payload['x_memory_citation_tombstones']
+        assert len(tombstones) == 1
+        assert tombstones[0]['superseded_memory_id'] == _DOOMED
+        assert tombstones[0]['replacement_memory_id'] == _SURVIVOR
+        assert tombstones[0]['paths'] == ['mem0_canonical_entry']
+        assert tombstones[0]['run_id'] == 'run-abc'
+
+        assert stats['stage1_citations_repointed'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 1
+        assert stats['stage1_citation_repoint_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_nested_repoint_carries_the_whole_top_level_key(self):
+        """(a2) merge is SHALLOW last-write-wins (tools.py:4984-4985), so
+        repointing memory_hints.queries[0] must resend the ENTIRE memory_hints
+        value — a partial nested fragment would wipe its siblings."""
+        interceptor = _make_task_interceptor([
+            _task('102', 'pending', {
+                'memory_hints': {
+                    'entities': ['MemoryConsolidator', 'CitationVerifier'],
+                    'queries': [
+                        f'canonical advice {_DOOMED}',
+                        'an unrelated second query',
+                    ],
+                },
+                'priority': 'high',
+            }),
+        ])
+
+        await repoint_task_citations(
+            interceptor,
+            '/tmp/root',
+            memory_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            run_id='run-abc',
+        )
+
+        payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
+
+        # The whole memory_hints value travels, siblings intact.
+        assert payload['memory_hints'] == {
+            'entities': ['MemoryConsolidator', 'CitationVerifier'],
+            'queries': [
+                f'canonical advice {_SURVIVOR}',
+                'an unrelated second query',
+            ],
+        }
+        # Untouched top-level keys are NOT resent (merge preserves omitted keys).
+        assert 'priority' not in payload
+
+    @pytest.mark.asyncio
+    async def test_every_non_terminal_status_is_scanned(self):
+        """(b) All 7 non-terminal statuses are repointed — the incident's
+        missed tasks were pending, not in-progress."""
+        tasks = [
+            _task(str(200 + i), status, {'cited': _DOOMED})
+            for i, status in enumerate(_NON_TERMINAL_STATUSES)
+        ]
+        interceptor = _make_task_interceptor(tasks)
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert interceptor.update_task.await_count == len(_NON_TERMINAL_STATUSES)
+        written_ids = {c[1]['task_id'] for c in interceptor.update_task.call_args_list}
+        assert written_ids == {str(200 + i) for i in range(len(_NON_TERMINAL_STATUSES))}
+        assert stats['stage1_citation_tasks_repointed'] == len(_NON_TERMINAL_STATUSES)
+
+    @pytest.mark.asyncio
+    async def test_terminal_tasks_are_reported_never_written(self):
+        """(c) done/cancelled citers are surfaced, not rewritten — rewriting a
+        done task's record would falsify history, and recon_write_policy Gate 1
+        would refuse it anyway."""
+        interceptor = _make_task_interceptor([
+            _task('301', 'done', {'cited': _DOOMED}),
+            _task('302', 'cancelled', {'memory_hints': {'queries': [f'x {_DOOMED}']}}),
+            _task('303', 'pending', {'cited': _DOOMED}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        # Only the pending task was written.
+        interceptor.update_task.assert_awaited_once()
+        assert interceptor.update_task.call_args[1]['task_id'] == '303'
+
+        reported = {r['task_id']: r for r in stats['terminal_citations']}
+        assert set(reported) == {'301', '302'}
+        assert reported['301']['status'] == 'done'
+        assert reported['301']['paths'] == ['cited']
+        assert reported['302']['status'] == 'cancelled'
+        assert reported['302']['paths'] == ['memory_hints.queries[0]']
+        assert stats['stage1_terminal_citations_reported'] == 2
+
+    @pytest.mark.asyncio
+    async def test_tasks_without_the_uuid_are_untouched(self):
+        """(d) Non-citing tasks are scanned but never written."""
+        interceptor = _make_task_interceptor([
+            _task('401', 'pending', {'cited': _SURVIVOR}),
+            _task('402', 'pending', {'memory_hints': {'queries': ['nothing relevant']}}),
+            _task('403', 'pending', None),
+            _task('404', 'pending', {}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        interceptor.update_task.assert_not_awaited()
+        assert stats['stage1_citation_tasks_scanned'] == 4
+        assert stats['stage1_citation_tasks_repointed'] == 0
+        assert stats['terminal_citations'] == []
+        assert stats['unrepointed'] == []
+
+    @pytest.mark.asyncio
+    async def test_rejected_write_is_counted_and_listed_not_raised(self):
+        """(e) Interceptor gates REFUSE BY RETURNING a {'success': False}
+        dict (recon_write_policy.py:309), never by raising — so the failure
+        must be read from the response and tallied, not caught."""
+        interceptor = _make_task_interceptor(
+            [_task('501', 'pending', {'cited': _DOOMED})],
+            update_result={
+                'success': False,
+                'error': 'recon-stage write to terminal task refused',
+                'error_type': 'ReconTerminalWriteRejected',
+            },
+        )
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert stats['stage1_citation_repoint_failures'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 0
+        assert len(stats['unrepointed']) == 1
+        assert stats['unrepointed'][0]['task_id'] == '501'
+        assert stats['unrepointed'][0]['paths'] == ['cited']
+
+    @pytest.mark.asyncio
+    async def test_write_raising_is_tallied_and_the_sweep_continues(self):
+        """(e) A raised per-task write error is tallied too, and does not
+        abandon the remaining citers."""
+        interceptor = _make_task_interceptor([
+            _task('601', 'pending', {'cited': _DOOMED}),
+            _task('602', 'pending', {'cited': _DOOMED}),
+        ])
+
+        async def _update(**kwargs):
+            if kwargs['task_id'] == '601':
+                raise RuntimeError('backend exploded')
+            return {'success': True}
+
+        interceptor.update_task = AsyncMock(side_effect=_update)
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert stats['stage1_citation_repoint_failures'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 1
+        assert [u['task_id'] for u in stats['unrepointed']] == ['601']
+
+    @pytest.mark.asyncio
+    async def test_stats_shape_is_complete_on_the_no_occurrences_path(self):
+        """(f) Every key is present on EVERY path, so a consumer never has to
+        guard a missing counter."""
+        interceptor = _make_task_interceptor([])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert set(stats) == {
+            'stage1_citation_tasks_scanned',
+            'stage1_citations_repointed',
+            'stage1_citation_tasks_repointed',
+            'stage1_citation_repoint_failures',
+            'stage1_terminal_citations_reported',
+            'terminal_citations',
+            'unrepointed',
+        }
+        assert stats['stage1_citation_tasks_scanned'] == 0
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_failure_propagates_so_the_caller_can_fail_closed(self):
+        """(g) The BULK read failing means 'unknown', and unknown must not be
+        treated as 'no citations' — it propagates so the delete-side guard can
+        refuse rather than destroy."""
+        interceptor = _make_task_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+
+        with pytest.raises(RuntimeError, match='task db unreachable'):
+            await repoint_task_citations(
+                interceptor, '/tmp/root',
+                memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+            )
+
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_tombstones_are_appended_to_not_replaced(self):
+        """A prior forwarding record is retained (merge overwrites the key
+        wholesale, so the existing list must be resent) — and its now-stale
+        destination is transitively repointed.
+
+        The prior record forwarded ``A -> _DOOMED``. ``_DOOMED`` is the entry
+        being deleted, so leaving that record verbatim would park a dangling
+        pointer in a field literally named ``replacement_memory_id`` — the
+        exact harm this sweep exists to prevent, merely relocated. Repointing
+        it to the survivor keeps the chain resolvable; the appended record
+        preserves the ``_DOOMED -> _SURVIVOR`` hop that was collapsed.
+        """
+        prior_superseded = 'aaaaaaaa-0000-4000-8000-000000000000'
+        prior = {
+            'superseded_memory_id': prior_superseded,
+            'replacement_memory_id': _DOOMED,
+            'paths': ['cited'],
+            'run_id': 'run-earlier',
+        }
+        interceptor = _make_task_interceptor([
+            _task('701', 'pending', {
+                'cited': _DOOMED,
+                'x_memory_citation_tombstones': [prior],
+            }),
+        ])
+
+        await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
+        tombstones = payload['x_memory_citation_tombstones']
+        assert len(tombstones) == 2
+
+        # The prior record is retained and its provenance is intact — what A
+        # was superseded FROM never changes...
+        assert tombstones[0]['superseded_memory_id'] == prior_superseded
+        assert tombstones[0]['paths'] == ['cited']
+        assert tombstones[0]['run_id'] == 'run-earlier'
+        # ...but its destination now resolves, instead of pointing at the entry
+        # this very call is about to delete.
+        assert tombstones[0]['replacement_memory_id'] == _SURVIVOR
+
+        # The collapsed hop is recorded explicitly by the appended record.
+        assert tombstones[1]['superseded_memory_id'] == _DOOMED
+        assert tombstones[1]['replacement_memory_id'] == _SURVIVOR
+        assert tombstones[1]['run_id'] == 'run-abc'
+
+        # Net effect: no surviving pointer anywhere addresses the deleted id
+        # EXCEPT the explicitly-labelled superseded_memory_id slot.
+        assert find_citation_occurrences(payload, _DOOMED) == [
+            'x_memory_citation_tombstones[1].superseded_memory_id',
+        ]
+
+
+# --------------------------------------------------------------------------- #
+# The tombstone ledger is PROVENANCE, never a live pointer (task 3108, review 1)
+# --------------------------------------------------------------------------- #
+
+
+def _apply_merge(
+    original: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Simulate the backend's SHALLOW last-write-wins ``metadata_mode='merge'``.
+
+    Supplied top-level keys overwrite wholesale; omitted keys are preserved
+    (``tools.py:4982-5002``). Used to build the "metadata as it exists on the
+    second pass" fixture without inventing a different merge semantics than the
+    one the sweep actually writes against.
+
+    Annotated ``dict[str, Any]`` because a merged blob is heterogeneous: the
+    tombstone ledger under ``X_CITATION_TOMBSTONE_KEY`` is a ``list[dict]``,
+    not the ``str`` an all-string caller literal would otherwise infer.
+    """
+    merged = dict(original)
+    merged.update(payload)
+    return merged
+
+
+class TestTombstoneLedgerIsNotACitation:
+    """``x_memory_citation_tombstones`` is excluded from live-citation
+    detection and from the wholesale rewrite.
+
+    A tombstone's ``superseded_memory_id`` names the deleted id BY DESIGN —
+    that is its entire purpose. Scanning the whole blob therefore makes an
+    already-repointed task re-register as a live citer on every later pass, and
+    the damage compounds on precisely the retry path
+    ``_CITATION_REPOINT_FAILED_HINT`` advertises as idempotent: pass 2 would
+    rewrite ``superseded_memory_id`` to the survivor (destroying the forwarding
+    provenance), append a second record whose ``paths`` names tombstone
+    internals rather than any real citation, and inflate
+    ``stage1_citations_repointed`` — unbounded on every further retry.
+    """
+
+    def test_find_live_excludes_the_tombstone_ledger(self):
+        """The live scan skips the ledger while the raw scan still reports it.
+
+        The exclusion belongs to the CALLER, not to the generic scanner:
+        ``find_citation_occurrences`` stays a mechanical all-keys walk (see
+        ``TestFindCitationOccurrences`` and the closing assertion of
+        ``test_existing_tombstones_are_appended_to_not_replaced``, both of which
+        must keep passing verbatim).
+        """
+        metadata = {
+            'cited': _DOOMED,
+            X_CITATION_TOMBSTONE_KEY: [
+                {
+                    'superseded_memory_id': _DOOMED,
+                    'replacement_memory_id': _SURVIVOR,
+                    'paths': ['cited'],
+                    'run_id': 'run-1',
+                },
+            ],
+        }
+
+        assert find_live_citation_occurrences(metadata, _DOOMED) == ['cited']
+        # The raw scanner is unchanged and still sees the ledger occurrence.
+        assert find_citation_occurrences(metadata, _DOOMED) == [
+            'cited',
+            'x_memory_citation_tombstones[0].superseded_memory_id',
+        ]
+
+    def test_find_live_returns_empty_when_only_the_ledger_mentions_the_id(self):
+        """A fully-repointed task is NOT a citer, so it triggers no write."""
+        metadata = {
+            'cited': _SURVIVOR,
+            X_CITATION_TOMBSTONE_KEY: [
+                {
+                    'superseded_memory_id': _DOOMED,
+                    'replacement_memory_id': _SURVIVOR,
+                    'paths': ['cited'],
+                    'run_id': 'run-1',
+                },
+            ],
+        }
+
+        assert find_live_citation_occurrences(metadata, _DOOMED) == []
+
+    @pytest.mark.parametrize('metadata', [None, {}, 'a string', 42, [_DOOMED]])
+    def test_find_live_delegates_unchanged_on_malformed_input(self, metadata):
+        """Non-dict / empty blobs behave exactly as the raw scanner does."""
+        assert find_live_citation_occurrences(metadata, _DOOMED) == []
+
+    def test_repoint_tombstone_chain_rewrites_only_the_destination_slot(self):
+        """Only ``replacement_memory_id`` moves; the rest is byte-identical.
+
+        ``superseded_memory_id`` is the one field that MUST keep naming a dead
+        id, so a wholesale rewrite over the ledger is not merely wasteful — it
+        destroys the record's only reason to exist.
+        """
+        prior_superseded = 'aaaaaaaa-0000-4000-8000-000000000000'
+        records = [
+            {
+                'superseded_memory_id': prior_superseded,
+                'replacement_memory_id': _DOOMED,
+                'paths': ['cited'],
+                'run_id': 'run-earlier',
+            },
+            {
+                'superseded_memory_id': _DOOMED,
+                'replacement_memory_id': _SURVIVOR,
+                'paths': ['other'],
+                'run_id': 'run-1',
+            },
+        ]
+
+        out = repoint_tombstone_chain(records, _DOOMED, _SURVIVOR)
+
+        # Stale destination forwarded...
+        assert out[0]['replacement_memory_id'] == _SURVIVOR
+        # ...everything else untouched, including the dead id it supersedes.
+        assert out[0]['superseded_memory_id'] == prior_superseded
+        assert out[0]['paths'] == ['cited']
+        assert out[0]['run_id'] == 'run-earlier'
+        # A record already naming the deleted id in its superseded slot keeps it.
+        assert out[1] == records[1]
+        # Pure: the caller's list/records are not mutated.
+        assert records[0]['replacement_memory_id'] == _DOOMED
+
+    @pytest.mark.asyncio
+    async def test_already_repointed_task_issues_no_write(self):
+        """(a) IDEMPOTENCY — pass 2 over pass 1's exact output is a no-op.
+
+        This is the retry ``_CITATION_REPOINT_FAILED_HINT`` instructs callers to
+        perform ("already-repointed tasks are idempotent on a second pass").
+        """
+        interceptor = _make_task_interceptor([
+            _task('801', 'pending', {
+                'cited': _SURVIVOR,
+                X_CITATION_TOMBSTONE_KEY: [
+                    {
+                        'superseded_memory_id': _DOOMED,
+                        'replacement_memory_id': _SURVIVOR,
+                        'paths': ['cited'],
+                        'run_id': 'run-1',
+                    },
+                ],
+            }),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-2',
+        )
+
+        interceptor.update_task.assert_not_awaited()
+        assert stats['stage1_citation_tasks_repointed'] == 0
+        assert stats['stage1_citations_repointed'] == 0
+        assert stats['stage1_citation_repoint_failures'] == 0
+        assert stats['stage1_citation_tasks_scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_passes_preserve_provenance_and_do_not_grow_the_ledger(self):
+        """(b)+(c) Two consecutive sweeps over an evolving blob never produce a
+        ``SURVIVOR -> SURVIVOR`` record and never append a second one."""
+        original = {'cited': _DOOMED, 'priority': 'high'}
+        interceptor = _make_task_interceptor([_task('802', 'pending', original)])
+
+        await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-1',
+        )
+        payload_1 = json.loads(interceptor.update_task.call_args[1]['metadata'])
+        after_1 = _apply_merge(original, payload_1)
+
+        assert after_1['cited'] == _SURVIVOR
+        assert len(after_1[X_CITATION_TOMBSTONE_KEY]) == 1
+        assert after_1[X_CITATION_TOMBSTONE_KEY][0]['superseded_memory_id'] == _DOOMED
+
+        # Pass 2 — the same delete retried against the post-pass-1 metadata.
+        interceptor_2 = _make_task_interceptor([_task('802', 'pending', after_1)])
+        stats_2 = await repoint_task_citations(
+            interceptor_2, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-2',
+        )
+
+        interceptor_2.update_task.assert_not_awaited()
+        assert stats_2['stage1_citations_repointed'] == 0
+
+        # (b) Provenance survives: the record still names which id died.
+        record = after_1[X_CITATION_TOMBSTONE_KEY][0]
+        assert record['superseded_memory_id'] == _DOOMED
+        assert record['replacement_memory_id'] == _SURVIVOR
+        assert record['superseded_memory_id'] != record['replacement_memory_id']
+        # (c) And the ledger did not grow.
+        assert len(after_1[X_CITATION_TOMBSTONE_KEY]) == 1
+
+    @pytest.mark.asyncio
+    async def test_transitive_destination_repoint_still_happens(self):
+        """(d)+(e)+(f) A stale forwarding DESTINATION is still repaired, its
+        ``superseded_memory_id`` is left alone, the count reflects only the live
+        citation, and the appended record's ``paths`` names no ledger internals.
+        """
+        prior_superseded = 'aaaaaaaa-0000-4000-8000-000000000000'
+        interceptor = _make_task_interceptor([
+            _task('803', 'pending', {
+                'cited': _DOOMED,
+                X_CITATION_TOMBSTONE_KEY: [
+                    {
+                        'superseded_memory_id': prior_superseded,
+                        'replacement_memory_id': _DOOMED,
+                        'paths': ['cited'],
+                        'run_id': 'run-earlier',
+                    },
+                ],
+            }),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
+        tombstones = payload[X_CITATION_TOMBSTONE_KEY]
+        assert len(tombstones) == 2
+
+        # (d) The stale destination now resolves...
+        assert tombstones[0]['replacement_memory_id'] == _SURVIVOR
+        # ...while the id it superseded is untouched.
+        assert tombstones[0]['superseded_memory_id'] == prior_superseded
+        assert tombstones[0]['paths'] == ['cited']
+
+        # (e) Only the LIVE citation is counted — a transitive ledger rewrite is
+        # bookkeeping, not a repointed citation.
+        assert stats['stage1_citations_repointed'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 1
+
+        # (f) The appended record's paths name only live citation sites.
+        assert tombstones[1]['superseded_memory_id'] == _DOOMED
+        assert tombstones[1]['paths'] == ['cited']
+        assert not any(
+            p.startswith(X_CITATION_TOMBSTONE_KEY) for p in tombstones[1]['paths']
+        )

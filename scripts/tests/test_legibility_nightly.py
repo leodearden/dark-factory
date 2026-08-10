@@ -17,21 +17,22 @@ import gzip
 import json
 import logging
 import subprocess
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
-
 from legibility import (
     census_trigger,
     codebook,
-    config as config_mod,
     digest,
     nightly,
     trickle_state,
 )
+from legibility import (
+    config as config_mod,
+)
 from legibility.config import load_config
-
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -97,8 +98,17 @@ def _write_config(
 
 def _encode_cwd(cwd: str) -> str:
     """Mirror inventory.encode_cwd (kept independent -- this is fixture code,
-    not a reuse of the module under test)."""
-    return cwd.replace('/', '-').replace('.', '-')
+    not a reuse of the module under test).
+
+    '/', '.' and '_' all map to '-'. "Independent" means SEPARATELY WRITTEN,
+    not unchecked: test_legibility_inventory.py's TestEncoderLockstep pins
+    this copy to the canonical (orchestrator.session_registry.encode_cwd) and
+    to real on-disk dir names (task 3272, which found this fixture and three
+    production copies all missing the '_' rule at once). Deliberately does
+    NOT import the canonical -- a fixture that calls the code under test
+    moves in lockstep with its bugs, which is exactly how that divergence
+    survived a green suite."""
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def _write_transcript(
@@ -255,7 +265,7 @@ def test_select_scored_records_includes_matching_session(tmp_path):
 def test_select_scored_records_reads_gz_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
-    # -> gz-read (_iter_json_lines) -> classify (encoded worktree parent dir).
+    # -> gz-read (iter_json_lines) -> classify (encoded worktree parent dir).
     # An archived role transcript at the production nested layout
     # <archive>/<task_id>/<enc>/<sid>.jsonl.gz is enumerated ALONGSIDE an
     # (empty) ~/.claude/projects tree and classified 'orchestrated-task'.
@@ -610,7 +620,7 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
         poster=lambda url, envelope: None,
@@ -824,24 +834,22 @@ class _FakeHttpxResponse:
         pass
 
 
-def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy (httpx is not importable in
-    this test env), so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
+    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
+    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable independent of any live listener."""
     captured_kwargs = {}
-
-    fake_httpx = type(sys)('httpx')
 
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse()
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    install_fake_httpx(_fake_post)
 
     nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
 
@@ -1050,7 +1058,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     before_log = subprocess.run(
@@ -1157,7 +1165,7 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1192,7 +1200,7 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1268,7 +1276,7 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1349,7 +1357,7 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1397,7 +1405,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A single selected session whose invoke fails to parse -> 1/1 failed ->
@@ -1461,7 +1469,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid matching invoke -> the merge/dump genuinely happens; only the
@@ -1526,7 +1534,7 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid-but-empty judgment ("coded fine, found nothing") -- a genuine
@@ -1602,7 +1610,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         coder_calls.append(prompt)
         return 'not valid json'
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     result = nightly.run_nightly(
@@ -1947,11 +1955,14 @@ class TestRunNightlyRecordsTrickleState:
         else:
             projects_root.mkdir(parents=True, exist_ok=True)
 
-        kwargs = dict(
+        # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
+        # callables, None) whose inferred value union would otherwise be
+        # re-reported once per union member at the run_nightly(**kwargs) call.
+        kwargs: dict[str, Any] = dict(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=invoke,
             status_fetcher=None,
             poster=poster if poster is not None else (lambda url, envelope: None),
@@ -2157,7 +2168,7 @@ class _NightRunner:
             config_path=self.config_path,
             projects_root=self.projects_root,
             target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),

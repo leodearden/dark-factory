@@ -169,11 +169,13 @@ def _cluster(
     topic_id: str = 'topic-a',
     phrases: list[str] | None = None,
     min_phrase_hits: int = 2,
+    sufficient_phrases: list[str] | None = None,
 ) -> ProceduralTopicCluster:
     return ProceduralTopicCluster(
         topic_id=topic_id,
         phrases=phrases if phrases is not None else ['alpha', 'beta', 'gamma'],
         min_phrase_hits=min_phrase_hits,
+        sufficient_phrases=sufficient_phrases if sufficient_phrases is not None else [],
     )
 
 
@@ -225,6 +227,150 @@ class TestFindMatchingTopicCluster:
     def test_whitespace_content_returns_none(self):
         cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=1)
         assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+
+class TestFindMatchingTopicClusterSufficientPhrases:
+    """A single DECLARED-sufficient phrase qualifies its cluster alone (task 3054).
+
+    Count-only matching cannot block a write that straddles several
+    clusters at one hit each; a phrase distinctive enough that it cannot
+    appear incidentally should not have to wait for a second one.
+    """
+
+    def test_single_sufficient_phrase_matches_below_min_phrase_hits(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+
+    def test_sufficient_match_still_returns_the_two_tuple_shape(self):
+        """The return shape is load-bearing: server/tools.py destructures a 2-tuple.
+
+        ``matched_phrases`` is deliberately SHORTER than ``min_phrase_hits``
+        here -- it reports exactly what fired, which is the one sufficient
+        phrase.
+        """
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('only alpha here', [cluster])
+        assert match is not None
+        matched_cluster, matched_phrases = match
+        assert matched_cluster.topic_id == cluster.topic_id
+        assert matched_phrases == ['alpha']
+        assert len(matched_phrases) < cluster.min_phrase_hits
+
+    def test_single_non_sufficient_phrase_still_returns_none(self):
+        # 'beta' is a phrase but NOT declared sufficient -- one hit is still
+        # below min_phrase_hits, so the count-only path must still apply.
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('only beta here', [cluster]) is None
+
+    def test_sufficient_matching_is_case_insensitive_and_lowercases(self):
+        # Same convention as test_matching_is_case_insensitive above.
+        cluster = _cluster(
+            phrases=['Alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['ALPHA'],
+        )
+        match = find_matching_topic_cluster('SOME AlPhA content', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha']
+
+    def test_empty_sufficient_phrases_behaves_exactly_as_today(self):
+        cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=2, sufficient_phrases=[])
+        assert find_matching_topic_cluster('only alpha here', [cluster]) is None
+        match = find_matching_topic_cluster('alpha and beta', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['alpha', 'beta']
+
+    def test_count_path_still_qualifies_when_no_sufficient_phrase_hits(self):
+        # Reaching min_phrase_hits on NON-sufficient phrases must still match:
+        # sufficiency is an additional way to qualify, not a replacement.
+        cluster = _cluster(
+            phrases=['alpha', 'beta', 'gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        match = find_matching_topic_cluster('beta and gamma only', [cluster])
+        assert match is not None
+        _, matched_phrases = match
+        assert matched_phrases == ['beta', 'gamma']
+
+    def test_empty_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('', [cluster]) is None
+
+    def test_whitespace_content_returns_none_even_with_sufficient_phrases(self):
+        cluster = _cluster(
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+    def test_earlier_cluster_wins_on_a_sufficient_phrase(self):
+        # First-qualifying-cluster ordering is unchanged by sufficiency.
+        cluster_a = _cluster(
+            topic_id='topic-a',
+            phrases=['alpha', 'beta'],
+            min_phrase_hits=2,
+            sufficient_phrases=['alpha'],
+        )
+        cluster_b = _cluster(topic_id='topic-b', phrases=['alpha', 'delta'], min_phrase_hits=1)
+        match = find_matching_topic_cluster('alpha only', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+
+    def test_earlier_count_match_wins_over_a_later_sufficient_match(self):
+        """The converse precedence, pinned deliberately rather than left incidental.
+
+        Sufficiency decides WHETHER a cluster qualifies, never WHICH
+        qualifying cluster wins: the scan is a single pass in list order, so
+        an earlier cluster reaching ``min_phrase_hits`` on ordinary phrases
+        beats a later cluster whose declared-sufficient phrase also fired.
+        Seed order stays the single priority knob.
+        """
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+        assert match[1] == ['alpha', 'beta']
+
+    def test_reordering_the_same_clusters_hands_the_win_to_the_sufficient_one(self):
+        """Confirms the previous test pins ORDER, not a count-beats-sufficiency rule."""
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_b, cluster_a])
+        assert match is not None
+        assert match[0].topic_id == 'topic-b'
+        assert match[1] == ['gamma']
 
 
 class TestResolveTopicGuardClusters:

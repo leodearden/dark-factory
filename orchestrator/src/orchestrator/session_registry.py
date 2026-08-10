@@ -342,18 +342,34 @@ class DecisionRecord:
         filer doesn't supply one or the record predates this field; ''
         falls back to the scoring defaults.severity weight rather than
         raising or coercing to a recognized value.
+    escalations_dir: the source escalation QUEUE this record's
+        ``escalation_id`` belongs to, stored as a normalized absolute path
+        (see normalize_escalations_dir). Needed because DecisionRecords are
+        FLEET-GLOBAL while an escalation id (``esc-<taskid>-<n>``) is unique
+        only WITHIN one queue, and a single project can run more than one --
+        dark_factory runs ``data/escalations`` and
+        ``data/reconciliation/escalations`` over the same id namespace, so
+        without this second axis the reap-decisions reaper can close one
+        watcher's decision against an unrelated same-named escalation in the
+        other queue (task 3528). Defaults to '' (unknown/legacy -- a record
+        filed before this field existed, or by a caller that didn't supply
+        it), which makes the reaper fall back to project-only scoping.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
-    file may be mutated by TWO different subsystems: a C8 watcher (via
-    update_decision_state) and the C5 cockpit (via set_manual_boost). Both
-    helpers now serialize their read-modify-write span per-decision-id via
+    file may be mutated by SEVERAL different subsystems: a C8 watcher (via
+    update_decision_state), the C5 cockpit (via set_manual_boost), and -- for
+    task 3640's back-fill, running against live records while the watchers
+    are up -- scripts/backfill_decision_queue_stamp.py (via
+    set_decision_escalations_dir). All three helpers serialize their
+    read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
-    1609's escalation_id_lock), so a concurrent state-update and
-    boost-update racing on the same id no longer drops either mutation --
-    each write remains individually atomic AND the read+mutate+write span
-    is now serialized against other callers on the same id. See
-    update_decision_state/set_manual_boost for the caller-facing note.
+    1609's escalation_id_lock), so a concurrent state-update, boost-update
+    or queue-stamp racing on the same id no longer drops any of the
+    mutations -- each write remains individually atomic AND the
+    read+mutate+write span is serialized against other callers on the same
+    id. See update_decision_state/set_manual_boost/
+    set_decision_escalations_dir for the caller-facing note.
     """
 
     id: str
@@ -367,6 +383,7 @@ class DecisionRecord:
     manual_boost: int = field(default=0, kw_only=True)
     state: str = field(default=DecisionState.OPEN, kw_only=True)
     severity: str = field(default='', kw_only=True)
+    escalations_dir: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -381,6 +398,7 @@ class DecisionRecord:
             'manual_boost': self.manual_boost,
             'state': str(self.state),
             'severity': self.severity,
+            'escalations_dir': self.escalations_dir,
         }
 
     @classmethod
@@ -397,6 +415,11 @@ class DecisionRecord:
             manual_boost=data.get('manual_boost', 0),
             state=data.get('state', DecisionState.OPEN),
             severity=data.get('severity', ''),
+            # `or ''` (not a plain .get default): a missing key AND an
+            # explicit null both collapse to the one falsy sentinel, so the
+            # `str` annotation stays honest against a hand-edited record and
+            # the reaper's queue guard needs no None-vs-''-vs-missing branch.
+            escalations_dir=data.get('escalations_dir') or '',
         )
 
     def to_json(self) -> str:
@@ -489,15 +512,45 @@ def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
     return sessions_dir(root) / slug / 'record.json'
 
 
-def transcript_path_for_cwd(cwd: str) -> str:
-    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` encoding.
+def encode_cwd(cwd: str) -> str:
+    """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
-    Both ``/`` and ``.`` map to ``-`` (confirmed against a real
-    ``~/.claude/projects/`` directory; PRD §3). This is read-only enrichment
-    metadata — never used as a lookup key by this module.
+    THE authoritative statement of the rule; every other copy in this repo
+    is a mirror of this one and is pinned to it by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``.
+
+    ``/``, ``.`` and ``_`` all map to ``-``. ``-`` passes through unchanged.
+    CASE IS PRESERVED — there is no case-folding step (a live dir named
+    ``-opt-Auto-Claude-resources-backend`` proves it).
+
+    Validated against 738 real (encoded-dir, decoded-cwd) pairs sampled from
+    a live ``~/.claude/projects`` tree, which the rule reproduces exactly.
+    Over that sample the only non-alphanumeric characters appearing in ANY
+    cwd were ``- . / _``, so the rule is complete over the observed domain
+    and UNVERIFIED outside it — a cwd containing some other punctuation
+    character has never been measured, and this function's output for one is
+    a guess. Extend the sample before extending the rule (task 3272).
+
+    Returns the BARE dir name, no ``~/.claude/projects/`` prefix — see
+    :func:`transcript_path_for_cwd` for the display-path form.
     """
-    encoded = cwd.replace('/', '-').replace('.', '-')
-    return f'~/.claude/projects/{encoded}'
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
+
+
+def transcript_path_for_cwd(cwd: str) -> str:
+    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` path.
+
+    Delegates the encoding to :func:`encode_cwd` (``/``, ``.`` and ``_`` all
+    map to ``-``; case preserved), which carries the authoritative statement
+    of the rule and the record of what it was measured against — 738 real
+    (encoded-dir, decoded-cwd) pairs from a live ``~/.claude/projects`` tree.
+
+    This is read-only enrichment metadata — never used as a lookup key by
+    this module. Note that OTHER modules do use the encoding as a lookup key
+    (``scripts/legibility/check_transcript_persistence.py``), so its exactness
+    is load-bearing beyond this file.
+    """
+    return f'~/.claude/projects/{encode_cwd(cwd)}'
 
 
 _DECISION_ID_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
@@ -710,6 +763,50 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     return decisions
 
 
+def _mutate_decision(
+    decision_id: str,
+    mutate: Callable[[DecisionRecord], None],
+    *,
+    caller: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Lock-serialized, fail-soft read-modify-write of one decision record.
+
+    The single implementation of the field-setter body shared by
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    (task 3640 amendment). Those three are the public, caller-facing names and
+    keep their own docstrings; this holds the parts that MUST NOT diverge
+    between them -- the lock placement, the read, the write, and the
+    fail-soft except-tuple.
+
+    That is not merely tidiness. The lock has to sit INSIDE the try/except for
+    a lock-acquisition fault to be absorbed rather than raised at a C8/cockpit
+    caller, and the except-tuple has to cover exactly the read/parse/write
+    fault set. Copied per-setter, a fix to either is a fix that has to be
+    remembered three times, and a missed copy fails silently in production
+    while every test stays green.
+
+    *mutate* is applied to the freshly-read record in-place; *caller* names the
+    public helper in the ERROR log so a fail-soft None is still attributable to
+    the API the caller actually invoked.
+
+    Returns the mutated record, or None on ANY fault (missing file, corrupt
+    body, lock-acquisition fault, write failure), never raising -- matching
+    write_decision's contract.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            mutate(record)
+            if not write_decision(record, root=root):
+                return None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('%s: failed to read %s', caller, path, exc_info=True)
+        return None
+    return record
+
+
 def update_decision_state(
     decision_id: str,
     state: str,
@@ -728,17 +825,12 @@ def update_decision_state(
     a concurrent set_manual_boost (or a second update_decision_state) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.state = state
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('update_decision_state: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.state = state
+
+    return _mutate_decision(
+        decision_id, _set, caller='update_decision_state', root=root
+    )
 
 
 def set_manual_boost(
@@ -759,17 +851,55 @@ def set_manual_boost(
     a concurrent update_decision_state (or a second set_manual_boost) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.manual_boost = boost
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.manual_boost = boost
+
+    return _mutate_decision(decision_id, _set, caller='set_manual_boost', root=root)
+
+
+def set_decision_escalations_dir(
+    decision_id: str,
+    escalations_dir: str | Path,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s escalations_dir (queue stamp) field.
+
+    Added for task 3640's back-fill of the legacy open population, but written
+    as an ordinary field setter: any caller needing to (re)stamp a record's
+    owning queue should come through here rather than rewriting the JSON.
+
+    NORMALIZES ON THE WAY IN via normalize_escalations_dir, so every writer of
+    this field stores ONE canonical spelling and the reaper's axis-2 compare
+    stays honest -- a raw-stored dotted/trailing-slash spelling would compare
+    unequal to the very queue it names, and the record would silently never
+    close again (fail-open, so invisible). ``UNKNOWN_QUEUE`` passes through
+    verbatim by that same normalizer's sentinel case: it is a state, not a
+    path, and must not become cwd-dependent.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, a lock-acquisition fault, or a write
+    failure -- rather than raising, matching write_decision's contract for
+    its direct C8/cockpit callers. That matters concretely for the back-fill,
+    which lists the whole decision population and then writes each id back: a
+    record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is serialized per-decision-id via decision_id_lock (a stable
+    ``<id>.json.lock`` sidecar, mirroring task 1609's escalation_id_lock).
+    Its two siblings already race each other; the back-fill is a THIRD writer,
+    running against live records while the C8 watchers and the cockpit are up,
+    which is exactly why it goes through this helper instead of rewriting
+    decision JSON itself -- doing that in a script would bypass both the lock
+    and the atomic tmp+os.replace writer and reintroduce the race 1609/3528
+    fixed.
+    """
+    def _set(record: DecisionRecord) -> None:
+        record.escalations_dir = normalize_escalations_dir(escalations_dir)
+
+    return _mutate_decision(
+        decision_id, _set, caller='set_decision_escalations_dir', root=root
+    )
 
 
 @contextlib.contextmanager
@@ -825,11 +955,90 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
         os.close(fd)
 
 
-_ESCALATION_ARCHIVE_SUBDIR = 'archive'
+ESCALATION_ARCHIVE_SUBDIR = 'archive'
 """Mirrors escalation.archive.ARCHIVE_SUBDIR BY CONVENTION, not by import:
 this module is deliberately stdlib-only with no intra-orchestrator imports
 (see module docstring), so it cannot import escalation.archive directly.
-Kept in sync by hand with that constant."""
+Kept in sync by hand with that constant.
+
+PUBLIC (task 3640 amendment) because it defines half of what "this queue
+holds that escalation id" MEANS: read_escalation_status looks at the queue
+root and then under this subdir, and scripts/backfill_decision_queue_stamp.py
+must search exactly the same two tiers or it can stamp a record with a queue
+the reaper would never match against -- pinning that record OPEN forever.
+Out-of-module searchers reference this name rather than re-spelling 'archive',
+so the two notions cannot drift."""
+
+
+UNKNOWN_QUEUE = '<unknown>'
+"""The THIRD queue state for DecisionRecord.escalations_dir (task 3640).
+
+Distinct from BOTH a real queue path and the ``''`` unset/legacy sentinel:
+
+- ``''``          -- "nobody told us". A record filed before the field
+                     existed, or by a caller that omitted it. The reaper
+                     falls back to project-only scoping and MAY close it.
+- ``'<unknown>'`` -- "we investigated and could NOT determine the owning
+                     queue". The reaper REFUSES to close it; it stays a
+                     visible cockpit row for human closure.
+- ``'/abs/path'`` -- a normalized queue path. Reaped only by that queue.
+
+The two sentinels are deliberately NOT collapsed. 3528 defined ``''``'s
+meaning and an existing test asserts a ``''`` record still closes; redefining
+it would change behaviour for every future omitted-flag caller under the
+human. Separating them lets task 3640 back-fill the undeterminable records
+with an honest value instead of leaving them in the false-closable ``''``
+population.
+
+The angle brackets are load-bearing rather than decorative: a resolved queue
+path always begins with ``'/'``, so this sentinel can never collide with a
+real queue no matter what a project is named or where it is checked out."""
+
+
+def normalize_escalations_dir(value: str | Path) -> str:
+    """The ONE canonical spelling of an escalation-queue path (task 3528).
+
+    Both sides of the (fleet-global decisions <-> per-queue escalations) join
+    run their queue path through this helper: the ``write-decision`` verb
+    stamps the normalized form onto ``DecisionRecord.escalations_dir``, and
+    the ``reap-decisions`` verb normalizes both its own ``--escalations-dir``
+    and the decision's stored value before comparing them. Routing both
+    through one function is what makes ``data/../data/escalations/``, a
+    ``~``-relative spelling and a plain absolute path all compare EQUAL --
+    a raw string compare would silently fail open and reintroduce the
+    cross-queue false-closure bug this scoping exists to prevent.
+
+    Returns ``''`` -- the "unset/legacy queue" sentinel, never a path -- for
+    an empty or whitespace-only *value*, mirroring the sibling
+    ``DecisionRecord.severity`` convention; the reaper reads that sentinel as
+    "fall back to project-only scoping". Returns ``UNKNOWN_QUEUE`` VERBATIM
+    for that sentinel (task 3640) -- the reaper reads it as "refuse to close".
+    Otherwise returns ``str(Path(raw).expanduser().resolve())``.
+    ``Path.resolve()`` is non-strict on Python 3.11+, so a well-formed queue
+    path that does not exist yet still normalizes rather than faulting.
+
+    Stdlib-only and fail-soft: never raises. A value the OS cannot resolve
+    (an embedded NUL, an unreadable cwd) degrades to the stripped raw string,
+    which simply matches no real queue -- the fail-OPEN direction, leaving a
+    decision visible to the human rather than risking a false close. Keeps
+    this module's no-intra-orchestrator-imports rule (see module docstring).
+    """
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    # BEFORE the resolve(): UNKNOWN_QUEUE is a bare word, so Path.resolve()
+    # would treat it as a path RELATIVE TO THE CALLING PROCESS'S CWD and
+    # return '<cwd>/<unknown>' -- a different string in the back-fill script
+    # than in a watcher's reaper. The stamp would stop being deterministic
+    # across processes (the two sides of the join could never compare equal)
+    # and the stored value would be an outright lie about where the record's
+    # escalation lives. It is a sentinel, not a path: it round-trips verbatim.
+    if raw == UNKNOWN_QUEUE:
+        return UNKNOWN_QUEUE
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return raw
 
 
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
@@ -868,7 +1077,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     base = Path(escalations_dir)
     candidate = base / f'{escalation_id}.json'
     if not candidate.is_file():
-        matches = sorted((base / _ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
+        matches = sorted((base / ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
         candidate = matches[-1] if matches else None
     if candidate is None:
         return None
@@ -2221,6 +2430,7 @@ def _run_write_decision(
     escalation_id: str | None,
     session_id: str | None,
     severity: str = '',
+    escalations_dir: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -2236,6 +2446,14 @@ def _run_write_decision(
     critical|urgent) onto the record so the cockpit decision queue can
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
+
+    ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
+    to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
+    passes the SAME queue dir it later reaps with, so this fleet-global
+    decision can be joined back to the right per-queue escalation-id
+    namespace: ids are unique only within one queue, and a project may run
+    several (task 3528). Omitting it stores '' and keeps today's
+    project-only-scoped reaper behaviour, so no existing caller breaks.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -2259,6 +2477,7 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
         severity=severity,
+        escalations_dir=normalize_escalations_dir(escalations_dir),
     )
     if write_decision(record):
         print(record.id)
@@ -2268,14 +2487,59 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
-    reap_answered_decisions: a decision belonging to a DIFFERENT project is
-    left alone (returns None -- unresolved), since DecisionRecords are
-    fleet-global (``~/.claude/fleet/decisions/``) but escalations are
-    per-project (``<project_root>/data/escalations``); otherwise defers to
-    read_escalation_status against *escalations_dir*. Project-scoping this
-    way makes the (global decisions <-> per-project escalations) join
-    correct without fragile project_id -> path auto-discovery. Root
-    resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+    reap_answered_decisions. The (fleet-global decisions <-> per-queue
+    escalations) join is scoped on TWO axes, and a decision failing either
+    one is left alone (returns None -- unresolved):
+
+    1. PROJECT. DecisionRecords are fleet-global
+       (``~/.claude/fleet/decisions/``) but escalations are per-project
+       (``<project_root>/data/escalations``), so a decision belonging to a
+       DIFFERENT project is skipped. Scoping this way keeps the join correct
+       without fragile project_id -> path auto-discovery.
+    2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
+       only WITHIN one queue, and a project can run several: dark_factory
+       runs ``data/escalations`` (orchestrator) and
+       ``data/reconciliation/escalations`` (recon watcher) over the SAME id
+       namespace. Project scoping alone therefore let either watcher's
+       reaper resolve the OTHER watcher's decisions against its own queue --
+       observed with ``esc-3036-1``, where an unrelated resolved
+       orchestrator escalation silently closed a still-pending recon
+       blocking gate, which then sat invisible in the cockpit for ~7 days
+       (15 ids were resolved in both queues at time of measurement). So a
+       decision stamped with a queue OTHER than *escalations_dir* is
+       skipped. Both sides go through normalize_escalations_dir, including
+       the decision's own stored value, so equivalent spellings match and a
+       hand-written record is compared honestly rather than fail-open.
+
+    A decision carrying NO queue (``escalations_dir == ''`` -- every record
+    filed before that field existed) falls back to axis 1 alone, keeping
+    today's exact behaviour for the existing population rather than changing
+    it under the human; the two watchers stamp the queue on newly-filed
+    decisions, so the unprotected set only shrinks. Task 3640 then BACK-FILLED
+    the pre-existing open population, so that fallback set is drained rather
+    than merely shrinking. Otherwise the closure defers to
+    read_escalation_status against *escalations_dir*. Root resolves via
+    $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    UNKNOWN QUEUE (task 3640). A decision stamped ``UNKNOWN_QUEUE`` is
+    refused by name: its owning queue was investigated and could not be
+    determined, so NO reaper may close it and it stays a visible cockpit row
+    until a human closes it. Honestly: the axis-2 compare above would already
+    refuse it, since it refuses ANY truthy stamp that is not this reaper's
+    queue -- so the by-name guard changes no outcome today. It is here so the
+    policy is INTENTIONAL and named rather than an accident of string
+    inequality that a future refactor of that compare could silently remove,
+    and because it closes the one degenerate case the compare genuinely does
+    not cover: a reaper invoked with the sentinel as its OWN
+    ``--escalations-dir`` makes both sides compare EQUAL, and the record then
+    survives only because read_escalation_status happens to find no queue at
+    that bogus relative path.
+
+    Both guards are fail-OPEN: on any doubt the decision stays OPEN and
+    visible in the cockpit queue, matching reap_answered_decisions' contract
+    that any status not in DECISION_CLOSE_MAP leaves a decision OPEN. The
+    asymmetry of harm is the reason -- an over-held decision is a
+    human-triageable row, while a falsely closed one is invisible.
 
     A watcher runs this once per Main Loop cycle (SKILL.md "Closing parked
     decisions on resolve") so a decision it (or anyone -- /unblock, an L2
@@ -2283,6 +2547,7 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     resolved/dismissed. Prints one ``f'{id} {new_state}'`` line per closed
     decision, mirroring `write-decision` printing the filed id.
     """
+    reaper_dir = normalize_escalations_dir(escalations_dir)
 
     def _status(decision: DecisionRecord) -> str | None:
         if decision.project != project:
@@ -2295,6 +2560,22 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
             # call below (typed to take a `str`) and stays correct if this
             # closure is ever invoked from elsewhere.
             return None
+        # Axis 2: normalize the decision's OWN stored value at compare time
+        # too, not just at write time -- a raw compare would fail open for
+        # any record write-decision did not produce (hand-repaired, migrated
+        # between checkouts, or written by a future caller), and a false
+        # NON-match is how silent divergence creeps back in.
+        decision_dir = normalize_escalations_dir(decision.escalations_dir)
+        # Task 3640: refuse an undeterminable-queue record BY NAME, before the
+        # inequality compare below -- see the UNKNOWN QUEUE paragraph above
+        # for why this deliberately-redundant-today guard exists.
+        if decision_dir == UNKNOWN_QUEUE:
+            return None
+        if decision_dir and decision_dir != reaper_dir:
+            return None
+        # RAW escalations_dir here, deliberately: only the comparison needs a
+        # canonical spelling; the read keeps using exactly what the caller
+        # passed.
         return read_escalation_status(escalations_dir, decision.escalation_id)
 
     for reaped in reap_answered_decisions(escalation_status=_status):
@@ -2362,6 +2643,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default='',
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
+    write_decision_p.add_argument(
+        '--escalations-dir',
+        default='',
+        help=(
+            "the escalation queue dir this decision's --escalation-id belongs to; "
+            'scopes the reaper (see reap-decisions)'
+        ),
+    )
 
     reap_decisions_p = sub.add_parser(
         'reap-decisions',
@@ -2412,6 +2701,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.escalation_id,
                 args.session_id,
                 args.severity,
+                args.escalations_dir,
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)

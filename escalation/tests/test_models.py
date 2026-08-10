@@ -967,3 +967,156 @@ class TestEscalationGrantedFiles:
         assert restored.granted_files == [], (
             f"Expected granted_files=[] for legacy JSON, got {restored.granted_files!r}"
         )
+
+
+class TestFilingClaimantRunId:
+    """Escalation carries the FILING incarnation's claimant identity (task 3533).
+
+    These tests pin the FIELD's storage/round-trip behaviour only.  What the
+    identity MEANS, and the fail-safe rule applied to it, are documented once
+    on ``escalation.pins.classify_pins`` and exercised in tests/test_pins.py.
+    """
+
+    #: Real ``compose_claimant_run_id`` output shape.
+    IDENTITY = 'run-abc/3533-f3af2d2a/pid=1234'
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+        )
+
+    # --- (a) default is None ---
+
+    def test_filing_claimant_run_id_defaults_to_none(self):
+        """A minimally-constructed Escalation has filing_claimant_run_id=None."""
+        esc = self._make_base_esc()
+        assert esc.filing_claimant_run_id is None
+
+    # --- (b) construction preserves a real identity string ---
+
+    def test_filing_claimant_run_id_preserved_on_construction(self):
+        """filing_claimant_run_id is stored verbatim (no parsing/normalisation)."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        assert esc.filing_claimant_run_id == self.IDENTITY
+
+    # --- (c) round-trip via to_dict / from_dict ---
+
+    def test_filing_claimant_run_id_appears_in_to_dict(self):
+        """to_dict() carries the key (not silently dropped)."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        d = esc.to_dict()
+        assert 'filing_claimant_run_id' in d
+        assert d['filing_claimant_run_id'] == self.IDENTITY
+
+    def test_filing_claimant_run_id_round_trip_via_to_dict_from_dict(self):
+        """Escalation.from_dict(esc.to_dict()) round-trips the identity exactly."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.filing_claimant_run_id == self.IDENTITY
+
+    # --- (d) round-trip via to_json / from_json ---
+
+    def test_filing_claimant_run_id_round_trip_via_to_json_from_json(self):
+        """Escalation.from_json(esc.to_json()) round-trips the identity exactly."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.filing_claimant_run_id == self.IDENTITY
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def _legacy_payload(self) -> dict:
+        """A pre-3533 on-disk payload — every field EXCEPT filing_claimant_run_id."""
+        return {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without filing_claimant_run_id',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'evidence': [],
+            'train_state': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            'triaged_at': None,
+            'triaged_by': None,
+            'triage_note': '',
+            'updated_at': None,
+            'granted_files': [],
+            # NOTE: filing_claimant_run_id is intentionally absent
+        }
+
+    def test_from_dict_legacy_payload_omits_filing_claimant_run_id(self):
+        """Legacy JSON without the key deserialises to None — zero migration."""
+        restored = Escalation.from_dict(self._legacy_payload())
+        assert restored.filing_claimant_run_id is None, (
+            f'Expected None for legacy JSON, got {restored.filing_claimant_run_id!r}'
+        )
+
+    def test_from_json_legacy_payload_does_not_raise(self):
+        """Legacy JSON deserialises through from_json without raising."""
+        restored = Escalation.from_json(json.dumps(self._legacy_payload()))
+        assert restored.id == 'esc-task-1-0001'
+        assert restored.filing_claimant_run_id is None
+
+    # --- (f) the __dataclass_fields__ filter is not weakened ---
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """An unknown payload key is dropped by from_dict's __dataclass_fields__ filter."""
+        payload = self._legacy_payload()
+        payload['not_a_real_field'] = 'boom'
+        restored = Escalation.from_dict(payload)
+        assert not hasattr(restored, 'not_a_real_field')

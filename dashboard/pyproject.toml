@@ -42,6 +42,10 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
@@ -49,6 +53,29 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Default per-test wall-clock cap (pytest-timeout, already a dev dependency).
+# Task 3431 / esc-3216-2: observed one run of
+# tests/test_app.py::test_performance_returns_performance spend 178.5s in
+# teardown and end in sqlite3.OperationalError "attempt to write a readonly
+# database" from the aiosqlite worker thread; the retry mechanism behind the
+# stall is unconfirmed (task 3431 flags it as an unverified hypothesis, not
+# established fact). Without this cap, a wedge like that hangs the whole
+# suite with no output instead of failing loud with a traceback.
+# 60s matches shared/escalation/orchestrator/fused-memory's default, so slow
+# tests can opt up individually with @pytest.mark.timeout(N) as those
+# configs document. Per-module merge/root verify test_commands already pass
+# --timeout=300 on the CLI (which overrides this ini value), so this default
+# instead governs bare local/agent invocations (`cd dashboard && uv run
+# pytest tests/`, the form CONTRIBUTING.md and the 3216 incident used).
+timeout = 60
+# dashboard runs no pytest-xdist, so signal is safe and is the only method
+# that interrupts a blocking main-thread wait (thread mode can't — mirrors
+# escalation/pyproject.toml). Residual risk: signal only raises in the main
+# thread, and aiosqlite's connection worker is a non-daemon thread
+# (aiosqlite/core.py: `Thread(target=_connection_worker_thread, ...)`), so a
+# sufficiently wedged worker can still block interpreter shutdown even after
+# pytest-timeout has failed the test.
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [

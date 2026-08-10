@@ -1008,6 +1008,110 @@ class TestShapeEscalations:
         body = redux_api.shape_escalations(queues=queues, task_maps={})
         assert body['ESCALATIONS']['summary'] == top_summary
 
+    def test_shape_escalations_carries_subsection_skipped(self):
+        """The per-subsection ``skipped`` list reaches the shaped payload.
+
+        The out_subsections loop rebuilds each subsection field-by-field, so a
+        new key on build_escalation_queues' output is dropped unless the loop
+        names it.  Without this the corruption facts stop at the data layer and
+        the tab renders one escalation short with nothing saying so (INV-2).
+        """
+        skipped = [{
+            'path': '/p/projA/data/escalations/esc-bad.json',
+            'error': 'Expecting value: line 1 column 1',
+        }]
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': skipped,
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out = body['ESCALATIONS']['subsections'][0]
+
+        assert 'skipped' in out, (
+            "shape_escalations must carry `skipped` into the shaped subsection — "
+            'add it to the out_subsections dict beside `summary`'
+        )
+        assert out['skipped'] == skipped
+        assert len(out['skipped']) == 1
+        assert set(out['skipped'][0].keys()) == {'path', 'error'}
+
+    def test_shape_escalations_skipped_defaults_to_empty_list(self):
+        """A subsection with no ``skipped`` key shapes to ``[]``, never None.
+
+        Defensive against a stale or partial upstream dict: the JSX iterates the
+        list unconditionally, so a missing key must not become ``undefined``.
+        """
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out = body['ESCALATIONS']['subsections'][0]
+        assert out['skipped'] == []
+
+        # An explicit None must degrade the same way.
+        subsection_none = {**subsection, 'skipped': None}
+        queues_none = {'subsections': [subsection_none], 'summary': _EMPTY_SUMMARY}
+        body_none = redux_api.shape_escalations(queues=queues_none, task_maps={})
+        assert body_none['ESCALATIONS']['subsections'][0]['skipped'] == []
+
+    def test_shape_escalations_carries_skipped_count_both_levels(self):
+        """``summary.skipped_count`` survives at BOTH nesting levels.
+
+        Regression pin: the summary blocks pass through by ``dict(...)`` copy
+        today, so this already holds — it exists so a future field-by-field
+        rewrite of a summary block cannot silently drop the count the way the
+        subsection loop drops ``skipped``.
+        """
+        sub_summary = {**_EMPTY_SUMMARY, 'skipped_count': 2}
+        top_summary = {**_EMPTY_SUMMARY, 'skipped_count': 3}
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': [],
+            'summary': sub_summary,
+        }
+        queues = {'subsections': [subsection], 'summary': top_summary}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+
+        assert body['ESCALATIONS']['subsections'][0]['summary']['skipped_count'] == 2
+        assert body['ESCALATIONS']['summary']['skipped_count'] == 3
+
+    def test_shape_escalations_skipped_does_not_alias_input(self):
+        """The shaped ``skipped`` list and its records are copies, not aliases.
+
+        Matches the shaper's existing no-alias discipline: mutating the shaped
+        payload must not reach back into build_escalation_queues' output.
+        """
+        entry = {'path': '/p/projA/data/escalations/esc-bad.json', 'error': 'boom'}
+        skipped = [entry]
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': skipped,
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out_skipped = body['ESCALATIONS']['subsections'][0]['skipped']
+
+        assert out_skipped is not skipped, 'shaped list must be a distinct object'
+        assert out_skipped[0] is not entry, 'each shaped record must be a copy'
+        assert out_skipped[0] == entry
+
 
 # ---------------------------------------------------------------------------
 # shape_merge_queue — active_approximate pass-through (task-1606 step-9)

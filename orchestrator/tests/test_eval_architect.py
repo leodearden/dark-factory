@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -622,6 +623,43 @@ class TestScorePlanStructure:
 
 
 # ---------------------------------------------------------------------------
+# clamp_unit_score — THE single output-range contract for BOTH plan-quality
+# instruments (task 3410)
+#
+# score_plan_structure and judge_plan_quality reduce onto the SAME axis
+# (EvalMetrics.plan_quality), so — exactly as is_scorable_plan (below) is the
+# ONE scorability predicate both instruments call — clamp_unit_score is the
+# ONE range/rounding contract both instruments call. Pinning it directly here
+# is the anti-drift anchor: a future edit to either instrument cannot drift
+# the range behaviour without also breaking this class.
+# ---------------------------------------------------------------------------
+
+class TestClampUnitScore:
+    @pytest.mark.parametrize('score', [0.0, 0.5, 1.0])
+    def test_in_range_values_pass_through_unchanged(self, score):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(score) == score
+
+    def test_above_range_clamps_to_the_upper_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(1.5) == 1.0
+        assert clamp_unit_score(42) == 1.0
+
+    def test_below_range_clamps_to_the_lower_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(-0.4) == 0.0
+
+    def test_result_is_rounded_to_four_decimal_places(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        # Exact — verified by execution, not a tuned tolerance.
+        assert clamp_unit_score(0.123456789) == 0.1235
+
+
+# ---------------------------------------------------------------------------
 # is_scorable_plan — THE single "does this artifact carry model content?" test
 # (3118 step-19/20)
 #
@@ -685,6 +723,33 @@ def _judge_task() -> dict:
         'name': 'implement the widget',
         'task_definition': {'description': 'implement the widget correctly'},
     }
+
+
+def _judge_result_scoring(raw, *, via: str) -> MagicMock:
+    """A judge invoke_agent result reporting ``plan_quality=raw``, delivered via
+    *via* (``'structured_output'`` or ``'json_output'``).
+
+    That delivery choice is the ONLY difference between the two mocks. It
+    matters in PRODUCTION — ``PLAN_QUALITY_SCHEMA``'s ``{'minimum': 0.0,
+    'maximum': 1.0}`` binds a real ``structured_output`` response but not the
+    ``json.loads(result.output)`` fallback (see ``clamp_unit_score``'s
+    docstring in judge.py) — but NOT in this mock: a ``MagicMock`` enforces no
+    schema either way, so both deliveries reach the parser with *raw*
+    unchecked here. What the ``via`` parametrization actually pins is that the
+    clamp/NaN handling lives AFTER the ``structured_output or
+    json.loads(...)`` merge point, so neither delivery path can regress
+    independently of the other.
+    """
+    payload = {'plan_quality': raw, 'per_criterion': {}, 'reasoning': 'r'}
+    fake = MagicMock()
+    if via == 'structured_output':
+        fake.structured_output = payload
+    elif via == 'json_output':
+        fake.structured_output = None
+    else:
+        raise ValueError(f'unknown via: {via!r}')
+    fake.output = json.dumps(payload)
+    return fake
 
 
 @pytest.mark.asyncio
@@ -821,6 +886,357 @@ class TestJudgePlanQuality:
                 _well_formed_plan(), 'diff', _judge_task(),
             )
         assert verdict.plan_quality is None
+
+    # -- Output-range contract (task 3410) --------------------------------
+    # score_plan_structure has always clamped+rounded to [0, 1]/4dp
+    # (judge.py:396). judge_plan_quality's parse block did not (see
+    # clamp_unit_score's docstring in judge.py for why the schema bound alone
+    # is not enough). Both delivery paths are covered so that hole cannot
+    # hide behind a structured-output-only test.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range-clamps-high'),
+        pytest.param(42, 1.0, id='far-above-range-clamps-high'),
+        pytest.param(-0.4, 0.0, id='below-range-clamps-low'),
+        pytest.param(0.123456789, 0.1235, id='rounds-to-4dp-parity-with-floor'),
+    ])
+    async def test_parsed_score_is_clamped_and_rounded_regardless_of_delivery_path(
+        self, raw, expected, via,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.plan_quality, float)
+        assert 0.0 <= verdict.plan_quality <= 1.0
+        assert verdict.plan_quality == expected
+
+    # -- Loud-over-silent: an out-of-contract answer leaves a WARNING (3410) --
+    # docs/legibility/design-invariants.md loud-over-silent /
+    # structured-facts-at-failure — the same discipline the unjudgeable-
+    # artifact guard's WARNING already follows (judge.py:514).
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range'),
+        pytest.param(-0.4, 0.0, id='below-range'),
+    ])
+    async def test_out_of_range_answer_leaves_exactly_one_warning_naming_it(
+        self, via, raw, expected, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        # Both clamp directions are pinned, not just the above-range case —
+        # the warning text is built from raw_quality!r / plan_quality!r, so a
+        # future edit that only warns on raw_quality > 1.0 would keep every
+        # above-range assertion green while silently dropping the low-side
+        # signal.
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]  # WHICH cell to go look at
+        assert repr(raw) in warnings[0]       # the raw out-of-range value
+        assert repr(expected) in warnings[0]  # the substituted value
+
+        # The verdict is otherwise intact: a corrected CONTENT answer, never
+        # an infra refusal (3118 exclusion shape) or a parse failure.
+        assert verdict.plan_quality == expected
+        assert verdict.invocation_error is None
+        assert verdict.per_criterion == {}
+        assert verdict.reasoning == 'r'
+
+    async def test_in_range_answer_emits_no_warning(self, caplog):
+        """CONTROL — without this, the warning fires on every judge call and
+        stops meaning anything.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(
+                return_value=_judge_result_scoring(0.83, via='structured_output'),
+            ),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == 0.83
+        assert _judge_warnings(caplog) == []
+
+    # -- The hole a bare clamp leaves open: NaN (task 3410) ----------------
+    # NaN is unordered, so a bare clamp does NOT keep plan_quality in [0, 1]
+    # (see clamp_unit_score's docstring in judge.py for the mechanics). A NaN
+    # would be persisted verbatim by runner.py and poison
+    # report._mean_plan_quality. json.loads('{"plan_quality": NaN}')
+    # SUCCEEDS in CPython, so this is reachable through the same
+    # schema-bypassing path the rest of this task is about — not
+    # hypothetical.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    async def test_nan_answer_degrades_to_the_none_sentinel_not_a_nan(
+        self, via, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(float('nan'), via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        # The existing sentinel run_architect_eval already degrades to the
+        # deterministic structural floor on — never a NaN laundered into a
+        # number a downstream mean could be poisoned by.
+        assert verdict.plan_quality is None
+        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
+        # exclusion shape.
+        assert verdict.invocation_error is None
+        # Same degraded shape the parse-failure fallback uses — pinned here
+        # too, not just plan_quality, so a future edit can't quietly leave
+        # per_criterion/reasoning out of step with that documented shape.
+        assert verdict.per_criterion == {}
+        assert 'nan' in verdict.reasoning.lower()
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]           # WHICH cell
+        assert 'nan' in warnings[0].lower()            # WHAT was wrong
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(float('inf'), 1.0, id='positive-infinity-clamps-high'),
+        pytest.param(float('-inf'), 0.0, id='negative-infinity-clamps-low'),
+    ])
+    async def test_infinity_clamps_because_it_is_orderable_unlike_nan(
+        self, raw, expected, via, caplog,
+    ):
+        """DELIBERATE asymmetry, documented in one place: infinity IS
+        orderable, so the clamp has a defined answer; NaN is not, so it has
+        none. Parametrized over both delivery paths like the sibling
+        range/NaN tests above, so this path isn't only covered on the
+        structured_output mock.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == expected
+        # Infinity is out-of-range-but-orderable, so it takes the SAME
+        # clamp-and-warn path as any other out-of-contract answer (e.g.
+        # 1.5) — exactly one WARNING, never silent.
+        assert len(_judge_warnings(caplog)) == 1
+
+
+# ---------------------------------------------------------------------------
+# PlanQualityVerdict.cost_usd (step-1/2, eval-revival υ) — the judge's OWN
+# invocation spend
+#
+# run_architect_eval never sees the judge's AgentResult, only the returned
+# PlanQualityVerdict — so the judge invocation's cost has to ride the return
+# value. A trailing, defaulted field (mirroring invocation_error,
+# judge.py:458-463) keeps every existing 3-arg construction site — including
+# every judge test above predating this task — reading back cost_usd=0.0
+# rather than crashing.
+# ---------------------------------------------------------------------------
+
+class TestPlanQualityVerdictCarriesJudgeSpend:
+    @pytest.mark.asyncio
+    async def test_success_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = 0.42
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == pytest.approx(0.42)
+
+    # -- Amendment (reviewer design-coherence): the PRODUCER coerces too ----
+    # PlanQualityVerdict.cost_usd is declared ``float``; these pin that the
+    # declared type is actually true at construction, not just enforced by
+    # the runner's defensive read (_verdict_cost_usd / coerce_cost_usd).
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_unset_mock_cost_degrades_to_zero(self):
+        """A bare MagicMock invoke result that never sets ``cost_usd`` must
+        read back a real ``0.0`` float, not a Mock instance and not a
+        fabricated ``1.0`` (MagicMock's default ``__float__``).
+
+        This is what makes the producer-side coercion safe for the ~20
+        pre-existing judge tests that construct exactly this kind of bare
+        mock and never touch ``cost_usd``: none of them assert on the field,
+        and this pins the value they'd now get if they did.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        # cost_usd deliberately left UNSET — fake.cost_usd is an
+        # auto-generated MagicMock child.
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+        assert isinstance(verdict.cost_usd, float)
+
+    @pytest.mark.asyncio
+    async def test_success_path_with_non_finite_cost_degrades_to_zero(self):
+        """A judge invocation reporting a non-finite cost_usd (NaN) must not
+        ride into the verdict unchanged — it would poison every downstream
+        sum/mean once folded into an architect cell's cost_usd."""
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.83, 'per_criterion': {}, 'reasoning': 'r'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        fake.cost_usd = float('nan')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.cost_usd == 0.0
+
+    def test_legacy_three_arg_construction_reads_back_zero_spend(self):
+        """Every pre-existing construction site (and any older persisted /
+        monkeypatched verdict) must keep working and read back "no spend
+        recorded" rather than crashing."""
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        verdict = PlanQualityVerdict(
+            plan_quality=0.5, per_criterion={}, reasoning='ok',
+        )
+        assert verdict.cost_usd == 0.0
+
+    # -- Degraded POST-invoke paths still carry real spend (step-3/4) ------
+    # A refused/unparseable/non-finite judge answer still consumed whatever
+    # the provider charged — reporting $0 there would understate real spend
+    # exactly the way this task's bug does. Mirrors the content-failure /
+    # infra-failure discipline tasks 3118/3302/3303 already established.
+
+    @pytest.mark.asyncio
+    async def test_transport_refusal_path_carries_the_invocations_own_spend(self):
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.judge import judge_plan_quality
+
+        refused = AgentResult(
+            success=False,
+            output=_CAP_TEXT,
+            cost_usd=0.07,
+            duration_ms=1200,
+            turns=0,
+            subtype='error',
+            api_error_status=429,
+        )
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=refused),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.invocation_error, str) and verdict.invocation_error
+        assert verdict.cost_usd == pytest.approx(0.07)
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = MagicMock()
+        fake.structured_output = None
+        fake.output = 'not json at all {{{'
+        fake.cost_usd = 0.31
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.31)
+
+    @pytest.mark.asyncio
+    async def test_nan_path_carries_the_invocations_own_spend(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        fake = _judge_result_scoring(float('nan'), via='structured_output')
+        fake.cost_usd = 0.29
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.cost_usd == pytest.approx(0.29)
+
+    # -- The PRE-invoke refusal fabricates no spend (step-3/4) --------------
+    # Nothing to judge, so invoke_agent is never awaited — recording spend
+    # here would fabricate a cost for an invocation that never happened.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_pre_invoke_refusal_records_no_fabricated_spend(self, plan):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        mock_invoke = AsyncMock()
+        with patch('orchestrator.evals.judge.invoke_agent', mock_invoke):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        mock_invoke.assert_not_awaited()
+        assert verdict.cost_usd == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1048,9 +1464,10 @@ class TestArchitectEvalConfigs:
         assert cfg.role == 'architect'
 
     def test_architect_fable_candidate_added_existing_byte_unchanged(self):
-        """eval-revival π: architect-fable-high joins ARCHITECT_EVAL_CONFIGS.
+        """eval-revival π/ρ: architect-fable-high and architect-fable-max join
+        ARCHITECT_EVAL_CONFIGS.
 
-        Parity discipline (eval-revival decision 11): the three pre-existing
+        Parity discipline (eval-revival decision 11): the four pre-existing
         candidates stay byte-unchanged (dataclass equality) when a new
         candidate is appended; the new candidate is config-only — it rides
         run_ofat_stage's existing generic role='architect' branch (task 2478).
@@ -1061,6 +1478,7 @@ class TestArchitectEvalConfigs:
             EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
             EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
             EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
         ]
         by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
         for expected in existing:
@@ -1072,11 +1490,48 @@ class TestArchitectEvalConfigs:
         assert fable.effort == 'high'
         assert fable.role == 'architect'
 
+        # architect-fable-max's field-level shape (backend/model/effort/role)
+        # is pinned by test_architect_fable_max_is_effort_matched_to_opus_incumbent
+        # below, not duplicated here — this test's job is parity + membership.
         assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
             'architect-opus-high',
             'architect-opus-max',
             'architect-sonnet-high',
             'architect-fable-high',
+            'architect-fable-max',
+        }
+
+    def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
+        """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
+
+        Per the OFAT methodology (mirroring JUDGE_EVAL_CONFIGS: "effort fixed →
+        ONLY the model varies"), architect-fable-max holds effort/role/backend
+        equal to its architect-opus-max incumbent and varies EXACTLY the model
+        axis. v1's screen compared fable@high against opus@max — a confound —
+        so fable-trial-v2 δ's stage-2 screen needs this effort-matched pair to
+        isolate the model delta cleanly.
+        """
+        from orchestrator.evals.configs import get_config_by_name, ofat_candidates
+
+        cfg = get_config_by_name('architect-fable-max')
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5'
+        assert cfg.effort == 'max'
+        assert cfg.role == 'architect'
+        # A native cloud claude candidate, never a proxied bundle (the same
+        # discriminator _cloud_implementer_incumbents uses).
+        assert not cfg.env_overrides
+
+        incumbent = get_config_by_name('architect-opus-max')
+        assert incumbent is not None
+        assert cfg.effort == incumbent.effort
+        assert cfg.role == incumbent.role
+        assert cfg.backend == incumbent.backend
+        assert cfg.model != incumbent.model
+
+        assert 'architect-fable-max' in {
+            c.name for c in ofat_candidates() if c.role == 'architect'
         }
 
 
@@ -1111,6 +1566,8 @@ async def _run_architect_eval_hermetic(
     arch_success: bool = True,
     invoke_side_effect=None,
     arch_result=None,
+    orch_prices: dict | None = None,
+    orch_config_side_effect=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1124,6 +1581,24 @@ async def _run_architect_eval_hermetic(
     carrying the campaign 429 payload (``api_error_status=429`` +
     "You've hit your session limit · resets 8pm"), which the MagicMock cannot
     express because every attribute access on it returns a truthy Mock.
+
+    ``orch_prices`` seeds the PRICE TABLE on the patched ``build_eval_orch_config``
+    return, which the runner reads to resolve the architect component's cost
+    provenance (Invariant P5). It defaults to an EMPTY dict rather than a bare
+    ``MagicMock`` deliberately: a bare MagicMock's ``.get(model)`` returns a
+    truthy Mock, which would send ``resolve_cost_usd`` down its price-table
+    branch and multiply Mocks into ``cost_usd``. The default ``invoke_agent``
+    return likewise carries REAL integer token/turn counts for EVERY usage leaf
+    the runner reads (input/output, both cache counts, turns) for the same
+    reason — a truthy Mock is one that ``or 0`` cannot rescue, and it would
+    land verbatim in the persisted cell. Both make the harness model reality so
+    a RED here is caused by production behaviour, never by the double.
+
+    ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
+    RAISE — the harness-crash shape where the eval orch config (and therefore
+    the price table) is never bound at all. It has to live here rather than in
+    a caller-side ``patch``: this helper patches the same name from inside, so
+    an outer patch would be shadowed.
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -1135,6 +1610,8 @@ async def _run_architect_eval_hermetic(
 
     invoke_return = arch_result if arch_result is not None else MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
+        input_tokens=12_000, output_tokens=3_000,
+        cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
@@ -1161,7 +1638,12 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.agents.briefing.BriefingAssembler',
                 MagicMock(return_value=briefing_instance)))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
-                MagicMock(return_value=MagicMock())))
+                MagicMock(
+                    return_value=MagicMock(
+                        prices=orch_prices if orch_prices is not None else {},
+                    ),
+                    side_effect=orch_config_side_effect,
+                )))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
@@ -1240,6 +1722,20 @@ class TestRunArchitectEval:
         )
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['plan_quality'] is not None
+
+        # Amendment (reviewer test-coverage): a judge that RAISES must not
+        # fabricate spend — no invocation credited, no cost, and the cell's
+        # cost_usd is the architect's own spend alone (the harness's default
+        # invoke_agent mock reports cost_usd=1.23). A regression that moved
+        # judge_invocations=1 above the raise, or invented a cost inside the
+        # except block, would previously go unnoticed here.
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+        # ...but the raise must not look identical to a judge that was
+        # SKIPPED either: it is recorded so the cell reads "spend unknown",
+        # not silently judge-free.
+        assert 'judge:raised' in (result.metrics['invocation_error'] or '')
 
     async def test_architect_timeout_maps_to_timeout_outcome(self):
         # A hung architect invoke surfaces as TimeoutError — what asyncio.wait_for
@@ -1568,6 +2064,598 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
+#
+# run_architect_eval built its EvalMetrics from the architect's OWN spend
+# only, discarding the plan judge's opus/effort=max invocation cost entirely
+# — every architect cell persisted judge_cost_usd=0.0. judge_cost_usd is a
+# SUBSET of cost_usd, not disjoint (metrics.py:69-71), so the cell's cost_usd
+# must become architect spend + judge spend, with judge_cost_usd as the
+# subset breakdown — mirroring the implementer path's existing semantics
+# (metrics.py:597-598 / workflow.py:7872-7875).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectCellRecordsJudgeSpend:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_judge_spend_recorded_and_folded_into_cell_cost(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            judge_return=PlanQualityVerdict(
+                plan_quality=0.77, per_criterion={}, reasoning='good',
+                cost_usd=0.42,
+            ),
+        )
+
+        # The RETURNED result...
+        assert result.metrics['judge_cost_usd'] == pytest.approx(0.42)
+        assert result.metrics['judge_invocations'] == 1
+        # ...the SUBSET invariant: architect spend (1.23, the harness default)
+        # PLUS the judge spend, never the architect spend alone.
+        assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+        # ...and what was actually PERSISTED via save_result, not just what
+        # the function happens to return.
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['judge_invocations'] == 1
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+
+
+def _token_agent_result(input_tokens, output_tokens, *, cost_usd: float = 1.23):
+    """A REAL ``AgentResult`` carrying explicit token counts.
+
+    Real, not a MagicMock, because the ``int | None`` "provider did not report"
+    shape is exactly what these tests pin — a MagicMock cannot express a
+    genuine ``None`` on an attribute the runner reads.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=True,
+        output='done',
+        cost_usd=cost_usd,
+        duration_ms=4567,
+        turns=3,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+@pytest.mark.asyncio
+class TestArchitectCellStampsTokenUsageAndProxySignal:
+    """Task 3656 step-1: the architect cell must record the run's TOKEN USAGE
+    and its PROXY signal, not leave all three at their dataclass defaults.
+
+    These are the three inputs :func:`~orchestrator.evals.metrics.resolve_cost_usd`
+    needs to resolve cost provenance per Invariant P5. Without them the
+    price-table path is unreachable on the architect side no matter what the
+    resolver is asked, so they are pinned BEFORE the resolution itself
+    (step-5). Every assertion checks the PERSISTED cell as well as the returned
+    result — the persisted JSON is what ``report.py`` and an operator read.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high',
+            role='architect', **kw,
+        )
+
+    async def test_reported_token_counts_are_stamped(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(12_000, 3_000),
+        )
+
+        assert result.metrics['input_tokens'] == 12_000
+        assert result.metrics['output_tokens'] == 3_000
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 12_000
+        assert persisted['output_tokens'] == 3_000
+
+    async def test_unreported_token_counts_persist_as_zero_not_none(self):
+        """``AgentResult`` declares both ``int | None``; a provider that did not
+        report must persist an honest ``0``, never a ``None`` that would poison
+        the arithmetic in ``resolve_cost_usd`` (and ``json`` a bare null into a
+        field the report layer treats as an int)."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(None, None),
+        )
+
+        assert result.metrics['input_tokens'] == 0
+        assert result.metrics['output_tokens'] == 0
+        assert result.metrics['input_tokens'] is not None
+        assert result.metrics['output_tokens'] is not None
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+        # Same ``int | None`` contract for the cache counts (this AgentResult
+        # leaves both at their None default).
+        assert persisted['cache_read_tokens'] == 0
+        assert persisted['cache_create_tokens'] == 0
+
+    async def test_cache_tokens_and_turns_are_stamped(self):
+        """The REST of the token profile ``collect_metrics`` stamps.
+
+        These price nothing, but a native Claude run is cache-read dominated:
+        a cell reporting 12k input / 3k output beside a zeroed cache block
+        reads as a far smaller run than it was, so the persisted evidence must
+        be symmetric with the implementer path's (reviewer: completeness).
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cache_read_tokens'] == 48_000
+        assert persisted['cache_create_tokens'] == 6_000
+        assert persisted['turns_used'] == 9
+        # output_tokens ÷ that leg's own duration — the identical formula
+        # collect_metrics uses, over the same duration workflow_duration_ms
+        # carries.
+        assert persisted['workflow_duration_ms'] == 4567
+        assert persisted['tokens_per_second'] == pytest.approx(
+            round(3_000 / (4567 / 1000), 2),
+        )
+        assert result.metrics['cache_read_tokens'] == 48_000
+
+    async def test_zero_duration_cell_reports_zero_tokens_per_second(self):
+        """A timed-out cell has no duration to divide by — 0.0, not a
+        ZeroDivisionError that would lose the whole cell."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            invoke_side_effect=TimeoutError(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['tokens_per_second'] == 0.0
+        assert persisted['turns_used'] == 0
+        assert result.metrics['tokens_per_second'] == 0.0
+
+    async def test_proxied_candidate_is_flagged_local(self):
+        """``ANTHROPIC_BASE_URL`` set == a PROXIED endpoint, the signal Invariant
+        P5 keys on to stop trusting the CLI's own cost figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is True
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is True
+
+    async def test_native_candidate_is_not_flagged_local(self):
+        """Today's shape (``architect-opus-max`` / ``architect-fable-max``):
+        native cloud, no proxy, so the CLI cost stays trustworthy."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is False
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is False
+
+
+_PROXY_ENV = {'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}
+
+
+@pytest.mark.asyncio
+class TestArchitectCellResolvesCostProvenance:
+    """Task 3656 step-5: the architect cell's cost must be RESOLVED through
+    :func:`~orchestrator.evals.metrics.resolve_cost_usd`, not copied from the
+    raw CLI figure with an UNVERIFIED ``cost_source='cli'`` dataclass default.
+
+    Invariant P5: a PROXIED endpoint's CLI cost figure is untrustworthy, so a
+    proxied architect candidate must land on the price table (or the defined,
+    LOUD fallback) rather than keeping the proxy's number. ``collect_metrics``
+    (the implementer path) has resolved through this seam since task 2820;
+    ``run_architect_eval`` bypassed it entirely.
+
+    The plan judge is held to ZERO spend throughout (the harness's default
+    ``PlanQualityVerdict`` carries ``cost_usd=0.0``) so these cases isolate the
+    ARCHITECT component — composing the two-component label is step-7's.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    async def test_native_candidate_keeps_the_cli_figure_verbatim(self):
+        """REGRESSION PIN for every architect cell that has already landed.
+
+        ``architect-opus-max`` / ``architect-fable-max`` are native cloud
+        (``env_overrides={}``) and unlisted in the price table, so
+        ``resolve_cost_usd`` takes its ``not is_local_model`` branch and returns
+        ``(cli_cost_usd, 'cli')`` VERBATIM. Both the figure and the label must
+        be byte-identical to today's — the change bites only a PROXIED
+        candidate, and turns today's UNVERIFIED 'cli' into a DERIVED one.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23)
+        assert result.metrics['cost_source'] == 'cli'
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    async def test_priced_proxied_candidate_uses_the_price_table(self):
+        """A proxied candidate whose model IS listed must be priced from the
+        table, NOT from the proxy's own (wrong) CLI figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        expected = (1_000_000 * 0.30 + 500_000 * 1.20) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        # Emphatically NOT the raw proxied CLI figure.
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'price_table'
+
+    async def test_unpriced_proxied_candidate_warns_and_uses_defined_fallback(
+        self, caplog,
+    ):
+        """A proxied candidate with NO price entry degrades to the DEFINED
+        ``_FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
+        number (the loud-over-silent-degradation norm)."""
+        from orchestrator.evals.metrics import _FALLBACK_PRICE
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+                orch_prices={},
+            )
+
+        # Import the constant rather than hardcoding 2.0/8.0, so a future rate
+        # change updates this expectation instead of leaving a stale magic
+        # number (the single-home discipline of task 2459).
+        expected = (
+            1_000_000 * _FALLBACK_PRICE['input_per_1m']
+            + 500_000 * _FALLBACK_PRICE['output_per_1m']
+        ) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'unpriced_proxy'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'unpriced_proxy'
+
+        warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'No configured price for proxied-endpoint model' in r.message
+        ]
+        assert warnings, (
+            'Expected the LOUD unpriced-proxy WARNING from '
+            'orchestrator.evals.metrics; got '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_orch_config_never_built_still_lands_a_cell(self):
+        """The price table lives on the eval orch config, which is built INSIDE
+        the try — so a harness crash before it is bound must leave an explicit
+        ``None`` the resolver tolerates, never an ``UnboundLocalError`` /
+        ``AttributeError`` that loses the whole cell.
+
+        That path never invoked the architect (0 tokens, $0.00), so no price
+        table could have changed the number anyway.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_config_side_effect=RuntimeError('config build exploded'),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        # The cell LANDED — marked and excluded, not lost.
+        assert persisted['cap_tainted'] is True
+        assert 'harness_error' in (persisted['invocation_error'] or '')
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        # A concrete label, not merely "some member of the vocabulary": nothing
+        # was spent, so the resolution is skipped and the documented 'cli'
+        # default stands (reviewer: an `in {the whole vocabulary}` check cannot
+        # fail, so it pinned nothing).
+        assert persisted['cost_source'] == 'cli'
+        assert result.metrics['cap_tainted'] is True
+
+    async def test_zero_spend_proxied_cell_does_not_warn_about_pricing(
+        self, caplog,
+    ):
+        """A cell that spent NOTHING has no provenance to resolve.
+
+        The timeout / harness-error / pre-invoke-cap paths never bind
+        ``result``, so they reach the resolution with 0 tokens and $0.00.
+        Resolving anyway would fire the LOUD unpriced-proxy WARNING for spend
+        that never happened on EVERY timed-out proxied cell — training
+        operators to ignore the warning that matters — and would label a $0.00
+        figure 'unpriced_proxy' as though the degradation were real. The
+        loud-over-silent norm is about REAL degradation (reviewer: log-noise).
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                invoke_side_effect=TimeoutError(),
+                orch_prices={},
+            )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+        assert persisted['cost_source'] == 'cli'
+        assert result.metrics['cost_source'] == 'cli'
+        assert not [
+            r for r in caplog.records
+            if 'No configured price for proxied-endpoint model' in r.message
+        ], (
+            'A $0.00 / 0-token cell must not emit the unpriced-proxy '
+            f'degradation WARNING; got {[r.message for r in caplog.records]}'
+        )
+
+
+@pytest.mark.asyncio
+class TestArchitectCellCostSourceIsComposed:
+    """Task 3656 step-7: the cell's ``cost_usd`` is a TWO-COMPONENT sum
+    (architect spend + plan-judge spend), so its single ``cost_source`` must
+    not silently describe two differently-sourced components.
+
+    Only the ARCHITECT component is resolved. The plan judge is always a
+    native-cloud opus call — ``judge_plan_quality`` takes neither the
+    candidate's model nor its ``env_overrides`` — so its CLI figure is
+    trustworthy by construction, and re-resolving it against the candidate's
+    price table would price opus tokens at a vLLM rate. The label therefore
+    COMPOSES (``metrics.compose_cost_source``): agreement → that source,
+    disagreement with judge dollars actually in the sum → ``'mixed'``.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    def _spending_judge(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        return PlanQualityVerdict(
+            plan_quality=0.77, per_criterion={}, reasoning='good', cost_usd=0.42,
+        )
+
+    async def test_price_table_architect_plus_cli_judge_reads_mixed(self):
+        """A price-table architect component beside a CLI judge component: the
+        figure is the RESOLVED architect cost plus the judge's CLI cost, and the
+        label says the two disagree rather than claiming either one."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.90 + 0.42)
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['cost_source'] == 'mixed'
+        assert result.metrics['cost_source'] == 'mixed'
+
+    async def test_todays_native_shape_with_a_spending_judge_stays_cli(self):
+        """REGRESSION PIN: both components are CLI-sourced, so a spending judge
+        must NOT tip today's architect cells into 'mixed'. Keeps every landed
+        result and ``TestArchitectCellRecordsJudgeSpend`` byte-identical."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert result.metrics['cost_source'] == 'cli'
+
+    async def test_judge_skipped_labels_the_architect_component_alone(self):
+        """An unscorable plan SKIPS the judge (``_create_plan_stub`` is the
+        header-only artifact ``create_plan`` writes), so no judge dollars enter
+        the sum and the label describes the architect component alone — NOT
+        'mixed', which would announce a blend that never happened."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_create_plan_stub(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        mocks['judge'].assert_not_called()
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.0)
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        assert result.metrics['cost_source'] == 'price_table'
+
+
+@pytest.mark.asyncio
+class TestArchitectRunnerJudgeCostReadIsDefensive:
+    """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
+    spend on a judge-skipped branch, and an unreadable verdict field must
+    degrade gracefully rather than crash the cell or mis-attribute the
+    failure to "the judge raised" (the judge DID run and DID answer; only
+    its cost figure is unreadable).
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    # -- (a) NO FABRICATED SPEND on every judge-skipped branch ----------------
+    # Each of these branches already asserts ``mocks['judge'].assert_not_called()``
+    # elsewhere in this file; here the pin is on the COST fields specifically —
+    # a judge that never ran must never leave a nonzero judge_cost_usd/
+    # judge_invocations behind, and the cell's cost_usd must equal the
+    # ARCHITECT's own spend for that branch, nothing more.
+
+    async def test_cap_tainted_branch_records_architect_spend_only(self):
+        """Cap landed right after ``create_plan``: header-only stub, tainted."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_stub_with_steps([]),
+            arch_result=_cap_agent_result(),
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        # _cap_agent_result() itself spends $0.00 — no fabricated judge
+        # dollars riding along with a refusal that burned nothing.
+        assert result.metrics['cost_usd'] == pytest.approx(0.0)
+
+    async def test_cap_refusal_with_a_plan_records_architect_spend_only(self):
+        """Cap landed MID-run, after a real plan with steps had landed."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_cap_agent_result(),
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['cost_usd'] == pytest.approx(0.0)
+
+    async def test_healthy_stepless_plan_records_architect_spend_only(self):
+        """Architect ran fine (no cap) but produced nothing worth judging."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_success=True,
+        )
+        mocks['judge'].assert_not_called()
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['judge_invocations'] == 0
+        # No arch_result override here — the harness's default architect
+        # mock reports cost_usd=1.23, and that must be the WHOLE cell cost.
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    # -- (b) an unreadable or nonsensical verdict.cost_usd must not damage
+    #    the cell ------------------------------------------------------------
+
+    @pytest.mark.parametrize('bad_verdict', [
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None,
+            ),
+            id='missing-cost_usd-field',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=None,
+            ),
+            id='cost_usd-is-None',
+        ),
+        # Amendment (reviewer robustness): a READABLE but NON-FINITE or
+        # negative cost_usd is just as dangerous as a missing one —
+        # `arch_cost_usd + judge_cost_usd` would otherwise poison the cell's
+        # cost_usd with NaN/Infinity (which json.dump emits as bare,
+        # non-standard tokens) or a nonsense negative total, and NaN
+        # propagates through every downstream report.py mean for the whole
+        # config row.
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('nan'),
+            ),
+            id='cost_usd-is-nan',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=float('inf'),
+            ),
+            id='cost_usd-is-infinite',
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                plan_quality=0.77, per_criterion={}, reasoning='r',
+                invocation_error=None, cost_usd=-3.5,
+            ),
+            id='cost_usd-is-negative',
+        ),
+    ])
+    async def test_unreadable_verdict_cost_degrades_the_field_not_the_cell(
+        self, bad_verdict, caplog,
+    ):
+        """A legacy/monkeypatched verdict lacking a readable, or carrying a
+        nonsensical, ``cost_usd``.
+
+        Must not crash the cell (``arch_cost_usd + verdict.cost_usd`` when the
+        field is ``None`` raises ``TypeError`` today, outside any try/except),
+        must not lose the fact that the judge WAS called, and must not log
+        "plan judge raised" — that warning means the judge invocation itself
+        failed, which is false here: the judge ran and answered fine, only
+        this ONE field on its verdict is unreadable or nonsensical (NaN,
+        Infinity, negative).
+        """
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            judge_return=bad_verdict,
+        )
+
+        mocks['judge'].assert_awaited_once()
+        # The judge's real answer survives...
+        assert result.metrics['plan_quality'] == 0.77
+        # ...the unreadable cost degrades to 0.0, never a fabricated number...
+        assert result.metrics['judge_cost_usd'] == 0.0
+        # ...but the invocation itself is NOT lost: the judge DID run.
+        assert result.metrics['judge_invocations'] == 1
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+        assert not any(
+            'plan judge raised' in r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

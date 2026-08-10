@@ -21,11 +21,16 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client / httpx / live models, so every
-seam is ALWAYS faked in this module's own test suite; the deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network.
+--project shared``) has no MCP client and no live models, so every seam is
+ALWAYS faked in this module's own test suite; the deterministic core
+(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
+manifestation matrix, census-state advance, codebook lifecycle transforms,
+report rendering) is unit-tested with no network. Note that httpx IS
+available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
+what keep the suite off the network, not an absent HTTP client: an
+un-faked poster would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -43,6 +48,7 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import functools
 import json
@@ -54,7 +60,7 @@ import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
@@ -66,13 +72,33 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as scripts/audit_combine_gate_marker_loss.py:74-84 and
+# scripts/repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329), with
+# parents[2] rather than parent.parent because census.py sits one directory
+# deeper (scripts/legibility/, not scripts/). Unconditional -- NOT inside the
+# `__main__` guard above -- because the `shared.cap_markers` import it enables
+# is module-level, so it must resolve under pytest and package import too.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
 import codebook  # noqa: E402
 import coder  # noqa: E402
-import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
+# The banner marker list itself lives in shared.cap_markers and is never
+# restated here -- this module only asks the question, via the predicate.
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+
+import config  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
 
@@ -340,19 +366,44 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
 # usage API assumed -- one tiny call, scan its reply for a banner)
 # ---------------------------------------------------------------------------
 
-_HEADROOM_BANNER_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "please run /login",
-    "invalid api key",
-)
-"""Case-insensitive substrings that mark a usage-limit/auth banner reply
-from the headless `claude` CLI, rather than a genuine model response."""
-
 _HEADROOM_PROBE_PROMPT = "ping"
 """The tiny probe prompt -- a cheap single round trip, not a real mining
 call. Its content doesn't matter; only whether the reply carries a banner
 marker or raises."""
+
+_VERIFY_PROBE_EVERY = 5
+"""How many clusters the default verifier adjudicates between backstop
+headroom probes (``_build_default_verify_fn``'s third, weakest detector).
+
+The trade-off this number sets: one extra trickle-tier probe per N
+clusters, against up to N-1 clusters of misattributed verdicts in the one
+residual case the cheaper detectors cannot see (a cap presenting as a
+clean-but-wrong verdict). Verification is one agentic Sonnet call per
+cluster, so a probe per cluster would be cheap but not free, and pointless
+-- the two first-cluster-accurate detectors already cover the cases where
+a cap announces itself."""
+
+
+class CensusHeadroomExhausted(Exception):
+    """Raised when a headroom limit is detected DURING a census stage.
+
+    Not an error in the census -- an external condition that makes the
+    stage's output untrustworthy. It exists so an infra failure can never
+    be laundered into a verdict: ``run_census`` catches it and defers
+    before any persistence, instead of the cap-poisoned clusters landing
+    in the codebook as ordinary rejections.
+
+    Carries the counts an operator needs to size what was interrupted:
+    *verified* clusters adjudicated before the hit, *unverified* ones left
+    (the hitting cluster plus every one never attempted).
+    """
+
+    def __init__(self, *, stage: str, reason: str, verified: int = 0, unverified: int = 0):
+        super().__init__(f"census headroom exhausted during {stage}: {reason}")
+        self.stage = stage
+        self.reason = reason
+        self.verified = verified
+        self.unverified = unverified
 
 
 @dataclass
@@ -372,8 +423,10 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
 
     No usage API is assumed to exist (PRD decision 5) -- this is a cheap
     preflight probe, not a quota lookup. The reply is scanned
-    case-insensitively for a known usage-limit/auth banner marker
-    (``_HEADROOM_BANNER_MARKERS``); a match defers. An invocation error
+    case-insensitively for a known usage-limit/auth banner marker via
+    ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
+    either means no useful model output is coming); a match defers, and
+    the reason quotes the marker that fired. An invocation error
     raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
     is also treated as a deferral -- fail-safe, never a crash, since a
     probe failure is exactly the kind of "the model isn't reachable right
@@ -385,14 +438,49 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
         return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
 
-    lowered = (reply or "").lower()
-    for marker in _HEADROOM_BANNER_MARKERS:
-        if marker in lowered:
-            return HeadroomResult(
-                ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
-            )
+    marker = looks_like_blocking_banner(reply or "")
+    if marker is not None:
+        return HeadroomResult(
+            ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
+        )
 
     return HeadroomResult(ok=True, reason=None)
+
+
+def _stage_headroom_gate(
+    invoke, *, model: str, stage: str, probe_count: list | None = None,
+) -> HeadroomResult:
+    """Re-probe headroom at a stage boundary, logging which stage asked.
+
+    Deliberately NOT a second probe implementation -- it is a thin wrapper
+    over ``preflight_headroom`` that adds the stage name to the log and
+    nothing else, so the "one tiny call, no usage API assumed" decision
+    (PRD decision 5) and its fail-safe exception handling hold identically
+    at every gate.
+
+    *probe_count* is a one-element mutable counter incremented for every
+    probe this gate spends, so the report's cost note can state what the
+    run ACTUALLY paid rather than a hardcoded literal.
+
+    Gates exist only where an unnoticed cap CORRUPTS output, not at every
+    stage transition. Today that means the preflight and this one, before
+    verification. There is deliberately NO gate before synthesis: a cap
+    there makes ``synthesize_fn`` RAISE, which propagates into ``main()``'s
+    hard-failure path and is already loud and already distinguishable from
+    a verification result -- so a gate there would only abort a run whose
+    ``verified`` list is complete and honest, discarding work that was
+    genuinely paid for. Mining is the same: a storm batch is already
+    detected and reported. Do not "complete the pattern" by adding them.
+    """
+    if probe_count is not None:
+        probe_count[0] += 1
+    result = preflight_headroom(invoke, model=model)
+    if not result.ok:
+        logger.warning(
+            "census headroom gate FAILED at the %s stage boundary: %s",
+            stage, result.reason,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -623,16 +711,24 @@ def advance_census_state(
         "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
+    # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
+    # writer -- deliberately belt-and-braces with run_census's own
+    # _ensure_output_parents, which serves a different purpose. That call
+    # buys FAIL-FAST (an un-creatable output path must cost nothing rather
+    # than a whole ~$100 mining run) and only covers run_census's four
+    # paths; this line makes the guarantee hold for EVERY caller of this
+    # function, present and future, so nobody can reintroduce the
+    # FileNotFoundError that mkstemp(dir=<missing>) raises just by writing
+    # census state from somewhere new. Idempotent, so the two do not fight.
+    os.makedirs(directory, exist_ok=True)
     fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f)
         os.replace(tmp_file, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp_file)
-        except OSError:
-            pass
         raise
 
 
@@ -936,6 +1032,13 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     )
 
 
+def _ensure_output_parents(*paths) -> None:
+    """Create the parent directory of every non-``None`` output path."""
+    for path in paths:
+        if path is not None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
 _VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
 """codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
 since codebook.py is NOT modified by this module (see the module
@@ -950,9 +1053,9 @@ already spent (reviewer_comprehensive finding #3)."""
 
 @dataclass
 class CensusOutcome:
-    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
-    preflight failed -- no further work was done) or ``"done"`` (the full
-    pipeline ran to completion)."""
+    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
+    gate failed -- NOTHING was persisted) or ``"done"`` (the full pipeline
+    ran to completion)."""
 
     status: str
     reason: str | None = None
@@ -960,6 +1063,91 @@ class CensusOutcome:
     filed_task_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
     dry_run: DryRunFiling | None = None
+
+    deferred_stage: str | None = None
+    """Which headroom gate deferred this run: ``"preflight"`` (before any
+    work) or ``"verify"`` (after mining, before or during verification).
+    Meaningful ONLY when ``status == "deferred"``; ``None`` otherwise.
+
+    Exists so the two are distinguishable by FIELD rather than by parsing
+    prose out of ``reason``. They differ in what an operator has lost: a
+    preflight defer spent nothing, a verify defer sank the mining cost.
+    Neither persisted anything, so both recover by re-running."""
+
+    unverified_clusters: int = 0
+    """How many novel clusters were left unadjudicated by a ``"verify"``
+    deferral -- the hitting cluster plus every one never attempted.
+
+    NOT a loss count: because the abort happens before
+    ``advance_census_state``, ``last_census_at`` is untouched and these
+    sightings are re-mined by the next run. It is the size of the work the
+    cap interrupted, which is what makes a defer legible next to an
+    ordinary run in which the verifier genuinely rejected everything."""
+
+
+def _defer(
+    stage: str,
+    reason: str | None,
+    *,
+    escalate_fn,
+    verified: int = 0,
+    unverified: int = 0,
+) -> CensusOutcome:
+    """Abort the census at *stage*: log loudly, escalate, return the outcome.
+
+    ONE owner of the deferral shape, so the preflight gate, the
+    stage-boundary gate and the in-verify abort cannot drift into three
+    slightly different logs/escalations/outcomes (design-invariants:
+    one mechanism, one spelling). Every caller must ``return`` this
+    directly -- a defer that keeps going and persists something is the
+    exact failure this whole guard exists to prevent.
+
+    The escalation is best-effort, matching the mass-rejection site below:
+    a raising ``escalate_fn`` must never be what turns a clean abort into
+    a crash, and the warning above it is the real signal either way.
+    """
+    reason = reason or f"headroom gate failed at the {stage} stage"
+    logger.warning("census deferred at the %s stage: %s", stage, reason)
+
+    detail = reason
+    if stage != "preflight":
+        # BOTH counts. They size the interruption from either side, which is
+        # what tells "capped on cluster 2 of 5" apart from "capped before a
+        # single cluster was adjudicated" -- the stage-boundary gate always
+        # reports 0 verified, an in-verify abort reports where it got to.
+        detail = (
+            f"{reason}\n\n"
+            f"{verified} novel cluster(s) were verified before the cap; "
+            f"{unverified} were NOT verified. Nothing was "
+            "persisted: no report, no matrix, no codebook merge, no filed "
+            "tasks, and last_census_at was NOT advanced -- so this window "
+            "WILL be re-mined and these sightings are not lost. The mining "
+            "spend for this run is sunk. Recovery is a plain re-run once "
+            "capacity returns; re-mining is idempotent (apply_coding_record "
+            "dedups sightings by session)."
+        )
+
+    try:
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=(
+                f"legibility census deferred at the {stage} stage "
+                f"({verified} cluster(s) verified, {unverified} unverified): {reason}"
+                if stage != "preflight"
+                else f"legibility census deferred: {reason}"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+        logger.warning("census: deferral escalation failed (best-effort): %s", exc)
+
+    return CensusOutcome(
+        status="deferred",
+        reason=reason,
+        deferred_stage=stage,
+        unverified_clusters=unverified,
+    )
 
 
 def run_census(
@@ -998,7 +1186,22 @@ def run_census(
     whole census: files one INFO escalation via *escalate_fn* naming the
     deferral, logs loudly, and returns immediately -- no batch is pulled
     from *batch_source*, no ``submit_fn``/``codebook.dump``/
-    ``advance_census_state`` call happens. Otherwise falls through to the
+    ``advance_census_state`` call happens.
+
+    There is a SECOND headroom gate, after mining and before ``verify_fn``
+    (``_stage_headroom_gate``, skipped when there is nothing to verify).
+    Mining is long and expensive, so a cap absent at preflight can easily
+    have arrived by the time verification starts -- and verification is
+    where an unnoticed cap goes SILENT rather than loud, because the
+    default verifier fails closed per cluster and would record every
+    cap-poisoned call as an ordinary rejection. A mid-run cap detected
+    INSIDE verification surfaces as ``CensusHeadroomExhausted`` and lands
+    on this same path. Both defer through ``_defer``, so all three aborts
+    emit an identical log/escalation/outcome shape, and all three return
+    BEFORE any persistence -- crucially before ``advance_census_state``,
+    so ``last_census_at`` is untouched and the window is re-mined. The
+    outcome's ``deferred_stage``/``unverified_clusters`` tell the two
+    apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
     split records into duplicates vs novel clusters -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
@@ -1126,17 +1329,64 @@ def run_census(
             "than bounding it; omit it entirely to verify every novel cluster"
         )
 
+    # Real probe accounting for the report's cost note. A legibility tool
+    # that under-reports its own spend -- in the very artifact an operator
+    # reads to check --max-verify-clusters -- is the same defect class this
+    # pipeline exists to find. Counts THIS function's probes (the preflight
+    # below and the stage gate); the verifier's own in-verify probes are
+    # added from its reported count at the verify site.
+    probe_count = [1]
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
-        reason = headroom.reason or "headroom preflight failed"
-        logger.warning("census deferred: %s", reason)
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census deferred: {reason}",
-            detail=reason,
+        return _defer(
+            "preflight",
+            headroom.reason or "headroom preflight failed",
+            escalate_fn=escalate_fn,
         )
-        return CensusOutcome(status="deferred", reason=reason)
+
+    # Every output parent, created ONCE, here -- not at each of the four
+    # write sites below. Three reasons, in order of how much they cost when
+    # ignored:
+    #
+    # (1) FAIL-FAST. On 2026-08-03 a census of /home/leo/src/reify mined to
+    #     saturation (~12.5h, ~$100) and only THEN died on its first output
+    #     write: `[Errno 2] No such file or directory:
+    #     '/home/leo/src/reify/plans/confusion-census-2026-08-02-payloads.json'`
+    #     -- reify simply has no plans/ directory. Creating (or failing to
+    #     create) the parents before mining means an un-creatable output path
+    #     costs nothing instead of a whole mining run.
+    # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
+    #     census_state_path are four writers of the SAME run's outputs; a
+    #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
+    #     a fifth output is added. Note this covers codebook.dump and
+    #     advance_census_state too, not just the two write_text calls: both
+    #     write atomically via `tempfile.mkstemp(dir=os.path.dirname(path))`,
+    #     which raises the same FileNotFoundError on a missing directory as
+    #     write_text does. reify tripped only the plans/ pair because main()
+    #     loads its config from <root>/docs/legibility/legibility.yaml, so
+    #     that directory necessarily existed; a target reached via --config
+    #     pointing elsewhere trips the codebook/state pair identically.
+    #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
+    #     none of this was ever hit before.
+    #     This "one place" argument is honest only for run_census's OWN four
+    #     paths, so it is not the whole guard: advance_census_state also
+    #     creates its parent writer-side (mirroring trickle_state), which
+    #     covers every OTHER caller too. codebook.dump has no such
+    #     writer-side guard yet -- codebook.py sits outside this task's lock
+    #     scope -- so nightly.py's codebook.dump call remains exposed to the
+    #     same FileNotFoundError. Follow-up, not fixed here.
+    # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
+    #     at the top of run_census keeps the DEFER branch side-effect-free --
+    #     a deferred census creates no empty directories in the target
+    #     project.
+    #
+    # Creating an empty directory is not persisted census state, so the
+    # documented report -> codebook.dump -> advance_census_state ordering
+    # invariant (see this function's docstring and the comments at those
+    # three sites) is untouched by this call.
+    _ensure_output_parents(
+        report_path, codebook_path, census_state_path, dry_run_payloads_path,
+    )
 
     mining_result = mine_to_saturation(
         batch_source,
@@ -1171,10 +1421,101 @@ def run_census(
                 max_verify_clusters, deferred_count, len(novel_clusters),
             )
 
-    verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+    # Stage-boundary gate. Mining is long and expensive, so a cap that was
+    # absent at preflight can easily have arrived by now -- and the stage it
+    # guards is the one where an unnoticed cap goes SILENT rather than loud:
+    # the default verifier fails closed per cluster, so every cap-poisoned
+    # verify call would land as an ordinary rejection and the run would exit 0
+    # looking unremarkable. Guarded by `if clusters_to_verify` so a run with
+    # nothing to verify spends no probe on a stage it is about to skip.
+    if clusters_to_verify:
+        stage_headroom = _stage_headroom_gate(
+            invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
+        )
+        if not stage_headroom.ok:
+            # The reason NAMES the stage. The preflight's reason is left
+            # byte-identical to what it has always been (nothing downstream
+            # that reads it changes), so the stage name is added here, where
+            # it is new information, rather than in _defer where it would
+            # rewrite both.
+            return _defer(
+                "verify",
+                "headroom gate failed at the verify stage boundary: "
+                f"{stage_headroom.reason or 'no headroom'}",
+                escalate_fn=escalate_fn,
+                unverified=len(clusters_to_verify),
+            )
+
+    # A cap detected INSIDE verification lands here. The except must sit so
+    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
+    # compute_matrix, the codebook merge and every write -- the whole point is
+    # that nothing is persisted, so no cap-poisoned cluster is ever recorded
+    # as a verdict and last_census_at never advances past a window that was
+    # not actually adjudicated.
+    try:
+        verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+    except CensusHeadroomExhausted as exc:
+        return _defer(
+            "verify",
+            f"headroom exhausted during verification: {exc.reason}",
+            escalate_fn=escalate_fn,
+            verified=exc.verified,
+            unverified=exc.unverified,
+        )
+    # The default verifier probes internally (detectors (a)/(b)/(c)) and
+    # reports how many probes it spent, so the cost note below counts those
+    # too rather than only run_census's own two. A verify_fn that omits the
+    # key -- every fake in the tests, any custom verifier -- contributes 0,
+    # and a non-int is ignored rather than crashing a finished census over a
+    # cosmetic count.
+    reported_probes = verify_result.get("headroom_probes")
+    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
+
+    # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
+    # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
+    # detector for the class. _build_default_verify_fn fails CLOSED per
+    # cluster -- correctly, an unverifiable claim must reject rather than
+    # crash -- so ANY systemic failure (model unreachable mid-run, a
+    # different permission denial, a persistent parse failure) still
+    # presents as an ordinary all-rejected run, and the report below states
+    # zero verified clusters in the same voice it would use for a genuinely
+    # unremarkable census. "clusters were offered and NONE survived" is the
+    # observable signature of that incident, so say it out loud.
+    #
+    # Not an error and not a defer: an all-rejected run is legitimately
+    # possible, so this must not fail a census whose mining is already
+    # paid for. The escalate_fn call is wrapped because, unlike the
+    # defer-path escalation above (which returns immediately afterwards),
+    # this one sits between the mining spend and the output writes -- a
+    # raising escalate_fn must not be what discards the run's results.
+    if clusters_to_verify and not verified:
+        suspect = (
+            f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
+            "REJECTED and none survived -- suspect a systemic verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) rather "
+            "than genuinely unfounded claims. This is the observable signature of the "
+            "2026-08-03 sandbox incident, where the verify subprocess was rooted "
+            "outside the censused tree and every read was permission-denied. Check "
+            "the per-cluster 'verify failed' warnings above; a run with real findings "
+            "is being reported as an empty census if this is systemic."
+        )
+        logger.warning("%s", suspect)
+        try:
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=(
+                    f"legibility census: all {len(clusters_to_verify)} cluster(s) rejected "
+                    "-- possible systemic verifier failure"
+                ),
+                detail=suspect,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+            logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
 
@@ -1305,13 +1646,15 @@ def run_census(
 
     # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
     # total -- and the per-cluster count is precisely what an operator using
-    # --max-verify-clusters reads this line to check.
+    # --max-verify-clusters reads this line to check. headroom-probe is the
+    # run's REAL probe spend: this function's preflight and stage gate PLUS
+    # whatever the verifier reported spending on its own in-verify detectors.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
         f"{config.models.census_verify} verify={len(clusters_to_verify)}, "
         f"{config.models.census_synthesis} synthesis=1, "
-        f"{config.models.trickle} headroom-probe=1"
+        f"{config.models.trickle} headroom-probe={probe_count[0]}"
     )
     if storm_batch_indices:
         cost_note += (
@@ -1523,10 +1866,17 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
 def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads.
-    Absolute paths only -- this function never sets a subprocess cwd, so a
-    relative path in the model's own tool calls would resolve against
-    whatever directory the CLI process happens to inherit. Asks for an
-    OBSERVATION, never a diagnosis (codebook lesson
+
+    The CLI subprocess this prompt is delivered to runs with its cwd set to
+    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: ``claude -p``
+    SANDBOXES tool access to the cwd tree, so a verifier launched from
+    anywhere else has every Read/Bash against this tree permission-denied,
+    with no interactive prompt to approve (proven 2026-08-03). The
+    absolute-paths instruction below is retained as belt-and-braces on top
+    of that scoping, not as a substitute for it.
+
+    Asks for an OBSERVATION, never a diagnosis (codebook lesson
     guards-assert-unverified-diagnoses)."""
     return (
         "You are the periodic-census verifier for the dark-factory "
@@ -1557,7 +1907,13 @@ def _synthesis_prompt(verified: list) -> str:
     )
 
 
-def _build_default_verify_fn(project_root: str, invoke):
+def _build_default_verify_fn(
+    project_root: str,
+    invoke,
+    *,
+    headroom_probe=None,
+    probe_every: int = _VERIFY_PROBE_EVERY,
+):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (default ``coder._invoke_cli`` --
     headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
@@ -1565,22 +1921,241 @@ def _build_default_verify_fn(project_root: str, invoke):
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
-    prompt is designed to elicit)."""
+    prompt is designed to elicit).
+
+    That fail-closed default is correct, and it is also what made the
+    2026-08-03 sandbox gap SILENT: with the CLI subprocess rooted outside
+    the censused tree, every permission-denied verifier read became an
+    ordinary per-cluster rejection, so a whole census mass-rejected without
+    a single error surfacing. What keeps the default honest rather than
+    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    *project_root* -- a rejection then means the claim really could not be
+    verified, not that the verifier could not see the tree.
+
+    Scoping the cwd removed one CAUSE, not the class: a model that goes
+    unreachable mid-run, a different permission denial, or persistently
+    unparseable verdicts all still land here as ordinary rejections. So
+    ``run_census`` additionally DETECTS the signature -- clusters offered,
+    none verified -- and says so loudly rather than quietly reporting an
+    empty census.
+
+    **The cap case is carved out of the fail-closed default.** A usage cap
+    is an infra failure, not a verdict about a claim, and must never be
+    laundered into one -- that is the same silent-mass-rejection class the
+    2026-08-03 incident above describes, arriving by a different route and
+    invisible to the all-rejected detector whenever a cap lands partway
+    through (some clusters verified, so the total-wipeout signature never
+    fires). When *headroom_probe* is supplied, two detectors fire at the
+    FIRST corrupted cluster:
+
+    (a) a reply that FAILED TO PARSE as a verdict carries a blocking banner,
+        and ONE re-probe then confirms no capacity. Banner-matching CONTENT
+        may only TRIGGER a probe, never itself decide that the account is
+        capped -- which makes (a) structurally identical to (b): content or
+        exception triggers, the probe decides.
+
+        The scan is confined to the parse-failure path because **a reply that
+        parses into a verdict IS a verdict and must never be re-read as a
+        banner.** The loose OR-substring marker list is safe on the ``"ping"``
+        -> ``"pong"`` preflight probe precisely because that reply is fixed
+        and contentless; it is unsafe the moment it is pointed at arbitrary
+        model output, because a verify reply is a model-authored
+        ``{"verified":..., "reason":...}`` whose reason legitimately QUOTES the
+        cluster under adjudication -- and this repo's codebook is dominated by
+        clusters ABOUT usage/weekly limits, so the markers match ordinary
+        healthy content. Scanning pre-parse aborted the run on those clusters,
+        and because the abort precedes ``advance_census_state`` the next run
+        re-mined the same window and aborted again: a permanent census stall
+        plus a stream of false "the account is capped" escalations. The
+        probe-confirmation closes the residual half of that class, where the
+        model ignores the prompt's STRICT-JSON instruction and answers in
+        prose about a cap-themed cluster.
+
+        Splitting on parse success loses no detection -- a real CLI cap banner
+        is plain prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
+        ``CoderParseError``, so all of them still reach the scan. That premise
+        is load-bearing, so it is pinned directly rather than asserted here:
+        ``test_every_real_cli_cap_message_fails_to_parse_as_a_verdict``
+        parametrizes the whole corpus, and the detector's own test does too --
+        a newly-observed phrasing that happened to embed a ``{...}`` fragment
+        would parse, bypass this detector and go red there. The probe is
+        reliable in BOTH directions here: ``preflight_headroom`` folds any
+        probe exception into ``HeadroomResult(ok=False)``, so a genuinely
+        capped account confirms whether its probe returns a banner or raises.
+        Cost is bounded and paid only on a path that has ALREADY failed to
+        parse AND matched a marker -- one trickle-tier probe, against a
+        cap-themed cluster permanently stalling the census.
+    (b) a per-cluster invocation exception triggers ONE re-probe. No
+        headroom means ``CensusHeadroomExhausted``, and the hitting cluster
+        is NOT recorded as rejected. Headroom still available means the
+        claim really was unverifiable, and it rejects exactly as before --
+        the fail-closed default is narrowed to non-cap causes, not removed.
+
+    (c) every *probe_every* clusters, a backstop probe. Ordered LAST because
+        it is the weakest: it is the only detector that can miss the first
+        corrupted cluster, letting up to ``probe_every - 1`` clusters be
+        fail-closed rejected before the cap is noticed -- which is the defect
+        above reproduced in miniature. It earns its place by covering the one
+        residual case neither (a) nor (b) can see: a cap presenting as a
+        clean-but-wrong verdict, where the reply parses fine and nothing
+        raises. It is a BACKSTOP for (a) and (b), never the primary, and a
+        counter alone would not be an acceptable design.
+
+        The cost trade-off, stated plainly: one extra trickle-tier probe per
+        *probe_every* clusters, against up to ``probe_every - 1`` clusters of
+        misattributed verdicts in that residual case. No probe is spent after
+        the last cluster, where it would guard a stage already over.
+
+    All three are no-ops without a *headroom_probe* -- literally, now that (a)
+    confirms rather than assumes -- so every existing call site keeps its
+    current behaviour exactly. Production reach is unaffected: ``main()``
+    wires ``headroom_probe=functools.partial(preflight_headroom,
+    verify_invoke, model=cfg.models.trickle)``, so every real run keeps full
+    detection.
+
+    Two properties of the probe seam itself, both owned by the ``_probe()``
+    wrapper below rather than restated at the three call sites:
+
+    * **It is counted.** The result dict carries ``headroom_probes`` -- how
+      many probes this verifier actually spent -- which ``run_census`` folds
+      into the report's cost note. Reported through the return value rather
+      than a counter passed in, because the seam is wired by ``main()`` and a
+      counter would need a second wiring site nothing forces anyone to
+      connect. A caller that ignores the key loses only the count.
+    * **It never raises.** *headroom_probe* is injected and carries no
+      exception contract, so a raising seam is folded into
+      ``HeadroomResult(ok=False)`` exactly as ``preflight_headroom`` folds an
+      invocation error -- a deferral, not an exception escaping into
+      ``main()``'s exit-1 path after the whole mining spend.
+    """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
-        for cluster in clusters:
+        # Every probe THIS verifier spends, reported back in the result dict
+        # so run_census's cost note can state the run's real probe spend.
+        # It rides the return value rather than a mutable counter passed in
+        # because the probe seam is wired by main(), not by run_census: a
+        # counter would need a second wiring site that nothing forces anyone
+        # to connect, and an unwired counter is exactly how the cost note
+        # came to under-report in the first place.
+        probes = [0]
+
+        def _probe():
+            """Call the injected probe seam: counted, and never raising.
+
+            *headroom_probe* is an injected seam with no exception contract.
+            Production wires ``preflight_headroom``, which folds any failure
+            into ``HeadroomResult(ok=False)`` -- but a seam that RAISES here
+            would escape ``_verify_fn``, sail past ``run_census``'s
+            ``except CensusHeadroomExhausted`` and land in ``main()``'s
+            hard-failure path: exit 1 plus a traceback escalation, after the
+            whole mining spend, on a path that has ALREADY failed once.
+            Matching ``preflight_headroom``'s own fail-safe stance turns that
+            into the deferral this guard exists to produce.
+            """
+            if headroom_probe is None:
+                # Unreachable -- every call site below is guarded by
+                # `headroom_probe is not None`. Stated rather than asserted so
+                # a future caller that forgets the guard gets the DOCUMENTED
+                # no-probe behaviour (the detectors are no-ops; nothing says
+                # the account is capped) and spends no probe, instead of a
+                # TypeError escaping mid-verification.
+                return HeadroomResult(ok=True, reason=None)
+            probes[0] += 1
+            try:
+                return headroom_probe()
+            except Exception as exc:  # noqa: BLE001 - a raising probe defers, never crashes the census
+                return HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
+
+        for index, cluster in enumerate(clusters):
+            # The hitting cluster plus everything never attempted. Computed
+            # identically at every raise site so the counts cannot disagree
+            # about what "unverified" means.
+            remaining = len(clusters) - index
             prompt = _verify_prompt(cluster, project_root=project_root)
             try:
                 raw = invoke(prompt, model)
-                verdict = coder.parse_coder_output(raw)
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
+                # (b) One re-probe, only on a path that has already failed.
+                if headroom_probe is not None:
+                    probe = _probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify invocation failed and the headroom re-probe "
+                                f"reports no capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                logger.warning(
+                    "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
+                )
+                rejected.append(cluster)
+                continue
+
+            try:
+                verdict = coder.parse_coder_output(raw)
+            except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
+                # (a) Only a reply that failed to parse as a verdict is
+                # eligible for the banner scan. A parsed verdict is a verdict,
+                # however cap-themed the cluster it adjudicates. And even
+                # here the marker only TRIGGERS: a probe decides.
+                marker = looks_like_blocking_banner(raw or "")
+                if marker is not None and headroom_probe is not None:
+                    probe = _probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify reply failed to parse and carries a banner "
+                                f"marker {marker!r}; headroom probe confirms no "
+                                f"capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                    logger.warning(
+                        "census: verify reply for cluster %r carries banner marker %r "
+                        "but the headroom probe reports capacity available -- "
+                        "treating it as an ordinary unparseable verdict",
+                        cluster.get("title"),
+                        marker,
+                    )
                 logger.warning(
                     "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
                 )
                 rejected.append(cluster)
                 continue
             (verified if verdict.get("verified") else rejected).append(cluster)
-        return {"verified": verified, "rejected": rejected, "fixed": []}
+
+            # (c) The backstop. Guarded on `remaining > 1` so no probe is
+            # spent after the last cluster, where it would guard a stage
+            # already over.
+            if (
+                headroom_probe is not None
+                and probe_every > 0
+                and (index + 1) % probe_every == 0
+                and remaining > 1
+            ):
+                probe = _probe()
+                if not probe.ok:
+                    raise CensusHeadroomExhausted(
+                        stage="verify",
+                        reason=(
+                            "headroom backstop probe after "
+                            f"{index + 1} cluster(s) reports no capacity: "
+                            f"{probe.reason or 'no headroom'}"
+                        ),
+                        verified=len(verified),
+                        unverified=remaining - 1,
+                    )
+        return {
+            "verified": verified,
+            "rejected": rejected,
+            "fixed": [],
+            "headroom_probes": probes[0],
+        }
 
     return _verify_fn
 
@@ -1609,9 +2184,12 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
     result via ``census_trigger._extract_tool_result`` (reused rather than
     reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
+    codebase). ``httpx`` is imported lazily so importing this module for its
+    unit-tested pure core never needs it, and so the tests can substitute a
+    stub for the real POST -- not for availability, since httpx is a direct
+    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
+    runs under ``uv run --project shared``. Mirrors
+    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
     import httpx
 
     response = httpx.post(
@@ -1730,11 +2308,11 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _build_stage_invokes(cfg):
+def _build_stage_invokes(cfg, *, project_root):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
     carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
     (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget).
+    own budget) and each scoped to *project_root* as its subprocess cwd.
 
     Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
     census stage calls its invoke as ``invoke(prompt, model)`` with two
@@ -1743,14 +2321,50 @@ def _build_stage_invokes(cfg):
     ``mining_invoke`` also backs the headroom probe (``run_census`` routes
     both through its single ``invoke`` param).
 
+    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
+    alone. VERIFY is where the gap was proven fatal (fleet session
+    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
+    directs the model to read the target tree, and ``claude -p`` sandboxes
+    tool access to its cwd tree, so censusing a project from some other
+    directory permission-denied every verifier read. Scoping only verify
+    would nonetheless leave mining and synthesis silently rooted in
+    whatever directory the operator launched from — an asymmetry with no
+    defensible reason that a later reader would file as a bug. Binding all
+    three makes "the census subprocess runs inside the censused project" a
+    uniform invariant instead of a verify-only patch.
+
+    That uniformity is NOT free, and the cost belongs on the record.
+    Mining and synthesis take no tool action, but their cwd is still
+    observable: ``claude -p`` assembles context from the directory it runs
+    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
+    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
+    censused project therefore prepends THAT project's CLAUDE.md to every
+    mining call — and mining is both the highest-volume stage (hundreds of
+    calls) and the dominant cost of a ~$100 census — and can fire that
+    project's session hooks inside the census subprocess. It is still the
+    right trade: reading the censused project's own conventions is if
+    anything more correct for mining, and the alternative is two stages
+    silently rooted in an arbitrary directory. But if the added per-call
+    context ever measures material, the lever is an explicit
+    ``--settings``/``--strict-mcp-config``-style flag on the mining and
+    synthesis partials — NOT un-scoping their cwd, which would restore the
+    asymmetry this paragraph exists to rule out.
+
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
     monkeypatching ``coder._invoke_cli`` in tests takes effect.
     """
+    cwd = str(project_root)
     return (
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        ),
     )
 
 
@@ -1865,7 +2479,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    project_root = Path(args.project_root)
+    # Resolved, not used raw: --project-root defaults to "." and is routinely
+    # passed relative. An unresolved relative root would make the stage cwd
+    # binding below vacuous (cwd="." IS the launcher's cwd — exactly the bug
+    # that binding exists to close) and would silently falsify
+    # _verify_prompt's own "ABSOLUTE paths only" contract, since it
+    # interpolates str(project_root) straight into the prompt. One resolve()
+    # at the CLI boundary makes the prompt text, the subprocess cwd and all
+    # four output paths name the same absolute tree.
+    project_root = Path(args.project_root).resolve()
+
+    # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
+    # somewhere downstream. Now that project_root is also the stage
+    # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
+    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # deliberately folds ANY probe exception into HeadroomResult(ok=False).
+    # Without this check `census --project-root /typo --config <real one>`
+    # would exit 0 with "census deferred: headroom probe invocation
+    # failed: ..." plus an INFO escalation: an operator typo wearing the
+    # exact costume of a usage-limit defer, on every subsequent run. A
+    # non-existent root is never a deferral -- it is a bad argument.
+    if not project_root.is_dir():
+        print(
+            f"census: --project-root {args.project_root!r} resolves to "
+            f"{project_root}, which is not an existing directory",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path = (
         Path(args.config) if args.config
         else project_root / "docs" / "legibility" / "legibility.yaml"
@@ -1877,7 +2518,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 
@@ -1911,7 +2552,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Each census stage gets its OWN claude-CLI subprocess timeout; see
     # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+        cfg, project_root=project_root,
+    )
 
     # One escalate_fn closure shared by BOTH consumers: run_census's
     # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
@@ -1925,7 +2568,17 @@ def main(argv: list[str] | None = None) -> int:
                 cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
             ),
             invoke=mining_invoke,
-            verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
+            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+            # verifier it guards (so it fails exactly when the verifier would)
+            # but on the cheap trickle tier, matching every other headroom
+            # gate -- one probe implementation, one model tier, four sites.
+            verify_fn=_build_default_verify_fn(
+                str(project_root),
+                verify_invoke,
+                headroom_probe=functools.partial(
+                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                ),
+            ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
             escalate_fn=escalate_fn,
@@ -1960,7 +2613,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if outcome.status == "deferred":
-        print(f"census: deferred -- {outcome.reason}")
+        # The FIELDS, not only the prose. The two defer flavours read much the
+        # same in `reason` but cost an operator completely different things: a
+        # preflight defer spent nothing, a verify defer sank the whole mining
+        # spend and left N clusters unadjudicated (re-mined next run, never
+        # lost). Printing neither hides that from the person watching the run.
+        print(
+            f"census: deferred -- stage={outcome.deferred_stage} "
+            f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
+        )
         return 0
 
     if outcome.dry_run is not None:

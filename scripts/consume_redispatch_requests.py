@@ -64,7 +64,7 @@ import sys
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Identify ourselves explicitly on `initialize`. The TaskInterceptor derives an
 # actor class from the MCP client identity, so a nightly automated mutator of
@@ -134,8 +134,22 @@ class Request:
     path: str
     mtime: float
     task_id: int | None = None
-    cls: str | None = None
-    action: str | None = None
+    # Same treatment as ``action`` below, for the same reason: load_request
+    # rejects any body whose class is absent from CLASS_ACTION, so a request
+    # that can be acted on carries a known class, and LEGAL_STATUSES.get()
+    # keyed on it no longer has to accept None. The empty default is likewise
+    # not a member of LEGAL_STATUSES, so the "no legal-status scope known"
+    # branch behaves exactly as it did for None.
+    cls: str = ''
+    # NOT Optional, and defaulted like ``evidence`` below rather than to None:
+    # load_request only populates this after checking the body's action against
+    # the fixed CLASS_ACTION mapping, so on any request that can be acted on it
+    # is a known action string. A skipped request keeps the empty default,
+    # which is not a member of ACTION_TARGET_STATUS or ACTION_APPLIERS either,
+    # so guard_row's and apply_request's defensive "unknown action" branches
+    # behave exactly as they did for None. Typing it Optional instead forced
+    # `str | None` into every dict lookup keyed on it.
+    action: str = ''
     verdict: str | None = None
     evidence: str = ''
     skip_reason: str | None = None
@@ -299,7 +313,7 @@ class McpClient:
         self._timeout = timeout
         self._session_id: str | None = None
 
-    def __enter__(self) -> 'McpClient':
+    def __enter__(self) -> McpClient:
         # No session id on the FIRST request: the MCP streamable-HTTP contract
         # requires `initialize` to be sent session-less. A STATEFUL server 404s
         # "Session not found" if a client invents its own id here. The
@@ -469,7 +483,7 @@ def _parse_timestamp(value):
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 
