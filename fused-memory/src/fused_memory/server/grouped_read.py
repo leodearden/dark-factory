@@ -433,11 +433,19 @@ async def group_search_results(
         parent_base = (hit_by_id.get(parent_id) or resolved.get(parent_id)) if parent_id else None
         child_meta = getattr(hit, 'metadata', None) if parent_id else None
         if parent_id and _suppress_child(child_meta, parent_base, block_by_id.get(parent_id)):
+            # _suppress_child's UNRESOLVABLE-PARENT carve-out already returned
+            # False for a None parent_base; restated so the checker sees it too.
+            assert parent_base is not None
             target_id, base, parent_unresolved = parent_id, parent_base, False
         else:
             # Not a child, or a child a carve-out keeps: it stays a top-level
-            # hit in its own right.
-            target_id, base = getattr(hit, 'id', None), hit
+            # hit in its own right.  A hit with no usable str id can be neither
+            # deduped nor grouped (mirroring the isinstance guards above), so it
+            # takes a per-position key that cannot collide with a real id —
+            # two id-less hits must never collapse into a single entry.
+            hit_id = getattr(hit, 'id', None)
+            target_id = hit_id if isinstance(hit_id, str) else f'\x00no-id:{index}'
+            base = hit
             parent_unresolved = bool(parent_id) and parent_base is None
         score = getattr(hit, 'relevance_score', 0.0)
         existing = entries.get(target_id)

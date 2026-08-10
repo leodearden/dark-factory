@@ -460,7 +460,7 @@ class TestNeverSuppressCarveOuts:
         ])
         hits = [
             _result(_CANONICAL_ID, 'the canonical claim', 0.9, metadata={'kind': 'canonical'}),
-            _child_result(_AMEND_1, 0.8, **{CONTESTED_METADATA_KEY: True}),
+            _child_result(_AMEND_1, 0.8, AMENDMENT_KIND, **{CONTESTED_METADATA_KEY: True}),
         ]
 
         grouped = await group_search_results(service, _PROJECT_ID, hits)
@@ -639,6 +639,7 @@ class TestChildReadFaultContainment:
 
         block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
 
+        assert block is not None
         assert block == {'children_unavailable': True, 'error_type': 'TimeoutError'}, (
             f'Expected the explicit unavailability marker, got {block!r}'
         )

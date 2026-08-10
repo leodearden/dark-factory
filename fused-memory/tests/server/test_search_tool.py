@@ -206,7 +206,7 @@ def _service_with_a_parented_canonical(**search_kwargs) -> AsyncMock:
     def _count(*, project_id: str, filters: dict):
         if filters.get('parent_id') != _CANONICAL_ID:
             return 0
-        return {'sighting': 3, 'amendment': 2}.get(filters.get('kind'), 5)
+        return {'sighting': 3, 'amendment': 2}.get(filters.get('kind', ''), 5)
 
     def _scroll(*, project_id: str, filters: dict, limit: int = 1000):
         return rows[:limit]

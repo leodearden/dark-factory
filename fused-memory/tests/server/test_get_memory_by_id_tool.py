@@ -416,7 +416,7 @@ def _grouped_read_service(record: dict, *, total: int = 5) -> AsyncMock:
     def _count(*, project_id: str, filters: dict):
         if filters.get('parent_id') != _CANONICAL_ID:
             return 0
-        return {'sighting': 3, 'amendment': 2}.get(filters.get('kind'), total)
+        return {'sighting': 3, 'amendment': 2}.get(filters.get('kind', ''), total)
 
     def _scroll(*, project_id: str, filters: dict, limit: int = 1000):
         return rows[:limit]
