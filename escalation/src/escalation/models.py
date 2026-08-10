@@ -248,7 +248,23 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # dashboard's effective_benign/_origin_block/_workflow_block count it as
 # classified+stamped but bucket it into neither, preserving the evidence the
 # old 'benign' mis-label destroyed.
-RESOLUTION_CLASSES: frozenset[str] = frozenset({'benign', 'actionable', 'moot-terminal-subject'})
+#
+# 'stale-strand' (task 3172) is the DISTINCT, non-benign stamp
+# EscalationQueue.dismiss_all_pending writes for a level-0 escalation that had
+# already been pending for >= strand_age_secs when the orchestrator restarted
+# and swept it.  Like 'moot-terminal-subject' it is deliberately neither
+# 'benign' nor 'actionable' so a strand stays auditable after the sweep that
+# closed it.  It EXTENDS this vocabulary rather than forking a second
+# classification scheme (task 3172: coordinate, do not fork).
+#
+# The origin incident is what this member exists to make legible: esc-5189-7
+# had been pending 20h58m with a workflow parked on it, while esc-5685-1 had
+# been pending ~90s — a genuine strand and an ordinary restart artifact.  The
+# old single 'benign' stamp made the two records indistinguishable, so the
+# only durable trace of a 20h strand read as routine restart noise.
+RESOLUTION_CLASSES: frozenset[str] = frozenset(
+    {'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'}
+)
 
 
 @dataclass
