@@ -7,8 +7,10 @@ import fcntl
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -46,6 +48,35 @@ def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', l
 def _submit_escalation(queue: EscalationQueue, esc: Escalation) -> None:
     """Write an escalation directly, bypassing the callback."""
     queue.submit(esc)
+
+
+def _aged_escalation(
+    esc_id: str,
+    *,
+    age_secs: float,
+    task_id: str = '1',
+    level: int = 0,
+    severity: str = 'blocking',
+) -> Escalation:
+    """An escalation explicitly stamped *age_secs* in the past.
+
+    Every age-aware test pins its own timestamps and passes its own explicit
+    threshold, so no assertion here depends on the production default value of
+    ``orphan_l0_timeout_secs`` (task 3172).
+    """
+    esc = _make_escalation(esc_id, task_id=task_id, level=level)
+    esc.severity = severity
+    esc.timestamp = (datetime.now(UTC) - timedelta(seconds=age_secs)).isoformat()
+    return esc
+
+
+_PENDING_SECS_RE = re.compile(r'\[pending_secs=(\d+)\b')
+
+
+def _pending_secs(resolution: str) -> int | None:
+    """Parse the pending-age token out of a dismissal resolution, or None."""
+    m = _PENDING_SECS_RE.search(resolution)
+    return int(m.group(1)) if m else None
 
 
 class TestDismissAllPending:
@@ -126,7 +157,12 @@ class TestDismissAllPending:
         assert dismissed_esc.resolution == 'User dismissed earlier'  # unchanged
 
     def test_resolution_message_preserved(self, tmp_path: Path):
-        """Resolution message is preserved on dismissed escalations."""
+        """Resolution message is preserved on dismissed escalations.
+
+        The caller's message is now a PREFIX rather than the whole string:
+        per-record pending age is always recorded alongside it (task 3172
+        ASK A), so a swept record carries how long it had been waiting.
+        """
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_make_escalation('esc-1-1'))
 
@@ -135,7 +171,8 @@ class TestDismissAllPending:
 
         esc = queue.get('esc-1-1')
         assert esc is not None
-        assert esc.resolution == msg
+        assert esc.resolution.startswith(msg)
+        assert _pending_secs(esc.resolution) is not None
 
     def test_mixed_statuses_only_pending_dismissed(self, tmp_path: Path):
         """With a mix of pending/resolved/dismissed, only pending ones are dismissed."""
@@ -159,6 +196,104 @@ class TestDismissAllPending:
         assert queue.get('esc-3-1').status == 'resolved'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').status == 'dismissed'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').resolution == 'dismissed already'  # type: ignore[union-attr]
+
+
+class TestDismissAllPendingAgeAware:
+    """dismiss_all_pending() records pending age and stamps long strands distinctly.
+
+    The origin incident (task 3172): a restart swept esc-5189-7, pending 20h58m
+    with a workflow parked on it, using the same fixed resolution string and the
+    same 'benign' class as esc-5685-1, pending ~90s.  The two records were
+    indistinguishable afterwards, so a 20h strand read as ordinary restart
+    noise.  These tests pin that they are now distinguishable.
+    """
+
+    STRAND_AGE_SECS = 75480.0  # 20h58m — esc-5189-7
+    FRESH_AGE_SECS = 90.0  # ~90s — esc-5685-1
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(
+            _aged_escalation(
+                'esc-5189-7', age_secs=self.STRAND_AGE_SECS, task_id='5189', severity='blocking'
+            )
+        )
+        queue.submit(
+            _aged_escalation('esc-5685-1', age_secs=self.FRESH_AGE_SECS, task_id='5685')
+        )
+        queue.submit(_aged_escalation('esc-9-1', age_secs=self.STRAND_AGE_SECS, task_id='9', level=1))
+        return queue
+
+    def test_returns_plain_int_count_of_dismissed_l0s(self, tmp_path: Path):
+        """Return type stays a plain int — the L1 is not counted."""
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert type(count) is int
+        assert count == 2
+
+    def test_level_1_escalation_untouched(self, tmp_path: Path):
+        """A 20h-old L1 is still preserved across the age-aware sweep."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        l1 = queue.get('esc-9-1')
+        assert l1 is not None
+        assert l1.status == 'pending'
+        assert l1.resolution_class is None
+
+    def test_strand_and_fresh_record_get_distinguishable_classes(self, tmp_path: Path):
+        """THE user-observable signal: the 20h strand and the 90s artifact differ."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution_class == 'stale-strand'
+        assert fresh.resolution_class == 'benign'
+        assert strand.resolution_class != fresh.resolution_class
+
+    def test_effective_benign_reads_both_stamps_verbatim(self, tmp_path: Path):
+        """The dashboard classifier reads each stamp as stamped, not inferred."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert effective_benign(strand) == ('stale-strand', 'stamped')
+        assert effective_benign(fresh) == ('benign', 'stamped')
+
+    def test_both_resolutions_keep_caller_message_and_record_pending_age(self, tmp_path: Path):
+        """Every dismissed L0 keeps the caller's message and gains its own age."""
+        queue = self._seed(tmp_path)
+        msg = 'Auto-dismissed: orchestrator restarted — stale from prior run'
+
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution.startswith(msg)
+        assert fresh.resolution.startswith(msg)
+        assert abs(_pending_secs(strand.resolution) - self.STRAND_AGE_SECS) < 5  # type: ignore[operator]
+        assert abs(_pending_secs(fresh.resolution) - self.FRESH_AGE_SECS) < 5  # type: ignore[operator]
+
+    def test_resolution_records_severity_alongside_age(self, tmp_path: Path):
+        """The durable blocked-ness signal travels with the swept record."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        assert strand is not None
+        assert 'severity=blocking' in strand.resolution
 
 
 class TestDismissAllPendingResilience:
