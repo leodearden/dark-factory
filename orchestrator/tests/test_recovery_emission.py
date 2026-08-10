@@ -11,7 +11,6 @@ import json
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # S3 — the pure payload primitives
 # ---------------------------------------------------------------------------
@@ -67,9 +66,10 @@ class TestRenderShape:
     """``render_shape`` mirrors ``task_ground_truth._shape``'s element order."""
 
     def test_renders_the_five_tuple_in_shape_order(self):
+        from shared.task_statuses import TaskStatus
+
         from orchestrator.recovery_emission import render_shape
         from orchestrator.task_ground_truth import BranchStateKind
-        from shared.task_statuses import TaskStatus
 
         # _RECOVERY row (f): IN_PROGRESS, no claimant, ON_MAIN, open escalation.
         assert render_shape(
@@ -109,9 +109,10 @@ class TestRenderShape:
         ) == 'in-progress|false|on_main|true|ran'
 
     def test_output_is_stable_and_lowercase(self):
+        from shared.task_statuses import TaskStatus
+
         from orchestrator.recovery_emission import render_shape
         from orchestrator.task_ground_truth import BranchStateKind
-        from shared.task_statuses import TaskStatus
 
         first = render_shape(TaskStatus.BLOCKED, True, BranchStateKind.EXISTS_OFF_MAIN, False, None)
         second = render_shape('blocked', True, 'exists_off_main', False, None)
