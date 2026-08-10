@@ -2318,3 +2318,76 @@ class TestDryRunTranscriptArchival:
                 f'{sorted(p for p in archive_root.rglob("*")) if archive_root.exists() else "(absent)"}'
             )
             assert archived.read_bytes() == state.payloads[sid]
+
+    @pytest.mark.asyncio
+    async def test_archival_disabled_writes_nothing(self, tmp_path):
+        """The fleet-wide off switch must be honoured by EVERY producer.
+
+        ``TranscriptArchiveConfig.enabled`` is documented as "disable
+        transcript archival entirely — the _invoke producer hook short-circuits
+        and never calls archive_task_transcripts" (config.py:1075-1082). That
+        contract is only true fleet-wide if this producer consults the same
+        knob, rather than being true-for-two-of-three.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(return_value=0)) as mock_archive,
+        ):
+            await run_dry_run_unblock(
+                task_id='3273',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(enabled=False),
+                ),
+            )
+
+        # The transcript really was produced — so a passing assertion below is
+        # a genuine short-circuit, not an empty run with nothing to archive.
+        assert len(state.sessions) == 1
+
+        # Pin the SHORT-CIRCUIT itself, not merely an empty result: the
+        # disabled path must not even spin up the archiver's worker thread.
+        assert not mock_archive.called, (
+            f'archive_task_transcripts must not be called when '
+            f'transcript_archive.enabled is False; got calls: '
+            f'{mock_archive.call_args_list}'
+        )
+
+        # …and it leaves zero on-disk trace. _archive_one only ever mkdirs
+        # per-file, so a genuine short-circuit means the archive root is never
+        # even created.
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        assert not archive_root.exists(), (
+            f'Expected no archive root at all with archival disabled, found: '
+            f'{sorted(p for p in archive_root.rglob("*"))}'
+        )
+
+        # Disabling archival must not change teardown.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
