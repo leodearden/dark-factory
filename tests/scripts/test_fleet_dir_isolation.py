@@ -49,6 +49,7 @@ NOTHING here writes to, or asserts the content of, the real
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -248,10 +249,42 @@ class TestSharedVocabularyIsReachableFromBothRoots:
         in ``sys.modules``.  An import of ``drain_check`` or
         ``orchestrator.fleet_heartbeat`` here would break collection for a whole
         subproject, loudly but far from the edit that caused it.
+
+        BEHAVIOURAL, not textual.  This deliberately imports the module in a
+        clean interpreter and inspects ``sys.modules`` rather than scanning the
+        source for forbidden substrings.  The substring form was tried and
+        removed: it let ``from orchestrator.fleet_heartbeat import
+        DEFAULT_FLEET_DIR`` — the single most likely real regression, and the
+        exact line the comments here forbid — through untouched, while
+        false-positiving on PROSE (the comment at the FLEET_DIR literal reads
+        "not an import of drain_check…" and passed only by the accident of the
+        word "of").  Asking sys.modules catches every spelling, cannot be
+        broken by rewording a comment, and cannot confuse a docstring mention
+        for a real import.
         """
-        source = (REPO_ROOT / 'df_pytest_isolation.py').read_text(encoding='utf-8')
-        for forbidden in ('import drain_check', 'from drain_check', 'import orchestrator'):
-            assert forbidden not in source, forbidden
+        probe = '\n'.join((
+            'import sys',
+            'import df_pytest_isolation',
+            'roots = {"drain_check", "orchestrator", "shared"}',
+            'leaked = sorted(m for m in sys.modules if m.split(".")[0] in roots)',
+            'if leaked:',
+            '    sys.exit("df_pytest_isolation pulled in: " + ", ".join(leaked))',
+        ))
+        # cwd=REPO_ROOT so the bare `import df_pytest_isolation` resolves: the
+        # module sits at the repo root, and `python -c` puts cwd on sys.path.
+        result = subprocess.run(
+            [sys.executable, '-c', probe],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, (
+            f'df_pytest_isolation must import with nothing but the stdlib and '
+            f'pytest, so every subproject venv can import it.\n'
+            f'exit={result.returncode}\nstdout={result.stdout}\n'
+            f'stderr={result.stderr}'
+        )
 
 
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
