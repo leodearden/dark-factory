@@ -160,13 +160,19 @@ def matches_collection_predicate(value: object) -> bool:
 
 
 def iter_transcript_files(root: Path | str) -> Iterator[Path]:
-    """Yield every ``.jsonl.gz`` under *root*, RECURSIVELY, in sorted order.
+    """Yield every ``.jsonl`` under *root*, RECURSIVELY, in sorted order.
 
     THE WALK MUST RECURSE. Measured 2026-08-08 (prerequisite P3): the archive
     nests its leaves two directories below the root —
-    ``<root>/<task_id>/<project-dir>/<uuid>.jsonl.gz``, 710 task dirs, 5201
-    leaves, 551 MB. A top-level ``*.jsonl.gz`` glob returns ZERO files, which
-    would produce a silently empty corpus that looks like a clean run.
+    ``<root>/<task_id>/<project-dir>/<uuid>.jsonl``, 710 task dirs, 5201
+    leaves. A top-level ``*.jsonl`` glob returns ZERO files, which would
+    produce a silently empty corpus that looks like a clean run.
+
+    The archive is stored PLAIN since task 3618; the suffix carries no ``.gz``
+    and the reader does no decompression. A residual ``.jsonl.gz`` left by an
+    interrupted migration is therefore not matched here at all — deliberately,
+    since counting it would mean decompressing it, which is the coupling 3618
+    removed.
 
     A missing root yields nothing rather than raising: an archive that has been
     rotated away is a legitimate state for a caller that only wants a count.
@@ -174,7 +180,7 @@ def iter_transcript_files(root: Path | str) -> Iterator[Path]:
     root = Path(root)
     if not root.is_dir():
         return
-    yield from sorted(path for path in root.rglob('*.jsonl.gz') if path.is_file())
+    yield from sorted(path for path in root.rglob('*.jsonl') if path.is_file())
 
 
 class Candidate(NamedTuple):
@@ -199,7 +205,7 @@ class WalkReport:
     offending paths, not just a shrug.
     """
 
-    #: Every ``.jsonl.gz`` the recursive walk found.
+    #: Every ``.jsonl`` the recursive walk found.
     files_walked: int = 0
     #: Those it read to the end. ``files_walked - files_read == len(unreadable)``.
     files_read: int = 0
@@ -208,12 +214,12 @@ class WalkReport:
 
 
 def iter_tool_use_blocks(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield the ``tool_use`` blocks of one gzipped transcript, streaming.
+    """Yield the ``tool_use`` blocks of one transcript, streaming.
 
     Delegates the read to ``legibility.inventory.iter_json_lines`` — THE
-    low-level streaming transcript reader, already gz-transparent — rather than
-    re-rolling one here. Everything this function still does is a STRUCTURAL
-    shape check on already-parsed JSON.
+    low-level streaming transcript reader — rather than re-rolling one here.
+    Everything this function still does is a STRUCTURAL shape check on
+    already-parsed JSON.
 
     That reader's contract, which callers here depend on: a blank or corrupt
     LINE degrades silently, an unreadable FILE raises ``OSError``. The split is
@@ -485,7 +491,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # archive layout produces when the walker forgets to recurse, and an
         # empty corpus would otherwise read as a clean snapshot.
         print(
-            f'ERROR: no .jsonl.gz found under {args.archive_root} — '
+            f'ERROR: no .jsonl found under {args.archive_root} — '
             'nothing written (check --archive-root, and that the walk recurses)',
             file=sys.stderr,
         )
