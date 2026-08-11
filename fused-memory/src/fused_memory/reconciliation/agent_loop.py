@@ -376,6 +376,21 @@ class AgentLoop:
                 # already inert on turn 1 since cli_invoke only reads it inside
                 # `if invoke_kwargs.get('resume_session_id'):`.
                 resume_delivers_prompt=True,
+                # Robustness caveat (not a live bug): resume_delivers_prompt=True
+                # makes this a "live continuation" caller per invoke_with_cap_retry's
+                # own contract (cli_invoke.py:1600-1603, 1703-1706, 2071-2074) — its
+                # original_prompt (the bare _serialize_tool_results(...) string, with
+                # no conversation context) is only meaningful *inside* the resumed
+                # session. If that session is lost, the gated retry loop's
+                # rebuild_prompt hook is what reconstructs a self-contained prompt for
+                # the fresh session it starts instead; this call passes none. That is
+                # harmless today ONLY because AgentLoop's sole production caller
+                # (verify.py) never supplies a real usage_gate, so this call always
+                # takes the gate-less fast path (cli_invoke.py:1507) and never reaches
+                # the resume-to-fresh fallback, auth-failover, or zero-output-wedge
+                # branches that would invoke rebuild_prompt. If AgentLoop is ever
+                # constructed with a real usage_gate, add a rebuild_prompt hook here
+                # at the same time.
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
                 # switched to a neutral cwd. This is a multi-turn agent that
                 # actively adjudicates memory-vs-codebase discrepancies with
