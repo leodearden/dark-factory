@@ -70,6 +70,13 @@ from fused_memory.services.completion_claim_gate import (
     verify_claims,
 )
 
+# UNRESOLVABLE is re-exported deliberately. The ticket probe below returns THIS
+# sentinel object — identity-compared by completion_claim_gate._verify_ticket —
+# when the registry cannot be consulted at all, which is what keeps a missing
+# tickets.db from being reported as a fabrication accusation. Tests bind it from
+# this module so they assert against the same object the sweep actually passes.
+__all__ = ['UNRESOLVABLE']
+
 # --------------------------------------------------------------------------- #
 # Category recovery from source_description
 # --------------------------------------------------------------------------- #
@@ -544,6 +551,123 @@ this script was written. This is the join that yields the esc-3085-1
 instance-(2) shape — episode ``02090224-7bc9-4485-9291-6748e1042ac9`` ->
 edge ``7dbf12cf-9251-4674-b396-8eefdf651d1c``.
 """
+
+
+class EpisodeReader:
+    """Reads the ``Episodic`` population of one graph over ``GRAPH.RO_QUERY``.
+
+    Constructed either with an explicit *graph* handle (the tests pass a
+    double) or with a uri + graph name, in which case a ``falkordb.asyncio``
+    client is opened lazily on first use.
+
+    ``falkordb.FalkorDB`` — the DB client — is categorically distinct from
+    ``graphiti_core.driver.falkordb_driver.FalkorDriver``, the graphiti driver
+    whose ``__init__`` fire-and-forgets ``build_indices_and_constraints()``.
+    This class must never construct the latter: that would make a script whose
+    entire premise is "read-only" issue a write before it read anything.
+    """
+
+    def __init__(
+        self,
+        *,
+        graph: Any | None = None,
+        graph_name: str = DEFAULT_PROJECT,
+        uri: str | None = None,
+    ) -> None:
+        self._graph = graph
+        self.graph_name = graph_name
+        self.uri = uri
+
+    @staticmethod
+    def assert_read_only_command(command: str) -> None:
+        """Raise unless *command* is :data:`RO_COMMAND`.
+
+        A client-side guard layered on the server-side one. The server would
+        refuse a write anyway; this makes the violation a typed error at the
+        seam that owns the guarantee, rather than a redis error surfacing three
+        layers down where a reader would not connect it to this claim.
+        """
+        if command != RO_COMMAND:
+            raise RuntimeError(
+                f'this sweep may only issue {RO_COMMAND}, refused {command!r} '
+                f'— it is strictly read-only'
+            )
+
+    def _resolve_graph(self) -> Any:
+        """Return the graph handle, opening a client on first use.
+
+        The import is local so that merely importing this module — which the
+        tests do, with a double in hand — never requires falkordb to be
+        installed or a store to be running.
+        """
+        if self._graph is None:
+            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
+
+            client = (
+                FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
+            )
+            self._graph = client.select_graph(self.graph_name)
+        return self._graph
+
+    @staticmethod
+    def _cell(row: list[Any], index: int) -> str:
+        """Read column *index* defensively.
+
+        A FalkorDB ``RETURN e.<prop>`` over a node lacking that property yields
+        NULL, which lands here as ``None``. Degrading to ``''`` keeps one odd
+        historical row from aborting a sweep whose whole job is to survey odd
+        historical rows; the empty value is visible in the report either way.
+        """
+        if index >= len(row):
+            return ''
+        value = row[index]
+        return '' if value is None else str(value)
+
+    async def fetch_population(self, *, limit: int | None = None) -> list[CorpusRecord]:
+        """Return every ``Episodic`` node in this graph, projected.
+
+        One query, no ``WHERE`` — the category filter cannot run in Cypher
+        because the category is not a stored property, so it runs in Python
+        over the label recovered from ``source_description``.
+        """
+        self.assert_read_only_command(RO_COMMAND)
+        query = EPISODE_CYPHER
+        if limit is not None:
+            query = f'{query} LIMIT {int(limit)}'
+        graph = self._resolve_graph()
+        response = await graph.ro_query(query)
+        rows = getattr(response, 'result_set', response) or []
+        population: list[CorpusRecord] = []
+        for row in rows:
+            source_description = self._cell(row, 3)
+            population.append(
+                CorpusRecord(
+                    uuid=self._cell(row, 0),
+                    kind='episode',
+                    text=self._cell(row, 5),
+                    source_description=source_description,
+                    category=parse_category(source_description),
+                    project_id=self._cell(row, 2) or self.graph_name,
+                    created_at=self._cell(row, 4),
+                    name=self._cell(row, 1),
+                )
+            )
+        return population
+
+    async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
+        """Return the uuids of RELATES_TO edges extracted FROM *episode_uuid*.
+
+        These are the actual harm artefacts: in esc-5603-1 one false sentence
+        fanned out into five false edges, so naming only the source episode
+        would understate what is in the graph.
+        """
+        self.assert_read_only_command(RO_COMMAND)
+        graph = self._resolve_graph()
+        response = await graph.ro_query(
+            DERIVED_EDGE_CYPHER, {'episode_uuid': episode_uuid}
+        )
+        rows = getattr(response, 'result_set', response) or []
+        return tuple(self._cell(row, 0) for row in rows)
 
 
 def _build_parser() -> argparse.ArgumentParser:

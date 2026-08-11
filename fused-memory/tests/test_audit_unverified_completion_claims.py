@@ -6,13 +6,14 @@ sys.path pollution — mirrors the pattern in test_audit_found_on_main_provenanc
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import re
 import types
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -163,9 +164,9 @@ class TestParseCategory:
         assert parse_category('   ') is None
 
     def test_in_scope_categories(self) -> None:
-        assert IN_SCOPE_CATEGORIES == frozenset(
+        assert frozenset(
             {'temporal_facts', 'decisions_and_rationale'}
-        )
+        ) == IN_SCOPE_CATEGORIES
 
 
 class TestScanRecords:
@@ -658,7 +659,7 @@ class TestEpisodeReader:
         expected = 'MATCH (e:Episodic) RETURN ' + ', '.join(
             f'e.{field}' for field in PROJECTED_FIELDS
         )
-        assert EPISODE_CYPHER == expected
+        assert expected == EPISODE_CYPHER
 
     async def test_rows_map_onto_corpus_records(self) -> None:
         graph = _FakeGraph(rows=[_episode_row()])
@@ -717,10 +718,29 @@ class TestEpisodeReader:
     async def test_reader_constructs_no_graphiti_driver(self) -> None:
         """graphiti_core's FalkorDriver.__init__ fire-and-forgets
         build_indices_and_constraints() — a WRITE. This class must never
-        construct it (build_corpus.py:706-712's explicit warning)."""
-        source = SCRIPT_PATH.read_text()
-        assert 'FalkorDriver' not in source
-        assert 'graphiti_core' not in source
+        construct it (build_corpus.py:706-712's explicit warning).
+
+        Asserted STRUCTURALLY over the AST, not as a substring scan: the module
+        deliberately NAMES FalkorDriver in a docstring to warn against it (as
+        build_corpus.py does), and a substring test cannot tell a warning from
+        a construction — it would punish documenting the hazard.
+        """
+        tree = ast.parse(SCRIPT_PATH.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith('graphiti_core'), (
+                        f'imports graphiti_core: {alias.name}'
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                assert not (node.module or '').startswith('graphiti_core'), (
+                    f'imports from graphiti_core: {node.module}'
+                )
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, 'id', None) or getattr(func, 'attr', None)
+                assert name != 'FalkorDriver', 'constructs graphiti FalkorDriver'
+
         graph = _FakeGraph(rows=[_episode_row()])
         reader = EpisodeReader(graph=graph)
         await reader.fetch_population()
