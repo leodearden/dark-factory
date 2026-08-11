@@ -10,6 +10,8 @@ Covers:
   step-13 RED  — build_chain builds a clean chain in ONE worktree
   step-15 RED  — build_chain truncation semantics + purity (decision #4)
                  (conflict / train / merge_error reasons, empty-prefix edge)
+  step-17 RED  — "Already up to date." is a FAILURE, not a phantom link
+                 (primitive: already_up_to_date; chain: 'already_merged')
 
 Reference: ``plans/deep-merge-ahead-prd.md``.
 
@@ -512,6 +514,89 @@ class TestMergeBranchIntoWorktree:
         assert res.details
         assert res.merge_worktree == wt
         assert await _rev_parse(wt) == tip
+
+    # ── step-17: already-merged is a FAILURE, not a success ──────────────
+
+    async def test_already_merged_branch_is_not_a_success(self, git_repo: Path):
+        """A source already contained in the lane is NOT a successful merge.
+
+        ``git merge --no-ff <ref-already-an-ancestor-of-HEAD>`` prints
+        "Already up to date.", exits **rc=0**, and creates **NO commit**
+        (verified empirically: HEAD byte-identical before/after, no
+        MERGE_HEAD).  Reporting that as a success would hand back
+        ``pre_merge_sha`` as if it were this item's merge commit, breaking the
+        documented contract that ``merge_commit`` is "the stripped 40-char
+        merge sha" of a NEW merge — and ``build_chain`` would then record a
+        duplicate-sha link claiming the item landed when no merge commit for
+        it exists.
+
+        Unlike ``merge_to_main``, whose destination is a FRESH
+        ``_merge-<hex8>`` at main HEAD where the case cannot arise, this
+        method's destination is a REUSED lane whose HEAD advances with every
+        chain item — so any queued branch already contained in the lane base,
+        or merged earlier in the same chain, hits it.
+        """
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+
+        first = await git_ops.merge_branch_into_worktree(wt, '101')
+        assert first.success is True
+        tip = await _rev_parse(wt)
+        assert tip == first.merge_commit
+
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        # The load-bearing assertion: this is what makes build_chain TRUNCATE
+        # instead of recording a phantom link.
+        assert res.success is False
+        # An already-merged branch is NOT a textual conflict.
+        assert res.conflicts is False
+        # Never hand back a sha that is not a new merge commit.
+        assert res.merge_commit is None
+        # Assert the structured discriminator, NOT a substring of git's
+        # message: string-sniffing stdout would be locale- and
+        # version-fragile, and violates structured-facts-at-failure.
+        assert res.already_up_to_date is True
+        assert res.pre_merge_sha == tip
+        assert res.merge_worktree == wt
+        # The diagnostic names WHICH source was already up to date.
+        assert '101' in res.details
+
+        # Worktree untouched and still usable — nothing was started, so there
+        # is nothing to abort and the lane is not wedged.
+        assert await _rev_parse(wt) == tip
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', '-q', 'MERGE_HEAD'], cwd=wt)
+        assert rc != 0
+        nxt = await git_ops.merge_branch_into_worktree(wt, '102')
+        assert nxt.success is True
+        assert nxt.already_up_to_date is False
+        assert await _rev_parse(wt, 'HEAD^1') == tip
+
+    async def test_genuine_merge_is_not_flagged_already_up_to_date(
+        self, git_repo: Path,
+    ):
+        """Negative control: the sha-equality check must not over-trigger.
+
+        ``--no-ff`` of a NON-ancestor always creates a commit, so
+        ``post != pre`` is guaranteed on the clean path.  This pins that, so
+        the already-up-to-date check cannot silently break genuine merges.
+        """
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        pre = await _rev_parse(wt)
+
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        assert res.success is True
+        assert res.already_up_to_date is False
+        assert res.merge_commit is not None
+        assert res.pre_merge_sha == pre
+        assert res.merge_commit != res.pre_merge_sha
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1533,6 +1618,118 @@ class TestBuildChainTruncation:
         assert res.truncated_reason == 'conflict'
         # An empty result never HOLDS a lane, so a caller that skips the
         # release on the empty path cannot leak one.
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert git_ops.spec_warm_lane_pool is not None
+        assert all(
+            s == LaneState.FREE
+            for s in git_ops.spec_warm_lane_pool._lanes.values()
+        )
+        assert not snap[0].result.done()
+
+    # ── F (step-17). an ALREADY-MERGED item truncates, never phantom-links ──
+
+    async def _seed_head_containing(
+        self, git_ops: GitOps, git_repo: Path, branch: str,
+    ) -> str:
+        """Build a head merge commit that already contains *branch*'s work.
+
+        Mimics ``frozen_prefix_tip``: the base a chain stacks on is the newest
+        frozen merge commit, which can already contain a still-queued item's
+        work (a re-request, or an item the head itself landed).
+
+        Seeding materializes ``worktree_base``, which then trips
+        ``acquire_spec_lane``'s pool-storage-presence guard (``worktree_base``
+        exists but the ``.pool-root`` sentinel does not => suspected unmounted
+        mountpoint => cold fallback), silently making every warm ``_spec-``
+        lane assertion vacuous.  ``mark_pool_storage_present()`` is the
+        documented remedy (idiom at test_crash_recovery.py:69).
+        """
+        main_sha = await _rev_parse(git_repo)
+        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seeded = await git_ops.merge_branch_into_worktree(seed_wt, branch)
+        assert seeded.success is True
+        head = seeded.merge_commit
+        assert head is not None
+        await git_ops.cleanup_merge_worktree(seed_wt)
+        git_ops.mark_pool_storage_present()
+        return head
+
+    async def test_already_merged_item_truncates_without_a_phantom_link(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An item already in the base caps the chain — it never becomes a link.
+
+        All three items are textually CLEAN, so the failure shows up as the
+        phantom link itself rather than as an incidental conflict.  Before the
+        fix, ``merge_branch_into_worktree`` returned
+        ``success=True, merge_commit=<lane HEAD>`` for 102 and the loop
+        appended ``('102', sha1)`` — a duplicate-sha link claiming 102 landed
+        under 101's merge commit, which δ would then CAS-advance onto.
+        """
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+        # The head this chain stacks on ALREADY contains 102's work.
+        head = await self._seed_head_containing(git_ops, git_repo, '102')
+
+        before = await _worktree_names(git_ops)
+        acquires = _count_spec_lane_acquires(git_ops, monkeypatch)
+        merges = _spy_merges(git_ops, monkeypatch)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert [tid for tid, _ in res.links] == ['101']
+        # The finding's core: 102 is NOT recorded as a link.
+        assert '102' not in [tid for tid, _ in res.links]
+        # No duplicate-sha link — the exact shape the phantom produced.
+        assert len({sha for _, sha in res.links}) == len(res.links)
+        assert res.tip not in [sha for tid, sha in res.links if tid != '101']
+        # Benign, and DISTINCT from the 'merge_error' fault bucket.
+        assert res.truncated_at == '102'
+        assert res.truncated_reason == 'already_merged'
+        # 103 was never attempted — contiguous prefix preserved.
+        assert merges == ['101', '102']
+        assert res.lane is not None
+        await _assert_lane_clean_at(res.lane, res.tip)
+        assert await _worktree_names(git_ops) - before == {'_spec-0'}
+        assert len(acquires) == 1
+        # Purity (decision #4) holds on this route unchanged: an already-landed
+        # item still takes its normal sequential path, where
+        # `_is_genuinely_merged` renders the real verdict.
+        assert all(not r.result.done() for r in snap)
+
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_first_item_already_merged_yields_empty_and_releases_the_lane(
+        self, git_repo: Path,
+    ):
+        """The empty-result-never-holds-a-lane invariant on the new route."""
+        from orchestrator.merge_queue import build_chain
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        head = await self._seed_head_containing(git_ops, git_repo, '101')
+
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=1)
+
+        assert res.links == []
+        assert res.depth == 0
+        assert res.tip == head
+        assert res.truncated_at == '101'
+        assert res.truncated_reason == 'already_merged'
         assert res.lane is None
         assert res.lane_warm is False
         assert git_ops.spec_warm_lane_pool is not None
