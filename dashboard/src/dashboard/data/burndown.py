@@ -59,9 +59,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
     in_progress_stranded INTEGER NOT NULL DEFAULT 0,
     -- max_concurrent_tasks in force AT SNAPSHOT TIME. Nullable on purpose:
     -- NULL means "cap unknown", which is not a breach. Storing 0 instead would
-    -- read as a cap of zero and alarm on every snapshot. The cap is green-tier
-    -- hot-reloadable, so the only honest denominator for a historical row is
-    -- the cap that was in force at that instant.
+    -- read as a cap of zero and alarm on every snapshot. The cap is restart-
+    -- only (red-tier), but a burndown window spans restarts and the cap also
+    -- varies BETWEEN projects, so the only honest denominator for a historical
+    -- row is the cap that was in force at that instant.
     concurrency_cap      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
@@ -323,8 +324,9 @@ async def collect_snapshot(
                 counts = _count_zones(tasks, now_dt)
                 # One cap read per ROOT (not per task): it touches the
                 # filesystem, and the value is a per-project scalar.  Stored on
-                # the row because max_concurrent_tasks is hot-reloadable — see
-                # BURNDOWN_SCHEMA's concurrency_cap comment.
+                # the row because max_concurrent_tasks varies across restarts
+                # and across projects — see BURNDOWN_SCHEMA's concurrency_cap
+                # comment.
                 cap = read_max_concurrent_tasks(root_str)
                 if cap is not None and counts['in_progress'] > cap:
                     logger.warning(
@@ -597,8 +599,9 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
 
     **Each snapshot is judged against the cap stored on THAT snapshot**, never
     against one "current" cap applied across history.  ``max_concurrent_tasks``
-    is green-tier hot-reloadable: re-deriving a single cap would forgive a real
-    past breach after a cap raise, and invent a fictional one after a cap cut.
+    is restart-only (red-tier), but a burndown window spans restarts, so it is
+    still TIME-VARYING across the window: re-deriving a single cap would forgive
+    a real past breach after a cap raise, and invent a fictional one after a cut.
 
     Semantics:
 
@@ -606,10 +609,10 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
       is INCLUSIVE, so running exactly at capacity is healthy, not an alarm.
     * ``parity_alarm`` — ``breach_count > 0``.
     * ``parity_peak`` / ``parity_cap`` — a MATCHED PAIR read off ONE snapshot,
-      never assembled from two.  The cap is hot-reloadable, so a peak from one
-      snapshot beside a cap from another misstates the severity of the very
-      breach it is describing (50-over-40 rendered as 50-over-24), and in a
-      healthy window it manufactures a breach that never happened
+      never assembled from two.  The cap can change mid-window (a restart), so
+      a peak from one snapshot beside a cap from another misstates the severity
+      of the very breach it is describing (50-over-40 rendered as 50-over-24),
+      and in a healthy window it manufactures a breach that never happened
       (peak 33 / cap 24 printed next to ``parity_alarm: False``).
 
       The snapshot chosen is:

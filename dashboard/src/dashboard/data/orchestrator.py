@@ -179,11 +179,14 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
     """Read *project_root*'s orchestrator concurrency cap, or ``None`` if unknown.
 
     This is the burndown parity alarm's denominator. ``max_concurrent_tasks``
-    is green-tier hot-reloadable (CLAUDE.md), i.e. TIME-VARYING, so the
-    collector calls this once per snapshot and stores the answer ON the
-    snapshot row: comparing a historical in-progress census against today's
-    cap would forgive a past breach after a cap raise and invent one after a
-    cut. Callers must treat ``None`` as UNKNOWN, never as "not breaching".
+    is restart-only (red-tier: it is absent from ``config.py``'s hot-reload
+    allowlist, and the scheduler semaphore is sized once at startup), but a
+    burndown window spans restarts and the cap varies between projects, so it
+    is TIME-VARYING across the window regardless. The collector therefore calls
+    this once per snapshot and stores the answer ON the snapshot row: comparing
+    a historical in-progress census against today's cap would forgive a past
+    breach after a cap raise and invent one after a cut. Callers must treat
+    ``None`` as UNKNOWN, never as "not breaching".
 
     Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
     reuses its filename constants so the two cannot fork: the canonical
