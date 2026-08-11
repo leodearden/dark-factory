@@ -309,3 +309,180 @@ class TestStartReportResultIsUnambiguous:
         report = state.get_assembled_report('r1', 'memory_consolidator')
         assert report is not None
         assert len(report['flagged_items']) == 1
+
+
+# ---------------------------------------------------------------------------
+# step-5: the _active pointer must never be stolen by a stray repeat call
+# naming an earlier stage, but MUST be repaired when the run has no active
+# stage at all — RED (repair half) until step-6.
+# ---------------------------------------------------------------------------
+
+
+class _CountingStore:
+    """Wraps a real ReconReportStore, counting upsert_many calls.
+
+    Delegates every method to the wrapped store so persistence still
+    behaves exactly like the real thing (readback via load_all reflects
+    every write) — only upsert_many is instrumented, since that is the
+    write call under test: a pure no-op repeat start_report must trigger
+    ZERO of them, while the _active-repair repeat path must trigger
+    exactly one. Mirrors the _TripwireStore shape at
+    test_recon_report_store.py:896-931, counting instead of raising.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.upsert_many_calls = 0
+
+    def open(self):
+        self._inner.open()
+
+    def close(self):
+        self._inner.close()
+
+    def upsert_entry(self, **kwargs):
+        return self._inner.upsert_entry(**kwargs)
+
+    def upsert_many(self, rows):
+        self.upsert_many_calls += 1
+        self._inner.upsert_many(rows)
+
+    def delete_run(self, run_id):
+        self._inner.delete_run(run_id)
+
+    def load_all(self):
+        return self._inner.load_all()
+
+
+class TestStartReportActivePointerAndPersistence:
+    """_active pointer semantics and store side-effects of a repeat call."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_repeat_call_never_steals_active_pointer_from_different_stage(self):
+        state, _t = self._make_state()
+        state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        finding_one = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d1',
+            suggested_action='a', task_id='1', flag_type='f',
+        )
+        assert 'finding_id' in finding_one, finding_one
+        state.complete('r1', 'stage one summary')
+
+        state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
+        assert state._active['r1'] == 'stage_two'
+
+        before = state.get_assembled_report('r1', 'stage_one')
+
+        # Stray repeat call naming the EARLIER, now-inactive stage.
+        result = state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        assert result['already_started'] is True
+        assert state._active['r1'] == 'stage_two'  # pointer not stolen
+
+        finding_two = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d2',
+            suggested_action='a', task_id='2', flag_type='f',
+        )
+        assert 'finding_id' in finding_two, finding_two
+        # Lands in stage_two's entry (the live one), not stage_one's.
+        assert len(state._state[('r1', 'stage_two')].findings) == 1
+        assert len(state._state[('r1', 'stage_one')].findings) == 1
+
+        complete_result = state.complete('r1', 'stage two summary')
+        assert complete_result['flagged_count'] == 1
+
+        after = state.get_assembled_report('r1', 'stage_one')
+        assert after == before  # untouched by the stray call
+
+    def test_repeat_call_repairs_missing_active_pointer(self):
+        state, _t = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        finding = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d',
+            suggested_action='a', task_id='1', flag_type='f',
+        )
+        assert 'finding_id' in finding, finding
+        finding_id = finding['finding_id']
+
+        # Simulates tick() evicting the active stage, or a hydrate whose
+        # persisted rows carried no is_active=True row for this run.
+        del state._active['r1']
+        blocked = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d2',
+            suggested_action='a', task_id='2', flag_type='f',
+        )
+        assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+        result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        assert result['already_started'] is True
+        assert state._active['r1'] == 's1'  # pointer restored
+
+        resumed = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d3',
+            suggested_action='a', task_id='3', flag_type='f',
+        )
+        assert 'finding_id' in resumed, resumed
+        # Lands in the SAME preserved entry — earlier finding still present.
+        entry = state._state[('r1', 's1')]
+        assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+
+    def test_pure_noop_repeat_triggers_zero_store_writes(self, tmp_path):
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        real_store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        real_store.open()
+        try:
+            store = _CountingStore(real_store)
+            t = [0.0]
+            state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
+            state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            state.add_finding(
+                run_id='r1', severity='low', category='cat', description='d',
+                suggested_action='a', task_id='1', flag_type='f',
+            )
+            calls_before = store.upsert_many_calls
+            assert calls_before > 0  # sanity: setup really did write
+
+            # Pointer is intact (points at s1) — a pure no-op repeat.
+            result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            assert result['already_started'] is True
+
+            assert store.upsert_many_calls == calls_before  # zero NEW writes
+        finally:
+            real_store.close()
+
+    def test_repair_path_persists_and_marks_row_active(self, tmp_path):
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        real_store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        real_store.open()
+        try:
+            store = _CountingStore(real_store)
+            t = [0.0]
+            state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
+            state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            state.add_finding(
+                run_id='r1', severity='low', category='cat', description='d',
+                suggested_action='a', task_id='1', flag_type='f',
+            )
+            del state._active['r1']
+            calls_before = store.upsert_many_calls
+
+            result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            assert result['already_started'] is True
+            assert store.upsert_many_calls == calls_before + 1  # exactly one repair write
+
+            rows = [
+                r for r in real_store.load_all()
+                if r['run_id'] == 'r1' and r['stage'] == 's1'
+            ]
+            assert len(rows) == 1
+            assert rows[0]['is_active'] is True
+        finally:
+            real_store.close()
