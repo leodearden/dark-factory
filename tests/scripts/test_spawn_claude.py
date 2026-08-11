@@ -3197,3 +3197,100 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
         f"the child must still see the result file allocated for THIS spawn "
         f"({record.result_file!r}), got {captured!r}"
     )
+
+
+def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The scrub must cover the whole ``CLAUDE_SPAWN_*`` namespace, not a
+    hand-maintained list of the names known today.
+
+    CLAUDE_SPAWN_FUTURE_KNOB exists nowhere in the codebase, which is the
+    entire point: it is the only assertion that can distinguish a
+    prefix-generic ``${!CLAUDE_SPAWN_@}`` sweep from a fourth named
+    enumeration that a future launch knob would silently fall outside of.
+    Same idiom this file already applies to its OWN scrub in
+    test_base_env_scrubs_every_claude_spawn_var -- kept deliberately
+    identical so the harness-side and script-side scrubs read the same.
+
+    A real input var is poisoned alongside it so a regression that drops the
+    sweep entirely fails here too, not only in the test above.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_namespace.txt"
+    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_FUTURE_KNOB"] = "leak"
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    assert "CLAUDE_SPAWN_FUTURE_KNOB" not in captured, (
+        "the unset must be prefix-generic (${!CLAUDE_SPAWN_@}), so a var "
+        "that exists nowhere in the codebase is stripped too -- an "
+        "enumerated name list would leak every knob added after it was "
+        f"written. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in captured, (
+        f"the known input var must be stripped as well, got {captured!r}"
+    )
+
+
+def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """On a session-registry fault the child must see NO
+    CLAUDE_SPAWN_RESULT_FILE at all -- never the SPAWNER's inherited one.
+
+    This case gets its own test rather than an assertion folded into the
+    prefix-genericity one above because it is the only one that silently
+    corrupts a PARENT session's outcome record: with the registry faulted,
+    SESSION_RECORD_DIR is empty, so ``result_export`` is the empty string
+    and nothing is exported -- and before task 4015 the parent's inherited
+    value simply survived into the child, which would then dutifully write
+    its own outcome over its spawner's result.md.
+
+    Uses the same deterministic fault injection as
+    test_spawn_fail_soft_skips_result_handback_when_registry_faults: a
+    CLAUDE_FLEET_ROOT nested under a pre-existing regular file, so the
+    registry's mkdir raises NotADirectoryError rather than depending on
+    permission semantics that vary across CI users and containers.
+
+    RED if the unset were nested inside the ``if [ -n
+    "$CLAUDE_SPAWN_RESULT_FILE" ]`` / ``if [ -n "$SESSION_RECORD_DIR" ]``
+    guards, whose bodies are skipped on exactly this path: the skip path
+    must UNSET, not merely decline to set. Fail-soft must also stay
+    fail-soft -- the exit-code contract is asserted unchanged.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_namespace.txt"
+    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    parent_result = "/parent/session/result.md"
+    env["CLAUDE_SPAWN_RESULT_FILE"] = parent_result
+
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, (
+        f"a registry fault must never change the exit-code contract: "
+        f"expected 0, got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") != parent_result, (
+        "a child must never inherit its SPAWNER's result file -- it would "
+        f"overwrite the parent's outcome record. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_RESULT_FILE" not in captured, (
+        "with no record dir of its own the child must see NO result file at "
+        f"all, not a stale inherited one. Child saw: {captured!r}"
+    )
