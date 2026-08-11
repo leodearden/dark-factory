@@ -3115,6 +3115,104 @@ class FetchCacheError(RuntimeError):
     """
 
 
+def corpus_fingerprint(records: list[ArmRecord]) -> str:
+    """sha256 over what a replay must agree with the dump about.
+
+    ``(record_id, content, sorted metadata)`` — all three, because all three
+    feed retrieval: the id is the cache's join key, the content is what was
+    embedded, and the metadata is what every read transform branches on.  A
+    fingerprint over ids alone would pass cleanly through a fixture edit that
+    rewrote every body.
+
+    SORTED, so the digest answers a set question ("does the cache describe
+    THIS corpus?") rather than a sequence one.  ``materialize_arm`` is already
+    deterministically ordered, so this is never exercised by the real
+    pipeline; it is chosen so that a reordering cannot raise a false alarm
+    while every content/id/metadata change still does.
+
+    ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
+    does not depend on metadata insertion order either.
+    """
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha256()
+    for record_id, content, metadata in sorted(
+        (
+            record.record_id,
+            record.content,
+            json.dumps(record.metadata, sort_keys=True, default=str),
+        )
+        for record in records
+    ):
+        # Length-prefixed, so two different corpora cannot collide by
+        # straddling a separator that happens to occur inside a body.
+        for part in (record_id, content, metadata):
+            digest.update(f'{len(part)}:'.encode())
+            digest.update(part.encode('utf-8'))
+    return digest.hexdigest()
+
+
+def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
+    """Repo-relative path + sha256 of each fixture's CONTENT.
+
+    Deliberately not folded into :func:`fixture_provenance`, which stamps the
+    last-touching COMMIT.  The two answer different questions and the cache
+    needs both: a commit sha is the blind-authoring audit trail, but it does
+    not move when a fixture is edited in the working tree — which is exactly
+    the drift that silently invalidates a dumped cache.
+
+    Paths are reported repo-relative for the same reason
+    :func:`fixture_provenance` does it (:1852): an artifact naming somebody's
+    absolute home-directory checkout is neither reproducible nor readable by
+    anyone else.
+    """
+    import hashlib  # noqa: PLC0415
+
+    repo_root = _PACKAGE_ROOT.parent
+    rows: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw).resolve()
+        try:
+            relative = str(path.relative_to(repo_root))
+        except ValueError:
+            relative = path.name
+        rows.append({
+            'path': relative,
+            'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    return rows
+
+
+def fetch_cache_provenance(
+    *,
+    records_by_shape: dict[str, list[ArmRecord]],
+    fixtures: list[str | Path],
+    search_limit: int,
+    guard_threshold: float,
+    embedder_model: str,
+) -> dict[str, Any]:
+    """Everything a replayed report needs that the rankings do not carry.
+
+    ``guard_threshold`` and ``embedder_model`` ride along because they are the
+    only other LIVE-ONLY values that reach the report's protocol block
+    (:3264, :3297): ``resolve_guard_threshold`` navigates a real
+    ``MemoryService`` to find the threshold production would run at, and the
+    embedder model comes off the live config.  Without them a replayed report
+    is unbuildable — not merely less detailed — and defaulting either would
+    feed the threshold replay a number the store never produced.
+    """
+    return {
+        'corpus_fingerprints': {
+            shape: corpus_fingerprint(records)
+            for shape, records in sorted(records_by_shape.items())
+        },
+        'fixtures': fixture_digests(list(fixtures)),
+        'search_limit': int(search_limit),
+        'guard_threshold': float(guard_threshold),
+        'embedder_model': embedder_model,
+    }
+
+
 def _serialize_ranking(hits: list[ScoredHit]) -> list[list[Any]]:
     """One ranked list as ``[[record_id, score], ...]``, in RANK ORDER.
 
@@ -3130,17 +3228,30 @@ def _serialize_ranking(hits: list[ScoredHit]) -> list[list[Any]]:
 def fetches_to_document(
     arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
     *,
-    provenance: dict[str, Any] | None = None,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """The on-disk form of one run's fetches: a pure ranking map.
 
     *arms* maps each shape to that shape's :func:`fetch_arm` result.  Pure —
     the caller is still measuring off these same lists (``run_arm`` calls
     ``measure_arm`` twice off one fetch), so nothing here may mutate them.
+
+    *provenance* is REQUIRED, not defaulted.  A cache with no fingerprint can
+    never be loaded (:func:`_check_corpus_fingerprint` refuses it), so making
+    it optional would only move the failure to load time — i.e. to AFTER a
+    full live seeding run had already been spent producing an unusable file.
     """
+    if not provenance:
+        raise FetchCacheError(
+            'refusing to dump a fetch cache with no provenance block. Without '
+            'a per-shape corpus fingerprint the cache can never be verified '
+            'against the fixtures it is replayed over, and `load_fetches` '
+            'would refuse it — after a full seeding run had been spent '
+            'producing it. Build the block with `fetch_cache_provenance`.'
+        )
     return {
         'schema_version': FETCH_CACHE_SCHEMA_VERSION,
-        'provenance': dict(provenance or {}),
+        'provenance': dict(provenance),
         'arms': {
             shape: {
                 'queries': {
@@ -3161,7 +3272,7 @@ def dump_fetches(
     path: str | Path,
     arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
     *,
-    provenance: dict[str, Any] | None = None,
+    provenance: dict[str, Any],
 ) -> Path:
     """Write the fetch cache atomically, byte-stably.
 
@@ -3209,21 +3320,8 @@ def _rehydrate_ranking(
     return hits
 
 
-def load_fetches(
-    path: str | Path,
-    seeded_by_shape: dict[str, SeededArm],
-) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
-    """Replay a dumped run's rankings against locally materialized arms.
-
-    Returns exactly what :func:`fetch_arm` would have returned for each
-    requested shape, so ``measure_arm`` cannot tell a replay from a live run —
-    which is the point, and also why every disagreement between the cache and
-    the corpus has to raise here instead of downstream.
-
-    Iterates the CALLER's shapes, not the cache's: a cache carrying extra
-    shapes is merely wider than this run needs, but a requested shape it does
-    not carry would otherwise be measured as an arm with no queries.
-    """
+def _read_fetch_cache(path: str | Path) -> tuple[Path, dict[str, Any]]:
+    """The parsed cache document, or a named refusal."""
     target = Path(path)
     try:
         doc = json.loads(target.read_text(encoding='utf-8'))
@@ -3243,11 +3341,109 @@ def load_fetches(
             f'fetch cache at {target} is schema version {version!r}, but this '
             f'build reads version {FETCH_CACHE_SCHEMA_VERSION}.'
         )
+    return target, doc
+
+
+def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
+    """The dump's provenance block — the live-only half of a replayed report.
+
+    Separate from :func:`load_fetches` because the driver needs it BEFORE it
+    has materialized anything (``guard_threshold`` and ``embedder_model`` go
+    into the protocol block), and because reading it must not require the
+    caller to have already built every arm.
+    """
+    _, doc = _read_fetch_cache(path)
+    provenance = doc.get('provenance')
+    if not isinstance(provenance, dict):
+        raise FetchCacheError(
+            f'fetch cache at {Path(path)} carries no provenance block, so the '
+            f'guard threshold and embedder model this run was measured at are '
+            f'unknown. Defaulting either would feed the threshold replay a '
+            f'number the store never produced.'
+        )
+    return provenance
+
+
+def _check_corpus_fingerprint(
+    target: Path, provenance: dict[str, Any], shape: str, seeded: SeededArm,
+) -> None:
+    """Refuse a cache whose corpus is not the one being replayed.
+
+    The failure this exists for is silent by construction: a stale cache still
+    LOADS, it just describes records that no longer exist, and the replayed
+    report is indistinguishable from a fresh measurement.
+    """
+    cached = (provenance.get('corpus_fingerprints') or {}).get(shape)
+    if cached is None:
+        raise FetchCacheError(
+            f'fetch cache at {target} carries no corpus fingerprint for shape '
+            f'{shape!r}, so it cannot be checked against the fixtures this run '
+            f'materialized — and an unverifiable cache replayed as a '
+            f'measurement is exactly the silent staleness the fingerprint '
+            f'exists to catch. Re-dump the cache with --dump-fetches.'
+        )
+    local = corpus_fingerprint(seeded.records)
+    if cached != local:
+        raise FetchCacheError(
+            f'fetch cache at {target} was dumped against a different {shape!r} '
+            f'corpus: cached fingerprint {cached}, but the fixtures in this '
+            f'tree materialize {local} ({len(seeded.records)} records). THE '
+            f'FIXTURES MOVED — the cached rankings name records that no longer '
+            f'exist, or omit records that now do, so replaying them would '
+            f'publish a stale ranking as a fresh measurement. Re-run the '
+            f'seeding pass with --dump-fetches.'
+        )
+
+
+def load_fetches(
+    path: str | Path,
+    seeded_by_shape: dict[str, SeededArm],
+    *,
+    expect_query_ids: list[str] | None = None,
+    expect_limit: int | None = None,
+) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
+    """Replay a dumped run's rankings against locally materialized arms.
+
+    Returns exactly what :func:`fetch_arm` would have returned for each
+    requested shape, so ``measure_arm`` cannot tell a replay from a live run —
+    which is the point, and also why every disagreement between the cache and
+    the corpus has to raise HERE instead of surfacing downstream as a
+    plausible-looking table.
+
+    Iterates the CALLER's shapes, not the cache's: a cache carrying extra
+    shapes is merely wider than this run needs, but a requested shape it does
+    not carry would otherwise be measured as an arm with no queries.
+
+    *expect_query_ids* and *expect_limit* are the truncation and depth guards.
+    Both are opt-in so the pure round-trip tests can exercise the join without
+    a full query set, and both are supplied by the live driver.
+    """
+    target, doc = _read_fetch_cache(path)
+    provenance = load_fetch_provenance(path)
     cached_arms = doc.get('arms')
     if not isinstance(cached_arms, dict):
         raise FetchCacheError(
             f'fetch cache at {target} carries no "arms" block.'
         )
+
+    if expect_limit is not None:
+        cached_limit = provenance.get('search_limit')
+        if cached_limit is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} does not record the search limit it '
+                f'was fetched at, so it cannot be checked against the '
+                f'requested depth of {expect_limit}.'
+            )
+        if int(cached_limit) < int(expect_limit):
+            raise FetchCacheError(
+                f'fetch cache at {target} was fetched at limit '
+                f'{int(cached_limit)}, shallower than the requested limit '
+                f'{int(expect_limit)}. Replaying it would measure every arm '
+                f'over a {int(cached_limit)}-deep window while the report '
+                f'claimed {int(expect_limit)} — a silently DIFFERENT '
+                f'experiment, not a smaller one. (A deeper cache is fine: '
+                f'`read_path` truncates to the reader budget anyway.)'
+            )
 
     replayed: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
     for shape, seeded in seeded_by_shape.items():
@@ -3258,6 +3454,19 @@ def load_fetches(
                 f'(it carries {sorted(cached_arms)}). Measuring that arm from '
                 f'an absent cache would publish an empty ranking as a zero.'
             )
+        _check_corpus_fingerprint(target, provenance, shape, seeded)
+
+        cached_queries = block.get('queries') or {}
+        if expect_query_ids is not None:
+            missing = [q for q in expect_query_ids if q not in cached_queries]
+            if missing:
+                raise FetchCacheError(
+                    f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
+                    f'{len(missing)} of {len(expect_query_ids)} requested '
+                    f'queries have no cached ranking, e.g. {missing[:5]}. '
+                    f'Measuring the arm anyway would score it over a subset of '
+                    f'the query set while the report claimed the whole one.'
+                )
         replayed[shape] = {
             kind: {
                 key: _rehydrate_ranking(

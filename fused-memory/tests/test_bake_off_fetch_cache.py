@@ -217,6 +217,25 @@ def _fetched(queries: dict, probes: dict) -> dict:
     }
 
 
+def _provenance(mod, records_by_shape: dict, *, search_limit: int = 10,
+                guard_threshold: float = 0.85,
+                embedder_model: str = 'text-embedding-3-small') -> dict:
+    """A provenance block for hand-built arms, as the live driver would build.
+
+    Required on every dump: a cache with no per-shape corpus fingerprint can
+    never be loaded, so `dump_fetches` refuses to produce one rather than
+    letting a full seeding run be spent on an unusable file.  Its contents are
+    pinned by `TestFetchCacheProvenance` below.
+    """
+    return mod.fetch_cache_provenance(
+        records_by_shape=records_by_shape,
+        fixtures=[FIXTURES_DIR / name for name in sorted(ANCHOR_FIXTURE_SHA256)],
+        search_limit=search_limit,
+        guard_threshold=guard_threshold,
+        embedder_model=embedder_model,
+    )
+
+
 class TestFetchCacheRoundTrip:
     """`dump_fetches`/`load_fetches` preserve a `fetch_arm` result exactly.
 
@@ -238,7 +257,10 @@ class TestFetchCacheRoundTrip:
         )
 
         path = tmp_path / 'cache.json'
-        mod.dump_fetches(path, {'c_peers': fetched})
+        mod.dump_fetches(
+            path, {'c_peers': fetched},
+            provenance=_provenance(mod, {'c_peers': [r1, r2, r3]}),
+        )
         loaded = mod.load_fetches(path, {'c_peers': seeded})
 
         assert set(loaded) == {'c_peers'}
@@ -265,7 +287,10 @@ class TestFetchCacheRoundTrip:
         ranked = [(records[4], 0.9), (records[0], 0.8), (records[3], 0.7),
                   (records[1], 0.6), (records[5], 0.5), (records[2], 0.4)]
         path = tmp_path / 'cache.json'
-        mod.dump_fetches(path, {'b_grouped': _fetched({'q1': ranked}, {})})
+        mod.dump_fetches(
+            path, {'b_grouped': _fetched({'q1': ranked}, {})},
+            provenance=_provenance(mod, {'b_grouped': records}),
+        )
 
         loaded = mod.load_fetches(path, {'b_grouped': seeded})
         assert [h.record.record_id for h in loaded['b_grouped']['queries']['q1']] == \
@@ -281,7 +306,10 @@ class TestFetchCacheRoundTrip:
         seeded = _seeded('status_quo', records)
         pairs = list(zip(records, awkward, strict=True))
         path = tmp_path / 'cache.json'
-        mod.dump_fetches(path, {'status_quo': _fetched({'q1': pairs}, {})})
+        mod.dump_fetches(
+            path, {'status_quo': _fetched({'q1': pairs}, {})},
+            provenance=_provenance(mod, {'status_quo': records}),
+        )
 
         loaded = mod.load_fetches(path, {'status_quo': seeded})
         scores = [h.relevance_score for h in loaded['status_quo']['queries']['q1']]
@@ -309,6 +337,7 @@ class TestFetchCacheRoundTrip:
         path = tmp_path / 'cache.json'
         mod.dump_fetches(
             path, {'c_peers': _fetched({'q1': [(r1, 0.9)]}, {'cl1': [(r2, 0.5)]})},
+            provenance=_provenance(mod, {'c_peers': [r1, r2]}),
         )
 
         raw = path.read_text(encoding='utf-8')
@@ -332,7 +361,10 @@ class TestFetchCacheRoundTrip:
         mod = _mod()
         r1 = _record('rec-1', content='SOME DISTINCTIVE BODY')
         path = tmp_path / 'cache.json'
-        mod.dump_fetches(path, {'c_peers': _fetched({'q1': [(r1, 0.875)]}, {})})
+        mod.dump_fetches(
+            path, {'c_peers': _fetched({'q1': [(r1, 0.875)]}, {})},
+            provenance=_provenance(mod, {'c_peers': [r1]}),
+        )
 
         doc = json.loads(path.read_text(encoding='utf-8'))
         assert doc['arms']['c_peers']['queries']['q1'] == [['rec-1', 0.875]]
@@ -350,6 +382,7 @@ class TestFetchCacheRoundTrip:
             path,
             {'c_peers': _fetched({'q1': [(r1, 0.9)]},
                                  {'cl1': [(r2, 0.4)], 'cl2': []})},
+            provenance=_provenance(mod, {'c_peers': [r1, r2]}),
         )
 
         loaded = mod.load_fetches(path, {'c_peers': seeded})
@@ -376,8 +409,13 @@ class TestFetchCacheRoundTrip:
             {'clA': [(records[0], 0.3)], 'clB': [(records[2], 0.2)]},
         )
         first, second = tmp_path / 'a.json', tmp_path / 'b.json'
-        mod.dump_fetches(first, {'c_peers': forward, 'status_quo': forward})
-        mod.dump_fetches(second, {'status_quo': backward, 'c_peers': backward})
+        prov = _provenance(mod, {'c_peers': records, 'status_quo': records})
+        mod.dump_fetches(
+            first, {'c_peers': forward, 'status_quo': forward}, provenance=prov,
+        )
+        mod.dump_fetches(
+            second, {'status_quo': backward, 'c_peers': backward}, provenance=prov,
+        )
 
         assert first.read_text(encoding='utf-8') == second.read_text(encoding='utf-8')
 
@@ -392,7 +430,10 @@ class TestFetchCacheRoundTrip:
             'probes': {k: list(v) for k, v in fetched['probes'].items()},
         }
 
-        mod.dump_fetches(tmp_path / 'cache.json', {'c_peers': fetched})
+        mod.dump_fetches(
+            tmp_path / 'cache.json', {'c_peers': fetched},
+            provenance=_provenance(mod, {'c_peers': [r1, r2]}),
+        )
 
         assert fetched['queries']['q1'] == before['queries']['q1']
         assert fetched['probes']['cl1'] == before['probes']['cl1']
@@ -406,7 +447,10 @@ class TestFetchCacheRoundTrip:
         seeded = _seeded('c_peers', [r1])
         path = tmp_path / 'cache.json'
         doc = json.loads(
-            (mod.dump_fetches(path, {'c_peers': _fetched({'q1': [(r1, 0.9)]}, {})})
+            (mod.dump_fetches(
+                path, {'c_peers': _fetched({'q1': [(r1, 0.9)]}, {})},
+                provenance=_provenance(mod, {'c_peers': [r1]}),
+             )
              ).read_text(encoding='utf-8'),
         )
         doc['arms']['c_peers']['queries']['q1'].append(['rec-nope', 0.1])
@@ -430,19 +474,6 @@ class TestFetchCacheRoundTrip:
 # This is the same posture `_search` already takes at :2688 — "an empty
 # ranking must never be published as a measured zero" — extended to the
 # replay path, and the repo's no-silent-fail-soft norm requires it.
-
-
-def _provenance(mod, records_by_shape: dict, *, search_limit: int = 10,
-                guard_threshold: float = 0.85,
-                embedder_model: str = 'text-embedding-3-small') -> dict:
-    """A provenance block for hand-built arms, as the live driver would build."""
-    return mod.fetch_cache_provenance(
-        records_by_shape=records_by_shape,
-        fixtures=[FIXTURES_DIR / name for name in sorted(ANCHOR_FIXTURE_SHA256)],
-        search_limit=search_limit,
-        guard_threshold=guard_threshold,
-        embedder_model=embedder_model,
-    )
 
 
 class TestCorpusFingerprint:
@@ -536,6 +567,23 @@ class TestFetchCacheProvenance:
             # Repo-relative, never an absolute home-directory path — the same
             # rule `fixture_provenance` documents at :1852.
             assert not key.startswith('/')
+
+    def test_dumping_without_provenance_is_refused_at_dump_time(self, tmp_path):
+        """Fail BEFORE the run is spent, not after.
+
+        A cache with no per-shape fingerprint can never be loaded
+        (`_check_corpus_fingerprint` refuses it), so allowing the dump would
+        only move the failure to load time — i.e. to after a full live seeding
+        run had already produced an unusable file.
+        """
+        mod = _mod()
+        with pytest.raises(mod.FetchCacheError, match='provenance'):
+            mod.dump_fetches(
+                tmp_path / 'cache.json',
+                {'c_peers': _fetched({'q1': [(_record('rec-1'), 0.9)]}, {})},
+                provenance={},
+            )
+        assert not (tmp_path / 'cache.json').exists()
 
     def test_carries_the_live_only_values_a_replay_cannot_reconstruct(self, tmp_path):
         """`resolve_guard_threshold(memory)` (:3264) navigates a live
