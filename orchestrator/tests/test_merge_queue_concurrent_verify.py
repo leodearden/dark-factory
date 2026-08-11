@@ -37,7 +37,7 @@ from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import MERGE_RESULT_TIMEOUT, RESPONSIVE_WAIT_WALL_CAP
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -201,7 +201,21 @@ HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+    # task 3980: `wait_responsive`'s hard wall backstop, so a scanned call
+    # site that spells the cap explicitly resolves rather than silently
+    # contributing 0.0.
+    'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
 }
+
+# task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its
+# budget in loop-responsive time, so its worst-case WALL clock is the nominal
+# `timeout` stretched by the ratio between the wall cap and the nominal merge
+# ceiling — exactly 2 by construction (RESPONSIVE_WAIT_WALL_CAP =
+# 2 * MERGE_RESULT_TIMEOUT).  Fixing the ratio at 2 is what lets a reviewer
+# check the paired-mark arithmetic instead of trusting a number: the worst
+# per-method budget in test_merge_speculation.py is 125s, and 125 x 2 = 250s
+# still clears HEAVY_BARRIER_TEST_TIMEOUT (300s).
+_RESPONSIVE_WAIT_STRETCH = float(RESPONSIVE_WAIT_WALL_CAP) / float(MERGE_RESULT_TIMEOUT)
 
 
 def _resolve_wait_value(node: ast.expr | None) -> float:
@@ -222,11 +236,14 @@ def _resolve_wait_value(node: ast.expr | None) -> float:
 def _call_wait_budget(call: ast.Call) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    Recognises exactly three call shapes -- ``asyncio.wait_for(..., timeout=N)``
     (the attribute's value must itself be the ``asyncio`` name, so
-    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
     ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
-    when no ``timeout=`` kwarg is given). Every other call shape --
+    when no ``timeout=`` kwarg is given), and ``wait_responsive(...)``
+    (task 3980; same hidden default, but its worst-case WALL clock is the
+    nominal budget stretched by ``_RESPONSIVE_WAIT_STRETCH`` and hard-bounded
+    by ``RESPONSIVE_WAIT_WALL_CAP`` -- see below). Every other call shape --
     ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
     non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
     unknown names -- contributes 0.0 and is skipped silently (this is a
@@ -253,6 +270,22 @@ def _call_wait_budget(call: ast.Call) -> float:
             if kw.arg == 'timeout':
                 return _resolve_wait_value(kw.value)
         return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    if isinstance(func, ast.Name) and func.id == 'wait_responsive':
+        # task 3980: the nominal `timeout` is charged in loop-responsive
+        # time, so real wall clock can run past it under starvation. Bill
+        # the stretched worst case, hard-bounded by the wall cap the helper
+        # itself enforces -- a wait_responsive call can NEVER consume more
+        # wall clock than RESPONSIVE_WAIT_WALL_CAP, whatever its nominal
+        # budget.
+        nominal = _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                nominal = _resolve_wait_value(kw.value)
+                break
+        return min(
+            nominal * _RESPONSIVE_WAIT_STRETCH,
+            _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
+        )
     return 0.0
 
 

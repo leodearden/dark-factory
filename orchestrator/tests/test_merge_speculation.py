@@ -50,13 +50,22 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec  # noqa: F401
+from _orch_helpers import (  # noqa: F401
+    MERGE_RESULT_TIMEOUT,
+    make_placeholder_future,
+    pydantic_spec,
+    wait_responsive,
+)
 from test_merge_queue_concurrent_verify import (  # noqa: F401
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    PYPROJECT_DEFAULT_TIMEOUT,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
+    _timeout_mark_offenders,
+    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
@@ -3471,4 +3480,67 @@ class TestFinalizeInflightJournalsLandedRow:
         assert row.branch_tip_sha == item.merged_branch_tip, (
             f'Expected branch_tip_sha={item.merged_branch_tip!r}, '
             f'got {row.branch_tip_sha!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3980: enforced timeout-mark coverage over THIS module's own source
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a ``@pytest.mark.timeout`` mark whose value clears that budget.
+
+    Task 3492 built this guard and applied it to
+    test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
+    own ``Path(__file__)`` -- so THIS module, which carries the merge-spec
+    late-arrival block, was never covered despite having five classes whose
+    worst-case per-method budget is 105s-125s against a 60s pyproject default
+    and ZERO ``@pytest.mark.timeout`` marks anywhere in the file.
+
+    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
+    than reimplemented: they are deliberately pure (source text in, offender
+    list out, class resolver injected as ``globals().get``) precisely so they
+    can be driven with foreign input, and a second copy would be free to
+    drift from the marks it audits.
+
+    Task 3980 extended ``_call_wait_budget`` there to recognise
+    ``wait_responsive(...)``, whose budget is charged in loop-responsive time
+    and can therefore consume up to ``RESPONSIVE_WAIT_WALL_CAP`` of real wall
+    clock -- i.e. the scanned budget for those call sites is stretched by
+    exactly 2. That stretch is why this guard has to exist BEFORE any wait in
+    this file is migrated: a stretched wait under an inadequate mark is
+    strictly worse than the flake it fixes.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a ``timeout`` mark whose value clears its own computed budget.
+
+        RED when first written (task 3980 step-3, before step-4 added the
+        marks): five late-arrival classes computed >= 60s with no timeout
+        mark at all -- TestLateArrivalCleanCAS 125s,
+        TestLateArrivalSubmissionOrderCAS 125s, TestLateArrivalAttaches 110s,
+        TestLateArrivalGuards 110s, TestLateArrivalFailCascade 105s.
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+        offenders = _timeout_mark_offenders(budgets, globals().get)
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure -- strictly worse than the flake being '
+            'fixed. Add @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) '
+            'directly above each offending class.'
         )
