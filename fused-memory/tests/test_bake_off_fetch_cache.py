@@ -302,6 +302,10 @@ class TestFetchCacheRoundTrip:
         mod = _mod()
         r1, r2 = _record('rec-1'), _record('rec-2')
         seeded = _seeded('c_peers', [r1, r2])
+        # The premise, made explicit: these records really ARE reachable in
+        # this run under mem0 point ids, which is the join `_search` uses.
+        assert set(seeded.by_stored_id) == set(_POINT_IDS[:2])
+
         path = tmp_path / 'cache.json'
         mod.dump_fetches(
             path, {'c_peers': _fetched({'q1': [(r1, 0.9)]}, {'cl1': [(r2, 0.5)]})},

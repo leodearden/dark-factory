@@ -3067,6 +3067,209 @@ async def fetch_arm(
     return {'queries': fetched_queries, 'probes': fetched_probes}
 
 
+# ---------------------------------------------------------------------------
+# The fetch cache — replaying a live run's rankings without a live run
+# ---------------------------------------------------------------------------
+#
+# :func:`fetch_arm` above is the ONLY thing in this experiment that costs an
+# embedder call and a live Qdrant collection.  Everything downstream of it —
+# :func:`read_path`, :func:`rescore`, :func:`measure_arm`, :func:`build_report`,
+# :func:`render_markdown` — is pure, and ``measure_arm``'s docstring says so
+# explicitly (no store, no await).  Dumping ``fetch_arm``'s return value at
+# this seam and replaying it therefore makes every read-side variant free
+# forever, and makes the metric code unit-testable against REAL rankings
+# rather than only hand-built ones.
+#
+# WHAT IS STORED, and why it is only this:
+#
+#   ``record_id`` and ``relevance_score``.  Nothing else.
+#
+#   NOT mem0's point id.  :func:`_search` joins its results back through
+#   ``seeded.by_stored_id[item['id']]``, and ``Mem0Backend.add`` pins
+#   ``infer=False`` — which routes to mem0's fresh-uuid ``_create_memory``
+#   path.  ``item['id']`` is therefore newly minted on EVERY seeding run, so a
+#   cache keyed on it is replayable exactly once and then rehydrates to an
+#   empty ranking, which this script's whole posture forbids publishing as a
+#   measured zero.  :func:`_derive_record_id` is uuid5-deterministic over
+#   ``(shape, key)`` and :func:`materialize_arm` is pure over the committed
+#   fixtures, so the join key is stable across runs by construction.
+#
+#   NOT the record body.  It is fully reconstructible from the committed
+#   fixtures via ``materialize_arm``, so storing it would make the cache both
+#   large and — the real objection — capable of DISAGREEING with the fixtures
+#   it claims to describe, with no way for a reader to tell which won.
+
+#: Bumped when the on-disk cache layout changes incompatibly.  A replay is a
+#: measurement, so an unreadable cache must fail rather than degrade.
+FETCH_CACHE_SCHEMA_VERSION = 1
+
+
+class FetchCacheError(RuntimeError):
+    """A fetch cache cannot be trusted to describe the corpus being replayed.
+
+    A sibling of :class:`FixtureError`/:class:`SeedingError`/
+    :class:`MeasurementError`, and raised for the same reason they are: a
+    replayed report is indistinguishable from a live one in the artifact, so
+    every way the cache can be wrong has to be loud at load time rather than
+    silently producing a plausible table.
+    """
+
+
+def _serialize_ranking(hits: list[ScoredHit]) -> list[list[Any]]:
+    """One ranked list as ``[[record_id, score], ...]``, in RANK ORDER.
+
+    A list of pairs rather than an object keyed by record id: every metric in
+    this experiment is rank-based, so order IS the data, and a JSON object
+    would invite a re-sort that no downstream assertion could detect.
+    """
+    return [
+        [hit.record.record_id, float(hit.relevance_score)] for hit in hits
+    ]
+
+
+def fetches_to_document(
+    arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The on-disk form of one run's fetches: a pure ranking map.
+
+    *arms* maps each shape to that shape's :func:`fetch_arm` result.  Pure —
+    the caller is still measuring off these same lists (``run_arm`` calls
+    ``measure_arm`` twice off one fetch), so nothing here may mutate them.
+    """
+    return {
+        'schema_version': FETCH_CACHE_SCHEMA_VERSION,
+        'provenance': dict(provenance or {}),
+        'arms': {
+            shape: {
+                'queries': {
+                    query_id: _serialize_ranking(hits)
+                    for query_id, hits in sorted(fetched['queries'].items())
+                },
+                'probes': {
+                    cluster_id: _serialize_ranking(hits)
+                    for cluster_id, hits in sorted(fetched['probes'].items())
+                },
+            }
+            for shape, fetched in sorted(arms.items())
+        },
+    }
+
+
+def dump_fetches(
+    path: str | Path,
+    arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> Path:
+    """Write the fetch cache atomically, byte-stably.
+
+    ``sort_keys=True`` on top of the sorted comprehensions above because the
+    cache is a COMMITTED artifact: a re-dump of the same fetches must diff
+    cleanly, and JSON object order otherwise follows insertion order — which
+    follows query-set iteration order, which is not a property anyone should
+    have to keep stable by hand.
+    """
+    target = Path(path)
+    _atomic_write_text(
+        target,
+        json.dumps(
+            fetches_to_document(arms, provenance=provenance),
+            indent=2, sort_keys=True,
+        ) + '\n',
+    )
+    return target
+
+
+def _rehydrate_ranking(
+    seeded: SeededArm, entries: Any, *, shape: str, kind: str, key: str,
+) -> list[ScoredHit]:
+    """One cached ranking back to ``list[ScoredHit]``, joined to THIS arm."""
+    hits: list[ScoredHit] = []
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise FetchCacheError(
+                f'fetch cache entry for {shape}/{kind}/{key} is {entry!r}, not '
+                f'a [record_id, score] pair. Skipping it would shrink a '
+                f'measured ranking silently.'
+            )
+        record_id, score = entry
+        record = seeded.records_by_id.get(record_id)
+        if record is None:
+            raise FetchCacheError(
+                f'fetch cache names record {record_id!r} in {shape}/{kind}/'
+                f'{key}, which this run did not materialize. The cache and the '
+                f'fixtures describe different corpora — dropping the hit would '
+                f'silently shrink the measured ranking (the same refusal '
+                f'`_search` makes for an unseeded point). Re-dump the cache '
+                f'against the current fixtures.'
+            )
+        hits.append(ScoredHit(record=record, relevance_score=float(score)))
+    return hits
+
+
+def load_fetches(
+    path: str | Path,
+    seeded_by_shape: dict[str, SeededArm],
+) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
+    """Replay a dumped run's rankings against locally materialized arms.
+
+    Returns exactly what :func:`fetch_arm` would have returned for each
+    requested shape, so ``measure_arm`` cannot tell a replay from a live run —
+    which is the point, and also why every disagreement between the cache and
+    the corpus has to raise here instead of downstream.
+
+    Iterates the CALLER's shapes, not the cache's: a cache carrying extra
+    shapes is merely wider than this run needs, but a requested shape it does
+    not carry would otherwise be measured as an arm with no queries.
+    """
+    target = Path(path)
+    try:
+        doc = json.loads(target.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise FetchCacheError(
+            f'no fetch cache at {target} — a replay measures nothing without '
+            f'one. Produce it with --dump-fetches on a live run.'
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise FetchCacheError(
+            f'fetch cache at {target} is not valid JSON: {exc}'
+        ) from exc
+
+    version = doc.get('schema_version')
+    if version != FETCH_CACHE_SCHEMA_VERSION:
+        raise FetchCacheError(
+            f'fetch cache at {target} is schema version {version!r}, but this '
+            f'build reads version {FETCH_CACHE_SCHEMA_VERSION}.'
+        )
+    cached_arms = doc.get('arms')
+    if not isinstance(cached_arms, dict):
+        raise FetchCacheError(
+            f'fetch cache at {target} carries no "arms" block.'
+        )
+
+    replayed: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
+    for shape, seeded in seeded_by_shape.items():
+        block = cached_arms.get(shape)
+        if block is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} has no rankings for shape {shape!r} '
+                f'(it carries {sorted(cached_arms)}). Measuring that arm from '
+                f'an absent cache would publish an empty ranking as a zero.'
+            )
+        replayed[shape] = {
+            kind: {
+                key: _rehydrate_ranking(
+                    seeded, entries, shape=shape, kind=kind, key=key,
+                )
+                for key, entries in sorted((block.get(kind) or {}).items())
+            }
+            for kind in ('queries', 'probes')
+        }
+    return replayed
+
+
 def read_path(
     seeded: SeededArm, hits: list[ScoredHit], k: int, *, pin: bool,
 ) -> list[ArmRecord]:
