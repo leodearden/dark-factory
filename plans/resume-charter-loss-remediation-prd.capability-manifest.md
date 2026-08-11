@@ -113,9 +113,39 @@ material corrections are recorded as amendments in PRD §7c.
 - `archive_available` instrumentation on main →
   `orchestrator/src/orchestrator/event_store.py:255-270`,
   `orchestrator/src/orchestrator/harness.py:1641-1649`. **PASS**
+
+  > **CORRECTION 2026-08-11:** the `harness.py:1641-1649` anchor is
+  > wrong. Those lines are only the *fault-log rate limiter*
+  > (`self._archive_available_fault_logged`, task 3727) — they emit
+  > nothing. The actual instrumentation is:
+  > - the emit — `orchestrator/src/orchestrator/harness.py:8069-8081`
+  >   (the `session_resume_fallback` `event_store.emit(...)`; the
+  >   `'archive_available'` data field itself at `:8076-8079`);
+  > - the helper — `_archive_available` defined at
+  >   `orchestrator/src/orchestrator/harness.py:3179`.
+  >
+  > Verified by reading all three ranges. Both new anchors are
+  > byte-identical at this manifest's stated baseline `03ff70c5dd`
+  > (`harness.py` is unchanged between `03ff70c5dd` and `376b10cc5c`),
+  > so they are valid at the SHA the rest of this file is pinned to.
+
 - RED premise: `data.archive_available` NULL on all 260 historical
   fallbacks despite the code being on main — the deployed-fleet gap is
   exactly what θ measures (deployed-code check, `ExecMainStart`-style). **PASS**
+
+  > **CORRECTION 2026-08-11:** "NULL on all 260" reports the **NULL ARM
+  > as if it were the total**. 260 is the count of NULL events, not the
+  > population. Re-measured directly against
+  > `data/orchestrator/runs.db` (`event_type='session_resume_fallback'`,
+  > dark-factory): the total was **264** (260 NULL + 4 non-NULL) when
+  > the θ gate report was written on task 4005, and is **268** (260 NULL
+  > + 8 non-NULL, every one of them `true`) as of 2026-08-11T15:12Z.
+  >
+  > The asymmetry is the point: the **NULL arm is frozen at 260** while
+  > the non-NULL arm grows. That is not a rounding quibble — it is the
+  > evidence that the field is live and emitting, which is what
+  > dissolves the fleet-staleness reading recorded in PRD §5. See the
+  > correction there.
 - DAG-direction: 3578 depends on θ (edge wired at decompose); θ has no
   upstream deps (3727 already done). **PASS**
 
