@@ -9,6 +9,7 @@ Covers:
   step-11 RED  — build_chain degenerate inputs touch zero worktrees
   step-13 RED  — build_chain builds a clean chain in ONE worktree
   step-15 RED  — build_chain truncation semantics + purity (decision #4)
+                 (conflict / train / merge_error reasons, empty-prefix edge)
 
 Reference: ``plans/deep-merge-ahead-prd.md``.
 
@@ -1160,3 +1161,382 @@ class TestBuildChainClean:
         assert res.truncated_at is None
         assert res.truncated_reason is None
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-15: RED — build_chain truncation semantics + purity (decision #4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _spy_merges(git_ops: GitOps, monkeypatch) -> list[str]:
+    """Record the bare branch id of every merge ATTEMPT, in order.
+
+    Proves the chain is a contiguous PREFIX: an item past the truncation
+    point must never even be attempted, since a hole in ``links`` would
+    break δ's in-order CAS walk.
+    """
+    calls: list[str] = []
+    original = git_ops.merge_branch_into_worktree
+
+    def _recording(worktree: Path, branch: str):
+        calls.append(branch)
+        return original(worktree, branch)
+
+    monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _recording)
+    return calls
+
+
+def _spy_merge_attempt_events(monkeypatch) -> list[tuple[str, object]]:
+    """Replace ``merge_queue._emit_merge_attempt`` with a recorder."""
+    from orchestrator import merge_queue as _mq
+
+    calls: list[tuple[str, object]] = []
+
+    def _recording(_event_store, task_id, outcome, **_kw) -> None:
+        calls.append((task_id, outcome))
+
+    monkeypatch.setattr(_mq, '_emit_merge_attempt', _recording)
+    return calls
+
+
+def _spy_note_conflict_detected(monkeypatch) -> list[str]:
+    """Replace ``SpeculativeMergeWorker._note_conflict_detected`` with a recorder.
+
+    ``classify_and_merge`` calls it on its conflict arm; calling it from the
+    chain builder would feed the conflict-graph / thrash machinery from a
+    non-genuine conflict (one against an UNLANDED predecessor).
+    """
+    calls: list[str] = []
+
+    def _recording(_self, request_id: str) -> None:
+        calls.append(request_id)
+
+    monkeypatch.setattr(
+        SpeculativeMergeWorker, '_note_conflict_detected', _recording,
+    )
+    return calls
+
+
+async def _is_ancestor(cwd: Path, maybe_ancestor: str, descendant: str) -> bool:
+    rc, _, _ = await _run(
+        ['git', 'merge-base', '--is-ancestor', maybe_ancestor, descendant],
+        cwd=cwd,
+    )
+    return rc == 0
+
+
+async def _assert_lane_clean_at(lane: Path, tip: str) -> None:
+    """The lane is at *tip* with no unmerged paths and no in-progress merge."""
+    assert await _rev_parse(lane) == tip
+    _, unmerged, _ = await _run(
+        ['git', 'diff', '--name-only', '--diff-filter=U'], cwd=lane,
+    )
+    assert unmerged.strip() == ''
+    rc, _, _ = await _run(['git', 'rev-parse', '--verify', '-q', 'MERGE_HEAD'], cwd=lane)
+    assert rc != 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestBuildChainTruncation:
+    """The task's headline signal: clean prefix, conflicted item UNTOUCHED, ONE worktree.
+
+    "Untouched" is the load-bearing half (PRD decision #4).  A chain conflict
+    at position j may be a conflict with an *unlanded* predecessor, so item j
+    must take its normal sequential path later — which it cannot if the
+    builder has already resolved its future, emitted a ``merge_attempt``, or
+    fed the conflict-graph machinery on its behalf.
+    """
+
+    async def _conflicting_trio(self, git_repo: Path) -> list[str]:
+        """101 and 102 both rewrite shared.txt line 1; 103 is disjoint/clean."""
+        return [
+            await _create_branch_editing(
+                git_repo, 'task/101', 'shared.txt', _shared_txt_with(1, 'from-101'),
+            ),
+            await _create_branch_editing(
+                git_repo, 'task/102', 'shared.txt', _shared_txt_with(1, 'from-102'),
+            ),
+            await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n'),
+        ]
+
+    # ── A. textual-conflict truncation ───────────────────────────────────
+
+    async def test_conflict_truncates_at_the_clean_prefix(
+        self, git_repo: Path, monkeypatch,
+    ):
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        tips = await self._conflicting_trio(git_repo)
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+        acquires = _count_spec_lane_acquires(git_ops, monkeypatch)
+        merges = _spy_merges(git_ops, monkeypatch)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        # The clean prefix only.
+        assert [tid for tid, _ in res.links] == ['101']
+        assert res.tip == res.links[0][1]
+        assert res.depth == 1
+        assert res.truncated_at == '102'
+        assert res.truncated_reason == 'conflict'
+
+        # 103 was never ATTEMPTED — a contiguous prefix, not a gap-filling scan.
+        assert merges == ['101', '102']
+        assert res.lane is not None
+        assert not await _is_ancestor(res.lane, tips[2], res.tip)
+        assert await _is_ancestor(res.lane, tips[0], res.tip)
+
+        # The lane is clean and verifiable AT the tip: the aborted 102 merge
+        # left no unmerged index behind to poison γ's verify.
+        await _assert_lane_clean_at(res.lane, res.tip)
+
+        # Exactly ONE worktree for the whole chain.
+        assert await _worktree_names(git_ops) - before == {'_spec-0'}
+        assert len(acquires) == 1
+
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    # ── B. purity: the conflicted item is UNTOUCHED ──────────────────────
+
+    async def test_resolves_no_future(self, git_repo: Path, monkeypatch):
+        """102's future stays pending — it may only conflict with UNLANDED 101."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await self._conflicting_trio(git_repo)
+        head = await _rev_parse(git_repo)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert res.truncated_at == '102'
+        assert all(not r.result.done() for r in snap)
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_emits_no_merge_attempt_event(self, git_repo: Path, monkeypatch):
+        """Zero events of ANY type — an outcome event would be a false report."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+        from tests._recording_event_store import _RecordingEventStore
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        store = _RecordingEventStore()
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store)  # type: ignore[arg-type]
+        emitted = _spy_merge_attempt_events(monkeypatch)
+        await self._conflicting_trio(git_repo)
+        head = await _rev_parse(git_repo)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(
+            git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
+        )
+
+        assert res.truncated_at == '102'
+        assert emitted == []
+        assert store.events == []
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_does_not_mutate_queue_state(self, git_repo: Path, monkeypatch):
+        """Buffers, lifecycle states and the drift/conflict machinery untouched."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        worker = _make_worker(git_ops)
+        noted = _spy_note_conflict_detected(monkeypatch)
+        await self._conflicting_trio(git_repo)
+        head = await _rev_parse(git_repo)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+        buffers_before = {k: list(v) for k, v in worker._lane_buffers.items()}
+        lifecycle_before = dict(worker._lifecycle._states)
+
+        res = await build_chain(
+            git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
+        )
+
+        assert res.truncated_at == '102'
+        # Object identity AND order, not just equality.
+        after = {k: list(v) for k, v in worker._lane_buffers.items()}
+        assert after.keys() == buffers_before.keys()
+        for lane_name, items in buffers_before.items():
+            assert len(after[lane_name]) == len(items)
+            for got, want in zip(after[lane_name], items, strict=True):
+                assert got is want
+        assert dict(worker._lifecycle._states) == lifecycle_before
+        assert noted == []
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_rebuild_is_stable(self, git_repo: Path):
+        """Invalidation is rebuild-per-round, so a repeat build must be stable.
+
+        Compares task_ids and the tip TREE rather than raw shas: committer
+        timestamps advance between rounds, so the merge shas legitimately
+        differ while the content does not.
+        """
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await self._conflicting_trio(git_repo)
+        head = await _rev_parse(git_repo)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        first = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+        assert first.lane is not None
+        tree_first = await _rev_parse(first.lane, f'{first.tip}^{{tree}}')
+        await release_chain_build_lane(git_ops, first.lane, warm=first.lane_warm)
+
+        second = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+        assert second.lane is not None
+        tree_second = await _rev_parse(second.lane, f'{second.tip}^{{tree}}')
+
+        assert [tid for tid, _ in second.links] == [tid for tid, _ in first.links]
+        assert second.truncated_at == first.truncated_at
+        assert second.truncated_reason == first.truncated_reason
+        assert tree_second == tree_first
+        assert all(not r.result.done() for r in snap)
+        await release_chain_build_lane(git_ops, second.lane, warm=second.lane_warm)
+
+    # ── C. truncation at a train (GroupMergeRequest) ─────────────────────
+
+    async def test_truncates_at_a_group_merge_request(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A train is landed by _do_train_merge, never chained as a plain item.
+
+        All three items here are textually CLEAN, so a missing guard shows up
+        as a 3-link chain rather than as an incidental conflict.
+        """
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/199', 'd.txt', 'edit-199\n')
+        await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+        head = await _rev_parse(git_repo)
+        merges = _spy_merges(git_ops, monkeypatch)
+        train = _make_group_req(
+            '199', '199', config, git_repo, member_task_ids=['198', '199'],
+        )
+        snap = (
+            _make_req('101', '101', config, git_repo),
+            train,
+            _make_req('103', '103', config, git_repo),
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert [tid for tid, _ in res.links] == ['101']
+        assert res.truncated_at == '199'
+        assert res.truncated_reason == 'train_request'
+        # The train is not merged, and 103 behind it is not skipped past.
+        assert merges == ['101']
+        assert not train.result.done()
+        assert all(not r.result.done() for r in snap)
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    # ── D. non-conflict merge error is a DISTINCT reason ─────────────────
+
+    async def test_missing_ref_truncates_as_merge_error(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A broken ref must not be reported as a textual conflict.
+
+        Conflating the two would hide a genuine fault behind the chain's most
+        common benign outcome (loud-over-silent-degradation).
+        """
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+        head = await _rev_parse(git_repo)
+        merges = _spy_merges(git_ops, monkeypatch)
+        # No task/102 branch is ever created.
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert [tid for tid, _ in res.links] == ['101']
+        assert res.truncated_at == '102'
+        assert res.truncated_reason == 'merge_error'
+        assert merges == ['101', '102']
+        assert res.lane is not None
+        await _assert_lane_clean_at(res.lane, res.tip)
+        assert all(not r.result.done() for r in snap)
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    # ── E. the first item conflicts: empty prefix holds NO lane ──────────
+
+    async def test_first_item_conflicts_yields_empty_and_releases_the_lane(
+        self, git_repo: Path,
+    ):
+        """head already carries the edit 101 conflicts with → zero links."""
+        from orchestrator.merge_queue import build_chain
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(
+            git_repo, 'task/100', 'shared.txt', _shared_txt_with(1, 'from-100'),
+        )
+        await _create_branch_editing(
+            git_repo, 'task/101', 'shared.txt', _shared_txt_with(1, 'from-101'),
+        )
+        main_sha = await _rev_parse(git_repo)
+
+        # Mimic frozen_prefix_tip: head is 100's merge commit, already holding
+        # the line-1 edit that 101 rewrites differently.
+        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seeded = await git_ops.merge_branch_into_worktree(seed_wt, '100')
+        assert seeded.success is True
+        head = seeded.merge_commit
+        assert head is not None
+        await git_ops.cleanup_merge_worktree(seed_wt)
+
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=1)
+
+        assert res.links == []
+        assert res.depth == 0
+        assert res.tip == head
+        assert res.truncated_at == '101'
+        assert res.truncated_reason == 'conflict'
+        # An empty result never HOLDS a lane, so a caller that skips the
+        # release on the empty path cannot leak one.
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert git_ops.spec_warm_lane_pool is not None
+        assert all(
+            s == LaneState.FREE
+            for s in git_ops.spec_warm_lane_pool._lanes.values()
+        )
+        assert not snap[0].result.done()
