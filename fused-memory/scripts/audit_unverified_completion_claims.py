@@ -352,3 +352,123 @@ def adjudicate(
         )
     )
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# The report (pure — swept_at is passed in, never read from the wall clock)
+# --------------------------------------------------------------------------- #
+
+CAVEATS: tuple[str, ...] = (
+    'RETROSPECTIVE BIAS, FALSE NEGATIVES: the write-time gate reads each '
+    'authority AT WRITE TIME; this sweep reads it TODAY. A claim written while '
+    'its task was still in-progress VERIFIES today if that task has since gone '
+    'terminal, so the sweep systematically under-counts. A low mismatch count '
+    'is therefore NOT evidence the corpus is clean.',
+    "RETROSPECTIVE BIAS, FALSE POSITIVES: 'cancelled' is in "
+    'shared.task_statuses.TERMINAL, so a claim about work that was later '
+    'CANCELLED reads as verified here even though the work never landed.',
+    'UNVERIFIABLE INDICTS NOBODY: a task deleted since, a garbage-collected '
+    'commit, or an expired ticket all read as unverifiable through no fault of '
+    "the writer. 'unverifiable' and 'mismatch' are different facts and are "
+    'never summed in this report.',
+    'COVERAGE, STORE: this sweep covers GRAPHITI EPISODES only. A '
+    'MEM0-resident record is NOT covered, because the two categories in scope '
+    'are Graphiti-primary and Mem0 is not read at all.',
+    'COVERAGE, ORPHANED EDGES: a derived RELATES_TO edge whose source episode '
+    'has been deleted is NOT covered, and neither is an episode ingested '
+    'through add_episode with a caller-supplied description, which carries no '
+    'category and so falls outside the category scope.',
+    'DETECTION BOUND: claims are detected by the deterministic lexical '
+    'vocabulary in fused_memory.services.completion_claim_gate, which requires '
+    'completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ '
+    'id) to co-occur in one clause. A fabricated completion phrased without a '
+    'named ref is invisible to this sweep by construction.',
+)
+"""The report's caveats, as DATA rather than docstring prose.
+
+They travel with the committed artifact into investigation.md and into whatever
+reads it next, and a test pins this literal tuple so a later editor cannot
+quietly delete one while leaving the report looking authoritative.
+"""
+
+
+def _tally(findings: Iterable[Finding], key: Callable[[Finding], str]) -> dict[str, int]:
+    """Count *findings* by *key*, returned in sorted key order.
+
+    Sorted, not insertion-ordered: the report must be byte-stable across runs,
+    and dict insertion order here would follow whatever order the store
+    returned rows in.
+    """
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[key(finding)] = counts.get(key(finding), 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_report(
+    findings: Iterable[Finding],
+    *,
+    swept_at: str,
+    scanned_count: int,
+    records_with_claims: int,
+    projects: list[str],
+    categories: list[str],
+    include_unverifiable: bool,
+) -> dict[str, Any]:
+    """Build the machine-readable report.
+
+    VOLUME CONTROL WITHOUT A SILENT CAP. The write-time gate tags on
+    unverifiable because a false positive costs one ``source_description``
+    prefix. A batch report has inverted economics: across thousands of
+    historical episodes the unverifiable bucket dominates for reasons that
+    indict nobody — tasks purged, commits gc'd, tickets expired — and a report
+    that lists all of it inline is unread, which is the failure mode that let
+    the original incident sit unnoticed. So only mismatches are LISTED by
+    default, but BOTH buckets are unconditionally COUNTED and ``truncated_by``
+    names the flag that reveals the rest. A bounded listing must say what it
+    dropped, or it reads as coverage it does not have.
+
+    ``mismatch`` and ``unverifiable`` are NEVER summed into one headline
+    number. They are different facts, and
+    :mod:`fused_memory.services.completion_claim_gate` makes the same
+    distinction load-bearing at the sentinel level (:123-127) — a report that
+    collapsed it would undo that.
+
+    Pure: *swept_at* is an argument rather than a ``datetime.now()`` call, which
+    is what makes the output byte-stable across two runs on the same input.
+    """
+    findings = list(findings)
+    mismatches = [f for f in findings if f.status == 'mismatch']
+    unverifiables = [f for f in findings if f.status == 'unverifiable']
+
+    listed = findings if include_unverifiable else mismatches
+    truncated_by: dict[str, Any] | None = None
+    if not include_unverifiable and unverifiables:
+        truncated_by = {
+            'status': 'unverifiable',
+            'withheld': len(unverifiables),
+            'flag': '--include-unverifiable',
+            'note': (
+                f'{len(unverifiables)} unverifiable finding(s) were COUNTED in '
+                f'summary.unverifiable but not listed. Re-run with '
+                f'--include-unverifiable to see them.'
+            ),
+        }
+
+    return {
+        'swept_at': swept_at,
+        'projects': list(projects),
+        'categories': list(categories),
+        'scanned': scanned_count,
+        'records_with_claims': records_with_claims,
+        'summary': {
+            'mismatch': len(mismatches),
+            'unverifiable': len(unverifiables),
+            'by_category': _tally(findings, lambda f: f.category or '(uncategorized)'),
+            'by_project': _tally(findings, lambda f: f.project_id),
+            'by_subject': _tally(findings, lambda f: f.subject),
+        },
+        'truncated_by': truncated_by,
+        'caveats': list(CAVEATS),
+        'findings': [f.to_json() for f in listed],
+    }
