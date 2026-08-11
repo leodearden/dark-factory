@@ -336,7 +336,10 @@ class AgentLoop:
 
         Multi-turn is handled by passing ``resume_session_id`` on subsequent
         calls; ``_call_llm`` is responsible for serialising tool results into
-        the next turn's prompt before calling this method.
+        the next turn's prompt before calling this method. ``resume_delivers_prompt=True``
+        is what actually gets that serialised prompt to the CLI on turn >= 2 —
+        without it, ``invoke_with_cap_retry`` overwrites ``prompt`` with the
+        short crash-recovery continuation string before ever making the call.
 
         ``_cli_session_id`` is cleared to ``None`` before any exception propagates
         out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
@@ -362,6 +365,17 @@ class AgentLoop:
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
+                # This loop's --resume is its NORMAL operating mode, not crash
+                # recovery: each turn's prompt is _serialize_tool_results(...),
+                # computed in Python and never replayed in the CLI transcript
+                # (disallowed_tools=['*'] above), so it exists nowhere else.
+                # Without resume_delivers_prompt=True, cli_invoke.py would
+                # replace it with CRASH_RECOVERY_RESUME_PROMPT and the turn's
+                # tool results would be silently and unrecoverably lost.
+                # Passed unconditionally (not gated on _cli_session_id): it is
+                # already inert on turn 1 since cli_invoke only reads it inside
+                # `if invoke_kwargs.get('resume_session_id'):`.
+                resume_delivers_prompt=True,
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
                 # switched to a neutral cwd. This is a multi-turn agent that
                 # actively adjudicates memory-vs-codebase discrepancies with
