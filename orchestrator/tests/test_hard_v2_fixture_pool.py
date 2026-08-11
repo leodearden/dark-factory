@@ -20,7 +20,12 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import REPO_ROOT
+
+# Matches the parents[2] convention used by conftest.py and the sibling
+# evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
+# imported: the bare `conftest` module name collides across subprojects in
+# sys.modules under --import-mode=importlib.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 EVALS_DIR = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'evals'
 POOL_DIR = EVALS_DIR / 'tasks_hard_v2'

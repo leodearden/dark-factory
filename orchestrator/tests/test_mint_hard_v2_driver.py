@@ -5,7 +5,7 @@ Hermetic: the census filter runs against a synthetic sqlite db built inline
 ladder runs against temp git repos built per-test. No live data / no network.
 
 ``scripts/`` is not an importable package, so the driver is loaded by path via
-``importlib.util.spec_from_file_location`` off ``conftest.REPO_ROOT``.
+``importlib.util.spec_from_file_location`` off the module-local ``REPO_ROOT``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,12 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from conftest import REPO_ROOT
+
+# Matches the parents[2] convention used by conftest.py and the sibling
+# evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
+# imported: the bare `conftest` module name collides across subprojects in
+# sys.modules under --import-mode=importlib.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_driver() -> ModuleType:
