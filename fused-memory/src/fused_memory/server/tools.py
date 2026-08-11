@@ -3246,7 +3246,9 @@ def create_mcp_server(
             {'id','content','created_at','kind','matched': True} carrying its
             FULL body — that is where a matched child's text lives.  A digest
             already listing the matched child is marked 'matched': True in
-            place instead.
+            place instead and gains a 'content' key carrying that same FULL
+            body alongside its truncated 'digest', so a matched child's text is
+            never shortened by grouping wherever it ends up.
 
             Loud-fault keys, present only when something is genuinely unknown:
             'grouped'['children_unavailable'] (+ 'error_type') means the child

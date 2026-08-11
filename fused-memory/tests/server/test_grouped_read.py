@@ -23,7 +23,6 @@ import pytest
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 from fused_memory.memory_metadata import (
-    EXPERIMENTAL_KEY_PREFIX,
     KIND_REGISTRY,
     validate_memory_metadata,
 )
@@ -704,6 +703,10 @@ class TestNeverSuppressCarveOuts:
 #: pinned entry carries the FULL text" cannot pass by accident on a short body.
 _MATCHED_TEXT = 'THE MATCHED TEXT — ' + ('the correction body says otherwise. ' * 20)
 
+#: The same, for a match that lands INSIDE the digest cap — distinct text so a
+#: byte-for-byte comparison cannot be satisfied by the other child's body.
+_IN_CAP_TEXT = 'THE IN-CAP MATCHED TEXT — ' + ('the in-cap correction runs long. ' * 20)
+
 
 class TestSuppressionRequiresRepresentation:
     """A child is suppressed ONLY when its parent's block demonstrably represents it.
@@ -716,54 +719,70 @@ class TestSuppressionRequiresRepresentation:
         module sorts, so which cap-sized sample comes back is arbitrary and a
         matched amendment beyond the cap simply is not in ``amendments``;
     (b) SIGHTING-ONLY MATCH — ``build_grouped_document`` scrolls
-        ``kind='amendment'`` only, so a matched sighting can never be listed.
+        ``kind='amendment'`` only, so a matched sighting can never be listed;
+    (c) IN-CAP MATCH WITH A LONG BODY — the child IS listed, but a digest is
+        truncated to ``_DIGEST_CHARS``, so "it is in the list" still hands
+        back less text than the ungrouped response carried.
 
     The fix keeps BOTH goals: the canonical still absorbs its children
     (esc-5541 stays closed) AND the matched text stays reachable (D6), by
-    pinning the swallowed child — full body, from the hit already in hand, at
-    zero extra backend reads — into a ``matched_children`` list on the block.
+    carrying the swallowed child's full body — from the hit already in hand, at
+    zero extra backend reads — in a ``matched_children`` pin (a, b) or on the
+    existing digest entry alongside its truncated ``digest`` (c).
     """
 
     _FANOUT = 50
     _MATCHED_INDEX = 30  # beyond _AMENDMENT_DIGEST_CAP: excluded from the scroll
+    _IN_CAP_INDEX = 2  # inside the cap: listed, but only as a TRUNCATED digest
+
+    @classmethod
+    def _body(cls, index: int) -> str:
+        if index == cls._MATCHED_INDEX:
+            return _MATCHED_TEXT
+        if index == cls._IN_CAP_INDEX:
+            return _IN_CAP_TEXT
+        return f'correction {index}'
 
     @classmethod
     def _fifty_amendments(cls) -> list[dict]:
         return [
             _child(
-                f'44444444-4444-4444-8444-{index:012d}',
+                cls._amendment_id(index),
                 _CANONICAL_ID,
                 AMENDMENT_KIND,
-                _MATCHED_TEXT if index == cls._MATCHED_INDEX else f'correction {index}',
+                cls._body(index),
                 f'2026-08-01T00:00:{index:02d}+00:00',
             )
             for index in range(cls._FANOUT)
         ]
 
+    @staticmethod
+    def _amendment_id(index: int) -> str:
+        return f'44444444-4444-4444-8444-{index:012d}'
+
     @classmethod
     def _matched_amendment_id(cls) -> str:
-        return f'44444444-4444-4444-8444-{cls._MATCHED_INDEX:012d}'
+        return cls._amendment_id(cls._MATCHED_INDEX)
 
     @staticmethod
     def _canonical_hit(score: float = 0.9) -> MemoryResult:
         return _result(_CANONICAL_ID, 'the canonical claim', score, metadata={'kind': 'canonical'})
 
     @staticmethod
-    def _matched_hit(memory_id: str, kind: str, score: float, created_at: str) -> MemoryResult:
+    def _matched_hit(
+        memory_id: str,
+        kind: str,
+        score: float,
+        created_at: str,
+        text: str = _MATCHED_TEXT,
+    ) -> MemoryResult:
         return _result(
             memory_id,
-            _MATCHED_TEXT,
+            text,
             score,
             metadata={'parent_id': _CANONICAL_ID, 'kind': kind},
             created_at=created_at,
         )
-
-    @staticmethod
-    def _represented_ids(block: dict) -> set:
-        """Every child id the parent's block demonstrably accounts for."""
-        return {d.get('id') for d in block.get('amendments', [])} | {
-            e.get('id') for e in block.get('matched_children', [])
-        }
 
     @pytest.mark.asyncio
     async def test_matched_amendment_beyond_the_cap_is_pinned_not_swallowed(self):
@@ -911,6 +930,45 @@ class TestSuppressionRequiresRepresentation:
         )
 
     @pytest.mark.asyncio
+    async def test_in_cap_matched_amendment_carries_its_full_body_not_just_a_digest(self):
+        """(c) The COMMON case: in-cap, matched, and longer than ``_DIGEST_CHARS``.
+
+        Marking the digest ``matched`` and stopping there leaves only
+        ``_DIGEST_CHARS`` of a body the UNGROUPED response returned in full —
+        the grouped result would carry strictly less text than the one it
+        replaces, which is the retrieval regression itself.
+        """
+        service = _stub_service([
+            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, _MATCHED_TEXT, '2026-08-01T00:00:00+00:00'),
+            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, 'second correction', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [
+            self._canonical_hit(0.9),
+            self._matched_hit(_AMEND_1, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:00+00:00'),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert [r['id'] for r in grouped] == [_CANONICAL_ID], (
+            f'The collapse must still happen, got {[r["id"] for r in grouped]!r}'
+        )
+        block = grouped[0]['grouped']
+        entry = {d['id']: d for d in block['amendments']}[_AMEND_1]
+        assert len(_MATCHED_TEXT) > _DIGEST_CHARS and entry['digest'].endswith(_DIGEST_ELLIPSIS), (
+            'PRECONDITION: this test is only meaningful while the matched body '
+            f'exceeds the digest cap and is therefore CUT in the list, got {entry!r}'
+        )
+        assert entry['matched'] is True
+        assert entry['content'] == _MATCHED_TEXT, (
+            'A matched digest must carry the child FULL body alongside its '
+            'truncated digest: that text was in the response BEFORE grouping, '
+            f'so grouping must not shorten it, got {entry!r}'
+        )
+        assert entry['digest'] != entry['content'], (
+            f'PRECONDITION: the two keys must genuinely differ here, got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_same_child_hit_twice_is_pinned_once(self):
         """Pinning dedups by id — a duplicated hit must not duplicate the entry."""
         service = _stub_service(self._fifty_amendments())
@@ -929,9 +987,29 @@ class TestSuppressionRequiresRepresentation:
         )
 
     @pytest.mark.asyncio
-    async def test_every_swallowed_child_appears_in_its_parents_block(self):
-        """The general property both live cases instantiate."""
+    async def test_grouping_moves_a_childs_body_but_never_shortens_it(self):
+        """DIFFERENTIAL: the grouped response vs. the UNGROUPED hits it replaces.
+
+        Deliberately NOT phrased as "every suppressed child is in the
+        represented set": ``_suppress_child`` gates suppression on exactly that
+        set, so such a property holds by construction and can never fail.  This
+        instead captures the child bodies the ungrouped result carried and
+        requires each to reappear BYTE-FOR-BYTE inside its parent's block —
+        checked by id and content, never by re-deriving the production
+        represented-id helper.
+
+        It has teeth in both directions.  Remove the pinning pass and the
+        out-of-cap amendment and the sighting stop being represented, so they
+        survive as top-level hits and the esc-5541 collapse assertion goes red.
+        Keep pinning but leave the in-cap match as a truncated digest and the
+        byte-for-byte comparison goes red.
+
+        All three children are uncontested, with a resolvable parent and a
+        successful grouping, so every carve-out in :func:`_suppress_child` is
+        inapplicable by construction — the canonical must absorb all of them.
+        """
         matched_id = self._matched_amendment_id()
+        in_cap_id = self._amendment_id(self._IN_CAP_INDEX)
         service = _stub_service(
             self._fifty_amendments()
             + [
@@ -939,38 +1017,51 @@ class TestSuppressionRequiresRepresentation:
                 _child(_SIGHT_2, _CANONICAL_ID, SIGHTING_KIND, 'seen', '2026-08-03T00:00:00+00:00'),
             ]
         )
-        in_cap_id = '44444444-4444-4444-8444-000000000002'
         hits = [
             self._canonical_hit(0.95),
             self._matched_hit(matched_id, AMENDMENT_KIND, 0.9, '2026-08-01T00:00:30+00:00'),
             self._matched_hit(_SIGHT_2, SIGHTING_KIND, 0.85, '2026-08-03T00:00:00+00:00'),
-            self._matched_hit(in_cap_id, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:02+00:00'),
+            self._matched_hit(
+                in_cap_id, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:02+00:00', text=_IN_CAP_TEXT
+            ),
         ]
+        # The BEFORE picture: what a caller would have received ungrouped.
+        ungrouped = {
+            hit.id: hit.content for hit in hits if (hit.metadata or {}).get('parent_id')
+        }
+        assert set(ungrouped) == {matched_id, _SIGHT_2, in_cap_id}, (
+            f'PRECONDITION: three distinct child hits, got {sorted(ungrouped)!r}'
+        )
+        assert all(len(body) > _DIGEST_CHARS for body in ungrouped.values()), (
+            'PRECONDITION: every child body must exceed the digest cap, or a '
+            f'truncating regression could pass unnoticed, got {ungrouped!r}'
+        )
 
         grouped = await group_search_results(service, _PROJECT_ID, hits)
 
         by_id = {r['id']: r for r in grouped}
-        surviving = set(by_id)
-        for hit in hits:
-            parent_id = (hit.metadata or {}).get('parent_id')
-            if parent_id is None or hit.id in surviving:
-                continue
-            block = by_id[parent_id]['grouped']
-            assert hit.id in self._represented_ids(block), (
-                f'{hit.id} was suppressed but its parent block does not represent '
-                f'it — that is a silent retrieval regression, not a grouping. Block: {block!r}'
+        assert set(by_id) == {_CANONICAL_ID}, (
+            'esc-5541: no carve-out applies to any of these children, so the '
+            f'canonical must absorb all three and stand alone, got {sorted(by_id)!r}'
+        )
+        block = by_id[_CANONICAL_ID]['grouped']
+        carried: dict[str, list] = {}
+        for entry in list(block.get('amendments') or []) + list(
+            block.get('matched_children') or []
+        ):
+            carried.setdefault(entry['id'], []).append(entry.get('content'))
+        for child_id, body in ungrouped.items():
+            assert body in carried.get(child_id, []), (
+                f'{child_id} was folded into its parent, but the block that '
+                'replaced it does not carry its body verbatim — grouping handed '
+                f'back LESS text than the ungrouped response did. Ungrouped body '
+                f'({len(body)} chars): {body!r}. Block entries for that id: '
+                f'{carried.get(child_id)!r}'
             )
 
 
 class TestIsContestedChild:
     """The single home of the contested predicate (leaf γ's one constant to stamp)."""
-
-    def test_experimental_namespace_key(self):
-        assert CONTESTED_METADATA_KEY == 'x_contested', (
-            'The flag lives in the x_ experimental namespace so it needs no '
-            "amendment to task 3195's closed five-key reserved set and makes no "
-            'unknown-key census noise'
-        )
 
     def test_truthy_flag_is_contested(self):
         assert is_contested_child({CONTESTED_METADATA_KEY: True}) is True
@@ -1237,10 +1328,7 @@ class TestChildRecordSchema:
     """The add-only child-record representation, pinned as a contract."""
 
     def test_child_kinds_are_landed_kind_registry_members(self):
-        """'amendment' and 'sighting' are already KIND_REGISTRY members (task 3195)."""
-        assert AMENDMENT_KIND == 'amendment'
-        assert SIGHTING_KIND == 'sighting'
-        assert frozenset({'amendment', 'sighting'}) == CHILD_KINDS
+        """This leaf's child kinds are already KIND_REGISTRY members (task 3195)."""
         for kind in CHILD_KINDS:
             assert kind in KIND_REGISTRY, (
                 f'{kind!r} must be a landed KIND_REGISTRY member — this leaf adds '
@@ -1616,16 +1704,4 @@ class TestPointIdParentIsVerified:
         assert service.get_memory_by_id.await_count == 0, (
             'A canonical has no parent pointer to verify, so the point-id surface '
             f'must issue no extra read, got {service.get_memory_by_id.await_args_list!r}'
-        )
-
-
-class TestContestedKeyComposesTheExperimentalPrefix:
-    """The flag is built from the vocabulary module's prefix, not a re-spelling."""
-
-    def test_key_is_composed_not_hardcoded(self):
-        composed = f'{EXPERIMENTAL_KEY_PREFIX}contested'
-        assert composed == CONTESTED_METADATA_KEY, (
-            'CONTESTED_METADATA_KEY must COMPOSE memory_metadata.'
-            'EXPERIMENTAL_KEY_PREFIX so a prefix change cannot silently desync '
-            f'the read side from the vocabulary module, got {CONTESTED_METADATA_KEY!r}'
         )

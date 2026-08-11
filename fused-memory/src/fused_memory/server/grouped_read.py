@@ -476,7 +476,12 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     a sighting is not an amendment, and ``amendment_count`` / ``truncated``
     must keep meaning exactly what the count API said.  When the child is
     already listed as a digest (the common in-cap amendment case) that entry is
-    marked in place instead of being duplicated.
+    marked in place and GAINS THE FULL BODY rather than being duplicated into a
+    second list — a digest alone is truncated to ``_DIGEST_CHARS``, so marking
+    it and stopping there would hand back strictly less text than the ungrouped
+    response carried, which is the very regression this function exists to
+    stop.  ``digest`` keeps its own meaning (the bounded pointer every listed
+    amendment carries); ``content`` is added ALONGSIDE it.
 
     Mutates only *block* — a dict this call's :func:`build_grouped_document`
     just built, never a shared or cached structure.
@@ -485,9 +490,15 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     if not isinstance(child_id, str) or not child_id:
         # Not pinnable and not verifiable; the caller keeps such a hit.
         return
+    body = getattr(hit, 'content', '') or ''
     for digest in block.get('amendments') or []:
         if digest.get('id') == child_id:
             digest['matched'] = True
+            # Unconditional, not "only when the digest was cut": the invariant
+            # a consumer can rely on is "a matched entry carries the body the
+            # ungrouped response would have shown", and a rule with an
+            # is-it-long-enough branch is one a reader has to re-derive.
+            digest['content'] = body
             return
     pinned: list[dict[str, Any]] = block.setdefault(MATCHED_CHILDREN_KEY, [])
     if any(entry.get('id') == child_id for entry in pinned):
@@ -496,7 +507,7 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     pinned.append(
         {
             'id': child_id,
-            'content': getattr(hit, 'content', '') or '',
+            'content': body,
             'created_at': getattr(hit, 'created_at', None),
             'kind': meta.get('kind'),
             'matched': True,
