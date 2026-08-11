@@ -5828,7 +5828,11 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
-        ('merge',    True,  'merge'),
+        # NOTE: ('merge', True) is intentionally ABSENT — that pair used to
+        # resolve to 'merge' and SHALLOW-clobber nested metadata (the task-3581 /
+        # DF-3260 memory_hints clobber); it now RAISES. See
+        # test_resolve_metadata_mode_merge_plus_append_true_raises.
+        ('additive', True,  'additive'),
         ('additive', False, 'additive'),
         ('replace',  True,  'replace'),
     ],
@@ -5871,6 +5875,29 @@ def test_resolve_metadata_mode_bare_append_false_raises():
     # 'replace' escape hatch (asserted above). Incident traceability lives in the
     # source error message and the _resolve_metadata_mode docstring, not here, so
     # a future reword that keeps the guidance but drops the tag won't break this.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_raises():
+    """metadata_mode='merge' alongside append=True is a CONTRADICTION and is
+    REJECTED (task 3581). ``append=True`` means exactly one thing — 'additive',
+    the recursive union merge — while 'merge' is shallow last-write-wins, so the
+    pair asks for two incompatible resolutions of the same write. It used to
+    resolve silently to 'merge', shallow-clobbering nested metadata: the whole
+    ``memory_hints`` key (with its authored ``entities``/``queries``) was
+    overwritten wholesale by the incoming stub — the DF-3260 clobber."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('merge', True)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert 'additive' in msg, (
+        f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+    )
+    # NB: as with the task-2180 guard above, deliberately do NOT assert on the
+    # incident number or the full prose. The load-bearing contract is that the
+    # caller is told about the actionable 'additive' resolution; traceability
+    # lives in the source message and the _resolve_metadata_mode docstring.
 
 
 def test_resolve_metadata_mode_append_false_cosignal_replace():
