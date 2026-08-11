@@ -205,3 +205,107 @@ class TestStartReportPreservesExistingEntryDurable:
             }
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# step-3: the response shape must let a caller always distinguish a fresh
+# start from a repeat — RED until step-4 enriches both return paths.
+# ---------------------------------------------------------------------------
+
+
+class TestStartReportResultIsUnambiguous:
+    """The caller can always tell a fresh start from a repeat, both at the
+    state level and through the FastMCP tool surface.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_first_call_reports_already_started_false(self):
+        state, _t = self._make_state()
+        result = state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        assert result['run_id'] == 'r1'
+        assert result['stage'] == 'memory_consolidator'
+        assert result['already_started'] is False
+
+    def test_repeat_call_reports_census_of_retained_entry(self):
+        state, _t = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d',
+            suggested_action='a', task_id='1', flag_type='f',
+        )
+
+        result = state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        assert result['run_id'] == 'r1'
+        assert result['stage'] == 'memory_consolidator'
+        assert result['already_started'] is True
+        assert result['project_id'] == 'dark_factory'
+        assert result['finding_count'] == 1
+        assert result['completed'] is False
+        assert isinstance(result['warning'], str) and result['warning']
+
+    def test_repeat_call_with_completed_entry_reports_completed_true(self):
+        state, _t = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        state.complete('r1', 'summary')
+
+        result = state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        assert result['already_started'] is True
+        assert result['completed'] is True
+
+    def test_divergent_project_id_retains_original_and_warns(self, caplog):
+        state, _t = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            result = state.start_report(
+                run_id='r1', stage='memory_consolidator', project_id='other_project',
+            )
+
+        assert result['already_started'] is True
+        assert result['project_id'] == 'dark_factory'  # retained, NOT overwritten
+        assert 'other_project' in result['warning']
+
+        entry = state._state[('r1', 'memory_consolidator')]
+        assert entry.project_id == 'dark_factory'  # never overwritten on the entry either
+
+        divergence_warnings = [
+            r for r in caplog.records
+            if 'dark_factory' in r.getMessage() and 'other_project' in r.getMessage()
+        ]
+        assert divergence_warnings, [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_fastmcp_surface_reports_same_shapes(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        tm = mcp._tool_manager
+
+        first = await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+        assert first['already_started'] is False
+
+        add_result = await tm.call_tool('add_finding', {
+            'run_id': 'r1', 'severity': 'low', 'category': 'cat',
+            'description': 'd', 'suggested_action': 'a', 'task_id': '1', 'flag_type': 'f',
+        })
+        assert 'finding_id' in add_result
+
+        second = await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+        assert second['already_started'] is True
+        assert second['finding_count'] == 1
+        assert second['completed'] is False
+
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
