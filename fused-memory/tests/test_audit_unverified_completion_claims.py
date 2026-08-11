@@ -41,6 +41,43 @@ def _load_module() -> types.ModuleType:
 _mod = _load_module()
 parse_category = _mod.parse_category
 IN_SCOPE_CATEGORIES = _mod.IN_SCOPE_CATEGORIES
+CorpusRecord = _mod.CorpusRecord
+ScannedRecord = _mod.ScannedRecord
+scan_records = _mod.scan_records
+
+KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
+
+#: esc-3085-1 instance (2), verbatim: a filing/dispatch claim naming a ticket
+#: id that does not exist in the registry.
+ESC_3085_1_INSTANCE_2 = (
+    'reify task 5638 was reported unactionable and re-filed into '
+    "dark_factory's task tree as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376"
+)
+
+#: esc-3085-1 instance (1): an applied-work claim about a still-open task.
+ESC_3085_1_INSTANCE_1 = "task 5422's de-flake fix has been applied"
+
+
+def _record(
+    uuid: str = 'ep-1',
+    text: str = '',
+    category: str | None = 'temporal_facts',
+    project_id: str = 'reify',
+    created_at: str = '2026-07-26T00:00:00Z',
+    source_description: str = 'add_memory:temporal_facts',
+    name: str = 'episode',
+) -> object:
+    """Build a CorpusRecord without touching a store."""
+    return CorpusRecord(
+        uuid=uuid,
+        kind='episode',
+        text=text,
+        source_description=source_description,
+        category=category,
+        project_id=project_id,
+        created_at=created_at,
+        name=name,
+    )
 
 
 class TestParseCategory:
@@ -115,3 +152,92 @@ class TestParseCategory:
         assert IN_SCOPE_CATEGORIES == frozenset(
             {'temporal_facts', 'decisions_and_rationale'}
         )
+
+
+class TestScanRecords:
+    """The imported extractor, run over the corpus projection.
+
+    The script contributes NO claim-detection regex of its own — the whole
+    point of reusing completion_claim_gate is that a second, drifting copy of
+    the negation/aspirational strippers is what stops "has not yet landed"
+    from being read as a completion (the gate's own docstring, :20-26).
+    """
+
+    def _scan(self, records: list[object]) -> list[object]:
+        return scan_records(
+            records,
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+
+    def test_esc_3085_1_instance_2_yields_the_ticket_claim(self) -> None:
+        """Ticket > commit > task precedence (completion_claim_gate.py:405-411).
+
+        The clause names BOTH task 5638 and the ticket; it is ONE claim about
+        the ticket — the most specific ref is what the writer asserted into
+        existence.
+        """
+        scanned = self._scan([_record(text=ESC_3085_1_INSTANCE_2)])
+        assert len(scanned) == 1
+        claims = scanned[0].claims
+        assert len(claims) == 1
+        assert claims[0].kind == 'filing_dispatch'
+        assert claims[0].subject == 'ticket'
+        assert claims[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    def test_esc_3085_1_instance_1_yields_the_task_claim(self) -> None:
+        scanned = self._scan([_record(text=ESC_3085_1_INSTANCE_1)])
+        assert len(scanned) == 1
+        claims = scanned[0].claims
+        assert len(claims) == 1
+        assert claims[0].kind == 'applied_work'
+        assert claims[0].subject == 'task'
+        assert claims[0].ref == '5422'
+        assert claims[0].project_id == 'reify'
+
+    def test_negated_claim_yields_nothing(self) -> None:
+        """Proves the imported strippers are LIVE, not re-derived."""
+        scanned = self._scan(
+            [_record(text='the fix has not been applied for task 5422')]
+        )
+        assert scanned == []
+
+    def test_out_of_scope_category_is_excluded(self) -> None:
+        scanned = self._scan([
+            _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
+                    category='entities_and_relations'),
+            _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1, category=None),
+        ])
+        assert scanned == []
+
+    def test_records_without_claims_are_dropped(self) -> None:
+        scanned = self._scan([
+            _record(uuid='ep-a', text='an ordinary observation about the tree'),
+            _record(uuid='ep-b', text=''),
+            _record(uuid='ep-c', text=ESC_3085_1_INSTANCE_1),
+        ])
+        assert [s.record.uuid for s in scanned] == ['ep-c']
+
+    def test_output_order_is_deterministic(self) -> None:
+        """Sorted by (category, created_at, uuid) — never dict iteration order."""
+        records = [
+            _record(uuid='ep-z', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-27T00:00:00Z'),
+            _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-26T00:00:00Z'),
+            _record(uuid='ep-m', text=ESC_3085_1_INSTANCE_1,
+                    category='decisions_and_rationale',
+                    created_at='2026-07-28T00:00:00Z'),
+            _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-26T00:00:00Z'),
+        ]
+        expected = ['ep-m', 'ep-a', 'ep-b', 'ep-z']
+        assert [s.record.uuid for s in self._scan(records)] == expected
+        assert [s.record.uuid for s in self._scan(list(reversed(records)))] == expected
+
+    def test_record_project_id_overrides_the_default(self) -> None:
+        scanned = self._scan(
+            [_record(text=ESC_3085_1_INSTANCE_1, project_id='dark_factory')]
+        )
+        assert scanned[0].claims[0].project_id == 'dark_factory'
