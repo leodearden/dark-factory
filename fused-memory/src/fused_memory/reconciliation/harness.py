@@ -51,6 +51,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
@@ -660,6 +661,16 @@ class ReconciliationHarness:
         # drain or timeout raises mid-stage), never leaking a phantom-busy run.
         self._active_runs = ActiveRunRegistry()
 
+        # Q4 (task 3709): last-reported set of UNEXPECTED (operator-added)
+        # indices per graph, so `_detect_index_drift` logs one at INFO only when
+        # it CHANGES.  Logging every cycle would be noise in a cheaper channel —
+        # the recon cadence runs continuously, so one operator-added index would
+        # emit an identical line forever and train readers to ignore the field.
+        # Deliberately in-process and NOT durable: a restart re-logging each
+        # graph's current set once is correct, since a fresh process has never
+        # reported it.  Keyed by group_id so one graph cannot suppress another.
+        self._last_unexpected_indices: dict[str, tuple] = {}
+
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
 
@@ -1222,6 +1233,68 @@ class ReconciliationHarness:
                     'actual_total': health['actual_total'],
                 },
             )
+        return health
+
+    async def _detect_index_drift(
+        self, group_id: str, *, run_id: str | None = None
+    ) -> dict | None:
+        """Check a graph's index health and escalate when it has drifted.
+
+        The ONE detector both Q3 paths call — the registry-scoped startup sweep
+        (`_check_index_health_at_startup`) and the recon cadence
+        (`run_full_cycle`).  Sharing the detector, not merely the pure
+        summarizer, is what keeps δ from forking into two copies that silently
+        disagree: the startup path has no stage, no StageReport and no run, so a
+        stage-resident filer could not serve it at all.
+
+        Args:
+            group_id: The graph to check (a project id).
+            run_id: Reconciliation run that observed this, when there is one —
+                the startup sweep has none.
+
+        Returns:
+            The health record, or None when health is unknown.  The caller
+            ALWAYS gets the facts, whether or not anything was filed.
+        """
+        health = await self._check_index_health(group_id)
+        if health is None:
+            return None
+
+        if not health['healthy']:
+            logger.warning(
+                'reconciliation.index_drift_detected',
+                extra={
+                    'group_id': group_id,
+                    'run_id': run_id,
+                    'missing_count': len(health['missing']),
+                    'expected_total': health['expected_total'],
+                },
+            )
+            if HAS_ESCALATION and self._escalation_queue is not None:
+                escalate_missing_indices(
+                    self._escalation_queue,
+                    group_id,
+                    health,
+                    project_id=group_id,
+                    run_id=run_id,
+                )
+
+        # Q4: report operator-added indices at INFO on CHANGE only, never
+        # escalate them (D8 — an operator-added index is not drift to repair, so
+        # escalating it would generate guaranteed-benign pages).
+        unexpected = tuple(health['unexpected'])
+        if unexpected and self._last_unexpected_indices.get(group_id) != unexpected:
+            logger.info(
+                'reconciliation.index_unexpected_present',
+                extra={
+                    'group_id': group_id,
+                    'run_id': run_id,
+                    'unexpected_count': len(unexpected),
+                    'unexpected': [list(spec) for spec in unexpected],
+                },
+            )
+        self._last_unexpected_indices[group_id] = unexpected
+
         return health
 
     async def _reconcile_status_correction(
