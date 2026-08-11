@@ -890,6 +890,40 @@ _ALLOWED_RENAMERS = {
     ('orchestrator/src/orchestrator/agents/invoke.py', '_invoke_pi'):
         'Swaps .mcp.json with a backup and back again; renames existing files '
         'rather than writing new content, so atomic_write_text does not apply.',
+    # --- Sites that landed on main AFTER this task branched. Both were triaged
+    # on their merits when the branch was rebased; neither is "out of scope"
+    # boilerplate, because each has a concrete semantic atomic_write_text
+    # cannot express today. Stated here rather than migrated, because a
+    # migration that quietly dropped one of these is exactly the silent
+    # regression this task exists to avoid.
+    ('shared/src/shared/transcript_archive.py', '_archive_one'):
+        'COPIES an existing file rather than writing new text, so it is the '
+        'same category as escalation sweep._atomic_move / queue._archive_resolved. '
+        'Two specifics rule out atomic_write_text even as a rewrite: (1) the '
+        'payload is a multi-MB agent-session JSONL moved with shutil.copyfile '
+        'on the platform fast-copy path, so peak RSS stays flat regardless of '
+        'transcript size, whereas atomic_write_text takes a str already fully '
+        'in memory; (2) os.utime mirrors the SOURCE mtime onto the staging file '
+        'BEFORE the replace, and atomic_write_text exposes no pre-replace seam '
+        'for that — a now-stamped archive reads to gc_agent_transcripts as a '
+        'reset retention age.',
+    ('orchestrator/src/orchestrator/mcp/plan_tools.py', '_atomic_write_plan'):
+        'Cannot delegate without losing three semantics atomic_write_text does '
+        'not offer. (1) SYMLINK RESOLUTION: it writes to os.path.realpath(path) '
+        'and refuses a dangling link; atomic_write_text replaces the path as '
+        'given, so an os.replace onto the lane plan.json symlink would swap the '
+        'LINK for a regular file and re-fork the lane/meta-root copies (the '
+        'esc-5205-9 divergence that symlink exists to prevent). (2) PRE-REPLACE '
+        'VERIFICATION: _verify_plan_json re-parses the TEMP file after the '
+        'chmod and before the swap — a deliberately named seam a test injects '
+        'into, at the last reversible checkpoint; atomic_write_text has no '
+        'pre-replace inspection hook, and verifying after the swap is backwards. '
+        '(3) FSYNC ASYMMETRY: it fsyncs the temp file but NOT the parent dir, '
+        'while atomic_write_text does both under fsync=True and neither under '
+        'fsync=False, so no setting reproduces it. It also funnels every '
+        'failure into PlanWriteError naming both the original and resolved '
+        'paths. A follow-up may widen atomic_write_text; it must not be forced '
+        'through the current signature.',
 }
 
 
