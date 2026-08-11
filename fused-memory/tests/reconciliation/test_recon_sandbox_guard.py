@@ -30,6 +30,7 @@ from fused_memory.config.schema import ReconciliationConfig
 try:
     from fused_memory.reconciliation.sandbox_guard import (
         RemediationSandboxUnavailable,
+        _writable_roots,
         resolve_recon_sandbox_wrap,
     )
     _SANDBOX_GUARD_AVAILABLE = True
@@ -381,7 +382,14 @@ class TestConfigDirContainment:
         )
 
     def test_config_dir_under_task_dir_is_accepted(self, tmp_path: Path) -> None:
-        """`<cwd>/.task/...` is accepted with no extras — both backends grant `.task`."""
+        """`<cwd>/.task/...` is accepted with no extras — both backends grant `.task`.
+
+        The `_writable_roots` assertion is what makes this leaf mean something:
+        pytest's ``tmp_path`` lives under ``/tmp``, which is blanket-writable, so
+        acceptance alone would be satisfied by the ``/tmp`` root no matter what
+        the ``.task`` logic did. Asserting the `.task` root is present AND
+        contains the config dir pins the grant this leaf is named for.
+        """
         cfg = tmp_path / '.task' / 'claude-config-x'
         cfg.mkdir(parents=True)
 
@@ -394,6 +402,15 @@ class TestConfigDirContainment:
             )
 
         assert callable(wrap), f'Expected a callable; got {wrap!r}'
+
+        task_root = os.path.realpath(str(tmp_path / '.task'))
+        roots = _writable_roots(tmp_path, [])  # type: ignore[possibly-unbound]
+        assert task_root in roots, (
+            f'`<cwd>/.task` must be one of the writable roots; got {roots!r}'
+        )
+        assert os.path.realpath(str(cfg)).startswith(task_root + os.sep), (
+            f'{cfg} must be inside the .task root {task_root}'
+        )
 
     def test_config_dir_under_tmp_is_accepted(self) -> None:
         """A /tmp config dir is accepted with no extras — /tmp is blanket-writable."""
@@ -435,7 +452,11 @@ class TestConfigDirContainment:
         runtime, reproducing the exact silent-degrade class this check exists to
         end.
         """
-        ghost_root = tmp_path / 'never-created'
+        # NOT under tmp_path: pytest's tmp_path is itself under /tmp, which both
+        # backends grant blanket, so a ghost root there would be rescued by the
+        # /tmp rule and this leaf would silently prove nothing. Nothing is ever
+        # created here, so no /var/tmp write permission is required.
+        ghost_root = Path(f'/var/tmp/df-4003-never-created-{uuid.uuid4().hex}')
         cfg = ghost_root / 'claude-config-x'
         assert not ghost_root.exists(), 'precondition: the root must not exist on disk'
 

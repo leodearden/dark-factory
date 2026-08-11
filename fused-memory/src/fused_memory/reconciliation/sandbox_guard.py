@@ -47,10 +47,33 @@ Operators deploying fused-memory outside the workspace venv MUST either:
      member), OR
   2. Set ``reconciliation.sandbox_recon_agents = false`` in config.yaml to
      explicitly opt out of confinement on that host.
+
+CONFIG-DIR CONTAINMENT — the INV-1 machine check (task 4003)
+------------------------------------------------------------
+The recon per-run ``CLAUDE_CONFIG_DIR`` is part of the writable set.  The
+*policy* lives in the caller (``cli_stage_runner.run_stage_via_cli`` appends
+``config_dir.path`` to the writable extras); the *verification* lives here:
+``resolve_recon_sandbox_wrap`` refuses to return a wrap — fail-CLOSED, as
+everywhere else in this module — unless the config dir it is handed is actually
+contained in the writable set that will be built.
+
+That split is what makes the assertion load-bearing.  If a future edit drops the
+computed grant, recon refuses to launch instead of silently producing a
+transcript-less stage.
+
+Why it exists: task 2744 (2026-07-18) redirected recon stages to a per-run
+config dir under ``<data_dir>/recon-config/`` — neither ``/tmp`` nor
+``<cwd>/.task``, i.e. outside every writable root either backend grants.  The
+CLI's session-JSONL writes were denied, so ``count_transcript_turns`` returned
+None forever: the liveness watchdog degraded to inert and every cap-retry
+force-freshed instead of resuming.  That ran silently until 2026-08-11.  A
+comment claiming the dir was writable existed the entire time; only a check can
+hold an invariant a comment cannot.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -67,9 +90,81 @@ class RemediationSandboxUnavailable(RuntimeError):
     """
 
 
+def _writable_roots(cwd: Path, writable_extras: list[str] | None) -> list[str]:
+    """Roots BOTH backends make writable: ``/tmp``, ``<cwd>/.task``, each extra.
+
+    Computed backend-agnostically on purpose — the containment invariant must
+    hold whether Landlock or bwrap wins resolution, and both grant exactly these
+    (``build_landlock_command`` at landlock.py:69-108, ``build_bwrap_command``
+    at sandbox.py:56-101).
+
+    Two details keep the check honest:
+
+    - ``os.path.realpath`` on every root. Landlock resolves its rules by O_PATH
+      fd — i.e. by real path — so a symlinked ``/tmp`` or a symlinked data dir
+      must not produce a false PASS or a false FAIL here.
+    - Roots that do not exist as directories are DROPPED. ``landlock_exec._add_path``
+      returns silently for a non-existent path, adding no rule and raising
+      nothing, so a grant naming a missing dir is vacuous. Counting it would let
+      the check pass while the write still failed at runtime — precisely the
+      silent-degrade class this module is meant to end.
+    """
+    roots = [
+        os.path.realpath('/tmp'),
+        os.path.realpath(os.path.join(str(Path(cwd).resolve()), '.task')),
+    ]
+    roots += [os.path.realpath(extra) for extra in (writable_extras or [])]
+    return [root for root in roots if os.path.isdir(root)]
+
+
+def _assert_config_dir_writable(
+    config_dir: Path,
+    cwd: Path,
+    writable_extras: list[str] | None,
+) -> None:
+    """Raise unless *config_dir* is inside the writable set (task 4003).
+
+    Containment is prefix-WITH-SEPARATOR, never a bare ``str.startswith`` on the
+    root: ``/tmp-evil`` is not inside ``/tmp``.
+    """
+    raw = str(config_dir)
+    resolved = os.path.realpath(raw)
+    roots = _writable_roots(cwd, writable_extras)
+
+    for root in roots:
+        if resolved == root or resolved.startswith(root + os.sep):
+            return
+
+    # Name the raw path as well as the resolved one: the operator configured the
+    # former, but containment is decided on the latter, and a symlink between
+    # them is exactly the case where a bare resolved path reads as a non sequitur.
+    shown = raw if resolved == raw else f'{raw} (resolved: {resolved})'
+    raise RemediationSandboxUnavailable(
+        f'Refusing to launch a reconciliation agent whose CLAUDE_CONFIG_DIR is '
+        f'OUTSIDE the sandbox writable set: {shown}. The CLI would be told to '
+        f'write its session transcript there and then denied the write by the '
+        f'kernel — silently (this is the 2026-07-18 -> 2026-08-11 recon defect, '
+        f'task 4003). Writable roots resolved for this invocation: '
+        f'{roots or "(none — no writable root exists on disk)"}. '
+        f'The per-run config dir is normally granted automatically by '
+        f'cli_stage_runner.run_stage_via_cli; if you are seeing this, that '
+        f'computed grant was lost. Note that a path listed in '
+        f'reconciliation.sandbox_recon_writable_extras is IGNORED here unless the '
+        f'directory actually exists — landlock_exec skips a non-existent path '
+        f'silently, so such a grant would be vacuous. Do NOT "fix" this by adding '
+        f'the config-dir BASE (<data_dir>/recon-config) to '
+        f'reconciliation.sandbox_recon_writable_extras: that is the root under '
+        f'which every run\'s claude-config-<run_id>/.credentials.json lives, and '
+        f'granting it would give every recon stage write access to every other '
+        f'run\'s credentials.'
+    )
+
+
 def resolve_recon_sandbox_wrap(
     cwd: Path,
     writable_extras: list[str] | None = None,
+    *,
+    config_dir: Path | None = None,
 ) -> Callable[[list[str]], list[str]]:
     """Return a sandbox-wrap callable for a reconciliation stage agent.
 
@@ -89,17 +184,33 @@ def resolve_recon_sandbox_wrap(
              source directories are added to the writable set
              (``writable_modules=[]``).
         writable_extras: Optional additional paths to include in the writable
-             set (e.g. a uvx/pip cache dir used by a stdio MCP server).
+             set (e.g. a uvx/pip cache dir used by a stdio MCP server, or —
+             for recon stages — the per-run ``CLAUDE_CONFIG_DIR``, appended by
+             ``cli_stage_runner.run_stage_via_cli``).
              These are passed through to the underlying backend's
              ``writable_extras`` parameter.
+        config_dir: Optional per-run ``CLAUDE_CONFIG_DIR`` (task 4003). When
+             given, this function VERIFIES that the path is contained in the
+             writable set that will be built and raises otherwise — it does not
+             grant it; granting is the caller's job (policy in the caller,
+             verification here). ``None`` skips the check entirely, keeping the
+             generic and non-recon call sites byte-identical.
 
     Returns:
         A ``Callable[[list[str]], list[str]]`` that wraps the inner argv.
 
     Raises:
         RemediationSandboxUnavailable: When neither Landlock nor bwrap is
-            available, OR when the orchestrator backends cannot be imported.
+            available, when the orchestrator backends cannot be imported, OR
+            when ``config_dir`` is outside the writable set.
     """
+    # The containment check runs ONCE, before the backend branch, because the
+    # invariant is backend-independent: Landlock and bwrap grant the same roots
+    # (/tmp, <cwd>/.task, extras). Checking here rather than inside each branch
+    # means a future third backend cannot be added without inheriting it.
+    if config_dir is not None:
+        _assert_config_dir_writable(config_dir, cwd, writable_extras)
+
     # ── Landlock branch ───────────────────────────────────────────────────────
     try:
         from orchestrator.agents.landlock import (  # type: ignore[import]

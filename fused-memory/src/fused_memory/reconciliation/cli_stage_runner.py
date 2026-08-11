@@ -491,6 +491,11 @@ async def run_stage_via_cli(
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
                 writable_extras,
+                # Hand the dir back to the guard so the grant above is VERIFIED,
+                # not merely intended: if a future edit drops the append, the
+                # guard fails closed instead of launching a stage that can never
+                # write a transcript. Policy here, verification there.
+                config_dir=config_dir.path if config_dir is not None else None,
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(
