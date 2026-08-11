@@ -451,3 +451,458 @@ class TestPromotingAnchorNeedsNoContestedKey:
         )
 
         assert _ids(without) == _ids(with_key)
+
+
+# ---------------------------------------------------------------------------
+# Arm (2): the TOPIC-KEYED grouped read
+# ---------------------------------------------------------------------------
+#
+# `apply_grouped_read` (bake_off_storage_shape.py:837) keys on `parent_id`.
+# The ratified C write shape stores PEERS — a topic's records carry `topic`
+# and `canonical` and NOT a parent link (`_materialize_c_peers`, :653-694) —
+# so parent-keyed grouping is structurally inert over it: every C peer is
+# "parentless", passes through in place, and the grouped read measures
+# nothing.  Arm (2) keys on `topic` instead, which is the corner eval-design
+# OQ5 actually asked for (peers PLUS children) and which PRD D9 mislabelled
+# as "already C".  It needs no `parent_id` writer, no backfill and no new
+# vocabulary key.
+#
+# It also turns the ONE hard-coded policy in `apply_grouped_read` into a
+# dial.  That function credits `[canonical, *amendments, *others]` (:927) and
+# collapses sightings to a bare count, and its own comment states the fix if
+# a sighting's claim is meant to be recallable: "render its body and pay the
+# tokens — not to credit it unrendered".  `render_sightings` is exactly that
+# knob, so the report can price the trade instead of inheriting it.
+
+
+def _topic_index(*records):
+    """`topic -> [records]`, the member set arm (2) resolves upward into."""
+    index: dict = {}
+    for record in records:
+        topic = record.metadata.get('topic')
+        if topic is None:
+            continue
+        index.setdefault(topic, []).append(record)
+    return index
+
+
+class TestTopicKeyedGroupsWhatParentKeyedCannot:
+    """The whole point: C's peers carry `topic` and no `parent_id`."""
+
+    def test_c_shaped_peers_group_on_topic(self):
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        peer = _rec('peer-1', topic='alpha', kind='amendment', content='AMEND')
+        hits = [canonical, peer]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert len(result.records) == 1
+        assert result.records[0].content == 'CANON\n[amendment] AMEND'
+
+    def test_the_landed_parent_keyed_read_leaves_that_same_set_flat(self):
+        """Cross-check against the shipped transform, not against a claim.
+
+        If `apply_grouped_read` ever started grouping this input, arm (2)
+        would stop being the variant it is described as and the report's
+        comparison would be measuring the same transform twice.
+        """
+        bake_off = _bake_off()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        peer = _rec('peer-1', topic='alpha', kind='amendment', content='AMEND')
+        hits = [canonical, peer]
+        records_by_id = {r.record_id: r for r in hits}
+
+        grouped = bake_off.apply_grouped_read(
+            hits, records_by_id, contested_ids=set(),
+        )
+
+        # Flat, and by ELEMENT IDENTITY: no `parent_id`, so nothing folded.
+        assert all(g is h for g, h in zip(grouped, hits, strict=True))
+
+    def test_a_hit_with_a_parent_link_but_no_topic_is_not_grouped(self):
+        """Keyed on `topic`, full stop — `parent_id` is not a second key."""
+        mod = _mod()
+        orphan = _rec('child-a', topic=None, parent_id='canon-a', kind='amendment')
+
+        result = mod.apply_topic_keyed_grouped_read(
+            [orphan], _topic_index(orphan), render_sightings=False,
+        )
+
+        assert result.records[0] is orphan
+
+
+class TestTopicKeyedRenderOrder:
+    """Canonical body FIRST, then amendments, then every other kind."""
+
+    def test_canonical_leads_then_amendments_then_others(self):
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        other = _rec('other-1', topic='alpha', kind='clarification', content='CLAR')
+        amendment = _rec('amend-1', topic='alpha', kind='amendment', content='AMEND')
+        # Deliberately ranked out of render order: the DOCUMENT's order is a
+        # rendering rule, not an echo of the store's ranking.
+        hits = [other, amendment, canonical]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert result.records[0].content == (
+            'CANON\n[amendment] AMEND\n[clarification] CLAR'
+        )
+
+    def test_a_child_with_no_kind_renders_as_child_not_as_amendment(self):
+        """Same vocabulary as `_render_grouped_document` (:806), reused.
+
+        A fixed `[amendment]` label would rename a record of any third kind
+        inside the transform that claims to be the executable specification.
+        """
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        kindless = _rec('peer-1', topic='alpha', content='PLAIN')
+        hits = [canonical, kindless]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert result.records[0].content == 'CANON\n[child] PLAIN'
+
+
+class TestSightingCreditingIsAnExplicitKnob:
+    """`render_sightings` prices what `apply_grouped_read` hard-codes."""
+
+    @staticmethod
+    def _corpus():
+        canonical = _rec('canon-a', topic='alpha', canonical=True,
+                         content='CANON', claim_ids=['k0'])
+        amendment = _rec('amend-1', topic='alpha', kind='amendment',
+                         content='AMEND', claim_ids=['k1'])
+        sighting_a = _rec('sight-1', topic='alpha', kind='sighting',
+                          content='SEEN-A', claim_ids=['k2'])
+        sighting_b = _rec('sight-2', topic='alpha', kind='sighting',
+                          content='SEEN-B', claim_ids=['k3'])
+        return [canonical, amendment, sighting_a, sighting_b]
+
+    def test_uncredited_sightings_collapse_to_a_count_and_lose_their_claims(self):
+        mod = _mod()
+        hits = self._corpus()
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        document = result.records[0]
+        assert document.content == 'CANON\n[amendment] AMEND\n[sightings: 2]'
+        assert 'SEEN-A' not in document.content
+        assert document.claim_ids == ['k0', 'k1']
+
+    def test_credited_sightings_render_their_bodies_and_carry_their_claims(self):
+        mod = _mod()
+        hits = self._corpus()
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=True,
+        )
+
+        document = result.records[0]
+        assert document.content == (
+            'CANON\n[amendment] AMEND\n[sighting] SEEN-A\n[sighting] SEEN-B'
+        )
+        assert '[sightings:' not in document.content  # rendered, not counted
+        assert document.claim_ids == ['k0', 'k1', 'k2', 'k3']
+
+    def test_crediting_and_rendering_never_disagree(self):
+        """The invariant `apply_grouped_read`'s comment turns on.
+
+        A claim may be credited only if its text actually reached the
+        reader; otherwise the arm banks recall AND a token discount for the
+        same content — a double advantage in exactly the two columns the
+        decision table is read on.
+        """
+        mod = _mod()
+        hits = self._corpus()
+
+        for render in (False, True):
+            result = mod.apply_topic_keyed_grouped_read(
+                hits, _topic_index(*hits), render_sightings=render,
+            )
+            document = result.records[0]
+            credited_bodies = [
+                r.content for r in hits if set(r.claim_ids) <= set(document.claim_ids)
+            ]
+            for body in credited_bodies:
+                assert body in document.content
+
+    def test_crediting_the_sightings_costs_tokens(self):
+        """The knob is a DIAL between recall and cost, and it is priced."""
+        mod = _mod()
+        bake_off = _bake_off()
+        hits = self._corpus()
+        estimator = bake_off.resolve_token_estimator()
+
+        counted = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+        rendered = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=True,
+        )
+
+        cheap = bake_off.tokens_returned(counted.records, 5, estimator)
+        dear = bake_off.tokens_returned(rendered.records, 5, estimator)
+        assert dear['total_tokens'] > cheap['total_tokens']
+
+
+class TestClaimRecallCeiling:
+    """The knob's arithmetic, stated as an identity rather than a hope."""
+
+    def test_uncredited_sightings_cap_recall_at_claims_minus_sightings(self):
+        mod = _mod()
+        corpus = TestSightingCreditingIsAnExplicitKnob._corpus()
+
+        ceiling = mod.claim_recall_ceiling(corpus, render_sightings=False)
+
+        # (claims - sightings + contested) / claims = (4 - 2 + 0) / 4
+        assert ceiling == 0.5
+
+    def test_a_contested_sighting_escapes_suppression_and_raises_the_ceiling(self):
+        """The `+ contested` term of the identity — measured, not assumed.
+
+        PRD V2 says a contested child is never suppressed, so its body
+        survives as its own hit and its claim stays reachable.  This asserts
+        the ARITHMETIC of that term; whether the term can ever be non-zero
+        in production is a separate, and currently negative, question — see
+        `TestTheContestedTermIsStructurallyZeroToday`.
+        """
+        mod = _mod()
+        corpus = TestSightingCreditingIsAnExplicitKnob._corpus()
+
+        ceiling = mod.claim_recall_ceiling(
+            corpus, render_sightings=False, contested_ids={'sight-1'},
+        )
+
+        # (4 - 2 + 1) / 4
+        assert ceiling == 0.75
+
+    def test_crediting_sightings_lifts_the_ceiling_to_one(self):
+        mod = _mod()
+        corpus = TestSightingCreditingIsAnExplicitKnob._corpus()
+
+        assert mod.claim_recall_ceiling(corpus, render_sightings=True) == 1.0
+
+    def test_a_claimless_corpus_has_no_ceiling_rather_than_a_zero(self):
+        """`None` is no measurement; 0.0 would read as "recalls nothing"."""
+        mod = _mod()
+
+        assert mod.claim_recall_ceiling([], render_sightings=False) is None
+        assert mod.claim_recall_ceiling(
+            [_rec('r1', topic='alpha')], render_sightings=False,
+        ) is None
+
+    def test_the_ceiling_equals_what_the_transform_actually_credits(self):
+        """Ties the arithmetic to the transform, so the two cannot drift."""
+        mod = _mod()
+        corpus = TestSightingCreditingIsAnExplicitKnob._corpus()
+        total = len({c for r in corpus for c in r.claim_ids})
+
+        for render in (False, True):
+            result = mod.apply_topic_keyed_grouped_read(
+                corpus, _topic_index(*corpus), render_sightings=render,
+            )
+            credited = {c for r in result.records for c in r.claim_ids}
+            assert len(credited) / total == mod.claim_recall_ceiling(
+                corpus, render_sightings=render,
+            )
+
+
+class TestTheContestedTermIsStructurallyZeroToday:
+    """Arm (2) suppresses, and cannot implement V2's protection.
+
+    `contested` is a hand-labelled bake-off FIXTURE field: it is absent from
+    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601
+    — `{topic, canonical, kind, parent_id, supersedes}`), has no writer and
+    no adjudication surface.  So the `+ contested` term above is arithmetic
+    that production cannot currently make non-zero, and the report says so
+    rather than implying the protection exists.
+    """
+
+    def test_contested_is_not_a_live_vocabulary_key(self):
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+
+        assert 'contested' not in RESERVED_VOCABULARY_KEYS
+        assert set(RESERVED_VOCABULARY_KEYS) == {
+            'topic', 'canonical', 'kind', 'parent_id', 'supersedes',
+        }
+
+    def test_the_transform_takes_no_contested_argument(self):
+        import inspect  # noqa: PLC0415
+
+        params = inspect.signature(
+            _mod().apply_topic_keyed_grouped_read,
+        ).parameters
+
+        assert not any('contested' in name for name in params)
+
+
+class TestTopicKeyedRanking:
+    """A group lands at the BEST rank among its members."""
+
+    def test_the_group_takes_the_min_rank_of_its_members(self):
+        mod = _mod()
+        lead = _rec('slab-1', topic=None, content='SLAB')
+        amendment = _rec('amend-1', topic='alpha', kind='amendment', content='AMEND')
+        trailer = _rec('slab-2', topic=None, content='SLAB2')
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        hits = [lead, amendment, trailer, canonical]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        # The group inherits rank 1 (its amendment), not rank 3 (its
+        # canonical): demoting it to the worst member would make grouping
+        # look worse at every k as an artifact of this transform.  Same rule
+        # `rescore` applies to SCORE (:3246), so the two agree.
+        assert _ids(result.records) == ['slab-1', 'canon-a', 'slab-2']
+
+
+class TestTopicKeyedNeverInventsRetrieval:
+    """Only the canonical is pulled in unranked; members are hits only."""
+
+    def test_a_topic_member_the_store_never_returned_is_not_folded(self):
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True,
+                         content='CANON', claim_ids=['k0'])
+        ranked = _rec('amend-1', topic='alpha', kind='amendment',
+                      content='AMEND', claim_ids=['k1'])
+        unranked = _rec('amend-2', topic='alpha', kind='amendment',
+                        content='NEVER-RANKED', claim_ids=['k2'])
+
+        result = mod.apply_topic_keyed_grouped_read(
+            [canonical, ranked],
+            _topic_index(canonical, ranked, unranked),
+            render_sightings=False,
+        )
+
+        document = result.records[0]
+        assert 'NEVER-RANKED' not in document.content
+        assert 'k2' not in document.claim_ids
+
+    def test_an_unranked_canonical_IS_pulled_in(self):
+        """D6's upward resolution: a member hit must reach its anchor.
+
+        This is the one record the index legitimately contributes — without
+        it a peer hit's group would have no canonical body, which is the
+        whole benefit being measured.
+        """
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True,
+                         content='CANON', claim_ids=['k0'])
+        ranked = _rec('amend-1', topic='alpha', kind='amendment',
+                      content='AMEND', claim_ids=['k1'])
+
+        result = mod.apply_topic_keyed_grouped_read(
+            [ranked], _topic_index(canonical, ranked), render_sightings=False,
+        )
+
+        assert result.records[0].content == 'CANON\n[amendment] AMEND'
+        assert result.records[0].claim_ids == ['k0', 'k1']
+
+
+class TestTopicKeyedSynthesizesNothingItNeedNot:
+    def test_a_topic_with_no_canonical_passes_through_flat(self):
+        """Never synthesize a canonical — leaf ε's uniqueness rule is not
+        this transform's to invent, and anointing the best-ranked peer
+        would make the document depend on ANN order."""
+        mod = _mod()
+        first = _rec('peer-1', topic='orphan')
+        second = _rec('peer-2', topic='orphan')
+        hits = [first, second]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert all(r is h for r, h in zip(result.records, hits, strict=True))
+
+    def test_a_lone_canonical_hit_is_returned_by_identity(self):
+        """A group of one IS its canonical: no synthesis, no allocation."""
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+
+        result = mod.apply_topic_keyed_grouped_read(
+            [canonical], _topic_index(canonical), render_sightings=False,
+        )
+
+        assert result.records[0] is canonical
+
+    def test_an_empty_hit_list_returns_empty(self):
+        assert _mod().apply_topic_keyed_grouped_read(
+            [], {}, render_sightings=False,
+        ).records == []
+
+
+class TestTopicKeyedIsPure:
+    def test_it_mutates_neither_input(self):
+        mod = _mod()
+        hits = TestSightingCreditingIsAnExplicitKnob._corpus()
+        index = _topic_index(*hits)
+        hits_before = copy.deepcopy(hits)
+        index_before = copy.deepcopy(index)
+
+        mod.apply_topic_keyed_grouped_read(hits, index, render_sightings=False)
+
+        assert hits == hits_before
+        assert index == index_before
+
+    def test_the_document_gets_a_fresh_metadata_dict(self):
+        mod = _mod()
+        canonical = _rec('canon-a', topic='alpha', canonical=True, content='CANON')
+        peer = _rec('peer-1', topic='alpha', kind='amendment', content='AMEND')
+
+        result = mod.apply_topic_keyed_grouped_read(
+            [canonical, peer], _topic_index(canonical, peer), render_sightings=False,
+        )
+
+        assert result.records[0].metadata is not canonical.metadata
+        assert result.records[0].metadata == canonical.metadata
+
+
+class TestArmTwoIsDeclaredSuppressing:
+    """The flag step-19's report column reads, set at the source.
+
+    Two DISTINCT facts, deliberately not collapsed into one boolean: does
+    the transform drop ranked records, and would satisfying PRD V2 under it
+    require a `contested` key?  Arm (2) is both; arm (1) is neither.
+    """
+
+    def test_arm_two_drops_ranked_records_and_would_need_contested(self):
+        spec = _mod().ARM_SPECS['topic_keyed_grouped']
+
+        assert spec.drops_ranked_records is True
+        assert spec.requires_contested_key_for_v2 is True
+
+    def test_arm_one_drops_nothing_and_needs_no_contested_key(self):
+        spec = _mod().ARM_SPECS['promoting_pin']
+
+        assert spec.drops_ranked_records is False
+        assert spec.requires_contested_key_for_v2 is False
+        # It still costs the window's last slot — via `read_path`'s
+        # truncation, which is a different mechanism and gets its own flag
+        # rather than being folded into "suppressing".
+        assert spec.displaces_at_window_edge is True
+
+    def test_grouped_members_stop_being_independent_hits(self):
+        """What `drops_ranked_records is True` actually means, measured."""
+        mod = _mod()
+        hits = TestSightingCreditingIsAnExplicitKnob._corpus()
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert len(result.records) < len(hits)
+        assert 'amend-1' not in _ids(result.records)
