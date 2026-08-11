@@ -1063,6 +1063,7 @@ class TestBuildChainClean:
         assert len(calls) == 1
 
         # Lane ownership on the success path: γ verifies the tip in place.
+        assert res.lane is not None
         assert res.lane == git_ops.worktree_base / '_spec-0'
         assert res.lane_warm is True
         assert git_ops.spec_warm_lane_pool is not None
