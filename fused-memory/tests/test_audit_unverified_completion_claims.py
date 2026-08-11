@@ -10,6 +10,8 @@ import importlib.util
 import json
 import re
 import types
+
+import pytest
 from pathlib import Path
 
 SCRIPT_PATH = (
@@ -53,6 +55,9 @@ build_report = _mod.build_report
 CAVEATS = _mod.CAVEATS
 _build_parser = _mod._build_parser
 RO_COMMAND = _mod.RO_COMMAND
+EpisodeReader = _mod.EpisodeReader
+EPISODE_CYPHER = _mod.EPISODE_CYPHER
+PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -605,3 +610,118 @@ class TestReadOnlyByConstruction:
         defaults = parser.parse_args([])
         assert defaults.include_unverifiable is False
         assert defaults.fail_on_mismatch is False
+
+
+class _FakeGraph:
+    """A graph double recording every command issued against it.
+
+    Hand-written rather than MagicMock so the recorded commands are a plain,
+    readable list — the read-only assertions below are about what was ISSUED,
+    and a mock's call machinery obscures exactly that.
+    """
+
+    def __init__(self, rows: list[list[object]] | None = None,
+                 edge_rows: list[list[object]] | None = None) -> None:
+        self.rows = rows if rows is not None else []
+        self.edge_rows = edge_rows if edge_rows is not None else []
+        self.commands: list[str] = []
+        self.queries: list[tuple[str, object]] = []
+
+    async def ro_query(self, query: str, params: object = None) -> object:
+        self.commands.append(RO_COMMAND)
+        self.queries.append((query, params))
+        rows = self.edge_rows if 'RELATES_TO' in query else self.rows
+        return types.SimpleNamespace(result_set=rows)
+
+    async def query(self, query: str, params: object = None) -> object:  # pragma: no cover
+        self.commands.append('GRAPH.QUERY')
+        raise AssertionError('the sweep must never issue a writable GRAPH.QUERY')
+
+
+def _episode_row(
+    uuid: str = 'ep-1',
+    name: str = 'episode',
+    group_id: str = 'reify',
+    source_description: str = 'add_memory:temporal_facts',
+    created_at: str = '2026-07-26T00:00:00Z',
+    content: str = ESC_3085_1_INSTANCE_1,
+) -> list[object]:
+    return [uuid, name, group_id, source_description, created_at, content]
+
+
+@pytest.mark.asyncio
+class TestEpisodeReader:
+    """The read seam: GRAPH.RO_QUERY only, no graphiti_core driver."""
+
+    async def test_episode_cypher_is_derived_from_the_projection(self) -> None:
+        """Built from the constant, so query and record cannot drift apart."""
+        expected = 'MATCH (e:Episodic) RETURN ' + ', '.join(
+            f'e.{field}' for field in PROJECTED_FIELDS
+        )
+        assert EPISODE_CYPHER == expected
+
+    async def test_rows_map_onto_corpus_records(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row()])
+        records = await EpisodeReader(graph=graph).fetch_population()
+        assert len(records) == 1
+        record = records[0]
+        assert record.uuid == 'ep-1'
+        assert record.kind == 'episode'
+        assert record.project_id == 'reify'
+        assert record.category == 'temporal_facts'
+        assert record.text == ESC_3085_1_INSTANCE_1
+        assert record.source_description == 'add_memory:temporal_facts'
+
+    async def test_null_columns_degrade_to_empty_string(self) -> None:
+        """A real corpus has episodes with no source_description."""
+        graph = _FakeGraph(rows=[[None, None, None, None, None, None]])
+        records = await EpisodeReader(graph=graph).fetch_population()
+        assert len(records) == 1
+        assert records[0].uuid == ''
+        assert records[0].source_description == ''
+        assert records[0].category is None
+        assert records[0].text == ''
+
+    async def test_reader_issues_only_ro_query(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row()])
+        reader = EpisodeReader(graph=graph)
+        await reader.fetch_population()
+        await reader.fetch_derived_edges('ep-1')
+        assert set(graph.commands) == {RO_COMMAND}
+        write_re = re.compile(
+            r'\b(?:CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP)\b', re.IGNORECASE
+        )
+        for query, _params in graph.queries:
+            assert write_re.search(query) is None
+
+    async def test_fetch_derived_edges_returns_edge_uuids(self) -> None:
+        graph = _FakeGraph(edge_rows=[
+            ['7dbf12cf-9251-4674-b396-8eefdf651d1c', 'a fact', None, None],
+            ['edge-2', 'another fact', None, None],
+        ])
+        uuids = await EpisodeReader(graph=graph).fetch_derived_edges(
+            '02090224-7bc9-4485-9291-6748e1042ac9'
+        )
+        assert uuids == ('7dbf12cf-9251-4674-b396-8eefdf651d1c', 'edge-2')
+
+    async def test_fetch_derived_edges_empty_result(self) -> None:
+        graph = _FakeGraph(edge_rows=[])
+        assert await EpisodeReader(graph=graph).fetch_derived_edges('ep-x') == ()
+
+    async def test_limit_is_applied(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row(uuid=f'ep-{i}') for i in range(3)])
+        await EpisodeReader(graph=graph).fetch_population(limit=2)
+        query, _params = graph.queries[0]
+        assert 'LIMIT 2' in query
+
+    async def test_reader_constructs_no_graphiti_driver(self) -> None:
+        """graphiti_core's FalkorDriver.__init__ fire-and-forgets
+        build_indices_and_constraints() — a WRITE. This class must never
+        construct it (build_corpus.py:706-712's explicit warning)."""
+        source = SCRIPT_PATH.read_text()
+        assert 'FalkorDriver' not in source
+        assert 'graphiti_core' not in source
+        graph = _FakeGraph(rows=[_episode_row()])
+        reader = EpisodeReader(graph=graph)
+        await reader.fetch_population()
+        assert reader._graph is graph
