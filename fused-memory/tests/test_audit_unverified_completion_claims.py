@@ -7,6 +7,7 @@ sys.path pollution — mirrors the pattern in test_audit_found_on_main_provenanc
 from __future__ import annotations
 
 import importlib.util
+import json
 import types
 from pathlib import Path
 
@@ -47,6 +48,8 @@ scan_records = _mod.scan_records
 adjudicate = _mod.adjudicate
 Finding = _mod.Finding
 UNRESOLVABLE = _mod.UNRESOLVABLE
+build_report = _mod.build_report
+CAVEATS = _mod.CAVEATS
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -395,3 +398,128 @@ class TestAdjudicate:
             commit_probe=lambda ref, project_id: None,
         )
         assert [f.status for f in findings] == ['mismatch', 'unverifiable']
+
+
+def _finding(
+    status: str = 'mismatch',
+    uuid: str = 'ep-1',
+    category: str = 'temporal_facts',
+    project_id: str = 'reify',
+    subject: str = 'ticket',
+    ref: str = 'tkt_X',
+    created_at: str = '2026-07-26T00:00:00Z',
+) -> object:
+    return Finding(
+        record_uuid=uuid,
+        record_kind='episode',
+        category=category,
+        project_id=project_id,
+        created_at=created_at,
+        claim_kind='filing_dispatch',
+        subject=subject,
+        ref=ref,
+        claim_project_id=None,
+        status=status,
+        observed=f'observed for {ref}',
+        claimed_text='some claiming clause',
+    )
+
+
+class TestBuildReport:
+    """Volume control WITHOUT a silent cap, and the retrospective bias as data."""
+
+    def _build(self, findings: list[object], include_unverifiable: bool = False):
+        return build_report(
+            findings,
+            swept_at='2026-08-11T12:00:00Z',
+            scanned_count=100,
+            records_with_claims=7,
+            projects=['dark_factory', 'reify'],
+            categories=sorted(IN_SCOPE_CATEGORIES),
+            include_unverifiable=include_unverifiable,
+        )
+
+    def test_summary_counts_both_buckets_even_when_not_listing(self) -> None:
+        """Counting-but-not-listing must never read as a clean corpus."""
+        report = self._build([
+            _finding('mismatch', uuid='ep-a'),
+            _finding('unverifiable', uuid='ep-b'),
+            _finding('unverifiable', uuid='ep-c'),
+        ])
+        assert report['summary']['mismatch'] == 1
+        assert report['summary']['unverifiable'] == 2
+        assert report['summary']['by_category']
+        assert report['summary']['by_project']
+        assert report['summary']['by_subject']
+
+    def test_mismatch_and_unverifiable_are_never_summed(self) -> None:
+        """Different facts — the gate makes the same distinction load-bearing
+        at the sentinel level (completion_claim_gate.py:123-127)."""
+        report = self._build([_finding('mismatch'), _finding('unverifiable')])
+        assert 'total' not in report['summary']
+        assert 'findings_total' not in report['summary']
+
+    def test_default_lists_only_mismatches_and_says_what_it_withheld(self) -> None:
+        report = self._build([
+            _finding('mismatch', uuid='ep-a'),
+            _finding('unverifiable', uuid='ep-b'),
+        ])
+        assert [f['status'] for f in report['findings']] == ['mismatch']
+        assert report['summary']['unverifiable'] == 1
+        truncated = report['truncated_by']
+        assert truncated is not None
+        assert truncated['withheld'] == 1
+        assert truncated['status'] == 'unverifiable'
+        assert '--include-unverifiable' in truncated['flag']
+
+    def test_include_unverifiable_lists_everything(self) -> None:
+        report = self._build(
+            [_finding('mismatch', uuid='ep-a'), _finding('unverifiable', uuid='ep-b')],
+            include_unverifiable=True,
+        )
+        assert [f['status'] for f in report['findings']] == [
+            'mismatch', 'unverifiable',
+        ]
+        assert report['truncated_by'] is None
+
+    def test_denominators_are_present(self) -> None:
+        """A rate can be computed rather than guessed."""
+        report = self._build([_finding('mismatch')])
+        assert report['scanned'] == 100
+        assert report['records_with_claims'] == 7
+        assert report['projects'] == ['dark_factory', 'reify']
+        assert report['categories'] == sorted(IN_SCOPE_CATEGORIES)
+        assert report['swept_at'] == '2026-08-11T12:00:00Z'
+
+    def test_caveats_pin_the_retrospective_bias_as_data(self) -> None:
+        """A write-time gate reads the authority at write time; this sweep reads
+        it TODAY. The gap biases the result in BOTH directions, and a reader who
+        takes the headline as a clean measurement draws a wrong conclusion
+        either way. Pinning the literal text against a module constant means a
+        later editor cannot quietly drop one while the report still looks
+        authoritative."""
+        report = self._build([_finding('mismatch')])
+        caveats = report['caveats']
+        assert caveats
+        assert list(caveats) == list(CAVEATS)
+        blob = ' '.join(caveats).lower()
+        assert 'under-count' in blob or 'under-counts' in blob
+        assert 'cancelled' in blob
+        assert 'mem0' in blob
+
+    def test_report_is_json_serializable_and_byte_stable(self) -> None:
+        findings = [
+            _finding('unverifiable', uuid='ep-b', category='decisions_and_rationale'),
+            _finding('mismatch', uuid='ep-a'),
+        ]
+        first = json.dumps(self._build(findings, True), indent=2, default=str)
+        second = json.dumps(self._build(findings, True), indent=2, default=str)
+        assert first == second
+        assert json.loads(first)['summary']['mismatch'] == 1
+
+    def test_empty_corpus_reports_zero_without_truncation(self) -> None:
+        report = self._build([])
+        assert report['findings'] == []
+        assert report['summary']['mismatch'] == 0
+        assert report['summary']['unverifiable'] == 0
+        assert report['truncated_by'] is None
