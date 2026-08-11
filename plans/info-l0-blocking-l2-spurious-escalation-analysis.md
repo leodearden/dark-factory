@@ -331,3 +331,123 @@ session scratchpad (`full_index.json`, `task2_strict_results.json`,
 `task3_results.json`, `task4_results.json`, `task5_results.json`); the queue
 mutated twice during measurement (esc-3624-6/-7 resolved, esc-3543-5 filed) —
 all numbers are from the final consistent snapshot.
+
+---
+
+# Addendum (2026-08-11): Option C's premise re-examined, and a larger defect found
+
+Operator discussion round 1 rejected Option C as written ("consume-on-terminal"
+would archive info L0s silently — "not what I want") and posed two empirical
+questions: (1) aren't late-lifecycle info L0s almost always non-blocking review
+comments (test completeness / code quality) that should be *actioned* as
+follow-up tasks, not archived? (2) doesn't deterministic conversion code for
+that already exist? Two agent studies answered both; every load-bearing claim
+below was spot-checked in code or against the live server.
+
+## A1. What info L0s actually are (corpus study, N=1,501, sample=300)
+
+Population: 1,307 info L0s + 194 reaper-minted info L1s, 2026-07-12→08-11.
+
+| Class | Share | Disposition it deserves |
+|---|---|---|
+| STATUS_INFO (mechanical notices; ~⅔ of the orchestrator-filed ones are the one "done step commit orphaned" tripwire) | **61%** | class-specific auto-handling; never promote, never convert |
+| FOLLOWUP_WORK (real adjacent bugs/gaps, out of scope) | **17%** | **convert to task** (the operator's ratification pattern) |
+| DEVIATION_NOTE (plan-vs-reality audit notes, "no action needed") | **16%** | consume-on-terminal (original C1, correctly scoped to THIS class only) |
+| REVIEW_TEST + REVIEW_CODE (the hypothesized class) | **5.3%** | convert to task |
+
+So the hypothesis is **refuted on prevalence** (5%, not "almost always") but
+**confirmed on tone and timing**: 86.6% are filed within 24h of the task's
+merge (median 8.4h before). The quality leak is real but lives mostly in
+FOLLOWUP_WORK: in the sample crosstab, 32/50 genuine follow-up-work notes died
+DISMISSED_BENIGN vs 12 converted. Full-population conversion-to-task: 5.4%
+(L0s) / 25.3% (reaper L1s — inflated by cascade credit); 79% dismissed benign;
+the mechanical reaper touches 44.9% of all info-L0 dispositions, and 52.7% of
+reaper-minted L1s are cascade-resolved without ever being independently read.
+Of the 9 info records pending today: 4 FOLLOWUP_WORK worth keeping, 3
+DEVIATION_NOTE, 2 STATUS_INFO, 0 review comments.
+
+## A2. The conversion machinery exists — its deterministic core is a silent no-op
+
+Task 2640 (done, `1ecbb4f430`, 2026-07-21) codified the owner decision (Leo,
+2026-07-15): *work item → submit_task; information → escalate_info*. Inventory
+of all 18 discovered paths from "follow-up content" to "task": the only paths
+carrying real volume are 2640's **prompt** instruction to architect/implementer
+(387 tasks since landing — LLM discretion, no detector for missed filings) and
+the steward sweep-up (**1% coverage** — scoped to "YOUR OWN still-open
+info-notes", but 99% of info L0s are filed by implementer/architect/debugger,
+and it never runs when a workflow dies — both fixture incidents were exactly
+that crash path).
+
+**The genuinely deterministic paths are all dead behind one transport bug.**
+`workflow.py`'s four raw MCP POSTs (`:15149, :15190, :15222, :15260` —
+`_post_submit_tasks` and the completion/decisions/suggestions memory writes)
+plus `merge_queue.py:15122` POST to `{mcp.url}/mcp/` (trailing slash); the
+server answers **HTTP 307 → /mcp**; bare `httpx.AsyncClient()` defaults
+`follow_redirects=False`; the response is never inspected; success is logged
+regardless. Verified live this session (curl → `307 http://localhost:8002/mcp`).
+Corroboration: **0 tickets ever** with the review-suggestion spawn_contexts in
+6,087 all-time tickets; `steward-triage` ticket volume collapsed 1,668→96/month
+when task 1367 (2026-05-15) cut the DONE path over to this transport.
+Consequence: **every task's end-of-review non-blocking suggestions have been
+silently discarded since ~2026-05-15** — they never become an escalation, a
+ticket, or a memory; not even a human sees them. This is the actual
+code-quality/test-completeness leak, and it sits *upstream* of the escalation
+ladder entirely. Precedent: task 29 diagnosed this exact httpx/307 bug and
+prescribed the fix ("follow_redirects=True … and correct the URL") but only
+`dashboard/` was fixed; task 3644 fixed a third instance in a script. The
+orchestrator's five sites were never swept; `test_suggestion_triage.py:260-266`
+mocks the POST so the suite can't notice.
+
+Other structural facts: no code anywhere reads an escalation and files a task
+(`RESOLVE_ACTIONS` has no filing action; `escalation/src/` has zero references
+to any task store). The L1 auto-watcher holds **no** filing tool
+(`_WATCHER_ALLOWED_TOOLS`), yet its skill resolves `cleanup_needed` with
+*"Cleanup queued… tracked in digest"* — nothing is queued and the digest dies
+with the rotation, while the *same record* at L2 would get a real
+`submit_task` — L1 resolves it first, so it never reaches L2. Ticket-pipeline
+losses: 272 `failed` all-time (117 `tm_add_task_returned_no_id`, 49
+`server_restart` — a fused-memory restart destroys in-flight candidates);
+`refused` is a latent trap (0 occurrences, excluded from janitor sweep and
+agent-facing status list); the completion-claim gate verifies "filed as tkt_X"
+on row *existence*, so a failed ticket passes it.
+
+## A3. Revised proposal: a disposition router, not one policy
+
+Replacing Option C as written. "Never inflate to blocking" (3976) stays first
+and orthogonal. For open info L0s at end of lifecycle:
+
+1. **Work-shaped (FOLLOWUP_WORK + REVIEW, ~22%): convert-and-close.** File a
+   candidate via the curator admission gate (which is what makes over-filing
+   safe — it fails open to `create`), resolve the note citing the ticket/task
+   id. Candidate mechanisms, cheapest first: (a) **fix the 307 transport** (5
+   sites, one keyword + `raise_for_status()` — prerequisite for everything
+   else and independently urgent); (b) give the L1 auto-watcher a filing tool
+   + a convert-and-close rung (replaces the fictional digest); (c) a
+   crash-path backstop so the steward sweep-up's conversion also happens when
+   the workflow dies (the reaper — or the terminal-subject sweep — routing
+   work-shaped info L0s to the curator instead of promoting them).
+2. **DEVIATION_NOTE (~16%): consume-on-terminal** (original C1, now correctly
+   scoped) — resolved as observation-consumed, archived, searchable.
+3. **STATUS_INFO (~61%): class-specific handling** — the dominant tripwire
+   class already has discriminators; extend the existing benign-class
+   dismissal rather than inventing a new channel.
+4. The work/information discriminator is a judgment call → it belongs with an
+   LLM consumer (the L1 watcher) or the filing author, not a regex in the
+   reaper; the reaper stays a lifecycle mechanism.
+
+## A4. Updated open questions
+
+1. The 307 transport fix is outside this investigation's no-implement rule but
+   is an active fleet-wide loss (review suggestions + three memory-write
+   classes + main-health auto-heal filing). Fix now as its own task?
+2. Ratify the disposition router? Which mechanism for work-shaped conversion —
+   L1 watcher rung (LLM judgment, needs tool grant), reaper→curator routing
+   (deterministic reach, needs a classifier), or steward crash-backstop
+   (narrowest)?
+3. Is DISMISSED_BENIGN-by-default acceptable for STATUS_INFO (61%), given the
+   dominant tripwire is itself an automation artifact worth reducing at source?
+4. The L1/L2 skill asymmetry (`cleanup_needed` "digest" fiction; L2's "local
+   todo" for design_concern/risk_identified never reaching the task tree) —
+   fix the skills regardless of the router decision?
+5. Ticket-pipeline hardening (server_restart flush, refused trap, claim gate
+   row-existence check) — in scope for this remediation or separate?
