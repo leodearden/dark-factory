@@ -22,6 +22,10 @@ from shared.cli_invoke import AllAccountsCappedException, read_transcript_record
 from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
+from fused_memory.backends.falkor_indices import (
+    expected_index_set,
+    normalize_index_records,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -47,6 +51,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
@@ -1149,6 +1154,75 @@ class ReconciliationHarness:
                 f'_check_graphiti_queue_health failed for project_id={project_id!r}: {exc}'
             )
             return None
+
+    async def _check_index_health(self, group_id: str) -> dict | None:
+        """Read a graph's actual index set and classify it against the expected one.
+
+        Surfaces the silent-failure tail this PRD exists for: graphiti's index
+        provisioning was stubbed, so graphs served queries with none of the
+        indices they should have had.  Nothing failed — reads just got slower and
+        no signal was ever emitted.
+
+        The read is `ro_query`-based (`GraphitiBackend.list_indices` issues
+        `CALL db.indexes()` via `GRAPH.RO_QUERY`) and therefore CANNOT create,
+        drop or alter an index.  That is the HAZARD control which lets this run
+        against real graphs while esc-3375-1's index-state evidence stays intact.
+
+        Args:
+            group_id: The graph to check (a project id).
+
+        Returns:
+            A `summarize_index_health()` record, or None when the graphiti
+            backend is unavailable, the graph does not exist yet, or the read
+            failed.  None means UNKNOWN — never a synthesised healthy record.
+
+        Raises:
+            IndexRecordShapeError: `CALL db.indexes()` returned a record shape α
+                refuses to interpret.  Normalisation deliberately runs OUTSIDE
+                the try block: swallowing this into `actual = set()` would report
+                a fully-provisioned graph as entirely un-provisioned and file a
+                bogus escalation.
+        """
+        graphiti = getattr(self.memory, 'graphiti', None)
+        if graphiti is None:
+            return None
+        try:
+            records = await graphiti.list_indices(group_id=group_id)
+        except Exception as exc:
+            # Decide graph-absence STRUCTURALLY, never by matching FalkorDB's
+            # error wording (D2).  A registered project with no graph yet (D6
+            # names autotrade and mission_control) is NOT drift: there is
+            # nothing to repair until something writes to the graph, so
+            # reporting the full expected set as missing would file an
+            # escalation an operator cannot act on.
+            try:
+                if group_id not in await graphiti.list_graphs():
+                    return None
+            except Exception as probe_exc:
+                logger.warning(
+                    f'_check_index_health could not determine whether graph '
+                    f'{group_id!r} exists after a failed read: {probe_exc}'
+                )
+                return None
+            logger.warning(
+                f'_check_index_health failed for group_id={group_id!r}: {exc}'
+            )
+            return None
+
+        health = summarize_index_health(
+            normalize_index_records(records), expected_index_set()
+        )
+        if not health['healthy']:
+            logger.warning(
+                'reconciliation.index_health_unhealthy',
+                extra={
+                    'group_id': group_id,
+                    'missing_count': len(health['missing']),
+                    'expected_total': health['expected_total'],
+                    'actual_total': health['actual_total'],
+                },
+            )
+        return health
 
     async def _reconcile_status_correction(
         self, project_id: str, statuses: dict[str, str]
