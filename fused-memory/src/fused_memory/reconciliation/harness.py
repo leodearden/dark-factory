@@ -1297,6 +1297,42 @@ class ReconciliationHarness:
 
         return health
 
+    async def _check_index_health_at_startup(self) -> None:
+        """One-shot index-health sweep over the REGISTERED projects (task 3709, Q3).
+
+        Q3 asked whether index health is checked at startup, on the recon
+        cadence, or both.  Both — and both call `_detect_index_drift`, so there
+        is one detector rather than two that can silently disagree.
+
+        WHY THE REGISTRY IS THE SCOPE: `self._known_projects` is built by
+        `build_known_projects_map` from `taskmaster.project_root` +
+        `DASHBOARD_KNOWN_PROJECT_ROOTS` — exactly the registry PRD D5 names — so
+        δ inherits D5's scoping without writing a filter in `backends/` that γ
+        will later own, and without pre-empting γ, which owns provisioning.
+
+        The alternative — reusing `GraphitiBackend.initialize()`'s
+        `!= 'default_db' and not endswith('_db')` graph filter — was rejected:
+        D5 measured it as all 35 probe/test/scratch graphs plus the 6 real ones,
+        and since γ has not landed EVERY one of those is genuinely
+        un-provisioned today.  A sweep there would file ~35
+        `recon_missing_index` escalations on the first restart — a flood the
+        recon-escalation-watcher would have to close one by one, converting a
+        loud signal into noise (INV-4).
+
+        Projects are visited in sorted order for determinism.  Each is wrapped
+        in its own guard so one project's failure cannot skip the rest, matching
+        the "safety net, not a gate" posture of the sibling one-shot passes.
+        Never raises.
+        """
+        for project_id in sorted(self._known_projects):
+            try:
+                await self._detect_index_drift(project_id)
+            except Exception as e:
+                logger.warning(
+                    f'_check_index_health_at_startup failed for '
+                    f'project_id={project_id!r}: {e}'
+                )
+
     async def _reconcile_status_correction(
         self, project_id: str, statuses: dict[str, str]
     ) -> dict | None:
@@ -2445,6 +2481,15 @@ class ReconciliationHarness:
             await self._recover_pending_judge_reviews()
         except Exception as e:
             logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
+
+        # One-shot: health-check the registered projects' FalkorDB index state
+        # (task 3709 / PRD δ Q3). Placed AFTER _start_escalation_server() so the
+        # queue exists to file into. Guarded like the sibling one-shot passes so
+        # a health hiccup can never crash harness startup.
+        try:
+            await self._check_index_health_at_startup()
+        except Exception as e:
+            logger.warning(f'_check_index_health_at_startup at startup failed: {e}')
 
         loop_count = 0
         try:
