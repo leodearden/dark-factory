@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import types
 from pathlib import Path
 
@@ -578,10 +579,15 @@ class TestReadOnlyByConstruction:
             if name.endswith('_CYPHER') and isinstance(value, str)
         ]
         assert cypher_constants, 'expected at least one *_CYPHER constant'
+        # Word-boundary matched, not substring: the projected field
+        # ``e.created_at`` legitimately contains the letters of CREATE, and a
+        # substring test would fail on a read-only query.
+        write_keyword_re = re.compile(
+            r'\b(?:CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP)\b', re.IGNORECASE
+        )
         for query in cypher_constants:
-            upper = query.upper()
-            for keyword in ('CREATE', 'MERGE', 'SET ', 'DELETE', 'REMOVE'):
-                assert keyword not in upper, f'write keyword {keyword!r} in {query!r}'
+            hit = write_keyword_re.search(query)
+            assert hit is None, f'write keyword {hit and hit.group()!r} in {query!r}'
 
     def test_project_is_repeatable(self) -> None:
         """esc-3085-1's two instances were written by reify agents about work in

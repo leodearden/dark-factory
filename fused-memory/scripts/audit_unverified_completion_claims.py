@@ -53,7 +53,10 @@ Exit codes: ``0`` ran, ``1`` infra failure (nothing printed), ``2``
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import re
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -472,3 +475,153 @@ def build_report(
         'caveats': list(CAVEATS),
         'findings': [f.to_json() for f in listed],
     }
+
+
+# --------------------------------------------------------------------------- #
+# The read seam — GRAPH.RO_QUERY, no graphiti driver
+# --------------------------------------------------------------------------- #
+
+DEFAULT_PROJECT = 'dark_factory'
+"""The graph swept when --project is not given."""
+
+RO_COMMAND = 'GRAPH.RO_QUERY'
+"""The only FalkorDB command this script is permitted to issue.
+
+Read-only here is **server-enforced**, not client-promised: build_corpus.py
+(:667-675) records that a ``CREATE`` issued through this command path was
+refused by a live FalkorDB and materialized no graph. For an audit whose entire
+premise is "do not mutate on a regex verdict", that is the difference between a
+promise and a guarantee — which is why this script reads over Cypher rather
+than through ``MemoryService`` / ``GraphitiBackend``, both of which reach the
+store through a handle that CAN write.
+
+Two secondary reasons. ``MemoryService.initialize()`` brings up Qdrant and an
+embedder this sweep does not need, and graphiti_core's ``FalkorDriver.__init__``
+fire-and-forgets ``build_indices_and_constraints()`` — a WRITE. And
+``MemoryService.get_episodes`` is unusable regardless: it drops
+``source_description`` from its projection (memory_service.py:3838-3843), which
+is the ONLY carrier of the category this task scopes to, and the MCP layer
+clamps ``last_n`` to 1000 against a population measured at 2976 (dark_factory)
+and 4547 (reify) rows.
+"""
+
+PROJECTED_FIELDS: tuple[str, ...] = (
+    'uuid',
+    'name',
+    'group_id',
+    'source_description',
+    'created_at',
+    'content',
+)
+"""The closed set of episode fields this sweep ever reads.
+
+Load-bearing, not documentation: :data:`EPISODE_CYPHER` builds its RETURN list
+from this tuple and :class:`CorpusRecord` mirrors it field for field, so the
+query and the record shape cannot drift apart.
+"""
+
+EPISODE_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
+    f'e.{field}' for field in PROJECTED_FIELDS
+)
+"""The population query, derived from :data:`PROJECTED_FIELDS`.
+
+No ``WHERE``: the category filter runs in Python over the recovered label,
+because the category is not a stored property and so cannot be filtered in
+Cypher at all. No ``LIMIT`` by default — a truncated population would make
+every denominator in the report wrong.
+"""
+
+DERIVED_EDGE_CYPHER = (
+    'MATCH ()-[r:RELATES_TO]->() WHERE $episode_uuid IN r.episodes '
+    'RETURN r.uuid, r.fact, r.valid_at, r.invalid_at'
+)
+"""The RELATES_TO edges extracted FROM a given episode — the harm artefacts.
+
+``r.episodes`` is a real persisted uuid list, not merely a declared one: the
+projection at ``fused_memory/maintenance/cross_graph_move.py:672`` is the
+in-tree precedent, and it was confirmed populated in both live graphs before
+this script was written. This is the join that yields the esc-3085-1
+instance-(2) shape — episode ``02090224-7bc9-4485-9291-6748e1042ac9`` ->
+edge ``7dbf12cf-9251-4674-b396-8eefdf651d1c``.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    Factored out (as audit_duplicate_memories.py:2796 does) precisely so
+    ``TestReadOnlyByConstruction`` can enumerate ``parser._actions`` and assert
+    that NO mutation affordance exists. There is deliberately no ``--apply``,
+    no ``--invalidate``, no ``--delete`` and no ``--repair``: this script
+    reports, and a human adjudicates.
+    """
+    parser = argparse.ArgumentParser(
+        prog='audit_unverified_completion_claims',
+        description=(
+            'Read-only retrospective sweep for unverified completion claims in '
+            'the Graphiti episode corpus (task 3381, esc-3085-1). Reports only '
+            '— it never mutates the graph.'
+        ),
+    )
+    parser.add_argument(
+        '--project',
+        action='append',
+        metavar='GRAPH',
+        help=(
+            'Project graph to sweep. Repeatable — esc-3085-1 spanned two trees '
+            f'(reify agents claiming about dark_factory work). Default: '
+            f'{DEFAULT_PROJECT}.'
+        ),
+    )
+    parser.add_argument(
+        '--uri',
+        default=None,
+        help='FalkorDB URI (redis://host:port). Default: read from --config.',
+    )
+    parser.add_argument(
+        '--config',
+        default=None,
+        help='Path to fused-memory config.yaml. Default: the packaged config.',
+    )
+    parser.add_argument(
+        '--categories',
+        default=','.join(sorted(IN_SCOPE_CATEGORIES)),
+        help=(
+            'Comma-separated categories to sweep. Default: the two this task '
+            'scopes to.'
+        ),
+    )
+    parser.add_argument(
+        '--include-unverifiable',
+        action='store_true',
+        help=(
+            'List unverifiable findings too. They are always COUNTED in the '
+            'summary; this flag adds them to the findings listing.'
+        ),
+    )
+    parser.add_argument(
+        '--fail-on-mismatch',
+        action='store_true',
+        help='Exit 2 when at least one mismatch is found (for a CI/cron gate).',
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help=(
+            'Cap the episodes read per graph. Diagnostics only — a capped run '
+            "makes the report's denominators unrepresentative, and the cap is "
+            'recorded in the report when set.'
+        ),
+    )
+    return parser
+
+
+def main() -> int:
+    """Entry point: parse argv and run the sweep."""
+    args = _build_parser().parse_args()
+    return asyncio.run(_run(args))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
