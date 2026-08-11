@@ -1966,6 +1966,7 @@ def _make_late_arrival_worker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 110s, x2 stretched
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -2177,6 +2178,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -2379,6 +2381,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 105s, x2 stretched
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2565,6 +2568,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 110s, x2 stretched
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -3113,6 +3117,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
