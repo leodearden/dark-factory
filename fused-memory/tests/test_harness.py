@@ -13773,9 +13773,10 @@ def _index_records_for(specs):
     so a graphiti upgrade that changes the index set cannot make these tests pass
     against a stale expectation.
     """
-    from fused_memory.backends.falkor_indices import resolve_header_positions
     from test_ensure_indices import _rows_for
     from test_falkor_indices import LIVE_HEADER
+
+    from fused_memory.backends.falkor_indices import resolve_header_positions
 
     positions = resolve_header_positions(
         LIVE_HEADER,

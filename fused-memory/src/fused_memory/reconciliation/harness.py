@@ -50,9 +50,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_config_base_dir,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
