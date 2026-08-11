@@ -30,11 +30,13 @@ from shared.cli_invoke import (
     build_failure_message,
     classify_agent_failure,
     count_transcript_turns,
+    get_unreadable_transcript_escapes,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    reset_unreadable_transcript_escapes,
 )
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
@@ -4579,3 +4581,173 @@ class TestBackendForwarding:
             'oauth_token': 'tok',
             'config_dir': None,
         }, f'invoke_claude_agent call shape changed unexpectedly (gated path): {call_kwargs}'
+
+
+# ── INV-4: the unreadable-transcript storm escape, wiring half (task 4003) ────
+
+
+@pytest.mark.asyncio
+class TestUnreadableTranscriptEscapeWiring:
+    """The watchdog loop must COUNT its consecutive unreadable-transcript polls.
+
+    The unit half (test_transcript_unreadable_escape.py) pins the helper. This
+    pins that the loop actually calls it, with a CONSECUTIVE streak, and only
+    for roles configured to have a transcript.
+
+    The escape must not change any kill decision — "NEVER kill on None" stays
+    exactly as it is. It only makes the degrade observable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_counter(self):
+        reset_unreadable_transcript_escapes()
+        yield
+        reset_unreadable_transcript_escapes()
+
+    @staticmethod
+    def _proc(run_secs: float = 0.25):
+        """A process whose communicate() stays pending across many watchdog polls."""
+        payload = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-escape',
+        }).encode()
+
+        async def _communicate(input=None):  # noqa: A002
+            await asyncio.sleep(run_secs)
+            return (payload, b'')
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=_communicate)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+        proc.pid = 4003
+        return proc
+
+    async def _drive(self, tmp_path, *, turns_side_effect, config_dir, session_id):
+        """Run the watchdog loop at millisecond cadence with a patched transcript read."""
+        proc = self._proc()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=turns_side_effect,
+            ) as mock_turns,
+        ):
+            result = await _run_subprocess(
+                ['fake'],
+                cwd=tmp_path,
+                env={},
+                model='opus',
+                timeout_seconds=30.0,
+                session_id=session_id,
+                config_dir=config_dir,
+                startup_grace_secs=30.0,
+            )
+
+        # The process exited normally — no kill decision was taken, which is the
+        # invariant the escape must not disturb.
+        assert result.timed_out is False, 'the escape must not change the kill decision'
+        return mock_turns
+
+    async def test_streak_escape_fires_when_transcript_never_readable(self, tmp_path):
+        """A transcript that is never readable fires the escape exactly once.
+
+        This is the test that would have fired on 2026-07-18. Every poll of every
+        recon stage read None for three weeks and nothing counted it.
+        """
+        mock_turns = await self._drive(
+            tmp_path,
+            turns_side_effect=lambda *a, **k: None,
+            config_dir=tmp_path / 'cfg',
+            session_id='sid',
+        )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must produce enough polls to cross the threshold; '
+            f'got {mock_turns.call_count}'
+        )
+        assert get_unreadable_transcript_escapes() == 1, (
+            f'an always-unreadable transcript must fire exactly one escape; '
+            f'got {get_unreadable_transcript_escapes()} over '
+            f'{mock_turns.call_count} polls'
+        )
+
+    async def test_no_escape_when_transcript_readable(self, tmp_path):
+        """A readable transcript never fires the escape."""
+        await self._drive(
+            tmp_path,
+            turns_side_effect=lambda *a, **k: 1,
+            config_dir=tmp_path / 'cfg',
+            session_id='sid',
+        )
+
+        assert get_unreadable_transcript_escapes() == 0, (
+            f'a readable transcript must not fire; got {get_unreadable_transcript_escapes()}'
+        )
+
+    async def test_streak_resets_on_a_readable_read(self, tmp_path):
+        """The streak is CONSECUTIVE, not cumulative.
+
+        Alternates None/0 rather than None/1: a 0 keeps ``seen_turn`` False, so
+        the loop keeps reading every poll. (A 1 would latch ``seen_turn`` and
+        short-circuit all further reads, making the alternation untestable after
+        two polls.) Over dozens of polls a cumulative counter would cross the
+        threshold many times over; a consecutive one never crosses at all.
+        """
+        alternating = itertools.cycle([None, 0])
+        mock_turns = await self._drive(
+            tmp_path,
+            turns_side_effect=lambda *a, **k: next(alternating),
+            config_dir=tmp_path / 'cfg',
+            session_id='sid',
+        )
+
+        assert mock_turns.call_count >= 6, (
+            f'need several alternations for this to mean anything; '
+            f'got {mock_turns.call_count} polls'
+        )
+        assert get_unreadable_transcript_escapes() == 0, (
+            f'an alternating streak never reaches the threshold; got '
+            f'{get_unreadable_transcript_escapes()} over {mock_turns.call_count} polls'
+        )
+
+    async def test_no_escape_without_config_dir_or_session_id(self, tmp_path):
+        """A role with no transcript configured is out of scope and never fires.
+
+        The watchdog never reads a transcript for such a role, so its Nones mean
+        nothing — counting them would be noise, not signal. This is the scope
+        bound from the amendment.
+        """
+        for config_dir, session_id in (
+            (None, 'sid'),
+            (tmp_path / 'cfg', None),
+            (None, None),
+        ):
+            reset_unreadable_transcript_escapes()
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                config_dir=config_dir,
+                session_id=session_id,
+            )
+
+            assert mock_turns.call_count == 0, (
+                f'no transcript read is expected for config_dir={config_dir!r} '
+                f'session_id={session_id!r}; got {mock_turns.call_count} calls'
+            )
+            assert get_unreadable_transcript_escapes() == 0, (
+                f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
+                f'got {get_unreadable_transcript_escapes()}'
+            )
