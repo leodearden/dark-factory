@@ -35,9 +35,8 @@ import re
 import time
 from typing import Any
 
-import pytest
-
 import _orch_helpers
+import pytest
 from _orch_helpers import MERGE_RESULT_TIMEOUT, RESPONSIVE_WAIT_WALL_CAP, wait_responsive
 
 # Tiny injected bounds: this whole module must run in ~a second.
