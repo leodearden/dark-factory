@@ -18,6 +18,12 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
+# These, and every other CLAUDE_SPAWN_* var read below, are per-launch
+# INPUTS: consumed by this invocation and then REMOVED from the spawned
+# session's own environment (task 4015 -- see $sanitize_env further down), so
+# a session can never re-serve its own launch parameters to a session IT
+# spawns. Set them explicitly on each spawn; they do not propagate onward.
+#
 # Backend selection:
 #   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -368,6 +374,22 @@ q_sentinel=$(printf %q "$sentinel")
 # Placing it INSIDE $inner -- not in this launcher process -- is what makes
 # it hold for every backend, including daemon-owned emulators
 # (gnome-terminal-server) that never inherit this script's own environment.
+#
+# UNCONDITIONAL, and at the TOP LEVEL of $inner -- never nested inside the
+# `[ -n "$SESSION_RECORD_DIR" ]` / `[ -n "$CLAUDE_SPAWN_RESULT_FILE" ]`
+# guards above, whose bodies are skipped on precisely the fail-soft path
+# this most needs to cover. On a registry fault result_export is the empty
+# string, so with the unset already run the child sees NO
+# CLAUDE_SPAWN_RESULT_FILE at all -- correct -- where before it inherited
+# the SPAWNER's path and would have written its own outcome over its
+# parent's result.md. The skip path must UNSET, not merely decline to set.
+#
+# Prefix-generic (`${!CLAUDE_SPAWN_@}` enumerates variable NAMES) rather
+# than an enumerated list, so a launch knob added later cannot silently fall
+# outside it, and so a value containing a newline or an `=` cannot spoof an
+# entry the way parsing `env` output can. No subprocess; bash 2.04+, so the
+# macOS bash 3.2 path the mac-terminal branch supports is fine; a safe no-op
+# under `set -u` when the namespace is empty.
 sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
