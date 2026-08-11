@@ -59,6 +59,8 @@ RO_COMMAND = _mod.RO_COMMAND
 EpisodeReader = _mod.EpisodeReader
 EPISODE_CYPHER = _mod.EPISODE_CYPHER
 PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
+_run = _mod._run
+Probes = _mod.Probes
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -745,3 +747,171 @@ class TestEpisodeReader:
         reader = EpisodeReader(graph=graph)
         await reader.fetch_population()
         assert reader._graph is graph
+
+
+class _FakeReader:
+    """A reader double: a fixed corpus plus a fixed episode->edges map."""
+
+    def __init__(
+        self,
+        records: list[object],
+        edges: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
+        self.records = records
+        self.edges = edges or {}
+        self.edge_lookups: list[str] = []
+
+    async def fetch_population(self, *, limit: int | None = None) -> list[object]:
+        return self.records if limit is None else self.records[:limit]
+
+    async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
+        self.edge_lookups.append(episode_uuid)
+        return self.edges.get(episode_uuid, ())
+
+
+def _args(**overrides: object) -> object:
+    parser = _build_parser()
+    args = parser.parse_args([])
+    args.project = ['reify']
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _probes(
+    task_status: object = None,
+    ticket: object = None,
+    commit: object = None,
+) -> object:
+    return Probes(
+        task_status_probe=lambda ref, project_id: task_status,
+        ticket_probe=lambda ref: ticket,
+        commit_probe=lambda ref, project_id: commit,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunEndToEnd:
+    """_run wired against fakes — the seams injected as audit_found_on_main
+    injects its GitFacts facade."""
+
+    async def _run_capture(
+        self,
+        capsys,
+        reader: object,
+        probes: object,
+        **arg_overrides: object,
+    ) -> tuple[int, dict[str, object] | None, str]:
+        code = await _run(
+            _args(**arg_overrides),
+            reader_factory=lambda project: reader,
+            probes=probes,
+        )
+        out = capsys.readouterr().out
+        report = json.loads(out) if out.strip() else None
+        return code, report, out
+
+    async def test_clean_corpus_returns_zero_with_no_findings(self, capsys) -> None:
+        reader = _FakeReader([_record(uuid='ep-1', text='an ordinary observation')])
+        code, report, _ = await self._run_capture(capsys, reader, _probes())
+        assert code == 0
+        assert report is not None
+        assert report['findings'] == []
+        assert report['summary']['mismatch'] == 0
+
+    async def test_mismatch_returns_zero_by_default_and_two_when_gated(
+        self, capsys
+    ) -> None:
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+
+        code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert code == 0
+        assert report['summary']['mismatch'] == 1
+
+        code, _report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None), fail_on_mismatch=True
+        )
+        assert code == 2
+
+    async def test_stdout_is_exactly_one_json_blob(self, capsys) -> None:
+        """The committed artifact in the sweep directory is byte-for-byte
+        stdout, so any stray print corrupts it."""
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        _code, report, out = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report is not None
+        assert out == json.dumps(report, indent=2, default=str) + '\n'
+
+    async def test_flagged_episode_carries_its_derived_edge_uuids(
+        self, capsys
+    ) -> None:
+        """The esc-3085-1 episode->edge shape: the operator gets the actual harm
+        artefacts, not only the source episode."""
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
+        edge = '7dbf12cf-9251-4674-b396-8eefdf651d1c'
+        reader = _FakeReader(
+            [_record(uuid=episode, text=ESC_3085_1_INSTANCE_2)],
+            edges={episode: (edge,)},
+        )
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report['findings'][0]['derived_edge_uuids'] == [edge]
+        assert reader.edge_lookups == [episode]
+
+    async def test_unavailable_ticket_store_never_yields_a_mismatch(
+        self, capsys
+    ) -> None:
+        """THE PROBE-AVAILABILITY CONTRACT, at the wiring level.
+
+        When the ticket store is absent, EVERY ticket claim must land on
+        'unverifiable' and ZERO on 'mismatch'. Pinned here as well as at the
+        unit level (TestAdjudicate) because this is the defect most likely to
+        be reintroduced by someone "simplifying" the probe to match the live
+        gate, and the regression would happen in the wiring.
+        """
+        reader = _FakeReader([
+            _record(uuid=f'ep-{i}', text=ESC_3085_1_INSTANCE_2) for i in range(5)
+        ])
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=UNRESOLVABLE), include_unverifiable=True
+        )
+        assert report['summary']['mismatch'] == 0
+        assert report['summary']['unverifiable'] == 5
+        assert all(f['status'] == 'unverifiable' for f in report['findings'])
+
+    async def test_infra_failure_returns_one_and_prints_nothing(self, capsys) -> None:
+        """A truncated report that looks complete is worse than none."""
+
+        def exploding_factory(project: str) -> object:
+            raise RuntimeError('FalkorDB unreachable')
+
+        code = await _run(
+            _args(), reader_factory=exploding_factory, probes=_probes()
+        )
+        assert code == 1
+        assert capsys.readouterr().out == ''
+
+    async def test_unverifiable_is_counted_but_not_listed_by_default(
+        self, capsys
+    ) -> None:
+        reader = _FakeReader([
+            _record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2),
+            _record(uuid='ep-2', text=ESC_3085_1_INSTANCE_1),
+        ])
+        _code, report, _ = await self._run_capture(
+            capsys,
+            reader,
+            Probes(
+                task_status_probe=lambda ref, project_id: None,
+                ticket_probe=lambda ref: None,
+                commit_probe=lambda ref, project_id: None,
+            ),
+        )
+        assert report['summary']['mismatch'] == 1
+        assert report['summary']['unverifiable'] == 1
+        assert [f['status'] for f in report['findings']] == ['mismatch']
+        assert report['truncated_by']['withheld'] == 1
