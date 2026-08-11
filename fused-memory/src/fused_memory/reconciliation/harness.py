@@ -938,6 +938,7 @@ class ReconciliationHarness:
         filtered_task_tree: FilteredTaskTree | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
+        index_health: dict | None = None,
         status_correction_reconciliation: dict | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
@@ -953,6 +954,8 @@ class ReconciliationHarness:
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
             in full-cycle passes; None in remediation passes).
+        index_health: _detect_index_drift record (task 3709; available only in
+            full-cycle passes; None in remediation passes).
         status_correction_reconciliation: _reconcile_status_correction record
             (task 1938; available only in full-cycle passes; None in
             remediation passes).
@@ -966,6 +969,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
+        stage.index_health = index_health
         stage.status_correction_reconciliation = status_correction_reconciliation
 
     @staticmethod
@@ -3038,6 +3042,13 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
+        # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
+        # This is the recon-cadence half of Q3; the startup sweep calls the SAME
+        # detector.  Kept here, outside the _active_runs.track block below, so a
+        # slow `CALL db.indexes()` read cannot be misattributed to a stage —
+        # exactly where the sibling diagnostics reads sit.
+        index_health = await self._detect_index_drift(scope.project_id, run_id=run_id)
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages(scope)
@@ -3073,6 +3084,7 @@ class ReconciliationHarness:
                             filtered_task_tree=filtered_task_tree,
                             task_count_verification=task_count_verification,
                             graphiti_queue_health=graphiti_queue_health,
+                            index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
                         )
 
