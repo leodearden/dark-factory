@@ -3294,3 +3294,174 @@ def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_i
         "with no record dir of its own the child must see NO result file at "
         f"all, not a stale inherited one. Child saw: {captured!r}"
     )
+
+
+def _write_fake_claude_dumping_full_env(
+    bin_dir: pathlib.Path,
+    capture_file: pathlib.Path,
+    argv_file: pathlib.Path | None = None,
+) -> None:
+    """Write a fake ``claude`` that dumps its ENTIRE environment (NUL-delimited,
+    via ``env -0``) to *capture_file* -- and, when *argv_file* is given, its
+    own argv alongside -- then exits 0.
+
+    The full environment, not just the CLAUDE_SPAWN_* slice: this is exactly
+    what the spawned session's Bash tool would hand to the next
+    spawn-claude.sh it runs, so it can be fed straight back in as a second
+    invocation's environment (see the two-level test below).
+
+    NUL-delimited for the same reason ``_write_fake_claude_capturing_argv``
+    is: an environment value may itself contain newlines, so a newline
+    separator could not delimit entries unambiguously. Read back with
+    ``_read_env0`` / ``_read_argv``.
+    """
+    p = bin_dir / "claude"
+    body = f"env -0 > {capture_file!s}\n"
+    if argv_file is not None:
+        body += f'printf "%s\\0" "$@" > {argv_file!s}\n'
+    p.write_text("#!/usr/bin/env bash\n" + body + "exit 0\n")
+    p.chmod(0o755)
+
+
+def _read_env0(capture_file: pathlib.Path) -> dict[str, str]:
+    """Read a NUL-delimited ``env -0`` capture into a dict.
+
+    Partitions each entry on its FIRST ``=`` (a value may contain further
+    ``=`` characters) and drops the trailing empty element left by the final
+    NUL terminator -- the env-shaped counterpart of ``_read_argv``.
+    """
+    parsed: dict[str, str] = {}
+    for entry in capture_file.read_bytes().decode().split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("=")
+        parsed[key] = value
+    return parsed
+
+
+def test_spawned_session_cannot_reserve_its_own_launch_args_to_a_grandchild(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The 2026-08-11 incident, reproduced end-to-end across TWO real spawns.
+
+    Level 1 is a fleet crash-recovery launch:
+    CLAUDE_SPAWN_CLAUDE_ARGS="--resume <a session id>". That is a DELIBERATE
+    input and the direct child must honour it -- asserted below on the
+    level-1 child's own argv. Requirement (4): inputs are consumed before
+    the unset, and from inside the script a deliberate command-prefix
+    assignment is indistinguishable from an inherited one, so the direct
+    child's argv is NOT where this is fixed. Do not "fix" that path -- it
+    would delete the documented CLAUDE_SPAWN_CLAUDE_ARGS passthrough and
+    break test_spawn_model_env_precedes_raw_claude_args.
+
+    Level 2 is where the fix bites. The recovered session's own environment
+    -- captured verbatim at level 1, exactly what its Bash tool would hand
+    to the next spawn-claude.sh it runs -- is fed back in as a second
+    invocation's environment. That grandchild is meant to be FRESH, and
+    before task 4015 it came up as a live resume of its spawner because the
+    inherited CLAUDE_SPAWN_CLAUDE_ARGS was re-served as apparent caller
+    intent.
+
+    Two real script invocations rather than a fake claude that spawns
+    recursively: the level-1 run has fully completed before level 2 starts,
+    so the fake ``claude`` can simply be rewritten in between and nothing
+    races.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    child_env_file = tmp_path / "child_env.bin"
+    child_argv_file = tmp_path / "child_argv.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, child_env_file, child_argv_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    # --- level 1: the crash-recovery launch -------------------------------
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    child_argv = _read_argv(child_argv_file)
+    assert "--resume" in child_argv and "poisoned-parent-session" in child_argv, (
+        f"the DIRECT child must still receive args deliberately passed on "
+        f"this invocation (requirement 4) -- got: {child_argv!r}"
+    )
+
+    child_env = _read_env0(child_env_file)
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in child_env, (
+        f"the recovered session must not carry its own launch args forward "
+        f"in its environment, got: "
+        f"{ {k: v for k, v in child_env.items() if k.startswith('CLAUDE_SPAWN_')} !r}"
+    )
+
+    # --- level 2: what that session's next /spawn would actually run ------
+    grandchild_argv_file = tmp_path / "grandchild_argv.bin"
+    _write_fake_claude_capturing_argv(bin_dir, grandchild_argv_file)
+
+    result2 = _run_spawn(child_env, tmp_path)
+    assert result2.returncode == 0, f"stderr: {result2.stderr.decode()}"
+
+    grandchild_argv = _read_argv(grandchild_argv_file)
+    assert "--resume" not in grandchild_argv, (
+        f"a session spawned from within the recovered session must be FRESH, "
+        f"not a resume of its spawner -- got: {grandchild_argv!r}"
+    )
+    assert not any("poisoned-parent-session" in tok for tok in grandchild_argv), (
+        f"the spawner's own resume target must not reach the grandchild's "
+        f"argv anywhere, got: {grandchild_argv!r}"
+    )
+
+
+def test_sanitization_preserves_launcher_stamped_record_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The not-over-broad lock, in the two-way style of
+    test_sibling_parentage_two_way_into_hook_record: identity must survive
+    on the session-registry RECORD even though it no longer travels in the
+    child's environment.
+
+    CLAUDE_SPAWN_ROLE / TASK_ID are launcher-side inputs. They are stamped
+    by the ``python3 ... launching`` write, which runs in its own subprocess
+    BEFORE and OUTSIDE $inner -- so a payload-level unset cannot reach it.
+    The child itself has no consumer for them: session_hooks.run_session_start
+    reads identity from the environment only in its ``except
+    FileNotFoundError`` branch, and a spawn-claude.sh child provably has a
+    record at its slug already (CLAUDE_SPAWN_SESSION_ID is exported only
+    when SESSION_RECORD_DIR is non-empty), so that branch is unreachable
+    here.
+
+    Stripping them is in fact corrective: a leaked inherited identity used
+    to resolve as ``implementer:<project>#<id>`` on an unrelated session --
+    the same leak orchestrator/tests/test_session_hooks.py::_clear_claude_
+    spawn_env exists to defend against.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_namespace.txt"
+    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_ROLE"] = "implementer"
+    env["CLAUDE_SPAWN_TASK_ID"] = "9999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.role == "implementer", (
+        f"the launching write runs before/outside $inner, so the payload's "
+        f"unset must not disturb the stamped role, got {record.role!r}"
+    )
+    assert record.task_id == "9999", (
+        f"same for the stamped task_id, got {record.task_id!r}"
+    )
+
+    captured = _parse_captured_env(capture_file)
+    assert "CLAUDE_SPAWN_ROLE" not in captured, (
+        f"identity belongs on the record, not in the child's environment "
+        f"where it would be re-served to the next spawn: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_TASK_ID" not in captured, (
+        f"same for the task id: {captured!r}"
+    )
