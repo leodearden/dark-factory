@@ -3086,3 +3086,114 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
     assert record.status == session_registry.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
     )
+
+
+# ===========================================================================
+# task-4015: CLAUDE_SPAWN_* launch inputs are consumed, then REMOVED from the
+# spawned session's own environment
+# ===========================================================================
+# spawn-claude.sh's inputs (CLAUDE_SPAWN_CLAUDE_ARGS / MODE / MODEL / BACKEND /
+# TMUX_SESSION / ...) reach it by ordinary environment inheritance, and until
+# task 4015 nothing removed them from the environment the payload then exec'd
+# `claude` with. A spawned session therefore carried its OWN launch parameters
+# forward, and its Bash tool handed them straight back to the next
+# spawn-claude.sh it ran -- so an inherited value was re-served as apparent
+# caller intent one level down.
+#
+# The 2026-08-11 incident: a fleet crash-recovery launch sets
+# CLAUDE_SPAWN_CLAUDE_ARGS="--resume <that session's own id>". The recovered
+# session inherited it, and its next /spawn -- meant to be a FRESH sibling --
+# came up as a live resume of the spawner instead.
+#
+# Every test below poisons the namespace EXPLICITLY on top of _base_env's
+# prefix scrub (see test_base_env_scrubs_every_claude_spawn_var), rather than
+# depending on the runner's ambient state, so they fail on the merge worker's
+# clean systemd unit too -- same rationale as the task-3062 tests above.
+
+
+def _write_fake_claude_capturing_spawn_namespace(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures the ENTIRE ``CLAUDE_SPAWN_*``
+    namespace visible in its own environment to *capture_file*, then exits 0.
+
+    Prefix-generic on purpose -- unlike ``_write_fake_claude_capturing_env``,
+    which echoes four vars by name. The whole point of the task-4015 tests is
+    that a var this file never names (a future launch knob) must not survive
+    into the child either, so the capture itself cannot be an enumeration.
+
+    The trailing ``exit 0`` is load-bearing: ``grep`` exits 1 when it matches
+    nothing, and an EMPTY namespace is a PASSING outcome here -- without the
+    explicit exit, the fully-scrubbed case would surface as a nonzero spawn
+    exit code rather than as the pass it is.
+
+    Emits ``KEY=value`` lines, so the capture reads back through the existing
+    ``_parse_captured_env`` -- no new parser.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f"env | grep '^CLAUDE_SPAWN_' | sort > {capture_file!s}\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def test_spawn_unsets_inherited_launch_inputs_from_child_env(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The four pure-input launch knobs must NOT be visible in the spawned
+    session's own environment, however they reached this invocation.
+
+    The poison values are chosen so neither reroutes the launcher away from
+    the foreground-xterm path under test: ``MODE=child`` is the default, and
+    a ``BACKEND`` of anything other than ``tmux`` falls through to normal
+    emulator discovery. What is asserted is purely what the CHILD can see.
+
+    The positive half matters just as much: the scrub must not be
+    over-broad, so the child must still see its own freshly-computed
+    CLAUDE_SPAWN_SESSION_ID and CLAUDE_SPAWN_RESULT_FILE -- the values THIS
+    spawn computed for THAT child, not inherited ones.
+
+    RED today: nothing in the payload unsets the namespace, so all four
+    inherited vars reach the child by plain environment inheritance.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_namespace.txt"
+    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+    env["CLAUDE_SPAWN_MODE"] = "child"
+    env["CLAUDE_SPAWN_MODEL"] = "haiku"
+    env["CLAUDE_SPAWN_BACKEND"] = "leak-not-tmux"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    for var in (
+        "CLAUDE_SPAWN_CLAUDE_ARGS",
+        "CLAUDE_SPAWN_MODE",
+        "CLAUDE_SPAWN_MODEL",
+        "CLAUDE_SPAWN_BACKEND",
+    ):
+        assert var not in captured, (
+            f"{var} is a per-launch INPUT: consumed by this invocation, then "
+            f"removed from the child's environment so it cannot be re-served "
+            f"to a grandchild. Child saw: {captured!r}"
+        )
+
+    # Not over-broad: this child's OWN computed values must survive.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert captured.get("CLAUDE_SPAWN_SESSION_ID") == record.session_slug, (
+        f"the child must still see its own new session slug "
+        f"{record.session_slug!r}, got {captured!r}"
+    )
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") == record.result_file, (
+        f"the child must still see the result file allocated for THIS spawn "
+        f"({record.result_file!r}), got {captured!r}"
+    )
