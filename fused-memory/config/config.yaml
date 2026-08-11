@@ -269,23 +269,40 @@ summary_rebuild:
 # id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
 # every value below is the shipped default, shown so the knobs are discoverable
 # without reading the schema. Uncomment to change one.
-# mem0_update:
-#   # Kill switch. false denies every caller on the very next call, allowlisted
-#   # or not — this is the knob to flip during a runaway-rewrite incident.
-#   enabled: true
-#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
-#   # metadata bar ALONE is the supported way to admit an interactive tagging
-#   # flow without granting content-amend authority: a mistagged record is cheap
-#   # to notice and cheap to correct, a silent content rewrite is neither.
-#   # agent_id is self-reported, so this deters misuse by cooperating callers
-#   # rather than enforcing a security boundary.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-']
-#   # Content-amend burst alarm: escalates, never blocks (a hard block would
-#   # risk a legitimate large consolidation cycle failing mid-run over its own
-#   # success count). Metadata-only calls do not count toward it.
-#   storm_threshold: 20
-#   storm_window_seconds: 3600.0
+mem0_update:
+  # Kill switch. false denies every caller on the very next call, allowlisted
+  # or not — this is the knob to flip during a runaway-rewrite incident.
+  enabled: true
+  # Two independent agent_id-prefix allowlists, one per arm. Widening the
+  # metadata bar ALONE is the supported way to admit an interactive tagging
+  # flow without granting content-amend authority: a mistagged record is cheap
+  # to notice and cheap to correct, a silent content rewrite is neither.
+  # agent_id is self-reported, so this deters misuse by cooperating callers
+  # rather than enforcing a security boundary.
+  #
+  # 'curator-' ADDED 2026-08-11 by Leo's ruling (b) on esc-3524-1 — see that
+  # record's triage addendum for the full rationale. It admits the interactive
+  # memory-consolidation sitting (task 3524 / gate 3625) rather than routing
+  # those consolidations through a recon-stage agent, which was the rejected
+  # option (a). Deliberately a DEDICATED NARROW prefix that a sitting session
+  # opts into by self-reporting agent_id='curator-<something>', NOT the everyday
+  # 'claude-interactive' — admitting that would grant silent history-rewrite
+  # authority to every ordinary interactive session in every project sharing
+  # this config.
+  #
+  # BOTH arms carry it, and that is required rather than incidental: gate 3200
+  # ratified Option C's retain-and-tag write shape (2026-08-11), whose folded
+  # entries are RETAINED as topic-tagged peers via a metadata-only patch. A
+  # sitting granted content_amend alone could rewrite the canonical but not
+  # stamp the peers it retains, i.e. it could do the destructive half and not
+  # the preserving half.
+  content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+  metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+  # Content-amend burst alarm: escalates, never blocks (a hard block would
+  # risk a legitimate large consolidation cycle failing mid-run over its own
+  # success count). Metadata-only calls do not count toward it.
+  storm_threshold: 20
+  storm_window_seconds: 3600.0
 
 write_triage:
   # CALIBRATION OUTPUT — do not hand-edit.
