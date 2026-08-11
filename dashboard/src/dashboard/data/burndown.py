@@ -605,11 +605,24 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     * ``parity_breach_count`` — snapshots where ``in_progress > cap``.  The cap
       is INCLUSIVE, so running exactly at capacity is healthy, not an alarm.
     * ``parity_alarm`` — ``breach_count > 0``.
-    * ``parity_cap`` — the most recent KNOWN cap in the series, for display
-      next to the peak.  ``None`` when no snapshot carries one.
-    * ``parity_peak`` — the highest ``in_progress`` among snapshots that carry
-      a cap.  Capless snapshots are excluded: a peak means nothing without the
-      cap it is measured against, and mixing them in would show a number the
+    * ``parity_peak`` / ``parity_cap`` — a MATCHED PAIR read off ONE snapshot,
+      never assembled from two.  The cap is hot-reloadable, so a peak from one
+      snapshot beside a cap from another misstates the severity of the very
+      breach it is describing (50-over-40 rendered as 50-over-24), and in a
+      healthy window it manufactures a breach that never happened
+      (peak 33 / cap 24 printed next to ``parity_alarm: False``).
+
+      The snapshot chosen is:
+
+      - when the series breaches — the breaching snapshot with the WIDEST
+        margin ``count - cap`` (ties broken toward the larger count), i.e. the
+        worst moment and the cap that was actually in force at it;
+      - otherwise — the snapshot with the highest ``in_progress`` (ties broken
+        toward the tighter cap), i.e. the literal peak of a healthy window and
+        the cap it was actually measured against.
+
+      Capless snapshots are excluded from both: a peak means nothing without
+      the cap it is compared to, and mixing them in would show a number the
       displayed cap cannot explain.
 
     A series with no cap anywhere is UNKNOWN, not "not breaching": the alarm
@@ -622,21 +635,30 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     in_progress = list(series.get('in_progress') or [])
     caps = list(series.get('concurrency_cap') or [])
 
-    peak: int | None = None
-    latest_cap: int | None = None
     breaches = 0
     comparable = 0
+    # Both candidates are (count, cap) pairs read off a SINGLE snapshot, so
+    # whichever one is published cannot misdescribe the other half.
+    worst_breach: tuple[int, int] | None = None   # widest margin among breaches
+    highest: tuple[int, int] | None = None        # highest count overall
     for count, cap in zip(in_progress, caps, strict=False):
         if not isinstance(count, int) or isinstance(count, bool):
             continue
         if not isinstance(cap, int) or isinstance(cap, bool):
             continue
         comparable += 1
-        latest_cap = cap
-        if peak is None or count > peak:
-            peak = count
+        if highest is None or (count, -cap) > (highest[0], -highest[1]):
+            highest = (count, cap)
         if count > cap:
             breaches += 1
+            margin = count - cap
+            if worst_breach is None or (margin, count) > (
+                worst_breach[0] - worst_breach[1], worst_breach[0]
+            ):
+                worst_breach = (count, cap)
+
+    chosen = worst_breach if worst_breach is not None else highest
+    peak, cap_at_peak = chosen if chosen is not None else (None, None)
 
     if not comparable:
         logger.debug(
@@ -647,7 +669,7 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         'parity_alarm': breaches > 0,
-        'parity_cap': latest_cap,
+        'parity_cap': cap_at_peak,
         'parity_peak': peak,
         'parity_breach_count': breaches,
     }

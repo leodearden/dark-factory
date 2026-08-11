@@ -281,8 +281,51 @@ class TestComputeParityAlarm:
 
         assert result['parity_breach_count'] == 2
         assert result['parity_alarm'] is True
-        assert result['parity_cap'] == 40, 'parity_cap reports the most recent known cap'
+        # The pair is read off the breaching snapshot, not assembled from the
+        # peak of one snapshot and the cap of another: 20 breached the cap of
+        # 10 that was in force at the time.  Publishing today's cap of 40 here
+        # would render the breach as 20-under-40, i.e. no breach at all.
         assert result['parity_peak'] == 20
+        assert result['parity_cap'] == 10
+
+    def test_peak_and_cap_come_from_the_same_snapshot_when_the_cap_changes(self):
+        """A mid-window cap change must not misstate the breach severity.
+
+        The real breach is 50 against the cap of 40 in force at the time
+        (margin 10).  Pairing the series peak with the LATEST cap would render
+        it as 50-against-24 — a margin of 26, 2.6x the truth.
+        """
+        result = compute_parity_alarm(_series([50, 10], [40, 24]))
+
+        assert result['parity_alarm'] is True
+        assert result['parity_breach_count'] == 1
+        assert result['parity_peak'] == 50
+        assert result['parity_cap'] == 40
+
+    def test_healthy_window_never_publishes_a_breach_looking_pair(self):
+        """No snapshot breached, so no pair may read as a breach.
+
+        33-under-40 and 10-under-24 are both healthy.  Pairing the peak of 33
+        with the latest cap of 24 would print '33 in flight, cap 24' next to
+        ``parity_alarm: False`` — a 9-over breach that never happened.
+        """
+        result = compute_parity_alarm(_series([33, 10], [40, 24]))
+
+        assert result['parity_alarm'] is False
+        assert result['parity_breach_count'] == 0
+        assert result['parity_peak'] == 33
+        assert result['parity_cap'] == 40
+        assert result['parity_peak'] <= result['parity_cap'], (
+            'a non-alarming series must not publish a pair that reads as a breach'
+        )
+
+    def test_the_widest_margin_breach_wins_not_the_highest_count(self):
+        """Severity is the margin over the cap in force, not the raw count."""
+        result = compute_parity_alarm(_series([50, 30], [49, 10]))
+
+        assert result['parity_breach_count'] == 2
+        assert result['parity_peak'] == 30, '30 over a cap of 10 is the worse breach'
+        assert result['parity_cap'] == 10
 
     def test_cap_cut_does_not_retro_alarm_a_healthy_window(self):
         """The mirror case: a cap CUT must not invent a historical breach."""
