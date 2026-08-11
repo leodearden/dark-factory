@@ -13964,6 +13964,224 @@ class TestHarnessCheckIndexHealth:
             await harness._check_index_health('dark_factory')
 
 
+class TestHarnessDetectIndexDrift:
+    """ReconciliationHarness._detect_index_drift summarizes, escalates and memoizes.
+
+    Wired to a REAL EscalationQueue on tmp_path (the _make_dedup_harness pattern)
+    so the INV-4 storm escape is proven end-to-end at the caller's altitude, not
+    just against a mocked queue.
+
+    step-9 (RED): _detect_index_drift does not exist yet.
+    step-10 (GREEN): add it to harness.py.
+    """
+
+    def _harness_with_queue(
+        self, journal, event_buffer, mock_memory_service, tmp_path, specs
+    ):
+        from escalation.queue import EscalationQueue
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(specs)
+        )
+        queue_dir = tmp_path / 'recon_esc'
+        harness._escalation_queue = EscalationQueue(queue_dir)
+        return harness, queue_dir
+
+    # --- (a)+(b) storm escape at the caller's altitude ---
+
+    @pytest.mark.asyncio
+    async def test_repeated_drift_files_exactly_one_escalation(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """Two cycles observing the same drift file ONE escalation (boundary test 5)."""
+        import json as _json
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness, queue_dir = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected - {dropped}
+        )
+
+        first = await harness._detect_index_drift('dark_factory')
+        second = await harness._detect_index_drift('dark_factory')
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected exactly one escalation, got {files}'
+        record = _json.loads(files[0].read_text())
+        assert record['category'] == 'recon_missing_index'
+        assert record['index_health']['group_id'] == 'dark_factory'
+
+        # (b) the caller always gets the facts, even when nothing was filed
+        assert first is not None and second is not None
+        assert first['healthy'] is False
+        assert second['healthy'] is False
+        assert second['missing'] == [dropped]
+
+    # --- (c) healthy is silent ---
+
+    @pytest.mark.asyncio
+    async def test_healthy_graph_files_nothing(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """A fully-provisioned graph returns its record and files no escalation."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        harness, queue_dir = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected_index_set()
+        )
+
+        result = await harness._detect_index_drift('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is True
+        assert list(queue_dir.glob('esc-*.json')) == []
+
+    # --- (d) no queue is not a crash ---
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_queue_still_returns_record(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """With _escalation_queue None the detector still reports, and does not crash."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected - {dropped})
+        )
+        harness._escalation_queue = None
+
+        result = await harness._detect_index_drift('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is False
+
+    @pytest.mark.asyncio
+    async def test_unreadable_graph_returns_none(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """When the health read reports unknown, the detector propagates None."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = None
+
+        assert await harness._detect_index_drift('dark_factory') is None
+
+    # --- (e) Q4: unexpected indices log at INFO on CHANGE only ---
+
+    @pytest.mark.asyncio
+    async def test_unexpected_index_logs_info_once_and_files_nothing(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """An operator-added index is INFO-logged once, never escalated (Q4/D8).
+
+        Logging it every cycle would be the same noise in a cheaper channel: the
+        recon cadence runs continuously, so one operator-added index would emit
+        an identical line forever, training readers to ignore the field.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        extra_spec = ('Entity', 'NODE', 'operator_added_field', 'RANGE')
+        harness, queue_dir = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected_index_set() | {extra_spec},
+        )
+
+        with caplog.at_level(logging.INFO):
+            first = await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('dark_factory')
+
+        assert first is not None
+        assert first['healthy'] is True
+        assert first['unexpected'] == [extra_spec]
+        assert list(queue_dir.glob('esc-*.json')) == [], (
+            'An operator-added index is not drift — it must never escalate'
+        )
+
+        unexpected_logs = [
+            r
+            for r in caplog.records
+            if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 1, (
+            'The unchanged unexpected set must log exactly once across two '
+            f'cycles, got {len(unexpected_logs)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_unexpected_set_logs_again(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """A CHANGE in the unexpected set emits a second INFO — the memo is per-set."""
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        first_extra = ('Entity', 'NODE', 'operator_added_one', 'RANGE')
+        second_extra = ('Entity', 'NODE', 'operator_added_two', 'RANGE')
+
+        harness, _ = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected | {first_extra}
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._detect_index_drift('dark_factory')
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected | {first_extra, second_extra})
+            )
+            await harness._detect_index_drift('dark_factory')
+
+        unexpected_logs = [
+            r for r in caplog.records if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 2, (
+            'A changed unexpected set must be re-reported, got '
+            f'{len(unexpected_logs)} log(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_memo_is_keyed_by_graph(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """One graph's unexpected set must not suppress another graph's."""
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        extra_spec = ('Entity', 'NODE', 'operator_added_field', 'RANGE')
+        harness, _ = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected_index_set() | {extra_spec},
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('autotrade')
+
+        unexpected_logs = [
+            r for r in caplog.records if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 2, (
+            'The memo is keyed by group_id, so a second graph reports its own '
+            f'unexpected set, got {len(unexpected_logs)}'
+        )
+
+
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
