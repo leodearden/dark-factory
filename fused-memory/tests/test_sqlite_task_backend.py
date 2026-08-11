@@ -6135,6 +6135,170 @@ async def test_update_task_details_only_append_false_ok(backend, project_root):
     )
 
 
+# ── update_task end-to-end: merge+append=True clobber guard (task 3581) ──────
+#
+# These reproduce the exact live call shape observed from the Stage-2
+# reconciliation LLM against DF task 3857:
+#   update_task(id=3857, metadata={...}, metadata_mode='merge', append=True)
+# issued against a row that already carried authored memory_hints. The pair
+# used to resolve silently to 'merge' and overwrite the whole memory_hints key.
+
+_DF3857_SEED_METADATA = {
+    'memory_hints': {
+        'entities': [],
+        'queries': [
+            'resolution for: dashboard: stop leaking CLOSE-WAIT sockets '
+            'on the escalation poller',
+        ],
+    },
+    'files': ['dashboard/src/poller.py'],
+    '_causation_id': 'caus-df3857',
+}
+
+_DF3857_INCOMING_HINTS = {
+    'memory_hints': {
+        'queries': [
+            'CLOSE_WAIT socket leak httpx client lifecycle',
+            'dashboard escalation poller connection reuse',
+        ],
+    },
+}
+
+
+async def _raw_metadata_bytes(backend, project_root, task_id: int = 1) -> str:
+    """Read the stored metadata blob verbatim, bypassing get_task's parsing."""
+    conn = await backend._get_connection(project_root)
+    cursor = await conn.execute(
+        'SELECT metadata FROM tasks WHERE id = ?', (task_id,),
+    )
+    row = await cursor.fetchone()
+    return row['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_plus_append_true_rejected_and_blob_untouched(
+    backend, project_root,
+):
+    """The contradictory metadata_mode='merge' + append=True pair is REJECTED
+    and the stored blob is left byte-for-byte intact (task 3581).
+
+    The load-bearing assertion is the second one: _resolve_metadata_mode is
+    called before ensure_connected() and before the write _txn, so a rejection
+    can never leave a half-applied write. Rejecting is therefore strictly safer
+    than the old silent 'merge', which clobbered memory_hints wholesale."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    before = await _raw_metadata_bytes(backend, project_root)
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps(_DF3857_INCOMING_HINTS),
+            metadata_mode='merge', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    after = await _raw_metadata_bytes(backend, project_root)
+    assert after == before, (
+        f'rejected write must leave stored bytes untouched.\n'
+        f'before={before!r}\nafter={after!r}'
+    )
+
+    # Belt and braces on the parsed view: the authored query survives, the
+    # siblings survive, and neither incoming query was written.
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+    assert hints['queries'] == _DF3857_SEED_METADATA['memory_hints']['queries'], (
+        f'authored memory_hints.queries must be untouched: {meta}'
+    )
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+    for q in _DF3857_INCOMING_HINTS['memory_hints']['queries']:
+        assert q not in hints['queries'], f'rejected write must not land: {meta}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        pytest.param({'append': True}, id='append-true-alone'),
+        pytest.param({'metadata_mode': 'additive'}, id='metadata_mode-additive'),
+    ],
+)
+async def test_update_task_append_true_unions_nested_memory_hints(
+    backend, project_root, kwargs,
+):
+    """The positive control: the CORRECT spellings of the same intent union the
+    nested memory_hints lists instead of replacing them (task 3581).
+
+    Both ``append=True`` alone and the explicit ``metadata_mode='additive'``
+    resolve to 'additive', which recursively unions list/dict values — so the
+    pre-existing authored query survives alongside both incoming ones and the
+    top-level siblings are preserved."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        **kwargs,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+
+    expected_queries = (
+        _DF3857_SEED_METADATA['memory_hints']['queries']
+        + _DF3857_INCOMING_HINTS['memory_hints']['queries']
+    )
+    assert set(hints['queries']) == set(expected_queries), (
+        f'memory_hints.queries must UNION, not replace: {meta}'
+    )
+    assert len(hints['queries']) == len(expected_queries), (
+        f'union must dedup-preserve exactly one copy of each query: {meta}'
+    )
+    # The sub-field the incoming payload omitted is preserved, not dropped.
+    assert hints.get('entities') == [], f'memory_hints.entities lost: {meta}'
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_explicit_merge_without_append_still_shallow(
+    backend, project_root,
+):
+    """The guard did NOT broaden: a bare metadata_mode='merge' (no append) still
+    resolves and performs the documented shallow last-write-wins.
+
+    Many production callers legitimately use this spelling (task_interceptor,
+    citation_verifier), so the task-3581 guard must fire only on the
+    contradictory PAIR — never on 'merge' on its own."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        metadata_mode='merge',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    # Shallow: the whole memory_hints key was overwritten wholesale...
+    assert meta['memory_hints'] == _DF3857_INCOMING_HINTS['memory_hints'], (
+        f"bare metadata_mode='merge' must stay shallow last-write-wins: {meta}"
+    )
+    # ...while untouched top-level siblings survive (that is what 'merge' means).
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
 @pytest.mark.asyncio
 async def test_update_task_default_corrupt_blob_refused(backend, project_root, caplog):
     """Default (no-arg) merge refuses a corrupt existing blob — raises TaskmasterError
