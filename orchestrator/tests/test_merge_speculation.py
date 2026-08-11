@@ -41,6 +41,7 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import logging
@@ -3548,4 +3549,173 @@ class TestTimeoutMarkCoverage:
             'clean per-test failure -- strictly worse than the flake being '
             'fixed. Add @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) '
             'directly above each offending class.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3980: structural guard — late-arrival waits must be load-independent
+# ---------------------------------------------------------------------------
+
+# The classes whose load-bearing waits must go through `wait_responsive`.
+# These are exactly the five classes step-4 marked with
+# @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT).
+_LATE_ARRIVAL_CLASSES = frozenset({
+    'TestLateArrivalAttaches',
+    'TestLateArrivalCleanCAS',
+    'TestLateArrivalFailCascade',
+    'TestLateArrivalGuards',
+    'TestLateArrivalSubmissionOrderCAS',
+})
+
+
+def _load_bearing_wait_target(node: ast.expr) -> str | None:
+    """Describe *node* if it is a load-bearing synchronisation point, else None.
+
+    Exactly two shapes are load-bearing in the late-arrival block, and both
+    gate a hard assertion downstream:
+
+      * ``req_a.result`` — a ``MergeRequest.result`` future. Its resolution IS
+        the event the test is waiting for; a deadline here fails a test whose
+        merge pipeline completed correctly.
+      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier. Already
+        event-driven; only its deadline is wall-clock.
+
+    Deliberately NOT load-bearing, and therefore excluded: the
+    ``await asyncio.wait_for(worker_task, timeout=5.0)`` teardown waits. Those
+    target a bare ``Name`` (the worker Task), sit inside
+    ``contextlib.suppress(Exception)``, assert nothing, and swallow their own
+    TimeoutError — so they cannot manufacture the flake this task fixes, and
+    stretching them would only slow teardown down. The Name-vs-Attribute/Call
+    distinction is what makes that exclusion structural rather than a
+    hand-maintained name list.
+    """
+    if isinstance(node, ast.Attribute) and node.attr == 'result':
+        return f'{ast.unparse(node)} (MergeRequest.result future)'
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'wait'
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id.startswith('gate')
+    ):
+        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
+    return None
+
+
+def _late_arrival_wait_offenders(source: str) -> list[str]:
+    """Statically scan *source* for late-arrival waits that are still charged
+    in wall clock, returning one formatted offender string per site.
+
+    Two offence kinds, both reported as ``file:line`` plus the enclosing test
+    so the failure is directly actionable:
+
+      1. a load-bearing wait still routed through a bare
+         ``asyncio.wait_for(..., timeout=...)`` instead of ``wait_responsive``;
+      2. a raw numeric wall-clock literal on a load-bearing wait site (on
+         EITHER call shape) instead of a bound derived from
+         ``MERGE_RESULT_TIMEOUT``.
+
+    Must never raise: a crash here would fail the module over an unrelated
+    edit. Unparseable source returns [].
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    name = Path(__file__).name
+    offenders: list[str] = []
+
+    for cls in ast.iter_child_nodes(tree):
+        if not (isinstance(cls, ast.ClassDef) and cls.name in _LATE_ARRIVAL_CLASSES):
+            continue
+        for item in cls.body:
+            if not (
+                isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name.startswith('test_')
+            ):
+                continue
+            where = f'{cls.name}::{item.name}'
+            for call in ast.walk(item):
+                if not (isinstance(call, ast.Call) and call.args):
+                    continue
+                func = call.func
+
+                is_bare_wait_for = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == 'wait_for'
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == 'asyncio'
+                )
+                is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
+                if not (is_bare_wait_for or is_responsive):
+                    continue
+
+                target = _load_bearing_wait_target(call.args[0])
+                if target is None:
+                    continue
+
+                if is_bare_wait_for:
+                    offenders.append(
+                        f'{name}:{call.lineno} — {where} — awaits {target} via a '
+                        f'bare asyncio.wait_for, so its deadline is charged in '
+                        f'WALL CLOCK. Route it through wait_responsive(...) '
+                        f'with a descriptive label=.'
+                    )
+
+                timeout_kw = next(
+                    (kw for kw in call.keywords if kw.arg == 'timeout'), None
+                )
+                if (
+                    timeout_kw is not None
+                    and isinstance(timeout_kw.value, ast.Constant)
+                    and isinstance(timeout_kw.value.value, (int, float))
+                    and not isinstance(timeout_kw.value.value, bool)
+                ):
+                    offenders.append(
+                        f'{name}:{call.lineno} — {where} — awaits {target} with a '
+                        f'RAW wall-clock literal timeout='
+                        f'{timeout_kw.value.value!r}. Derive the bound from '
+                        f'MERGE_RESULT_TIMEOUT instead of writing a number.'
+                    )
+
+    return offenders
+
+
+class TestLateArrivalWaitsAreLoadIndependent:
+    """Enforced invariant: no load-bearing wait in the late-arrival block may
+    carry a wall-clock deadline.
+
+    This is the guard that stops the class recurring in this file a thirteenth
+    time. The measured failures behind task 3980 were all genuine asyncio
+    deadline expiries on tests whose logic had ALREADY completed — the CleanCAS
+    log tail reads ``verify end (passed=True)`` next to a heartbeat of
+    ``oldest age=46s ... state=finalizing``. Widening the numbers would only
+    move the threshold; charging the budget in loop-responsive time removes the
+    dependence, and this guard is what keeps it removed.
+
+    It also closes the specific hole that produced one of the three failures.
+    Task 2376's sweep replaced merge-pipeline wait literals, but its stated
+    policy only covered literals <= 15 — so the lone ``timeout=25.0`` in
+    test_predecessor_fail_cascades_to_late_arrival sat just above the sweep and
+    survived as the file's only bare mid-range deadline. A policy expressed as
+    "literals up to N" cannot catch the one above N; a structural invariant
+    over the call SHAPE can.
+    """
+
+    def test_no_late_arrival_wait_is_charged_in_wall_clock(self) -> None:
+        offenders = _late_arrival_wait_offenders(Path(__file__).read_text())
+
+        assert not offenders, (
+            'These late-arrival synchronisation points still carry '
+            'wall-clock deadlines:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nA MergeRequest.result future wait and an asyncio.Event '
+            'gate barrier are both load-bearing: a deadline expiry there '
+            'fails a test whose merge pipeline completed correctly, purely '
+            'because the xdist worker was descheduled. Use '
+            'wait_responsive(...), which charges its budget in '
+            'loop-responsive time and still reports a genuine hang red. The '
+            'worker_task teardown waits are deliberately exempt (best-effort '
+            'cleanup inside contextlib.suppress, asserting nothing).'
         )
