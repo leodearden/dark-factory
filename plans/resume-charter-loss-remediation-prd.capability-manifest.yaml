@@ -1,149 +1,187 @@
-# Machine-readable twin of resume-charter-loss-remediation-prd.capability-manifest.md
-# Schema: plans/capability-delivered-checks-prd.md §Contract; validated by
-# shared/src/shared/capability_manifest.py (CapabilityManifestDoc).
-# task_id values are null until commit_planning stamps them (task 2578 stamper).
-# Evidence verified against main @ 03ff70c5dd on 2026-08-10; delivered_checks
-# are pattern-anchored (test names / stable literals), never file:line.
 prd: plans/resume-charter-loss-remediation-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Escalation drain durability: compact projection carries root_cause+member_ids; add_members_to_l2 stops discarding authored framing"
-    capabilities:
-      - name: "compact-projection-carries-root-cause"
-        binding: "capability→producer (wired) — _COMPACT_ESCALATION_FIELDS tuple + apply site in escalation/src/escalation/server.py; drop of root_cause/members is the verified RED premise"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_compact_projection_carries_root_cause"
-          paths: ["escalation/"]
-          expect: present
-      - name: "promote-fold-preserves-incoming-framing"
-        binding: "capability→producer (wired) — add_members_to_l2 in escalation/src/escalation/queue.py; its docstring states the members-only preservation policy verbatim (the discard is the RED premise)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_add_members_preserves_incoming_framing"
-          paths: ["escalation/"]
-          expect: present
-  - label: "β"
-    task_id: null
-    title: "Root-cause canonicalisation in find_pending_l2_by_root_cause"
-    capabilities:
-      - name: "canonicalised-root-cause-matching"
-        binding: "capability→producer (wired) — find_pending_l2_by_root_cause in escalation/src/escalation/queue.py is stripped exact-string equality today; canonicalisation is β's deliverable, single-site per INV-5"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_root_cause_match_is_canonicalised"
-          paths: ["escalation/"]
-          expect: present
-  - label: "γ"
-    task_id: null
-    title: "Auto-watcher drain loop: enriched projection + archive-inclusive read"
-    capabilities:
-      - name: "archive-inclusive-drain-protocol"
-        binding: "capability→producer (wired) — get_task_escalations is ARCHIVE-INCLUSIVE by default (escalation/src/escalation/server.py); the SKILL.md drain section currently unions members of PENDING L2s only (the RED premise)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "get_task_escalations"
-          paths: ["skills/escalation-watcher-auto/SKILL.md"]
-          expect: present
-      - name: "already-promoted-rebuilt-from-projection"
-        binding: "capability→producer — α's enriched compact projection (upstream); the drain loop consumes root_cause/member_ids fields, no session memory"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "protocol quality (what the loop unions) is judged by prose review of the SKILL.md, not a grep"
-  - label: "δ"
-    task_id: null
-    title: "Exit-on-drain + degenerate-exit guard change in the same task"
-    capabilities:
-      - name: "drained-exit-bypasses-misconfigured-guard"
-        binding: "capability→producer (wired) — guard knobs in orchestrator defaults.yaml/config.py; supervisor split degenerate-vs-healthy in harness.py; the exit_reason=drained marker is NEW substrate δ delivers (PRD §9 C4)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_drained_exit_does_not_trip_misconfigured_guard"
-          paths: ["orchestrator/"]
-          expect: present
-      - name: "unmarked-fast-exit-still-trips-guard"
-        binding: "rejection-mechanism — the guard's storm escape is retained for exits without the marker (INV-4); asserted by its own RED→GREEN test"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_unmarked_fast_exit_still_trips_guard"
-          paths: ["orchestrator/"]
-          expect: present
-  - label: "ε"
-    task_id: null
-    title: "Quiet-project watcher cost containment + daily-ceiling under-count fix"
-    capabilities:
-      - name: "quiet-project-watcher-spend-bounded"
-        binding: "capability→producer (wired) — watcher_daily_cost_ceiling_usd enforced in harness.py against a store missing ~40% of rotations (RED premise); task 2629's launch gate is done, its deployed state is ε's first deliverable"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the deliverable spans deployed fleet state and per-project config, not a repo pattern"
-  - label: "ζ"
-    task_id: null
-    title: "unblock_auto: CLI-enforced read-only envelope + governing cap-wait bound"
-    capabilities:
-      - name: "dry-run-argv-carries-explicit-envelope"
-        binding: "capability→producer (wired) — permission_mode param + --permission-mode/--disallowed-tools emission exist in shared/src/shared/cli_invoke.py; dry_run_unblock.py passes neither today (RED premise)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_dry_run_argv_denies_write_tools"
-          paths: ["orchestrator/"]
-          expect: present
-      - name: "cap-wait-sanity-bound-governs-real-wait"
-        binding: "capability→producer (wired) — _DRY_RUN_CAP_WAIT_SANITY_SECS exists in dry_run_unblock.py; _check_cap_wait closure sampled only inside the cap-hit retry loop while the wait sits in usage_gate.invoke_slot (RED premise, 11x overshoot observed)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_cap_wait_sanity_bound_governs_slot_wait"
-          paths: ["orchestrator/", "shared/"]
-          expect: present
-  - label: "η"
-    task_id: null
-    title: "Recon Landlock fix: recon config dir inside the sandbox writable set"
-    capabilities:
-      - name: "recon-config-dir-landlock-writable"
-        binding: "capability→producer (wired) — sandbox_recon_writable_extras (empty default, unset in config.yaml) consumed fail-closed in cli_stage_runner.py; recon_config_base_dir outside the writable set is the verified RED premise (probe DENIED; zero recon transcripts since 2026-07-18)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_recon_config_dir_is_landlock_writable"
-          paths: ["fused-memory/"]
-          expect: present
-      - name: "landlock-exec-stale-claim-corrected"
-        binding: "capability→producer (wired) — the stale per-task-CLAUDE_CONFIG_DIR-inside-worktree claim in orchestrator/src/orchestrator/agents/landlock_exec.py is the correction target"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "redirected to a per-task ``CLAUDE_CONFIG_DIR`` inside"
-          paths: ["orchestrator/src/orchestrator/agents/landlock_exec.py"]
-          expect: absent
-  - label: "θ"
-    task_id: null
-    title: "Verify 3727 deployed & writing archive_available; settle the no_transcript polarity dispute (gate for 3578)"
-    capabilities:
-      - name: "3727-instrumentation-on-main"
-        binding: "capability→producer (wired) — durable_archive_path in shared/src/shared/transcript_archive.py; archive_available in orchestrator event_store.py/harness.py; the deployed-fleet gap (NULL on all 260 fallbacks) is what θ measures"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "operational verification of running units; the deliverable is a report + possible restart, not a repo artifact"
-  - label: "ι"
-    task_id: null
-    title: "Reassess 3728/3729/3730/3733 against a working resume baseline"
-    capabilities:
-      - name: "eligibility-leaves-reassessed-post-3578"
-        binding: "DAG-direction — subjects 3728/3729/3730/3733 all pending (verified via get_statuses 2026-08-10); upstream producer is 3578 (dep wired)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "decision task; the deliverable is recorded rationale on the subject tasks"
+- label: α
+  task_id: 3997
+  title: 'Escalation drain durability: compact projection carries root_cause+member_ids;
+    add_members_to_l2 stops discarding authored framing'
+  capabilities:
+  - name: compact-projection-carries-root-cause
+    binding: capability→producer (wired) — _COMPACT_ESCALATION_FIELDS tuple + apply
+      site in escalation/src/escalation/server.py; drop of root_cause/members is the
+      verified RED premise
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_compact_projection_carries_root_cause
+      paths:
+      - escalation/
+      expect: present
+  - name: promote-fold-preserves-incoming-framing
+    binding: capability→producer (wired) — add_members_to_l2 in escalation/src/escalation/queue.py;
+      its docstring states the members-only preservation policy verbatim (the discard
+      is the RED premise)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_add_members_preserves_incoming_framing
+      paths:
+      - escalation/
+      expect: present
+- label: β
+  task_id: 3998
+  title: Root-cause canonicalisation in find_pending_l2_by_root_cause
+  capabilities:
+  - name: canonicalised-root-cause-matching
+    binding: capability→producer (wired) — find_pending_l2_by_root_cause in escalation/src/escalation/queue.py
+      is stripped exact-string equality today; canonicalisation is β's deliverable,
+      single-site per INV-5
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_root_cause_match_is_canonicalised
+      paths:
+      - escalation/
+      expect: present
+- label: γ
+  task_id: 3999
+  title: 'Auto-watcher drain loop: enriched projection + archive-inclusive read'
+  capabilities:
+  - name: archive-inclusive-drain-protocol
+    binding: capability→producer (wired) — get_task_escalations is ARCHIVE-INCLUSIVE
+      by default (escalation/src/escalation/server.py); the SKILL.md drain section
+      currently unions members of PENDING L2s only (the RED premise)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: get_task_escalations
+      paths:
+      - skills/escalation-watcher-auto/SKILL.md
+      expect: present
+  - name: already-promoted-rebuilt-from-projection
+    binding: capability→producer — α's enriched compact projection (upstream); the
+      drain loop consumes root_cause/member_ids fields, no session memory
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: protocol quality (what the loop unions) is judged by prose review of
+        the SKILL.md, not a grep
+- label: δ
+  task_id: 4000
+  title: Exit-on-drain + degenerate-exit guard change in the same task
+  capabilities:
+  - name: drained-exit-bypasses-misconfigured-guard
+    binding: capability→producer (wired) — guard knobs in orchestrator defaults.yaml/config.py;
+      supervisor split degenerate-vs-healthy in harness.py; the exit_reason=drained
+      marker is NEW substrate δ delivers (PRD §9 C4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_drained_exit_does_not_trip_misconfigured_guard
+      paths:
+      - orchestrator/
+      expect: present
+  - name: unmarked-fast-exit-still-trips-guard
+    binding: rejection-mechanism — the guard's storm escape is retained for exits
+      without the marker (INV-4); asserted by its own RED→GREEN test
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_unmarked_fast_exit_still_trips_guard
+      paths:
+      - orchestrator/
+      expect: present
+- label: ε
+  task_id: 4001
+  title: Quiet-project watcher cost containment + daily-ceiling under-count fix
+  capabilities:
+  - name: quiet-project-watcher-spend-bounded
+    binding: capability→producer (wired) — watcher_daily_cost_ceiling_usd enforced
+      in harness.py against a store missing ~40% of rotations (RED premise); task
+      2629's launch gate is done, its deployed state is ε's first deliverable
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the deliverable spans deployed fleet state and per-project config, not
+        a repo pattern
+- label: ζ
+  task_id: 4002
+  title: 'unblock_auto: CLI-enforced read-only envelope + governing cap-wait bound'
+  capabilities:
+  - name: dry-run-argv-carries-explicit-envelope
+    binding: capability→producer (wired) — permission_mode param + --permission-mode/--disallowed-tools
+      emission exist in shared/src/shared/cli_invoke.py; dry_run_unblock.py passes
+      neither today (RED premise)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_dry_run_argv_denies_write_tools
+      paths:
+      - orchestrator/
+      expect: present
+  - name: cap-wait-sanity-bound-governs-real-wait
+    binding: capability→producer (wired) — _DRY_RUN_CAP_WAIT_SANITY_SECS exists in
+      dry_run_unblock.py; _check_cap_wait closure sampled only inside the cap-hit
+      retry loop while the wait sits in usage_gate.invoke_slot (RED premise, 11x overshoot
+      observed)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_cap_wait_sanity_bound_governs_slot_wait
+      paths:
+      - orchestrator/
+      - shared/
+      expect: present
+- label: η
+  task_id: 4003
+  title: 'Recon Landlock fix: recon config dir inside the sandbox writable set'
+  capabilities:
+  - name: recon-config-dir-landlock-writable
+    binding: capability→producer (wired) — sandbox_recon_writable_extras (empty default,
+      unset in config.yaml) consumed fail-closed in cli_stage_runner.py; recon_config_base_dir
+      outside the writable set is the verified RED premise (probe DENIED; zero recon
+      transcripts since 2026-07-18)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_recon_config_dir_is_landlock_writable
+      paths:
+      - fused-memory/
+      expect: present
+  - name: landlock-exec-stale-claim-corrected
+    binding: capability→producer (wired) — the stale per-task-CLAUDE_CONFIG_DIR-inside-worktree
+      claim in orchestrator/src/orchestrator/agents/landlock_exec.py is the correction
+      target
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: redirected to a per-task ``CLAUDE_CONFIG_DIR`` inside
+      paths:
+      - orchestrator/src/orchestrator/agents/landlock_exec.py
+      expect: absent
+- label: θ
+  task_id: 4005
+  title: Verify 3727 deployed & writing archive_available; settle the no_transcript
+    polarity dispute (gate for 3578)
+  capabilities:
+  - name: 3727-instrumentation-on-main
+    binding: capability→producer (wired) — durable_archive_path in shared/src/shared/transcript_archive.py;
+      archive_available in orchestrator event_store.py/harness.py; the deployed-fleet
+      gap (NULL on all 260 fallbacks) is what θ measures
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational verification of running units; the deliverable is a report
+        + possible restart, not a repo artifact
+- label: ι
+  task_id: 4007
+  title: Reassess 3728/3729/3730/3733 against a working resume baseline
+  capabilities:
+  - name: eligibility-leaves-reassessed-post-3578
+    binding: DAG-direction — subjects 3728/3729/3730/3733 all pending (verified via
+      get_statuses 2026-08-10); upstream producer is 3578 (dep wired)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: decision task; the deliverable is recorded rationale on the subject
+        tasks
