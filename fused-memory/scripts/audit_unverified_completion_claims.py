@@ -54,13 +54,17 @@ Exit codes: ``0`` ran, ``1`` infra failure (nothing printed), ``2``
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.completion_claim_gate import (
+    UNRESOLVABLE,
+    ClaimVerdict,
     CompletionClaim,
     extract_completion_claims,
+    verify_claims,
 )
 
 # --------------------------------------------------------------------------- #
@@ -225,3 +229,126 @@ def scan_records(
         key=lambda s: (s.record.category or '', s.record.created_at, s.record.uuid)
     )
     return scanned
+
+
+# --------------------------------------------------------------------------- #
+# Adjudication (pure and sync — the three authorities are INJECTED probes)
+# --------------------------------------------------------------------------- #
+
+#: Verdict statuses, ordered so a mismatch always sorts ahead of an
+#: unverifiable. A mismatch is evidence the writer was WRONG; an unverifiable is
+#: merely unchecked. Putting the evidence at the head is what makes the part
+#: worth reading the part that gets read.
+_STATUS_ORDER: dict[str, int] = {'mismatch': 0, 'unverifiable': 1}
+
+
+@dataclass(frozen=True, slots=True)
+class Finding:
+    """One non-verified claim, with everything needed to re-check it by hand.
+
+    ``derived_edge_uuids`` names the Graphiti ``RELATES_TO`` edges extracted
+    FROM this episode — the actual harm artefacts. In esc-5603-1 one false
+    sentence fanned out into five false edges, so a report that named only the
+    source episode would understate what is actually in the graph. It defaults
+    to ``()`` because the pure layer cannot reach the store; ``_run`` attaches
+    the real uuids for flagged episodes.
+    """
+
+    record_uuid: str
+    record_kind: str
+    category: str | None
+    project_id: str
+    created_at: str
+    claim_kind: str
+    subject: str
+    ref: str
+    claim_project_id: str | None
+    status: str
+    observed: str
+    claimed_text: str
+    derived_edge_uuids: tuple[str, ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        """Render as a plain JSON-serializable dict."""
+        return {
+            'record_uuid': self.record_uuid,
+            'record_kind': self.record_kind,
+            'category': self.category,
+            'project_id': self.project_id,
+            'created_at': self.created_at,
+            'claim_kind': self.claim_kind,
+            'subject': self.subject,
+            'ref': self.ref,
+            'claim_project_id': self.claim_project_id,
+            'status': self.status,
+            'observed': self.observed,
+            'claimed_text': self.claimed_text,
+            'derived_edge_uuids': list(self.derived_edge_uuids),
+        }
+
+
+def adjudicate(
+    scanned: Iterable[ScannedRecord],
+    *,
+    task_status_probe: Callable[[str, str | None], str | None],
+    ticket_probe: Callable[[str], dict[str, Any] | None | Any],
+    commit_probe: Callable[[str, str | None], bool | None],
+) -> list[Finding]:
+    """Adjudicate every scanned claim, returning only the non-verified ones.
+
+    The verdicts come from the IMPORTED
+    :func:`~fused_memory.services.completion_claim_gate.verify_claims`, with the
+    three tri-state probes passed through unchanged — so this sweep and the
+    write-time gate cannot disagree about what a given authority answer means.
+
+    Verified claims are DROPPED: this is a report of problems, and listing the
+    clean majority would bury the part worth reading.
+
+    Each finding slices the claiming clause out of the record's own text by the
+    claim span, the same self-containment
+    :func:`~fused_memory.services.completion_claim_gate.build_unverified_flag`
+    provides (:623-639) — a reader can see what was claimed, what was checked
+    and what was actually there without re-running anything.
+
+    Pure and sync. Probes are injected, so no Taskmaster, no ticket DB and no
+    git are required to exercise this layer.
+    """
+    findings: list[Finding] = []
+    for item in scanned:
+        verdicts: list[ClaimVerdict] = verify_claims(
+            list(item.claims),
+            task_status_probe=task_status_probe,
+            ticket_probe=ticket_probe,
+            commit_probe=commit_probe,
+        )
+        for verdict in verdicts:
+            if verdict.status == 'verified':
+                continue
+            start, end = verdict.claim.span
+            findings.append(
+                Finding(
+                    record_uuid=item.record.uuid,
+                    record_kind=item.record.kind,
+                    category=item.record.category,
+                    project_id=item.record.project_id,
+                    created_at=item.record.created_at,
+                    claim_kind=verdict.claim.kind,
+                    subject=verdict.claim.subject,
+                    ref=verdict.claim.ref,
+                    claim_project_id=verdict.claim.project_id,
+                    status=verdict.status,
+                    observed=verdict.observed,
+                    claimed_text=item.record.text[start:end].strip(),
+                )
+            )
+
+    findings.sort(
+        key=lambda f: (
+            _STATUS_ORDER.get(f.status, 99),
+            f.category or '',
+            f.created_at,
+            f.record_uuid,
+            f.ref,
+        )
+    )
+    return findings
