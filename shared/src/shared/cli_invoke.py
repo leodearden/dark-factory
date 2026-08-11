@@ -68,6 +68,11 @@ _WATCHDOG_MIN_POLL_SECS = 0.01
 # Still floored by _WATCHDOG_MIN_POLL_SECS and clamped by time-to-idle-kill /
 # time-to-absolute-cap so a kill boundary is never overshot by a full poll.
 _WATCHDOG_WORKING_POLL_SECS = 60.0
+# Consecutive unreadable-transcript polls before the storm escape fires (task 4003).
+# Small enough to fire well inside a real invocation, large enough that the
+# ordinary startup window — where the transcript legitimately does not exist yet
+# because the CLI has not written its first record — never trips it.
+_WATCHDOG_UNREADABLE_STREAK_THRESHOLD = 3
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -185,14 +190,17 @@ __all__ = [
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'ended_awaiting_background_for_session',
+    'get_unreadable_transcript_escapes',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_cli_invocation_rejected',
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
+    'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'reset_unreadable_transcript_escapes',
     'transcript_exists',
 ]
 
@@ -462,6 +470,97 @@ def count_transcript_turns(
     if records is None:
         return None
     return sum(1 for r in records if r.get('type') == 'assistant')
+
+
+# Process-wide count of storm escapes fired (task 4003).  A plain module global
+# with an explicit `global` statement is sufficient — the watchdog runs on the
+# event loop thread, so there is no cross-thread race to lock against.
+_unreadable_transcript_escapes = 0
+
+
+def get_unreadable_transcript_escapes() -> int:
+    """Number of unreadable-transcript storm escapes fired in this process."""
+    return _unreadable_transcript_escapes
+
+
+def reset_unreadable_transcript_escapes() -> None:
+    """Reset the escape counter (test isolation)."""
+    global _unreadable_transcript_escapes
+    _unreadable_transcript_escapes = 0
+
+
+def note_unreadable_transcript(
+    streak: int,
+    *,
+    config_dir: object,
+    session_id: str,
+    label: str,
+) -> bool:
+    """Escape hatch for the silent ``count_transcript_turns() is None`` degrade.
+
+    THIS COUNTS; IT DOES NOT KILL.  The conservative degrade it observes is
+    correct and stays exactly as it is — the watchdog must never kill on an
+    unreadable transcript, because "unreadable" is indistinguishable from
+    "not written yet".  What was wrong was that it ran *silently*.
+
+    This is the storm escape for a fail-soft that ran silently for three weeks.
+    From 2026-07-18 (task 2744) to 2026-08-11 (task 4003) every reconciliation
+    stage had its ``CLAUDE_CONFIG_DIR`` outside the sandbox writable set, so the
+    CLI could never write a transcript; every poll read None; the liveness
+    watchdog degraded to inert and every cap-retry force-freshed instead of
+    resuming.  Two independent fail-softs absorbed the same PermissionError and
+    neither incremented anything, so there was no signal to notice.
+
+    Fires EXACTLY ONCE per crossing (``streak == threshold``), never on every
+    poll above it — a wedged invocation polls its transcript for the whole of a
+    long run, and one WARNING per poll would bury the very signal this exists to
+    raise.  A readable transcript resets the caller's streak, so a later relapse
+    is a new crossing and fires again.
+
+    Scope: only invocations configured with BOTH ``config_dir`` and
+    ``session_id`` reach here, i.e. roles that are SUPPOSED to have a
+    transcript.  A role with neither is not expected to have one and its Nones
+    mean nothing.  (Both call sites are already inside branches requiring them,
+    so no additional guard is needed here.)
+
+    Deliberately a counter plus a log rather than an escalation call: ``shared``
+    sits at the bottom of the dependency stack and must not take an import edge
+    on the escalation client.
+
+    Args:
+        streak: Number of CONSECUTIVE unreadable polls, including this one.
+        config_dir: The ``CLAUDE_CONFIG_DIR`` the transcript was expected under.
+        session_id: The session whose transcript could not be read.
+        label: The invocation label (which agent/model), for the log line.
+
+    Returns:
+        True if this call fired the escape, False otherwise.
+    """
+    global _unreadable_transcript_escapes
+
+    if streak != _WATCHDOG_UNREADABLE_STREAK_THRESHOLD:
+        return False
+
+    _unreadable_transcript_escapes += 1
+    logger.warning(
+        'Transcript UNREADABLE for %d consecutive watchdog polls — '
+        'label=%s session_id=%s config_dir=%s. This invocation was configured '
+        'with both config_dir and session_id, so it is SUPPOSED to have a '
+        'transcript; an unreadable one means the transcript is not being '
+        'written at all (a sandbox/permission or path problem), not that the '
+        'agent is slow. Consequences, both silent by design until now: the '
+        'liveness watchdog is degraded to INERT for this invocation (it never '
+        'kills on None), and any cap-retry will force-fresh instead of '
+        'resuming, losing the session. Archetype: the recon Landlock instance, '
+        '2026-07-18 -> 2026-08-11, where the per-run CLAUDE_CONFIG_DIR sat '
+        'outside the sandbox writable set (task 4003). Check that config_dir '
+        'is inside the sandbox writable set and that the path exists.',
+        streak,
+        label,
+        session_id,
+        config_dir,
+    )
+    return True
 
 
 # Background-management tool names that "reap" a launched background task — a

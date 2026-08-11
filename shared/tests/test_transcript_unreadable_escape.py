@@ -109,6 +109,10 @@ def test_above_threshold_does_not_re_fire(caplog):
     assert _note(_THRESHOLD) is True
     assert get_unreadable_transcript_escapes() == 1
 
+    # Drop the record from the crossing above: caplog accumulates for the whole
+    # test, and this block asserts that NO FURTHER record is emitted.
+    caplog.clear()
+
     with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
         for streak in range(_THRESHOLD + 1, _THRESHOLD + 6):
             assert _note(streak) is False, (
