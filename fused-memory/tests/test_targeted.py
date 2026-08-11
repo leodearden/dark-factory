@@ -1193,6 +1193,140 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
     )
 
 
+# ── task-3581: the hints-attach write must UNION, not clobber, memory_hints ──
+#
+# DF-3260: _on_task_blocked attaches generated hints onto a row that may
+# already carry human-authored memory_hints. It passed neither metadata_mode
+# nor append, so the write resolved to the default 'merge' — shallow
+# last-write-wins — and the whole authored memory_hints key was replaced by
+# the generated {entities: [...], queries: ['resolution for: <title>']} stub.
+
+# The authored hints DF task 3260 was carrying before the clobber.
+_DF3260_AUTHORED_METADATA = {
+    'memory_hints': {
+        'entities': ['Task 3113', 'Task 3146'],
+        'queries': ['metadata.files scope recon boundary'],
+    },
+}
+
+
+def _resolved_mode_of(call_kwargs: dict) -> str:
+    """Resolve the merge mode the captured update_task call actually requests.
+
+    Goes through the REAL backend resolver rather than string-matching a
+    kwarg, so the assertion is spelling-agnostic: metadata_mode='additive'
+    and a bare append=True both resolve to 'additive', while the pre-fix
+    no-mode-argument call resolves to 'merge'.
+    """
+    from fused_memory.backends.sqlite_task_backend import _resolve_metadata_mode
+    return _resolve_metadata_mode(
+        call_kwargs.get('metadata_mode'),
+        call_kwargs.get('append'),
+        metadata_present=call_kwargs.get('metadata') is not None,
+    )
+
+
+async def _capture_blocked_hints_write(reconciler, mock_memory_service, *, via_interceptor):
+    """Drive _on_task_blocked through the hints-attach branch and return the
+    kwargs of whichever update_task call it made."""
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(
+            id='1', content='blocker info', source_store=SourceStore.mem0,
+            entities=['EntityA'],
+        ),
+    ])
+    if via_interceptor:
+        mock_interceptor = AsyncMock()
+        mock_interceptor.update_task = AsyncMock(return_value={'success': True})
+        reconciler.task_interceptor = mock_interceptor
+        target = mock_interceptor
+    else:
+        assert reconciler.task_interceptor is None, (
+            'fallback-branch test requires an unwired interceptor'
+        )
+        target = reconciler.taskmaster
+
+    await reconciler.reconcile_task(
+        task_id='42', transition='blocked',
+        project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+    target.update_task.assert_called_once()
+    return target.update_task.call_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('via_interceptor', [True, False], ids=['interceptor', 'fallback'])
+async def test_on_task_blocked_hints_write_uses_additive_mode(
+    reconciler, mock_memory_service, mock_taskmaster, via_interceptor,
+):
+    """The _on_task_blocked hints-attach write must request ADDITIVE merge
+    semantics on BOTH branches — the wired-interceptor one and the direct
+    taskmaster fallback (task 3581).
+
+    Both branches are separately reachable, so a fix applied to only one of
+    them leaves the DF-3260 clobber live on the other."""
+    call_kwargs = await _capture_blocked_hints_write(
+        reconciler, mock_memory_service, via_interceptor=via_interceptor,
+    )
+    mode = _resolved_mode_of(call_kwargs)
+    assert mode == 'additive', (
+        f"the hints-attach write must request additive (union) merge; it resolves "
+        f"to {mode!r}. Pass metadata_mode='additive' (or append=True) — under the "
+        f"default 'merge' the authored memory_hints key is overwritten wholesale "
+        f"(DF-3260). Captured kwargs: "
+        f"{ {k: v for k, v in call_kwargs.items() if k != 'metadata'} }"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('via_interceptor', [True, False], ids=['interceptor', 'fallback'])
+async def test_on_task_blocked_preserves_authored_memory_hints(
+    reconciler, mock_memory_service, mock_taskmaster, via_interceptor,
+):
+    """The behavioural DF-3260 reproduction: run the captured hints-attach
+    payload through the REAL _merge_metadata using the mode the call actually
+    requests, against a row already carrying human-authored memory_hints.
+
+    The authored entities and query must SURVIVE alongside the generated
+    'resolution for: <title>' stub — union, not replacement. This is the
+    assertion that would have caught the original incident, and one that a
+    future call-site regression cannot slip past by keeping a kwarg while
+    changing its value."""
+    import json as _json
+
+    from fused_memory.backends.sqlite_task_backend import _merge_metadata
+
+    call_kwargs = await _capture_blocked_hints_write(
+        reconciler, mock_memory_service, via_interceptor=via_interceptor,
+    )
+
+    merged = _json.loads(_merge_metadata(
+        _json.dumps(_DF3260_AUTHORED_METADATA),
+        call_kwargs['metadata'],
+        mode=_resolved_mode_of(call_kwargs),
+    ))
+    hints = merged['memory_hints']
+
+    authored = _DF3260_AUTHORED_METADATA['memory_hints']
+    for entity in authored['entities']:
+        assert entity in hints['entities'], (
+            f'authored memory_hints entity {entity!r} was CLOBBERED by the '
+            f'hints-attach write (DF-3260): {merged}'
+        )
+    assert authored['queries'][0] in hints['queries'], (
+        f'authored memory_hints query was CLOBBERED by the hints-attach '
+        f'write (DF-3260): {merged}'
+    )
+    # ...and the generated stub still lands alongside it.
+    assert 'resolution for: Blocked task' in hints['queries'], (
+        f'generated resolution query must still be attached: {merged}'
+    )
+    assert 'EntityA' in hints['entities'], (
+        f'generated entity must still be attached: {merged}'
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'rejection_dict, expected_error, expected_reason',
