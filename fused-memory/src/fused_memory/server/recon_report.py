@@ -913,7 +913,27 @@ class ReconReportState:
         stage: str,
         project_id: str,
     ) -> dict[str, Any]:
-        """Create a new in-progress report entry."""
+        """Create a new in-progress report entry.
+
+        Idempotent per PRD §9.2/§9.4: a first call for a given ``(run_id,
+        stage)`` creates a fresh entry. A repeat call for an ``(run_id,
+        stage)`` pair already present in ``self._state`` is a no-op that
+        preserves the existing entry untouched — this guard is keyed
+        solely on ``(run_id, stage)`` presence in ``self._state`` and
+        deliberately does not police a stage name that does not yet exist
+        for this run (that remains a legal fresh-create, matching a normal
+        stage transition within a run).
+        """
+        existing = self._state.get((run_id, stage))
+        if existing is not None:
+            logger.warning(
+                'recon_report: start_report called again for an existing entry '
+                'run_id=%r stage=%r (findings=%d completed=%s); '
+                'existing report preserved, call ignored',
+                run_id, stage, len(existing.findings), existing.completed_at is not None,
+            )
+            return {'run_id': run_id, 'stage': stage, 'already_started': True}
+
         entry = _ReportEntry(
             run_id=run_id,
             stage=stage,
