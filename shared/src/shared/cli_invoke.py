@@ -2882,6 +2882,12 @@ async def _run_subprocess(
             # updated together whenever a later poll observes MORE turns.
             last_progress_turns: int | None = None
             last_progress_monotonic: float | None = None
+            # CONSECUTIVE unreadable-transcript polls (task 4003).  Reset by any
+            # successful read, so a transcript that is briefly unreadable — the
+            # normal startup window, before the CLI writes its first record —
+            # never accumulates toward the escape.  Only a transcript that is
+            # never readable does.
+            unreadable_streak = 0
 
             comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
 
@@ -2970,7 +2976,16 @@ async def _run_subprocess(
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
-                    if n is not None:
+                    if n is None:
+                        unreadable_streak += 1
+                        note_unreadable_transcript(
+                            unreadable_streak,
+                            config_dir=config_dir,
+                            session_id=session_id,
+                            label=model,
+                        )
+                    else:
+                        unreadable_streak = 0
                         live_turns = n
                         if n >= 1:
                             seen_turn = True
@@ -2978,9 +2993,19 @@ async def _run_subprocess(
                             last_progress_monotonic = time.monotonic()
                 elif extension_engaged and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
-                    if n is not None and (last_progress_turns is None or n > last_progress_turns):
-                        last_progress_turns = n
-                        last_progress_monotonic = time.monotonic()
+                    if n is None:
+                        unreadable_streak += 1
+                        note_unreadable_transcript(
+                            unreadable_streak,
+                            config_dir=config_dir,
+                            session_id=session_id,
+                            label=model,
+                        )
+                    else:
+                        unreadable_streak = 0
+                        if last_progress_turns is None or n > last_progress_turns:
+                            last_progress_turns = n
+                            last_progress_monotonic = time.monotonic()
 
                 elapsed = time.monotonic() - watchdog_start
                 # Re-derive fresh (not the top-of-loop value) so a seen_turn
@@ -2991,6 +3016,15 @@ async def _run_subprocess(
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
+                # That degrade is now COUNTED (note_unreadable_transcript, above):
+                # a role configured WITH config_dir and session_id is supposed to
+                # HAVE a transcript, so one that is never readable is a defect,
+                # not patience.  The comment alone was not enough — it was correct
+                # and present the whole time recon's per-run CLAUDE_CONFIG_DIR sat
+                # outside the sandbox writable set (2026-07-18 -> 2026-08-11, task
+                # 4003), during which this branch degraded to inert on every poll
+                # of every stage and said nothing.  The kill decision is unchanged;
+                # only its silence is.
                 if not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs:
                     logger.warning(
                         f'Startup wedge detected after {elapsed:.1f}s '
