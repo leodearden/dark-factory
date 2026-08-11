@@ -23,10 +23,25 @@ Two failure shapes were reported separately and looked like two problems. They
 are **one defect with two manifestations**, and it lives at the harness's
 tool-call XML serialization boundary, **upstream of this repository**.
 
-The mechanism: the harness's tool-call parser terminates a string **argument**
-early when a literal closing tag appears inside that argument's *value*. An
-agent writing a task description that quotes `&#60;/description>` therefore
-ends the `description` argument at that point, mid-value.
+The mechanism: the model emits a parameter's **closing** tag in the wrong
+dialect — echoing the parameter *name* (`&#60;/description>`, `&#60;/content>`,
+`&#60;/rationale>`) instead of the canonical `&#60;/parameter>` — and frequently
+continues the remaining parameters in that same wrong dialect. The harness's
+tool-call parser does not find the closer it expects. It **over-consumes**: it
+runs forward to the next available terminator — a later well-formed
+`&#60;/parameter>`, else `&#60;/invoke>` — dumps everything it swallowed along
+the way into the *current* parameter's value, and **silently drops every
+parameter in between**.
+
+That direction, not early termination, is what the evidence requires. The
+observed signature is a fragment **inside** the stored value *and* sibling
+parameters **missing**. Early termination is inconsistent with both halves at
+once: it would end the argument *at* the tag, so the fragment would be
+**absent** from the stored text rather than embedded in it, and the parser
+would resume normally at the next parameter, so the siblings would be
+**intact** rather than missing. Only over-consumption produces both halves
+together — a fragment landing inside the value *and* everything between it
+and the fallback terminator disappearing.
 
 ### The negative evidence that settles it
 
