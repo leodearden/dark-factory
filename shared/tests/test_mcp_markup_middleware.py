@@ -462,8 +462,19 @@ class TestB6DeliberateQuotingOverride:
         )
 
     @BOTH_POLICIES
-    async def test_the_override_key_is_stripped_before_dispatch(self, policy):
-        """The flag is a write-time control, never payload the tool should see."""
+    async def test_a_metadata_taking_tool_receives_the_flag_INTACT(self, policy):
+        """ONE override, ONE lifecycle — the second guard has to be able to see it.
+
+        fused-memory's write-time tripwire keys the SAME hatch off the metadata
+        that reaches the tool body (``tools.py``'s ``_markup_gate``: ``if
+        markup_override_requested(metadata): return None``), and strips it there
+        (2703/2933/6565/7118). Consuming the flag at this boundary would let a
+        caller quoting envelope literals in ``submit_task.description`` past
+        THIS guard and straight into a rejection from the NEXT one — bounced
+        with a hint telling it to set a flag it had already set. So on a tool
+        that declares ``metadata``, the map travels UNCHANGED and the tool body
+        owns the rest of the lifecycle.
+        """
         h = build_harness(policy)
 
         await h.call(
@@ -475,7 +486,28 @@ class TestB6DeliberateQuotingOverride:
             },
         )
 
-        assert h.recorder.args['metadata'] == {'keep': 'this'}
+        assert h.recorder.args['metadata'] == {'allow_mcp_markup': True, 'keep': 'this'}
+
+    @BOTH_POLICIES
+    async def test_a_tool_with_no_metadata_parameter_has_the_key_dropped(self, policy):
+        """The other half of the same decision — nothing to hand the flag to.
+
+        ``escalate_info`` declares no ``metadata``, so there is no second guard
+        to inform and forwarding the parameter at all would be
+        ``ToolError: Unexpected keyword argument``.
+        """
+        h = build_harness(policy)
+
+        await h.call(
+            'escalate_info',
+            {
+                'summary': 's',
+                'detail': 'quoting ' + _closer('content'),
+                'metadata': {'allow_mcp_markup': True},
+            },
+        )
+
+        assert 'metadata' not in h.recorder.args
 
     @BOTH_POLICIES
     async def test_no_fact_is_emitted(self, policy):
@@ -527,7 +559,12 @@ class TestB6DeliberateQuotingOverride:
         )
 
         assert h.recorder.args['description'] == quoted
-        assert json.loads(h.recorder.args['metadata']) == {'keep': 'this'}
+        # submit_task declares ``metadata``, so the map travels unchanged — the
+        # JSON-string shape included, since that is the shape the caller chose
+        # and the tool body's own ``markup_override_requested`` parses it.
+        assert json.loads(h.recorder.args['metadata']) == {
+            'allow_mcp_markup': True, 'keep': 'this',
+        }
         assert h.facts == []
 
     # -- the hatch has to work on the tools that have no metadata ----------
@@ -581,22 +618,24 @@ class TestB6DeliberateQuotingOverride:
     async def test_metadata_the_caller_also_sent_is_NOT_dropped(self, policy):
         """Only the emptied case is dropped — the rest is the caller's payload.
 
-        Dropping a non-empty metadata map would silently discard data on a tool
-        that does declare the parameter, which is a far worse trade than the
-        failure being fixed.
+        On a tool with no ``metadata`` parameter, a residue the caller sent
+        alongside the flag is the caller's own bug; leaving it in place surfaces
+        that as an unknown-parameter error, where dropping it would silently
+        discard data.
         """
         h = build_harness(policy)
 
-        await h.call(
-            'submit_task',
-            {
-                'title': 't',
-                'description': 'quoting ' + _closer('content'),
-                'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
-            },
-        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'escalate_info',
+                {
+                    'summary': 's',
+                    'detail': 'quoting ' + _closer('content'),
+                    'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
+                },
+            )
 
-        assert h.recorder.args['metadata'] == {'keep': 'this'}
+        assert h.recorder.calls == []
 
 
 # ---------------------------------------------------------------------------

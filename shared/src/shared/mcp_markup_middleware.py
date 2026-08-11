@@ -128,11 +128,12 @@ FACT_MARKUP_DETECTED = 'markup_detected'
 #:
 #: The claim it makes is true on EVERY tool, including the many that declare no
 #: ``metadata`` parameter at all — see :meth:`MarkupGuardMiddleware._apply_override`
-#: for why the key is dropped rather than forwarded empty.
+#: for why the key is forwarded to a tool that takes ``metadata`` and dropped
+#: from one that does not.
 _OVERRIDE_SENTENCE = (
-    "override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}. The flag is "
-    'stripped before dispatch, and dropped entirely when it is the only '
-    'metadata you sent, so it works even on a tool that takes no metadata.'
+    "override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}. On a tool "
+    'that takes no metadata the flag is dropped before dispatch rather than '
+    'forwarded as an unexpected argument, so it works there too.'
 )
 
 #: Surfaced at the point of rejection, mirroring markup_tripwire's
@@ -278,12 +279,12 @@ class MarkupGuardMiddleware(Middleware):
         if name in self.exempt_tools:
             return await call_next(context)
 
-        # B6 — the author is quoting the markup deliberately. Strip the
-        # write-time-only control flag before dispatch (it must never reach the
-        # tool or be persisted) and forward, again with no fact: a declared
-        # quote is not a detection.
+        # B6 — the author is quoting the markup deliberately. Forward, with no
+        # fact: a declared quote is not a detection. Whether the flag itself
+        # travels with the call is decided by the invoked tool's own schema —
+        # see :meth:`_apply_override`.
         if markup_override_requested(arguments.get('metadata')):
-            self._apply_override(arguments)
+            await self._apply_override(context, name, arguments)
             return await call_next(context)
 
         hit = self._first_markup_argument(arguments)
@@ -297,31 +298,55 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- the deliberate-quoting override (B6) ------------------------------
 
-    @staticmethod
-    def _apply_override(arguments: dict[str, Any]) -> None:
-        """Strip the write-time-only control flag, DROPPING empty metadata.
+    @classmethod
+    async def _apply_override(cls, context, name: str, arguments: dict[str, Any]) -> None:
+        """Decide, FROM THE TOOL'S OWN SCHEMA, whether the flag travels onward.
 
-        The flag must never reach the tool or be persisted, so stripping it is
-        not optional. Dropping the key when nothing is left, however, is what
-        makes the escape hatch UNIVERSAL rather than metadata-only.
+        ONE override, ONE lifecycle. There are two guards on this hatch, not
+        one: this boundary middleware, and fused-memory's write-time tripwire
+        (``tools.py``'s ``_markup_gate``, which returns ``None`` for a caller
+        that set the flag and then strips it at 2703/2933/6565/7118). They key
+        off the SAME ``metadata`` map. So whether the flag reaches the tool body
+        is not a detail — it decides whether the second guard can see the
+        declaration the first one already honoured.
 
-        MEASURED: most tools this guard sits in front of declare no ``metadata``
-        parameter at all — ``escalate_info``, ``escalate_blocker``,
-        ``add_reuse_item`` and most of the escalation/orchestrator surface.
-        Forwarding a stripped-to-empty ``metadata={}`` to one of those turns the
-        documented remediation into ``ToolError: Unexpected keyword argument``:
-        an agent legitimately quoting envelope markup in an escalation summary —
-        a very likely topic, given DF 3083 — would do exactly what
-        :data:`_OVERRIDE_SENTENCE` told it to and land in a second, more
-        confusing error with no working way out.
+        * The tool DECLARES ``metadata`` — forward it UNCHANGED, flag included.
+          The tool body owns the rest of the lifecycle: it is the guard that
+          still has to be told, and it is already the party that strips the key
+          before persistence. Consuming the flag here would leave a caller doing
+          exactly what :data:`_OVERRIDE_SENTENCE` tells it to — quoting envelope
+          literals in ``add_memory.content`` or ``submit_task.description`` with
+          the flag set — past this guard and REJECTED by the next one, with a
+          hint telling it to set a flag it had already set.
+        * The tool declares NO ``metadata`` — strip the flag (it is
+          write-time-only control, never payload) and drop the key when that
+          empties it. MEASURED: most tools this
+          guard sits in front of take none — ``escalate_info``,
+          ``escalate_blocker``, ``add_reuse_item`` and most of the
+          escalation/orchestrator surface. Forwarding ``metadata`` to one of
+          those turns the documented remediation into ``ToolError: Unexpected
+          keyword argument``: an agent quoting envelope markup in an escalation
+          summary — a very likely topic, given DF 3083 — would land in a second,
+          more confusing error with no working way out. That failure, and only
+          that failure, is what the drop exists to fix, so anything the caller
+          sent BESIDES the flag is left in place, in its original shape: on a
+          tool with no ``metadata`` parameter that residue is the caller's own
+          bug, and an unknown-parameter error on it is visible where silently
+          discarding it would not be.
 
-        An empty metadata map carries nothing any tool could act on, so absent
-        and empty mean the same thing to every consumer, which is what makes
-        dropping it safe rather than merely convenient. Anything the caller sent
-        BESIDES the flag is preserved verbatim in its original shape (dict in /
-        dict out, JSON string in / JSON string out); an unknown-parameter
-        failure on THAT is the caller's own bug and is left visible.
+        The awaited ``get_tool`` round-trip is affordable here for the same
+        reason it is on the repair path: an explicit override is rarer even than
+        the 0.26% leak rate, and the clean fast path never reaches this method.
+
+        Fail-safe: an unresolvable schema yields ``()`` (see
+        :meth:`_schema_params`), which takes the DROP branch — the branch that
+        cannot raise ``Unexpected keyword argument``. A tool that does take
+        metadata then loses the flag and its own gate bounces the write with an
+        actionable hint, which is strictly better than a call the tool cannot
+        accept at all.
         """
+        if 'metadata' in await cls._schema_params(context, name):
+            return
         stripped = strip_markup_override(arguments['metadata'])
         # Both shapes of "nothing left": ``{}`` from a dict, and the ``'{}'``
         # ``json.dumps`` emits for the JSON-string form the real
