@@ -151,10 +151,15 @@ survives any revert/reland of 3983.
   and machine-readable, and the guard change lands in the same task as
   exit-on-drain (δ), never separately**. The guard's storm-escape
   purpose is retained for exits *without* the drained marker (INV-4).
-- **D7** — Recon Landlock fix shape (η): grant the recon config root to
-  the sandbox writable set (`sandbox_recon_writable_extras` default, or
-  relocate `recon_config_base_dir` under `<explore_codebase_root>/.task/`
-  which is already granted unconditionally). This *activates* R6 and
+- **D7** — Recon Landlock fix shape (η): grant the **per-run** recon
+  config dir to the sandbox writable set as a **computed writable extra**
+  appended per invocation, with containment machine-checked at
+  `resolve_recon_sandbox_wrap`. Neither of the two shapes originally
+  floated here — a `sandbox_recon_writable_extras` schema default, or
+  relocating `recon_config_base_dir` under `<explore_codebase_root>/.task/`
+  — is taken: both leave every run's config dir writable by every other
+  run, i.e. cross-run `.credentials.json` write access (see §11 open
+  question 5, decided in this leaf). This *activates* R6 and
   recon transcripts — acceptable only because Fix A is on main (D1).
   Side benefits: the recon cap-retry veto stops force-fresh re-work
   (~110-150k tokens/day floor), `count_transcript_turns` starts
@@ -372,13 +377,28 @@ call) — flag-enforced, resume-surviving per the organising principle.
 The cap-wait sanity bound is enforced where the wait actually happens
 (`usage_gate.invoke_slot` path), not only in the cap-hit branch.
 
-**C6. Recon writable set (η).** The recon per-run config dir root is a
-member of the Landlock writable set for recon stage invocations, via
-schema default or relocation under the already-granted
-`<explore_codebase_root>/.task/`. The stale claim in `landlock_exec.py`
-(~:20-23) is corrected in the same change. Credential isolation is
-preserved (the parent writes `.credentials.json` pre-spawn today;
-nothing new is shared across runs — per-run dirs stay per-run).
+**C6. Recon writable set (η).** The **per-run** recon config dir —
+`<data_dir>/recon-config/claude-config-<run_id>` — is a member of the
+sandbox writable set for that run's stage invocations, granted as a
+**computed writable extra** appended per invocation by
+`cli_stage_runner.run_stage_via_cli`. `recon_config_base_dir(data_dir)`
+itself is **never** granted, so every sibling run's config dir (and its
+`.credentials.json`) remains read-only under the ruleset. Containment is
+**machine-checked** at `sandbox_guard.resolve_recon_sandbox_wrap`, which
+fails closed (`RemediationSandboxUnavailable`) if the config dir it is
+handed is not inside the writable set that will be built — so a future
+edit that drops the grant refuses to launch instead of silently
+producing a transcript-less stage. The stale claim in `landlock_exec.py`
+(~:20-23) is corrected in the same change, along with its twin in
+`sandbox.py`'s bwrap docstring.
+
+Credential isolation is **enforced by the ruleset**, not merely preserved
+by naming: it is the per-run grant plus the containment assertion that
+keep it, and the earlier framing — "nothing new is shared across runs —
+per-run dirs stay per-run" — was FALSE for the schema-default-grant shape
+this section originally admitted. Granting the base would have made every
+run's `.credentials.json` writable by every other run, a capability that
+does not exist today (corrected under η's Amendment finding 1).
 
 > **CORRECTION 2026-08-11: the credential-isolation clause is true for
 > directory NAMING and FALSE for the WRITABLE SET.** Per-run dirs do
@@ -453,9 +473,20 @@ nothing new is shared across runs — per-run dirs stay per-run).
 4. **ε mechanism split** — how much of the quiet-project saving δ
    already captures; ε's description directs re-measuring after δ lands
    before adding config. Decide in ε.
-5. **η placement** — schema-default grant vs `recon_config_base_dir`
-   relocation. Relocation keeps the Landlock ruleset untouched (smaller
-   blast radius); the schema default documents the contract. Decide in η.
+5. **η placement** — **DECIDED in η (task 4003): neither.** The per-run
+   config dir is granted as a **computed writable extra** per invocation,
+   with containment machine-checked at `resolve_recon_sandbox_wrap`.
+   Both originally-offered options lose on the same axis — cross-run
+   credential write access:
+   - *schema-default grant* — the value would have to be
+     `recon_config_base_dir(data_dir)`, the root under which every run's
+     `claude-config-<run_id>/.credentials.json` lives, so every recon
+     stage would gain write access to every other run's credentials.
+   - *relocation under `<explore_codebase_root>/.task/`* — does not fix
+     that in substance: `.task` is granted as a whole subtree, so all
+     sibling run dirs would still be mutually writable, and it would
+     additionally move OAuth credentials inside the repo checkout and
+     force GC (`gc_run_config_dir`) and harness-sweep path changes.
 
    > **RESOLVED 2026-08-11 — and it was a SECURITY decision, not a
    > tactical one.** This question was framed as a placement trade-off
@@ -521,10 +552,20 @@ nothing new is shared across runs — per-run dirs stay per-run).
   INV-7 (the unbounded `invoke_slot` wait gains its governing bound).
 - ε: INV-4 repair (a cost ceiling enforced against an under-counted
   store is a silent fail-soft).
-- η/C6: INV-3 (the landlock_exec.py comment asserting an unverified
-  grant is corrected at the seam it describes).
+- η/C6: INV-1 `contracts-machine-checked` (a capability envelope — "the
+  per-task `CLAUDE_CONFIG_DIR` is writable" — lived in a prose comment
+  plus an empty-by-default config list, and the mismatch between the two
+  was discovered by failure three weeks late; the containment assertion
+  at `resolve_recon_sandbox_wrap` converts it to an enforced check) and
+  INV-4 `storm-escape-required` (the None-transcript degrade and the
+  cap-retry force-fresh both absorbed the same `PermissionError` with no
+  counter on either path; `note_unreadable_transcript` is the escape).
+  Correcting the `landlock_exec.py` comment does **not** satisfy INV-1 —
+  a corrected comment is still a prose contract, and the whole failure
+  is that a comment cannot notice when it stops being true.
 
-  > **CORRECTION 2026-08-11 — WRONG SLUG.** INV-3
+  > **CORRECTION 2026-08-11 — WRONG SLUG.** This row originally read
+  > `INV-3`; the slugs above are the corrected assignment. INV-3
   > `corroborate-before-acting` governs state read from a
   > snapshot/cache/metadata and then **acted on** without
   > re-corroboration. Nothing ACTS on the stale `landlock_exec.py`
