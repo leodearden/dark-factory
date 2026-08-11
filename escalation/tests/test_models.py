@@ -9,6 +9,7 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     Escalation,
     EvidenceEntry,
+    IndexHealthState,
     TrainState,
 )
 
@@ -325,6 +326,131 @@ class TestEscalationTrainState:
         restored = Escalation.from_json(old_json)
         assert restored.train_state is None, (
             f"Expected train_state=None for legacy JSON, got {restored.train_state!r}"
+        )
+
+
+class TestEscalationIndexHealthField:
+    """Escalation carries a structured index_health payload (task 3709, PRD δ D8+D11).
+
+    A `recon_missing_index` escalation must expose the drifted graph and the
+    missing index specs as FIRST-CLASS FIELDS (INV-2), so no consumer parses
+    `summary`/`detail` prose to recover a fact the emitter had in a variable.
+    These three properties are exactly what the additive zero-migration
+    precedent (`train_state`, `granted_files`) relies on.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base = {
+            'id': 'esc-graph:dark_factory-0001',
+            'task_id': 'graph:dark_factory',
+            'agent_role': 'reconciliation-index-drift',
+            'severity': 'blocking',
+            'category': 'recon_missing_index',
+            'summary': 'graph dark_factory is missing 3 expected indices',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    # --- (a) default is None ---
+
+    def test_index_health_default_is_none(self):
+        """Escalation constructed without index_health has index_health=None."""
+        esc = self._make_base_esc()
+        assert esc.index_health is None
+
+    def test_index_health_default_is_none_in_to_dict(self):
+        """to_dict() surfaces the None default rather than dropping the key."""
+        esc = self._make_base_esc()
+        d = esc.to_dict()
+        assert 'index_health' in d
+        assert d['index_health'] is None
+
+    # --- (b) round-trip with nested lists preserved ---
+
+    def test_index_health_round_trip_via_to_dict_from_dict(self):
+        """index_health payload is preserved through to_dict() / from_dict()."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.index_health == ih
+
+    def test_index_health_round_trip_via_to_json_from_json(self):
+        """index_health survives JSON serialisation with nested lists intact.
+
+        Specs are carried as JSON LISTS (not tuples) precisely so the on-disk
+        record round-trips identically — a tuple would come back as a list and
+        break equality for any consumer that compares payloads.
+        """
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.index_health == ih
+        assert restored.index_health['missing'] == [['Entity', 'NODE', 'name', 'RANGE']]
+        assert restored.to_json() == esc.to_json()
+
+    def test_index_health_appears_in_to_json_output(self):
+        """index_health is serialised (not silently dropped) when set."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE'], ['Episodic', 'NODE', 'uuid', 'RANGE']],
+            'unexpected': [['Entity', 'NODE', 'custom_field', 'RANGE']],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(index_health=ih)
+        d = json.loads(esc.to_json())
+        assert 'index_health' in d
+        assert d['index_health'] == ih
+        assert d['index_health']['group_id'] == 'dark_factory'
+        assert len(d['index_health']['missing']) == 2
+
+    # --- (c) legacy JSON backward compat (zero migration) ---
+
+    def test_from_dict_legacy_json_omits_index_health(self):
+        """from_json() on JSON without index_health returns None (backward compat).
+
+        The `__dataclass_fields__` filter in from_dict is what makes the field
+        additive: pre-3709 records on disk deserialise unchanged, no migration.
+        """
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without index_health',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: index_health is intentionally absent
+        }
+        restored = Escalation.from_json(json.dumps(old_dict))
+        assert restored.index_health is None, (
+            f'Expected index_health=None for legacy JSON, got {restored.index_health!r}'
         )
 
 
