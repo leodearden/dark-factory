@@ -923,13 +923,32 @@ time.sleep(300)
 
 
 def _is_running(pid: int) -> bool:
-    """Return True if *pid* is still alive (os.kill(pid, 0) succeeds)."""
+    """Return True if *pid* is alive AND not a zombie.
+
+    ``os.kill(pid, 0)`` succeeding is not enough: it also returns success for
+    zombies (state 'Z') and for processes that were just SIGKILLed but not
+    yet torn down — both are still visible in /proc even though they have
+    already been killed. SIGKILL delivery, orphan reparenting, and the final
+    reap are all asynchronous, so treating a zombie as "alive" turns this
+    check into a wall-clock race under host load rather than a test of
+    whether reaping actually happened. A zombie has already been killed; its
+    lingering /proc entry just means its parent hasn't called wait() yet.
+    """
     import os
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, OSError):
         return False
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        # Format: "pid (comm) state ...". comm may itself contain ')' or
+        # spaces, so split on the LAST ')' to reliably find the state field.
+        state = stat.rsplit(')', 1)[1].split()[0]
+    except (FileNotFoundError, IndexError, OSError):
+        # Vanished between kill(0) and reading /proc, or /proc unreadable —
+        # either way it is not confirmed running.
+        return False
+    return state != 'Z'
 
 
 def _wait_for_file(path, timeout=10.0, interval=0.1):
@@ -943,7 +962,26 @@ def _wait_for_file(path, timeout=10.0, interval=0.1):
     return False
 
 
-@pytest.mark.timeout(30)
+def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
+    """Poll until every pid in *pids* is dead per :func:`_is_running`.
+
+    Returns whatever pids are still alive once *timeout* expires (empty if
+    all died sooner). Used instead of a fixed sleep so the check only waits
+    as long as the async SIGKILL/reparent/reap sequence actually takes on
+    this host, while still failing loudly if a pid never dies: a genuinely
+    un-reaped ``start_new_session`` escapee keeps sleeping (state 'S'/'R')
+    and will still be in the returned list at the deadline.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    still_alive = [pid for pid in pids if _is_running(pid)]
+    while still_alive and time.monotonic() < deadline:
+        time.sleep(interval)
+        still_alive = [pid for pid in pids if _is_running(pid)]
+    return still_alive
+
+
+@pytest.mark.timeout(60)
 def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     """cancel_request reaps root AND start_new_session-escaped descendants.
 
@@ -986,9 +1024,6 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     # Run cancel_request (uses real /proc walk internally)
     rc = cancel_request(pgid_file_path)
 
-    # Allow a brief window for processes to be reaped
-    time.sleep(0.5)
-
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
@@ -999,8 +1034,12 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     # would incorrectly report root as alive if we don't wait first.
     root_proc.wait(timeout=5)
 
-    # All tracked pids (including start_new_session escapes) must be dead
-    still_alive = [pid for pid in all_pids if _is_running(pid)]
+    # Poll (rather than sleep a fixed amount) until every tracked pid is
+    # confirmed dead. SIGKILL delivery, orphan reparenting to init, and the
+    # final reap are all asynchronous — a fixed sleep races host scheduling
+    # load, while a bounded poll only waits as long as actually needed and
+    # still fails loudly if a pid is never reaped (see _wait_until_all_dead).
+    still_alive = _wait_until_all_dead(all_pids, timeout=5.0)
     assert still_alive == [], (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
         f'{still_alive}'
