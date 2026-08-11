@@ -1,0 +1,271 @@
+"""Deterministic unit tests for ``_orch_helpers.wait_responsive`` (task 3980).
+
+``wait_responsive`` exists because the late-arrival tests in
+test_merge_speculation.py flake under host oversubscription: their
+``asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)`` deadlines are
+charged in WALL CLOCK, so a descheduled xdist worker fails a test whose logic
+completed correctly (measured: green path 4.55s/4.08s/3.79s in isolation,
+observed failing at the 45s and 25s deadlines under load avg 246.59 on 32
+cores -- a >=11x tail).
+
+The fix charges the budget in EVENT-LOOP-RESPONSIVE time instead: each polling
+slice contributes only ``min(observed, slice_s)``, so wall clock the worker
+never got is not billed to the awaited work. The four behaviours pinned here
+are the whole contract:
+
+  (a) a promptly-resolved awaitable returns its value unchanged, fast;
+  (b) a REAL hang on a RESPONSIVE loop still reports red, loudly, by label --
+      the fix must not be able to mask a genuine merge-pipeline deadlock;
+  (c) under simulated starvation the budget stretches automatically, so a wait
+      whose APPARENT wall clock far exceeds ``timeout`` still succeeds -- this
+      is load-independence BY CONSTRUCTION, not a wider deadline;
+  (d) the ``max_wall_s`` cap still terminates a permanently-starved wait, so a
+      stretched wait can never outlive its class ``@pytest.mark.timeout`` and
+      let pytest-timeout's thread method ``os._exit()`` the xdist worker.
+
+Everything here is hermetic and sub-second: no git, no merge worker, tiny
+injected ``timeout``/``slice_s``/``max_wall_s`` values rather than the
+production 45s, and a synthetic monotonic clock for the starvation cases.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from typing import Any
+
+import pytest
+
+import _orch_helpers
+from _orch_helpers import MERGE_RESULT_TIMEOUT, RESPONSIVE_WAIT_WALL_CAP, wait_responsive
+
+# Tiny injected bounds: this whole module must run in ~a second.
+SLICE = 0.02
+BUDGET = 0.5
+WALL_CAP = 15.0
+
+# Starvation factor for the synthetic clock. Deliberately far larger than the
+# ~7.7x oversubscription measured at failure time so cases (c)/(d) carry a wide
+# margin and cannot themselves become load-flaky.
+STARVE = 200.0
+
+
+class _StarvationClock:
+    """Monotonic clock that runs *factor* times faster than real time.
+
+    Simulates a descheduled xdist worker: a nominal ``slice_s`` sleep appears
+    to have consumed ``factor * slice_s``, which is exactly the evidence
+    ``wait_responsive`` must refuse to charge against the budget.
+    """
+
+    def __init__(self, factor: float) -> None:
+        self._factor = factor
+        self._origin = time.monotonic()
+
+    def __call__(self) -> float:
+        return (time.monotonic() - self._origin) * self._factor
+
+
+def _reported(message: str, field: str) -> float:
+    """Extract ``<field>=<number>s`` from a wait_responsive failure message.
+
+    Pins the diagnostic contract: a give-up must report the charged total, the
+    true elapsed wall clock and the implied starvation ratio, so a starved run
+    is self-diagnosing rather than an opaque timeout.
+    """
+    match = re.search(rf'{field}=([0-9.]+)', message)
+    assert match is not None, f'failure message does not report {field}=: {message}'
+    return float(match.group(1))
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveHappyPath:
+    """(a) A promptly-resolved awaitable returns its value, well under budget."""
+
+    async def test_pre_resolved_future_returns_value_unchanged(self) -> None:
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        fut.set_result('sentinel')
+
+        started = time.monotonic()
+        got = await wait_responsive(
+            fut, timeout=BUDGET, label='happy-pre', slice_s=SLICE, max_wall_s=WALL_CAP
+        )
+
+        assert got == 'sentinel'
+        assert time.monotonic() - started < WALL_CAP
+
+    async def test_future_resolved_after_a_few_slices_returns_value(self) -> None:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[int] = loop.create_future()
+        loop.call_later(SLICE * 3, lambda: None if fut.done() else fut.set_result(7))
+
+        got = await wait_responsive(
+            fut, timeout=BUDGET, label='happy-slices', slice_s=SLICE, max_wall_s=WALL_CAP
+        )
+
+        assert got == 7
+
+    async def test_accepts_a_coroutine_and_returns_its_value(self) -> None:
+        async def _work() -> str:
+            await asyncio.sleep(SLICE)
+            return 'from-coro'
+
+        got = await wait_responsive(
+            _work(), timeout=BUDGET, label='happy-coro', slice_s=SLICE, max_wall_s=WALL_CAP
+        )
+
+        assert got == 'from-coro'
+
+    async def test_defaults_derive_from_the_shared_merge_constant(self) -> None:
+        # Never a fresh literal: both bounds derive from MERGE_RESULT_TIMEOUT,
+        # and the cap's ratio of exactly 2 is what makes the worst stretched
+        # per-method budget in test_merge_speculation.py (125s x 2 = 250s)
+        # provably clear HEAVY_BARRIER_TEST_TIMEOUT (300s).
+        assert RESPONSIVE_WAIT_WALL_CAP == 2 * MERGE_RESULT_TIMEOUT
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveRealHangStillReportsRed:
+    """(b) A responsive loop + a never-resolving future must still fail LOUDLY.
+
+    This is the property that keeps the fix honest: charging in responsive time
+    stretches the deadline only when the loop was actually starved. When the
+    loop IS responsive, every slice is charged in full and the guard trips at
+    ~``timeout``, so a genuine merge-pipeline hang cannot be masked into an
+    unbounded wait.
+    """
+
+    async def test_never_resolving_future_fails_naming_the_label(self) -> None:
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+        started = time.monotonic()
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            await wait_responsive(
+                fut,
+                timeout=BUDGET,
+                label='late3-a MergeOutcome',
+                slice_s=SLICE,
+                max_wall_s=WALL_CAP,
+            )
+        elapsed = time.monotonic() - started
+        fut.cancel()
+
+        message = str(excinfo.value)
+        assert 'late3-a MergeOutcome' in message
+        # Gave up on the BUDGET, not on the wall cap -- the charged total
+        # reached ~timeout because the loop was responsive throughout.
+        assert _reported(message, 'charged') >= BUDGET
+        assert _reported(message, 'wall') < WALL_CAP
+        # A real hang is reported promptly, never left to run to the cap.
+        assert elapsed < WALL_CAP
+
+    async def test_give_up_cancels_a_wrapped_coroutine_rather_than_leaking_it(
+        self,
+    ) -> None:
+        cancelled = asyncio.Event()
+
+        async def _never() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(pytest.fail.Exception):
+            await wait_responsive(
+                _never(),
+                timeout=BUDGET,
+                label='leak-check',
+                slice_s=SLICE,
+                max_wall_s=WALL_CAP,
+            )
+
+        await asyncio.sleep(0)
+        assert cancelled.is_set(), (
+            'wait_responsive leaked its wrapper task into pytest-asyncio '
+            'teardown instead of cancelling it on give-up'
+        )
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveIsLoadIndependent:
+    """(c) THE core property: the budget is charged in responsive time.
+
+    With the clock running ``STARVE`` times faster than real time, a wait whose
+    APPARENT elapsed wall clock is orders of magnitude beyond ``timeout`` must
+    still return its value -- a bare ``asyncio.wait_for(timeout=BUDGET)`` on
+    the same clock would have raised TimeoutError long before.
+    """
+
+    async def test_apparent_wall_clock_far_beyond_budget_still_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _StarvationClock(STARVE)
+        monkeypatch.setattr(_orch_helpers, '_monotonic', clock)
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        loop.call_later(SLICE * 5, lambda: None if fut.done() else fut.set_result('late'))
+
+        apparent_start = clock()
+        got = await wait_responsive(
+            fut,
+            timeout=BUDGET,
+            label='starved-but-correct',
+            slice_s=SLICE,
+            max_wall_s=1_000_000.0,
+        )
+        apparent_elapsed = clock() - apparent_start
+
+        assert got == 'late'
+        # The discriminating assertion: apparent wall clock blew far past the
+        # budget, yet the wait survived -- so the budget was NOT charged in
+        # wall-clock terms.
+        assert apparent_elapsed > BUDGET * 10, (
+            f'test did not actually simulate starvation: apparent elapsed '
+            f'{apparent_elapsed}s vs budget {BUDGET}s'
+        )
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveHonoursWallCap:
+    """(d) Permanent starvation + a never-resolving future still terminates.
+
+    Without this cap a stretched wait could outlive its class-level
+    ``@pytest.mark.timeout``; under ``timeout_method = "thread"`` with
+    ``--max-worker-restart=0`` that is an ``os._exit()`` of the xdist worker,
+    i.e. a worker death rather than a clean failure.
+    """
+
+    async def test_permanently_starved_hang_gives_up_at_the_wall_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _StarvationClock(STARVE)
+        monkeypatch.setattr(_orch_helpers, '_monotonic', clock)
+
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        apparent_cap = 20.0
+
+        started = time.monotonic()
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            await wait_responsive(
+                fut,
+                # Budget deliberately unreachable so ONLY the wall cap can
+                # end this wait.
+                timeout=1000.0,
+                label='starved-and-hung',
+                slice_s=SLICE,
+                max_wall_s=apparent_cap,
+            )
+        elapsed = time.monotonic() - started
+        fut.cancel()
+
+        message = str(excinfo.value)
+        assert 'starved-and-hung' in message
+        assert _reported(message, 'wall') >= apparent_cap
+        assert _reported(message, 'charged') < 1000.0
+        # Real time spent is a small multiple of a slice: the cap is reached in
+        # APPARENT time, so this terminates regardless of how starved the host
+        # actually is.
+        assert elapsed < WALL_CAP
