@@ -30,18 +30,45 @@ in-process real-server test there would fail to import or, worse, be
 `importorskip`-ed into a silent skip, reproducing the very green-on-paper
 failure this task exists to close. Adding fastmcp+escalation to `shared`'s
 deps would invert the package dependency direction. Under
-`cd escalation && uv run pytest tests/` both sides import (the `scripts/`
-path inserts live in this directory's conftest.py), and this suite already
-hosts a cross-package client/server lockstep test of exactly this shape
-(`test_capability_guard_http.py`).
+`cd escalation && uv run pytest tests/` both sides import, and this suite
+already hosts a cross-package client/server lockstep test of exactly this
+shape (`test_capability_guard_http.py`).
 """
 
 from __future__ import annotations
 
 import logging
+import sys
+from pathlib import Path
 
-import census
-import pytest
+# --- scoped legibility-scripts path setup (review finding #6, task 3644) ---
+#
+# Deliberately HERE and not in this directory's conftest.py: the legibility
+# scripts dir contributes very generic flat top-level module names (`config`,
+# `inventory`, `sampling`, `digest`, `coder`, `codebook`), and putting those on
+# the path for all ~1080 tests in this suite would shadow any same-named module
+# for every one of them, failing as a confusing wrong-module import rather than
+# an ImportError. This module is the only consumer, so it does its own setup.
+#
+# APPEND, never insert(0, ...): repo and stdlib names must keep winning even
+# once this module has been imported (sys.path edits are process-global and
+# outlive collection of this file).
+#
+# `scripts/` provides the `legibility` PACKAGE (`from legibility import
+# census_trigger`, which census.py itself does); `scripts/legibility/` provides
+# the flat module names (`import census`). The `shared` stub installed by
+# conftest.py is compatible: its `__path__` points at the real
+# `shared/src/shared`, so census.py's `shared.cap_markers` import resolves
+# against real source.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _p in (str(_REPO_ROOT / 'scripts'), str(_REPO_ROOT / 'scripts' / 'legibility')):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+import census  # noqa: E402  — needs the sys.path setup above
+import check_transcript_persistence  # noqa: E402
+import nightly  # noqa: E402
+import pytest  # noqa: E402
 
 _RAISED_MESSAGE = 'codebook merge produced an invalid codebook'
 _PROJECT_ID = 'e2e_census_project'
@@ -182,3 +209,150 @@ def test_default_escalate_fn_returns_the_live_servers_response(
     )
     assert fetched.task_id == f'legibility-census-{_PROJECT_ID}'
     assert fetched.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# The two SIBLING posters, end to end (review finding #4, task 3644)
+# ---------------------------------------------------------------------------
+#
+# `nightly._default_poster` and `check_transcript_persistence._default_poster`
+# carried the identical defect and were rewritten by the same change, but were
+# covered only by `install_fake_httpx` unit tests whose fakes were widened to
+# keep passing -- exactly the test shape this file's docstring names as the
+# reason the bug survived ("nothing ever spoke the real streamable-HTTP
+# protocol to a real escalation server"). Without these, the claim that the
+# trickle and transcript-loss alarms now land rests on a hand-run live probe
+# recorded in a commit message rather than on a repeatable test.
+
+
+def _live_cfg(tmp_path, port):
+    """A LegibilityConfig pointed at the live test server's port."""
+    project_root = tmp_path / 'project'
+    project_root.mkdir()
+    _write_legibility_yaml(project_root, escalation_port=port)
+    return census.config.load_config(
+        project_root / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+
+def test_nightly_trickle_escalation_lands_against_a_live_server(
+    tmp_path, serve_escalation_mcp,
+):
+    """The trickle's fail-loud escalation (extractor crash, coder storm, commit
+    failure) must actually reach the queue over the real transport."""
+    _base_url, port, queue = serve_escalation_mcp(tmp_path / 'queue')
+    cfg = _live_cfg(tmp_path, port)
+
+    landed = nightly.post_escalation(
+        cfg,
+        f'legibility trickle: extractor crashed ({_PROJECT_ID})',
+        'traceback would go here',
+    )
+
+    assert landed is True, 'post_escalation reported failure against a live server'
+
+    pending = queue.get_pending()
+    assert len(pending) == 1, (
+        f'expected exactly one escalation, got {len(pending)}: '
+        f'{[e.id for e in pending]}'
+    )
+    fetched = queue.get(pending[0].id)
+    assert fetched is not None, f'escalation {pending[0].id} is not retrievable by id'
+    assert fetched.task_id == f'legibility-trickle-{_PROJECT_ID}'
+    assert fetched.agent_role == 'legibility-trickle'
+    assert fetched.category == 'infra_issue'
+    assert _PROJECT_ID in fetched.summary
+
+
+def test_transcript_loss_alarm_lands_against_a_live_server(
+    tmp_path, serve_escalation_mcp,
+):
+    """The transcript-loss alarm must actually reach the queue too.
+
+    `post_findings` -- NOT `post_escalation`; this module's escalation
+    entrypoint takes a `Sequence[MissingTranscript]`, so a minimal non-empty
+    findings list is what reaches the POST.
+    """
+    _base_url, port, queue = serve_escalation_mcp(tmp_path / 'queue')
+    cfg = _live_cfg(tmp_path, port)
+
+    finding = check_transcript_persistence.MissingTranscript(
+        session_slug='sess-lost-e2e',
+        cwd=str(tmp_path / 'project'),
+        prompt_prefix='Diagnose the stuck reconciliation.',
+        start_ts='2026-08-10T00:00:00+00:00',
+        exit_code=0,
+        expected_dir=tmp_path / 'projects' / 'enc',
+    )
+
+    landed = check_transcript_persistence.post_findings(cfg, [finding])
+
+    assert landed is True, 'post_findings reported failure against a live server'
+
+    pending = queue.get_pending()
+    assert len(pending) == 1, (
+        f'expected exactly one escalation, got {len(pending)}: '
+        f'{[e.id for e in pending]}'
+    )
+    fetched = queue.get(pending[0].id)
+    assert fetched is not None, f'escalation {pending[0].id} is not retrievable by id'
+    assert fetched.task_id == f'legibility-transcript-check-{_PROJECT_ID}'
+    assert fetched.agent_role == 'legibility-transcript-check'
+    assert fetched.category == 'infra_issue'
+    assert 'sess-lost-e2e' in fetched.detail
+
+
+def test_the_transport_releases_its_session_on_the_real_server(
+    tmp_path, serve_escalation_mcp, monkeypatch,
+):
+    """The session opened by the handshake is really GONE server-side.
+
+    The unit tests can only assert that a DELETE was SENT; and the DELETE is
+    best-effort by design, so a version that sent a request the server
+    rejected would pass them and still leak. `StreamableHTTPSessionManager`
+    keeps every live session in `_server_instances` with its own anyio task
+    until an explicit DELETE, and the escalation server is a long-lived
+    process serving the whole fleet -- so "the server no longer knows this
+    session" is the assertion that actually matters (review finding #2, task
+    3644).
+
+    Proven black-box: re-POST with the SAME session id the transport used and
+    require the server to reject it as unknown.
+    """
+    import httpx
+    from legibility import census_trigger
+
+    base_url, port, _queue = serve_escalation_mcp(tmp_path / 'queue')
+    cfg = _live_cfg(tmp_path, port)
+
+    captured = {}
+    real_terminate = census_trigger._terminate_mcp_session
+
+    def _spy(url, session_headers, *, timeout):
+        captured['headers'] = dict(session_headers)
+        return real_terminate(url, session_headers, timeout=timeout)
+
+    monkeypatch.setattr(census_trigger, '_terminate_mcp_session', _spy)
+
+    assert nightly.post_escalation(cfg, f'summary ({_PROJECT_ID})', 'detail') is True
+
+    session_headers = captured.get('headers') or {}
+    assert session_headers.get('mcp-session-id'), (
+        'the transport handshook but never reached session termination'
+    )
+
+    replayed = httpx.post(
+        f'{base_url}/mcp',
+        json={
+            'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+            'params': {'name': 'escalate_info', 'arguments': {}},
+        },
+        headers=session_headers,
+        timeout=10.0,
+    )
+    assert replayed.status_code == 404, (
+        f'the server still accepts session '
+        f'{session_headers["mcp-session-id"]!r} (HTTP {replayed.status_code}) '
+        f'-- the DELETE did not actually release it, so every legibility '
+        f'escalation still leaks one server-side session: {replayed.text!r}'
+    )

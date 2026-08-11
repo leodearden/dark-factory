@@ -73,30 +73,18 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-# ---------------------------------------------------------------------------
-# Legibility-scripts path injection for the census<->escalation E2E contract
-# test (task 3644).
-# ---------------------------------------------------------------------------
-# `scripts/legibility/census.py` posts its fail-loud escalate_info to a REAL
-# escalation MCP server, and that POST speaks the stateful streamable-HTTP
-# transport (session handshake + SSE-framed responses).  Proving the two sides
-# stay in lockstep needs BOTH the census client and a live `create_server`
-# in one process — and only THIS project env has fastmcp (`shared`, which runs
-# `scripts/tests/`, does not depend on it), so the E2E test lives here.
-#
-# `scripts/` gets the `legibility` package (`from legibility import
-# census_trigger`) and `scripts/legibility/` gets the flat module names
-# (`import census`) — the same two-entry idiom `scripts/tests/conftest.py`
-# uses, mirroring the `_SHARED_SRC` / `_ORCH_SRC` inserts above.  The `shared`
-# STUB installed by the block above is compatible: its `__path__` points at
-# the real `shared/src/shared`, so census.py's own `shared.cap_markers` import
-# resolves against real source rather than the stub's namespace.
-_SCRIPTS = _REPO_ROOT / 'scripts'
-_SCRIPTS_LEGIBILITY = _SCRIPTS / 'legibility'
-if _SCRIPTS_LEGIBILITY.is_dir():
-    for _p in (str(_SCRIPTS), str(_SCRIPTS_LEGIBILITY)):
-        if _p not in sys.path:
-            sys.path.insert(0, _p)
+# NOTE (task 3644, review finding #6): the `scripts/` + `scripts/legibility/`
+# path injection the census<->escalation E2E contract test needs is NOT done
+# here.  It lives in that one test module
+# (`test_legibility_census_escalation_e2e.py`), scoped to its only consumer and
+# APPENDING rather than inserting.  `scripts/legibility/` contributes very
+# generic flat top-level module names — `config.py`, `inventory.py`,
+# `sampling.py`, `digest.py`, `coder.py`, `codebook.py` — and putting those at
+# `sys.path[0]` for all ~1080 tests in this directory would shadow any
+# same-named module for every one of them, with a wrong-module import (not an
+# ImportError) as the failure mode.  The two-entry idiom in
+# `scripts/tests/conftest.py` is fine THERE because every test in that
+# directory needs those modules; here exactly one does.
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd escalation && uv run pytest tests/`, which makes rootdir the
@@ -211,6 +199,15 @@ def serve_escalation_mcp():
     serving thread before ``loop.close()``; and the join is bounded at 5s with
     an assert, so a hang surfaces loudly instead of silently leaking a daemon
     thread past this fixture.
+
+    Two teardown details are load-bearing (review finding #7, task 3644):
+    the ``loop.stop`` is suppressed on ``RuntimeError`` because a server thread
+    that DIED during startup has already run ``loop.close()`` in its own
+    ``finally`` -- stopping a closed loop would then raise out of this
+    fixture's own ``finally`` and MASK the informative "did not become ready"
+    error; and hung threads are COLLECTED rather than asserted in-loop, so one
+    hang cannot abort the teardown of every server started after it and leak
+    exactly the daemon threads the assert exists to prevent.
     """
     import asyncio
     import contextlib
@@ -286,12 +283,24 @@ def serve_escalation_mcp():
     try:
         yield _start
     finally:
+        hung = []
         for loop, thread, state, port in started:
             state['stopping'] = True
-            loop.call_soon_threadsafe(loop.stop)
+            # A thread that died during startup already ran `loop.close()` in
+            # its own `finally`, and stopping a CLOSED loop raises
+            # RuntimeError. Letting that escape here would replace the
+            # fixture's informative "did not become ready ... (server thread
+            # raised: ...)" with a bare "Event loop is closed" from teardown.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5.0)
-            assert not thread.is_alive(), (
-                f'escalation-mcp-http-{port} serving thread did not stop within '
-                'the 5s teardown bound -- event loop stop is hung or the server '
-                'task is stuck in a non-cancellable await (task 2741)'
-            )
+            if thread.is_alive():
+                hung.append(f'escalation-mcp-http-{port}')
+        # Collected, not asserted in-loop: an in-loop assert would abort
+        # teardown of every server started AFTER the first hung one, leaking
+        # precisely the daemon threads this assert exists to prevent.
+        assert not hung, (
+            f'serving thread(s) {hung} did not stop within the 5s teardown '
+            'bound -- event loop stop is hung or the server task is stuck in a '
+            'non-cancellable await (task 2741)'
+        )
