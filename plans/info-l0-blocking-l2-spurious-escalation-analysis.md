@@ -451,3 +451,76 @@ and orthogonal. For open info L0s at end of lifecycle:
    fix the skills regardless of the router decision?
 5. Ticket-pipeline hardening (server_restart flush, refused trap, claim gate
    row-existence check) — in scope for this remediation or separate?
+
+---
+
+# Addendum B (2026-08-11, round 3): rulings executed, L1 history, fictions verified, recovery map
+
+Operator rulings: 307 fix filed as **task 4023** (priority high + scheduler
+boost_tier=critical); disposition router **RATIFIED** (reaper→curator primary
++ steward crash-backstop); skill-fiction fixes verify-then-discuss; ticket
+hardening in scope.
+
+## B1. L1 filing-authority history (operator recollection: REFUTED with a kernel)
+
+The auto-watcher **never** held a filing tool; `_WATCHER_ALLOWED_TOOLS` has
+four all-additive commits. No restriction-for-cause exists anywhere. The
+kernel: the **L1 tier** lost filing on 2026-05-27 when task 1505 moved the
+human watcher (which could file) to L2 and handed L1 to the auto-watcher,
+built 12 days earlier with a deliberately narrow AFK toolset — a loss by tier
+reassignment, unnoticed until **task 3726 (pending, filed by Leo 2026-08-05:
+grant submit_task/resolve_ticket to the auto-watcher)** — the grant is already
+decided, just unimplemented (one dispatch bounced on missing plan-tools MCP).
+Composition with the ratified router: reaper→curator = **coverage**
+(deterministic; runs with no rotation up; but no content judgment, and only
+fires on *orphaned L0s* — 12 of 20 pending L1s today were born at L1);
+L1 filing = **quality + closure** (reads/RCAs the record, one task per root
+cause across a cluster, file-and-close in one rotation). Cautions: the curator
+no longer fails open to create on LLM failure (files a curator_failure L1 —
+feedback edge into the watcher's own queue); a per-rotation cap would be
+prompt-only (allowlist is advisory under --permission-bypass); 3726 collides
+with pending 3465 (both edit the auto-watcher skill).
+
+## B2. Fictions verification (ruling 3: discuss before actioning — NOT yet edited)
+
+| Item | Verdict | Evidence core |
+|---|---|---|
+| auto `cleanup_needed` "tracked in digest" (SKILL.md:390-404) | **FICTION** | digest = the rotation's final chat message; supervisor reads only success/timed_out; allowlist has no write tool; `resume` archives the record. esc-3568-2 promised replay+memory correction — cited ids exist nowhere; esc-2868-2/esc-3088-2 self-document the gap. 12 archived specimens checked. |
+| L2 `design_concern` "create a local task/todo" (:806-815) | **PARTIAL** | Ambiguous TodoWrite-vs-task; omits the write-decision line siblings carry (vs C8 policy). Mitigations: "leave pending" is real tracking; 18 sampled human-present rulings almost always filed/amended real tasks. Hazard = unattended AFK. |
+| L2 `risk_identified` "track as todo" (:817-822) | **PARTIAL** | Same as above; thinner section. |
+| Everything else (full sweep of both skills) | **REAL** | afk-digest.md is a real file; write-decision implemented; amend-fold close conditions checkable; L2 cleanup_needed two-phase pattern correct incl. refused/failed handling. |
+
+No code parses any of these phrases (repo-wide grep) — rewording is safe.
+Proposed changes (pending sign-off): #1 either grant filing (= task 3726) and
+make the handler file-and-close via curator, or reword to state truthfully
+that no durable follow-up exists; #2/#3 replace "local task/todo" with
+explicit submit_task-for-work-items + restate write-decision, TodoWrite as
+in-session convenience only.
+
+## B3. Recovery map
+
+**Reviewer suggestions (lost to the 307 since 05-15):** recoverable from
+`.worktrees/.task-meta/<task_id>/reviews/*.json` (meta-root migration
+`5067b2d230`, 2026-07-06; never reaped — survives worktree deletion).
+Post-07-06 era: **88.5% of 745 done tasks recoverable; 477 tasks hold 1,329
+verbatim suggestion objects, 0 parse errors**. Pre-07-06 era (706 tasks):
+near-total loss (3 recoverable) — reviews lived inside since-deleted
+worktrees. runs.db review events carry `data='{}'`; journal retention ~3d
+(counts only). Server access log confirms the 307 **still firing today**.
+
+**L1-died follow-ups:** escalation archive retention is **30 days**
+(`DEFAULT_RETENTION_DAYS=30`) — everything before ~07-12 permanently pruned.
+In-window: 43 L1-auto-resolved records in the 4 work categories; 36 legitimate
+closes; 2 covered elsewhere; **5 genuine re-file candidates**: esc-2763-2
+(dead legacy plan.lock fallback in task_ground_truth.py — verified still in
+code), esc-2868-2 (one-off reify metadata.files reconcile, 6 tasks,
+"a human should file this"), esc-2834-2 (reify sidecar note, only durable
+copy, relevant later), esc-2608-2 (2 optional git_ops cancellation-reap
+tests), esc-2243-2 (moot). The 12% miss-rate is a *rate*: pre-07-12 losses of
+the same shape are unrecoverable.
+
+**Pending decisions:** (1) backfill the 1,329 recovered suggestions through
+the curator after 4023 lands (spawn_context tag, curator dedup as safety)?
+(2) file which of the 5 re-file candidates? (3) 3726: proceed as the L1 half
+of the ratified combination (and resolve the 3465 collision)? (4) skill edits
+per B2 once signed off.
