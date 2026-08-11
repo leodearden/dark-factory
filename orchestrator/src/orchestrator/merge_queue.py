@@ -6036,7 +6036,20 @@ async def build_chain(
                 # study saw 0/190 real ones), while a non-conflict merge
                 # failure — missing ref, hook rejection — is a genuine fault
                 # ε's telemetry must be able to see separately.
-                truncated_reason = 'conflict' if res.conflicts else 'merge_error'
+                #
+                # Order matters: `already_up_to_date` is ALSO conflicts=False,
+                # so checking it second would swallow it into the fault
+                # bucket.  An already-landed item is BENIGN — its work is
+                # already in the base and it takes its normal sequential path,
+                # where `_is_genuinely_merged` renders the real verdict — so
+                # reporting it as a fault would inflate ε's deep-fail reader
+                # with non-faults and hide the real ones.
+                if res.already_up_to_date:
+                    truncated_reason = 'already_merged'
+                elif res.conflicts:
+                    truncated_reason = 'conflict'
+                else:
+                    truncated_reason = 'merge_error'
                 break
             links.append((req.task_id, res.merge_commit))
             tip = res.merge_commit

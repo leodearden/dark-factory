@@ -1193,10 +1193,15 @@ class ChainResult:
       clean, ``truncated_at`` is ``None``.
     * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
       expected, benign chain outcome), ``'train_request'`` (a
-      :class:`GroupMergeRequest`, which ``_do_train_merge`` owns), or
-      ``'merge_error'`` (a non-conflict merge failure: missing ref, hook
-      rejection — a genuine fault, deliberately NOT collapsed into
-      ``'conflict'``).
+      :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'already_merged'`` (the item's work is ALREADY in the base, so
+      ``git merge --no-ff`` was a no-op — benign: it caps the chain but
+      signals no fault, and the item's real verdict is rendered by the
+      sequential path's ``_is_genuinely_merged`` guard), or ``'merge_error'``
+      (a non-conflict merge failure: missing ref, hook rejection).  **Only
+      ``'merge_error'`` denotes a genuine fault** — the other three are
+      expected outcomes and are deliberately NOT collapsed into it, so ε's
+      deep-fail reader is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
 
     **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome

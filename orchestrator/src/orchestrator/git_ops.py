@@ -816,6 +816,15 @@ class MergeResult:
     merge_commit: str | None = None
     pre_merge_sha: str | None = None
     merge_worktree: Path | None = None
+    # Set ONLY by :meth:`GitOps.merge_branch_into_worktree` (task 3184).
+    # ``success=False`` with ``already_up_to_date=True`` means the merge was a
+    # NO-OP because the source is already an ancestor of the destination —
+    # git printed "Already up to date.", exited 0, and created no commit.
+    # That is NOT a fault: the item's work is already in the base, and the
+    # sequential path's ``_is_genuinely_merged`` renders its real verdict.
+    # ``merge_to_main`` never sets it (its destination is a fresh
+    # ``_merge-<hex8>`` at main HEAD, where the case cannot arise).
+    already_up_to_date: bool = False
 
 
 class WarmBaseHealth(Enum):
@@ -9352,7 +9361,8 @@ class GitOps:
            the raw ``_run`` stdout (with trailing newline) and several callers
            strip defensively (e.g. ``_newest_frozen_commit``).  Stripping at
            the source keeps ``ChainResult.links`` shas clean.
-        4. **No absent-ref fallback.**  ``merge_to_main`` derives a merge
+        4. **No absent-ref fallback** (closes the *self-HEAD* route
+           specifically).  ``merge_to_main`` derives a merge
            source from :meth:`worktree_head_beyond_main` when the named
            ``task/<id>`` ref is missing — but there *worktree* is the TASK
            worktree, a legitimate source holding the task's commits, and the
@@ -9369,6 +9379,27 @@ class GitOps:
            ref is genuinely absent simply caps the chain at that position and
            still lands normally through the sequential path, which keeps its
            own fallback.
+        5. **Already-up-to-date is a FAILURE, not a success**
+           (``success=False, conflicts=False, already_up_to_date=True``).
+           ``git merge --no-ff <ref-already-an-ancestor-of-HEAD>`` prints
+           "Already up to date.", exits **rc 0**, and creates **no commit**.
+           ``merge_to_main`` can return an un-created merge sha because its
+           destination is a fresh ``_merge-<hex8>`` at main HEAD where the case
+           cannot arise; here the destination is a REUSED lane whose HEAD
+           advances with every chain item, so any queued branch already
+           contained in the lane base — or merged earlier in this same chain —
+           hits it.  Reporting success would hand back ``pre_merge_sha`` as
+           this item's merge commit, and ``build_chain`` would record a
+           duplicate-sha link claiming the item landed when no merge commit
+           for it exists; δ would then CAS-advance to a sha already on main.
+           Returning not-success is what keeps ``merge_commit``'s documented
+           "the stripped 40-char merge sha" contract (below) true on every
+           success return.  ``build_chain`` maps it to
+           ``truncated_reason='already_merged'`` — benign, and deliberately
+           distinct from the ``'merge_error'`` fault bucket.  The real verdict
+           for such an item is rendered by the sequential path's
+           ``merge_queue._is_genuinely_merged`` guard, which this method must
+           not pre-empt.
 
         ``merge_worktree`` is populated on EVERY return path (including the
         non-conflict failure arm, where ``merge_to_main`` omits it because it
@@ -9438,9 +9469,31 @@ class GitOps:
             )
 
         _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        post_merge_sha = sha.strip()
+        if post_merge_sha == pre_merge_sha:
+            # rc==0 but NO commit: `merge_source` is already an ancestor of the
+            # lane HEAD, so `git merge --no-ff` was a no-op ("Already up to
+            # date.").  Returning success here would hand back `pre_merge_sha`
+            # as if it were this item's merge commit — see divergence 5.
+            # Nothing was started, so there is nothing to abort: the index is
+            # clean, HEAD is untouched, and the worktree stays immediately
+            # reusable for the next chain item.
+            #
+            # Detected by sha equality rather than by scraping git's "Already
+            # up to date." stdout, which keeps the check locale- and
+            # version-independent.  It cannot misfire on a genuine merge:
+            # `--no-ff` of a non-ancestor ALWAYS creates a commit.
+            return MergeResult(
+                success=False,
+                conflicts=False,
+                already_up_to_date=True,
+                details=f'already up to date: {merge_source}',
+                pre_merge_sha=pre_merge_sha,
+                merge_worktree=worktree,
+            )
         return MergeResult(
             success=True,
-            merge_commit=sha.strip(),
+            merge_commit=post_merge_sha,
             pre_merge_sha=pre_merge_sha,
             merge_worktree=worktree,
         )
