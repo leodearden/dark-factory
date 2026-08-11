@@ -84,6 +84,27 @@ Set `CLAUDE_SPAWN_MODE=sibling` when a session should hand off to a fresh sessio
 - **Fire-and-forget.** `spawn-claude.sh` returns **immediately** once the child is launched, with **no blocking wait** for it to finish — the exit-code contract in [Verification](#verification) does not apply to a sibling spawn's own return code. The child is launched **detached** (`setsid`, its stdio redirected off this script's own output) so it survives the spawner's process exiting. Because of this, sibling handoff pairs best with a launcher that already keeps the window alive independent of the launching client — a daemon-owned emulator (`gnome-terminal`, `konsole`) or the tmux lane (`$CLAUDE_SPAWN_BACKEND=tmux`, Fleet Cockpit C6) — rather than one whose only lifetime is the launching terminal's own session.
 - **The join is not the exit code.** Since there is no blocking wait, a caller cannot join a sibling spawn the way it would a normal one. Read the session-registry record (best-effort refreshed to `running` once launched) and, authoritatively, the child's own [result.md](#result-handback-resultmd) once it writes one.
 
+### What a spawned session inherits
+
+`spawn-claude.sh` unsets the **entire `CLAUDE_SPAWN_*` namespace** inside the payload that execs `claude`, then re-exports only the values it computed for *that* child. A spawned session therefore never carries its own launch parameters forward, and cannot re-serve them to a session it spawns in turn.
+
+Exactly four vars are visible to the spawned session:
+
+| Var | What it is for |
+|-----|----------------|
+| `CLAUDE_SPAWN_SESSION_ID` | The child's own session-registry slug. Its `SessionStart`/`Notification`/`Stop` hooks key their record writes on this, so they converge on the record this spawn already created rather than forking a second one. |
+| `CLAUDE_SPAWN_PARENT_ID` | The child's parent-of-record — the direct spawner, or the shared ancestor in [sibling mode](#sibling-mode-claude_spawn_modesibling). Empty when the child is a root. |
+| `CLAUDE_SPAWN_WM_TITLE` | The exact window-title marker handed to the terminal emulator, so the child's own hook can resolve its live window id via `wmctrl -l`. Set only when a non-empty `<title>` was passed. |
+| `CLAUDE_SPAWN_RESULT_FILE` | Where the child writes its outcome — see [Result-handback](#result-handback-resultmd). |
+
+On a session-registry fault **none** of the four is set. In particular `CLAUDE_SPAWN_RESULT_FILE` is then *absent* rather than pointing at the spawner's own file, so a child can never overwrite its parent's outcome record.
+
+**Everything else is a per-launch INPUT**: `CLAUDE_SPAWN_MODE`, `BACKEND`, `MODEL`, `CLAUDE_ARGS`, `TMUX_SESSION`, `ROLE`, `PROJECT`, `TASK_ID`, `ESCALATION_ID`, and Fleet Cockpit's `SKIP_PERMS`/`SCRIPT`. Each is consumed by the invocation it is passed to and then removed from the child's environment. **Callers must set these explicitly on every spawn** — they no longer propagate transitively to grandchildren the way ambient inheritance used to carry them. Identity is not lost by this: `ROLE`/`PROJECT`/`TASK_ID`/`ESCALATION_ID` are stamped onto the session-registry record by the `launching` write, which happens before and outside the payload, so they remain readable from `record.json`; they simply no longer travel in the environment.
+
+Why the namespace is cleared wholesale rather than by an exemption list: a session launched with `CLAUDE_SPAWN_CLAUDE_ARGS="--resume <its own id>"` (fleet crash-recovery) would otherwise re-serve that flag as apparent caller intent on its next `/spawn`, so a session meant to be a *fresh* sibling came up as a live resume of its spawner (2026-08-11). Any allowlist reintroduces exactly that failure mode for the next var nobody remembers to list.
+
+Callers do not need to scrub the namespace themselves — prefixing an invocation with `env -u CLAUDE_SPAWN_...` is unnecessary, and a caller that sets a var deliberately still has it honoured for that launch.
+
 ## Verification
 
 The background task's completion is a reliable **liveness** signal: it tells you the spawned session's process is gone, present vs. died-silent. As of Attention Rail T5, exit codes are documented as **liveness-only** — they are not, and should not be treated as, the semantic outcome channel. That channel is an explicit file the session writes: see [Result-handback (result.md)](#result-handback-resultmd) below. All codes below are still returned unchanged (nothing here is a breaking change); only their meaning narrows to "was the process alive, and how did it stop," not "did the work succeed." Script-level exit codes the caller should distinguish:
@@ -111,10 +132,10 @@ If you want to confirm the spawned session is alive mid-run, `ps -ef | grep clau
 
 Exit codes (above) only tell you the process is gone and roughly how it stopped — never what happened. The semantic outcome channel is an explicit file the spawned session writes before it ends:
 
-- `spawn-claude.sh` allocates `<record-dir>/result.md` — the same session-registry record directory captured as `SESSION_RECORD_DIR` — and exports its path into the spawned session's own environment as `$CLAUDE_SPAWN_RESULT_FILE`. The identical path is stored in the session-registry record's `result_file` field, so a parent reading the record never has to recompute or guess the path.
+- `spawn-claude.sh` allocates `<record-dir>/result.md` — the same session-registry record directory captured as `SESSION_RECORD_DIR` — and exports its path into the spawned session's own environment as `$CLAUDE_SPAWN_RESULT_FILE`. The identical path is stored in the session-registry record's `result_file` field, so a parent reading the record never has to recompute or guess the path. It is one of the four vars a spawned session may read from its own environment — see [What a spawned session inherits](#what-a-spawned-session-inherits).
 - The prompt handed to the spawned session gets a standard trailer appended, asking it to write — before ending, whether it finishes, hands off, or gets blocked — an `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched), and `action_needed` (what a human or parent should do next) as a small structured markdown header, followed by a few sentences of prose context.
 - This is **best-effort**: nothing in `spawn-claude.sh`, and nothing the trailer asks for, blocks the session's own exit. A parent joining a completed spawn (e.g. escalation-watcher on a `/spawn` background task's completion) should read `record.result_file` (equivalently `<record-dir>/result.md`) for the authoritative outcome, and fall back to exploring the worktree/task only when the file is absent, empty, or unparsable.
-- **Fail-soft, matching the registry's own fail-soft contract:** if the session-registry `launching` write itself faults (missing `python3`, an unwritable fleet root, etc.), `SESSION_RECORD_DIR` is empty and both the env export and the prompt trailer are cleanly skipped — no bogus `/result.md` path is ever exported, referenced, or created. The exit-code contract above is unaffected either way.
+- **Fail-soft, matching the registry's own fail-soft contract:** if the session-registry `launching` write itself faults (missing `python3`, an unwritable fleet root, etc.), `SESSION_RECORD_DIR` is empty and both the env export and the prompt trailer are cleanly skipped — no bogus `/result.md` path is ever exported, referenced, or created. Skipped means **absent**, not inherited: the payload's namespace unset has already run, so a spawner's own `$CLAUDE_SPAWN_RESULT_FILE` cannot survive into the child on this path and be written over. The exit-code contract above is unaffected either way.
 - A future `Stop`/`SessionEnd` hook (Attention Rail T6) may add a fallback stub-write for a session that skips the trailer's instruction, but this protocol does not depend on T6 landing — the prompt trailer plus the session's own best-effort write is already a complete signal, if occasionally missed.
 
 ## Generalized handoff pattern (author→execute, investigate→fix)
