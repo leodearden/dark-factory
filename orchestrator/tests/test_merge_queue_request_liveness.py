@@ -3602,11 +3602,22 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         # ── (1) the request ACTUALLY re-enters the live queue and is
         #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
-        assert gate.calls == 2, (
+        #
+        # task 3927: exact equality (calls == 2) is load-sensitive. Under
+        # host CPU oversubscription, the no-progress watchdog's independent
+        # wall-clock poll can race ahead of the just-redispatched call-2
+        # coroutine actually getting scheduled and fire a SECOND no-progress
+        # abort before call 2 ever runs, inflating the count to 3 (observed:
+        # esc-3609-4) — this is a load-induced extra retry, not the
+        # coalesce-drop bug this assertion actually guards against (which
+        # would show calls == 1). Lower bound (2) still fails on that
+        # coalesce-drop regression; upper bound (5) still fails on a genuine
+        # redispatch-storm regression.
+        assert 2 <= gate.calls <= 5, (
             f'expected the abort to be followed by a genuine RE-DISPATCH '
-            f'(run_scoped_verification called twice), got {gate.calls} call(s) — '
-            f'a single call means the re-queued request was dropped before '
-            f're-dispatch'
+            f'(run_scoped_verification called >=2 times), got {gate.calls} '
+            f'call(s) — a single call means the re-queued request was dropped '
+            f'before re-dispatch, and >5 calls would indicate a redispatch storm'
         )
         drop_warnings = [
             m for m in messages
@@ -3742,9 +3753,15 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
             )
         )
 
-        assert gate.calls == 2, (
+        # task 3927: see the sibling test above for why exact equality is
+        # load-sensitive (a starved no-progress watchdog can add a
+        # load-induced extra retry) — bounded range keeps both the
+        # coalesce-drop guard (lower bound) and the redispatch-storm guard
+        # (upper bound) meaningful.
+        assert 2 <= gate.calls <= 5, (
             f'the abort path must re-dispatch on its own, with no operator '
-            f'intervention; run_scoped_verification saw {gate.calls} call(s)'
+            f'intervention; run_scoped_verification saw {gate.calls} call(s) '
+            f'(expected >=2, and <=5 to still catch a redispatch storm)'
         )
         assert outcome.status == 'done', (
             f'the request must land unaided, got {outcome!r}'
