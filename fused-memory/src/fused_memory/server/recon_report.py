@@ -935,6 +935,29 @@ class ReconReportState:
         handling) and the divergence is surfaced in both the response
         ``warning`` and the logged message.
 
+        One deliberate exception to "mutate nothing": if ``self._active``
+        has NO entry for ``run_id`` at all, the repeat call REPAIRS
+        ``self._active[run_id] = stage`` and persists. ``_resolve_entry``
+        (used by ``add_finding``/``set_stat``/``inc_stat``/``complete``)
+        follows ``_active``, so a run whose pointer was dropped — by
+        :meth:`tick` evicting the active stage (see its docstring, "Remove
+        _active pointer only if it still points at this stage"), or by a
+        :meth:`hydrate_from_store` where no persisted row carried
+        ``is_active``  — would otherwise answer ``run_id_unknown`` on
+        EVERY subsequent call, forever: strictly worse than today's
+        overwrite bug, since there would be no way back in. Adopting the
+        pointer in exactly that case is purely additive (nothing already
+        set is overwritten) and restores usability.
+
+        The pointer is NEVER stolen from a different, currently-active
+        stage of the same run — i.e. the repair only fires when
+        ``self._active.get(run_id) is None``, never when it already names
+        a different stage. Re-pointing at an earlier stage would itself be
+        a corruption channel: a confused agent naming stage 1 while stage
+        2 is live would silently redirect stage 2's findings into stage
+        1's entry and close the wrong stage — the exact cross-stage
+        corruption this guard closes elsewhere.
+
         This guard is keyed solely on ``(run_id, stage)`` PRESENCE in
         ``self._state`` — it deliberately does not (and cannot, without a
         known-stage vocabulary) police a stage name that does not yet exist
@@ -965,6 +988,14 @@ class ReconReportState:
                 project_id,
                 existing.project_id,
             )
+            # Repair-only exception (see docstring): adopt the pointer ONLY
+            # when the run has no active stage at all; never steal it from a
+            # different, currently-active stage. Persist ONLY on this
+            # repair, so a pure no-op repeat still performs zero store
+            # writes.
+            if self._active.get(run_id) is None:
+                self._active[run_id] = stage
+                self._persist_run(run_id)
             return {
                 'run_id': run_id,
                 'stage': stage,
