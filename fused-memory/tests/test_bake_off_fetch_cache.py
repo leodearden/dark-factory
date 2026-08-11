@@ -722,3 +722,304 @@ class TestFetchCacheRefusesAStaleCorpus:
             path, {'c_peers': _seeded('c_peers', records)}, expect_limit=requested,
         )
         assert list(loaded['c_peers']['queries']) == ['q1']
+
+
+# ===========================================================================
+# step-5 — the CLI wiring, exercised WITHOUT a network
+# ===========================================================================
+#
+# The driver is the only part of this script that touches Qdrant or an
+# embedder, so it is the only part the pure tests cannot reach directly.
+# What CAN be reached — and is what actually goes wrong — is its WIRING:
+# whether `--dump-fetches` writes after fetching without perturbing the
+# report, and whether `--replay-fetches` really performs ZERO backend calls
+# rather than merely fewer.
+#
+# The doubles below are a deliberately SLIMMER sibling of the pair in
+# `test_bake_off_storage_shape.py:3261-3460`.  They are duplicated rather
+# than imported because that module is claimed by in-progress task 3560 and
+# `_fm_helpers` is outside this task's file scope; only the surface these
+# assertions actually touch is reproduced.
+
+import asyncio  # noqa: E402
+import copy  # noqa: E402
+import types as _types  # noqa: E402
+
+
+class _FakeConfig(_types.SimpleNamespace):
+    """A config with the leaves the driver reads, plus ``model_copy``."""
+
+    def model_copy(self, *, deep: bool = False) -> _FakeConfig:
+        return copy.deepcopy(self) if deep else copy.copy(self)
+
+
+def _driver_config() -> _FakeConfig:
+    return _FakeConfig(
+        mem0=_types.SimpleNamespace(
+            collection_prefix='fused', qdrant_url='http://localhost:6333',
+        ),
+        embedder=_types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=_types.SimpleNamespace(
+                openai=_types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+        queue=_types.SimpleNamespace(data_dir='./data/queue'),
+    )
+
+
+class _FakeInstance:
+    def __init__(self):
+        self.db = _types.SimpleNamespace(add_history=None)
+
+
+class _FakeMem0:
+    """Records every backend call, which is the whole point on the replay path."""
+
+    def __init__(self):
+        self.added: list[tuple[str, str]] = []
+        self.searches: list[tuple[str, str, int]] = []
+        self.instances: dict[str, _FakeInstance] = {}
+        self._stored: dict[str, list[dict]] = {}
+
+    async def _get_instance(self, scope):
+        return self.instances.setdefault(scope.project_id, _FakeInstance())
+
+    async def add(self, content, scope, metadata=None):
+        await asyncio.sleep(0)
+        bucket = self._stored.setdefault(scope.project_id, [])
+        stored_id = f'{scope.project_id}-{len(bucket):04d}'
+        bucket.append({'id': stored_id, 'memory': content,
+                       'metadata': dict(metadata or {})})
+        self.added.append((scope.project_id, content))
+        return {'results': [{'id': stored_id, 'memory': content, 'event': 'ADD'}]}
+
+    async def search(self, query, scope, limit=10, categories=None):
+        self.searches.append((scope.project_id, query, limit))
+        await asyncio.sleep(0)
+        bucket = self._stored.get(scope.project_id, [])
+        return {'results': [
+            {'id': item['id'], 'memory': item['memory'],
+             'metadata': item['metadata'], 'score': round(0.99 - 0.01 * rank, 4)}
+            for rank, item in enumerate(bucket[:limit])
+        ]}
+
+
+class _FakeMemoryService:
+    instances: list = []
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = _FakeMem0()
+        self.initialized = False
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def close(self):
+        self.closed = True
+
+
+class _DropRecorder:
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def __call__(self, names, **kwargs):
+        self.calls.append(list(names))
+
+    @property
+    def dropped(self) -> set[str]:
+        return {name for call in self.calls for name in call}
+
+
+def _install_driver_doubles(monkeypatch):
+    """Patch the three seams the driver reaches through, at their source.
+
+    The driver imports ``FusedMemoryConfig`` and ``MemoryService``
+    function-locally, so patching the DEFINING module (never a name already
+    bound into this script) is what actually intercepts them.
+    ``drop_collections`` is patched on the script itself because it is the
+    script's own qdrant seam.
+    """
+    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+    _FakeMemoryService.instances = []
+    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _driver_config)
+    monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+    drops = _DropRecorder()
+    monkeypatch.setattr(_mod(), 'drop_collections', drops)
+    return drops
+
+
+def _argv(tmp_path, name: str, *extra: str) -> list[str]:
+    """A small run, with BOTH artifacts pointed at throwaway paths.
+
+    `--json-out`/`--md-out` default to `plans/e2-storage-shape-bakeoff-report.*`
+    — the committed artifact that in-progress task 3560 owns.  A test that let
+    them default would rewrite it on every run.
+    """
+    return [
+        '--clusters', '2', '--distractors', '12',
+        '--project-suffix', f'utest_{name}',
+        '--json-out', str(tmp_path / f'{name}.json'),
+        '--md-out', str(tmp_path / f'{name}.md'),
+        *extra,
+    ]
+
+
+class TestFetchCacheCliDefaults:
+    """Both flags default to None, so `TestBuildParser` in the E2 module —
+    which asserts defaults BY ATTRIBUTE, not flag-set exhaustiveness — keeps
+    passing untouched, and an unflagged run behaves exactly as before."""
+
+    def test_both_flags_default_to_none(self):
+        args = _mod().build_parser().parse_args([])
+        assert args.dump_fetches is None
+        assert args.replay_fetches is None
+
+    def test_dump_and_replay_together_is_rejected_by_name(self, tmp_path, capsys):
+        """Silently preferring one would make the run's provenance a coin
+        flip: the operator cannot tell from the artifact whether the numbers
+        were measured or replayed."""
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        code = mod.main(_argv(
+            tmp_path, 'both',
+            '--dump-fetches', str(cache), '--replay-fetches', str(cache),
+        ))
+        assert code != 0
+        combined = capsys.readouterr()
+        message = combined.err + combined.out
+        assert '--dump-fetches' in message
+        assert '--replay-fetches' in message
+
+
+class TestDumpFetchesFlag:
+    """`--dump-fetches` is additive: it writes the cache and changes nothing."""
+
+    def test_a_dumping_run_writes_the_cache_and_the_identical_report(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'plain')) == 0
+        plain = json.loads((tmp_path / 'plain.json').read_text(encoding='utf-8'))
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'dumped', '--dump-fetches', str(cache),
+        )) == 0
+        dumped = json.loads((tmp_path / 'dumped.json').read_text(encoding='utf-8'))
+
+        assert cache.exists()
+        # The measurement is untouched by the act of recording it.
+        assert dumped['arms'] == plain['arms']
+        assert dumped['audit_recall'] == plain['audit_recall']
+
+    def test_the_dump_covers_every_shape_and_carries_its_fingerprint(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'dumped', '--dump-fetches', str(cache),
+        )) == 0
+
+        doc = json.loads(cache.read_text(encoding='utf-8'))
+        assert set(doc['arms']) == set(mod.ARM_SHAPES)
+        assert set(doc['provenance']['corpus_fingerprints']) == set(mod.ARM_SHAPES)
+        # The live-only values, taken from the run rather than defaulted.
+        assert doc['provenance']['embedder_model'] == 'text-embedding-3-small'
+        assert doc['provenance']['search_limit'] == mod.DEFAULT_SEARCH_LIMIT
+        assert isinstance(doc['provenance']['guard_threshold'], float)
+
+
+class TestReplayFetchesFlag:
+    """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
+
+    def _dump_then_replay(self, mod, tmp_path, monkeypatch):
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
+
+        drops = _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 0
+        replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
+        return live, replayed, drops
+
+    def test_a_replayed_run_makes_zero_backend_calls(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _mod()
+        _, _, drops = self._dump_then_replay(mod, tmp_path, monkeypatch)
+
+        # No MemoryService was even CONSTRUCTED — so no durable write queue
+        # was recovered, no config was deep-copied and repointed, and no
+        # embedder was resolved.
+        assert _FakeMemoryService.instances == []
+        # And no collection was created or dropped: a replay that reaped
+        # collections could destroy a concurrent live run's arms.
+        assert drops.calls == []
+
+    def test_the_replayed_measurement_is_identical_to_the_live_one(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _mod()
+        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+
+        assert replayed['arms'] == live['arms']
+        assert replayed['audit_recall'] == live['audit_recall']
+        for key in ('token_estimator', 'guard_threshold', 'embedder_model',
+                    'search_limit', 'distractor_slab_size', 'clusters_measured',
+                    'queries_measured', 'guard_probes_measured', 'fixtures'):
+            assert replayed['protocol'][key] == live['protocol'][key], key
+
+    def test_the_replayed_report_discloses_that_it_was_replayed(
+        self, tmp_path, monkeypatch,
+    ):
+        """The ONE way a replayed report must differ from a live one.
+
+        Every measured cell is identical — that is the point of the cache —
+        so nothing in the arms can tell a reader which they are holding. The
+        protocol block therefore says so outright, and `collections` is empty
+        because a replay created none: reporting the names it *would* have
+        used would be exactly the kind of unmeasured number this task forbids.
+        """
+        mod = _mod()
+        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+
+        assert live['protocol']['replayed_from'] is None
+        assert live['protocol']['collections']
+
+        assert replayed['protocol']['replayed_from'] == str(tmp_path / 'cache.json')
+        assert replayed['protocol']['collections'] == []
+
+    def test_a_replay_against_drifted_fixtures_exits_nonzero(
+        self, tmp_path, monkeypatch,
+    ):
+        """The refusal has to survive the CLI, not just the loader: a stale
+        cache that exits 0 has published a stale ranking as a measurement."""
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        doc = json.loads(cache.read_text(encoding='utf-8'))
+        doc['provenance']['corpus_fingerprints']['c_peers'] = 'deadbeef' * 8
+        cache.write_text(json.dumps(doc), encoding='utf-8')
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) != 0
+        # And NO artifact was written from the refused run.
+        assert not (tmp_path / 'replay.json').exists()
