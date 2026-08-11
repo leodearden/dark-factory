@@ -107,7 +107,9 @@ Phase enum everywhere: `prd | decompose | architect | implement | verify | revie
 
 ### 7.2 Digest (extractor output)
 
-One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt), self-corrections with context, retry loops. Soft cap 15KB (truncate lowest-signal sections last).
+One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, n_user_turns, truncated_items, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt), self-corrections with context, retry loops. Soft cap 15KB (truncate lowest-signal sections last).
+
+`n_user_turns` makes `score` reconstructible from the frontmatter alone — it is the count behind the score's dominant `user_turn`-weighted component, which `signal_counts` (the five *detector hit-counts*) does not and should not carry. `truncated_items` reports how many rendered items in the *shipped* body were byte-capped, so a reader weighing the digest can see that substance was dropped rather than inferring it from a marker buried in the body. Both were added by the 2026-07-31 confusion census (R2 and R1 respectively, discharging its §3.4 finding that rendered surfaces omit their own basis).
 
 ### 7.3 Coding record (coder output → merger input)
 
