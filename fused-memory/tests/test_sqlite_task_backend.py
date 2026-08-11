@@ -5900,6 +5900,16 @@ def test_resolve_metadata_mode_merge_plus_append_true_raises():
     # lives in the source message and the _resolve_metadata_mode docstring.
 
 
+def test_resolve_metadata_mode_merge_plus_append_true_no_metadata_ok():
+    """metadata_mode='merge' + append=True with metadata_present=False (a
+    details-only write, no metadata) is NOT rejected — the task-3581 guard is
+    scoped to metadata-present writes exactly like the task-2180 one. With no
+    metadata there is nothing to clobber and ``append`` is independently driving
+    the details-append path, so the pair is not contradictory. Returns 'merge'
+    (unused by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode('merge', True, metadata_present=False) == 'merge'
+
+
 def test_resolve_metadata_mode_append_false_cosignal_replace():
     """An explicit metadata_mode='replace' co-signal alongside append=False is
     honored (still resolves to 'replace') — the sanctioned way to confirm a
@@ -6297,6 +6307,32 @@ async def test_update_task_explicit_merge_without_append_still_shallow(
     # ...while untouched top-level siblings survive (that is what 'merge' means).
     assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
     assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_only_merge_plus_append_true_ok(backend, project_root):
+    """A details-only merge+append=True write (NO metadata) is NOT rejected —
+    the task-3581 guard is scoped to metadata-present writes, so the
+    details-append path stays green even when an inert metadata_mode='merge'
+    rides along. append=True appends to details rather than replacing it."""
+    await backend.add_task(
+        project_root=project_root, title='t', details='old',
+        metadata=json.dumps({'_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='new', metadata_mode='merge', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'new' in task['details'], (
+        f'details-only append=True should append: {task["details"]!r}'
+    )
+    assert 'old' in task['details'], (
+        f'details-only append=True must not replace: {task["details"]!r}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'a details-only write must not disturb metadata: {task["metadata"]}'
+    )
 
 
 @pytest.mark.asyncio

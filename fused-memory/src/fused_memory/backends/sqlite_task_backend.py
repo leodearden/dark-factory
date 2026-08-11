@@ -3270,9 +3270,12 @@ def _resolve_metadata_mode(
        so the pair asks for two incompatible resolutions of the same
        write, and silently picking 'merge' shallow-overwrote nested keys
        (a whole ``memory_hints`` blob, authored ``entities``/``queries``
-       and all, replaced by an incoming stub). The other explicit/append
-       combinations are unchanged: ``('replace', True)`` stays honored (the
-       sanctioned destructive co-signal rule 2 points callers at) and
+       and all, replaced by an incoming stub). Like the rule-2 rejection
+       below this is scoped to ``metadata_present`` writes — with no
+       metadata there is nothing to clobber and ``append`` is driving the
+       details-append path instead. The other explicit/append combinations
+       are unchanged: ``('replace', True)`` stays honored (the sanctioned
+       destructive co-signal rule 2 points callers at) and
        ``('additive', False)`` stays 'additive'.
     2. ``append`` legacy shim — True → 'additive'. A bare ``append=False``
        (no explicit ``metadata_mode``) is **rejected** when
@@ -3302,11 +3305,19 @@ def _resolve_metadata_mode(
                 f"Invalid metadata_mode {metadata_mode!r}; "
                 f"must be one of {sorted(_METADATA_MODES)}.",
             )
-        if metadata_mode == 'merge' and append is True:
+        if metadata_mode == 'merge' and append is True and metadata_present:
             # Contradiction: 'merge' is shallow last-write-wins while
             # append=True means 'additive' (recursive union). Silently
             # honoring 'merge' clobbered nested metadata wholesale — the
             # task-3581 / DF-3260 memory_hints clobber.
+            #
+            # Scoped to metadata-present writes, exactly like the task-2180
+            # guard below: with no metadata there is nothing to merge, so
+            # metadata_mode is inert and ``append`` means something else
+            # entirely (it independently drives the details/prompt-append
+            # path). A details-only update_task(details=..., append=True)
+            # that happens to also carry metadata_mode='merge' is not
+            # contradictory and must NOT be rejected.
             raise TaskmasterError(
                 'TASKMASTER_TOOL_ERROR',
                 "Refusing a contradictory metadata_mode='merge' + append=True "
