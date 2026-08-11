@@ -344,10 +344,36 @@ q_sentinel=$(printf %q "$sentinel")
 # UNCONDITIONALLY — a plain literal, deliberately NOT a SESSION_RECORD_DIR-
 # gated *_export var — so persistence holds even on registry-fault fail-soft
 # paths. See the 2026-07-22 /deb RCA (session 15de5e77) and task 2893.
+#
+# sanitize_env (task 4015): strip the ENTIRE inherited CLAUDE_SPAWN_*
+# namespace from the environment the payload execs claude with, so a spawned
+# session can never re-consume its own launch parameters. Single-quoted here
+# so the OUTER shell stores it literally and only the payload shell evaluates
+# `${!CLAUDE_SPAWN_@}` -- against the CHILD's environment, not this one.
+#
+# ORDERING IS THE WHOLE CONTRACT, in both directions:
+#   - This invocation's inputs are ALREADY fully consumed by the time $inner
+#     is built -- $flags baked above (CLAUDE_SPAWN_MODEL/CLAUDE_ARGS),
+#     spawn_mode read near the top, the `python3 ... launching` identity
+#     write (ROLE/PROJECT/TASK_ID/ESCALATION_ID) long since done in its own
+#     subprocess -- so the unset can never disturb them. Deliberate inputs
+#     still reach the direct child's argv exactly as before; what changes is
+#     only that they no longer travel onward in its ENVIRONMENT.
+#   - It must precede the four re-exports below, or it would erase the very
+#     per-child values being handed over.
+# Kept to ONE logical line: the mac-terminal branch writes $inner into a
+# tmpscript via printf '#!/usr/bin/env bash\n%s\n', so an embedded newline
+# would corrupt that path.
+#
+# Placing it INSIDE $inner -- not in this launcher process -- is what makes
+# it hold for every backend, including daemon-owned emulators
+# (gnome-terminal-server) that never inherit this script's own environment.
+sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
+
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
