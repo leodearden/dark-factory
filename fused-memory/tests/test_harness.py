@@ -15192,6 +15192,110 @@ async def test_finding_persistence_count_journal_failure_fails_toward_escalate(
     )
 
 
+class TestFullCycleWiringIndexHealth:
+    """run_full_cycle must reach the index drift detector and thread its record.
+
+    This pins the recon-cadence half of Q3.  Without it a wiring regression
+    would silently revert index drift to invisible — exactly the four-month
+    silent failure this PRD exists to end — while every unit test still passed.
+
+    step-15 (RED): run_full_cycle never calls the detector and
+        _configure_consolidator has no index_health parameter, so the class
+        default None survives to run() time.
+    step-16 (GREEN): call _detect_index_drift in run_full_cycle and thread it
+        through _configure_consolidator.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_index_health_into_stage1(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A full cycle reaches the detector and its record arrives at Stage 1."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected - {dropped})
+        )
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        await harness.run_full_cycle(
+            'test-project',
+            'index-health-wiring-test',
+            events=[_make_event()],
+        )
+
+        assert captured, (
+            'MemoryConsolidator.run() was never invoked — run_full_cycle '
+            'skipped it or the stage list changed'
+        )
+
+        ih = captured.get('index_health')
+        assert ih is not None, (
+            'MemoryConsolidator.index_health is None — run_full_cycle must call '
+            '_detect_index_drift and pass index_health= to _configure_consolidator '
+            'at the production call site'
+        )
+        assert ih['healthy'] is False, (
+            f'Expected the mocked drifted graph to report unhealthy, got {ih!r}'
+        )
+        assert ih['missing'] == [dropped]
+        assert ih['expected_total'] == len(expected)
+
+    @pytest.mark.asyncio
+    async def test_healthy_graph_still_threads_a_record(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The HEALTHY record reaches Stage 1 too — ζ reads it to verify activation."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected_index_set())
+        )
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        await harness.run_full_cycle(
+            'test-project',
+            'index-health-wiring-healthy',
+            events=[_make_event()],
+        )
+
+        ih = captured.get('index_health')
+        assert ih is not None and ih['healthy'] is True
+
+
 # ---------------------------------------------------------------------------
 # _maybe_escalate_stale_task_count_snapshot — task 2278 step-9/10
 # ---------------------------------------------------------------------------
