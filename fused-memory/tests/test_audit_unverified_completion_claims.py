@@ -50,6 +50,8 @@ Finding = _mod.Finding
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
 CAVEATS = _mod.CAVEATS
+_build_parser = _mod._build_parser
+RO_COMMAND = _mod.RO_COMMAND
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -523,3 +525,77 @@ class TestBuildReport:
         assert report['summary']['mismatch'] == 0
         assert report['summary']['unverifiable'] == 0
         assert report['truncated_by'] is None
+
+
+class TestReadOnlyByConstruction:
+    """The scope note, turned into a test.
+
+    "read-only report first; do NOT auto-delete or auto-invalidate edges on a
+    regex verdict" — asserted mechanically so it survives a later editor who
+    never reads the task description. audit_duplicate_memories.py and
+    invalidate_fabricated_shipping_edges.py both HAVE an --apply; this script
+    deliberately has none, and the ABSENCE is what must be asserted.
+    """
+
+    #: Any option whose dest or option string contains one of these is a
+    #: mutation affordance this script must never grow.
+    FORBIDDEN = ('apply', 'invalidate', 'delete', 'repair', 'fix', 'write', 'mutate')
+
+    def test_parser_exposes_no_mutation_option(self) -> None:
+        parser = _build_parser()
+        offenders = []
+        for action in parser._actions:
+            names = [str(action.dest or '')] + [str(s) for s in action.option_strings]
+            for name in names:
+                lowered = name.lower()
+                if any(word in lowered for word in self.FORBIDDEN):
+                    offenders.append(name)
+        assert offenders == [], f'mutation affordance(s) present: {offenders}'
+
+    def test_ro_command_is_the_only_falkordb_command(self) -> None:
+        assert RO_COMMAND == 'GRAPH.RO_QUERY'
+        source = SCRIPT_PATH.read_text()
+        assert 'GRAPH.QUERY' not in source
+        assert source.count("'GRAPH.RO_QUERY'") == 1
+
+    def test_source_contains_no_mutation_call(self) -> None:
+        source = SCRIPT_PATH.read_text()
+        for symbol in (
+            'update_edge',
+            'delete_episode',
+            'bulk_remove_edges',
+            'remove_edge',
+            'delete_entity',
+            'add_memory(',
+            'add_episode(',
+        ):
+            assert symbol not in source, f'mutation call present: {symbol}'
+
+    def test_no_cypher_write_keyword_in_any_query_constant(self) -> None:
+        cypher_constants = [
+            value
+            for name, value in vars(_mod).items()
+            if name.endswith('_CYPHER') and isinstance(value, str)
+        ]
+        assert cypher_constants, 'expected at least one *_CYPHER constant'
+        for query in cypher_constants:
+            upper = query.upper()
+            for keyword in ('CREATE', 'MERGE', 'SET ', 'DELETE', 'REMOVE'):
+                assert keyword not in upper, f'write keyword {keyword!r} in {query!r}'
+
+    def test_project_is_repeatable(self) -> None:
+        """esc-3085-1's two instances were written by reify agents about work in
+        two different trees, so a single-project sweep would have missed half
+        the incident."""
+        parser = _build_parser()
+        args = parser.parse_args(['--project', 'dark_factory', '--project', 'reify'])
+        assert args.project == ['dark_factory', 'reify']
+
+    def test_volume_and_gate_flags_exist(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(['--include-unverifiable', '--fail-on-mismatch'])
+        assert args.include_unverifiable is True
+        assert args.fail_on_mismatch is True
+        defaults = parser.parse_args([])
+        assert defaults.include_unverifiable is False
+        assert defaults.fail_on_mismatch is False
