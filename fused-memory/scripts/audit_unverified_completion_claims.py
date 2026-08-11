@@ -54,8 +54,14 @@ Exit codes: ``0`` ran, ``1`` infra failure (nothing printed), ``2``
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from fused_memory.models.enums import MemoryCategory
+from fused_memory.services.completion_claim_gate import (
+    CompletionClaim,
+    extract_completion_claims,
+)
 
 # --------------------------------------------------------------------------- #
 # Category recovery from source_description
@@ -128,3 +134,94 @@ off a field: Graphiti persists no ``category`` property on Episodic nodes,
 Entity nodes, or RELATES_TO edges, and ``MemoryService._search_graphiti``
 hardcodes ``category=None`` (:3521) when it reads them back.
 """
+
+
+# --------------------------------------------------------------------------- #
+# The corpus projection + the scan (pure — no I/O, no store, no network)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusRecord:
+    """The closed projection of a swept record.
+
+    Mirrors ``build_corpus.EpisodeRecord``'s discipline: the dataclass IS the
+    statement of what this sweep is allowed to read. Nothing outside these
+    fields is projected out of the store, so a reviewer can bound the read from
+    the type alone.
+
+    Attributes:
+        uuid: The Graphiti node uuid.
+        kind: Always ``'episode'`` — the sweep is episode-primary (only
+            Episodic nodes carry the category this task scopes to).
+        text: The episode ``content`` — the exact string the write-time gate
+            consumes at server/tools.py:2793.
+        source_description: The raw description, kept verbatim so a reader can
+            re-derive ``category`` without re-running the sweep.
+        category: The recovered category, or ``None`` when uncategorized.
+        project_id: The graph the record was read from (Graphiti ``group_id``).
+        created_at: Write timestamp, as the store reports it.
+        name: The episode name.
+    """
+
+    uuid: str
+    kind: str
+    text: str
+    source_description: str
+    category: str | None
+    project_id: str
+    created_at: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedRecord:
+    """A :class:`CorpusRecord` paired with the claims found in its text."""
+
+    record: CorpusRecord
+    claims: tuple[CompletionClaim, ...]
+
+
+def scan_records(
+    records: Iterable[CorpusRecord],
+    *,
+    default_project_id: str,
+    known_project_ids: frozenset[str] | set[str],
+    categories: frozenset[str] = IN_SCOPE_CATEGORIES,
+) -> list[ScannedRecord]:
+    """Run the IMPORTED extractor over every in-scope record that makes a claim.
+
+    Records outside *categories* are skipped, and records yielding no claims are
+    dropped entirely — this is a report of problems, so a record with nothing to
+    say does not appear.
+
+    The extractor comes from
+    :mod:`fused_memory.services.completion_claim_gate`; this module contributes
+    NO detection regex of its own. Re-deriving the negation/aspirational
+    strippers would leave a third drifting copy of the one thing that keeps
+    "has not yet landed" from reading as a completion (that module's docstring,
+    :20-26).
+
+    Returns results sorted by ``(category, created_at, uuid)`` so two runs over
+    the same corpus produce byte-identical output regardless of the order the
+    store happened to return rows in.
+
+    Pure: no I/O, no store, no network.
+    """
+    scanned: list[ScannedRecord] = []
+    for record in records:
+        if record.category not in categories:
+            continue
+        claims = extract_completion_claims(
+            record.text,
+            default_project_id=record.project_id or default_project_id,
+            known_project_ids=known_project_ids,
+        )
+        if not claims:
+            continue
+        scanned.append(ScannedRecord(record=record, claims=tuple(claims)))
+
+    scanned.sort(
+        key=lambda s: (s.record.category or '', s.record.created_at, s.record.uuid)
+    )
+    return scanned
