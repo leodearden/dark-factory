@@ -5994,8 +5994,33 @@ async def build_chain(
     links: list[tuple[str, str]] = []
     # `tip` starts at the base so a zero-link result still names a verifiable tip.
     tip = head_merge_commit
+    truncated_at: str | None = None
+    truncated_reason: str | None = None
     try:
         for req in queue_snapshot[:depth]:
+            # ── DO NOT EMIT AN OUTCOME FOR `truncated_at` ────────────────
+            # PRD decision #4: item j may conflict only with an *unlanded*
+            # predecessor, so it takes its normal sequential path later and
+            # its verdict is not ours to render.  Firing
+            # `_emit_merge_attempt` / `_note_conflict_detected` /
+            # `set_result` here would also produce a deterministic reason
+            # string on EVERY round, hence an identical
+            # `merge_outcome_signature` round after round, which trips
+            # workflow.py's `consecutive_merge_thrash` ladder into a
+            # false-positive human escalation — the same failure class as
+            # MergeVerifyLeaseContended, documented in
+            # merge_liveness._acquire_warm_verify_worktree's Raises section.
+            # Truncation is recorded in the returned ChainResult and nowhere
+            # else.
+            if isinstance(req, GroupMergeRequest):
+                # A train carries `tip_branch` + `member_task_ids` + member
+                # callbacks and is landed by `_do_train_merge`; chaining it
+                # as a plain item would land a train without its member
+                # bookkeeping.  Truncate rather than skip past it — see the
+                # contiguous-prefix note below.
+                truncated_at = req.task_id
+                truncated_reason = 'train_request'
+                break
             # bare_id so merge_branch_into_worktree's resolve_queued_branch_ref /
             # branch_prefix handling matches the sequential path exactly.
             res = await git_ops.merge_branch_into_worktree(lane, req.branch.bare_id)
@@ -6004,7 +6029,14 @@ async def build_chain(
                 # later ones: the chain must be a contiguous PREFIX of the
                 # queue, because δ lands `links` in order through the existing
                 # CAS advance and a hole would break the in-order /
-                # frozen-prefix invariant. (step-16 adds reason classification.)
+                # frozen-prefix invariant.
+                truncated_at = req.task_id
+                # Deliberately NOT collapsed into one reason: a textual
+                # conflict is an expected, benign chain outcome (the replay
+                # study saw 0/190 real ones), while a non-conflict merge
+                # failure — missing ref, hook rejection — is a genuine fault
+                # ε's telemetry must be able to see separately.
+                truncated_reason = 'conflict' if res.conflicts else 'merge_error'
                 break
             links.append((req.task_id, res.merge_commit))
             tip = res.merge_commit
@@ -6018,14 +6050,21 @@ async def build_chain(
         # An empty result never holds a lane, so a caller that skips the
         # release on the empty path cannot leak one.
         await release_chain_build_lane(git_ops, lane, warm=warm)
-        return ChainResult(links=[], tip=tip)
+        return ChainResult(
+            links=[], tip=tip,
+            truncated_at=truncated_at, truncated_reason=truncated_reason,
+        )
 
     # One line per chain build, not per item — this runs on the dispatch path.
     logger.info(
-        'build_chain: depth=%d built=%d tip=%s lane=%s',
-        depth, len(links), tip[:8], lane.name,
+        'build_chain: depth=%d built=%d tip=%s truncated_at=%s lane=%s',
+        depth, len(links), tip[:8], truncated_at, lane.name,
     )
-    return ChainResult(links=links, tip=tip, lane=lane, lane_warm=warm)
+    return ChainResult(
+        links=links, tip=tip,
+        truncated_at=truncated_at, truncated_reason=truncated_reason,
+        lane=lane, lane_warm=warm,
+    )
 
 
 async def _journal_landed_then_advance(

@@ -9326,13 +9326,12 @@ class GitOps:
         The chain-builder twin of :meth:`merge_to_main`.  Same merge semantics
         — same ``git merge --no-ff``, same :func:`_merge_subject` (so
         ``find_merge_marker`` idempotency is preserved), same
-        :meth:`resolve_queued_branch_ref` + :meth:`worktree_head_beyond_main`
-        source derivation, same :class:`MergeResult` return type — but the
-        worktree comes from the caller.  Used by
-        :func:`orchestrator.merge_queue.build_chain` to merge k queued items
-        sequentially into ONE scratch lane.
+        :meth:`resolve_queued_branch_ref` source resolution, same
+        :class:`MergeResult` return type — but the worktree comes from the
+        caller.  Used by :func:`orchestrator.merge_queue.build_chain` to merge
+        k queued items sequentially into ONE scratch lane.
 
-        Three deliberate divergences from :meth:`merge_to_main`:
+        Four deliberate divergences from :meth:`merge_to_main`:
 
         1. **Never provisions or removes a worktree.**  No
            :meth:`_create_merge_worktree`, no :meth:`cleanup_merge_worktree` —
@@ -9353,6 +9352,23 @@ class GitOps:
            the raw ``_run`` stdout (with trailing newline) and several callers
            strip defensively (e.g. ``_newest_frozen_commit``).  Stripping at
            the source keeps ``ChainResult.links`` shas clean.
+        4. **No absent-ref fallback.**  ``merge_to_main`` derives a merge
+           source from :meth:`worktree_head_beyond_main` when the named
+           ``task/<id>`` ref is missing — but there *worktree* is the TASK
+           worktree, a legitimate source holding the task's commits, and the
+           merge DESTINATION is a separate freshly-created ``_merge-<hex8>``.
+           Here the two collapse into one argument: *worktree* is the
+           destination lane.  Mid-chain that lane's HEAD is beyond main, so
+           the same fallback would resolve the merge source to the lane's own
+           HEAD, ``git merge --no-ff <own HEAD>`` would report "Already up to
+           date" with rc 0, and the caller would record a duplicate-sha link
+           claiming the item landed when none of its work is present — a
+           silent wrong result.  An unresolvable ref therefore falls straight
+           through to *full_branch* and fails loudly, which ``build_chain``
+           reports as ``truncated_reason='merge_error'``.  A queued item whose
+           ref is genuinely absent simply caps the chain at that position and
+           still lands normally through the sequential path, which keeps its
+           own fallback.
 
         ``merge_worktree`` is populated on EVERY return path (including the
         non-conflict failure arm, where ``merge_to_main`` omits it because it
@@ -9382,15 +9398,11 @@ class GitOps:
         resolved = await self.resolve_queued_branch_ref(branch)
         full_branch = resolved or f'{self.config.branch_prefix}{branch}'
 
-        # Same source derivation as merge_to_main: prefer the named ref; when
-        # absent fall back to the worktree HEAD via the shared helper; when
-        # that too is unavailable fall back to full_branch so git fails loudly
-        # with "not something we can merge" (preserving the misroute signal).
-        _head_sha = (
-            None if resolved is not None
-            else await self.worktree_head_beyond_main(worktree)
-        )
-        merge_source: str = resolved or _head_sha or full_branch
+        # NO absent-ref fallback here — see divergence 4 in the docstring.
+        # An unresolvable ref falls through to full_branch so git fails
+        # loudly with "not something we can merge", which build_chain
+        # classifies as truncated_reason='merge_error'.
+        merge_source: str = resolved or full_branch
 
         _, pre, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         pre_merge_sha = pre.strip()

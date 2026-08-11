@@ -1327,9 +1327,10 @@ class TestBuildChainTruncation:
 
     async def test_emits_no_merge_attempt_event(self, git_repo: Path, monkeypatch):
         """Zero events of ANY type — an outcome event would be a false report."""
+        from _recording_event_store import _RecordingEventStore
+
         from orchestrator.merge_liveness import release_chain_build_lane
         from orchestrator.merge_queue import build_chain
-        from tests._recording_event_store import _RecordingEventStore
 
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
