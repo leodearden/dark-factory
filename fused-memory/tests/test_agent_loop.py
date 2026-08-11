@@ -1109,6 +1109,11 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     assert call_kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
     assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+    # Passed unconditionally (including on this, the first turn) — cli_invoke
+    # only reads it inside `if invoke_kwargs.get('resume_session_id'):`, so it
+    # is already inert here; asserting it holds regardless keeps the two
+    # kwargs from silently becoming coupled at the call site.
+    assert call_kwargs['resume_delivers_prompt'] is True
 
     # usage_gate may be positional or keyword — accept either
     if 'usage_gate' in call_kwargs:
@@ -1358,6 +1363,116 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
     # [Tool Result: ...] prefix, or subtly reorder fields.
     second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
     assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
+
+
+@pytest.mark.asyncio
+async def test_run_delivers_serialized_tool_results_on_resume_turn():
+    """Guards that the turn>=2 prompt reaches the CLI intact, not swapped for
+    CRASH_RECOVERY_RESUME_PROMPT.
+
+    This patches `shared.cli_invoke.invoke_claude_agent` — one level BELOW
+    `invoke_with_cap_retry` — instead of the file's usual
+    `patch('fused_memory.reconciliation.agent_loop.invoke_with_cap_retry')`
+    seam used by the sibling test above. That matters: the destruction this
+    test guards against (`cli_invoke.py:1369-1371` — ``if not
+    resume_delivers_prompt: invoke_kwargs['prompt'] =
+    CRASH_RECOVERY_RESUME_PROMPT``) lives INSIDE `invoke_with_cap_retry`'s
+    own body. Mocking that function out — as every existing turn>=2 test in
+    this file does — replaces the very code under test, so it cannot observe
+    the swap by construction; it passes whether or not `agent_loop.py`
+    passes `resume_delivers_prompt=True`. `usage_gate=None` selects the
+    gate-less fast path in `invoke_with_cap_retry` (cli_invoke.py:1507),
+    which still executes the prompt-swap guard above it (:1350-1371) — so
+    the behaviour under test is bit-identical to the gated path — while
+    guaranteeing exactly one `invoke_claude_agent` call per turn.
+    """
+    from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT, AgentResult
+
+    config = _make_cli_config()
+
+    async def my_tool_fn(x: int = 0):
+        return {'doubled': x * 2}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles the input',
+            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+            function=my_tool_fn,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Signals completion',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    # Turn 1: agent calls my_tool with x=7
+    first_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'calling my_tool',
+            'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
+        },
+    )
+    # Turn 2: agent calls stage_complete with the (serialized) tool result
+    second_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'done',
+            'tool_calls': [
+                {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
+            ],
+        },
+    )
+
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='You are a test agent.',
+            tools=tools,
+            terminal_tool='stage_complete',
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+        )
+
+        result, _journal = await agent.run('initial payload')
+
+    # Terminal tool input round-trips through run()
+    assert result == {'report': {'result': 14}}
+
+    # Both LLM turns must have fired against the real subprocess-invocation seam.
+    assert mock_agent.call_count == 2
+
+    first_kwargs = mock_agent.call_args_list[0].kwargs
+    second_kwargs = mock_agent.call_args_list[1].kwargs
+
+    # Turn 1 sanity: no prior session, initial payload passed straight through.
+    assert first_kwargs['prompt'] == 'initial payload'
+    assert first_kwargs['resume_session_id'] is None
+
+    # Non-vacuity guard, asserted FIRST: turn 2 really took the resume branch
+    # that performs the swap, so a future refactor that stops resuming fails
+    # loudly here instead of making the prompt assertion below pass trivially.
+    assert second_kwargs['resume_session_id'] == 'sess-1'
+
+    # Core contract: the serialized tool-result prompt reaches the CLI on the
+    # resume turn, byte for byte — same pinned string as the sibling test
+    # above, so both tests agree on the serialization contract.
+    assert second_kwargs['prompt'] == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
+
+    # Explicit anti-regression: the real prompt must not have been swapped
+    # for the crash-recovery continuation string.
+    assert second_kwargs['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
 
 
 @pytest.mark.asyncio
