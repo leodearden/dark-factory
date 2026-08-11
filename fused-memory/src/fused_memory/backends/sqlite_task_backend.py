@@ -3263,7 +3263,17 @@ def _resolve_metadata_mode(
     """Resolve the effective metadata merge mode from the two input signals.
 
     Precedence (high → low):
-    1. ``metadata_mode`` — explicit tri-state wins unconditionally.
+    1. ``metadata_mode`` — explicit tri-state wins, with ONE carve-out:
+       ``metadata_mode='merge'`` alongside ``append=True`` is **rejected**
+       as a contradiction (the task-3581 nested-metadata clobber,
+       2026-08-11). ``append=True`` means exactly one thing — 'additive' —
+       so the pair asks for two incompatible resolutions of the same
+       write, and silently picking 'merge' shallow-overwrote nested keys
+       (a whole ``memory_hints`` blob, authored ``entities``/``queries``
+       and all, replaced by an incoming stub). The other explicit/append
+       combinations are unchanged: ``('replace', True)`` stays honored (the
+       sanctioned destructive co-signal rule 2 points callers at) and
+       ``('additive', False)`` stays 'additive'.
     2. ``append`` legacy shim — True → 'additive'. A bare ``append=False``
        (no explicit ``metadata_mode``) is **rejected** when
        ``metadata_present`` is True: it used to resolve to a silent
@@ -3278,10 +3288,12 @@ def _resolve_metadata_mode(
        the details-append path in the backend.
     3. Default — 'merge' (shallow last-write-wins) when both are None.
 
-    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
-    unrecognised ``metadata_mode`` value AND for a bare ``append=False``
-    metadata write (both loud over silent). ``metadata_present`` defaults to
-    True (fail-safe strict) so any future 2-arg caller gets the guard.
+    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) in three
+    cases, all loud over silent: an unrecognised ``metadata_mode`` value; the
+    contradictory ``metadata_mode='merge'`` + ``append=True`` pair (rule 1);
+    and a bare ``append=False`` metadata write (rule 2). ``metadata_present``
+    defaults to True (fail-safe strict) so any future 2-arg caller gets the
+    guards.
     """
     if metadata_mode is not None:
         if metadata_mode not in _METADATA_MODES:
@@ -3289,6 +3301,27 @@ def _resolve_metadata_mode(
                 'TASKMASTER_TOOL_ERROR',
                 f"Invalid metadata_mode {metadata_mode!r}; "
                 f"must be one of {sorted(_METADATA_MODES)}.",
+            )
+        if metadata_mode == 'merge' and append is True:
+            # Contradiction: 'merge' is shallow last-write-wins while
+            # append=True means 'additive' (recursive union). Silently
+            # honoring 'merge' clobbered nested metadata wholesale — the
+            # task-3581 / DF-3260 memory_hints clobber.
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                "Refusing a contradictory metadata_mode='merge' + append=True "
+                "write: append=True asks for the ADDITIVE union merge while "
+                "metadata_mode='merge' asks for a SHALLOW last-write-wins "
+                "overwrite, and there is no coherent way to do both. Resolving "
+                "it silently to 'merge' overwrote nested keys wholesale — a "
+                "task's whole memory_hints blob (authored entities/queries and "
+                "all) replaced by the incoming stub instead of unioned with it "
+                "(the task-3581 nested-metadata clobber). State intent "
+                "explicitly: pass metadata_mode='additive' (or append=True "
+                "alone) to UNION nested list/dict fields like memory_hints into "
+                "the existing blob, or drop append and keep "
+                "metadata_mode='merge' to CONFIRM a shallow top-level "
+                "last-write-wins overwrite.",
             )
         return metadata_mode
     if append is True:
