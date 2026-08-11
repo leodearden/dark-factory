@@ -17,12 +17,31 @@ The ``/`` filesystem is made read-only (exec + read_file + read_dir). Each
 ``--writable`` path is granted full v1 access. ``~/.claude`` is NOT granted
 wholesale: only the subpaths passed in via ``--writable`` are writable (e.g.
 ``~/.claude/fleet/``, supplied as an extra computed by
-``orchestrator.agents.write_set.compute_write_set``). The CLI's own
-OAuth/session state is redirected to a per-task ``CLAUDE_CONFIG_DIR`` inside
-the worktree (already writable via the module/``.task`` paths), so
+``orchestrator.agents.write_set.compute_write_set``), so
 ``~/.claude/settings.json``, ``CLAUDE.md``, hooks, and plugins stay
 read-only (PRD deny-write-to-settings.json property). ``/dev`` gets
 WRITE_FILE + RO (for /dev/null etc.). Nothing else can be written.
+
+CALLER OBLIGATION — ``CLAUDE_CONFIG_DIR`` must be granted, not assumed
+----------------------------------------------------------------------
+This helper grants exactly ``/tmp``, ``/dev`` (WRITE_FILE), and the paths passed
+via ``--writable``. Nothing else is writable, ``~/.claude`` included. Whoever
+redirects the CLI's OAuth/session state to a per-task ``CLAUDE_CONFIG_DIR``
+MUST ALSO pass that directory in ``--writable`` — this module cannot infer it
+from the environment, and it will not complain about the omission.
+
+The orchestrator satisfies this via the worktree ``.task`` grant (its config
+dirs live under ``<worktree>/.task/``). Reconciliation satisfies it via a
+per-run computed extra (``cli_stage_runner.run_stage_via_cli``), machine-checked
+by ``sandbox_guard.resolve_recon_sandbox_wrap``.
+
+That check exists because the obligation was silently unmet once: from
+2026-07-18 (task 2744) to 2026-08-11 (task 4003), recon's config dir lived under
+``<data_dir>/recon-config/`` — outside every writable path above — so every
+reconciliation stage was told where to write its transcript and then denied the
+write. Zero transcripts, for three weeks, with no error. ``_add_path`` returns
+SILENTLY for a path that does not exist, so a wrong or missing grant produces no
+signal at this layer at all; the caller must verify.
 """
 
 from __future__ import annotations
