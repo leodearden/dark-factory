@@ -16,24 +16,34 @@ strictly ADD-ONLY: no code path in this task edits a canonical's text.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.memory_metadata import KIND_REGISTRY, validate_memory_metadata
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+from fused_memory.memory_metadata import (
+    EXPERIMENTAL_KEY_PREFIX,
+    KIND_REGISTRY,
+    validate_memory_metadata,
+)
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
     _AMENDMENT_DIGEST_CAP,
     _DIGEST_CHARS,
     _DIGEST_ELLIPSIS,
+    _MAX_CONCURRENT_GROUP_READS,
     AMENDMENT_KIND,
     CHILD_KINDS,
     CHILDREN_UNAVAILABLE_KEY,
     CONTESTED_METADATA_KEY,
+    PARENT_UNAVAILABLE_KEY,
+    PARENT_UNRESOLVED_KEY,
     SIGHTING_KIND,
     _suppress_child,
     build_grouped_document,
+    group_memory_document,
     group_search_results,
     is_contested_child,
 )
@@ -1271,8 +1281,351 @@ class TestChildRecordSchema:
                 f'strictly add-only on the read path, got {called} call(s)'
             )
 
+    # (Deliberately no test that _AMENDMENT_DIGEST_CAP / _DIGEST_CHARS are
+    # positive ints: asserting a module's own private constants against
+    # themselves exercises no behaviour and no regression can break it.  Their
+    # real behaviour is pinned by TestBoundedListingHonesty's
+    # test_wide_fanout_is_capped_and_marked_truncated and by
+    # test_long_body_truncated_to_named_cap_with_ellipsis above.)
+
+
+class TestIdLessHitsNeverCollapse:
+    """An EMPTY id is an id-LESS hit, not a shared identity.
+
+    ``MemoryService._search_mem0`` builds every hit with ``id=item.get('id',
+    '')``, so ``''`` is reachable on the live path.  Keying entries on it would
+    make two distinct id-less hits the same entry — silently dropping a result
+    and its content, which is the very retrieval regression this module exists
+    to prevent.
+    """
+
     @pytest.mark.asyncio
-    async def test_amendment_digest_cap_is_a_named_constant(self):
-        """The digest cap is a named module constant, not an inline literal."""
-        assert isinstance(_AMENDMENT_DIGEST_CAP, int) and _AMENDMENT_DIGEST_CAP > 0
-        assert isinstance(_DIGEST_CHARS, int) and _DIGEST_CHARS > 0
+    async def test_two_id_less_hits_both_survive_as_separate_entries(self):
+        service = _stub_service([])
+        hits = [
+            _result('', 'first orphan text', 0.9),
+            _result('', 'second orphan text', 0.8),
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == 2, (
+            'Two hits carrying id="" are two DIFFERENT results, not one — '
+            f'collapsing them silently drops a body, got {grouped!r}'
+        )
+        assert [r['content'] for r in grouped] == ['first orphan text', 'second orphan text'], (
+            f'Both bodies must survive, in rank order, got {grouped!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_id_less_hit_costs_no_child_probe(self):
+        """`''` cannot be a parent id, so probing it is a guaranteed-zero count."""
+        service = _stub_service([])
+
+        await group_search_results(service, _PROJECT_ID, [_result('', 'orphan', 0.9)])
+
+        assert service.count_memories_by_metadata.await_count == 0, (
+            "An empty id must never enter the groupable set — {'parent_id': ''} "
+            'can match nothing, so the count is pure waste. Got '
+            f'{service.count_memories_by_metadata.await_args_list!r}'
+        )
+
+
+class TestPromotedParentMetadataShape:
+    """One canonical, ONE wire shape — however it was reached.
+
+    A direct search hit's ``metadata`` is mem0-normalized
+    (``MemoryService._search_mem0`` forwards ``item['metadata']``), while
+    ``get_memory_by_id`` returns the FULL raw Qdrant payload.  An upward-resolved
+    parent must not therefore leak mem0-owned keys (``hash``/``user_id``/``role``
+    …) or duplicate the body inside ``metadata``.
+    """
+
+    _CUSTOM = {'category': 'observations_and_summaries', 'kind': 'canonical', 'topic': 'merge-lane'}
+
+    def _raw_record(self) -> dict:
+        """A parent record as ``get_memory_by_id`` really returns it."""
+        return {
+            'id': _CANONICAL_ID,
+            'content': 'the canonical claim',
+            'metadata': {
+                'data': 'the canonical claim',
+                'hash': 'deadbeef',
+                'user_id': 'dark_factory',
+                'created_at': '2026-08-01T00:00:00+00:00',
+                'updated_at': '2026-08-02T00:00:00+00:00',
+                **self._CUSTOM,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_promoted_parent_metadata_matches_the_direct_hit_shape(self):
+        upward_service = _stub_service(
+            _two_amendments_three_sightings(), parents={_CANONICAL_ID: self._raw_record()}
+        )
+        direct_service = _stub_service(_two_amendments_three_sightings())
+
+        promoted = (
+            await group_search_results(upward_service, _PROJECT_ID, [_child_result(_AMEND_1, 0.77)])
+        )[0]
+        # The SAME record arriving as a direct hit: _search_mem0 hands over
+        # mem0's already-normalized metadata, i.e. the custom half.
+        direct = (
+            await group_search_results(
+                direct_service,
+                _PROJECT_ID,
+                [_result(_CANONICAL_ID, 'the canonical claim', 0.77, metadata=dict(self._CUSTOM))],
+            )
+        )[0]
+
+        assert promoted['metadata'] == direct['metadata'], (
+            'An upward-resolved parent must carry the SAME metadata as the same '
+            f'record arriving as a direct hit, got {promoted["metadata"]!r} vs '
+            f'{direct["metadata"]!r}'
+        )
+        assert promoted['metadata'] == self._CUSTOM
+
+    @pytest.mark.asyncio
+    async def test_mem0_managed_keys_never_leak_to_the_wire(self):
+        service = _stub_service(
+            _two_amendments_three_sightings(), parents={_CANONICAL_ID: self._raw_record()}
+        )
+
+        promoted = (
+            await group_search_results(service, _PROJECT_ID, [_child_result(_AMEND_1, 0.77)])
+        )[0]
+
+        leaked = MEM0_MANAGED_METADATA_KEYS & set(promoted['metadata'])
+        assert not leaked, (
+            'mem0-owned payload keys are internal and must be stripped by '
+            f'split_managed_metadata, got {sorted(leaked)!r} in {promoted["metadata"]!r}'
+        )
+        assert promoted['content'] == 'the canonical claim'
+        assert 'data' not in promoted['metadata'], (
+            'The body must not be duplicated inside metadata — that is response '
+            f'size proportional to content length, got {promoted["metadata"]!r}'
+        )
+        assert promoted['created_at'] == '2026-08-01T00:00:00+00:00', (
+            'created_at lands in the MANAGED half and must still be read back '
+            f'from it, got {promoted!r}'
+        )
+
+
+class TestFanOutIsBounded:
+    """The hot read path must not burst one Qdrant request per hit, unbounded.
+
+    The ``search`` tool clamps ``limit`` to 1000, so the size of this module's
+    fan-out is chosen by the CALLER: without a ceiling a single grouped search
+    could put ~1000 concurrent counts into one gather, contending with the very
+    client pool the search itself used.
+    """
+
+    @staticmethod
+    def _peak_tracking_service(peak: list[int], in_flight: list[int]) -> AsyncMock:
+        async def _count(*, project_id: str, filters: dict):
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.005)
+            in_flight[0] -= 1
+            return 0
+
+        service = AsyncMock()
+        service.count_memories_by_metadata = AsyncMock(side_effect=_count)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_child_probes_never_exceed_the_named_ceiling(self):
+        peak, in_flight = [0], [0]
+        service = self._peak_tracking_service(peak, in_flight)
+        hits = [
+            _result(f'55555555-5555-4555-8555-{index:012d}', f'hit {index}', 0.9)
+            for index in range(_MAX_CONCURRENT_GROUP_READS * 3)
+        ]
+
+        grouped = await group_search_results(service, _PROJECT_ID, hits)
+
+        assert len(grouped) == len(hits), 'Bounding concurrency must not drop results'
+        assert peak[0] <= _MAX_CONCURRENT_GROUP_READS, (
+            f'At most {_MAX_CONCURRENT_GROUP_READS} child probes may be in flight at '
+            f'once, saw {peak[0]} — an unbounded gather over a 1000-hit search would '
+            'saturate the Qdrant client pool'
+        )
+        assert peak[0] > 1, (
+            f'The probes must still run CONCURRENTLY up to the ceiling, saw peak '
+            f'{peak[0]} — a bound of one would serialize the whole search'
+        )
+
+
+class TestDetailReadsAreConcurrent:
+    """The three detail reads share no data dependency, so they must not serialize."""
+
+    @pytest.mark.asyncio
+    async def test_sighting_count_amendment_count_and_scroll_overlap(self):
+        # A 3-party barrier: it can only be passed if all three reads are in
+        # flight AT ONCE. Serialized, the first read waits on two parties that
+        # will never arrive, and wait_for turns that into a loud timeout.
+        barrier = asyncio.Barrier(3)
+        children = _two_amendments_three_sightings()
+
+        async def _rendezvous():
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+
+        async def _count(*, project_id: str, filters: dict):
+            if 'kind' not in filters:
+                return len(children)  # the TOTAL probe deliberately runs first
+            await _rendezvous()
+            kind = filters['kind']
+            return len([c for c in children if c['metadata']['kind'] == kind])
+
+        async def _scroll(*, project_id: str, filters: dict, limit: int = 1000):
+            await _rendezvous()
+            return [c for c in children if c['metadata']['kind'] == AMENDMENT_KIND][:limit]
+
+        service = AsyncMock()
+        service.count_memories_by_metadata = AsyncMock(side_effect=_count)
+        service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block == {
+            'amendments': [
+                {
+                    'id': _AMEND_1,
+                    'digest': 'first correction',
+                    'created_at': '2026-08-01T00:00:00+00:00',
+                    'kind': AMENDMENT_KIND,
+                },
+                {
+                    'id': _AMEND_2,
+                    'digest': 'second correction',
+                    'created_at': '2026-08-02T00:00:00+00:00',
+                    'kind': AMENDMENT_KIND,
+                },
+            ],
+            'amendment_count': 2,
+            'sighting_count': 3,
+        }, (
+            'The two counts and the digest scroll must be issued CONCURRENTLY — '
+            'a TimeoutError contained as children_unavailable here means they '
+            f'were serialized, got {block!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_total_probe_still_gates_the_detail_reads(self):
+        """Concurrency must not leak upward: zero children still costs ONE count."""
+        service = _stub_service([])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is None
+        assert service.count_memories_by_metadata.await_count == 1, (
+            'The TOTAL probe short-circuits BEFORE the detail reads — gathering '
+            'them must not turn the zero-child common path into three reads, got '
+            f'{service.count_memories_by_metadata.await_args_list!r}'
+        )
+        assert service.get_memories_by_metadata.await_count == 0
+
+
+class TestPointIdParentIsVerified:
+    """``grouped.parent.id`` must never be an unverified pointer.
+
+    ``group_search_results`` already stamps ``parent_unresolved`` for a dangling
+    ``parent_id``; the point-id surface must not silently report the same
+    dangling pointer as a real parent.  ``build_grouped_document`` cannot tell
+    the difference on its own — "parent exists but is childless" and "parent does
+    not exist" are both ``None`` — so existence is probed explicitly.
+    """
+
+    @staticmethod
+    def _child_record() -> dict:
+        return {
+            'id': _AMEND_1,
+            'content': 'a correction',
+            'metadata': {'data': 'a correction', 'parent_id': _CANONICAL_ID, 'kind': AMENDMENT_KIND},
+        }
+
+    @pytest.mark.asyncio
+    async def test_dangling_parent_is_marked_unresolved(self):
+        # No parents registered → get_memory_by_id misses on the pointer.
+        service = _stub_service(_two_amendments_three_sightings())
+
+        grouped = await group_memory_document(
+            service, _PROJECT_ID, _AMEND_1, self._child_record()
+        )
+
+        assert grouped is not None
+        assert grouped[PARENT_UNRESOLVED_KEY] is True, (
+            'A parent_id that resolves to nothing must be reported as UNRESOLVED, '
+            f'not handed back as a real parent, got {grouped!r}'
+        )
+        assert grouped['parent']['id'] == _CANONICAL_ID, (
+            'The pointer itself is still reported — marked, not hidden'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolvable_parent_carries_no_marker(self):
+        service = _stub_service(
+            _two_amendments_three_sightings(), parents={_CANONICAL_ID: _parent_record()}
+        )
+
+        grouped = await group_memory_document(
+            service, _PROJECT_ID, _AMEND_1, self._child_record()
+        )
+
+        assert grouped is not None
+        assert PARENT_UNRESOLVED_KEY not in grouped, (
+            f'Fault-only loudness: a live parent gets no marker, got {grouped!r}'
+        )
+        assert PARENT_UNAVAILABLE_KEY not in grouped
+        assert grouped['parent']['sighting_count'] == 3, 'The group itself still comes through'
+
+    @pytest.mark.asyncio
+    async def test_failed_probe_is_unavailable_not_unresolved(self):
+        """Not knowing is a different claim from knowing the parent is absent."""
+        service = _stub_service(
+            _two_amendments_three_sightings(), parents={_CANONICAL_ID: _parent_record()}
+        )
+        service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timed out'))
+
+        grouped = await group_memory_document(
+            service, _PROJECT_ID, _AMEND_1, self._child_record()
+        )
+
+        assert grouped is not None
+        assert grouped[PARENT_UNAVAILABLE_KEY] is True, (
+            f'A FAILED existence probe must be its own marker, got {grouped!r}'
+        )
+        assert grouped['error_type'] == 'TimeoutError'
+        assert PARENT_UNRESOLVED_KEY not in grouped, (
+            'A probe that failed must NOT be reported as a confirmed miss — that '
+            f'would fabricate a dangling-pointer fault, got {grouped!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_canonical_read_costs_no_parent_probe(self):
+        """The verification is on the CHILD branch only."""
+        service = _stub_service(_two_amendments_three_sightings())
+        record = {
+            'id': _CANONICAL_ID,
+            'content': 'the canonical claim',
+            'metadata': {'data': 'the canonical claim', 'kind': 'canonical'},
+        }
+
+        await group_memory_document(service, _PROJECT_ID, _CANONICAL_ID, record)
+
+        assert service.get_memory_by_id.await_count == 0, (
+            'A canonical has no parent pointer to verify, so the point-id surface '
+            f'must issue no extra read, got {service.get_memory_by_id.await_args_list!r}'
+        )
+
+
+class TestContestedKeyComposesTheExperimentalPrefix:
+    """The flag is built from the vocabulary module's prefix, not a re-spelling."""
+
+    def test_key_is_composed_not_hardcoded(self):
+        composed = f'{EXPERIMENTAL_KEY_PREFIX}contested'
+        assert composed == CONTESTED_METADATA_KEY, (
+            'CONTESTED_METADATA_KEY must COMPOSE memory_metadata.'
+            'EXPERIMENTAL_KEY_PREFIX so a prefix change cannot silently desync '
+            f'the read side from the vocabulary module, got {CONTESTED_METADATA_KEY!r}'
+        )

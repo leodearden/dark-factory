@@ -3223,6 +3223,38 @@ def create_mcp_server(
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
             include_planned: Include planning-episode edges (default: False)
+
+        Returns:
+            {'results': [...]} — plus 'degraded'/'failed_stores'/
+            'failed_store_diagnostics' ONLY when a selected store failed.
+
+            Results are GROUPED (task 3129): an amendment or sighting (a record
+            whose metadata carries parent_id) does not appear as its own
+            top-level hit — it folds into the hit for the canonical it attaches
+            to, and a child-only match is replaced by that canonical. So a
+            search with limit=10 can legitimately return FEWER than 10 top-level
+            results, and a matched child's id/body is found INSIDE its parent's
+            entry, not beside it.
+
+            A result carrying children gains a 'grouped' block:
+            {'amendments': [{'id','digest','created_at','kind'}],
+             'amendment_count': int, 'sighting_count': int} — the counts are
+            EXACT while the digest list is bounded and TRUNCATED to a cap
+            (marked 'truncated': True, and each digest body is itself
+            truncated), so never read the list as the whole set.  Any child that
+            was folded away is pinned into 'grouped'['matched_children'] as
+            {'id','content','created_at','kind','matched': True} carrying its
+            FULL body — that is where a matched child's text lives.  A digest
+            already listing the matched child is marked 'matched': True in
+            place instead.
+
+            Loud-fault keys, present only when something is genuinely unknown:
+            'grouped'['children_unavailable'] (+ 'error_type') means the child
+            reads FAILED — not that there are no children — and such a hit
+            suppresses nothing; a top-level 'parent_unresolved': True means the
+            hit is a child whose parent_id no store could resolve, and it stays
+            a top-level hit.  A record that is neither a child nor has children
+            carries no 'grouped' key at all.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3649,9 +3681,15 @@ def create_mcp_server(
             (plus ``'truncated': True`` when the digest listing is bounded, or
             ``{'children_unavailable': True, 'error_type'}`` when the child
             reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
-            while keeping its OWN ``content``/``metadata``/``memory_id``.  The
-            key is OMITTED entirely when the record has no children and is not
-            itself a child, so an ungrouped response is unchanged.
+            while keeping its OWN ``content``/``metadata``/``memory_id``.  On
+            that child branch the parent pointer is VERIFIED, so
+            ``grouped['parent_unresolved'] is True`` marks a dangling
+            ``parent_id`` (the parent does not exist) and
+            ``grouped['parent_unavailable'] is True`` (+ ``error_type``) marks a
+            probe that FAILED — i.e. the pointer is unverified, which is not the
+            same claim as unresolved.  The key is OMITTED entirely when the
+            record has no children and is not itself a child, so an ungrouped
+            response is unchanged.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:

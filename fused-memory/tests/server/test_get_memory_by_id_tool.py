@@ -552,3 +552,43 @@ class TestGetMemoryByIdGroupedReads:
             f'A grouping fault must never convert a correct hit into an error, got {result!r}'
         )
         assert result['content'] == 'the canonical claim'
+
+    @pytest.mark.asyncio
+    async def test_child_with_a_dangling_parent_is_marked_unresolved(self):
+        """A parent_id nothing resolves must never be reported as a real parent.
+
+        `search` already stamps parent_unresolved for exactly this case; the
+        point-id surface would otherwise hand back grouped.parent.id as though
+        the pointer were live, because a childless parent and a missing parent
+        are both `None` from build_grouped_document alone.
+        """
+        record = {
+            'id': _AMEND_ID,
+            'content': 'a correction',
+            'metadata': {
+                'data': 'a correction',
+                'parent_id': _CANONICAL_ID,
+                'kind': 'amendment',
+            },
+        }
+        service = _grouped_read_service(record)
+        # The child's own read hits; the parent pointer resolves to nothing.
+        service.get_memory_by_id = AsyncMock(
+            side_effect=lambda *, project_id, memory_id: record if memory_id == _AMEND_ID else None
+        )
+        server = create_mcp_server(service)
+
+        result = await server._tool_manager.call_tool(
+            'get_memory_by_id',
+            {'project_id': _PROJECT_ID, 'memory_id': _AMEND_ID},
+        )
+
+        assert result['found'] is True, f'The CHILD still resolves and is returned, got {result!r}'
+        assert result['content'] == 'a correction', 'The child keeps its own body'
+        assert result['grouped']['parent_unresolved'] is True, (
+            'A dangling parent_id must be marked, not silently presented as a real '
+            f'parent, got {result["grouped"]!r}'
+        )
+        assert result['grouped']['parent']['id'] == _CANONICAL_ID, (
+            'The pointer is still reported — marked, not hidden'
+        )

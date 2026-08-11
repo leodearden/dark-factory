@@ -35,9 +35,20 @@ named module constants.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
+# ``split_managed_metadata`` / ``MEM0_MANAGED_METADATA_KEYS`` — the DECIDED
+# HOME (INV-5 / PRD D12) for "which payload keys are mem0's own".  A raw
+# ``get_memory_by_id`` payload is partitioned with it rather than forwarded
+# whole, so an upward-resolved parent's ``metadata`` matches what the SAME
+# record carries when it arrives as a direct search hit.
+from fused_memory.backends.mem0_client import split_managed_metadata
+
+# The experimental-key prefix, composed rather than re-spelled — see
+# CONTESTED_METADATA_KEY below.
+from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 
@@ -49,7 +60,7 @@ from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS
 from fused_memory.utils.async_utils import gather_collect
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Awaitable, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +102,63 @@ MATCHED_CHILDREN_KEY = 'matched_children'
 #: extending it.  This module is the single home of the predicate below because
 #: no landed vocabulary key carries adjudication state and the producer (leaf
 #: γ's write-triage judge) has not shipped — so without a read-side definition
-#: the D6 carve-out would be untestable.  The ``x_`` experimental namespace
-#: (``memory_metadata.EXPERIMENTAL_KEY_PREFIX``) is deliberate: it needs no
-#: amendment to task 3195's closed five-key ``RESERVED_VOCABULARY_KEYS`` set
-#: and produces no unknown-key census noise, while giving leaf γ exactly ONE
-#: constant to stamp.
-CONTESTED_METADATA_KEY = 'x_contested'
+#: the D6 carve-out would be untestable.  The ``x_`` experimental namespace is
+#: deliberate: it needs no amendment to task 3195's closed five-key
+#: ``RESERVED_VOCABULARY_KEYS`` set and produces no unknown-key census noise,
+#: while giving leaf γ exactly ONE constant to stamp.
+#:
+#: COMPOSED from ``memory_metadata.EXPERIMENTAL_KEY_PREFIX`` rather than
+#: re-spelling ``'x_'``, so a prefix change cannot silently desync the two.
+#: The vocabulary module is the repo's DECIDED HOME for metadata keys and is
+#: where this constant ultimately belongs — moving it there is deferred only
+#: because ``memory_metadata.py`` is outside this task's lock set; until then
+#: the write side (leaf γ) should import THIS name rather than re-spell it.
+CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested'
+
+#: Marks a ``parent_id`` no store could resolve.  ONE spelling shared by both
+#: surfaces — the search entry (:func:`group_search_results`) and the grouped
+#: block of a point-id read (:func:`group_memory_document`) — so a consumer
+#: learns the dangling-pointer fault by the same key everywhere.
+PARENT_UNRESOLVED_KEY = 'parent_unresolved'
+
+#: Marks a parent whose EXISTENCE probe itself failed: we did not learn whether
+#: the pointer dangles.  Deliberately distinct from
+#: :data:`PARENT_UNRESOLVED_KEY` (which asserts a genuine miss) for the same
+#: reason ``children_unavailable`` is distinct from a zero count.
+PARENT_UNAVAILABLE_KEY = 'parent_unavailable'
+
+#: Ceiling on grouped-document builds (and parent lookups) in flight at once.
+#: The ``search`` tool clamps ``limit`` to 1000, so an unbounded fan-out could
+#: put ~1000 concurrent Qdrant reads into a single gather — competing with the
+#: very client pool the search itself used.  Each admitted document issues at
+#: most four backend reads, keeping in-flight requests in the same range as the
+#: repo's other bounded fan-outs (``memory_service`` rebuild: ``Semaphore(20)``,
+#: ``task_curator``: ``Semaphore(10)``).
+_MAX_CONCURRENT_GROUP_READS = 10
+
+
+async def _bounded_gather(coros: Iterable[Awaitable[Any]]) -> list:
+    """:func:`gather_collect` with a ceiling on how many run AT ONCE.
+
+    Same value-or-Exception-per-item contract, same cancellation propagation —
+    only the concurrency is capped, at :data:`_MAX_CONCURRENT_GROUP_READS`.
+    Every awaitable still runs and every result still comes back in input order;
+    the excess simply queues.  A coroutine does not begin executing until it is
+    awaited, so wrapping them here starts nothing early and leaves nothing
+    un-awaited on the fault path.
+
+    Needed because this module's fan-outs are sized by the CALLER's result list
+    (up to the ``search`` tool's 1000-hit clamp), not by anything this module
+    controls: an unbounded gather would let one grouped search saturate the
+    Qdrant client pool that the search itself is sharing.
+    """
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_GROUP_READS)
+
+    async def _run(coro: Awaitable[Any]) -> Any:
+        async with sem:
+            return await coro
+
+    return await gather_collect(_run(coro) for coro in coros)
 
 
 def is_contested_child(meta: Mapping[str, Any] | None) -> bool:
@@ -175,7 +237,8 @@ async def build_grouped_document(
     common path — every canonical on today's corpus, where ``parent_id`` has
     zero live footprint — pays one cheap exact count and issues no scroll at
     all.  The detail reads are paid only when they buy something the total
-    cannot: the per-kind split and the child bodies the digests need.
+    cannot: the per-kind split and the child bodies the digests need, and they
+    then run CONCURRENTLY with each other (they share no data dependency).
 
     FAULT CONTAINMENT: a failed child read returns
     ``{'children_unavailable': True, 'error_type': ...}`` — never ``None``
@@ -215,19 +278,35 @@ async def _read_grouped_document(
     )
     if not total_children:
         return None
-    sighting_count = await service.count_memories_by_metadata(
-        project_id=project_id,
-        filters={PARENT_ID_KEY: canonical_id, 'kind': SIGHTING_KIND},
-    )
-    amendment_count = await service.count_memories_by_metadata(
-        project_id=project_id,
-        filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
-    )
-    rows = await service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
-        limit=_AMENDMENT_DIGEST_CAP,
-    )
+    # The three detail reads have NO data dependency on each other, so they are
+    # issued CONCURRENTLY: serializing them would treble the round-trip latency
+    # of every parented canonical — paid once per canonical per search — to buy
+    # nothing.  The total probe above stays strictly ahead of them because it is
+    # the short-circuit that decides whether they run at all.
+    #
+    # Fault containment is unchanged: gather_collect returns value-or-Exception
+    # per item (after propagating any cancellation), and the FIRST captured
+    # Exception is re-raised here so :func:`build_grouped_document` still turns
+    # any faulted read into the children_unavailable marker rather than a
+    # fabricated zero or a partial block.
+    sighting_count, amendment_count, rows = await gather_collect((
+        service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={PARENT_ID_KEY: canonical_id, 'kind': SIGHTING_KIND},
+        ),
+        service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
+        ),
+        service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
+            limit=_AMENDMENT_DIGEST_CAP,
+        ),
+    ))
+    for outcome in (sighting_count, amendment_count, rows):
+        if isinstance(outcome, Exception):
+            raise outcome
     digests = [_digest_entry(row) for row in sorted(rows or [], key=_digest_sort_key)]
     # A non-zero total means children EXIST, so the block is emitted even when
     # none of them is an amendment or a sighting — reporting an empty group for
@@ -281,20 +360,35 @@ def _is_mem0(result: Any) -> bool:
 
 
 def _promoted_parent(parent_id: str, record: Mapping[str, Any]) -> MemoryResult:
-    """Turn a raw ``get_memory_by_id`` record into a search-hit-shaped parent."""
+    """Turn a raw ``get_memory_by_id`` record into a search-hit-shaped parent.
+
+    ``get_memory_by_id`` returns the FULL unprocessed Qdrant payload, whereas
+    ``MemoryService._search_mem0`` builds a hit's ``metadata`` from mem0's
+    already-normalized ``item['metadata']`` — the mem0-owned keys stripped.
+    Forwarding the raw payload here would give ONE canonical two different
+    wire shapes depending on how it was reached (direct hit vs. upward
+    resolution), leaking ``hash``/``user_id``/``role`` to the MCP consumer and
+    duplicating the body text inside ``metadata``.
+
+    So the payload is partitioned with ``mem0_client.split_managed_metadata``
+    — the DECIDED HOME for that split (INV-5) rather than a re-derivation —
+    and only the CUSTOM half becomes ``metadata``.  ``created_at`` is read back
+    off the managed half, which is exactly where that key lands.
+    """
     payload = record.get('metadata') or {}
-    raw_category = payload.get('category')
+    managed, custom = split_managed_metadata(dict(payload))
+    raw_category = custom.get('category')
     try:
         category = MemoryCategory(raw_category) if isinstance(raw_category, str) else None
     except ValueError:
         category = None
-    created_at = payload.get('created_at')
+    created_at = managed.get('created_at')
     return MemoryResult(
         id=parent_id,
         content=record.get('content') or '',
         category=category,
         source_store=SourceStore.mem0,
-        metadata=dict(payload),
+        metadata=custom,
         created_at=created_at if isinstance(created_at, str) else None,
     )
 
@@ -312,7 +406,7 @@ async def _resolve_absent_parents(
     """
     if not parent_ids:
         return {}
-    records = await gather_collect(
+    records = await _bounded_gather(
         service.get_memory_by_id(project_id=project_id, memory_id=parent_id)
         for parent_id in parent_ids
     )
@@ -486,10 +580,13 @@ async def group_search_results(
         attributes BEFORE calling it.
     """
     hits = list(results)
+    # NON-EMPTY is part of "usable id" everywhere in this module: mem0 hits are
+    # built with ``id=item.get('id', '')``, so '' is reachable, and it is not an
+    # identity — treating it as one would make two id-less hits the same hit.
     hit_by_id: dict[str, Any] = {}
     for hit in hits:
         hit_id = getattr(hit, 'id', None)
-        if isinstance(hit_id, str) and hit_id not in hit_by_id:
+        if isinstance(hit_id, str) and hit_id and hit_id not in hit_by_id:
             hit_by_id[hit_id] = hit
 
     child_parents = {
@@ -517,6 +614,7 @@ async def group_search_results(
                 if _is_mem0(hit)
                 and _child_parent_id(hit) is None
                 and isinstance(hit_id := getattr(hit, 'id', None), str)
+                and hit_id  # '' is not an id: probing it costs a guaranteed-zero count
             ]
             + [
                 parent_id
@@ -525,7 +623,11 @@ async def group_search_results(
             ]
         )
     )
-    blocks = await gather_collect(
+    # BOUNDED (not a plain gather): `groupable` is sized by the caller's hit
+    # list, which the search tool clamps at 1000 — so an unbounded fan-out here
+    # would be an up-to-1000-wide burst of Qdrant counts on the hottest read
+    # path, contending with the search that produced the hits.
+    blocks = await _bounded_gather(
         build_grouped_document(service, project_id, target_id) for target_id in groupable
     )
     block_by_id: dict[str, Any] = {}
@@ -578,12 +680,15 @@ async def group_search_results(
             target_id, base, parent_unresolved = parent_id, parent_base, False
         else:
             # Not a child, or a child a carve-out keeps: it stays a top-level
-            # hit in its own right.  A hit with no usable str id can be neither
-            # deduped nor grouped (mirroring the isinstance guards above), so it
-            # takes a per-position key that cannot collide with a real id —
-            # two id-less hits must never collapse into a single entry.
+            # hit in its own right.  A hit with no usable id — absent, non-str,
+            # or the EMPTY string mem0 substitutes via ``item.get('id', '')`` —
+            # can be neither deduped nor grouped (mirroring the guards above),
+            # so it takes a per-position key that cannot collide with a real id.
+            # The empty string is an id-LESS hit, not a shared identity: keying
+            # on it would silently drop every id-less hit but the first, which
+            # is precisely the retrieval regression this module exists to stop.
             hit_id = getattr(hit, 'id', None)
-            target_id = hit_id if isinstance(hit_id, str) else f'\x00no-id:{index}'
+            target_id = hit_id if isinstance(hit_id, str) and hit_id else f'\x00no-id:{index}'
             base = hit
             parent_unresolved = bool(parent_id) and parent_base is None
         score = getattr(hit, 'relevance_score', 0.0)
@@ -596,7 +701,7 @@ async def group_search_results(
         if parent_unresolved:
             # Loud rather than silent: this hit points at a parent no store
             # could resolve, so its group is genuinely unknown — not empty.
-            entry['parent_unresolved'] = True
+            entry[PARENT_UNRESOLVED_KEY] = True
         block = block_by_id.get(target_id)
         if block:
             entry['grouped'] = block
@@ -617,7 +722,15 @@ async def group_memory_document(
     ADDITIVE ONLY, deliberately asymmetric with :func:`group_search_results`:
 
     * a CHILD keeps its own ``memory_id`` / ``content`` / ``metadata`` and gains
-      only ``{'parent': {...}}``.  ``get_memory_by_id`` is an exact-point-id
+      only ``{'parent': {...}}`` — plus, when the pointer DANGLES, the same
+      ``parent_unresolved`` marker :func:`group_search_results` stamps, so a
+      dangling ``parent_id`` is never reported as a real parent on either
+      surface.  ``build_grouped_document`` alone cannot tell "parent exists but
+      is childless" from "parent does not exist" (both are ``None``), so the
+      existence of the parent is probed explicitly, concurrently with its
+      grouping.  A probe that FAILS is reported as ``parent_unavailable`` with
+      its ``error_type`` rather than as a miss: not knowing is not the same
+      claim as knowing it is absent.  ``get_memory_by_id`` is an exact-point-id
       reader whose contract is load-bearing for
       ``reconciliation/citation_verifier.py``, recon stage 1 and
       ``server/recon_report.py::cite_memory`` — answering a child id with its
@@ -634,8 +747,30 @@ async def group_memory_document(
     parent_id = _parent_id_in_meta(record.get('metadata'))
     if parent_id is None:
         return await build_grouped_document(service, project_id, memory_id)
+    # Independent reads, so issued together: the parent's grouping and the
+    # existence probe that says whether the pointer resolves at all.
+    block, parent_record = await gather_collect((
+        build_grouped_document(service, project_id, parent_id),
+        service.get_memory_by_id(project_id=project_id, memory_id=parent_id),
+    ))
     parent: dict[str, Any] = {'id': parent_id}
-    block = await build_grouped_document(service, project_id, parent_id)
+    if isinstance(block, Exception):
+        # build_grouped_document contains its own faults; belt-and-braces.
+        block = {CHILDREN_UNAVAILABLE_KEY: True, 'error_type': type(block).__name__}
     if block:
         parent.update(block)
-    return {'parent': parent}
+    grouped: dict[str, Any] = {'parent': parent}
+    if isinstance(parent_record, Exception):
+        logger.warning(
+            'grouped_read: parent existence probe FAILED for parent_id=%s in '
+            'project=%s; marking the pointer UNVERIFIED rather than claiming it resolves',
+            parent_id,
+            project_id,
+            exc_info=parent_record,
+            extra={'project_id': project_id, 'parent_id': parent_id},
+        )
+        grouped[PARENT_UNAVAILABLE_KEY] = True
+        grouped['error_type'] = type(parent_record).__name__
+    elif not parent_record:
+        grouped[PARENT_UNRESOLVED_KEY] = True
+    return grouped

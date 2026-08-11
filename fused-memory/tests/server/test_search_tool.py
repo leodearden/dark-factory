@@ -290,8 +290,14 @@ class TestSearchToolGroupedReads:
         )
 
     @pytest.mark.asyncio
-    async def test_grouping_failure_degrades_to_the_ungrouped_list(self):
-        """A grouping fault must never turn a working search into an error dict."""
+    async def test_child_read_fault_is_marked_children_unavailable_on_the_hit(self):
+        """A faulted child read is CONTAINED by build_grouped_document, so the hit
+        survives carrying the explicit unavailability marker — never a silent
+        "no children" and never an error dict.
+
+        This is the fault the grouping layer handles ITSELF; the tool-level
+        fallback is exercised separately below, because nothing here reaches it.
+        """
         mock_service = AsyncMock()
         plain = _hit('44444444-4444-4444-8444-444444444444', 'a plain memory', 0.5, {})
         mock_service.search = AsyncMock(return_value=SearchResults([plain]))
@@ -309,3 +315,43 @@ class TestSearchToolGroupedReads:
             f'A grouping fault must not convert a working search into an error, got {result!r}'
         )
         assert [r['id'] for r in result['results']] == [plain.id]
+        assert result['results'][0]['grouped'] == {
+            'children_unavailable': True,
+            'error_type': 'TimeoutError',
+        }, (
+            'A faulted child read must be reported LOUDLY on the hit rather than '
+            f'collapsed into a silent "no children", got {result["results"][0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_grouping_exception_degrades_to_the_ungrouped_list(self, monkeypatch):
+        """The tool-level fallback: if grouping itself RAISES, the search still answers.
+
+        Reaching this branch requires the grouping layer's own containment to
+        fail, so it is forced here by monkeypatching the module-global the tool
+        calls — the belt-and-braces path is otherwise untestable, and untested
+        belt-and-braces is just an untested branch.
+        """
+        mock_service = AsyncMock()
+        plain = _hit('44444444-4444-4444-8444-444444444444', 'a plain memory', 0.5, {})
+        mock_service.search = AsyncMock(return_value=SearchResults([plain]))
+        mock_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError('grouping exploded')
+
+        monkeypatch.setattr('fused_memory.server.tools.group_search_results', _boom)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {'query': 'test query', 'project_id': _PROJECT_ID},
+        )
+
+        assert 'error' not in result, (
+            f'A raising grouping layer must not break a working search, got {result!r}'
+        )
+        assert result['results'] == [plain.model_dump()], (
+            'The fallback must be the PLAIN ungrouped list — exactly what the tool '
+            f'returned before grouping existed, got {result["results"]!r}'
+        )
