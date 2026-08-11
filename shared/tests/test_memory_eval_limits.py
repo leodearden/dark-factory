@@ -168,12 +168,14 @@ def _normal_two_sided_p(deviation: float, sd: float) -> float:
 
 
 _HUGE_INPUT_SECONDS = 5.0
-"""Wall-clock ceiling for the two huge-input tests below.
+"""CPU-time ceiling (measured via ``time.process_time()``) for the two
+huge-input tests below.
 
-Not a performance target — a shape discriminator, sized so it cannot flake. The
-implementations it rejects are ~100x over it (an O(n) binomial support at
-``n = 1e7``, an O(lam) Poisson left shoulder at ``lam = 1e8``); the walk that
-replaced them lands ~50x under it.
+Not a performance target — a shape discriminator, sized so it cannot flake.
+CPU time (not wall clock) is what's measured, so scheduler contention on a
+loaded host cannot trip it. The implementations it rejects are ~100x over it
+(an O(n) binomial support at ``n = 1e7``, an O(lam) Poisson left shoulder at
+``lam = 1e8``); the walk that replaced them lands ~50x under it.
 """
 
 
@@ -294,9 +296,9 @@ class TestBinomialExactTest:
         metric's probe/corpus size, which the M1 schema does not bound at all.
         The walk-from-the-mode implementation answers this in ~40 ms.
         """
-        start = time.perf_counter()
+        start = time.process_time()
         p = binomial_two_sided_p(5_010_000, 10_000_000, 0.5)
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
 
         # Cross-checked against the normal approximation, the only independent
         # reference that survives this n (both in-test enumerations above need
@@ -397,9 +399,9 @@ class TestPoissonExactTest:
         and take the grandfather-set update with it. Nothing bounds a count
         metric's value, so nothing bounds the rate a window of them derives.
         """
-        start = time.perf_counter()
+        start = time.process_time()
         p = poisson_two_sided_p(100_050_000, 1e8)
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
 
         # 5 sd above a rate of 1e8 (sd = sqrt(lam) = 1e4). Cross-checked against
         # the normal approximation, which agrees to ~2e-3 relative here.
