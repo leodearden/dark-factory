@@ -37,7 +37,11 @@ from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT, RESPONSIVE_WAIT_WALL_CAP
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_WALL_CAP,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -201,10 +205,12 @@ HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
-    # task 3980: `wait_responsive`'s hard wall backstop, so a scanned call
-    # site that spells the cap explicitly resolves rather than silently
-    # contributing 0.0.
+    # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
+    # gate-barrier nominal, so a scanned call site spelling either one
+    # resolves rather than silently contributing 0.0 (which would let the
+    # late-arrival gate barriers vanish from the audited budget entirely).
     'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
+    'MERGE_GATE_BARRIER_TIMEOUT': float(MERGE_GATE_BARRIER_TIMEOUT),
 }
 
 # task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its

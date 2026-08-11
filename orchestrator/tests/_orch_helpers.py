@@ -114,6 +114,22 @@ MERGE_RESULT_TIMEOUT = 45
 # with room for fixture setup.  Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = 2 * MERGE_RESULT_TIMEOUT  # 90s
 
+# task 3980: nominal budget for the merge-pipeline `asyncio.Event` GATE
+# barriers (`gate_a_entered.wait()` and friends in the late-arrival block of
+# test_merge_speculation.py), as distinct from the result-future waits above.
+# DERIVED rather than literal, and deliberately equal to the 15.0 those sites
+# already used: a gate barrier waits only for the fake verify runner to reach
+# a known point, not for a full merge round-trip, so borrowing the
+# result-sized budget would buy nothing green-path while tripling the scanned
+# per-method wait budget that the paired @pytest.mark.timeout must clear.
+# Keeping the nominal here is what makes the arithmetic work: the worst
+# per-method budget stays 245s stretched (2 gates x 30 + 2 results x 90 + a 5s
+# teardown), still under HEAVY_BARRIER_TEST_TIMEOUT (300s).  Never-narrow.
+# NOTE: this bounds only the NOMINAL, loop-responsive budget — `wait_responsive`
+# stretches the real wall clock it may consume up to RESPONSIVE_WAIT_WALL_CAP,
+# which is what removes these barriers' wall-clock dependence.
+MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
+
 # task 3307: generous synchronization-barrier ceiling for the workflow
 # CancellationScope tests (test_workflow_cancellation.py).  These barriers
 # wait for REAL work — git worktree creation, artifact writes, stubbed

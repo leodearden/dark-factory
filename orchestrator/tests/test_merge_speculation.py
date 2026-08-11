@@ -52,6 +52,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import (  # noqa: F401
+    MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
     make_placeholder_future,
     pydantic_spec,
@@ -2082,7 +2083,11 @@ class TestLateArrivalAttaches:
             #   (3) done the look-ahead peek (synchronous, no yield) → found nothing
             #   (4) released the permit, set spec_base=None
             #   (5) blocked in _acquire_next_request()
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late1-a: gate_a_entered',
+            )
 
             # B arrives LATE — after the one-shot look-ahead has already fired.
             await worker._queue.put(req_b)
@@ -2163,9 +2168,17 @@ class TestLateArrivalAttaches:
             gate_a_release.set()
 
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+                await wait_responsive(
+                    req_a.result,
+                    timeout=MERGE_RESULT_TIMEOUT,
+                    label='late1-a: MergeOutcome',
+                )
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+                await wait_responsive(
+                    req_b.result,
+                    timeout=MERGE_RESULT_TIMEOUT,
+                    label='late1-b: MergeOutcome',
+                )
 
             await worker.stop()
 
@@ -2295,22 +2308,38 @@ class TestLateArrivalCleanCAS:
 
             # Enqueue A only; wait for its verify to enter the gate (look-ahead done).
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late3-a: gate_a_entered',
+            )
 
             # Inject B late — after the one-shot look-ahead peek.
             await worker._queue.put(req_b)
 
             # Wait for B's remote verify to enter (B has been merged + dispatched).
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late3-b: gate_b_entered',
+            )
 
             # Release A → A's verify completes, A's advance_main fires, A lands.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='late3-a: MergeOutcome',
+            )
             assert outcome_a.status == 'done', f'A must land cleanly; got {outcome_a!r}'
 
             # A has landed → main == A's merge commit.  Now release B.
             gate_b_release.set()
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='late3-b: MergeOutcome',
+            )
 
             await worker.stop()
 
@@ -2469,7 +2498,11 @@ class TestLateArrivalFailCascade:
 
             # Enqueue A; wait for its verify to enter (look-ahead peek has fired).
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late5-a: gate_a_entered',
+            )
 
             # Inject B LATE — after the one-shot look-ahead peek.
             # B attaches to A's pending spec base → B merges speculatively on A's commit.
@@ -2477,7 +2510,11 @@ class TestLateArrivalFailCascade:
 
             # Wait for B's remote verify to start (confirms B is dispatched as
             # speculative descendant of A — otherwise there is no cascade to assert).
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late5-b: gate_b_entered',
+            )
 
             # Release A's gate with passed=False → A fails verification.
             gate_a_release.set()
@@ -2485,10 +2522,26 @@ class TestLateArrivalFailCascade:
             # The head-failure cascade cancels B's remote verify, re-merges B
             # against actual main, re-dispatches → local re-verify (call[1], passes).
             # Wait for B to resolve 'done'.
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
+            # task 3980: this site was the file's only bare mid-range deadline
+            # (a raw `timeout=25.0`) and one of the three MEASURED failures.
+            # Task 2376's sweep replaced merge-pipeline wait literals but its
+            # stated policy only covered literals <= 15, so 25.0 sat just above
+            # the sweep and survived. The bound is now DERIVED from the shared
+            # constant, and step-5's structural guard keys on the call shape
+            # rather than on a literal's magnitude, so a value above whatever
+            # the next sweep's threshold happens to be can no longer hide.
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='late5-b: MergeOutcome',
+            )
 
             # Await A's result too (should be set to a failed outcome).
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='late5-a: MergeOutcome',
+            )
 
             await worker.stop()
 
@@ -2648,14 +2701,22 @@ class TestLateArrivalGuards:
 
             # Enqueue A; let it run and land fully (no gate).
             await worker._queue.put(req_a)
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='guard7-a: MergeOutcome',
+            )
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
             # Now enqueue B — pending_predecessor (A) is done → FALLBACK.
             # The merger is blocked in _acquire_next_request(); the decision
             # code fires with pending_predecessor.result.done() == True.
             await worker._queue.put(req_b)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='guard7-b: MergeOutcome',
+            )
 
             await worker.stop()
 
@@ -2742,7 +2803,11 @@ class TestLateArrivalGuards:
             worker_task = asyncio.create_task(worker.run())
 
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='dk7-a: gate_a_entered',
+            )
 
             # After gate_a_entered, exactly ONE permit is held (the look-ahead).
             # slot._value == K-1 == 1.
@@ -2756,10 +2821,18 @@ class TestLateArrivalGuards:
 
             # Release A's gate → A lands.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='dk7-a: MergeOutcome',
+            )
             assert outcome_a.status == 'done'
 
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='dk7-b: MergeOutcome',
+            )
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -2844,13 +2917,25 @@ class TestLateArrivalGuards:
             worker_task = asyncio.create_task(worker.run())
 
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='sv7-a: gate_a_entered',
+            )
 
             await worker._queue.put(req_b)
 
             gate_a_release.set()
-            await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='sv7-a: MergeOutcome',
+            )
+            await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='sv7-b: MergeOutcome',
+            )
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -2942,7 +3027,11 @@ class TestLateArrivalGuards:
             worker_task = asyncio.create_task(worker.run())
 
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='k1-7-a: gate_a_entered',
+            )
 
             # After gate_a_entered: exactly ONE permit held (the look-ahead).
             # With K=1, slot._value == 0.
@@ -2954,10 +3043,18 @@ class TestLateArrivalGuards:
             await worker._queue.put(req_b)
 
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='k1-7-a: MergeOutcome',
+            )
             assert outcome_a.status == 'done'
 
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='k1-7-b: MergeOutcome',
+            )
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -3069,7 +3166,11 @@ class TestLateArrivalGuards:
             #   (3) done the peek → found nothing → entered RETAIN state
             #   (4) set pending_spec_base = A's merge commit, held_spec_permit=True
             #   (5) blocked in _acquire_next_request() (queue empty, no B)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='shutdown-guard-a: gate_a_entered',
+            )
 
             # RETAIN state: exactly one permit held; slot._value == K-1.
             retain_value = worker._speculation_slot._value
@@ -3246,19 +3347,35 @@ class TestLateArrivalSubmissionOrderCAS:
 
             # Enqueue A; wait for look-ahead peek to fire.
             await worker._queue.put(req_a)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='cas8-a: gate_a_entered',
+            )
 
             # Inject B LATE; wait for B's remote verify to enter.
             await worker._queue.put(req_b)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='cas8-b: gate_b_entered',
+            )
 
             # Release A → A lands; then release B → B advances.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='cas8-a: MergeOutcome',
+            )
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
             gate_b_release.set()
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='cas8-b: MergeOutcome',
+            )
 
             await worker.stop()
 
