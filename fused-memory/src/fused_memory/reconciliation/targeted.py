@@ -994,17 +994,30 @@ class TargetedReconciler:
                 # Fall back to direct taskmaster call when interceptor is not set
                 # (keeps existing unit-test fixtures working; the wiring-contract test
                 # in TestServerWiringContract ensures production always wires correctly).
+                #
+                # metadata_mode='additive' is LOAD-BEARING on both branches — do not
+                # drop it back to the default (task 3581). This write attaches
+                # GENERATED hints onto a row that may already carry human-authored
+                # memory_hints; the default 'merge' is shallow last-write-wins, so it
+                # replaced the whole authored memory_hints key with the stub built
+                # above — the DF-3260 clobber. 'additive' is the mode built for exactly
+                # this collision: it recursively unions the nested entities/queries
+                # lists. Stated explicitly rather than as a bare append=True so the
+                # intent is legible and it can never collide with the backend's
+                # merge+append=True contradiction guard.
                 resp: Any
                 if self.task_interceptor is not None:
                     resp = await self.task_interceptor.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
+                        metadata_mode='additive',
                         project_root=scope.project_root,
                     )
                 else:
                     resp = await self.taskmaster.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
+                        metadata_mode='additive',
                         project_root=scope.project_root,
                     )
 
