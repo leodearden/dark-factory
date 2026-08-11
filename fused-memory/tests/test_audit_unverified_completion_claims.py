@@ -44,6 +44,9 @@ IN_SCOPE_CATEGORIES = _mod.IN_SCOPE_CATEGORIES
 CorpusRecord = _mod.CorpusRecord
 ScannedRecord = _mod.ScannedRecord
 scan_records = _mod.scan_records
+adjudicate = _mod.adjudicate
+Finding = _mod.Finding
+UNRESOLVABLE = _mod.UNRESOLVABLE
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -241,3 +244,154 @@ class TestScanRecords:
             [_record(text=ESC_3085_1_INSTANCE_1, project_id='dark_factory')]
         )
         assert scanned[0].claims[0].project_id == 'dark_factory'
+
+
+class TestAdjudicate:
+    """Verdicts, via the IMPORTED verify_claims with hand-written probes.
+
+    Every probe is injected, so the whole adjudication layer is exercised with
+    no Taskmaster, no ticket DB and no git.
+    """
+
+    def _adjudicate(
+        self,
+        text: str,
+        *,
+        task_status: object = None,
+        ticket: object = None,
+        commit: object = None,
+        category: str = 'temporal_facts',
+        uuid: str = 'ep-1',
+        created_at: str = '2026-07-26T00:00:00Z',
+    ) -> list[object]:
+        scanned = scan_records(
+            [_record(uuid=uuid, text=text, category=category, created_at=created_at)],
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+        return adjudicate(
+            scanned,
+            task_status_probe=lambda ref, project_id: task_status,
+            ticket_probe=lambda ref: ticket,
+            commit_probe=lambda ref, project_id: commit,
+        )
+
+    def test_absent_ticket_is_a_mismatch(self) -> None:
+        """esc-3085-1 instance (2), reproduced end-to-end.
+
+        ``None`` from the ticket probe means the registry ANSWERED and said no
+        such ticket — that is evidence the writer was wrong.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=None)
+        assert len(findings) == 1
+        assert findings[0].status == 'mismatch'
+        assert findings[0].subject == 'ticket'
+        assert findings[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    def test_unresolvable_ticket_registry_is_unverifiable_not_mismatch(self) -> None:
+        """THE CRITICAL ASSERTION — the deliberate divergence from the live gate.
+
+        ``TaskInterceptor.get_ticket_row`` returns None BOTH for "no such
+        ticket" and for "no ticket store configured" (task_interceptor.py:
+        3006-3012), and ``_verify_ticket`` maps a None row to 'mismatch'
+        (completion_claim_gate.py:575). On the write path that conflation is
+        contained upstream by the _taskmaster_configured guard and costs one
+        spurious tag. In a BATCH sweep it would print a fabrication accusation
+        against every ticket claim in the corpus whenever tickets.db is merely
+        absent. The gate's own module makes this distinction load-bearing at the
+        sentinel level (:123-127, INV-2); honouring it here follows that intent.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=UNRESOLVABLE)
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+        assert findings[0].status != 'mismatch'
+
+    def test_existing_ticket_verifies_and_is_dropped(self) -> None:
+        findings = self._adjudicate(
+            ESC_3085_1_INSTANCE_2,
+            ticket={'project_id': 'dark_factory', 'status': 'open'},
+        )
+        assert findings == []
+
+    def test_terminal_task_status_verifies_and_is_dropped(self) -> None:
+        """Verified claims never appear — the report is a report of problems."""
+        assert self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='done') == []
+
+    def test_open_task_status_is_a_mismatch(self) -> None:
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='in-progress')
+        assert len(findings) == 1
+        assert findings[0].status == 'mismatch'
+        assert findings[0].observed == 'in-progress'
+
+    def test_unresolvable_task_status_is_unverifiable(self) -> None:
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status=None)
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+
+    def test_unknown_task_status_is_unverifiable_not_mismatch(self) -> None:
+        """'unknown' is get_statuses' NULL sentinel, not a live status.
+
+        It cannot contradict the claim, but it cannot confirm it either.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='unknown')
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+
+    def test_absent_commit_is_a_mismatch_unresolvable_is_not(self) -> None:
+        text = 'task 3142 has landed in commit 23f1c27ddf'
+        absent = self._adjudicate(text, commit=False)
+        assert len(absent) == 1
+        assert absent[0].status == 'mismatch'
+        assert absent[0].subject == 'commit'
+
+        unresolvable = self._adjudicate(text, commit=None)
+        assert len(unresolvable) == 1
+        assert unresolvable[0].status == 'unverifiable'
+
+        present = self._adjudicate(text, commit=True)
+        assert present == []
+
+    def test_finding_is_self_contained(self) -> None:
+        """A reader can re-check the verdict without re-running the sweep."""
+        findings = self._adjudicate(
+            ESC_3085_1_INSTANCE_2,
+            ticket=None,
+            category='decisions_and_rationale',
+            uuid='02090224-7bc9-4485-9291-6748e1042ac9',
+            created_at='2026-07-27T05:00:00Z',
+        )
+        finding = findings[0]
+        assert finding.record_uuid == '02090224-7bc9-4485-9291-6748e1042ac9'
+        assert finding.record_kind == 'episode'
+        assert finding.category == 'decisions_and_rationale'
+        assert finding.created_at == '2026-07-27T05:00:00Z'
+        assert finding.project_id == 'reify'
+        assert finding.claim_kind == 'filing_dispatch'
+        assert 'tkt_0RRRC5AASJ9Z630VP4PCN9H376' in finding.claimed_text
+        assert 'no ticket' in finding.observed
+        assert finding.derived_edge_uuids == ()
+        assert finding.to_json()['status'] == 'mismatch'
+
+    def test_mismatches_sort_before_unverifiables(self) -> None:
+        """A mismatch is evidence a writer was wrong; an unverifiable is merely
+        unchecked. The ordering is what makes the head of the report the part
+        worth reading."""
+        scanned = scan_records(
+            [
+                _record(uuid='ep-unver', text=ESC_3085_1_INSTANCE_2,
+                        category='decisions_and_rationale'),
+                _record(uuid='ep-mism', text=ESC_3085_1_INSTANCE_1,
+                        category='temporal_facts'),
+            ],
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+        findings = adjudicate(
+            scanned,
+            task_status_probe=lambda ref, project_id: 'in-progress',
+            ticket_probe=lambda ref: UNRESOLVABLE,
+            commit_probe=lambda ref, project_id: None,
+        )
+        assert [f.status for f in findings] == ['mismatch', 'unverifiable']
