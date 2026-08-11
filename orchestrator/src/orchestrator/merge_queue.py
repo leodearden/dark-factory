@@ -5991,9 +5991,41 @@ async def build_chain(
     if lane is None:
         return ChainResult(links=[], tip=head_merge_commit)
 
-    # The sequential merge loop lands in step-14.
-    await release_chain_build_lane(git_ops, lane, warm=warm)
-    return ChainResult(links=[], tip=head_merge_commit)
+    links: list[tuple[str, str]] = []
+    # `tip` starts at the base so a zero-link result still names a verifiable tip.
+    tip = head_merge_commit
+    try:
+        for req in queue_snapshot[:depth]:
+            # bare_id so merge_branch_into_worktree's resolve_queued_branch_ref /
+            # branch_prefix handling matches the sequential path exactly.
+            res = await git_ops.merge_branch_into_worktree(lane, req.branch.bare_id)
+            if not res.success or res.merge_commit is None:
+                # Truncate. Do NOT retry, and do NOT skip past this item to try
+                # later ones: the chain must be a contiguous PREFIX of the
+                # queue, because δ lands `links` in order through the existing
+                # CAS advance and a hole would break the in-order /
+                # frozen-prefix invariant. (step-16 adds reason classification.)
+                break
+            links.append((req.task_id, res.merge_commit))
+            tip = res.merge_commit
+    except BaseException:
+        # A cancellation mid-build must not strand a pool lane in ASSIGNED
+        # (mirrors merge_to_main's except BaseException cleanup).
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+        raise
+
+    if not links:
+        # An empty result never holds a lane, so a caller that skips the
+        # release on the empty path cannot leak one.
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+        return ChainResult(links=[], tip=tip)
+
+    # One line per chain build, not per item — this runs on the dispatch path.
+    logger.info(
+        'build_chain: depth=%d built=%d tip=%s lane=%s',
+        depth, len(links), tip[:8], lane.name,
+    )
+    return ChainResult(links=links, tip=tip, lane=lane, lane_warm=warm)
 
 
 async def _journal_landed_then_advance(
