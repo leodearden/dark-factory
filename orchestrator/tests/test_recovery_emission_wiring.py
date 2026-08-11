@@ -153,7 +153,7 @@ def _bind_reports(harness: Harness, reports: dict[str, TruthReport]) -> _StubGro
 
 def _rows(harness: Harness, event_type: EventType | None = None) -> list[dict]:
     """Every event row, oldest first, with ``data`` JSON-decoded."""
-    conn = sqlite3.connect(str(harness.event_store.db_path))
+    conn = sqlite3.connect(str(harness.event_store.db_path))  # type: ignore[union-attr]
     try:
         sql = 'SELECT task_id, event_type, data FROM events'
         params: tuple = ()

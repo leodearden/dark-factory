@@ -1696,7 +1696,7 @@ class TestDeterministicReconZeroBehaviorChange:
         task = _pinned_deploy_strand()
         h.scheduler.get_tasks = AsyncMock(return_value=[task])
         h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
-        h._escalation_queue.get_pending = MagicMock(
+        h._escalation_queue.get_pending = MagicMock(  # type: ignore[union-attr]
             return_value=[_pinning_esc(task_id='tid-pinned')],
         )
         h._recon_unit_inspector = AsyncMock(return_value={

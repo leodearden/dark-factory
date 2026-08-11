@@ -1859,7 +1859,7 @@ def _emitting_harness(mock_orch_config, tmp_path: Path) -> Harness:
 
 def _recovery_rows(harness: Harness) -> list[dict]:
     """Every recovery event row, oldest first, with ``data`` JSON-decoded."""
-    conn = sqlite3.connect(str(harness.event_store.db_path))
+    conn = sqlite3.connect(str(harness.event_store.db_path))  # type: ignore[union-attr]
     try:
         return [
             {'task_id': tid, 'event_type': et, 'data': json.loads(raw or '{}')}
