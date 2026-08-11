@@ -14182,6 +14182,136 @@ class TestHarnessDetectIndexDrift:
         )
 
 
+class TestHarnessIndexHealthStartupSweep:
+    """ReconciliationHarness._check_index_health_at_startup is REGISTRY-scoped.
+
+    Q3's startup half.  The scope is `self._known_projects` — the same registry
+    D5 names (taskmaster.project_root + DASHBOARD_KNOWN_PROJECT_ROOTS) — NOT
+    `initialize()`'s `!= default_db and not endswith('_db')` graph filter.  That
+    filter matches all 35 probe/test/scratch graphs plus the real ones, and
+    since γ has not landed EVERY one of them is genuinely un-provisioned today:
+    sweeping it would file ~35 escalations on the first restart, converting a
+    loud signal into noise the watcher would close one by one.
+
+    step-11 (RED): _check_index_health_at_startup does not exist yet.
+    step-12 (GREEN): add it to harness.py.
+    """
+
+    def _sweep_harness(self, journal, event_buffer, mock_memory_service):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness._known_projects = {
+            'dark_factory': '/tmp/df',
+            'autotrade': '/tmp/at',
+        }
+        harness.memory.graphiti = MagicMock()
+        # The graph server also hosts unregistered scratch graphs — the sweep
+        # must never health-check these.
+        harness.memory.graphiti.list_graphs = AsyncMock(
+            return_value=[
+                'dark_factory',
+                'autotrade',
+                '_test_foo_ab12cd34',
+                'probe_e1_gw3',
+                'my_solar_challenge',
+            ]
+        )
+        return harness
+
+    @pytest.mark.asyncio
+    async def test_sweep_visits_exactly_the_registered_projects(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Only registered project ids are checked — never the scratch graphs."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _record(group_id, **kwargs):
+            seen.append(group_id)
+            return None
+
+        harness._detect_index_drift = _record
+
+        await harness._check_index_health_at_startup()
+
+        assert seen == ['autotrade', 'dark_factory'], (
+            'The sweep must visit exactly the REGISTERED projects, in sorted '
+            f'order, and no scratch graph; got {seen}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_never_touches_unregistered_scratch_graphs(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A probe/test/scratch graph must not be turned into an escalation."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _record(group_id, **kwargs):
+            seen.append(group_id)
+            return None
+
+        harness._detect_index_drift = _record
+
+        await harness._check_index_health_at_startup()
+
+        for scratch in ('_test_foo_ab12cd34', 'probe_e1_gw3', 'my_solar_challenge'):
+            assert scratch not in seen, (
+                f'{scratch} is not a registered project — health-checking it '
+                'would file an escalation no operator can act on'
+            )
+
+    @pytest.mark.asyncio
+    async def test_one_project_failing_does_not_skip_the_rest(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Isolation: a raise on the first project must not abort the sweep.
+
+        A health hiccup must never break harness startup — exactly the posture
+        the sibling one-shot recovery passes document.
+        """
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _flaky(group_id, **kwargs):
+            seen.append(group_id)
+            if group_id == 'autotrade':  # the FIRST in sorted order
+                raise RuntimeError('graph server unreachable')
+            return None
+
+        harness._detect_index_drift = _flaky
+
+        await harness._check_index_health_at_startup()
+
+        assert seen == ['autotrade', 'dark_factory'], (
+            f'The sweep must continue past a failing project; got {seen}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_is_a_silent_noop(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """No registered projects → nothing checked, nothing raised."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        harness._known_projects = {}
+        harness._detect_index_drift = AsyncMock()
+
+        await harness._check_index_health_at_startup()
+
+        harness._detect_index_drift.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sweep_itself_never_raises(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Every project failing still returns normally — startup is never broken."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        harness._detect_index_drift = AsyncMock(
+            side_effect=RuntimeError('everything is down')
+        )
+
+        await harness._check_index_health_at_startup()
+
+
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
