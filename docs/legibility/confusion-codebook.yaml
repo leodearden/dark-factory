@@ -1195,6 +1195,13 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Background watcher task reaped/killed after timeout. Matches 'bg-task reaping' and 'liveness checks' mismatch patterns where harness termination is scored as anomaly.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 3938acd1-24cc-49a9-ac0f-035f5d914657
+    origin_phase: ops
+    manifested_phase: ops
+    invariant_violated: Escalation watcher should re-arm cleanly; instead observes repeated exit-124 timeouts and process kills
+    note: 17 consecutive watcher-rearm.sh invocations; mix of exit 124 (timeout ceiling), task killed by harness, and process death. Matches pattern of harness constraints conflicting with watcher lifecycle expectations.
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -1819,6 +1826,12 @@ entries:
     origin_phase: architect
     manifested_phase: implement
     note: 'Orchestrated task resume boilerplate assumes `.task-meta/3609/iterations.jsonl` exists. Error at turn 25: File does not exist. The path structure differs slightly from candidate text (.task-meta vs .task) but the pattern is identical.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: e51a3763-38b5-4785-8fd5-02b85eea628c
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Turn 23: Task metadata file .worktrees/.task-meta/3543/iterations.jsonl not found during session execution.'
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -2094,6 +2107,12 @@ entries:
     manifested_phase: ops
     invariant_violated: Rotation launch context must inject required env vars; DARK_FACTORY_ROOT undocumented and absent from supervisor prompt vocabulary
     note: 'Turn 71: watcher-rearm.sh exits with ''DARK_FACTORY_ROOT must be set to a valid directory''; subsequently worked around by agent exporting it manually in turns 98+'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: fc452e6a-96c1-4dff-9b11-647fee96ba0b
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 104: watcher-rearm.sh fails with ''DARK_FACTORY_ROOT must be set to a valid directory''. Supervisor-injected rotation prompt does not provide this required env var. Worker manually exports it in turn 133 retry.'
 - id: entry-cand-20260722-4
   title: Session-start memory search returns generically high-scored but task-irrelevant context
   severity: medium
@@ -2949,6 +2968,18 @@ entries:
     origin_phase: ops
     manifested_phase: implement
     note: Session-start memory search returns high relevance scores (1.0, 0.95, 0.9) for generic, task-irrelevant project history (tasks 1470, 2531, 841 circa May 2026) in a task dispatched to review 3543 dashboard changes (August 2026). Scores decouple from actionable relevance to the active task.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: cf5aa84c-ca41-4548-93cb-c30e7bd37088
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Session-start context search injects generic, task-irrelevant memories scored as highly relevant (1.0, 0.95, 0.9). Results reference tasks 1470, 2531, #841 from 2026-05, 2026-04 — months old and unrelated to current worktree 3709 task execution.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 30c74db9-c9dd-4c08-9f0d-99e9aba020e1
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Session-start memory search returns high-scored (1.0, 0.95, 0.9) but stale/generic results dated months prior (May 17, May 1, April 19); relevance scores suggest strong match while content is decontextualized and task-irrelevant
 - id: entry-cand-20260717-2
   title: Rotation-hour budget invisible during long blocking re-arm waits
   severity: medium
@@ -4128,6 +4159,24 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: modulenotfounderror signal at turn 15 in orchestrated-task worktree (.worktrees/3689); phase origin uncertain (entry references architect explore-phase, but task could be implement or later)
+  - date: '2026-08-11'
+    project: dark_factory
+    session: dd524a2d-d29e-4c34-8823-5561e3f1c4b6
+    origin_phase: architect
+    manifested_phase: architect
+    note: grep exit code 2 (ensure_snapshot_columns search) + 3 'not found' signals across turns 16, 41, 55 in task worktree .worktrees/3543
+  - date: '2026-08-11'
+    project: dark_factory
+    session: ae444400-0449-45e0-8f3f-3c9eeb0a3b0d
+    origin_phase: architect
+    manifested_phase: architect
+    note: Agent encountered 11 not_found errors (mostly ModuleNotFoundError) while exploring task/3223 in task worktree context during rebase/review; despite environmental friction, agent recovered and completed rebase and comprehensive review successfully
+  - date: '2026-08-11'
+    project: dark_factory
+    session: f6b02aae-e011-45df-a6ae-1ac7f83aa340
+    origin_phase: architect
+    manifested_phase: architect
+    note: Two ModuleNotFoundError signals in turns 60 and 177 of a .worktrees/3765 orchestrated-task session; recurring failures across the same task suggest persistent import/dependency issue in worktree environment or missing module setup during explore phase
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -4440,6 +4489,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: User Corrections section turn 3 contains what reads as the trickle-coder's own task prompt ('You are the periodic-census synthesis writer...') followed by '=== VERIFIED CLUSTERS ===' section; prompt mislabeled as user feedback rather than injected task framing.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 5e723e7b-b6c8-4840-8912-a1ddfb7a521a
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest pipeline extracted the injected /recon-escalation-watcher command (with boilerplate instruction 'Before you end this session...') and labeled it as a 'User Correction' despite being a skill-injected prompt, not user feedback
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -4756,6 +4811,31 @@ entries:
     origin_phase: ops
     manifested_phase: unknown
     note: 'Not Found section renders bare templates without matched substring context: ''(turn 21) does not exist'' and ''(turn 27) does not exist'''
+  - date: '2026-08-11'
+    project: dark_factory
+    session: a5044e78-e2d0-4f35-b8f6-a81e896af24d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest summary renders all four ''not_found'' signals as bare templates (''not found in'' / ''does not exist'') with zero detail on what object or location was searched. Entry-20260722-33 describes exactly this pattern: digest generator drops matched substring and renders guards/not-found as bare templates.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 30c74db9-c9dd-4c08-9f0d-99e9aba020e1
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: digest-extraction drops matched content from template signals
+    note: Three 'not found in' signals rendered as bare templates with the substring (actual missing item/path/name) dropped entirely; matches candidate description exactly
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 997b23c5-e2c5-41c6-928b-f395d0afbfca
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest truncates 'not found in' entries (turns 30, 34) as bare templates without matched substring or file context
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4fd435e4-a2b6-4a91-bf05-ce7264316f0d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Two guard trips rendered as bare 'blocked:' templates with no contextual detail or matched substring; exemplifies the digest generator's pattern of dropping guard detection content
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -5084,6 +5164,19 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Watcher background task 'Arm recon watcher, 3600s slice' killed at designed timeout boundary, scored as tool_error:1. Signal-scorer may be conflating normal bounded-wait expiration (exit 124) with a genuine failure.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 3938acd1-24cc-49a9-ac0f-035f5d914657
+    origin_phase: unknown
+    manifested_phase: ops
+    invariant_violated: Signal scorer conflates designed timeout-ceiling (exit 124) with tool_error, inflating perceived error rate and masking root causes
+    note: Exit code 124 is timeout(1)'s designed behavior for bounded-wait scripts, scored as tool_error. Digest signal_counts lists 3 tool_errors; primary source is watcher-rearm.sh's designed ceiling, not actual failures.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: fc452e6a-96c1-4dff-9b11-647fee96ba0b
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 133: watcher-rearm.sh exits with code 124 (designed timeout ceiling, marked ''CEILING exit=124''). Session reports signal_counts.tool_error: 2, suggesting the designed timeout is being misscored as a tool error rather than bounded-wait completion.'
 - id: entry-cand-20260730-25
   title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
   severity: medium
@@ -5308,6 +5401,12 @@ entries:
     origin_phase: implement
     manifested_phase: ops
     note: Session's 'User Corrections' bucket captured the dispatched task's injected '# Context'/'## Project Context' fused-memory search-results JSON as if it were a user correction — same digest-pipeline mislabeling of an ordinary task-dispatch briefing block seen in this entry's other instances.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: e51a3763-38b5-4785-8fd5-02b85eea628c
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Injected '# Context' briefing block from memory search mislabeled as 'User Corrections' in digest extraction.
 - id: entry-cand-20260731-1
   title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
   severity: medium
@@ -6053,6 +6152,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Session scored 5.0 with every signal_count (tool_error, self_correct, not_found, df_guard, interrupt) at 0 — score assigned with no supporting fired signal.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d54ead31-0cb1-496c-a7d1-38a2683e5e6d
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest assigned severity score 5.0 despite all signal_counts (tool_error, self_correct, not_found, df_guard, interrupt) reading zero; high score decoupled from evidence
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -6401,6 +6506,19 @@ entries:
     origin_phase: ops
     manifested_phase: implement
     note: 'Session digest mislabels the orchestrated-task''s injected ''# Context'' briefing block (memory search results) as ''User Corrections'' (turn 3). The context itself disclaims: ''This context was recalled from the `dark_factory` project''s memory — it is NOT a description of this worktree.'' This is digested as corrective user feedback despite being structured project briefing.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 3938acd1-24cc-49a9-ac0f-035f5d914657
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: Digest 'User Corrections' section mislabels system-generated task notifications and harness instructions as user feedback
+    note: Digest captures /escalation-watcher command invocation, task-notification payloads, and spawn instructions under 'User Corrections'. These are system-harness metadata, not corrective user input.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 30c74db9-c9dd-4c08-9f0d-99e9aba020e1
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Digest labels injected memory-search '# Context' block under 'User Corrections' section; session shows memory results (relevance 1.0–0.9, dated May 2026) mislabeled as corrective feedback when actually system-injected context
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -6468,6 +6586,13 @@ entries:
     manifested_phase: ops
     invariant_violated: MEMORY.md concurrent write atomicity
     note: 'Turn 384: Edit to MEMORY.md failed with ''String to replace not found'', suggesting concurrent modification or stale read. Followed by 3 not_found errors (turns 384, 409, 413), indicating cascade failure from the initial collision.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 3938acd1-24cc-49a9-ac0f-035f5d914657
+    origin_phase: unknown
+    manifested_phase: recon
+    invariant_violated: Concurrent writes to MEMORY.md cause stale-check rejections, blocking memory updates
+    note: 'Turn 635: Edit fails with ''File has been modified since read'' on MEMORY.md append. Auto-memory and concurrent sessions race on the same file.'
 - id: entry-cand-20260726-1
   title: Trickle-coder digest labels a pasted recon stage-report dump as a 'User Correction' despite all signal_counts reading zero
   severity: medium
@@ -7020,6 +7145,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest 'User Corrections' bucket contains '# Context' block (turn 3)—the task's system-injected briefing context, misclassified as user-provided correction
+  - date: '2026-08-11'
+    project: dark_factory
+    session: cf5aa84c-ca41-4548-93cb-c30e7bd37088
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Digest generator mislabels the dispatched task's injected '# Context' project-briefing memory-search block as a 'User Correction' (turn 3). The injected context explicitly disclaims relevance ('may name tasks, repos, crates, or file paths that do not exist here'), yet the agent subsequently fires 12 not_found errors attempting to navigate paths from recalled memories.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d54ead31-0cb1-496c-a7d1-38a2683e5e6d
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section appears to contain a task-briefing prompt about file prediction ('Given these tasks and this codebase structure, predict which files each task will create or modify') rather than actual user feedback; digest extraction mislabeled an injected task briefing/instruction block as a correction
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -7757,6 +7894,36 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: Orchestrated-task in worktree fires repeated 'does not exist' errors (turns 56, 240) with only not_found diagnostic signal present; tool_error/self_correct/df_guard/interrupt all zero
+  - date: '2026-08-11'
+    project: dark_factory
+    session: cf5aa84c-ca41-4548-93cb-c30e7bd37088
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Orchestrated worktree task fires repeated ''no such file or directory'' errors with minimal diagnostic context (turn 88: ''cd escalation'' fails; turn 260: sed cannot read src/fused_memory/reconciliation/harness.py). Total 12 not_found signals, sourced from paths recalled in injected memory context.'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 78120271-47b9-4be0-a993-48e443095a12
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated worktree task fires 'does not exist' (file-not-found) in turn 45 with no accompanying diagnostic signals (tool_error=0, df_guard=0, interrupt=0)
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 8c1fc4c9-f584-4007-ab35-24b61c0231b1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Worktree session (.worktrees/4004) with 3 not_found signals and 1 tool_error from file-access failures to fused-memory module paths. Pattern matches 20260728-3 except agent_class=interactive rather than orchestrated; suggests root cause affects both task-dispatched and interactive worktree sessions.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 997b23c5-e2c5-41c6-928b-f395d0afbfca
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Worktree task (.worktrees/3543) fires repeated 'not found' signals on turns 30, 34 during test file exploration with no diagnostic context
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 30c74db9-c9dd-4c08-9f0d-99e9aba020e1
+    origin_phase: architect
+    manifested_phase: architect
+    note: Orchestrated worktree task fires 4 repeated 'no such file or directory' errors (turns 57, 77, 154, 157) with zero tool_error signals; matches pattern of undiagnosed file-access failures
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -12007,3 +12174,68 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: (turn 99) Bash(... grep -m1 -E ...) -> Exit code 1 / [incomplete pattern and output truncation]
+- id: cand-20260811-1
+  title: Injected memory-context paths poison worktree agent with no scoping guard
+  cause: Orchestrated task agents receive session-start memory search results that reference project-wide paths (escalation/, src/fused_memory/...) from recalled tasks, but these paths do not exist in the isolated worktree context. No filtering validates whether recalled paths are reachable in the current execution sandbox before injection.
+  area: session-startup memory injection + worktree isolation
+  first_seen: '2026-08-11'
+  disposition: pending
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: cf5aa84c-ca41-4548-93cb-c30e7bd37088
+    origin_phase: ops
+    manifested_phase: implement
+    evidence_quote: User Corrections block explicitly warns 'it may name tasks, repos, crates, or file paths that do not exist here' but proceeds to inject unfiltered memory search results; subsequent agent execution fires 12 cascading not_found errors on those unreachable paths (turns 13–453).
+- id: cand-20260811-2
+  title: 'Database schema drift: missing ''depends_on_id'' column in task dependencies query'
+  cause: Task dependency query uses outdated column name or schema migration incomplete; fused-memory task database schema may have renamed or relocated the dependencies foreign-key column
+  area: fused-memory API / task database
+  first_seen: '2026-08-11'
+  disposition: pending
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 3938acd1-24cc-49a9-ac0f-035f5d914657
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'Turn 243: ''Error: in prepare, no such column: depends_on_id'' when executing ''select group_concat(depends_on_id) from dependencies where task_id=3731''. Affects task dependency chain resolution during escalation investigation.'
+- id: cand-20260811-3
+  title: Interactive investigation brief discovery and module navigation failures
+  cause: Interactive agent investigating an escalation cannot reliably locate investigation briefs (.claude/spawn-briefs/<id>.md) or navigate fused-memory cross-module structure; 4 not_found errors and a ModuleNotFoundError suggest systematic path/import discovery failures when exploring codebase in depth.
+  area: path-discovery, module-navigation, import-resolution
+  first_seen: '2026-08-11'
+  disposition: pending
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d61a82e1-44ac-467f-a06e-72de909f7631
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: 'Turn 33: agent lists fused_memory/ structure, prints ''=== guard ==='' (expecting fused_memory/memory/ subdir), gets exit 2; turns 191,201,273,327 accumulate 4 not_found errors including ''modulenotfounderror''. Turn 6 user instruction: ''Read the brief at /home/leo/.claude/spawn-briefs/df-esc-3936-1-near-dup-silent-drop.md''. Actual structure has memory_metadata.py top-level only; no memory/ subdir found.'
+- id: cand-20260811-4
+  title: Module structure documentation vs. actual layout in fused-memory navigation
+  cause: 'Agents exploring fused-memory expect a fused_memory/memory/ subdirectory (turn 33: ''=== guard ==='' followed by exit 2 on ''ls fused_memory/memory''), but actual structure has memory_metadata.py top-level and memory functionality scattered across reconciliation/, services/, models/; no agent-facing guide to the actual layout.'
+  area: module-structure, agent-navigation, documentation-coherence
+  first_seen: '2026-08-11'
+  disposition: pending
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d61a82e1-44ac-467f-a06e-72de909f7631
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: 'Turn 33 Bash: lists backends, config, __init__.py, maintenance, mcp_tools, memory_metadata.py, middleware, models, reconciliation, routing, server, services, topic_slug.py, utils; then ''=== guard ==='' header with no output (dir not found). Agent expected fused_memory/memory/ subdir structure.'
+- id: cand-20260811-5
+  title: Worktree shell environment aliases break multi-file tool invocations
+  cause: Tool substitution (head aliased to skim) or environment divergence in worktree breaks agent's multi-file command assumptions; skim rejects `head -60 file1 file2 file3` as multi-argument invalid
+  area: Bash tool / shell environment compatibility
+  first_seen: '2026-08-11'
+  disposition: pending
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 997b23c5-e2c5-41c6-928b-f395d0afbfca
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'Turn 25: agent runs `head -60 dashboard/tests/test_tab_burndown.py dashboard/tests/test_tab_tasks_stranded_badge.py dashboard/tests/test_tab_escalation_analytics.py` → exit 2, ''error: unexpected argument'' from `skim [OPTIONS] [FILE]` — skim does not support multi-file syntax'
