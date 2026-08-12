@@ -4755,6 +4755,132 @@ def test_liveness_pass_isolates_exception(monkeypatch: pytest.MonkeyPatch) -> No
 _SS_LISTEN_8002 = _SS_HEADER + "LISTEN 0      2048       127.0.0.1:8002      0.0.0.0:*\n"
 
 
+def _fake_ss_run(
+    monkeypatch: pytest.MonkeyPatch, ss_stdout: str = _SS_LISTEN_8002
+) -> list[list[str]]:
+    """Fake subprocess.run answering the `ss` port probe; returns the call log."""
+    recorded: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        recorded.append(list(cmd))
+        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return recorded
+
+
+def test_report_row_labels_alive_as_the_verdict_source(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """USER-SIGNAL: the --report row names /alive, the route the verdict came from.
+
+    Not cosmetic. This row is what an operator reads to answer "why did / did
+    not the watchdog kill fused-memory". Since task 3765 the verdict no longer
+    comes from /health, so a row still labelled /health would send an operator
+    to inspect the wrong signal.
+
+    Driven through the REAL verdict chain (faked `ss` + urlopen rather than a
+    stubbed verdict function) so the zero-mutating-calls assertion stays
+    meaningful, mirroring test_print_fused_memory_liveness_row above.
+    """
+    wdog = _load_watchdog()
+    recorded_calls = _fake_ss_run(monkeypatch)
+    _install_url_dispatching_urlopen(
+        wdog, monkeypatch, {wdog.FUSED_MEMORY_ALIVE_URL: 200}
+    )
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", lambda: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "fused-memory.service" in out, f"expected the unit name in: {out!r}"
+    assert "/alive" in out, (
+        "the row must name /alive as the verdict's source — after task 3765 a "
+        f"'/health' label asserts something false. Got: {out!r}"
+    )
+    assert "healthy" in out, f"expected the verdict token in: {out!r}"
+    # The row still carries BOTH signals plus the task-3764 streak column.
+    assert "recon-busy" in out, f"the readiness column must survive: {out!r}"
+    assert "streak" in out, f"the task-3764 streak column must survive: {out!r}"
+    _assert_zero_mutating_calls(recorded_calls)
+
+
+def test_recon_busy_verdict_still_reads_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recon gate was NOT collaterally repointed — it still reads /health.
+
+    /alive carries no recon_busy field by construction, and
+    scripts/recon_busy_check.py's parse_health() plus
+    restart-fused-memory.sh's defer-if-busy gate depend on /health's exact
+    body shape. Repointing this too would silently break the restart script's
+    cycle-awareness.
+    """
+    wdog = _load_watchdog()
+    body = json.dumps(
+        {"status": "ok", "recon_busy": [{"project_id": "dark_factory", "run_id": "r1"}]}
+    )
+    _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_HEALTH_URL: lambda _url: _FakeHealthBodyResponse(body),
+            wdog.FUSED_MEMORY_ALIVE_URL: lambda url: pytest.fail(
+                f"the recon-busy gate must NOT read {url} — it carries no recon_busy body"
+            ),
+        },
+    )
+
+    assert wdog._fused_memory_recon_busy_verdict() == "busy"
+
+
+def test_report_row_fetches_alive_and_health_exactly_once_each(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One --report row draws liveness from /alive AND readiness from /health.
+
+    With the recon-busy verdict left UNSTUBBED, a single row must fetch each
+    route exactly once: the two signals are deliberately both shown and must
+    not collapse into one. That is what lets the row legitimately read
+    "healthy" while the backing store is degraded — the entire point of the
+    aliveness/readiness split.
+    """
+    wdog = _load_watchdog()
+    _fake_ss_run(monkeypatch)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", lambda: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+    asked = _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_ALIVE_URL: 200,
+            wdog.FUSED_MEMORY_HEALTH_URL: lambda _url: _FakeHealthBodyResponse(
+                json.dumps({"status": "ok", "recon_busy": []})
+            ),
+        },
+    )
+
+    wdog._print_fused_memory_liveness()
+
+    assert set(asked) == {wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_HEALTH_URL}, (
+        f"the row must draw from BOTH routes; fetched {asked!r}"
+    )
+    assert asked.count(wdog.FUSED_MEMORY_ALIVE_URL) == 1, f"fetched /alive twice: {asked!r}"
+    assert asked.count(wdog.FUSED_MEMORY_HEALTH_URL) == 1, f"fetched /health twice: {asked!r}"
+
+    out = capsys.readouterr().out
+    assert "healthy" in out and "idle" in out, (
+        f"expected the aliveness verdict AND the readiness column in: {out!r}"
+    )
+
+
 def test_print_fused_memory_liveness_row(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
