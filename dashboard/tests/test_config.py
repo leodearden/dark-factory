@@ -206,9 +206,11 @@ class TestNoUrlWarnsNamingRoot:
 
 
 class TestNonMappingEscalationSection:
-    """Scope 3: a non-mapping ``escalation:`` value, or a non-mapping YAML
-    root, is malformed configuration. Both map to the same warn-and-
-    return-None path as a YAML parse error — never to an exception —
+    """Scope 3: a non-mapping ``escalation:`` value, a non-mapping YAML
+    root, or a wrong-typed ``host``/``port`` leaf inside an otherwise
+    well-formed ``escalation:`` mapping, is malformed configuration. All
+    three map to the same warn-and-return-None path as a YAML parse error
+    — never to an exception, and never to a silently-malformed URL —
     regardless of whether the wrong-typed value is truthy (``'x'``, ``5``,
     ``true``, ``[a, b]``) or falsy (``[]``).
     """
@@ -262,8 +264,9 @@ class TestNonMappingEscalationSection:
         [
             ('just-a-string', 'str'),
             ('- a\n- b', 'list'),
+            ('[]', 'list'),
         ],
-        ids=['scalar-root', 'list-root'],
+        ids=['scalar-root', 'list-root', 'empty-list-root'],
     )
     def test_non_mapping_yaml_root_warns_and_skips(
         self, tmp_path, caplog, raw_body, type_name
@@ -272,7 +275,12 @@ class TestNonMappingEscalationSection:
 
         Pins that the pre-existing root guard becomes diagnostic — naming
         the file and the offending type — rather than silently swallowing
-        the file.
+        the file. Includes the FALSY ``[]`` root: a naive ``safe_load(f) or
+        {}`` coalesce would silently rewrite an empty-list document into
+        ``{}`` before the mapping check ever saw it, reopening exactly the
+        truthy/falsy asymmetry this module already closed for
+        ``escalation:`` values (see the class docstring) one level up, at
+        the whole-document level.
         """
         root = tmp_path / 'myproj'
         canonical_path = root / 'dark-factory-orchestrator.yaml'
@@ -315,6 +323,47 @@ class TestNonMappingEscalationSection:
         assert all(r.levelno == logging.WARNING for r in records)
         messages = [r.getMessage() for r in records]
         assert sum('not a mapping' in m for m in messages) == 1
+        assert sum('No escalation URL discovered' in m for m in messages) == 1
+        assert not any('please migrate' in m for m in messages)
+
+    @pytest.mark.parametrize(
+        ('escalation_value', 'field_name', 'type_name'),
+        [
+            ({'host': ['a'], 'port': 9101}, 'escalation.host', 'list'),
+            ({'host': '127.0.0.1', 'port': [9101]}, 'escalation.port', 'list'),
+        ],
+        ids=['bad-host-type', 'bad-port-type'],
+    )
+    def test_non_mapping_leaf_warns_and_skips(
+        self, tmp_path, caplog, escalation_value, field_name, type_name
+    ):
+        """A wrong-typed ``host`` or ``port`` LEAF warns and yields no URL — never a bad URL.
+
+        ``escalation:`` here is itself a well-formed mapping (unlike the
+        other tests in this class); only a leaf inside it is wrong-typed.
+        Without validating the leaves, a wrong-typed ``host`` or ``port``
+        previously formatted straight into the URL string with no
+        diagnostic at all — e.g. ``host: [a]`` silently produced
+        ``"http://['a']:9101/mcp"``, a malformed URL that would only fail
+        much later, at request time, with an opaque connection error
+        instead of a startup warning naming the file.
+        """
+        root = tmp_path / 'myproj'
+        canonical_path = root / 'dark-factory-orchestrator.yaml'
+        _write_yaml(canonical_path, {'escalation': escalation_value})
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        leaf_msgs = [
+            m for m in messages if field_name in m and str(canonical_path) in m and type_name in m
+        ]
+        assert len(leaf_msgs) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
         assert not any('please migrate' in m for m in messages)
 
