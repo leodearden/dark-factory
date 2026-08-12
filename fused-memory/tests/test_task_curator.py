@@ -6243,6 +6243,43 @@ class TestCuratorPromptLoaderWiringSingle:
         )
 
 
+class TestCuratorPromptResolveFailSafe:
+    """``_resolve_curator_prompt``'s docstring leans on "PromptArtifactStore.
+    resolve never raises ... so the curator's best-effort contract is
+    preserved", and it runs on every live reconciliation cycle. Pin that
+    dependency at the consumer boundary so a future refactor reintroducing the
+    raise fails where it actually hurts.
+    """
+
+    def test_resolve_curator_prompt_falls_back_when_provenance_sidecar_is_unreadable(
+        self, tmp_path
+    ):
+        """An unreadable (here: directory-in-place-of-file) provenance sidecar
+        must degrade to the in-code baseline, not raise into the curator.
+
+        Synchronous — the guard under test is reached before any LLM call, so
+        no ``invoke_with_cap_retry`` patch and no event loop are needed.
+        """
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
+
+        key_dir = store._key_dir(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+        )
+        key_dir.mkdir(parents=True)
+        # A real heuristics.txt so resolve() reaches the provenance load.
+        (key_dir / 'heuristics.txt').write_text('PINNED heuristics', encoding='utf-8')
+        (key_dir / 'provenance.json').mkdir()
+
+        assert (
+            curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+            == CURATOR_SINGLE_SPEC.in_code_constant
+        )
+
+
 # ----------------------------------------------------------------------
 # Prompt-loader wiring — batch-call path (task 2494 step-5/step-6)
 # ----------------------------------------------------------------------

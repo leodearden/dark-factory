@@ -647,6 +647,72 @@ class TestFailSafeUnverifiablePin:
         assert resolved.text == spec.in_code_constant
         assert resolved.provenance is None
 
+    def test_resolve_falls_back_when_provenance_sidecar_is_unreadable(self, tmp_path):
+        """The sixth member of this fail-safe family: the sidecar is neither
+        absent nor corrupt-JSON but *unreadable* — here the path is a
+        DIRECTORY, so read_bytes() raises IsADirectoryError. ``safe_io``
+        deliberately propagates every non-FileNotFoundError OSError, so
+        resolve() must absorb it itself to keep its "never raises" contract.
+
+        The directory trigger is used rather than ``chmod 0o000`` because root
+        bypasses permission bits: a chmod-based test would silently pass by
+        never failing whenever the suite runs as root.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        # A real heuristics.txt so resolve() gets past its exists() short-circuit
+        # and actually reaches the provenance load.
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        (key_dir / 'provenance.json').mkdir()
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
+    def test_read_provenance_returns_none_when_sidecar_is_unreadable(self, tmp_path):
+        """read_provenance() is a distinct public entry point onto the same
+        helper — it must fail safe on an unreadable sidecar independently of
+        resolve().
+        """
+        store = PromptArtifactStore(tmp_path)
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        (key_dir / 'provenance.json').mkdir()
+
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') is None
+
+    def test_resolve_falls_back_when_provenance_read_hits_permission_error(
+        self, tmp_path, monkeypatch
+    ):
+        """A permission flip landing mid-operation, simulated deterministically.
+
+        ``chmod 0o000`` is a no-op under root, so the flip is injected by
+        patching the module-level-bound ``load_json_or_warn`` name on
+        ``prompt_artifact`` (``prompt_artifact.py`` does
+        ``from shared.safe_io import load_json_or_warn``) — ``safe_io`` itself
+        is untouched.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+
+        def boom(path, *, default, on_corrupt='warn'):
+            raise PermissionError(13, 'Permission denied')
+
+        monkeypatch.setattr(prompt_artifact, 'load_json_or_warn', boom)
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
 
 class TestAtomicWriteText:
     """Direct coverage of the private write-then-replace helper's failure path."""
