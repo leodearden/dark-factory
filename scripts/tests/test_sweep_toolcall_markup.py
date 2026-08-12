@@ -1513,3 +1513,102 @@ def test_the_script_source_spells_no_raw_envelope_literal():
     """
     source = Path(sweep.__file__).read_text(encoding='utf-8')
     assert (chr(60) + '/') not in source
+
+
+# ---------------------------------------------------------------------------
+# step-19 — --apply end-to-end, and the BINDING second-run-zero invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_repairs_both_lanes_and_rewrites_only_what_it_repaired(sweep_root, capsys):
+    """The whole pipeline, on both corpora at once."""
+    record_path = (
+        sweep_root / 'data' / 'escalations' / 'archive' / '2026-08-08' / 'esc-2-1.json'
+    )
+    clean_path = record_path.parent / 'esc-3-1.json'
+    plan_path = sweep_root / '.worktrees-orphaned' / '9001-2026' / '.task' / 'plan.json'
+    link_path = sweep_root / '.worktrees-orphaned' / '9002-2026' / '.task' / 'plan.json'
+
+    original_detail = json.loads(record_path.read_text(encoding='utf-8'))['detail']
+    original_plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    clean_before = clean_path.read_bytes()
+    pending_before = (sweep_root / 'data' / 'escalations' / 'esc-1-1.json').read_bytes()
+
+    code, summary = _run_json(capsys, '--root', str(sweep_root), '--apply')
+    assert code == sweep.EXIT_CLEAN
+    assert summary['failed'] == 0
+
+    # --- the escalation record ---------------------------------------------
+    record = json.loads(record_path.read_text(encoding='utf-8'))
+    assert original_detail.startswith(record['detail']), 'detail is the PREFIX'
+    assert record['suggested_action'] in original_detail, 'recovered VERBATIM'
+    assert record['suggested_action'] == 'Re-run the merge worker after the lock clears.'
+    for key, value in json.loads(clean_before.decode()).items():
+        if key in ('detail', 'suggested_action'):
+            continue
+        assert record[key] == value or key in ('id', 'task_id', 'status')
+    assert type(record['evidence']) is list, 'type preserved'
+    assert not record_path.read_bytes().endswith(b'\n'), 'no newline added'
+
+    # --- the plans lane -----------------------------------------------------
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    assert plan['_schema_version'] == 1, 'no schema stamp, no re-indent'
+    assert plan['steps'] == original_plan['steps']
+    assert plan['design_decisions'][0]['rationale'] == 'The first rationale, mis-closed.'
+    assert plan['design_decisions'][1] == original_plan['design_decisions'][1]
+    assert plan_path.read_bytes().endswith(b'\n'), 'trailing newline preserved'
+
+    assert link_path.is_symlink(), 'the link is still a link'
+    assert detect(json.loads(link_path.read_text(encoding='utf-8'))
+                  ['design_decisions'][0]['rationale']) is None
+
+    # --- nothing else was touched ------------------------------------------
+    assert clean_path.read_bytes() == clean_before, 'a clean file is NOT rewritten'
+    assert (sweep_root / 'data' / 'escalations' / 'esc-1-1.json').read_bytes() == (
+        pending_before
+    ), 'the non-terminal record is untouched even under --apply'
+
+
+def test_the_second_run_reports_zero_and_changes_nothing(sweep_root, capsys):
+    """THE binding invariant. A second --apply is a total no-op.
+
+    This is the signal the whole task is measured by, so it is asserted three
+    ways at once: zero repairs, a clean exit, and byte-identity of every file
+    in the tree against the post-first-run state.
+    """
+    first_code, _first = _run_json(capsys, '--root', str(sweep_root), '--apply')
+    assert first_code == sweep.EXIT_CLEAN
+    after_first = read_bytes_map(sweep_root)
+
+    second_code, second = _run_json(capsys, '--root', str(sweep_root), '--apply')
+
+    assert second['repaired'] == 0
+    assert second_code == sweep.EXIT_CLEAN
+    assert read_bytes_map(sweep_root) == after_first
+
+
+def test_a_write_failure_exits_2_names_the_path_and_does_not_abort(sweep_root, capsys, monkeypatch):
+    """One failing target must not cost the others their repair."""
+    record_path = (
+        sweep_root / 'data' / 'escalations' / 'archive' / '2026-08-08' / 'esc-2-1.json'
+    )
+    plan_path = sweep_root / '.worktrees-orphaned' / '9001-2026' / '.task' / 'plan.json'
+    record_before = record_path.read_bytes()
+
+    real_replace = os.replace
+
+    def _selective(src, dst):
+        if Path(dst) == record_path:
+            raise OSError(13, 'Permission denied')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(sweep.os, 'replace', _selective)
+    code, summary = _run_json(capsys, '--root', str(sweep_root), '--apply')
+
+    assert code == sweep.EXIT_WRITE_FAILED
+    assert summary['failed'] == 1
+    assert record_path.read_bytes() == record_before, 'the failed target is intact'
+    assert json.loads(record_path.read_text(encoding='utf-8')), 'still valid JSON'
+    # ...and the sweep carried on to the other lane.
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    assert detect(plan['design_decisions'][0]['rationale']) is None, 'others repaired'
