@@ -781,3 +781,47 @@ def load_target(target: Target) -> LoadedDocument | Refusal:
             )
 
     return LoadedDocument(target=target, raw=raw, obj=obj)
+
+
+# ---------------------------------------------------------------------------
+# Round-trip-or-refuse (design decision 5).
+# ---------------------------------------------------------------------------
+
+#: Re-serializing the file's UNMODIFIED parse did not reproduce its bytes, so
+#: this sweep cannot rewrite it without introducing changes the corrupted
+#: strings did not cause. Refused and counted, never rewritten.
+REASON_FORMAT_NOT_REPRODUCIBLE = 'format-not-reproducible'
+
+
+def serialize_like(raw: str, obj: Any) -> str:
+    """Serialize *obj* the way *raw*'s own writer would have.
+
+    ``json.dumps(obj, indent=2)``, plus a trailing newline when the source had
+    one. Those are the only two conventions in play: ``Escalation.to_json``
+    writes ``indent=2`` with NO trailing newline (models.py:194) and
+    ``artifacts`` writes ``indent=2`` WITH one (artifacts.py:1370).
+
+    ``ensure_ascii`` stays at its default. The live corpus is full of
+    em-dashes and smart quotes stored as ``\\uXXXX`` escapes; flipping it would
+    rewrite every one of them and turn a two-field repair into a whole-file
+    diff.
+    """
+    text = json.dumps(obj, indent=2)
+    return text + '\n' if raw.endswith('\n') else text
+
+
+def round_trips(raw: str, obj: Any) -> bool:
+    """True if *obj* re-serializes to exactly *raw*.
+
+    Called with the file's UNMODIFIED parse, BEFORE any repair. That is what
+    buys the guarantee behind "each byte-diff is confined to the corrupted
+    strings": if ``dumps(before) == raw``, then ``dumps(after)`` differs from
+    ``raw`` exactly where the parsed object differs — proven per file at run
+    time rather than asserted once in a test.
+
+    It also fail-safes any hand-edited or unusually-formatted file for free.
+    Reusing ``plan_tools._atomic_write_plan`` was rejected for the same reason:
+    it stamps ``_schema_version`` and re-indents, which would put changes in
+    the diff that the corrupted strings did not cause.
+    """
+    return serialize_like(raw, obj) == raw

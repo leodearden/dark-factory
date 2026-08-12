@@ -1219,3 +1219,80 @@ def test_liveness_is_checked_only_for_meta_root_resolutions(sweep_root):
     (sweep_root / '.worktrees' / '.task').mkdir(parents=True, exist_ok=True)
     resolved = sweep.resolve_write_target(_plan_target(sweep_root, '9001-2026'), sweep_root)
     assert isinstance(resolved, sweep.ResolvedTarget)
+
+
+# ---------------------------------------------------------------------------
+# step-13 — round-trip-or-refuse.
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_like_reproduces_both_real_writers_byte_for_byte(sweep_root):
+    """The UNMODIFIED parse of each fixture must re-serialize to its own bytes.
+
+    This is the mechanical guarantee behind "each byte-diff is confined to the
+    corrupted strings": if dumps(before) == raw, then dumps(after) differs from
+    raw exactly where the parsed object differs. The property is proven PER
+    FILE at run time rather than asserted once in a test.
+    """
+    record = sweep_root / 'data' / 'escalations' / 'archive' / '2026-08-08' / 'esc-2-1.json'
+    plan = sweep_root / '.worktrees-orphaned' / '9001-2026' / '.task' / 'plan.json'
+
+    for path in (record, plan):
+        raw = path.read_text(encoding='utf-8')
+        assert sweep.serialize_like(raw, json.loads(raw)) == raw, path.name
+        assert sweep.round_trips(raw, json.loads(raw)) is True
+
+
+def test_the_trailing_newline_convention_is_taken_from_the_source(tmp_path):
+    """One writer appends a newline and the other does not; both are honoured."""
+    obj = {'a': 1}
+    assert sweep.serialize_like(json.dumps(obj, indent=2), obj).endswith('}')
+    assert sweep.serialize_like(json.dumps(obj, indent=2) + '\n', obj).endswith('}\n')
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        json.dumps({'id': 'e', 'status': 'resolved'}, indent=4),
+        json.dumps({'id': 'e', 'status': 'resolved'}),
+        json.dumps({'id': 'e', 'status': 'resolved'}, indent=2) + '\n\n',
+    ],
+    ids=['indent-4', 'compact', 'double-trailing-newline'],
+)
+def test_unreproducible_formatting_is_refused(raw):
+    """A hand-edited or unusually-formatted file fail-safes for free.
+
+    Rewriting it would put changes in the diff that the corrupted strings did
+    not cause — the exact reason plan_tools._atomic_write_plan was NOT reused
+    here (it stamps _schema_version and re-indents).
+    """
+    assert sweep.round_trips(raw, json.loads(raw)) is False
+
+
+def test_non_ascii_round_trips_byte_exactly(tmp_path):
+    """ensure_ascii stays at its default, so escapes survive unchanged.
+
+    The live corpus is full of em-dashes and smart quotes written as \\uXXXX
+    escapes. Flipping ensure_ascii=False would rewrite every one of them and
+    turn a two-field repair into a whole-file diff.
+    """
+    obj = {'id': 'e', 'status': 'resolved', 'detail': 'em—dash and “quotes” and é'}
+    raw = json.dumps(obj, indent=2)
+    assert '\\u2014' in raw, 'the fixture must actually exercise escaping'
+    assert sweep.serialize_like(raw, json.loads(raw)) == raw
+    assert sweep.round_trips(raw, json.loads(raw)) is True
+
+
+def test_key_order_is_reproduced_from_the_file_not_re_sorted():
+    """A file written with sorted keys still round-trips — and that is CORRECT.
+
+    Worth pinning because it is non-obvious: ``json.loads`` preserves the
+    order the keys appear in the FILE, so re-dumping without ``sort_keys``
+    reproduces whatever order that file had. The round-trip check is a
+    statement about BYTES, not about which writer produced them, so a
+    sorted-key file is reproducible and safe to rewrite rather than a format
+    this sweep must refuse.
+    """
+    raw = json.dumps({'z': 1, 'a': 2}, indent=2, sort_keys=True)
+    assert raw.index('"a"') < raw.index('"z"')
+    assert sweep.round_trips(raw, json.loads(raw)) is True
