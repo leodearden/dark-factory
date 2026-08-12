@@ -955,3 +955,147 @@ def test_a_baseline_record_is_frozen():
 
     with pytest.raises(ValidationError):
         record.consumers = []
+
+
+# ---------------------------------------------------------------------------
+# (i) probe-time pollution — a KNOWN-FOREIGN list plus baseline drift
+# ---------------------------------------------------------------------------
+#
+# The baseline guard's positive allowlist CANNOT be reused here.  At probe time
+# the arm's own container is legitimately a NEW consumer, and
+# `--query-compute-apps=pid,process_name,used_memory` cannot tell a
+# containerised vLLM `python` from any other `python` -- arms run as docker
+# containers and nvidia-smi reports HOST pids, so the arm appears as an
+# ordinary compute app.  A negative allowlist here would flag every healthy run.
+#
+# What IS decidable:
+#   (i)  a newcomer matching a known-foreign process path, and
+#   (ii) any change in a consumer that was already present at baseline -- which
+#        is by construction non-arm, because the arm was not running then.
+#
+# Both DIRECTIONS of (ii) are pollution.  Growth over-charges the arm; a shrink
+# or a vanish UNDER-charges it, and the flattering direction is precisely the
+# one a fabricated artifact wants.
+
+
+ARM_CONTAINER = _consumer(pid=910001, process_name='python', used_mib=12800)
+
+
+def test_a_new_unrecognised_consumer_alone_is_clean_because_it_may_be_the_arm():
+    """The arm itself is a newcomer at probe time and looks like any other
+    `python`.  Flagging it would make every healthy run POLLUTED."""
+    state, reason = lms_vram.classify_pollution([WHISPER], [WHISPER, ARM_CONTAINER])
+
+    assert state is lms_vram.PollutionState.CLEAN
+    assert reason == ''
+
+
+def test_an_unchanged_baseline_with_no_newcomer_at_all_is_clean():
+    state, reason = lms_vram.classify_pollution([WHISPER], [WHISPER])
+
+    assert state is lms_vram.PollutionState.CLEAN
+    assert reason == ''
+
+
+def test_an_ollama_newcomer_over_the_floor_pollutes_the_probe():
+    """The exact measured scenario: whisper-writer at 4050 and a 10314 MiB
+    `/usr/local/lib/ollama/llama-server` that arrived while the arm ran."""
+    state, reason = lms_vram.classify_pollution(
+        [WHISPER], [WHISPER, ARM_CONTAINER, OLLAMA],
+    )
+
+    assert state is lms_vram.PollutionState.POLLUTED
+    assert '905936' in reason
+    assert '/usr/local/lib/ollama/llama-server' in reason
+    assert '10314' in reason
+
+
+def test_a_foreign_newcomer_under_the_floor_is_noise():
+    tiny_ollama = _consumer(
+        pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=64,
+    )
+
+    state, _ = lms_vram.classify_pollution([WHISPER], [WHISPER, tiny_ollama])
+
+    assert state is lms_vram.PollutionState.CLEAN
+
+
+def test_a_baseline_consumer_that_grew_past_the_floor_pollutes():
+    """It was there before the arm started, so it is not the arm.  Its growth
+    is charged to the arm by `used - baseline`."""
+    fatter_whisper = _consumer(pid=7575, process_name='python', used_mib=6000)
+
+    state, reason = lms_vram.classify_pollution([WHISPER], [fatter_whisper])
+
+    assert state is lms_vram.PollutionState.POLLUTED
+    assert '7575' in reason
+    assert '4050' in reason and '6000' in reason
+
+
+def test_a_baseline_consumer_that_shrank_pollutes_and_the_reason_says_why():
+    """The FLATTERING direction, and the one a fabricated artifact wants.
+
+    A consumer that shrank leaves `used - baseline` smaller than the arm truly
+    took, so the arm gets a discount it did not earn.  Silence here would be a
+    verdict that passes for the wrong reason.
+    """
+    thinner_whisper = _consumer(pid=7575, process_name='python', used_mib=1000)
+
+    state, reason = lms_vram.classify_pollution([WHISPER], [thinner_whisper])
+
+    assert state is lms_vram.PollutionState.POLLUTED
+    assert 'under-charge' in reason.lower() or 'under-charg' in reason.lower()
+
+
+def test_a_baseline_consumer_that_vanished_pollutes():
+    state, reason = lms_vram.classify_pollution([WHISPER], [ARM_CONTAINER])
+
+    assert state is lms_vram.PollutionState.POLLUTED
+    assert '7575' in reason
+
+
+def test_sub_floor_jitter_in_a_baseline_consumer_stays_clean():
+    """whisper-writer's own allocation wobbles; a few hundred MiB cannot move a
+    verdict, and flagging it would make the guard cry wolf."""
+    jittered = _consumer(pid=7575, process_name='python', used_mib=4050 + 512)
+
+    state, reason = lms_vram.classify_pollution([WHISPER], [jittered, ARM_CONTAINER])
+
+    assert state is lms_vram.PollutionState.CLEAN
+    assert reason == ''
+
+
+def test_a_vanished_baseline_consumer_under_the_floor_is_noise():
+    stray = _consumer(pid=331, process_name='/usr/bin/glxgears', used_mib=512)
+
+    state, _ = lms_vram.classify_pollution([WHISPER, stray], [WHISPER])
+
+    assert state is lms_vram.PollutionState.CLEAN
+
+
+def test_the_reason_is_empty_exactly_when_the_state_is_clean():
+    """So a consumer can branch on either and never disagree with itself."""
+    cases = [
+        ([WHISPER], [WHISPER, ARM_CONTAINER]),
+        ([WHISPER], [WHISPER, ARM_CONTAINER, OLLAMA]),
+        ([WHISPER], [ARM_CONTAINER]),
+        ([], [ARM_CONTAINER]),
+    ]
+    for baseline, probe in cases:
+        state, reason = lms_vram.classify_pollution(baseline, probe)
+        assert (state is lms_vram.PollutionState.CLEAN) == (reason == '')
+
+
+def test_classify_pollution_never_reports_the_unmeasured_sentinel():
+    """UNMEASURED means nobody looked.  Anything that ran a classification did."""
+    state, _ = lms_vram.classify_pollution([WHISPER], [WHISPER, OLLAMA])
+
+    assert state is not lms_vram.PollutionState.UNMEASURED
+
+
+def test_the_known_foreign_list_matches_ollama_and_no_containerised_arm():
+    (ollama,) = lms_vram.KNOWN_FOREIGN_CONSUMERS
+
+    assert ollama.matches('/usr/local/lib/ollama/llama-server')
+    assert not ollama.matches('python')
+    assert not ollama.matches('/usr/bin/python3')
