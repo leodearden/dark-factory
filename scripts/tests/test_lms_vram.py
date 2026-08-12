@@ -1099,3 +1099,72 @@ def test_the_known_foreign_list_matches_ollama_and_no_containerised_arm():
     assert ollama.matches('/usr/local/lib/ollama/llama-server')
     assert not ollama.matches('python')
     assert not ollama.matches('/usr/bin/python3')
+
+
+# ---------------------------------------------------------------------------
+# (j) the snapshot carries the inventory, so all three are ONE capture
+# ---------------------------------------------------------------------------
+
+
+MEASURED_IDENTITY_CSV = 'NVIDIA GeForce RTX 3090, 580.95.05\n'
+
+
+def _snapshot_runner(compute_apps_csv):
+    """A fake nvidia-smi answering each of the three narrow queries."""
+    recorded = []
+
+    def runner(argv):
+        recorded.append(argv)
+        if any(a.startswith('--query-compute-apps') for a in argv):
+            return compute_apps_csv
+        if any(a.startswith('--query-gpu=name') for a in argv):
+            return MEASURED_IDENTITY_CSV
+        return MEASURED_CSV
+
+    return runner, recorded
+
+
+def test_probe_gpu_snapshot_populates_the_consumer_inventory():
+    runner, _ = _snapshot_runner(f'{MEASURED_WHISPER_ROW}\n{MEASURED_OLLAMA_ROW}\n')
+
+    snapshot = lms_vram.probe_gpu_snapshot(runner)
+
+    assert snapshot.reading.used_mib == 7362
+    assert snapshot.identity.name == 'NVIDIA GeForce RTX 3090'
+    assert [c.pid for c in snapshot.consumers] == [7575, 905936]
+
+
+def test_probe_gpu_snapshot_shells_all_three_narrow_queries():
+    """Three narrow queries, not one wide one: the strict memory parser -- the
+    one whose failure would misreport the budget -- keeps its exact shape and
+    its existing coverage."""
+    runner, recorded = _snapshot_runner(MEASURED_WHISPER_ROW + '\n')
+
+    lms_vram.probe_gpu_snapshot(runner)
+
+    assert recorded == [
+        ['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'],
+        [
+            'nvidia-smi',
+            '--query-gpu=memory.total,memory.used,memory.free',
+            '--format=csv,noheader,nounits',
+        ],
+        [
+            'nvidia-smi',
+            '--query-compute-apps=pid,process_name,used_memory',
+            '--format=csv,noheader,nounits',
+        ],
+    ]
+
+
+def test_a_snapshot_cannot_be_built_without_an_inventory():
+    """The field is REQUIRED, so no call site can silently omit the evidence
+    about who else held the card at the moment the reading was taken.  An
+    optional inventory would read downstream as "nobody else was there"."""
+    with pytest.raises(ValidationError):
+        lms_vram.GpuSnapshot(
+            identity=lms_vram.GpuIdentity(
+                name='NVIDIA GeForce RTX 3090', driver_version='580.95.05',
+            ),
+            reading=_reading(),
+        )
