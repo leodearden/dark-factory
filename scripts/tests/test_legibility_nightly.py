@@ -909,6 +909,57 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     assert launcher_calls == [1]
 
 
+def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
+    """task 4085: the docstring's "this function never raises and never fails
+    the run" must hold for the DECIDE call, not only for the launcher call.
+
+    Today it guards only `launcher()` and parenthetically ASSUMES `decide` is
+    fail-safe ("never raises -- fail-safe") -- a promise about a callee it
+    cannot enforce, and `decide` is an injected seam any caller can replace.
+    The exception raised here is the real one task 4085 reports, from an
+    unvalidated `last_census_done_count` baseline reaching
+    `current_done - baseline`.
+
+    Two properties, and the second is a safety property rather than a style
+    one: a failed evaluation has established NOTHING, so it must not be able to
+    start an expensive census -- hence the return happens before
+    `entrypoint_exists` is even consulted."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
+
+    launcher_calls = []
+    entrypoint_calls = []
+
+    def _recording_entrypoint_exists():
+        entrypoint_calls.append(1)
+        return True
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=_recording_entrypoint_exists,
+            launcher=lambda: launcher_calls.append(1),
+        )
+
+    assert fire is False
+    # A downstream reader of NightlyResult.census_line must still see a
+    # well-formed decision line -- the one case an operator most needs to read
+    # is the worst possible place to emit a novel shape.
+    assert 'NO-FIRE' in line
+    assert line.startswith('census trigger: ')
+    assert 'trigger evaluation failed' in line
+    assert 'TypeError' in line
+
+    assert launcher_calls == [], 'a failed evaluation must never launch a census'
+    assert entrypoint_calls == [], 'the failure path must return before the launcher block'
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert 'TypeError' in warnings[0].getMessage()
+
+
 def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     """A non-zero census subprocess exit must be logged LOUD (naming the
     returncode) rather than silently discarded -- the silent-census incident
