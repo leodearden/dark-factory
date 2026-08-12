@@ -4232,6 +4232,92 @@ def test_fused_memory_constants_exposed() -> None:
     assert "/health" in wdog.FUSED_MEMORY_HEALTH_URL
 
 
+def test_fused_memory_alive_constants_exposed() -> None:
+    """The module exposes a /alive URL + timeout DISTINCT from the /health pair.
+
+    The kill decision fetches /alive (task 3765); /health remains the readiness
+    signal for --report's recon-busy column and the recon gate. The two are
+    separate constants, not a rename — assert both survive.
+    """
+    wdog = _load_watchdog()
+    assert hasattr(wdog, "FUSED_MEMORY_ALIVE_URL"), (
+        "Module must expose a FUSED_MEMORY_ALIVE_URL constant"
+    )
+    assert hasattr(wdog, "FUSED_MEMORY_ALIVE_TIMEOUT_SECS"), (
+        "Module must expose a FUSED_MEMORY_ALIVE_TIMEOUT_SECS constant"
+    )
+    assert str(wdog.FUSED_MEMORY_PORT) in wdog.FUSED_MEMORY_ALIVE_URL, (
+        f"FUSED_MEMORY_ALIVE_URL ({wdog.FUSED_MEMORY_ALIVE_URL!r}) must be built "
+        f"from FUSED_MEMORY_PORT ({wdog.FUSED_MEMORY_PORT})"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_URL.endswith("/alive"), (
+        f"FUSED_MEMORY_ALIVE_URL must target /alive; got {wdog.FUSED_MEMORY_ALIVE_URL!r}"
+    )
+    # NOT a rename: /health must still exist for the recon-busy gate.
+    assert wdog.FUSED_MEMORY_HEALTH_URL.endswith("/health"), (
+        f"FUSED_MEMORY_HEALTH_URL must still target /health; got "
+        f"{wdog.FUSED_MEMORY_HEALTH_URL!r}"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_URL != wdog.FUSED_MEMORY_HEALTH_URL, (
+        "the aliveness and readiness URLs must stay distinct"
+    )
+    assert isinstance(wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS, (int, float)), (
+        f"FUSED_MEMORY_ALIVE_TIMEOUT_SECS must be numeric; got "
+        f"{wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS!r}"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS > 0, (
+        f"FUSED_MEMORY_ALIVE_TIMEOUT_SECS must be positive; got "
+        f"{wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS!r}"
+    )
+
+
+def test_watchdog_probed_routes_are_registered_in_fused_memory_server() -> None:
+    """Every URL this watchdog probes must be a route fused-memory actually serves.
+
+    Cross-package wire-contract guard, sitting alongside (not replacing) the
+    config.yaml port guard below and copying its structure, including the
+    fail-open skip. Neither side can import the other: tests/scripts/ runs
+    under `uv run --project shared pytest tests/scripts/`, whose environment
+    does not carry the fused-memory package, and orchestrator-watchdog.py is a
+    stdlib-only systemd oneshot that could not import it at runtime either. So
+    the server's routes are read as TEXT out of its @mcp.custom_route
+    decorators.
+
+    A typo'd path would otherwise 404 — and probe_health treats ANY HTTP
+    response, 404 included, as ALIVE, so the kill decision would silently
+    become a no-op that never kills anything.
+    """
+    wdog = _load_watchdog()
+
+    tools_path = (
+        REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "server" / "tools.py"
+    )
+    if not tools_path.exists():
+        pytest.skip(f"{tools_path} not reachable in this environment")
+
+    registered = set(
+        re.findall(r"""@mcp\.custom_route\(\s*['"]([^'"]+)['"]""", tools_path.read_text())
+    )
+    # A zero-match regex must fail LOUDLY rather than pass vacuously: a change
+    # to the decorator syntax is itself the drift this test exists to catch.
+    assert registered, (
+        f"no @mcp.custom_route(...) registrations found in {tools_path} — the "
+        "decorator syntax changed and this drift guard has gone blind"
+    )
+
+    import urllib.parse  # noqa: PLC0415
+
+    for const_name in ("FUSED_MEMORY_ALIVE_URL", "FUSED_MEMORY_HEALTH_URL"):
+        path = urllib.parse.urlsplit(getattr(wdog, const_name)).path
+        assert path in registered, (
+            f"{const_name} probes {path!r}, which scripts/orchestrator-watchdog.py "
+            f"expects but {tools_path} does not register "
+            f"(registered routes: {sorted(registered)}). These two files live in "
+            "packages that cannot import each other, so this text guard is the "
+            "only thing holding the contract."
+        )
+
+
 def test_fused_memory_port_matches_configured_server_port() -> None:
     """FUSED_MEMORY_PORT must equal fused-memory/config/config.yaml's server.port.
 
