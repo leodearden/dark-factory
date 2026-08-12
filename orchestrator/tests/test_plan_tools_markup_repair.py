@@ -509,51 +509,48 @@ class TestRepairableFieldTable:
             assert record.field in record.target_keys
             assert record.target_keys[record.field] == record.field
 
-    def test_every_alternate_writer_is_a_real_tool_taking_that_field(self):
-        """``also_written_by`` must name real call sites, not prose labels.
+    def test_every_alternate_writer_really_writes_that_field(self, tmp_path, monkeypatch):
+        """``also_written_by`` must name real call sites that ACTUALLY write the field.
 
         The fact's ``tool`` is the collection's SCHEMA OWNER, which is not always
         the call that produced the corruption — ``replace_plan_step`` also writes
         ``description`` on steps AND prerequisites, ``update_plan_metadata`` also
-        writes ``analysis``. An alternate that named no real entry point, or one
-        that does not take the field at all, would send a triager somewhere the
-        corruption could not have come from: a diagnostic that reads as precision
-        while pointing at nothing.
+        writes ``analysis``, and ``mark_step_committed`` prepends a provenance tag
+        to ``description`` on either collection. An alternate that named no real
+        entry point, or one that never actually touches the field, would send a
+        triager somewhere the corruption could not have come from: a diagnostic
+        that reads as precision while pointing at nothing.
+
+        Checked BEHAVIOURALLY, not by signature. The previous version of this
+        check asserted ``record.field in _tool_params(impl)`` — a proxy that can
+        only see a writer that takes the field AS A PARAMETER. That is false of
+        ``mark_step_committed``: it rewrites ``description`` by re-reading and
+        rewriting the plan without ever taking a ``description`` argument at
+        all, so the proxy would have REJECTED a real writer. Calling
+        :func:`_alternate_writer_changed_the_cell` instead proves the actual
+        invariant the proxy was standing in for, and is strictly stronger — it
+        catches a declared alternate that names no real entry point (as before)
+        AND one that names a real entry point that simply does not write the
+        field (which the signature proxy could not).
         """
+        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             assert isinstance(record.also_written_by, tuple)
             owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
             for name in record.also_written_by:
                 impl = getattr(plan_tools, '_' + name, None)
                 assert callable(impl), f'{name!r} is not a plan_tools function'
-                assert record.field in _tool_params(impl), (
-                    f'{record.collection}.{record.field} names {name!r} as an '
-                    f'alternate writer, but it takes no {record.field!r} '
-                    f'parameter — it cannot write that field'
-                )
                 assert name != owner, (
                     f'{name!r} is the schema owner, already reported as `tool`'
                 )
-
-    def test_the_known_multi_writer_fields_declare_their_alternates(self):
-        """The three fields with a second writer, pinned by behaviour above.
-
-        Read off the module under test at review time and re-derivable from the
-        signatures: ``_replace_plan_step`` walks BOTH ``prerequisites`` and
-        ``steps`` looking for its ``step_id``, so it writes ``description`` on
-        either; ``_update_plan_metadata`` writes top-level ``analysis``. A row
-        that quietly lost its alternate would go back to overstating the fact.
-        """
-        alternates = {
-            (r.collection, r.field): set(r.also_written_by)
-            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
-        }
-        assert alternates[('steps', 'description')] == {'replace_plan_step'}
-        assert alternates[('prerequisites', 'description')] == {'replace_plan_step'}
-        assert alternates[(None, 'analysis')] == {'update_plan_metadata'}
-        # title has no second writer: update_plan_metadata does not take one.
-        assert alternates[(None, 'title')] == set()
-        assert 'title' not in _tool_params(plan_tools._update_plan_metadata)
+                root = tmp_path / f'{record.collection}-{record.field}-{name}'
+                assert _alternate_writer_changed_the_cell(
+                    root, record.collection, record.field, name
+                ), (
+                    f'{record.collection}.{record.field} names {name!r} as an '
+                    'alternate writer, but the probe observed no change on '
+                    'that cell — it cannot actually write that field'
+                )
 
     def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
         """Identifiers, enums and lists may never receive a recovered string.
