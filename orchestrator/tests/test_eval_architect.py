@@ -3004,6 +3004,63 @@ class TestJudgedWithoutReference:
             'df_task_2605' in m and 'reference' in m.lower() for m in warnings
         ), f'no warning naming the task and the missing reference: {warnings}'
 
+    async def test_missing_reference_warning_states_only_a_fixture_fact(
+        self, caplog,
+    ):
+        """The step-6 line must not claim anything about a judge score.
+
+        It fires BEFORE the architect's outcome is known, so on a cap-tainted
+        cell — which skips the judge entirely — a claim that "any plan judge
+        score will be plausibility-based" is simply false (reviewer:
+        robustness). The claim belongs to the step-7 warning, which fires
+        exactly where the judge is invoked blind, and which must not appear on
+        this path at all.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan={},
+                arch_result=_cap_agent_result(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        fixture_lines = [m for m in warnings if 'reference.post_task_commit' in m]
+        assert len(fixture_lines) == 1, warnings
+        # The judge never ran here, so NOTHING may assert how its score was
+        # produced — neither the removed 'PLAUSIBILITY' overclaim nor the
+        # step-7 line.
+        assert 'plausibility' not in fixture_lines[0].lower()
+        assert not any('EMPTY reference diff' in m for m in warnings), warnings
+
+    async def test_blind_judge_claim_is_made_once_by_step_7(self, caplog):
+        """On the ONE path where the claim is true, it is stated ONCE.
+
+        The pair of warnings must not double-report: the fixture-level line
+        names the authoring defect, the step-7 line names the consequence for
+        the score, and neither repeats the other.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        fixture_lines = [m for m in warnings if 'reference.post_task_commit' in m]
+        judge_lines = [m for m in warnings if 'EMPTY reference diff' in m]
+
+        assert len(fixture_lines) == 1, warnings
+        assert len(judge_lines) == 1, warnings
+        assert 'EMPTY reference diff' not in fixture_lines[0]
+
 
 # ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)

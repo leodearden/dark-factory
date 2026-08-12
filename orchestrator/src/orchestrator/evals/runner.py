@@ -828,11 +828,19 @@ async def run_architect_eval(
         # half its hard subset this way and it was discoverable only by
         # archaeology, because a fixture with no ``reference`` block reached the
         # judge silently.
+        #
+        # Scoped to the FIXTURE-LEVEL fact, which is all that is known here
+        # (reviewer: robustness). At this point the architect's outcome is not
+        # yet decided, so this site cannot say anything about a judge score: a
+        # cap-tainted cell and a no-scorable-plan cell both skip the judge
+        # entirely, and claiming their score is plausibility-based would be
+        # false. That claim belongs to — and is made by — the step-7 warning
+        # below, which fires exactly where the judge is invoked blind. This is
+        # the same over-broad keying the marker's comment at step 7 rejects for
+        # the metrics field, and it is rejected here for the same reason.
         logger.warning(
             f'Architect eval {task_id} × {config.name}: fixture carries no '
-            f'reference.post_task_commit, so NO reference diff is available — '
-            f'any plan judge score will be PLAUSIBILITY-based, not fidelity '
-            f'against the landed change'
+            f'reference.post_task_commit, so NO reference diff is available'
         )
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
