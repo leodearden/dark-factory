@@ -97,7 +97,11 @@ def escalate_missing_indices(
     if health is None or health.get('healthy', False):
         return None
 
-    if not _HAS_ESCALATION or escalation_queue is None:
+    # Guard on `Escalation is None` rather than `not _HAS_ESCALATION`: the two
+    # are equivalent by construction, but only the identity check NARROWS the
+    # optionally-imported symbol, so the constructor call below type-checks.
+    # This is `stage1_stall_detector`'s idiom verbatim.
+    if Escalation is None or escalation_queue is None:
         return None
 
     dedup_key = f'graph:{group_id}'

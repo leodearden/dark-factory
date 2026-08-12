@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
@@ -340,7 +341,10 @@ class TestEscalationIndexHealthField:
     """
 
     def _make_base_esc(self, **kwargs) -> Escalation:
-        base = {
+        # Annotated dict[str, Any]: without it the literal infers as
+        # dict[str, str], and the ** unpack then reports every non-str field
+        # (level, index_health, evidence, ...) as a type error.
+        base: dict[str, Any] = {
             'id': 'esc-graph:dark_factory-0001',
             'task_id': 'graph:dark_factory',
             'agent_role': 'reconciliation-index-drift',
@@ -395,6 +399,7 @@ class TestEscalationIndexHealthField:
         esc = self._make_base_esc(level=1, index_health=ih)
         restored = Escalation.from_json(esc.to_json())
         assert restored.index_health == ih
+        assert restored.index_health is not None
         assert restored.index_health['missing'] == [['Entity', 'NODE', 'name', 'RANGE']]
         assert restored.to_json() == esc.to_json()
 

@@ -13855,7 +13855,7 @@ class TestHarnessCheckIndexHealth:
     ):
         """No graphiti backend → None, not an exception."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.graphiti = None
+        harness.memory.graphiti = None  # type: ignore[assignment]
 
         assert await harness._check_index_health('dark_factory') is None
 
@@ -14070,7 +14070,7 @@ class TestHarnessDetectIndexDrift:
     ):
         """When the health read reports unknown, the detector propagates None."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.graphiti = None
+        harness.memory.graphiti = None  # type: ignore[assignment]
 
         assert await harness._detect_index_drift('dark_factory') is None
 
