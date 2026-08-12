@@ -460,6 +460,41 @@ steward tries to resolve the issue itself; if it can't (budget exhaustion,
 retry/timeout/empty-output cap, a missing worktree at preflight), it
 auto-escalates to a human, starting the L1→L2 promotion path in §6.
 
+`ESCALATED` has exactly **two** dispositions, and which one a task takes is
+what decides whether its row stays `in-progress` or lands in `blocked`:
+
+- **(a) In-slot bounded wait.** The workflow keeps its slot and its live
+  claimant while `_ensure_steward_started()` → `_wait_for_resolution()` runs,
+  so an `in-progress` row here is legitimate rather than stranded — the row
+  still matches a live, heartbeating claimant (INV-6 `status-matches-liveness`,
+  [docs/legibility/design-invariants.md](docs/legibility/design-invariants.md)).
+  The wait is bounded by a **progress-refreshed idle window**, not a wall-clock
+  deadline (task 3170): every observed advance of the steward's progress
+  counter buys another full window, so the hold is one window for a silent
+  producer and at most `steward_max_attempts +
+  steward_max_timeouts_per_escalation` windows for a steward that keeps
+  invoking its agent — bounded by the steward's own attempt ceilings, which is
+  the property that makes it INV-7 `holds-owned-and-bounded`-legal. A record
+  that is born-at-L2 (severity `critical`/`urgent`) or at `level ≥ 2`
+  short-circuits the wait immediately: the orchestrator does not hold a slot
+  waiting on a human. This now covers **every** phase, MERGE entry included —
+  `_handle_merge_gate_escalations`
+  (`orchestrator/src/orchestrator/workflow.py`, ~:3786) replaced the old
+  steward-less bail, which returned `ESCALATED` with no steward, no wait and no
+  status write, leaving `in-progress` + NULL claimant + an open gating record
+  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1).
+- **(b) Blocked exit.** When the wait concludes without resolution — idle-window
+  expiry, steward re-escalation, or a gating record still open on the
+  single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
+  slot. The open escalation record then *is* the ownership token and the wake
+  edge: resolving it re-pends the task (§6). The gate predicate itself
+  (`_is_gating_escalation`) is untouched stop-the-line either way — nothing
+  merges past an open gating record.
+
+Which exit status each outcome must write is specified normatively in
+[docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) §4
+(the state × owner table) and §5 (the outcome contract).
+
 ### 3.7 Recovery and failure paths
 
 - **`_mark_blocked`** is the sole choke point that stamps a task `blocked`
