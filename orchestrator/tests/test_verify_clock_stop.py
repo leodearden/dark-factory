@@ -346,6 +346,125 @@ class TestMatchClockMarker:
         ) is None
 
 
+# ── Task 3806: _clock_stop_reason message-attribution helper ─────────────────
+
+
+class TestClockStopReason:
+    """_clock_stop_reason attributes a clock-stop message to the armed limit
+    only when the stop is CONSISTENT with that limit (task 3806 / esc-3694-3).
+
+    Pure-function unit tests — no subprocesses, no sleeps; every case is
+    driven by plain (kind, limit, elapsed, remaining) numbers, mirroring
+    TestMatchClockMarker's style for _match_clock_marker.
+    """
+
+    def test_consistent_wall_clock_expiry_is_attributed(self):
+        """A wall-clock budget that genuinely elapsed is named in the
+        message, with the real elapsed wall time alongside it."""
+        from orchestrator.verify import _clock_stop_reason
+        result = _clock_stop_reason(
+            kind='wall-clock budget', limit=5400.0, elapsed=5400.3, remaining=-0.3,
+        )
+        assert 'wall-clock budget (5400s)' in result
+        assert 'wall time 5400.3s' in result
+
+    def test_esc_3694_3_shape_is_refused(self):
+        """The exact esc-3694-3 numbers (5400s armed budget, 561.1s real
+        elapsed, ~4838.9s still left on the armed deadline) can no longer
+        produce the impossible 'wall-clock budget (5400s), wall time 561.1s'
+        message — the armed deadline plainly did not elapse."""
+        from orchestrator.verify import _clock_stop_reason
+        result = _clock_stop_reason(
+            kind='wall-clock budget', limit=5400.0, elapsed=561.1, remaining=4838.9,
+        )
+        assert 'wall-clock budget (5400s)' not in result, (
+            f'esc-3694-3 shape must not be reproduced; got {result!r}'
+        )
+        assert 'unattributed' in result
+        assert 'external' in result
+        assert 'wall time 561.1s' in result
+        assert '4838.9' in result
+
+    def test_elapsed_may_exceed_the_named_limit(self):
+        """The invariant is one-directional: a stop long after the run
+        started may still name its limit (elapsed >> limit is fine); only a
+        named limit LARGER than elapsed is refused."""
+        from orchestrator.verify import _clock_stop_reason
+        result = _clock_stop_reason(
+            kind='heartbeat-idle backstop', limit=180.0, elapsed=612.4, remaining=0.0,
+        )
+        assert 'heartbeat-idle backstop (180s)' in result
+
+    @pytest.mark.parametrize(
+        ('kind', 'limit', 'elapsed', 'remaining'),
+        [
+            # Genuine wall-clock expiry.
+            ('wall-clock budget', 5400.0, 5400.3, -0.3),
+            # esc-3694-3: armed deadline had ~4839s left — must be refused.
+            ('wall-clock budget', 5400.0, 561.1, 4838.9),
+            # Elapsed far exceeds limit but is still self-consistent.
+            ('heartbeat-idle backstop', 180.0, 612.4, 0.0),
+            # Neither conjunct holds.
+            ('wall-clock budget', 10.0, 5.0, 6.0),
+            # Attributed even though elapsed > limit.
+            ('wall-clock budget', 10.0, 15.0, 0.0),
+            # remaining is within slack but elapsed does not support the
+            # limit — the second conjunct alone must refuse this one.  If a
+            # future rewrite drops that conjunct, this row starts naming the
+            # limit and the assertion below catches it.
+            ('max-total-stopped cap', 100.0, 94.0, 1.0),
+            ('max-total-stopped cap', 0.5, 0.6, 0.0),
+        ],
+    )
+    def test_self_consistency_invariant(self, kind, limit, elapsed, remaining):
+        """Whenever the returned message names *limit*, elapsed must support
+        it: ``limit <= elapsed + slack`` (scope item 2).  Asserted directly
+        against the returned string's content rather than by restating the
+        branch condition, so this still catches a regression even if the
+        branch logic inside _clock_stop_reason is later rewritten."""
+        from orchestrator.verify import (
+            _CS_ATTRIBUTION_SLACK_FRAC,
+            _CS_ATTRIBUTION_SLACK_MIN,
+            _clock_stop_reason,
+        )
+        result = _clock_stop_reason(kind=kind, limit=limit, elapsed=elapsed, remaining=remaining)
+        names_limit = f'{kind} ({limit:.0f}s)' in result
+        if names_limit:
+            slack = max(_CS_ATTRIBUTION_SLACK_MIN, _CS_ATTRIBUTION_SLACK_FRAC * limit)
+            assert limit <= elapsed + slack, (
+                f'{result!r} named limit={limit} but elapsed={elapsed} '
+                f'(slack={slack}) does not support it'
+            )
+
+    def test_cause_hint_round_trip_attributed(self):
+        """The attributed-branch reason survives _extract_cause_hint's
+        colon-sensitive regex (``[^:]+`` up to the message's own final
+        ``:``) end to end — a colon anywhere in the reason would silently
+        break this for every clock-stop escalation."""
+        from orchestrator.verify import _clock_stop_reason, _extract_cause_hint
+        reason = _clock_stop_reason(
+            kind='wall-clock budget', limit=5400.0, elapsed=5400.3, remaining=-0.3,
+        )
+        assert ':' not in reason
+        line = f'Command clock-stop timed out ({reason}): some cmd'
+        assert len(line) < 200, f'test line too long to pin the round trip: {len(line)}'
+        blob = f'preceding log line\n{line}\ntrailing log line\n'
+        assert _extract_cause_hint(blob) == line
+
+    def test_cause_hint_round_trip_unattributed(self):
+        """The unattributed-branch reason — the shape esc-3694-3 needed and
+        did not have — ALSO survives the colon-sensitive regex end to end."""
+        from orchestrator.verify import _clock_stop_reason, _extract_cause_hint
+        reason = _clock_stop_reason(
+            kind='wall-clock budget', limit=5400.0, elapsed=561.1, remaining=4838.9,
+        )
+        assert ':' not in reason
+        line = f'Command clock-stop timed out ({reason}): some cmd'
+        assert len(line) < 200, f'test line too long to pin the round trip: {len(line)}'
+        blob = f'preceding log line\n{line}\ntrailing log line\n'
+        assert _extract_cause_hint(blob) == line
+
+
 # ── Step-7 / Step-8: Core _run_cmd clock-stop behavioral tests ────────────────
 
 
