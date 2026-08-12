@@ -170,23 +170,70 @@ def _scrub_text(text: str, patterns: tuple[tuple[str, str], ...]) -> str:
     return out
 
 
-def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
-    """Return *value* with every string leaf AND every string dict key scrubbed.
+def _encodes_clean(value: Any, patterns: tuple[tuple[str, str], ...]) -> bool:
+    """True when *value*'s JSON ENCODING carries no *patterns* match.
 
-    Keys are rewritten with the same substitution as leaves (non-string keys are
-    left untouched).  That is not symmetry for its own sake: ``_gate`` scans the
-    JSON encoding of the WHOLE observation, in which a key is just as visible as
-    a value, so a generic-pattern hit living in a key would otherwise survive
-    this scrub into ``_gate``'s follow-up ``assert_no_credential_material`` and
-    turn its documented never-raise branch into a raise — losing the entire
-    already-paid-for capture rather than one matched run.
+    The scan domain and the scrub domain must agree.  ``_gate`` scans
+    ``json.dumps(observation)``, so cleanliness of the RAW value is the wrong
+    question: ``'\\t' + 'A' * 63`` carries a 63-character run raw (below the
+    threshold) but a 64-character one once ``json.dumps`` renders the tab as
+    ``\\t`` and the escape's literal ``t`` extends it.
+
+    An unencodable value answers True: it can never appear in the encoded
+    document at all, so it cannot contribute a match there.  (It also cannot
+    reach here through ``_gate``, which encodes the whole observation first.)
+    """
+    try:
+        encoded = json.dumps(value)
+    except (TypeError, ValueError):
+        return True
+    return scan_for_credential_material(encoded, patterns) is None
+
+
+def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
+    """Return *value* scrubbed so that its JSON ENCODING carries no *patterns* match.
+
+    Two gaps between the scan domain and the scrub domain are closed here.
+
+    KEYS.  ``_gate`` scans the JSON encoding of the WHOLE observation, in which a
+    dict key is just as visible as a value, so keys are rewritten with the same
+    substitution as leaves (non-string keys are left untouched).  Recursing into
+    values alone let a generic-pattern hit in a key survive into ``_gate``'s
+    follow-up ``assert_no_credential_material``.
+
+    ENCODED FORM.  Every leaf, scalar and key is additionally checked in its
+    ENCODED form (:func:`_encodes_clean`) and degraded wholesale to
+    ``<redacted>`` if the raw substitution did not suffice — JSON escaping can
+    manufacture a run that raw scrubbing cannot see.
+
+    Either gap turned ``_gate``'s documented never-raise branch into a raise,
+    losing the entire already-paid-for capture rather than one matched run.
+
+    Per-part cleanliness suffices for the WHOLE document because a
+    ``[A-Za-z0-9_-]{64,}`` run can never span JSON punctuation (``"``, ``:``,
+    ``,``, ``{``, ``[``): none of those characters is in the run's class, so no
+    match can straddle two parts, and each part's own encoding is delimited by
+    exactly the same punctuation it will sit between in the document.
+
+    Cost: the extra per-part ``json.dumps`` is off the sampling hot loop —
+    ``_scrub_value`` runs only after ``_gate`` has already detected a generic hit.
     """
     if isinstance(value, str):
-        return _scrub_text(value, patterns)
+        scrubbed = _scrub_text(value, patterns)
+        # The raw substitution is tried FIRST because it preserves the maximum
+        # surrounding text; the wholesale fallback is only for what it missed.
+        return scrubbed if _encodes_clean(scrubbed, patterns) else '<redacted>'
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         for key, item in value.items():
             scrubbed_key = _scrub_text(key, patterns) if isinstance(key, str) else key
+            if not _encodes_clean({scrubbed_key: 0}, patterns):
+                # Encoded as ``{"<key>": 0}`` — the same ``"`` delimiters the key
+                # will carry in the document, so this asks exactly the question
+                # _gate's scan will ask.  Covers a non-string key too, which no
+                # substitution branch would otherwise see (json renders it as a
+                # string).
+                scrubbed_key = '<redacted>'
             # Two distinct keys can scrub to the same '<redacted>' token (or
             # collide with a literal one already present), and letting the last
             # write win would silently DROP an entry — precisely the silent
@@ -204,7 +251,10 @@ def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
         return out
     if isinstance(value, list):
         return [_scrub_value(item, patterns) for item in value]
-    return value
+    # A non-str, non-container scalar: no substitution branch sees it, but its
+    # ENCODING is plain text in the document (a 70-digit int renders as 70
+    # run-class characters), so it needs the encoded check too.
+    return value if _encodes_clean(value, patterns) else '<redacted>'
 
 
 def _gate(observation: dict[str, Any]) -> dict[str, Any]:
