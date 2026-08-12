@@ -540,7 +540,7 @@ class TestStatsPhantomVerdicts:
             severity=VerdictSeverity.serious,
             findings=self._genuine_serious_findings(),
             reviewed_at=now,
-            action=VerdictAction.escalate,
+            action=VerdictAction.rollback,
         )
 
     async def _seed_both_phantoms(self, journal, now):
@@ -650,7 +650,7 @@ class TestStatsPhantomVerdicts:
             severity=VerdictSeverity.serious,
             findings=self._genuine_serious_findings(),
             reviewed_at=long_ago,
-            action=VerdictAction.escalate,
+            action=VerdictAction.rollback,
         )
 
         stats = await journal.get_stats('test-project', now - timedelta(hours=1))

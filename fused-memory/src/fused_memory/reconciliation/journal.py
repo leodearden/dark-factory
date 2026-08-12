@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+# Imported from ``shared``, NOT from ``fused_memory.reconciliation.judge`` —
+# judge.py imports THIS module at module scope, so importing it back would be a
+# circular import.  The rule lives in shared precisely so this module and the
+# dashboard can both reach it; judge.py delegates to the same primitives.
+from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_row
+
 from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
@@ -885,6 +891,23 @@ class ReconciliationJournal:
     # ── Dashboard stats ────────────────────────────────────────────────
 
     async def get_stats(self, project_id: str, since: datetime) -> dict:
+        """Dashboard stats for *project_id* over the window starting at *since*.
+
+        Returns ``runs_count``, ``avg_duration_seconds``, ``verdicts``
+        (``{severity: count}`` of GENUINE reviews) and ``phantom_verdicts``
+        (``{severity: count}`` of fabricated ones).
+
+        A PHANTOM verdict is a placeholder ``Judge._parse_verdict`` writes when
+        it could not parse its own model output — no review happened, so
+        counting one as a genuine ``serious`` finding reports a review that
+        never occurred.  Measured on the live DB (task 3287): nine of the ten
+        ``serious`` rows are phantoms from the 2026-07 cap-storm resume
+        failures.  They are SUBTRACTED from ``verdicts`` and reported by name
+        in ``phantom_verdicts``, so nothing vanishes unnamed and the two dicts
+        sum to the pre-3287 total.  A severity whose genuine count falls to
+        zero drops out of ``verdicts`` entirely, matching GROUP BY's
+        absent-key convention.
+        """
         db = self._require_db()
         since_str = since.isoformat()
 
@@ -915,10 +938,54 @@ class ReconciliationJournal:
             verdict_rows = await cursor.fetchall()
             verdicts = {row['severity']: row['cnt'] for row in verdict_rows}
 
+        # Phantom split.  The cheap GROUP BY above stays exactly as it was;
+        # only a bounded CANDIDATE set is fetched and JSON-parsed here.
+        #
+        # The prefilter is a strict SUPERSET of both branches of the phantom
+        # predicate, so no phantom can escape it: the marker branch can only
+        # fire if the literal code string is present somewhere in the findings
+        # JSON, and the legacy branch requires severity='serious'.  It is a
+        # CANDIDATE filter, never the verdict — a genuine row that merely
+        # mentions the code string is still correctly rejected by
+        # is_phantom_verdict_row in Python.  The LIKE pattern is built from the
+        # shared constant so hoisting the rule does not reintroduce a second
+        # spelling of the marker by the back door.
+        #
+        # Measured motivation (live DB, 30-day window): 10 candidate rows
+        # versus ~2400 findings blobs a naive full-window scan would parse.
+        phantom_counts: dict[str, int] = {}
+        async with db.execute(
+            """SELECT jv.severity as severity, jv.findings as findings
+               FROM judge_verdicts jv JOIN runs r ON jv.run_id = r.id
+               WHERE r.project_id = ? AND jv.reviewed_at > ?
+                 AND (jv.severity = 'serious' OR jv.findings LIKE ?)""",
+            (project_id, since_str, f'%{UNPARSEABLE_VERDICT_CODE}%'),
+        ) as cursor:
+            candidate_rows = await cursor.fetchall()
+
+        for row in candidate_rows:
+            try:
+                findings = json.loads(row['findings']) if row['findings'] else []
+            except (json.JSONDecodeError, TypeError):
+                findings = []
+            if not isinstance(findings, list):
+                findings = []
+            if is_phantom_verdict_row(row['severity'], findings):
+                phantom_counts[row['severity']] = (
+                    phantom_counts.get(row['severity'], 0) + 1
+                )
+
+        for severity, phantom_count in phantom_counts.items():
+            if severity in verdicts:
+                verdicts[severity] -= phantom_count
+                if verdicts[severity] <= 0:
+                    del verdicts[severity]
+
         return {
             'runs_count': runs_count,
             'avg_duration_seconds': round(avg_duration, 2) if avg_duration else None,
             'verdicts': verdicts,
+            'phantom_verdicts': phantom_counts,
         }
 
 
