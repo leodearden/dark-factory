@@ -157,15 +157,39 @@ def scan_for_credential_material(
     return None
 
 
+def _scrub_text(text: str, patterns: tuple[tuple[str, str], ...]) -> str:
+    """Substitute every *patterns* run in *text* with ``<redacted>``.
+
+    The single substitution definition shared by :func:`_scrub_value`'s string
+    LEAF branch and its string KEY branch, so the two can never drift into
+    scrubbing the same material differently.
+    """
+    out = text
+    for _name, pattern in patterns:
+        out = re.sub(pattern + r'\S*', '<redacted>', out)
+    return out
+
+
 def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
-    """Return *value* with every string leaf scrubbed against *patterns*."""
+    """Return *value* with every string leaf AND every string dict key scrubbed.
+
+    Keys are rewritten with the same substitution as leaves (non-string keys are
+    left untouched).  That is not symmetry for its own sake: ``_gate`` scans the
+    JSON encoding of the WHOLE observation, in which a key is just as visible as
+    a value, so a generic-pattern hit living in a key would otherwise survive
+    this scrub into ``_gate``'s follow-up ``assert_no_credential_material`` and
+    turn its documented never-raise branch into a raise — losing the entire
+    already-paid-for capture rather than one matched run.
+    """
     if isinstance(value, str):
-        out = value
-        for _name, pattern in patterns:
-            out = re.sub(pattern + r'\S*', '<redacted>', out)
-        return out
+        return _scrub_text(value, patterns)
     if isinstance(value, dict):
-        return {key: _scrub_value(item, patterns) for key, item in value.items()}
+        return {
+            (_scrub_text(key, patterns) if isinstance(key, str) else key): _scrub_value(
+                item, patterns
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_scrub_value(item, patterns) for item in value]
     return value
