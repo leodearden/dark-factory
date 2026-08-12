@@ -226,6 +226,54 @@ class TestMaybeFlagUnverifiedClaims:
         assert len(result) == 1
         assert result[0].token == "done_provenance_invalidated"
 
+    async def test_probe_construction_runs_off_event_loop(self, tmp_path):
+        """RED counterpart to test_probe_runs_off_event_loop, but for probe
+        CONSTRUCTION rather than probe INVOCATION.
+
+        This is the single-candidate counterpart to curate_batch_prepared's
+        already-offloaded probe construction (task_curator.py:1624 —
+        ``claim_probe = await asyncio.to_thread(make_source_and_history_probe,
+        self._cwd)``). make_source_and_history_probe resolves the git top
+        level via _resolve_git_toplevel, a blocking `git rev-parse
+        --show-toplevel` subprocess bounded only by a 10s timeout — a
+        fork/exec that must not run on the event-loop thread curate() shares
+        with every other coroutine.
+
+        Asserts thread identity rather than wall-clock timing: identity is
+        exact and cannot flake under CI/CPU contention, whereas a timing
+        threshold would need a numeric bound with no achievability basis —
+        the same rationale test_probe_runs_off_event_loop above already
+        records for probe invocation.
+        """
+        import threading
+        from unittest.mock import patch
+
+        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+
+        loop_thread_id = threading.get_ident()
+        build_threads: list[int] = []
+        build_roots: list[object] = []
+
+        def recording_make_probe(repo_root):
+            build_threads.append(threading.get_ident())
+            build_roots.append(repo_root)
+            return lambda token: False
+
+        config = _make_config(recon_claim_verification_enabled=True)
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
+
+        with patch(
+            "fused_memory.middleware.recon_claim_verification_guard."
+            "make_source_and_history_probe",
+            side_effect=recording_make_probe,
+        ):
+            result = await curator._maybe_flag_unverified_claims(candidate)
+
+        assert build_roots == [tmp_path]
+        assert build_threads and all(tid != loop_thread_id for tid in build_threads)
+        assert [c.token for c in result] == ["done_provenance_invalidated"]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Amendment: TestCurateBatchPreparedClaimVerificationPerformance
