@@ -504,6 +504,15 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # curator gate may close, so a drifted stamp spelling here would silently
 # defeat it.
 #
+# A fork is caught BEHAVIOURALLY, by the tests that stamp the bare wire literal
+# and drive real code: `TestHumanCuratorGateAdjudicationGuard` in
+# orchestrator/tests/test_deterministic_runner.py, and shared's `parse_metadata`
+# blessed-key tests in shared/tests/test_task_metadata.py.  Do NOT add an
+# in-process `is`/`id()` identity check against the shared constant — CPython
+# interns identifier-shaped string literals, so a forked local literal would be
+# the SAME object and such a check passes either way (a vacuous one was removed
+# by task 3420 for exactly this reason).
+#
 # NAMING (reviewer amendment): the stamp is `human_curator_adjudicated_at`, NOT
 # `curator_adjudicated_at`.  The bare `curator_*` metadata namespace is already
 # owned by a different subsystem — `curator_action` / `curator_justification` /

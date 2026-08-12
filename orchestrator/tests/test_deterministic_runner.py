@@ -1143,33 +1143,6 @@ def _curator_gate_task(
     return task
 
 
-def test_human_curator_gate_keys_are_single_sourced_from_shared():
-    """Drift guard (task 3420): the marker and stamp keys must not fork.
-
-    ``deterministic_runner`` imports both ``HUMAN_CURATOR_GATE_KEY`` and
-    ``HUMAN_CURATOR_ADJUDICATED_AT_KEY`` from ``shared.task_metadata`` rather
-    than declaring its own literals (task 3369 for the marker, task 3420 for
-    the stamp) — so the write-time rejection in
-    ``TaskMetadata._deterministic_invariants`` / ``_BLESSED_METADATA_KEYS``
-    and this module's dispatch-time guard can never key on different
-    strings. Asserting object identity (not just string equality) pins that
-    the import, not a coincidentally-matching literal, is what makes the
-    values equal.
-    """
-    import shared.task_metadata
-
-    from orchestrator import deterministic_runner
-
-    assert (
-        deterministic_runner.HUMAN_CURATOR_GATE_KEY
-        is shared.task_metadata.HUMAN_CURATOR_GATE_KEY
-    )
-    assert (
-        deterministic_runner.HUMAN_CURATOR_ADJUDICATED_AT_KEY
-        is shared.task_metadata.HUMAN_CURATOR_ADJUDICATED_AT_KEY
-    )
-
-
 @pytest.mark.asyncio
 class TestHumanCuratorGateAdjudicationGuard:
     """DeterministicRunner — a curator gate needs CONTENT proof, not just a closed record.
