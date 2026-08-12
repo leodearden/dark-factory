@@ -161,10 +161,12 @@ def _load_valid_provenance(
     """Load *path* as a schema-valid :class:`ArtifactProvenance`, fail-safe.
 
     Returns ``None`` — never raises — when *path* is absent, when it is
-    present but corrupt/non-JSON, when it parses as JSON but does not satisfy
-    :class:`ArtifactProvenance`'s required fields (e.g. a half-written or
-    hand-edited sidecar), or — when *expected_harness_version* is given —
-    when the loaded provenance's ``harness_version`` does not equal it.
+    present but corrupt/non-JSON, when it is present but *unreadable* (a
+    permission flip mid-operation, or the path replaced by a directory), when
+    it parses as JSON but does not satisfy :class:`ArtifactProvenance`'s
+    required fields (e.g. a half-written or hand-edited sidecar), or — when
+    *expected_harness_version* is given — when the loaded provenance's
+    ``harness_version`` does not equal it.
     :meth:`PromptArtifactStore.pin` always enforces that equality itself, so
     this last check only guards against a sidecar written or relocated
     outside the public API (e.g. a directory moved on disk, or a
@@ -172,7 +174,18 @@ def _load_valid_provenance(
     "nothing pinned": an unverifiable artifact must never be surfaced as a
     pinned one.
     """
-    parsed, _ok = load_json_or_warn(path, default=None)
+    try:
+        parsed, _ok = load_json_or_warn(path, default=None)
+    except OSError:
+        # The sidecar exists but is unreadable — a permission flip mid-
+        # operation, or the path replaced by a directory. safe_io
+        # deliberately propagates every non-FileNotFoundError OSError so its
+        # other callers still see genuine environmental faults; this caller's
+        # contract is "never raises — fall back to the in-code constant", so
+        # the fault is absorbed here rather than by widening safe_io.
+        # (FileNotFoundError is an OSError subclass but is already handled
+        # inside safe_io, so it never reaches this handler.)
+        return None
     if parsed is None:
         return None
     try:
