@@ -281,6 +281,22 @@ EXPECTED_CONSUMERS: tuple[ExpectedConsumer, ...] = (
 )
 
 
+class GpuBaseline(BaseModel):
+    """What the card held immediately before one arm started.
+
+    The reading and the inventory travel together as ONE value because they
+    describe one moment.  A reading taken at one instant paired with an
+    inventory from another would describe a card that never existed, and
+    nothing downstream could detect the mismatch.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reading: GpuReading
+    consumers: list[GpuConsumer]
+    measured_at: datetime
+
+
 class GpuSnapshot(BaseModel):
     """One atomic "what the GPU is and what it currently holds"."""
 
@@ -707,14 +723,40 @@ def baseline_path(arm_id: str) -> Path:
     return baseline_dir() / f'{arm_id}.json'
 
 
-def record_baseline(arm_id: str, reading: GpuReading) -> Path:
-    """Persist the pre-start GPU reading for *arm_id*.
+def record_baseline(
+    arm_id: str,
+    reading: GpuReading,
+    *,
+    consumers: Sequence[GpuConsumer],
+) -> Path:
+    """Persist the pre-start GPU reading AND inventory for *arm_id*.
 
     Called by ``lms_ctl.start`` between the pre-flight and ``systemctl start``.
     Recording it AT THE START EVENT, rather than accepting it as a healthcheck
     flag, is the anti-fabrication property: the number is produced by the act
     of starting the arm and cannot be typed in afterwards to make a report fit.
+
+    REFUSES a polluted baseline, and refuses it BEFORE any write, so no
+    polluted file ever exists for a later reader to pick up and no
+    truncate-then-fail can destroy a good measurement.  This is the same
+    refusal already sited in ``lms_ctl.start`` for a failed pre-flight: a
+    refused arm leaves nothing behind for another arm's report to find.
+    Writing-and-flagging would not do -- the file would still be the number the
+    next healthcheck subtracts, and the flag only helps a reader who thought to
+    look.
+
+    *consumers* is REQUIRED and keyword-only, not optional.  An optional
+    inventory would let a caller record a baseline carrying no evidence about
+    who else held the card, and downstream that absence reads as "clean".
     """
+    consumers = list(consumers)
+    offenders = unexpected_baseline_consumers(consumers)
+    if offenders:
+        raise PollutedBaselineError(
+            offenders,
+            context=f'refusing to record a baseline for arm {arm_id!r}',
+        )
+
     path = baseline_path(arm_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -723,18 +765,25 @@ def record_baseline(arm_id: str, reading: GpuReading) -> Path:
         'total_mib': reading.total_mib,
         'used_mib': reading.used_mib,
         'free_mib': reading.free_mib,
+        'consumers': [consumer.model_dump(mode='json') for consumer in consumers],
     }
     path.write_text(json.dumps(payload, indent=2) + '\n')
     return path
 
 
-def read_baseline(arm_id: str) -> GpuReading:
-    """The reading taken immediately before *arm_id* started.
+def read_baseline_record(arm_id: str) -> GpuBaseline:
+    """The reading AND inventory taken immediately before *arm_id* started.
 
     Raises rather than falling back to :data:`MEASURED_BASELINE_GIB`.  A default
     here would silently reintroduce the frozen baseline esc-3713-6 ruled out,
     and the artifact would look identical either way -- which is exactly the
     class of wrong answer this package refuses to emit.
+
+    A payload with no ``consumers`` key -- one written before this guard
+    existed -- raises for the same reason.  Defaulting it to ``[]`` would make
+    the one baseline we know NOTHING about look like the cleanest possible
+    reading.  Baselines live in ``$XDG_RUNTIME_DIR`` and are per-boot, so the
+    staleness window is bounded and the fix is one command.
     """
     path = baseline_path(arm_id)
     if not path.exists():
@@ -747,29 +796,56 @@ def read_baseline(arm_id: str) -> GpuReading:
         )
     try:
         payload = json.loads(path.read_text())
-        return GpuReading(
-            total_mib=payload['total_mib'],
-            used_mib=payload['used_mib'],
-            free_mib=payload['free_mib'],
+        if 'consumers' not in payload:
+            raise VramProbeError(
+                f'baseline file {path} records no GPU consumer inventory, so '
+                'there is no evidence about who else held the card when it was '
+                'taken. Treating that as an empty (clean) list would flatter '
+                'the one baseline nothing is known about; re-take it with '
+                '`lms_ctl start`'
+            )
+        return GpuBaseline(
+            reading=GpuReading(
+                total_mib=payload['total_mib'],
+                used_mib=payload['used_mib'],
+                free_mib=payload['free_mib'],
+            ),
+            consumers=[GpuConsumer(**entry) for entry in payload['consumers']],
+            measured_at=datetime.fromisoformat(payload['measured_at']),
         )
-    except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError,
+            ValidationError) as exc:
         raise VramProbeError(f'baseline file {path} is unreadable: {exc}') from exc
 
 
-def read_baselines(arm_ids: Sequence[str]) -> GpuReading:
-    """One baseline for a set of arms probed together.
+def read_baseline_records(arm_ids: Sequence[str]) -> GpuBaseline:
+    """One baseline record for a set of arms probed together.
 
     The LOWEST prior usage wins.  With several arms up, that reading attributes
     the MOST memory to them collectively, so the choice can only ever be
     unflattering -- the opposite of the direction a fabricated artifact wants.
+
+    The whole RECORD is chosen, never a reading from one arm and an inventory
+    from another: that pair would describe a card that never existed, and the
+    mismatch would be invisible in the artifact.
     """
     if not arm_ids:
         raise VramProbeError(
             'no arms to read a baseline for; a budget verdict over zero arms '
             'would describe nothing'
         )
-    readings = [read_baseline(arm_id) for arm_id in arm_ids]
-    return min(readings, key=lambda r: r.used_mib)
+    records = [read_baseline_record(arm_id) for arm_id in arm_ids]
+    return min(records, key=lambda record: record.reading.used_mib)
+
+
+def read_baseline(arm_id: str) -> GpuReading:
+    """The reading half of :func:`read_baseline_record`, for existing callers."""
+    return read_baseline_record(arm_id).reading
+
+
+def read_baselines(arm_ids: Sequence[str]) -> GpuReading:
+    """The reading half of :func:`read_baseline_records`, for existing callers."""
+    return read_baseline_records(arm_ids).reading
 
 
 def clear_baseline(arm_id: str) -> None:

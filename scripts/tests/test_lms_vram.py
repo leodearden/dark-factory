@@ -380,7 +380,7 @@ def _reading(used_mib=7310, free_mib=16813, total_mib=24576):
 def test_baseline_round_trips_through_the_recorded_file(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
-    lms_vram.record_baseline('qwen3.5-9b', _reading())
+    lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[])
     restored = lms_vram.read_baseline('qwen3.5-9b')
 
     assert restored.used_mib == 7310
@@ -391,8 +391,10 @@ def test_baseline_round_trips_through_the_recorded_file(tmp_path, monkeypatch):
 def test_baseline_is_written_per_arm_and_does_not_collide(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
-    lms_vram.record_baseline('qwen3.5-9b', _reading(used_mib=7310))
-    lms_vram.record_baseline('phi-4-14b', _reading(used_mib=7900, free_mib=16223))
+    lms_vram.record_baseline('qwen3.5-9b', _reading(used_mib=7310), consumers=[])
+    lms_vram.record_baseline(
+        'phi-4-14b', _reading(used_mib=7900, free_mib=16223), consumers=[],
+    )
 
     assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 7310
     assert lms_vram.read_baseline('phi-4-14b').used_mib == 7900
@@ -427,7 +429,7 @@ def test_the_recorded_baseline_is_stamped_with_an_aware_utc_time(
     """A baseline with no time on it cannot be told apart from last week's."""
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
-    lms_vram.record_baseline('qwen3.5-9b', _reading())
+    lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[])
     payload = json.loads(lms_vram.baseline_path('qwen3.5-9b').read_text())
 
     stamped = datetime.fromisoformat(payload['measured_at'])
@@ -441,8 +443,8 @@ def test_read_baselines_takes_the_most_conservative_of_several(
     usage attributes the MOST memory to the arms, which is the reading that
     cannot flatter them."""
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
-    lms_vram.record_baseline('a', _reading(used_mib=7310, free_mib=16813))
-    lms_vram.record_baseline('b', _reading(used_mib=9000, free_mib=15123))
+    lms_vram.record_baseline('a', _reading(used_mib=7310, free_mib=16813), consumers=[])
+    lms_vram.record_baseline('b', _reading(used_mib=9000, free_mib=15123), consumers=[])
 
     chosen = lms_vram.read_baselines(['a', 'b'])
 
@@ -459,7 +461,7 @@ def test_read_baselines_raises_when_asked_for_nothing(tmp_path, monkeypatch):
 
 def test_clearing_a_baseline_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
-    lms_vram.record_baseline('a', _reading())
+    lms_vram.record_baseline('a', _reading(), consumers=[])
 
     lms_vram.clear_baseline('a')
     lms_vram.clear_baseline('a')
