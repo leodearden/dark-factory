@@ -372,6 +372,41 @@ class TestResolveReifyRoot:
         start = _plant(src, 'dark-factory/fused-memory/tests')
         assert _resolve_reify_root(start) == (src / 'reify').resolve()
 
+    def test_resolver_delegates_to_the_shared_single_source(self, tmp_path, monkeypatch):
+        """The ancestor walk must live in ONE place — shared.reify_checkout.
+
+        Deliberately white-box, and deliberately the only genuinely-RED
+        assertion available for what is otherwise a behaviour-preserving
+        refactor: the cases above pass both before and after the migration, so
+        they are the regression net, not the signal.  What this pin buys is the
+        invariant the migration exists for — a SECOND copy of the walk cannot
+        quietly reappear in this file.  No black-box equivalence assertion can
+        express that, since a faithful duplicate would satisfy every one of them
+        while defeating the single-sourcing.
+        """
+        import shared.reify_checkout as reify_checkout
+
+        sentinel = tmp_path / 'sentinel-reify'
+        start = _plant(tmp_path, 'dark-factory/fused-memory/tests')
+        seen = {}
+
+        def _stub(marker, start=None):
+            seen['marker'] = Path(marker)
+            seen['start'] = start
+            return sentinel
+
+        monkeypatch.setattr(reify_checkout, 'resolve_reify_root', _stub)
+
+        assert _resolve_reify_root(start) == sentinel, (
+            'this module must DELEGATE to shared.reify_checkout.resolve_reify_root '
+            'rather than keep a private copy of the ancestor walk'
+        )
+        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
+            'the shared resolver must be bound to THIS call site marker '
+            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")})'
+        )
+        assert seen['start'] == start
+
     def test_module_constants_track_the_resolver(self):
         """Single-source-of-truth pin — GREEN as soon as step 2 lands.
 
