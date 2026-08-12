@@ -256,26 +256,56 @@ waits.
 
 ```mermaid
 stateDiagram-v2
+    %% entry
     [*] --> deferred: planning_mode submit
     [*] --> pending: normal submit (via curator)
-    deferred --> pending
-    deferred --> done
-    deferred --> blocked
-    deferred --> cancelled
+    %% dispatch
     pending --> in_progress: dispatch
+    %% completion
     in_progress --> done: merge lands
-    in_progress --> blocked: unresolved failure
+    merge_deferred --> done
+    blocked --> done
+    pending --> done
+    deferred --> done
+    infra_hold --> done
+    review --> done
+    %% park (atomic train)
     in_progress --> merge_deferred: parked in an atomic train
+    %% requeue / re-pend
     in_progress --> pending: requeue
+    blocked --> pending: re-pend
+    merge_deferred --> pending
+    deferred --> pending
+    infra_hold --> pending
+    review --> pending
+    %% block
+    in_progress --> blocked: unresolved failure
+    pending --> blocked: deterministic gate (born-at-L2)
+    merge_deferred --> blocked
+    deferred --> blocked
+    infra_hold --> blocked
+    review --> blocked
+    %% cancel (any non-terminal)
+    pending --> cancelled
+    in_progress --> cancelled
+    blocked --> cancelled
+    deferred --> cancelled
+    merge_deferred --> cancelled
+    infra_hold --> cancelled
+    review --> cancelled
+    %% infra hold
     in_progress --> infra_hold
+    blocked --> infra_hold
     infra_hold --> in_progress
+    blocked --> in_progress: resume (infra)
+    %% review
     in_progress --> review
     review --> in_progress
-    blocked --> pending: re-pend
-    merge_deferred --> done
-    merge_deferred --> blocked
-    merge_deferred --> cancelled
-    merge_deferred --> pending
+    %% deferred (planning / park)
+    pending --> deferred
+    in_progress --> deferred
+    blocked --> deferred
+    %% terminal
     done --> [*]
     cancelled --> [*]
 ```
@@ -283,9 +313,18 @@ stateDiagram-v2
 Legal transitions are a closed table (`shared/src/shared/task_transitions.py`)
 enforced by fused-memory's `TaskInterceptor`, keyed by the actor making the
 change — e.g. reconciliation is never allowed to transition a task *out of*
-`in-progress`. `blocked --resume(infra)--> in-progress` and a rare, audited
-`done`/`cancelled --reopen--> *` (requiring an explicit `reopen_reason`) are
-operator recovery paths, not part of the normal happy path.
+`in-progress`. The diagram above is that table in full, not a happy-path
+sketch: every one of its 37 edges is a `TRANSITIONS` pair, and
+`shared/tests/test_architecture_doc_transition_parity.py` asserts set-equality
+in both directions, so an edge added to the table cannot silently rot out of
+the diagram (it had lost 19 of them before that test existed). Many of the
+drawn edges are operator or sweep recovery paths rather than normal flow —
+`blocked --resume(infra)--> in-progress`, the `infra_hold`/`review` fan-outs,
+and reconciliation's any-non-terminal → `cancelled` family. One recovery path
+is deliberately *absent* from the table and so cannot be drawn: the rare,
+audited `done`/`cancelled --reopen--> *` (requiring an explicit
+`reopen_reason`), which `is_legal_transition` gates on its `reopen` flag
+instead of on a `(from, to)` pair.
 
 ### 3.2 Submit
 
