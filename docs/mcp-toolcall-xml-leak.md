@@ -135,11 +135,25 @@ precision calibration split: `MCP_MARKUP_PATTERNS` still over-reports on
 purpose at the write boundary, where a false positive costs only a retry,
 and `PREFILTER_NEEDLES` still under-reports on purpose over already-stored
 content, where a false positive would silently rewrite a user's memory.
-What the consolidation removes is the divergence that used to sit
-underneath that split — the write-time list carried one closing tag while
-the read-time list carried four. That divergence is exactly what made the
-original diagnosis ambiguous: a mis-closed `description` could not report
-its own tag, so the write-time guard blamed whatever happened to follow it.
+Be precise about what the consolidation does and does not remove. It
+removes the **independent spelling**: the two lists are no longer typed out
+at two sites, so they can no longer drift apart by accident. It does *not*
+collapse their membership, which still differs by calibration —
+`MCP_MARKUP_PATTERNS` carries one closing tag (plus the opener prefix and
+the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
+closers, and `ENVELOPE_LITERALS` is their union.
+
+So the write-time **diagnostic gap is still open today**.
+`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:189`) still
+scans `MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the
+fused-memory write boundary still cannot report its own tag and still
+blames whatever happens to follow it. What closes that gap is `detect()`
+over `ENVELOPE_LITERALS` — the earliest literal by position over the full
+union — reaching the write boundary when `MarkupGuardMiddleware` is
+registered on the four servers (task 3690, the same task the coverage
+table above is dated against). Until then, read a write-time `matched_pattern`
+as "an envelope literal was seen here", not as "this is the tag that was
+mis-closed".
 
 ---
 
