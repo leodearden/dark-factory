@@ -188,8 +188,17 @@ class _PlanField(NamedTuple):
     parameter vocabulary ``repair()`` validates against — which is not always
     the call that produced the corruption: ``replace_plan_step`` also writes
     ``steps[].description`` AND ``prerequisites[].description`` (its lookup loop
-    spans both collections), and ``update_plan_metadata`` also writes
-    ``analysis``. Naming only the owner would send whoever triages a fact to the
+    spans both collections), ``update_plan_metadata`` also writes ``analysis``,
+    and ``mark_step_committed`` ALSO writes ``steps[].description`` AND
+    ``prerequisites[].description`` — but differently from the other two: it
+    takes no ``description`` parameter at all. It re-reads the plan and
+    prepends ``TaskArtifacts.mark_step_committed``'s ``[COMMITTED <sha12>]``
+    provenance tag to whatever the field already held. It can therefore never
+    be the tail that INTRODUCES envelope markup into the field — it has no
+    prose argument to leak one from — but it IS a call site a triager may need
+    to account for when a ``[COMMITTED ...]``-prefixed description turns out
+    corrupt, which is why it is listed here despite writing no prose of its
+    own. Naming only the schema owner would send whoever triages a fact to the
     wrong call site; naming the alternates alongside it keeps the diagnosis
     honest without pretending the fact can identify the writer it cannot see.
     """
@@ -247,11 +256,16 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 )
 
 #: The OTHER tools that write a given field, per row of the table below. Each
-#: entry is machine-checked to name a real plan-tools entry point that actually
-#: takes that parameter
-#: (``TestRepairableFieldTable::test_every_alternate_writer_is_a_real_tool_taking_that_field``),
-#: so an alternate cannot drift into a prose label.
-_REPLACE_STEP_ALSO: tuple[str, ...] = ('replace_plan_step',)
+#: entry is machine-checked to name a real plan-tools entry point that is
+#: OBSERVED TO ACTUALLY WRITE the field
+#: (``TestRepairableFieldTable::test_every_alternate_writer_really_writes_that_field``),
+#: so an alternate cannot drift into a prose label. Checked BEHAVIOURALLY, not
+#: by signature: a writer need not take the field as a parameter to write it —
+#: ``mark_step_committed`` rewrites ``description`` by re-reading and
+#: rewriting the plan, never taking a ``description`` argument at all, so a
+#: signature-based check would have rejected it as an alternate despite it
+#: being a real one.
+_DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
 #: THE declared enumeration of the repairable surface. Adding a prose field to
@@ -288,14 +302,14 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
             'description',
             _params_of(_add_prerequisite),
             _ADD_PREREQUISITE_TARGETS,
-            _REPLACE_STEP_ALSO,
+            _DESCRIPTION_ALSO,
         ),
         _PlanField(
             'steps',
             'description',
             _params_of(_add_plan_step),
             _ADD_PLAN_STEP_TARGETS,
-            _REPLACE_STEP_ALSO,
+            _DESCRIPTION_ALSO,
         ),
         _PlanField(
             'design_decisions',
@@ -328,12 +342,13 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
 #:
 #: NOT "the only tool that writes this collection", which would be false of this
 #: module: ``replace_plan_step`` also writes ``description`` on both ``steps``
-#: and ``prerequisites`` items, and ``update_plan_metadata`` also writes
-#: ``analysis``. A fact therefore carries ``also_written_by`` beside ``tool``
-#: (see :class:`_PlanField`) so a triager is not sent to a call site the
-#: corruption may never have passed through. Asserted callable via
-#: ``getattr(plan_tools, '_' + tool)`` by the repair tests, so the label cannot
-#: drift into prose.
+#: and ``prerequisites`` items, ``update_plan_metadata`` also writes
+#: ``analysis``, and ``mark_step_committed`` also writes ``description`` on
+#: both — without taking a ``description`` parameter at all. A fact therefore
+#: carries ``also_written_by`` beside ``tool`` (see :class:`_PlanField`) so a
+#: triager is not sent to a call site the corruption may never have passed
+#: through. Asserted callable via ``getattr(plan_tools, '_' + tool)`` by the
+#: repair tests, so the label cannot drift into prose.
 _COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
     None: 'create_plan',
     'prerequisites': 'add_prerequisite',
