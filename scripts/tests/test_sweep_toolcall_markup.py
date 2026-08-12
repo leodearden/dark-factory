@@ -47,6 +47,9 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / 'shared' / 'src'
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
+# `import sweep_toolcall_markup` resolves because scripts/tests/conftest.py
+# already inserts scripts/ onto sys.path under --import-mode=importlib.
+import sweep_toolcall_markup as sweep  # noqa: E402
 from shared.toolcall_markup import (  # noqa: E402
     CANONICAL_OPENER_PREFIX,
     PREFILTER_NEEDLES,
@@ -409,3 +412,98 @@ def test_symlinked_plan_fixture_is_an_absolute_symlink(sweep_root):
     assert Path(os.path.realpath(link)) == (
         sweep_root / '.worktrees' / '.task-meta' / '9002' / 'plan.json'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-1 — discovery. The two pinned path sets, and NOTHING else.
+# ---------------------------------------------------------------------------
+
+
+def _discovered(root):
+    """``{relpath: lane}`` for every target ``discover_targets`` yields."""
+    return {
+        str(target.path.relative_to(root)): target.lane
+        for target in sweep.discover_targets(root)
+    }
+
+
+def test_discovery_yields_exactly_the_two_pinned_path_sets(sweep_root):
+    """Discovery is an allowlist of two shapes, not a repo-wide .json walk.
+
+    Pinning the WHOLE mapping (rather than asserting membership of a few
+    interesting paths) is deliberate: the hazard this sweep carries is
+    over-reach onto files it was never meant to rewrite, and a membership-only
+    assertion cannot fail when a new path is wrongly swept in.
+    """
+    assert _discovered(sweep_root) == {
+        'data/escalations/esc-1-1.json': sweep.LANE_ESCALATIONS,
+        'data/escalations/b3-state.json': sweep.LANE_ESCALATIONS,
+        'data/escalations/archive/2026-08-08/esc-2-1.json': sweep.LANE_ESCALATIONS,
+        'data/escalations/archive/2026-08-08/esc-3-1.json': sweep.LANE_ESCALATIONS,
+        '.worktrees-orphaned/9001-2026/.task/plan.json': sweep.LANE_PLANS,
+        '.worktrees-orphaned/9002-2026/.task/plan.json': sweep.LANE_PLANS,
+    }
+
+
+def test_discovery_recurses_into_the_archive_date_directories(sweep_root):
+    """59 of the 60 corrupted live records sit under ``archive/<date>/``.
+
+    A non-recursive escalations glob would therefore find almost nothing while
+    still reporting a clean, plausible-looking run.
+    """
+    found = _discovered(sweep_root)
+    assert 'data/escalations/archive/2026-08-08/esc-2-1.json' in found
+
+
+def test_discovery_skips_dot_prefixed_escalation_files(sweep_root):
+    """``.watch-fire.json`` is live watcher state, not a terminal record.
+
+    Design decision 8: it carries a full escalation-record shape, so nothing
+    about its CONTENT excludes it. ``glob.glob`` would drop it silently and
+    ``Path.rglob`` would sweep it silently, so the choice is made explicitly
+    here and asserted rather than inherited from whichever globbing API the
+    implementation happened to reach for.
+    """
+    assert 'data/escalations/.watch-fire.json' not in _discovered(sweep_root)
+
+
+def test_discovery_never_yields_the_replicated_committed_evidence(sweep_root):
+    """``worktree-inventory.json`` is git-tracked evidence that QUOTES specimens.
+
+    It is replicated into every worktree checkout, so an orphaned-worktree walk
+    that globbed ``**/*.json`` would find a 355 KB file full of verbatim leak
+    text and "repair" the evidence. Hazard 1 in the plan.
+    """
+    found = _discovered(sweep_root)
+    assert not [path for path in found if 'worktree-inventory.json' in path]
+
+
+def test_discovery_plans_glob_is_the_exact_task_plan_tail(sweep_root):
+    """Only ``<orphaned>/.task/plan.json`` — never any other .json beneath it."""
+    found = _discovered(sweep_root)
+    assert '.worktrees-orphaned/9001-2026/other.json' not in found
+    for path, lane in found.items():
+        if lane == sweep.LANE_PLANS:
+            assert path.endswith('/.task/plan.json')
+
+
+def test_discovery_is_deterministic_and_sorted(sweep_root):
+    """Two calls agree, and the order is sorted.
+
+    The report is diffed between runs by an operator, so an unstable order
+    would manufacture churn that looks like new corruption.
+    """
+    first = sweep.discover_targets(sweep_root)
+    second = sweep.discover_targets(sweep_root)
+    assert first == second
+    assert first == sorted(first)
+
+
+def test_discovery_tolerates_absent_lane_directories(tmp_path):
+    """A root with neither lane present yields nothing and does not raise.
+
+    ``.worktrees-orphaned`` only exists once the reclaim timer has rotated at
+    least one lane, so an empty or fresh checkout is an ordinary state, not an
+    error.
+    """
+    assert sweep.discover_targets(tmp_path / 'empty-root') == []
