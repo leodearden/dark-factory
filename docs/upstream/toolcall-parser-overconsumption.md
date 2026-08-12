@@ -71,3 +71,92 @@ code substituting a plausible-looking default for the now-missing parameter
 downstream, disconnected from its cause. We have repeatedly had to
 reconstruct, well after the fact, which of several plausible default values
 was silently substituted for an argument the model had actually supplied.
+
+## Specimens
+
+Four real examples, drawn from our own tool-call logs and reproduced below
+losslessly (each fenced block, once the `&#60;` escapes are read back as `<`,
+is the exact text the parser received as a single parameter's value). The
+tool names below — `submit_task`, `add_memory`, `update_memory` — are our own
+internal MCP tools; they appear only to illustrate the shape of the defect,
+not because they matter to the harness. Each specimen also carries a
+one-line HTML comment immediately above its block recording the call it
+came from in a structured form (`id`, `tool`, the parameter whose value
+absorbed the tail, the argument names that arrived intact, that tool's full
+parameter set, and the names that were dropped); the comment is invisible in
+a rendered view of this document and exists so the claims below are
+independently checkable against the parsed text, not just asserted.
+
+| Specimen | Tool call | Corrupted parameter | Keys received | Keys dropped |
+|---|---|---|---|---|
+| S1 | `submit_task` | `description` | `project_root`, `title`, `description` | `priority`, `agent_id`, `metadata` |
+| S2 | `submit_task` | `description` | `project_root`, `title`, `description` | `priority` (intended `low`) |
+| S3 | `add_memory` | `content` | `content`, `project_id`, `category`, `agent_id` | none — `content` was the last parameter |
+| S4 | `update_memory` | `content` | `memory_id`, `store`, `project_id`, `content` | `agent_id` |
+
+### S1 — dialect blend
+
+The model closes `description` by echoing its name (`&#60;/description>`
+instead of `&#60;/parameter>`), then drifts into that same name-echoing
+dialect for two more parameters, and finally blends the two dialects on a
+third: `&#60;metadata">` closes with a stray quote immediately before the
+bracket, on both its opening and closing tag. That stray quote is direct
+evidence the model is interpolating between the canonical
+`&#60;parameter name="X">` form and the name-echoing `&#60;X>` form, not
+cleanly using either one.
+
+&#60;!-- specimen id="S1" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority,agent_id,metadata" --&gt;
+```text
+Investigate the elevated error rate on the ingest pipeline and file a fix.&#60;/description>
+&#60;priority>medium&#60;/priority>
+&#60;agent_id>reviewer-bot-04&#60;/agent_id>
+&#60;metadata">{"source": "weekly-audit"}&#60;/metadata">
+&#60;/invoke>
+```
+
+### S2 — unterminated canonical opener
+
+Here the drift is only partial: the model still opens `priority` the
+canonical way, `&#60;parameter name="priority">`, but the call ends before
+any closing tag at all — there is nothing left to consume once the intended
+value ("low") runs out. The parser has no next terminator to over-consume
+*to*, so the entire remainder of the text, starting from the mis-close,
+becomes `description`'s value and `priority` never arrives.
+
+&#60;!-- specimen id="S2" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority" --&gt;
+```text
+Retry the failed webhook delivery; this can likely be resolved automatically).&#60;/description>
+&#60;parameter name="priority">low
+```
+
+### S3 — the invisible case
+
+`content` is mis-closed exactly the same way as in the other specimens, but
+here it happens to be the **last** parameter of the call. There is nothing
+after it to over-consume, so nothing is dropped and the call behaves
+correctly by accident. This specimen is included deliberately: it shows the
+defect is purely positional. The same model mistake, on the same tool, is
+completely invisible whenever the mis-closed parameter happens to be listed
+last, and harmful whenever it isn't — nothing about the mistake itself
+signals which case a given call falls into.
+
+&#60;!-- specimen id="S3" tool="add_memory" param="content" supplied="content,project_id,category,agent_id" schema="content,project_id,category,agent_id,session_id,metadata,dual_write" dropped="" --&gt;
+```text
+This memory is being stored verbatim, matching the schema by design.&#60;/content>
+&#60;/invoke>
+```
+
+### S4 — mis-closed with the generic tag
+
+The opposite drift from the others: this time the model closes `content`
+with the *generic* `&#60;/parameter>` closer rather than echoing its name,
+then opens the next parameter canonically. The generic closer is exactly
+what the parser is supposed to expect, on the wrong parameter — which is
+enough by itself to send it looking further ahead, past `agent_id`, for the
+next tag it recognizes.
+
+&#60;!-- specimen id="S4" tool="update_memory" param="content" supplied="memory_id,store,project_id,content" schema="memory_id,store,project_id,content,metadata_patch,metadata_delete_keys,metadata_mode,reason,agent_id,session_id,metadata" dropped="agent_id" --&gt;
+```text
+The memory has been re-scoped).&#60;/parameter>
+&#60;parameter name="agent_id">escalation-watcher-l2
+```

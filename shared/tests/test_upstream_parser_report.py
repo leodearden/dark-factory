@@ -149,9 +149,18 @@ class TestContainment:
 # identifier and, eventually, a closing one -- structurally the exact
 # open-tag shape this module exists to keep out of its own source, even
 # though it is regex syntax rather than an envelope literal.
+#
+# The comment delimiter is matched as the literal text '&#60;!--', NOT as an
+# escaped-then-decoded real HTML comment opener: the report spells its own
+# structural markup with the same '&#60;' convention as everything else in
+# it (design decision -- see plan.json), so that is what is actually on
+# disk. Matching a real, decoded comment opener here would never find it,
+# and re-escaping this text back to search for one would recreate the exact
+# literal this module exists to keep out of its own source for no benefit.
+#
 # Group order: id, tool, param, supplied, schema, dropped, block.
 _SPECIMEN_HEADER_RE = re.compile(
-    r'\x3c!--\s*specimen\s+'
+    r'&#60;!--\s*specimen\s+'
     r'id="([^"]*)"\s+'
     r'tool="([^"]*)"\s+'
     r'param="([^"]*)"\s+'
