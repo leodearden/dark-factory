@@ -806,3 +806,126 @@ class TestResolveRecoveryVetoStreakEscalation:
         assert _resolve_streak(
             escalation_queue=queue, task_id='3535', recovered_streak=9, threshold=3,
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# S25 — RecoverySweepTally folds escalation IDS, never record reprs
+# ---------------------------------------------------------------------------
+
+
+def _tally():
+    from orchestrator.recovery_emission import RecoverySweepTally
+
+    return RecoverySweepTally()
+
+
+def _pinned():
+    from orchestrator.recovery_emission import LeaveReason
+
+    return LeaveReason.escalation_pinned
+
+
+def _ref(esc_id: str):
+    """A real ``EscalationRef`` — the shape the reconcile sweep passes."""
+    from orchestrator.task_ground_truth import EscalationRef
+
+    return EscalationRef(
+        id=esc_id, level=1, category='', severity='blocking',
+        created_at='2026-08-12T00:00:00+00:00',
+    )
+
+
+def _row(esc_id: str):
+    """A real queue ``Escalation`` — the shape the scheduler / deterministic
+    recon sites pass, since they hold raw queue rows rather than refs."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id=esc_id, task_id='3535', agent_role='implementer', severity='blocking',
+        category='risk_identified', summary='held', level=1,
+    )
+
+
+class TestRecoverySweepTally:
+    """The per-sweep summary must name escalation IDS.
+
+    This line is the PER-SWEEP half of the cadence (the event store is
+    deliberately quiet for an unchanged hold), so a fleet with several held
+    tasks renders it on every pass.  Folding record objects instead of their
+    ids turns that line into an unreadable wall of dataclass reprs and breaks
+    ``pinning_ids``' own stated contract.
+
+    Every assertion here is EXACT equality, never a substring: a substring
+    assertion passes against a repr, which is exactly how the defect shipped.
+    """
+
+    def test_an_escalation_ref_folds_as_its_id(self):
+        tally = _tally()
+        tally.record(_pinned(), [_ref('esc-1')], task_id='T1')
+
+        assert tally.pinning_ids == ['esc-1']
+        assert tally.render().startswith('held=1 (esc-1);')
+
+    def test_a_queue_escalation_row_folds_as_its_id(self):
+        """The OTHER live record shape the adapter passes."""
+        tally = _tally()
+        tally.record(_pinned(), [_row('esc-9')], task_id='T1')
+
+        assert tally.pinning_ids == ['esc-9']
+        assert tally.render().startswith('held=1 (esc-9);')
+
+    def test_plain_string_ids_keep_working_verbatim(self):
+        """The bucketed-string path ``emit_recovery_veto_streak_escalation``
+        shares must be provably unchanged."""
+        tally = _tally()
+        tally.record(_pinned(), ['esc-2', 'esc-1'], task_id='T1')
+
+        assert tally.pinning_ids == ['esc-1', 'esc-2']
+
+    def test_a_bucketed_mapping_still_flattens(self):
+        tally = _tally()
+        tally.record(
+            _pinned(),
+            {
+                'dead_l0': ['esc-3'],
+                'queue_handoff': ['esc-1'],
+                'non_pinning': ['esc-2'],
+            },
+            task_id='T1',
+        )
+
+        assert tally.pinning_ids == ['esc-1', 'esc-2', 'esc-3']
+
+    def test_an_entry_with_no_id_degrades_to_its_str(self):
+        """Totality: this runs inside a sweep, so it must never raise — and a
+        DROPPED id would read as 'nothing held this'."""
+        tally = _tally()
+        tally.record(_pinned(), [42], task_id='T1')
+
+        assert tally.pinning_ids == ['42']
+
+    def test_the_same_id_across_two_records_collapses_to_one_entry(self):
+        tally = _tally()
+        tally.record(_pinned(), [_ref('esc-1')], task_id='T1')
+        tally.record(_pinned(), [_ref('esc-1')], task_id='T2')
+
+        assert tally.pinning_ids == ['esc-1']
+        assert tally.held == 2
+
+    def test_a_record_and_its_bare_id_collapse_to_one_entry(self):
+        """The very failure the repr caused: one escalation rendered twice."""
+        tally = _tally()
+        tally.record(_pinned(), [_ref('esc-1')], task_id='T1')
+        tally.record(_pinned(), ['esc-1'], task_id='T2')
+
+        assert tally.pinning_ids == ['esc-1']
+
+    def test_ids_appear_in_first_seen_order_across_record_calls(self):
+        """The stated contract, asserted rather than assumed."""
+        tally = _tally()
+        tally.record(_pinned(), [_ref('esc-9')], task_id='T1')
+        tally.record(_pinned(), [_ref('esc-2'), _ref('esc-5')], task_id='T2')
+        tally.record(_pinned(), [_ref('esc-1')], task_id='T3')
+
+        assert tally.pinning_ids == ['esc-9', 'esc-2', 'esc-5', 'esc-1']
+        assert tally.render().startswith('held=3 (esc-9, esc-2, esc-5, esc-1);')

@@ -4239,8 +4239,10 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
             await harness._reconcile_stranded_in_progress(mid_run=False)
 
         line = _summary_lines(caplog)[0]
-        assert 'held=2' in line
-        assert 'esc-1' in line and 'esc-2' in line
+        # EXACT, not substring: a substring assertion here passes against a
+        # dataclass repr that merely CONTAINS the id, which is how the tally's
+        # id-flattening defect shipped once already (task 3535 S25).
+        assert 'held=2 (esc-1, esc-2)' in line
 
     async def test_summary_breaks_the_left_count_down_by_reason(
         self, harness, caplog,
