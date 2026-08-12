@@ -261,7 +261,13 @@ async def _capture_writables(config, cwd, config_dir):
     assert callable(sandbox_wrap), (
         f'Expected a sandbox_wrap callable; got {sandbox_wrap!r}'
     )
-    return _writable_values(sandbox_wrap(['claude', '--print']))
+    wrapped = sandbox_wrap(['claude', '--print'])
+    # `call_kwargs.get` is typed `object`; narrow before handing it to a
+    # `list[str]` parameter (same idiom as the import-boundary test above).
+    assert isinstance(wrapped, list), (
+        f'wrap callable must return a list; got {wrapped!r}'
+    )
+    return _writable_values(wrapped)
 
 
 @pytest.mark.asyncio

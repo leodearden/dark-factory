@@ -480,6 +480,14 @@ class TestConfigDirContainment:
         ruleset rather than an argv shape. /var/tmp (not /tmp) is mandatory —
         /tmp is blanket-writable in both backends, which would make the
         sibling-denied half of this test vacuous.
+
+        The denial probes must be genuine CONTENT writes. ``touch`` on a file
+        that already exists is NOT one: coreutils falls back to ``utimensat()``
+        when the ``open(O_WRONLY)`` is refused, and Landlock has no access right
+        governing timestamps at all — its FS bits cover EXECUTE / WRITE_FILE /
+        READ_FILE / READ_DIR / REMOVE_* / MAKE_* / REFER / TRUNCATE / IOCTL_DEV
+        and nothing else. A ``touch``-the-credentials probe therefore succeeds
+        under *every* ruleset, including a correct one, and pins nothing.
         """
         base = Path(tempfile.mkdtemp(prefix='recon-cfgdir-test-', dir='/var/tmp'))
         try:
@@ -496,9 +504,18 @@ class TestConfigDirContainment:
             inner = [
                 '/bin/sh', '-c',
                 (
+                    # `mine` half: s.jsonl does NOT exist yet, so this is a real
+                    # O_CREAT (MAKE_REG), the same right the CLI needs to lay
+                    # down its session transcript.
                     f'mkdir -p {mine}/projects && touch {mine}/projects/s.jsonl '
                     f'&& echo mine_ok; '
-                    f'touch {other}/.credentials.json 2>/dev/null || echo sibling_denied'
+                    # Overwriting the bytes (WRITE_FILE|TRUNCATE) — the exact
+                    # capability that must not exist. See the docstring for why
+                    # this is not spelled `touch`.
+                    f'echo stolen > {other}/.credentials.json 2>/dev/null '
+                    f'|| echo sibling_write_denied; '
+                    # And no NEW file in a sibling's dir either (MAKE_REG).
+                    f'touch {other}/planted 2>/dev/null || echo sibling_create_denied'
                 ),
             ]
             wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
@@ -513,9 +530,21 @@ class TestConfigDirContainment:
                 f'is the whole point. stdout={result.stdout!r} stderr={result.stderr!r}'
             )
             assert 'mine_ok' in result.stdout, f'stdout={result.stdout!r}'
-            assert 'sibling_denied' in result.stdout, (
-                f'A sibling run\'s config dir (and its .credentials.json) must stay '
-                f'read-only. stdout={result.stdout!r} stderr={result.stderr!r}'
+            assert 'sibling_write_denied' in result.stdout, (
+                f'A sibling run\'s .credentials.json must stay read-only. '
+                f'stdout={result.stdout!r} stderr={result.stderr!r}'
+            )
+            assert 'sibling_create_denied' in result.stdout, (
+                f'A sibling run\'s config dir must not accept new files. '
+                f'stdout={result.stdout!r} stderr={result.stderr!r}'
+            )
+            # The ground truth behind both probes: the credential bytes are intact.
+            assert (other / '.credentials.json').read_text() == '{"token": "sibling"}', (
+                'A sibling run\'s OAuth credentials were modified through the '
+                'sandbox — the credential-isolation invariant is broken.'
+            )
+            assert not (other / 'planted').exists(), (
+                'A file was created inside a sibling run\'s config dir.'
             )
         finally:
             shutil.rmtree(base, ignore_errors=True)
