@@ -43,6 +43,54 @@ would resume normally at the next parameter, so the siblings would be
 together — a fragment landing inside the value *and* everything between it
 and the fallback terminator disappearing.
 
+### The four specimen shapes
+
+Four measured specimens (`plans/toolcall-markup-containment-prd.md` §2.1) show
+the mechanism end to end — what the model emitted, what the parser actually
+kept, and what silently never arrived:
+
+| Call | Value tail (as parsed) | Keys received | Dropped |
+|---|---|---|---|
+| `submit_task` 07-30T16:47Z | `…direction.&#60;/description>\n&#60;priority>medium&#60;/priority>\n&#60;agent_id>…&#60;/agent_id>\n&#60;metadata">{…}&#60;/metadata">\n&#60;/invoke>` | `project_root, title, description` | **priority, agent_id, metadata** |
+| `submit_task` 08-04T12:13Z | `…automatically).&#60;/description>\n&#60;parameter name="priority">low` | no `priority` | **priority** (intended `low`) |
+| `add_memory` 08-04T16:58Z | `…by design.&#60;/content>\n&#60;/invoke>` | all | none — `content` was the **last** parameter, so over-consumption ran straight to the invoke closer with nothing in between |
+| `update_memory` 08-02T21:26Z | `…scoped).&#60;/parameter>\n&#60;parameter name="agent_id">escalation-watcher-l2` | no `agent_id` | **agent_id** — that boundary is **ungated**, so the corrupted value landed |
+
+Specimen 1's metadata tags are a literal blend of the two dialects — a stray
+double quote before the angle bracket, the model interpolating between the
+canonical `&#60;parameter name="X">` opener and the name-echoing `&#60;X>`
+form. `shared.toolcall_markup`'s repairer carries a one-character blend
+tolerance (the trailing `"?` in its closer/opener regexes) for exactly this
+specimen — without it, the blended item is leftover text and the repair is
+rejected.
+
+### Blast radius
+
+334 corrupted calls out of 128,066 tool calls measured = **0.26%**
+(`plans/toolcall-markup-containment-prd.md` §2.3; measured from the archived
+agent transcripts against the collection predicate stated in PRD §2 — the
+tree grows live, so a later re-run will find a larger denominator). Per
+server:
+
+| Server | Corrupted calls | Guarded at measurement (2026-08-05) |
+|---|---|---|
+| orchestrator/plan-tools | 198 (59.3%) | **no** |
+| fused-memory | 96 (28.7%) | 4 of 6 write tools |
+| orchestrator/verdict-tools | 19 (5.7%) | **no** |
+| escalation | 18 (5.4%) | **no** |
+| Claude Code builtins (`Agent`, `Edit`) | 3 (0.9%) | out of scope — not our servers |
+
+Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90),
+`add_design_decision.decision` (33), `add_reuse_item.how` (33),
+`submit_review_verdict.summary` (19), `escalate_info.detail` (17).
+
+The "no" rows are not permanent. Closing that coverage gap is owned by the
+containment PRD's middleware-registration task (task 3690, registering
+`MarkupGuardMiddleware` on all four servers) — once that lands, three of the
+rows above go stale. The column is dated for exactly that reason: it
+describes coverage **at measurement**, not coverage today, so this table
+cannot silently rot into a false present-tense claim.
+
 ### The negative evidence that settles it
 
 The original report blamed "the submit_task/update_task description parser."
