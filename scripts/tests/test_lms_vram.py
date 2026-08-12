@@ -464,3 +464,170 @@ def test_clearing_a_baseline_is_idempotent(tmp_path, monkeypatch):
     lms_vram.clear_baseline('a')
 
     assert not lms_vram.baseline_path('a').exists()
+
+
+# ---------------------------------------------------------------------------
+# (f) the non-arm GPU consumer inventory (task 3755)
+# ---------------------------------------------------------------------------
+#
+# `--query-gpu=memory.used` says HOW MUCH of the card is held; it does not say
+# BY WHOM.  On 2026-08-06 ollama (`/usr/local/lib/ollama/llama-server`, pid
+# 905936) held 10314 MiB with qwen3:14b resident on keep_alive while a slate ran
+# against the same card, and every budget verdict produced that day silently
+# charged the arm for -- or credited it with -- memory it never touched.
+#
+# `--query-compute-apps=pid,process_name,used_memory` is what names the holders.
+# It is an INVENTORY, not an accounting: it does not list the KDE/X11 graphics
+# contexts at all, which is exactly why this host's operating budget is ~16.4
+# GiB rather than 19.5.
+#
+# Verbatim `nvidia-smi --query-compute-apps=pid,process_name,used_memory
+# --format=csv,noheader,nounits` output measured on this host:
+#
+#     7575, python, 4050                        <- whisper-writer (PRD D10)
+#     905936, /usr/local/lib/ollama/llama-server, 10314
+
+MEASURED_WHISPER_ROW = '7575, python, 4050'
+MEASURED_OLLAMA_ROW = '905936, /usr/local/lib/ollama/llama-server, 10314'
+
+
+def test_parse_compute_apps_on_the_measured_whisper_writer_row():
+    consumers = lms_vram.parse_nvidia_smi_compute_apps_csv(
+        MEASURED_WHISPER_ROW + '\n'
+    )
+
+    assert len(consumers) == 1
+    assert consumers[0].pid == 7575
+    assert consumers[0].process_name == 'python'
+    assert consumers[0].used_mib == 4050
+
+
+def test_parse_compute_apps_on_the_measured_two_consumer_output():
+    """The exact reading that motivated this guard: whisper-writer AND ollama."""
+    consumers = lms_vram.parse_nvidia_smi_compute_apps_csv(
+        f'{MEASURED_WHISPER_ROW}\n{MEASURED_OLLAMA_ROW}\n'
+    )
+
+    assert [c.pid for c in consumers] == [7575, 905936]
+    assert [c.process_name for c in consumers] == [
+        'python', '/usr/local/lib/ollama/llama-server',
+    ]
+    assert [c.used_mib for c in consumers] == [4050, 10314]
+
+
+def test_a_consumer_exposes_the_gib_conversion_in_the_module_convention():
+    consumer = lms_vram.parse_nvidia_smi_compute_apps_csv(
+        MEASURED_OLLAMA_ROW + '\n'
+    )[0]
+
+    assert consumer.used_gib == pytest.approx(10.07, abs=0.01)
+
+
+@pytest.mark.parametrize(('label', 'text'), [('empty', ''), ('whitespace only', '  \n\n')])
+def test_parse_compute_apps_reads_no_output_as_a_legitimately_empty_card(label, text):
+    """Unlike the memory row, ZERO compute apps is a real state.
+
+    nvidia-smi prints nothing at all when no process holds the card, and that is
+    the reading a clean baseline is *supposed* to produce.  Raising here would
+    make the healthiest possible slate the one this tooling refuses to record.
+    """
+    assert lms_vram.parse_nvidia_smi_compute_apps_csv(text) == []
+
+
+@pytest.mark.parametrize(
+    ('label', 'text'),
+    [
+        # The caller dropped `noheader`; row 1 is not a consumer.
+        ('header row present',
+         'pid, process_name, used_gpu_memory [MiB]\n7575, python, 4050\n'),
+        ('non-integer pid', 'abc, python, 4050\n'),
+        ('non-integer used_memory', '7575, python, lots\n'),
+        # nvidia-smi emits [N/A] for a field the driver cannot report.
+        ('[N/A] used_memory', '7575, python, [N/A]\n'),
+        ('[N/A] pid', '[N/A], python, 4050\n'),
+        # The caller dropped `nounits`; "4050 MiB" must not become 4050 by luck.
+        ('units left in', '7575, python, 4050 MiB\n'),
+        ('too few fields', '7575, python\n'),
+        ('one field', '7575\n'),
+        # A blank field is NOT the empty-output case: something was there and we
+        # cannot say what.
+        ('blank process_name', '7575, , 4050\n'),
+        ('blank pid', ', python, 4050\n'),
+        ('blank used_memory', '7575, python, \n'),
+        ('negative used_memory', '7575, python, -1\n'),
+        # One bad row poisons the whole inventory: a partial list read as
+        # complete is what lets an unlisted holder pass for absent.
+        ('one good row and one bad', '7575, python, 4050\nx, python, 99\n'),
+    ],
+)
+def test_parse_compute_apps_raises_rather_than_coercing(label, text):
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.parse_nvidia_smi_compute_apps_csv(text)
+
+
+def test_parse_compute_apps_error_quotes_the_offending_row():
+    with pytest.raises(lms_vram.VramProbeError) as excinfo:
+        lms_vram.parse_nvidia_smi_compute_apps_csv('7575, python, [N/A]\n')
+
+    assert '[N/A]' in str(excinfo.value)
+
+
+def test_parse_compute_apps_keeps_a_comma_inside_a_process_name():
+    """Split on the FIRST and LAST comma, not on every comma.
+
+    A process path may legitimately contain a comma.  Splitting naively would
+    make such a row look like a field-count error and raise -- turning a real,
+    possibly large, GPU holder into a refusal to record anything at all.
+    """
+    consumers = lms_vram.parse_nvidia_smi_compute_apps_csv(
+        '4242, /opt/weird,path/llama-server, 2048\n'
+    )
+
+    assert len(consumers) == 1
+    assert consumers[0].pid == 4242
+    assert consumers[0].process_name == '/opt/weird,path/llama-server'
+    assert consumers[0].used_mib == 2048
+
+
+def test_a_consumer_is_frozen():
+    consumer = lms_vram.GpuConsumer(pid=7575, process_name='python', used_mib=4050)
+
+    with pytest.raises(Exception):
+        consumer.used_mib = 0
+
+
+def test_probe_gpu_consumers_shells_the_expected_query_through_the_injected_runner():
+    recorded = []
+
+    def runner(argv):
+        recorded.append(argv)
+        return f'{MEASURED_WHISPER_ROW}\n{MEASURED_OLLAMA_ROW}\n'
+
+    consumers = lms_vram.probe_gpu_consumers(runner)
+
+    assert [c.pid for c in consumers] == [7575, 905936]
+    assert recorded == [[
+        'nvidia-smi',
+        '--query-compute-apps=pid,process_name,used_memory',
+        '--format=csv,noheader,nounits',
+    ]]
+
+
+def test_probe_gpu_consumers_wraps_a_runner_failure_in_the_typed_error():
+    def runner(argv):
+        raise FileNotFoundError('nvidia-smi')
+
+    with pytest.raises(lms_vram.VramProbeError) as excinfo:
+        lms_vram.probe_gpu_consumers(runner)
+
+    assert 'nvidia-smi' in str(excinfo.value)
+
+
+def test_the_inventory_note_says_it_is_not_a_full_accounting():
+    """The list omits graphics contexts entirely, and a reader who took it for
+    an accounting would conclude ~3.3 GiB of this card is unaccounted for."""
+    note = lms_vram.CONSUMER_INVENTORY_NOTE.lower()
+
+    assert 'inventory' in note
+    assert 'not' in note and 'accounting' in note
+    assert 'graphics' in note
