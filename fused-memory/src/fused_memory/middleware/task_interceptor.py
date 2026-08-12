@@ -117,13 +117,18 @@ logger = logging.getLogger(__name__)
 # for zero lines against schema-clean metadata.
 _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
-# The escalation-gate stamp, named once so the readers and the writers stay
-# greppably coupled. WRITERS:
-# ``operational_routing_guard.inject_operational_routing`` (the declared
-# execution_class='operational'|'decision' boundary coercion) and
-# ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
+# The escalation-gate stamp, named once so the writers stay greppably
+# coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
+# (the declared execution_class='operational'|'decision' boundary coercion)
+# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
 # route_deterministic fallback), which between them set every key below.
-# READER: ``TaskInterceptor._is_gate_metadata`` — see task 3446.
+#
+# NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
+# does NOT consult this constant — its gate predicate is deliberately
+# narrower than this tuple and hardcodes its three keys inline, and
+# 'task_kind' is intentionally excluded from that predicate. The sole
+# consumer of this constant is the combine-guard refusal WARNING below,
+# which uses it to build the `declared` dict named in the log line.
 _GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
 
 
@@ -2435,11 +2440,25 @@ class TaskInterceptor:
         ):
             candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
+            # _is_gate_metadata answers False both when the target genuinely
+            # has no gate AND when its metadata blob is unparseable/corrupt
+            # (permissive-on-parse-failure by design). Distinguish the two in
+            # the log text — a shape-level re-check via _parse_metadata_value
+            # (not _extract_metadata_dict, to avoid a second schema_warning
+            # emission for the same blob) is enough. The refuse-and-degrade
+            # decision itself is unchanged either way.
+            target_metadata = target.get('metadata')
+            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            if target_metadata and target_meta is None:
+                target_reason = 'the target metadata could not be read (corrupt/unparseable)'
+            else:
+                target_reason = 'the target does not declare a gate'
             logger.warning(
-                'combine-guard: candidate declares an escalation gate (%s) but target '
-                '%s does not — aborting combine; a human decision gate must not be '
+                'combine-guard: candidate declares an escalation gate (%s) but %s '
+                '(target=%s) — aborting combine; a human decision gate must not be '
                 'absorbed into an ungated task. Degrading to create.',
                 declared,
+                target_reason,
                 decision.target_id,
             )
             return None
