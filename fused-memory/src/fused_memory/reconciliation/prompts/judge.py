@@ -99,6 +99,28 @@ When evaluating a run, cross-reference stage report stats against MCP Actions to
 consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
 while stats show mutations were performed.
 
+**Write counters count writes that LANDED, not writes that were accepted.** A write can be \
+accepted at enqueue and still never reach the backend, because the durable queue retries it \
+asynchronously — often finishing long after the stage that issued it has reported — and may \
+ultimately dead-letter it. Such a write is EXCLUDED from `memories_added`, `episodes_added`, \
+`graphiti_writes_queued` and the other write counters, and is reported separately under \
+`writes_dead_lettered`.
+
+Read the two together. `graphiti_writes_queued: 0` alongside a non-zero \
+`writes_dead_lettered` does NOT mean the stage did nothing — it means the stage's writes \
+DIED, and should be judged as a failure rather than a no-op. A zero write counter with \
+`writes_dead_lettered: 0` is the genuine no-op case.
+
+One deliberate overlap: a *post-execute* dead-letter counts in BOTH. The backend write \
+landed and only the queue's callback kept failing, so the data is really there — but the \
+item still needs operator attention and must not be blind-replayed. A stage whose landed \
+counters are non-zero AND whose `writes_dead_lettered` is non-zero is therefore not \
+self-contradictory.
+
+A stage never self-reports `writes_dead_lettered` — it cannot know it, since dead-lettering \
+is decided after the stage ends. It is journal-derived only, so its absence from a stage's \
+`_reported` block is expected and is not a self-reporting failure.
+
 """ + _SNAPSHOT_STATS_ARE_MEM0_ONLY + """
 Evaluate this run on its own merits. Do not issue findings about trends or patterns across \
 runs — a separate code-side mechanism monitors verdict history and halts on systemic issues.
