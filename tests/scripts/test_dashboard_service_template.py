@@ -1300,6 +1300,74 @@ def test_ignored_directive_filter_matches_both_systemd_spellings() -> None:
     assert _ignored_directive_lines("", HARDCODED) == []
 
 
+def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_systemd_analyze_verify_skip_reason must gate on BOTH preconditions.
+
+    Four cases below, each host-independent: both the binary lookup and
+    XDG_RUNTIME_DIR are monkeypatched rather than read from this host's real
+    environment, so this test itself needs no systemd runtime -- honouring
+    the module docstring's "no systemd runtime is required" contract.
+
+    Measured 2026-08-12 in this worktree (systemd 255.4), running
+    ``systemd-analyze verify --user`` against the real dashboard unit:
+
+      - XDG_RUNTIME_DIR unset: combined stdout+stderr is ONLY "Failed to
+        lookup RuntimeDirectory path: No such device or address" / "Failed
+        to initialize manager: No such device or address", exit 1 -- ZERO
+        per-unit diagnostic lines, so the guarded assertion below would pass
+        having checked nothing.  This is the regression under repair.
+      - XDG_RUNTIME_DIR set to a real runtime dir: real per-unit diagnostics
+        ("fused-memory.service: Service has RestartMaxDelaySec= but no
+        RestartSteps= setting. Ignoring."), exit 0.
+      - DBUS_SESSION_BUS_ADDRESS unset, XDG_RUNTIME_DIR kept: still the same
+        real per-unit diagnostics, exit 0 -- DBUS_SESSION_BUS_ADDRESS is NOT
+        part of the discriminator, so the predicate under test must not
+        check it; doing so would over-skip on hosts where the guarded test
+        works fine.
+      - XDG_RUNTIME_DIR="": reproduces the exact unset-var no-op (same two
+        "Failed to ..." lines, exit 1) -- an empty value must count as
+        absent, which is why case (c) below forbids a membership test.
+      - XDG_RUNTIME_DIR=/tmp/does-not-exist (declared but nonexistent): still
+        the real per-unit diagnostics, exit 0 -- which is why case (d) below
+        forbids "hardening" the predicate into a directory-existence check.
+    """
+    # (a) Binary absent: reason must name systemd-analyze, even with a
+    # perfectly valid XDG_RUNTIME_DIR alongside it.
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+    assert "systemd-analyze" in reason
+
+    # (b) Binary present, XDG_RUNTIME_DIR absent: reason must name it. This
+    # is the regression under repair -- the old inline decorator condition
+    # never checked this at all.
+    monkeypatch.setattr(
+        shutil, "which", lambda *_a, **_k: "/usr/bin/systemd-analyze"
+    )
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+    assert "XDG_RUNTIME_DIR" in reason
+
+    # (c) Binary present, XDG_RUNTIME_DIR="": empty must count as absent, or
+    # a membership test ("XDG_RUNTIME_DIR" in os.environ) would treat this as
+    # present and let the vacuous pass through.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+
+    # (d) Binary present, XDG_RUNTIME_DIR set to a nonexistent path: the
+    # guarded test must be able to RUN. A directory-existence check would
+    # wrongly skip here, on a host where systemd-analyze verify still
+    # succeeds against a declared-but-missing runtime dir.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/does-not-exist")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is None
+
+
 @pytest.mark.skipif(
     shutil.which("systemd-analyze") is None,
     reason=(
