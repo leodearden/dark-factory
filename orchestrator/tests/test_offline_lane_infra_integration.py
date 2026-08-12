@@ -87,6 +87,37 @@ from orchestrator.offline_lane import OfflineLaneWorker
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Timeout bounds (task 4030) — this module's copy of
+# test_offline_lane_integration.py's named constants for the bounded waits
+# below, replacing near-identical inline 30.0 literals (the duplication that
+# let a single false citation drift into three near-verbatim docstring
+# copies). Modeled on the repo's own constant-plus-derivation-comment
+# convention: _orch_helpers.py's CANCEL_SCOPE_BARRIER_TIMEOUT /
+# CANCEL_SCOPE_PURE_UNIT_TIMEOUT and test_lane_lock_leak_guard.py's
+# _FOREIGN_HOLDER_* block. The full floor (task 3451's measured spawn
+# latency) / ceiling (the pyproject 60s global) derivation lives in
+# `_run_lane`'s docstring below; the executable pins are
+# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
+# `test_every_composing_caller_carries_a_timeout_override`.
+# ---------------------------------------------------------------------------
+
+# Bound for a single `_run_lane` pass / `_ControllableInfraRunner.wait_entered`
+# call. See `_run_lane`'s docstring for the full derivation.
+_LANE_PASS_BOUND_SECS = 30.0
+
+# Bound for `_assert_infra_never_a_gate`'s `_note_offline_lane` promptness check.
+_NOTE_OFFLINE_LANE_BOUND_SECS = 0.5
+
+# Bound for `_assert_infra_never_a_gate`'s `_note_merge_all` promptness check.
+_NOTE_MERGE_ALL_BOUND_SECS = 15.0
+
+# Task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
+# 2.13/3.10/4.71, load-per-core 6.6) -- the FLOOR authority
+# _LANE_PASS_BOUND_SECS is sized against. See `_run_lane`'s docstring for the
+# full derivation.
+_MEASURED_SPAWN_LATENCY_SECS = 4.71
+
 # Default git_overrides for _build_infra_worker — declared with an explicit
 # dict[str, Any] value type (rather than left as an inline dict literal,
 # which pyright would infer as the concrete dict[str, bool] and then reject
@@ -313,7 +344,7 @@ async def _run_lane(
     worker: OfflineLaneWorker,
     expected_passes: int,
     *,
-    timeout: float = 30.0,
+    timeout: float = _LANE_PASS_BOUND_SECS,
 ) -> None:
     """Drive worker.run() as a real background task until *expected_passes*
     full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
@@ -386,7 +417,7 @@ async def _run_lane(
         worker._run_once = inner_run_once
 
 
-async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 30.0) -> None:
+async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = _LANE_PASS_BOUND_SECS) -> None:
     """Drive worker.run() as a real background task for exactly one pass
     (IB1/IB3/IB5/IB6)."""
     await _run_lane(worker, 1, timeout=timeout)
@@ -422,7 +453,7 @@ class _ControllableInfraRunner:
         """Release the held first call."""
         self._hold.set()
 
-    async def wait_entered(self, timeout: float = 30.0) -> None:
+    async def wait_entered(self, timeout: float = _LANE_PASS_BOUND_SECS) -> None:
         """Block until the held first call has actually started (is in-flight).
 
         ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
@@ -662,11 +693,12 @@ async def _assert_infra_never_a_gate(
     # vacuously on the strength of the ``_note_offline_lane`` call above.
     await asyncio.wait_for(
         harness._note_offline_lane('task-2', base_sha, head_sha),
-        timeout=0.5,
+        timeout=_NOTE_OFFLINE_LANE_BOUND_SECS,
     )
     worker._dirty = False
     await asyncio.wait_for(
-        harness._note_merge_all('task-2', base_sha, head_sha), timeout=15.0,
+        harness._note_merge_all('task-2', base_sha, head_sha),
+        timeout=_NOTE_MERGE_ALL_BOUND_SECS,
     )
     assert worker._dirty is True, (
         'a landed advance during an in-flight infra run must arm a coalesced re-run'
