@@ -809,8 +809,15 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human:**
 1. Present the concern with full context
-2. Leave the escalation pending
-3. Create a local task/todo to track it
+2. Leave the escalation pending — the open escalation record IS the durable record that something
+   needs doing
+3. Create a local todo **for this session only** — it does not survive session end and is not the
+   record
+3a. File (or confirm one already exists for this `esc-id`) a cockpit DecisionRecord via
+   `write-decision` — **this, not the todo, is what makes the item recoverable across sessions and
+   after this session ends** (same registry as the Priority-3b instructions above). Skipping this
+   step is how esc-3223-4/-5 kept task 3223 blocked for 11 days: the question never reached the
+   cockpit queue the human actually reads.
 4. Continue handling other escalations while waiting
 5. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
@@ -818,8 +825,11 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 An agent flagged a risk during development. Risk assessment requires human judgment.
 
-**Escalate to the human.** Tell them, track as todo, continue with other work. Append `<esc-id>` to
-the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending.
+**Escalate to the human.** Tell them; create a session-only todo (an attention aid — the pending
+escalation, not the todo, is the durable record); file (or confirm) a cockpit DecisionRecord via
+`write-decision` for this `esc-id`, exactly as in `design_concern` step 3a; continue with other
+work. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while
+this item is pending.
 
 ### `cleanup_needed` (info, rarely blocking)
 
