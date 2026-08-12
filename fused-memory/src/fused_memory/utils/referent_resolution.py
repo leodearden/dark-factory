@@ -41,9 +41,14 @@ canonical_labels whose shape it copies.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
-from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
+from fused_memory.utils.canonical_labels import (
+    LabelScan,
+    Referent,
+    parse_node_name,
+    scan_content,
+)
 from fused_memory.utils.validation import (
     InputValidationError,
     PathShapedProjectIdError,
@@ -80,11 +85,17 @@ _DECLARED_ENTRY_KEYS = frozenset({'kind', 'id', 'project_id'})
 #: - ``'derived'``   — scanned out of the content by ``scan_content``.
 #: - ``'none'``      — nothing declared, bridged or derivable. A real, COUNTED
 #:   outcome, not a missing value.
-REFERENT_SOURCES: tuple[str, ...] = ('declared', 'metadata', 'derived', 'none')
-
-#: The type twin of :data:`REFERENT_SOURCES`. Single-sourced against it below
-#: so the constant and the type cannot drift apart.
 ReferentSource = Literal['declared', 'metadata', 'derived', 'none']
+
+#: The CLOSED vocabulary of resolution sources, in precedence order (strongest
+#: first) — see :data:`ReferentSource` above for what each one means.
+#:
+#: DERIVED from the Literal rather than re-spelled beside it, so the runtime
+#: constant and the static type cannot drift apart: adding a fifth source means
+#: editing exactly one line. Exported so task ι's declaration-rate telemetry
+#: iterates a single site instead of re-spelling four string literals — a
+#: second copy would drift the same way two copies of the label vocabulary do.
+REFERENT_SOURCES: tuple[str, ...] = get_args(ReferentSource)
 
 #: A resolved set of referents.
 #:
@@ -147,6 +158,54 @@ class ReferentResolution:
     #: Reported verbatim from the scan whatever the winning source, and NEVER
     #: promoted into :attr:`referents`: ambiguity is recorded, not guessed.
     ambiguous: ReferentSet = ()
+
+
+def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
+    """The declared referents the scanned content CONTRADICTS.
+
+    A declared referent ``d`` conflicts iff the scan found at least one
+    referent of ``d.kind`` and ``d`` is not among them. Declared order is
+    preserved; the result is de-duplicated.
+
+    Three load-bearing choices, each invisible from the code alone:
+
+    1. KIND-SCOPED, not global. ``_KIND_LABELS`` holds one entry today, so the
+       scoping is a no-op and NO test can construct a second kind — the guard
+       therefore has to be structural, exactly as β's kind-keyed ambiguity
+       partition is. The moment 'escalation' joins the registry, a global rule
+       would let a bare 'escalation 2500' mention corroborate (or contradict)
+       an unrelated TASK referent.
+    2. Membership is tested against ``refs | ambiguous``, so a declaration that
+       names an AMBIGUOUS referent counts as RESOLVING the ambiguity rather
+       than contradicting it — the single most useful thing a declaration can
+       do.
+    3. An EMPTY per-kind scan never conflicts. This is the load-bearing
+       consequence of resolved decision 8: the scanner cannot see bare-digit
+       node names, title-only references or Greek-letter aliases, so its
+       SILENCE is uninformative and must not reject an honest write.
+
+    The rejected alternative — a set-level "declared and scanned are disjoint"
+    verdict — is more permissive but stops catching ``[3127, 3129]`` where 3129
+    is an adjacent-number typo and 3127 corroborates, which is precisely the
+    misattribution this PRD exists to prevent. A per-ref list is also strictly
+    more informative: δ can derive the disjoint verdict from it, not the
+    reverse.
+    """
+    scan_by_kind: dict[str, set[Referent]] = {}
+    for referent in scan.refs + scan.ambiguous:
+        scan_by_kind.setdefault(referent.kind, set()).add(referent)
+
+    conflicts: list[Referent] = []
+    seen: set[Referent] = set()
+    for referent in declared:
+        scanned = scan_by_kind.get(referent.kind)
+        if not scanned or referent in scanned:
+            continue
+        if referent in seen:
+            continue
+        seen.add(referent)
+        conflicts.append(referent)
+    return tuple(conflicts)
 
 
 def _declared_number(entry: dict) -> str:
@@ -388,9 +447,15 @@ def resolve_referents(
     #    in any case no-op on an empty referent set — there is nothing to test
     #    membership against — exactly as it already does for source='none'.
     if declared is not None:
+        declared_referents = _declared_referents(declared, group_id=group_id)
         return ReferentResolution(
             source='declared',
-            referents=_declared_referents(declared, group_id=group_id),
+            referents=declared_referents,
+            # REPORTED, never enforced: .referents is deliberately left
+            # untouched by a conflict. γ is mechanism and δ is policy — a
+            # resolver that degraded to the scan here would produce a write the
+            # caller never asked for.
+            conflicts=_conflicting_referents(declared_referents, scan),
             ambiguous=ambiguous,
         )
 
@@ -404,7 +469,9 @@ def resolve_referents(
         return ReferentResolution(source='metadata', referents=bridged, ambiguous=ambiguous)
 
     # scan.refs already excludes the ambiguous ones, so the derived set needs
-    # no further filtering here.
+    # no further filtering here. `.conflicts` stays empty on this path too:
+    # conflicts are a property of what the CALLER declared, and the derived set
+    # IS the scan — it cannot contradict itself.
     if scan.refs:
         return ReferentResolution(source='derived', referents=scan.refs, ambiguous=ambiguous)
 
