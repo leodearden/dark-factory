@@ -954,15 +954,29 @@ def _is_running(pid: int) -> bool:
     return state != 'Z'
 
 
-def _wait_for_file(path, timeout=10.0, interval=0.1):
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
+def _poll_until(predicate, timeout, interval=0.1):
+    """Poll *predicate* (a zero-arg callable) until truthy, or *timeout* expires.
+
+    Checks immediately, then every *interval* seconds; returns True the
+    moment *predicate()* is truthy, False once *timeout* elapses first. This
+    is the one poll/backoff primitive for the module — both
+    :func:`_wait_for_file` and :func:`_wait_until_all_dead` are expressed in
+    terms of it, rather than each hand-rolling its own deadline loop (the
+    same shape recurs as ``_wait_until`` in test_harness_resume_scheduler.py
+    and ``wait_until`` in test_lane_lock_leak_guard.py).
+    """
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists():
+        if predicate():
             return True
         time.sleep(interval)
     return False
+
+
+def _wait_for_file(path, timeout=10.0, interval=0.1):
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    return _poll_until(path.exists, timeout, interval)
 
 
 def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
@@ -975,13 +989,10 @@ def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
     un-reaped ``start_new_session`` escapee keeps sleeping (state 'S'/'R')
     and will still be in the returned list at the deadline.
     """
-    import time
-    deadline = time.monotonic() + timeout
-    still_alive = [pid for pid in pids if _is_running(pid)]
-    while still_alive and time.monotonic() < deadline:
-        time.sleep(interval)
-        still_alive = [pid for pid in pids if _is_running(pid)]
-    return still_alive
+    _poll_until(
+        lambda: not any(_is_running(pid) for pid in pids), timeout, interval
+    )
+    return [pid for pid in pids if _is_running(pid)]
 
 
 @pytest.mark.timeout(60)
