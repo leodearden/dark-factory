@@ -753,3 +753,512 @@ def canonical_discoverability(
         'unaliased_rank': unaliased_rank,
         'topic_member_count': landed['topic_member_count'],
     }
+
+
+# ---------------------------------------------------------------------------
+# The UNLABELED production query set
+# ---------------------------------------------------------------------------
+#
+# External validity: the E2 query set is blind-authored, so an arm that wins
+# only there has won on questions nobody asked.  `harvest_production_queries`
+# samples what actually reaches `search`, and those queries are scored here.
+#
+# They are UNLABELED by construction — the write journal records what was
+# asked, never what should have come back — so the labeled columns are `None`
+# and render as `—`.  That is a disclosure, not a gap: the alternative is
+# fabricating the ground truth the measurement exists to establish.
+
+#: Production fires the briefing family at ``limit=5``
+#: (``orchestrator/src/orchestrator/agents/briefing.py``:1376), NOT the E2
+#: default of 10.  Scoring the production set at 10 would measure a window
+#: no production reader is ever handed.
+PRODUCTION_K = 5
+
+#: Every field a production row must carry.  There is deliberately no
+#: ``expects_claim_ids`` here, and :class:`ProductionQuery` has no such
+#: attribute — see the class docstring.
+_PRODUCTION_FIELDS = (
+    'query_id', 'text', 'source', 'observed_count', 'traffic_share',
+)
+
+#: Fields whose PRESENCE means an E2 row has strayed into the unlabeled set.
+_LABELED_FIELDS = ('expects_claim_ids', 'kind', 'cluster_id')
+
+_UNLABELED_REASON = (
+    'Production queries carry no ground truth: the reconciliation write '
+    'journal records which query was issued, never which memory should have '
+    'been returned. Claim recall and canonical discoverability are therefore '
+    'not computable over this set and render as no-measurement, not as a '
+    'measured zero.'
+)
+
+
+class ProductionQuerySetError(RuntimeError):
+    """The production query fixture is malformed, or is not unlabeled."""
+
+
+@dataclass(frozen=True)
+class ProductionQuery:
+    """One sampled production query.
+
+    Deliberately NOT a :class:`bake_off.Query`: that class requires
+    ``expects_claim_ids`` (:199) and ``cross_validate_fixtures`` (:477)
+    requires it non-empty.  Subclassing or defaulting it to ``[]`` here
+    would let a scorer compute ``0/0`` and report a recall for a query with
+    no ground truth at all — which is precisely the fabrication this whole
+    path exists to avoid.  The absence is structural: there is no attribute
+    to read, so no code path can accidentally read one.
+    """
+
+    query_id: str
+    text: str
+    source: str
+    observed_count: int
+    traffic_share: float | None
+    observed_limit: int = PRODUCTION_K
+    template: str | None = None
+    match: str | None = None
+
+
+def load_production_queries(path: str | Path) -> list[ProductionQuery]:
+    """Read the harvested production sample (unlabeled by construction).
+
+    Refuses a row carrying any labeled field.  The E2 loader already refuses
+    an unlabeled row (``load_query_set``:368 raises on the missing ``kind``);
+    this is the symmetric half, so the two corpora cannot silently merge in
+    either direction.
+    """
+    import json  # noqa: PLC0415
+
+    target = Path(path)
+    if not target.exists():
+        raise ProductionQuerySetError(f'production query set not found: {target}')
+    queries: list[ProductionQuery] = []
+    seen: set[str] = set()
+    for lineno, line in enumerate(target.read_text(encoding='utf-8').splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise ProductionQuerySetError(f'{target}:{lineno}: not JSON: {exc}') from exc
+        for field_name in _LABELED_FIELDS:
+            if field_name in row:
+                raise ProductionQuerySetError(
+                    f'{target}:{lineno}: row carries the labeled field '
+                    f'{field_name!r}. The production set is unlabeled by '
+                    'construction; a labeled row belongs in the E2 query set, '
+                    'where its ground truth is actually used.'
+                )
+        for field_name in _PRODUCTION_FIELDS:
+            if field_name not in row:
+                raise ProductionQuerySetError(
+                    f'{target}:{lineno}: production query missing field {field_name!r}'
+                )
+        query_id = row['query_id']
+        if query_id in seen:
+            raise ProductionQuerySetError(
+                f'{target}:{lineno}: duplicate query_id {query_id!r}'
+            )
+        seen.add(query_id)
+        queries.append(ProductionQuery(
+            query_id=query_id,
+            text=row['text'],
+            source=row['source'],
+            observed_count=int(row['observed_count']),
+            traffic_share=row['traffic_share'],
+            observed_limit=int(row.get('observed_limit', PRODUCTION_K)),
+            template=row.get('template'),
+            match=row.get('match'),
+        ))
+    if not queries:
+        raise ProductionQuerySetError(f'{target}: no production queries')
+    return queries
+
+
+# ---------------------------------------------------------------------------
+# Scoring without labels
+# ---------------------------------------------------------------------------
+
+
+def _topic_of(record: Any) -> str | None:
+    metadata = getattr(record, 'metadata', None) or {}
+    topic = metadata.get('topic')
+    return topic if isinstance(topic, str) else None
+
+
+def _reachable_ids(
+    records: list[Any], provenance: dict[str, DocumentProvenance] | None,
+) -> set[str]:
+    """Record ids a reader can still SEE, counting folded members.
+
+    A grouped document renders its members' bodies, so the member's
+    knowledge is in the window even though the member is no longer its own
+    hit.  The fold is only visible in the transform's own provenance — from
+    the records alone a folded member is indistinguishable from a dropped
+    one, which is exactly why the disclosure is load-bearing.
+    """
+    reachable = {record.record_id for record in records}
+    if provenance:
+        for record in records:
+            disclosure = provenance.get(record.record_id)
+            if disclosure is not None:
+                reachable.update(disclosure.aliased_from)
+    return reachable
+
+
+def score_unlabeled_query(
+    records: list[Any],
+    *,
+    baseline: list[Any],
+    k: int = PRODUCTION_K,
+    provenance: dict[str, DocumentProvenance] | None = None,
+    estimator: tuple[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Every metric computable for a query with no ground truth.
+
+    Labeled metrics are ``None`` — no measurement, never a measured zero —
+    and carry their reason so a ``—`` cell in the artifact is explainable
+    without reading this file.
+
+    RETENTION vs DISPLACEMENT
+    -------------------------
+    Two costs, deliberately not collapsed:
+
+      * ``baseline_retention_at_k`` — the fraction of the flat read's top-k
+        that is still REACHABLE.  A member folded into a grouped document
+        counts as retained: the reader still gets its body.
+      * ``window_displacement`` — how many of those records are no longer
+        INDEPENDENTLY present.  A folded member is displaced even though it
+        is retained; so is a record the cap dropped, and so is one the
+        promoting pin pushed past the window edge.
+
+    Collapsing them into a single "changed" number would hide whichever
+    half a reader cared about — and they are exactly the two halves task
+    3111 has to trade off.
+
+    A pure REORDER inside the window displaces nothing (``window_reordered``
+    reports it separately): motion is not eviction, and charging for it
+    would penalise the transform for doing its job.
+
+    Rank/set-based only.  Pure over *records* and *baseline*.
+    """
+    window = records[:k]
+    baseline_window = baseline[:k]
+    bake = bake_off()
+
+    reachable = _reachable_ids(window, provenance)
+    present = {record.record_id for record in window}
+    baseline_ids = [record.record_id for record in baseline_window]
+
+    retained = sum(1 for rid in baseline_ids if rid in reachable)
+    displaced = sum(1 for rid in baseline_ids if rid not in present)
+
+    topics = {t for t in (_topic_of(r) for r in window) if t is not None}
+    untopiced = sum(1 for r in window if _topic_of(r) is None)
+
+    token_block = bake.tokens_returned(window, k, estimator)
+
+    return {
+        # --- not computable without ground truth ---------------------
+        'claim_recall': None,
+        'canonical_aliased_in_top_k': None,
+        'canonical_unaliased_in_top_k': None,
+        'unlabeled': True,
+        'unlabeled_reason': _UNLABELED_REASON,
+        # --- computable ----------------------------------------------
+        'k': k,
+        'window_size': len(window),
+        'tokens_per_query': token_block['tokens'],
+        'token_estimator': token_block['estimator'],
+        'topic_diversity': len(topics),
+        'untopiced_in_window': untopiced,
+        'baseline_retention_at_k': bake._rate(retained, len(baseline_ids)),
+        'window_displacement': displaced,
+        'window_reordered': [r.record_id for r in window] != baseline_ids,
+    }
+
+
+def __getattr__(name: str) -> Any:
+    """Re-export the bake-off's helpers BY IDENTITY, lazily (INV-5).
+
+    ``_mean`` (:3286) and ``_rate`` (:1622) carry the no-measurement
+    discipline this module depends on — a ``None`` is a non-observation and
+    must never average in as a zero.  A local wrapper would be a second
+    implementation that could drift; a module-level import would force the
+    bake-off to load at import time.  PEP 562 gives both: the attribute
+    resolves to the bake-off's own function object, so
+    ``read_transform_selection._mean is bake_off._mean`` holds, and nothing
+    loads until it is first asked for.
+    """
+    if name in ('_mean', '_rate'):
+        return getattr(bake_off(), name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+def aggregate_unlabeled(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mean each metric across *rows*, holding the no-measurement discipline.
+
+    A column that is ``None`` in every row aggregates to ``None``, not to
+    ``0.0``; a column with one ``None`` among measurements averages over the
+    measurements only.  Delegated to the bake-off's ``_mean`` (:3286).
+    """
+    keys: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in keys and isinstance(row.get(key), (int, float, type(None))):
+                keys.append(key)
+    if not keys:
+        keys = [
+            'claim_recall', 'tokens_per_query', 'topic_diversity',
+            'baseline_retention_at_k', 'window_displacement',
+        ]
+    mean = bake_off()._mean
+    return {
+        key: mean([row.get(key) for row in rows])
+        for key in keys
+    }
+
+
+# ---------------------------------------------------------------------------
+# The driver: four arms, two query sets, one replayed cache
+# ---------------------------------------------------------------------------
+#
+# Every arm is a pure function over an ALREADY-FETCHED hit list, which is the
+# whole reason the fetch cache exists: one live seeding run pays for the
+# embeddings and the ANN search, and every read-side variant after it is free
+# and offline forever.  `fetch_arm` used to return its hit lists to a local
+# that `run_arm` dropped on the floor; `dump_fetches` catches them at that
+# seam.
+#
+# The transforms are measured over `c_peers` because that is the write shape
+# gate ζ RATIFIED.  Measuring them over a shape the repo is not going to
+# write would answer a question nobody asked.
+
+#: The ratified write shape.  The read side is being chosen ON TOP of it.
+SELECTION_SHAPE = 'c_peers'
+
+#: The baseline first: every column in the artifact is read as a delta
+#: against the flat read, so the flat read has to be measured under the
+#: identical harness rather than assumed.
+ARM_KEYS: tuple[str, ...] = (
+    'flat_read',
+    'promoting_pin',
+    'topic_keyed_grouped',
+    'topic_diversity_cap',
+)
+
+ARM_LABELS: dict[str, str] = {
+    'flat_read': 'flat read (baseline)',
+    **{key: spec.label for key, spec in ARM_SPECS.items()},
+}
+
+
+def _records_by_topic(records: list[Any]) -> dict[str, list[Any]]:
+    """``topic -> members``, over every record the arm seeded.
+
+    Built from the SEEDED corpus rather than from the window, because a
+    topic-keyed group has to be able to name a canonical that did not itself
+    rank — that gap is the aliasing the artifact reports.
+    """
+    grouped: dict[str, list[Any]] = {}
+    for record in records:
+        topic = _topic_of(record)
+        if topic is not None:
+            grouped.setdefault(topic, []).append(record)
+    return grouped
+
+
+def apply_arm(
+    arm_key: str,
+    hits: list[Any],
+    seeded: Any,
+    k: int,
+    *,
+    render_sightings: bool = False,
+    per_topic: int = 1,
+) -> TransformResult:
+    """Run one arm's read transform over *hits*, in production's own order.
+
+    Truncated BEFORE the transform and again after, exactly as ``read_path``
+    (:3214) does and for its two stated reasons: the store returns k and the
+    read side acts on what came back (transforming first would let a record
+    the store never returned into the window), and k is the READER's budget
+    so the arms are scored over equal-size windows.  Re-deriving that order
+    here rather than calling ``read_path`` is deliberate — ``read_path``
+    hard-codes the E2 arm variants (``b_grouped`` plus the additive pin) and
+    takes no transform argument.
+    """
+    if arm_key not in ARM_KEYS:
+        raise ValueError(f'unknown arm {arm_key!r}; expected one of {ARM_KEYS}')
+    records = [hit.record for hit in hits[:k]]
+
+    if arm_key == 'flat_read':
+        result = TransformResult(records=list(records), provenance={})
+    elif arm_key == 'promoting_pin':
+        result = TransformResult(
+            records=apply_promoting_topic_anchor(records, seeded.canonical_by_topic),
+            provenance={},
+        )
+    elif arm_key == 'topic_keyed_grouped':
+        result = apply_topic_keyed_grouped_read(
+            records,
+            _records_by_topic(seeded.records),
+            render_sightings=render_sightings,
+        )
+    else: # topic_diversity_cap
+        result = apply_topic_diversity_cap(
+            records, seeded.canonical_by_topic, per_topic=per_topic,
+        )
+
+    return TransformResult(records=result.records[:k], provenance=result.provenance)
+
+
+def score_labeled_query(
+    transform: TransformResult,
+    query: Any,
+    seeded: Any,
+    k: int,
+    *,
+    baseline: list[Any],
+    estimator: tuple[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score one E2 (labeled) query, with the unlabeled columns filled in too.
+
+    The unlabeled metrics are computed for BOTH sets on purpose: they are the
+    only columns that appear in both halves of the artifact, so a reader can
+    see whether an arm's token and displacement behaviour on authored queries
+    survives contact with real traffic.
+    """
+    bake = bake_off()
+    window = transform.records[:k]
+    scored = score_unlabeled_query(
+        window, baseline=baseline, k=k, provenance=transform.provenance,
+        estimator=estimator,
+    )
+    scored['unlabeled'] = False
+    scored['unlabeled_reason'] = None
+    scored['claim_recall'] = bake.claim_recall_at_k(
+        window, list(query.expects_claim_ids), k,
+    )
+    canonical = seeded.canonical_by_topic.get(query.topic)
+    if canonical is None:
+        # No canonical for this topic in this shape: no measurement, not a
+        # zero.  A topic with no canonical is a real fixture state, not a
+        # failure of the transform.
+        scored['canonical_aliased_in_top_k'] = None
+        scored['canonical_unaliased_in_top_k'] = None
+        scored['canonical_aliased_rank'] = None
+        scored['canonical_unaliased_rank'] = None
+        return scored
+    verdict = canonical_discoverability(
+        [bake.ScoredHit(record=r, score=0.0) for r in window],
+        query.topic,
+        canonical.record_id,
+        k,
+        provenance=transform.provenance,
+    )
+    scored['canonical_aliased_in_top_k'] = verdict['aliased_in_top_k']
+    scored['canonical_unaliased_in_top_k'] = verdict['unaliased_in_top_k']
+    scored['canonical_aliased_rank'] = verdict['aliased_rank']
+    scored['canonical_unaliased_rank'] = verdict['unaliased_rank']
+    return scored
+
+
+def score_arm(
+    arm_key: str,
+    queries: list[Any],
+    hits_by_query: dict[str, list[Any]],
+    seeded: Any,
+    *,
+    k: int,
+    labeled: bool,
+    render_sightings: bool = False,
+    per_topic: int = 1,
+    estimator: tuple[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score one arm across one query set, returning per-query rows + means.
+
+    A query the cache does not carry RAISES rather than being skipped: a
+    quietly-shorter query set would move every mean in this arm's row and
+    still report as a complete measurement.
+    """
+    rows: list[dict[str, Any]] = []
+    for query in queries:
+        hits = hits_by_query.get(query.query_id)
+        if hits is None:
+            raise KeyError(
+                f'arm {arm_key!r}: no cached fetch for query {query.query_id!r}. '
+                'Refusing to score a silently-shorter query set.'
+            )
+        baseline = apply_arm('flat_read', hits, seeded, k).records
+        transform = apply_arm(
+            arm_key, hits, seeded, k,
+            render_sightings=render_sightings, per_topic=per_topic,
+        )
+        if labeled:
+            row = score_labeled_query(
+                transform, query, seeded, k, baseline=baseline, estimator=estimator,
+            )
+        else:
+            row = score_unlabeled_query(
+                transform.records, baseline=baseline, k=k,
+                provenance=transform.provenance, estimator=estimator,
+            )
+        row['query_id'] = query.query_id
+        rows.append(row)
+    return {
+        'arm': arm_key,
+        'label': ARM_LABELS[arm_key],
+        'k': k,
+        'labeled': labeled,
+        'query_count': len(rows),
+        'rows': rows,
+        'means': aggregate_unlabeled(rows),
+    }
+
+
+def run_selection(
+    seeded: Any,
+    hits_by_query: dict[str, list[Any]],
+    e2_queries: list[Any],
+    production_queries: list[Any],
+    production_hits_by_query: dict[str, list[Any]],
+    *,
+    e2_k: int = 10,
+    production_k: int = PRODUCTION_K,
+    render_sightings: bool = False,
+    per_topic: int = 1,
+    estimator: tuple[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score all four arms over BOTH query sets from the replayed cache.
+
+    Two ks on purpose: the E2 set at its own default of 10, so this table
+    stays comparable with the committed E2 one, and the production set at 5,
+    which is the window production's briefing assembler actually asks for
+    (briefing.py:1376).
+    """
+    if estimator is None:
+        estimator = bake_off().resolve_token_estimator()
+    return {
+        'shape': SELECTION_SHAPE,
+        'sighting_crediting': 'rendered' if render_sightings else 'uncredited',
+        'per_topic_cap': per_topic,
+        'token_estimator': estimator[0],
+        'e2': {
+            arm: score_arm(
+                arm, e2_queries, hits_by_query, seeded,
+                k=e2_k, labeled=True, render_sightings=render_sightings,
+                per_topic=per_topic, estimator=estimator,
+            )
+            for arm in ARM_KEYS
+        },
+        'production': {
+            arm: score_arm(
+                arm, production_queries, production_hits_by_query, seeded,
+                k=production_k, labeled=False, render_sightings=render_sightings,
+                per_topic=per_topic, estimator=estimator,
+            )
+            for arm in ARM_KEYS
+        },
+    }
