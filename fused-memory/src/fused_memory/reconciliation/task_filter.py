@@ -287,14 +287,53 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Sentence-ish clause boundary: '.', ';', newline, '!', '?'.
-_CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
+# Sentence-ish clause boundary: ';', newline, '!', '?', and a '.' that is NOT
+# followed by a word character.
+#
+# The dot's guard was added by task 3403. The original form was a bare
+# character class, [.;\n!?], so EVERY dot ended a clause — including the dots
+# inside the technical tokens recon-authored prose is made of
+# (dark-factory-orchestrator.yaml, .envrc, CLAUDE.md:95, v1.2.3, 1.5s, dotted
+# Python identifiers like task_filter.TASK_REF_RE). Each such token shattered
+# the sentence containing it, and when the shatter fell BETWEEN a task
+# reference and the status marker in that same sentence, the clause-scoped
+# association below returned the EMPTY SET: both detectors were silently inert
+# on exactly the corpus they were written for (probe memory
+# 80d3f4c9-c334-490e-ab14-443b8aebb5c1).
+#
+# The guard is RIGHT-SIDE ONLY, deliberately. A left-side lookbehind
+# ((?<!\w)\.) or a whitespace-on-both-sides rule would also stop splitting
+# 'done. Task', and that split is the precision guarantee separating these
+# detectors from is_mixed_temporal_framing — it is what keeps 'Task 100 is
+# done. Task 200 is still pending.' from firing. No capture group, either:
+# re.split on a capturing pattern interleaves the separators into the clause
+# list, and the loops below would then read bare '.'/';' fragments as clauses.
+#
+# Three residuals, accepted:
+#   (i)   Clauses are now longer, so the clause-granularity caveat documented at
+#         the PRESENT_TENSE_COMPLETION_RE block below (a clause naming several
+#         ids tags ALL of them) fires more often — one sentence coordinating two
+#         tasks with different statuses now tags both. This moves these two
+#         detectors off the module's fail-open-on-under-firing default toward
+#         over-firing. Bounded by construction: a hit only soft-blocks a
+#         recon-stage write with a rephrase hint, never corrupts data. Pinned by
+#         TestConflictingTaskStatusFraming.test_widened_clause_tags_both_coordinated_ids
+#         so the trade-off stays visible.
+#   (ii)  'e.g.' / 'i.e.' still split at their SECOND dot (the right-side-only
+#         rule). Harmless — that is a genuine phrase boundary, not a break
+#         between a ref and its status.
+#   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
+#         rare in LLM prose, and the direction is the same over-firing as (i).
+_CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
 
 
 def find_conflicting_task_status_ids(text: str) -> set[int]:
     """Return task ids that are framed as BOTH non-terminal and terminal in `text`.
 
-    Splits text into clauses on sentence terminators ([.;\\n!?]). Within each
+    Splits text into clauses on sentence terminators — ';', newline, '!', '?',
+    and a '.' NOT followed by a word character, so dotted technical tokens
+    ('config.yaml', 'CLAUDE.md:95', 'v1.2.3') do not shatter a sentence
+    (task 3403). Within each
     clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
     N'/'#N', not bare digits) and tags each referenced id as non-terminal when
     the clause matches NON_TERMINAL_STATUS_RE and/or terminal when a
@@ -501,7 +540,10 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
     """Return task ids that `text` frames as COMPLETE in present/past-completion
     tense while naming them via an explicit task reference in the same clause.
 
-    Splits text into clauses on sentence terminators ([.;\\n!?]). Within each
+    Splits text into clauses on sentence terminators — ';', newline, '!', '?',
+    and a '.' NOT followed by a word character, so dotted technical tokens
+    ('config.yaml', 'CLAUDE.md:95', 'v1.2.3') do not shatter a sentence
+    (task 3403). Within each
     clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
     N'/'#N', not bare digits) and tags each referenced id as a completion claim
     when PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
