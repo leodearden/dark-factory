@@ -215,7 +215,7 @@ failure class this whole task exists to kill.
 
 | Change | What it does |
 |---|---|
-| `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens. |
+| `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
 | `fused_memory/server/markup_tripwire.py` (task 3141 — NOT this task) | Live rejection at the MCP write boundary. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
@@ -252,8 +252,11 @@ detectors are calibrated in **opposite** directions on purpose:
 Neither is redundant, and they must not be collapsed. A write-time false
 positive costs the caller one retry; a sweep-time false positive silently
 rewrites content a user wrote. That asymmetry is the whole justification for
-maintaining two detectors, and it is why the sweep does not simply reuse the
-tripwire's pattern list.
+maintaining two detectors — but it justifies two *predicates*, not two
+*literal lists*. Both now enumerate the same set, defined once in
+`shared.toolcall_markup` (§1, "The single literal source"); what still
+differs, on purpose, is method and calibration, exactly as the table above
+states.
 
 One diagnostic did not survive the withdrawal and is worth recovering later:
 the retired guard's message named the **sibling-argument risk** explicitly —
