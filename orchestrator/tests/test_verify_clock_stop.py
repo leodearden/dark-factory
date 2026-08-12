@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from importlib import resources as pkg_resources
 from pathlib import Path
 
@@ -663,6 +664,160 @@ class TestRunCmdMaxTotalSecs:
         )
         assert rc == 0, f'Expected rc==0; got rc={rc}'
         assert timed_out is False, f'Expected timed_out=False; got timed_out={timed_out}'
+
+
+# ── Task 3806: _run_cmd clock-stop message attribution (integration) ─────────
+
+
+class TestClockStopMessageAttribution:
+    """End-to-end: _run_cmd's clock-stop TimeoutError message is attributed
+    (or explicitly refused) via _clock_stop_reason evaluated AT THE STOP,
+    not a stale pre-built string (task 3806 / esc-3694-3).  No prior test in
+    this file asserts on the MESSAGE content of a clock-stop timeout — only
+    on `timed_out`.
+    """
+
+    @staticmethod
+    def _make_cfg(
+        heartbeat_idle_max: float = 5.0,
+        max_total_secs: float = 0.0,
+    ):
+        from orchestrator.verify import ClockStopConfig
+        return ClockStopConfig(
+            marker_stop='@@REIFY_CLOCK_STOP@@',
+            marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
+            marker_start='@@REIFY_CLOCK_START@@',
+            heartbeat_idle_max=heartbeat_idle_max,
+            max_total_secs=max_total_secs,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_external_stop_not_blamed_on_wall_clock_budget(self, tmp_path: Path):
+        """(a) esc-3694-3 regression: a TimeoutError surfacing from the read
+        for a reason OTHER than the armed read_timeout elapsing must not be
+        blamed on the per-command wall-clock budget.
+
+        Fakes asyncio.create_subprocess_shell with a process whose
+        stdout.read() yields one ordinary chunk and then raises TimeoutError
+        directly — deterministic, in milliseconds, no real 5400s budget
+        burned.  proc.returncode is a non-None int so
+        terminate_process_group's already-reaped short-circuit fires and no
+        real process is signalled.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from orchestrator.verify import _run_cmd
+
+        fake_stdout = MagicMock()
+        fake_stdout.read = AsyncMock(side_effect=[b'ordinary output\n', TimeoutError()])
+        fake_proc = MagicMock()
+        fake_proc.pid = 4242
+        fake_proc.returncode = 0
+        fake_proc.stdout = fake_stdout
+
+        log_path = tmp_path / 'verify.log'
+        with patch('asyncio.create_subprocess_shell', AsyncMock(return_value=fake_proc)):
+            rc, out, timed_out = await _run_cmd(
+                'never actually run (create_subprocess_shell is mocked)',
+                tmp_path,
+                timeout=5400.0,
+                log_path=log_path,
+                clock_stop=self._make_cfg(),
+            )
+
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        assert 'wall-clock budget (5400s)' not in out, (
+            f'esc-3694-3 shape must not be reproduced; got {out!r}'
+        )
+        assert 'unattributed' in out, f'Expected unattributed stop; got {out!r}'
+        match = re.search(r'wall time (-?[\d.]+)s', out)
+        assert match is not None, f'No wall time field in message: {out!r}'
+        assert float(match.group(1)) < 5.0, (
+            f'Expected a sub-second real elapsed, not the 5400s budget; got {out!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_elapsed_is_measured_at_the_stop_not_the_last_read(self, tmp_path: Path):
+        """(b) defect 2: the reported elapsed must be measured when the stop
+        actually fires, not frozen at when the last output arrived.
+
+        Output arrives at ~0.0s ('starting'), then the child goes silent and
+        the genuine 1.0s wall-clock budget fires at ~1.0s.  The pre-task-3806
+        loop built its message at the TOP of the iteration — i.e. right after
+        'starting' was read, at ~0.0s — so this reproduces the exact
+        'log terminates mid-progress, elapsed frozen at last output' shape
+        from esc-3694-3.
+        """
+        from orchestrator.verify import _run_cmd
+        log_path = tmp_path / 'verify.log'
+        cmd = 'echo "starting"; sleep 5'
+        cfg = self._make_cfg(heartbeat_idle_max=5.0)
+        rc, out, timed_out = await _run_cmd(
+            cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
+        )
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        assert 'wall-clock budget (1s)' in out, f'Unexpected message: {out!r}'
+        match = re.search(r'wall time (-?[\d.]+)s', out)
+        assert match is not None, f'No wall time field in message: {out!r}'
+        assert float(match.group(1)) >= 0.8, (
+            f'Expected elapsed measured at the stop (~1.0s), not at the last '
+            f'read (~0.0s); got {out!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_legitimate_heartbeat_idle_kill_is_still_named(self, tmp_path: Path):
+        """(c) guard against the rewire producing a false 'unattributed':
+        a genuine heartbeat-idle backstop kill is still named."""
+        from orchestrator.verify import _run_cmd
+        log_path = tmp_path / 'verify.log'
+        cmd = (
+            'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
+            'sleep 5'
+        )
+        cfg = self._make_cfg(heartbeat_idle_max=0.5)
+        rc, out, timed_out = await _run_cmd(
+            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+        )
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        assert 'heartbeat-idle backstop (0s)' in out, f'Unexpected message: {out!r}'
+        assert 'unattributed' not in out, f'Legitimate kill wrongly reported unattributed: {out!r}'
+        # This stub takes exactly one clean STOP -> silent-block -> timeout
+        # transition (no intervening heartbeats), so the pre-task-3806
+        # iteration-top snapshot is deterministically stale by ~0.5s here
+        # (it is captured right after STOP, before the block) — defect 2
+        # applies to the STOPPED-state path too, not just wall-clock budget.
+        match = re.search(r'wall time (-?[\d.]+)s', out)
+        assert match is not None, f'No wall time field in message: {out!r}'
+        assert float(match.group(1)) >= 0.3, (
+            f'Expected elapsed measured at the stop (~0.5s), not at STOP '
+            f'entry (~0.0s); got {out!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_legitimate_max_total_secs_kill_is_still_named(self, tmp_path: Path):
+        """(d) guard against the rewire producing a false 'unattributed' on
+        the max-total-stopped-cap NARROWING path — the path where the armed
+        deadline is the max-total narrowing rather than idle_deadline, which
+        catches an implementer recording the wrong armed deadline in the
+        STOPPED branch."""
+        from orchestrator.verify import _run_cmd
+        log_path = tmp_path / 'verify.log'
+        cmd = (
+            'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
+            'for i in $(seq 1 20); do sleep 0.2; echo "@@REIFY_CLOCK_HEARTBEAT@@ waited=$i"; done; '
+            'exit 0'
+        )
+        cfg = self._make_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
+        rc, out, timed_out = await _run_cmd(
+            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+        )
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        assert 'max-total-stopped cap' in out, f'Unexpected message: {out!r}'
+        assert 'unattributed' not in out, f'Legitimate kill wrongly reported unattributed: {out!r}'
 
 
 # ── Step-11 / Step-12: Wiring test (_run_or_skip_timed / run_verification) ────
