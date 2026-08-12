@@ -61,6 +61,7 @@ from _orch_helpers import (  # noqa: F401
 from test_merge_queue_concurrent_verify import (  # noqa: F401
     HEAVY_BARRIER_TEST_TIMEOUT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    _fake_verify_result,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
@@ -2457,6 +2458,20 @@ class TestLateArrivalFailCascade:
         gate_a_release = asyncio.Event()
         _local_calls: list[int] = [0]
 
+        # task 3980: built via _fake_verify_result (task 3477's
+        # MagicMock(spec=VerifyResult) factory, seeded from
+        # dataclasses.fields(VerifyResult)) rather than a bare MagicMock.
+        # Dropped from the old inline construction:
+        #   - `verify_skipped=False` — NOT a VerifyResult field at all; it lives
+        #     on MergeOutcome (merge_types.py:945). The factory rejects it.
+        #   - `lint_output=''`, `type_output=''`, `timed_out=False`,
+        #     `category=''` — the factory already seeds these from a real
+        #     VerifyResult's dataclass defaults, so restating them here is how
+        #     the doubles drifted out of sync in the first place.
+        # `category` now seeds to 'test_failure' on the failing leg instead of
+        # the old hardcoded ''; both sit in the same policy bucket (neither is
+        # in INFRA_TRANSIENT_CATEGORIES nor PREEXISTING_BREAK_SKIP_CATEGORIES),
+        # so no retry/skip path changes — verified against verify_categories.py.
         async def _gated_failing_local(*args: Any, **kwargs: Any) -> MagicMock:
             call = _local_calls[0]
             _local_calls[0] += 1
@@ -2464,16 +2479,12 @@ class TestLateArrivalFailCascade:
                 # First call: A's verify — gate then FAIL
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False, summary='tests failed', test_output='FAIL',
-                    lint_output='', type_output='', category='',
-                    timed_out=False, verify_skipped=False,
                 )
             # Subsequent calls (B's re-verify after cascade): PASS
-            return MagicMock(
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         # ── B's REMOTE verify: liveness-faithful runner to assert cancel-while-live ─
