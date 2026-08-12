@@ -800,6 +800,13 @@ async def _assert_infra_never_a_gate(
     assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
 
 
+@pytest.mark.timeout(150)  # task 4030: NOT a _drive_infra_reds chainer, which is why the
+# task-3832 review's marker sweep missed it -- but it composes anyway: a 30s _run_lane bound
+# raced concurrently by wait_entered (max, not sum), then _assert_infra_never_a_gate's 0.5 +
+# 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns (repo init,
+# _setup_repo, two _drive_advance/_advance_main rounds; task 3451 measured 4.71s worst case
+# per spawn). Clear the 60s pyproject default with margin so a genuinely wedged pass fails via
+# _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
 @pytest.mark.asyncio
 async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo, tmp_path):
     """IB2 (C7/§6, load-bearing) — a merge-landed notification while the
