@@ -43,7 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from fused_memory.utils.canonical_labels import Referent, scan_content
+from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 
 #: The CLOSED vocabulary of resolution sources, in precedence order (strongest
 #: first). Exported as one tuple so task ι's declaration-rate telemetry
@@ -125,6 +125,52 @@ class ReferentResolution:
     ambiguous: ReferentSet = ()
 
 
+def _metadata_referents(metadata: dict) -> ReferentSet:
+    """Bridge ambient ``metadata['task_id']`` into a referent set, or ``()``.
+
+    An unusable value is DROPPED, never raised on. This is asymmetric with the
+    ``declared`` path (which raises — see :func:`_declared_referents`) and the
+    asymmetry is deliberate: ``declared`` is an explicit caller assertion,
+    while ``metadata`` is ambient harness state the writer may not control, and
+    failing a write over odd ambient metadata would lose memories for no gain.
+    The degradation stays OBSERVABLE rather than silent — ι sees a lower
+    'metadata' share in its source counts, and the caller still falls THROUGH
+    to the derived scan rather than short-circuiting to ``'none'``.
+
+    ``_normalize_task_id_metadata`` (services/memory_service.py) documents this
+    path as carrying a SCALAR int or str: a list or tuple is out of contract
+    there precisely because it would ``str()``-coerce to a Python repr, so a
+    non-scalar is dropped here rather than coerced into a garbage referent
+    like ``'[5040, 5149]'``.
+    """
+    value = metadata.get('task_id')
+    # bool FIRST: bool subclasses int, so {'task_id': True} would otherwise
+    # become Task 1. The lesson is already encoded in validation._is_plain_int.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return ()
+    text = str(value).strip()
+    if not text:
+        return ()
+
+    # β's anchored parser owns every spelling that IS a label ('Task 3127',
+    # 'task #3127', 'reify:3127' with the qualifier preserved as a
+    # different-project signal), so reuse costs nothing and keeps the
+    # vocabulary at one site.
+    referent = parse_node_name(text)
+    if referent is not None:
+        return (referent,)
+
+    # Exactly ONE shape of our own: the bare digit run that metadata.task_id
+    # actually carries, and the one parse_node_name is anchored to refuse.
+    # String predicates rather than a compiled '^\d+$' because INV-5 forbids a
+    # second copy of the label vocabulary in this module. The isascii() half is
+    # precision, not ceremony: str.isdigit() accepts Arabic-Indic and
+    # superscript digits, and a Unicode digit is not a task id.
+    if text.isascii() and text.isdigit():
+        return (Referent(kind='task', number=text),)
+    return ()
+
+
 def resolve_referents(
     *,
     declared: list[dict] | None,
@@ -178,6 +224,15 @@ def resolve_referents(
     # referents are recorded, never guessed, and never promoted into
     # `.referents`.
     ambiguous = scan.ambiguous
+
+    # Ambient metadata outranks the prose but is never reconciled against it:
+    # `.conflicts` stays empty on this path, because metadata is not a CLAIM
+    # about the content. An agent working on task 3668 legitimately writes
+    # memories about Task 2500, so reconciling the two would reject a large
+    # fraction of correct writes.
+    bridged = _metadata_referents(metadata)
+    if bridged:
+        return ReferentResolution(source='metadata', referents=bridged, ambiguous=ambiguous)
 
     # scan.refs already excludes the ambiguous ones, so the derived set needs
     # no further filtering here.
