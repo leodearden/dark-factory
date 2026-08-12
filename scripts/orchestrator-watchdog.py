@@ -79,8 +79,18 @@ WATCHDOG_UNIT_NAME = "orchestrator-watchdog.service"
 # exact-equality drift tests). It needs a richer probe than a bare port
 # check: the in-process systemd watchdog thread pings WATCHDOG=1 from a
 # dedicated OS thread unconditionally (task 1731), so a wedged asyncio loop
-# still looks "healthy" to systemd forever — only an HTTP /health fetch can
-# catch that. See fused_memory_liveness_pass() / probe_health() below.
+# still looks "healthy" to systemd forever — only an HTTP fetch SERVED BY THAT
+# LOOP can catch it. See fused_memory_liveness_pass() / probe_health() below.
+#
+# The kill decision fetches /alive, NOT /health (task 3765). /health awaits two
+# sequential backing-store round-trips, which makes it a LOAD measurement: a
+# slow FalkorDB/Qdrant, or a busy-but-advancing loop, manufactured a false
+# "wedged" verdict. /alive is a zero-I/O route served by the SAME asyncio loop,
+# so the argument above is preserved intact — a genuinely hung loop still fails
+# to answer it and is still killed — while the false wedge disappears.
+# /health remains the READINESS signal, consumed by --report's recon-busy
+# column and _fused_memory_recon_busy_verdict()'s restart gate, which need the
+# recon_busy body that /alive by construction does not carry.
 FUSED_MEMORY_UNIT = "fused-memory.service"
 # Port value matches fused-memory/config/config.yaml's server.port (guarded
 # by the drift test in tests/scripts/test_orchestrator_watchdog.py).
@@ -92,6 +102,31 @@ FUSED_MEMORY_HEALTH_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/health"
 # ~10s worst case with margin, so only a genuinely wedged loop (no response
 # at all) times out here.
 FUSED_MEMORY_HEALTH_TIMEOUT_SECS = 15
+
+# The KILL decision's probe target (task 3765). /alive is a zero-I/O route
+# (fused_memory/server/tools.py, registered beside /health) that touches no
+# backing store, no harness and no disk — being served at all IS the signal.
+# It is served by the SAME asyncio loop as /health, so it still catches the
+# wedge the task-1731 rationale above describes, while a slow FalkorDB/Qdrant
+# no longer reads as one. The path is pinned against the server's actual
+# registered routes by the drift test in
+# tests/scripts/test_orchestrator_watchdog.py — a typo would 404, and
+# probe_health() treats ANY response (404 included) as alive, so a mistyped
+# path would silently disable the kill decision entirely.
+FUSED_MEMORY_ALIVE_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/alive"
+# DELIBERATELY NOT SHORTENED below the /health budget, despite /alive doing no
+# I/O. Shortening it would trade one false-positive class for another: a 25s
+# event-loop stall blocks /alive exactly as it blocks /health, and those
+# transient stalls are measured, not hypothetical (2026-08-06 controlled
+# window: /health exceeded 15s four times in 2h, peaks of 23.5s and 25s+ —
+# every one SELF-RECOVERED). That class is absorbed by task 3764's consecutive
+# -failure streak, not by this timeout; this task removes only the
+# backing-store class of false wedge and must not reintroduce another.
+# Kept as its OWN constant rather than reusing FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+# because that 15s is justified in-comment by /health's two sequential 5s store
+# probes — a rationale that does not apply here — so the two budgets can be
+# retuned independently without one's reasoning silently governing the other.
+FUSED_MEMORY_ALIVE_TIMEOUT_SECS = 15
 
 # Working directory shared by every orchestrator-*.service unit; the repo the
 # staleness pass diffs against.
