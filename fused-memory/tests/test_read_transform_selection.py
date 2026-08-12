@@ -1045,7 +1045,7 @@ class TestTheDistractorSlabIsNeverCapped:
         kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
 
         assert len(kept) == len(hits)
-        for out, original in zip(kept, hits):
+        for out, original in zip(kept, hits, strict=True):
             assert out is original
 
 
