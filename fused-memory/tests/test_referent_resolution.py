@@ -270,6 +270,22 @@ class TestAmbiguousReferentsAreRecordedNotGuessed:
             Referent(kind='task', project_id='dark_factory', number='2500'),
         )
 
+    def test_a_declaration_free_contest_is_still_reported_under_metadata(self):
+        """``.ambiguous`` is the scan's verbatim answer on EVERY path, so a
+        caller never has to check ``.source`` before trusting it — that would
+        force it to re-derive the scan itself (a second scan site, INV-5)."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 4242},
+            content='task 2500 duplicates dark_factory:2500',
+            group_id='reify',
+        )
+        assert resolution.source == 'metadata'
+        assert resolution.ambiguous == (
+            Referent(kind='task', number='2500'),
+            Referent(kind='task', project_id='dark_factory', number='2500'),
+        )
+
     def test_one_contested_number_never_suppresses_an_unrelated_clean_ref(self):
         """The contest is per-NUMBER, not per-content: a clean referent
         elsewhere in the same body still resolves, so one ambiguous mention
@@ -286,3 +302,143 @@ class TestAmbiguousReferentsAreRecordedNotGuessed:
             Referent(kind='task', number='2500'),
             Referent(kind='task', project_id='dark_factory', number='2500'),
         )
+
+
+class TestMetadataBridgeAcceptedShapes:
+    """``metadata['task_id']`` bridges the ambient harness task into a referent.
+
+    ``_normalize_task_id_metadata`` (services/memory_service.py) documents this
+    path as carrying a SCALAR int or str, str-coerced at the write boundary, so
+    those are the shapes the bridge accepts. Label spellings go through β's
+    ``parse_node_name`` first, at zero vocabulary cost.
+    """
+
+    @pytest.mark.parametrize(
+        'task_id',
+        [3127, '3127', ' 3127 ', 'Task 3127', 'task #3127', 'Task: 3127'],
+        ids=['int', 'str', 'padded', 'node-name', 'hash-spelled', 'colon-spelled'],
+    )
+    def test_scalar_and_label_spellings_bridge_to_the_task_referent(self, task_id):
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': task_id}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.source == 'metadata'
+
+    def test_zero_padding_is_preserved_verbatim(self):
+        """Never int-normalized: '0132' is a DIFFERENT referent from '132', so
+        coercing it would silently repoint the write at another task."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': '0132'}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (Referent(kind='task', number='0132'),)
+
+    def test_a_qualified_task_id_bridges_to_a_foreign_referent(self):
+        """``parse_node_name`` already owns this spelling and preserves the
+        qualifier as a different-project signal; reusing it keeps the
+        vocabulary at one site."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': 'reify:3127'}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify', number='3127'),
+        )
+        assert resolution.source == 'metadata'
+
+
+class TestMetadataBridgePrecedence:
+    """Metadata OUTRANKS the derived scan, and can never conflict with it."""
+
+    def test_metadata_wins_over_a_disagreeing_scan(self):
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 3668},
+            content='Task 2500 is the one that landed.',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='3668'),)
+        assert resolution.source == 'metadata'
+
+    def test_metadata_never_produces_a_conflict(self):
+        """Ambient harness state is NOT a claim about the prose: an agent
+        working on task 3668 legitimately writes memories about Task 2500.
+        Reconciling metadata against content would reject a large fraction of
+        correct writes — the "reject on absence loses memories" failure
+        resolved decision 3 forbids."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 3668},
+            content='Task 2500 is the one that landed.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+
+
+class TestMetadataBridgeDropsUnusableValues:
+    """An unparseable ``task_id`` is DROPPED — it falls through, never raises.
+
+    Asymmetric with ``declared`` ON PURPOSE: ``declared`` is an explicit caller
+    assertion, while ``metadata`` is ambient harness state the writer may not
+    control, and failing a write over odd ambient metadata would lose memories
+    for no gain. The degradation stays OBSERVABLE rather than silent — ι sees a
+    lower 'metadata' share, and the resolution still falls through to the
+    derived scan rather than short-circuiting to 'none'.
+    """
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {},
+            {'task_id': None},
+            {'task_id': ''},
+            {'task_id': '   '},
+            {'task_id': 'the merge-lane hardening task'},
+            {'task_id': '3127a'},
+            {'task_id': True},
+            {'task_id': [3127]},
+            {'task_id': {'id': 3127}},
+            {'task_id': '٣'},
+            {'task_id': 3.0},
+        ],
+        ids=[
+            'absent',
+            'none',
+            'empty',
+            'whitespace',
+            'title-prose',
+            'trailing-junk',
+            'bool-must-not-become-task-1',
+            'list',
+            'dict',
+            'non-ascii-digit',
+            'float',
+        ],
+    )
+    def test_unusable_values_yield_the_empty_resolution(self, metadata):
+        resolution = resolve_referents(
+            declared=None, metadata=metadata, content='', group_id=GROUP
+        )
+        assert resolution.referents == ()
+        assert resolution.source == 'none'
+
+    def test_a_non_scalar_task_id_is_never_str_coerced_into_a_garbage_referent(self):
+        """``_normalize_task_id_metadata`` flags list/tuple values as out of
+        contract precisely because they would ``str()``-coerce to a Python
+        repr; the bridge must drop them, never mint ``'[5040, 5149]'``."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': [5040, 5149]}, content='', group_id=GROUP
+        )
+        assert resolution.referents == ()
+
+    def test_a_dropped_task_id_falls_through_to_the_derived_scan(self):
+        """Proves the bridge falls THROUGH rather than short-circuiting to
+        'none' — an unusable ambient value must not blind the resolver to what
+        the prose plainly says."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 'the merge-lane hardening task'},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.source == 'derived'
