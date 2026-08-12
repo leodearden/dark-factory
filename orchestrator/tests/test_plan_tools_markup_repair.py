@@ -2031,6 +2031,106 @@ class TestReadPlanRepaired:
 
 
 # ---------------------------------------------------------------------------
+# task 3982 S1 — an UNRESOLVABLE locator must be reported every time, never
+# memoized under a key that means nothing. Drives ``_report_markup_facts``
+# directly: it is module-private and callable, which is how this branch is
+# reachable even though ``_read_plan_repaired`` can never produce it today
+# (it walks the same document it passes back, so its own locators always
+# resolve against it).
+# ---------------------------------------------------------------------------
+
+
+def _unresolvable_refusal_fact(**overrides: object) -> dict[str, object]:
+    """An 'unrepairable' fact in the exact shape ``_repair_one_field`` emits.
+
+    Defaults to locators that CANNOT resolve against ``corrupt_plan()``:
+    ``collection='steps'`` with ``index=99``, far past that plan's two-item
+    ``steps`` list.
+    """
+    fact: dict[str, object] = {
+        'tool': 'add_plan_step',
+        'also_written_by': [],
+        'param': 'description',
+        'pattern': 'a mis-close literal',
+        'misclose': None,
+        'outcome': 'unrepairable',
+        'recovered_params': [],
+        'declined_params': [],
+        'collection': 'steps',
+        'index': 99,
+        'field': 'description',
+    }
+    fact.update(overrides)
+    return fact
+
+
+class TestUnresolvableLocatorIsNeverMemoized:
+    """S1: a locator that no longer resolves must be reported every time.
+
+    ``_fact_value``'s except branch already carried a comment claiming this
+    ('report it every time rather than suppress on a key that means
+    nothing'), but returned plain ``None`` — indistinguishable from a
+    RESOLVABLE locator whose field is legitimately absent, so the two shared
+    one memo key and a SECOND unrelated unresolvable refusal was silently
+    suppressed. The comment disclaimed exactly what the code did.
+    """
+
+    def test_an_unresolvable_locator_is_reported_on_every_call(self, tmp_path, caplog):
+        plan = corrupt_plan()
+        fact = _unresolvable_refusal_fact()
+        plan_path = tmp_path / 'plan.json'
+
+        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
+            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+
+        assert first == [fact]
+        assert second == [fact], (
+            'an unresolvable locator must be reported every time, not '
+            'suppressed on the second call'
+        )
+        assert plan_tools._REPORTED_REFUSALS == set(), (
+            'no key that means nothing may ever be recorded'
+        )
+        assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
+        debug_records = [
+            r for r in caplog.records
+            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+        ]
+        assert debug_records == [], (
+            'an unresolvable refusal must never be suppressed to DEBUG'
+        )
+
+    def test_a_resolvable_locator_with_an_absent_field_is_still_memoized(
+        self, tmp_path, caplog
+    ):
+        """The boundary that must NOT change: a legitimately absent field.
+
+        A locator that DOES resolve, whose field simply holds nothing (the
+        holder has no such key), is a different case from a BROKEN locator
+        and keeps the existing memoization behaviour. This guards against
+        over-widening the S1 fix into 'never memoize a None'.
+        """
+        plan = corrupt_plan()
+        assert 'not_a_real_field' not in plan['steps'][0], (
+            'the fixture must pick a field the holder genuinely lacks'
+        )
+        fact = _unresolvable_refusal_fact(index=0, field='not_a_real_field')
+        plan_path = tmp_path / 'plan.json'
+
+        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
+            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+
+        assert first == [fact]
+        assert second == [], (
+            'a resolvable locator whose field is legitimately absent must '
+            'still converge to silence on repeat, unlike a broken locator'
+        )
+        assert len(plan_tools._REPORTED_REFUSALS) == 1
+
+
+# ---------------------------------------------------------------------------
 # step-13(d) — boundary row B12: a concurrent reader never sees a partial file.
 # ---------------------------------------------------------------------------
 
