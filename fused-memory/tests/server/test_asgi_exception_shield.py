@@ -123,3 +123,44 @@ class TestASGIExceptionShieldCancelledError:
         assert any(m['type'] == 'http.response.body' for m in sent)
         if expected_status == 503:
             assert dict(start['headers'])[b'retry-after'] == b'5'
+
+
+class _StartedThenRaisingApp:
+    """Minimal ASGI app that sends a real response start, then raises."""
+
+    async def __call__(self, scope, receive, send):
+        await send(
+            {
+                'type': 'http.response.start',
+                'status': 200,
+                'headers': [(b'content-type', b'application/json')],
+            }
+        )
+        raise RuntimeError('boom after response start')
+
+
+class TestASGIExceptionShieldResponseStarted:
+    """Pins the `if not response_started:` branch — previously uncovered.
+
+    Once the wrapped app has already sent `http.response.start`, the
+    shield must not stomp a fallback 500/503 on top of an in-flight
+    response: the entire fallback start+body pair sits under
+    `if not response_started`, so both must be skipped, not just the
+    start message.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('stop_received', [False, True])
+    async def test_no_fallback_response_after_start(self, monkeypatch, stop_received):
+        monkeypatch.setattr(main_module, '_operator_stop_received', stop_received)
+        shield = _ASGIExceptionShield(_StartedThenRaisingApp())
+
+        # Returning normally proves the RuntimeError was still contained.
+        sent = await _collect(shield)
+
+        starts = [m for m in sent if m['type'] == 'http.response.start']
+        assert len(starts) == 1
+        assert starts[0]['status'] == 200
+        # Stronger than "no second start": proves the whole fallback block
+        # (start + body) was skipped, not just the start message deduped.
+        assert not any(m['type'] == 'http.response.body' for m in sent)
