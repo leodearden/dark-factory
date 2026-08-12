@@ -160,3 +160,72 @@ next tag it recognizes.
 The memory has been re-scoped).&#60;/parameter>
 &#60;parameter name="agent_id">escalation-watcher-l2
 ```
+
+## Incidence
+
+Measured on 2026-08-05 against an archive of our own agent transcripts: 334
+of 128,066 tool calls were corrupted this way — **0.26%**. A tool call
+counted as corrupted if any one of its string-valued parameters matched,
+verbatim: `&#60;/invoke>\s*$`, or
+`&#60;/[A-Za-z_]\w*>\s*&#60;parameter\s+name="[^"]+">` (both written here
+with the same escaping as the rest of this report; read `&#60;` as a literal
+opening angle bracket). The whitespace requirement in the second pattern is
+deliberate — it is what keeps ordinary prose that happens to quote a closing
+tag out of the count, since a real over-consumption always mis-closes and
+then continues directly into the next tag with nothing but whitespace in
+between.
+
+## Repairability
+
+Replaying all 334 corrupted calls from that same archive through a
+schema-validated, deterministic repairer: **308 repair cleanly (92.2%)**,
+recovering 194 dropped parameters. The remaining 26 (7.8%) are
+doubly-corrupted — more than one mis-close in the same value — and are
+correctly refused rather than guessed, because a second mis-close makes the
+boundary between recovered arguments ambiguous.
+
+This is the load-bearing argument of this report. A downstream consumer,
+working only from the malformed text and the tool's parameter schema, can
+deterministically reconstruct the arguments the model actually supplied for
+the overwhelming majority of corrupted calls. If a repairer with no access
+to the original call can do this reliably, the parser itself — which has
+strictly more context, including the exact position where parsing actually
+diverged — could have raised a parse error at that point instead of silently
+guessing a wrong terminator and discarding everything past it.
+
+## What was actually lost
+
+The 334 calls above, by which parameter was silently dropped and how often,
+across our own MCP tools: `category` ×70, `project_id` ×32, `rationale`
+×25, `agent_id` ×18, `suggested_action` ×13, `issues` ×10, `priority` ×5.
+
+These are not abstract slots. A dropped `category` or `project_id` on a
+memory-write call means the record was filed under whatever fallback value
+the receiving code substitutes for a missing argument, not the value
+actually supplied — and nothing marks it as a fallback. A dropped `priority`
+means a task runs at the wrong urgency indefinitely. A dropped `rationale`
+means the reasoning behind a decision is gone, while some other field
+elsewhere claims a reasoning that doesn't belong to it. None of this trips
+any error path; all of it is a plausible, silently wrong value sitting where
+a correct one should be.
+
+## Reproducibility
+
+A second, independent measurement on 2026-08-09 — a later, larger snapshot
+of the same transcript archive (roughly 4,400 to 5,704 files) — found 504
+corrupted calls: 443 repaired (87.9%), 61 unrepairable, 245 parameters
+recovered. The same parameters dominate, at larger counts: `category` ×110,
+`project_id` ×44, `agent_id` ×25, `issues` ×16, `rationale` ×13,
+`suggested_action` ×12, `priority` ×5.
+
+The repair rate moved from 92.2% to 87.9% between the two measurements, for
+two identified and unremarkable reasons rather than one: the underlying
+archive grew (more calls, of the same shape), and in the interim the
+repairer itself was tightened to refuse a small class of cases it had
+previously accepted — exactly 3 of the original 334 calls, re-checked under
+the newer repairer, moved from repaired to unrepairable. Both measurements
+are reported here, dated, rather than presenting either alone as a single
+current figure: two independent snapshots showing the same shape, at
+different points in time and different sample sizes, is stronger evidence
+that this is a persistent property of the defect than either measurement
+would be alone.
