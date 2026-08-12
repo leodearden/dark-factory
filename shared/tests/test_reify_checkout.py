@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from shared.reify_checkout import REIFY_ROOT_ENV, resolve_reify_root
+from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_root
 
 # The two real markers in play, one per consumer call site.  The resolver is
 # parameterized on these precisely because the two consumers gate on different
@@ -38,6 +38,14 @@ def _plant(root: Path, tests_dir_relpath: str, marker: str | Path = _VERIFY_MARK
     tests_dir = root / tests_dir_relpath
     tests_dir.mkdir(parents=True, exist_ok=True)
     return tests_dir / 'test_x.py'
+
+
+def _plant_marker(root: Path, marker: str | Path = _VERIFY_MARKER) -> Path:
+    """Create ``root/<marker>`` as a real file and return *root*."""
+    marker_file = root / marker
+    marker_file.parent.mkdir(parents=True, exist_ok=True)
+    marker_file.write_text('#!/bin/sh\necho stub\n')
+    return root
 
 
 def test_env_var_name_is_single_sourced():
@@ -246,3 +254,99 @@ class TestResolveReifyRootOverride:
             'export steers every reify-dependent consumer to the same checkout '
             f'(got {result_a!r} for {_VERIFY_MARKER} vs {result_b!r} for {_GUARD_MARKER})'
         )
+
+
+class TestReifySkipReason:
+    """The pure skip-reason builder — WORK item 3.
+
+    Returns a reason STRING rather than calling ``pytest.skip`` (shared/src may
+    not import pytest); each call site turns it into the skip mechanism it
+    actually needs.  The two non-None arms are deliberately distinct: a
+    discovery MISS ("nobody has reify checked out") must never be confused with
+    an operator's REIFY_ROOT naming a path that is not there.
+    """
+
+    def test_returns_none_when_the_marker_is_present(self, tmp_path):
+        """The gate must RUN — no skip — when the checkout really carries it."""
+        root = _plant_marker(tmp_path / 'reify')
+        assert reify_skip_reason(_VERIFY_MARKER, root) is None
+
+    def test_discovery_miss_names_the_marker_and_the_override(self):
+        reason = reify_skip_reason(_VERIFY_MARKER, None)
+
+        assert isinstance(reason, str) and reason, (
+            'a falsy reason would silently DISABLE the skipif at the call sites, '
+            'which gate on truthiness / `is not None`'
+        )
+        assert str(_VERIFY_MARKER) in reason, (
+            'the discovery-miss reason must name the marker relpath that was '
+            f'searched for, so the reader knows what was missing (got {reason!r})'
+        )
+        assert REIFY_ROOT_ENV in reason, (
+            'the discovery-miss reason must name REIFY_ROOT as the way to '
+            f'override it (got {reason!r})'
+        )
+
+    def test_discovery_miss_does_not_claim_a_path_was_named(self):
+        """A None root must not be stringified into the message.
+
+        The concrete bug this pins shut: formatting the set-but-absent arm's
+        message with ``root=None`` yields 'reify checkout at None has no ...',
+        which reads as though the operator named a path when nobody did.
+        """
+        reason = reify_skip_reason(_VERIFY_MARKER, None)
+        assert 'None' not in reason, (
+            f'discovery-miss reason must not stringify the absent root: {reason!r}'
+        )
+
+    def test_set_but_absent_names_the_bad_path_verbatim(self, tmp_path):
+        bad_root = tmp_path / 'does-not-exist' / 'reify-typo'
+
+        reason = reify_skip_reason(_VERIFY_MARKER, bad_root)
+
+        assert isinstance(reason, str) and reason
+        assert str(bad_root) in reason, (
+            'the bad path must appear verbatim so it is self-evident in the '
+            f'pytest -rs output which path was wrong (got {reason!r})'
+        )
+
+    def test_the_two_arms_are_distinguishable(self, tmp_path):
+        """Keeps 'nobody has reify' from being read as 'you typed the path wrong'."""
+        bad_root = tmp_path / 'does-not-exist' / 'reify-typo'
+
+        miss_reason = reify_skip_reason(_VERIFY_MARKER, None)
+        named_reason = reify_skip_reason(_VERIFY_MARKER, bad_root)
+
+        assert miss_reason != named_reason
+        assert str(bad_root) in named_reason
+        assert str(bad_root) not in miss_reason
+
+    def test_existing_dir_without_the_marker_is_the_set_but_absent_arm(self, tmp_path):
+        """A checkout present but without the script is NOT a discovery miss."""
+        root = tmp_path / 'reify'
+        root.mkdir()
+
+        reason = reify_skip_reason(_VERIFY_MARKER, root)
+
+        assert isinstance(reason, str) and reason
+        assert str(root) in reason
+        assert reason != reify_skip_reason(_VERIFY_MARKER, None)
+
+    def test_marker_specific_when_the_root_carries_only_the_other_script(self, tmp_path):
+        root = _plant_marker(tmp_path / 'reify', marker=_VERIFY_MARKER)
+
+        assert reify_skip_reason(_VERIFY_MARKER, root) is None
+        guard_reason = reify_skip_reason(_GUARD_MARKER, root)
+        assert isinstance(guard_reason, str) and guard_reason
+        assert str(_GUARD_MARKER) in guard_reason
+
+    def test_accepts_a_str_marker(self, tmp_path):
+        root = _plant_marker(tmp_path / 'reify')
+        assert reify_skip_reason('scripts/verify.sh', root) is None
+
+        miss = reify_skip_reason('scripts/verify.sh', None)
+        assert isinstance(miss, str) and miss
+
+    def test_accepts_a_path_marker(self, tmp_path):
+        root = _plant_marker(tmp_path / 'reify')
+        assert reify_skip_reason(Path('scripts/verify.sh'), root) is None
