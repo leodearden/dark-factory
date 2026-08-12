@@ -3738,6 +3738,24 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     slack = _clock_stop_attribution_slack(limit)
     if remaining <= slack and limit <= elapsed + slack:
         return f'{kind} ({limit:.0f}s), wall time {elapsed:.1f}s'
+    # Self-consistency guard (scope item 2): make the anomaly LOUD, not just
+    # honest in the returned string.  A returned message is read only once a
+    # human triages the escalation; this WARNING is greppable across the
+    # fleet the moment it happens and is the only channel that survives
+    # _extract_cause_hint's 200-char cap truncating the returned message.
+    # Logged here (inside the helper) rather than at the two call sites in
+    # the clock-stop loop, so a future third stop site cannot bypass it, and
+    # this stays the single place attribution is decided.  Never logged on
+    # the attributed branch above: an ordinary verify timeout is already
+    # reported via the returned message and timed_out=True, and warning on
+    # every one of those would drown the anomaly this guard exists to catch.
+    logger.warning(
+        'clock-stop attribution refused - armed %s (%.0fs) still had %.1fs left '
+        'when the read stopped at wall time %.1fs; reporting the stop as '
+        'unattributed (external or aggregate deadline) rather than blaming a '
+        'budget that did not elapse',
+        kind, limit, remaining, elapsed,
+    )
     return (
         f'unattributed stop (external or aggregate deadline) - armed {kind} '
         f'had {remaining:.1f}s left, limit {limit:.0f}s, wall time {elapsed:.1f}s'
