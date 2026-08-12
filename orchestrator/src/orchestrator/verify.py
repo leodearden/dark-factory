@@ -3788,6 +3788,11 @@ async def _run_cmd(
     heartbeat arrives within ``clock_stop.heartbeat_idle_max`` seconds of
     the last STOP or HEARTBEAT.  Any deadline breach raises ``TimeoutError``,
     which the existing kill path catches (``timed_out=True → infra_timeout``).
+    The returned message's reason is computed by ``_clock_stop_reason`` AT
+    THE MOMENT OF THE STOP (task 3806) rather than pre-formatted per
+    iteration, and is attribution-checked: it names the deadline that armed
+    the read only when the measured elapsed and remaining time are
+    consistent with it, otherwise it reports the stop as unattributed.
 
     ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
     so that python children (pytest, ruff, pyright via uv) flush their stdout
@@ -3810,8 +3815,10 @@ async def _run_cmd(
     scope_unit: str | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
         scope_unit = _verify_scope_name(scope_tag)
-    # Populated by the clock-stop loop before raising TimeoutError so the except
-    # handler can emit a richer message (actual wall time + which deadline fired).
+    # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
+    # THE STOP (task 3806), before raising TimeoutError — so the except
+    # handler can emit a message with the real elapsed wall time and, when
+    # consistent with what genuinely elapsed, which deadline fired.
     _cs_timeout_msg: list[str] = []
     try:
         if scope_unit is not None:
@@ -3893,26 +3900,27 @@ async def _run_cmd(
                 # (step-10: max_total_secs cap).
                 total_stopped: float = 0.0
                 line_buf = bytearray()
-                # Human-readable reason for the binding deadline (overwritten each
-                # iteration; captured in _cs_timeout_msg before raising TimeoutError
-                # so the except handler can emit an informative message with the
-                # actual wall time and which limit fired).
-                _cs_reason = f'wall-clock budget ({timeout:.0f}s)'
+                # Which deadline is armed for the CURRENT read: a human label
+                # (_cs_kind) plus the configured number it names (_cs_limit).
+                # Recomputed at the top of every iteration (overwritten each
+                # iteration, like the loop's other deadline bookkeeping).  The
+                # actual reason STRING is built once, AT THE STOP, by
+                # _clock_stop_reason (task 3806) — not pre-formatted here — so
+                # it can be attribution-checked against what really elapsed
+                # instead of trusted blindly.  See _clock_stop_reason.
+                _cs_kind = 'wall-clock budget'
+                _cs_limit = timeout
 
                 while True:
                     now = time.monotonic()
                     if state == _CS_RUNNING:
                         read_timeout = deadline - now
-                        _cs_reason = (
-                            f'wall-clock budget ({timeout:.0f}s), '
-                            f'wall time {now - t0:.1f}s'
-                        )
+                        _cs_kind = 'wall-clock budget'
+                        _cs_limit = timeout
                     else:  # _CS_STOPPED
                         read_timeout = idle_deadline - now
-                        _cs_reason = (
-                            f'heartbeat-idle backstop ({clock_stop.heartbeat_idle_max:.0f}s), '
-                            f'wall time {now - t0:.1f}s'
-                        )
+                        _cs_kind = 'heartbeat-idle backstop'
+                        _cs_limit = clock_stop.heartbeat_idle_max
                         # max_total_secs cap (step-10): when > 0, also bound
                         # the read timeout by the remaining total-stopped budget
                         # so we don't stay STOPPED past the cumulative cap.
@@ -3921,13 +3929,23 @@ async def _run_cmd(
                             remaining_total = clock_stop.max_total_secs - cumulative
                             if remaining_total < read_timeout:
                                 read_timeout = remaining_total
-                                _cs_reason = (
-                                    f'max-total-stopped cap ({clock_stop.max_total_secs:.0f}s), '
-                                    f'wall time {now - t0:.1f}s'
-                                )
+                                _cs_kind = 'max-total-stopped cap'
+                                _cs_limit = clock_stop.max_total_secs
+
+                    # Absolute deadline armed for THIS read.  Uniformly
+                    # represents whichever clock binds — it already folds in
+                    # the START-shifted wall-clock `deadline`, `idle_deadline`,
+                    # and the max-total narrowing — so a single comparison
+                    # against the stop time attributes all three kinds
+                    # (task 3806; see _clock_stop_reason).
+                    _cs_armed = now + read_timeout
 
                     if read_timeout <= 0:
-                        _cs_timeout_msg.append(_cs_reason)
+                        t_stop = time.monotonic()
+                        _cs_timeout_msg.append(_clock_stop_reason(
+                            kind=_cs_kind, limit=_cs_limit,
+                            elapsed=t_stop - t0, remaining=_cs_armed - t_stop,
+                        ))
                         raise TimeoutError()
 
                     try:
@@ -3936,7 +3954,11 @@ async def _run_cmd(
                             timeout=read_timeout,
                         )
                     except TimeoutError:
-                        _cs_timeout_msg.append(_cs_reason)
+                        t_stop = time.monotonic()
+                        _cs_timeout_msg.append(_clock_stop_reason(
+                            kind=_cs_kind, limit=_cs_limit,
+                            elapsed=t_stop - t0, remaining=_cs_armed - t_stop,
+                        ))
                         raise
 
                     if not chunk:
@@ -3996,8 +4018,13 @@ async def _run_cmd(
         if _cs_timeout_msg:
             # Clock-stop path: include actual wall time and which deadline fired
             # (idle backstop / wall-clock budget / max-total cap) so infra_timeout
-            # incidents are distinguishable in the verify log.
-            return 1, f'Command clock-stop timed out ({_cs_timeout_msg[0]}): {cmd}', True
+            # incidents are distinguishable in the verify log.  [-1] (most
+            # recent), not [0]: both append sites raise immediately and no
+            # enclosing handler inside the `with open(log_path)` block resumes
+            # the loop, so today the list holds at most one element per call —
+            # [-1] is the intent-correct read if a future nested handler ever
+            # appends again (task 3806).
+            return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
         if scope_unit is not None:
