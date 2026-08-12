@@ -559,23 +559,47 @@ def evaluate_census_step(
     """Evaluate the periodic-census trigger (ζ) at the end of a nightly
     run, returning ``(one_line_decision, fire)``.
 
-    *decide* (default ``census_trigger.decide_for_project``, never raises
-    -- fail-safe) makes the FIRE/NO-FIRE call. On NO-FIRE, *launcher* is
-    never called. On FIRE: if *entrypoint_exists* (default: does
-    ``scripts/legibility/census.py`` -- task η -- exist) is False, this
-    logs a LOUD "FIRE-WITHOUT-LAUNCH" warning and returns without calling
-    *launcher* -- η is NOT a dependency of ε, so a fired trigger before η
-    lands must never crash or fail the nightly run. If the entrypoint is
-    present, *launcher* (default: best-effort subprocess launch) is called
-    once; any launcher failure is caught and logged, never propagated --
-    this function never raises and never fails the run.
+    *decide* (default ``census_trigger.decide_for_project``) makes the
+    FIRE/NO-FIRE call. On NO-FIRE, *launcher* is never called. On FIRE: if
+    *entrypoint_exists* (default: does ``scripts/legibility/census.py`` --
+    task η -- exist) is False, this logs a LOUD "FIRE-WITHOUT-LAUNCH"
+    warning and returns without calling *launcher* -- η is NOT a dependency
+    of ε, so a fired trigger before η lands must never crash or fail the
+    nightly run. If the entrypoint is present, *launcher* (default:
+    best-effort subprocess launch) is called once.
+
+    This function never raises and never fails the run, and that guarantee is
+    its OWN: both the *decide* call and the *launcher* call are guarded here,
+    each degrading to one WARNING. It is deliberately not delegated to
+    ``decide_for_project``'s own never-raises contract -- *decide* is an
+    injected seam any caller can replace, so a promise about the default
+    callee could not hold for an arbitrary one (task 4085). A failed
+    evaluation returns a synthetic line keeping the
+    ``census trigger: NO-FIRE -- ...`` grammar every consumer of
+    ``NightlyResult.census_line`` reads, and returns before the
+    entrypoint/launcher block so it can never start a census.
     """
     if entrypoint_exists is None:
         entrypoint_exists = _default_entrypoint_exists
     if launcher is None:
         launcher = _default_census_launcher
 
-    decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+    # Returns BEFORE the entrypoint/launcher block below, and that ordering is
+    # a safety property rather than a style choice: an evaluation that failed
+    # has established nothing, so it must never be able to start a census.
+    try:
+        decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+    except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+        logger.warning(
+            'census trigger evaluation failed (%s: %s) -- NO-FIRE; the nightly '
+            'run is unaffected', type(exc).__name__, exc,
+        )
+        return (
+            f'census trigger: NO-FIRE -- trigger evaluation failed '
+            f'({type(exc).__name__}: {exc})',
+            False,
+        )
+
     line = 'census trigger: {} -- {}'.format(
         'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
     )
