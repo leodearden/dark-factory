@@ -39,6 +39,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -129,6 +130,36 @@ class VramProbeError(Exception):
     """
 
 
+class PollutedBaselineError(VramProbeError):
+    """A foreign process held the card when a baseline was to be recorded.
+
+    A :class:`VramProbeError` subclass on purpose, so every existing
+    ``except VramProbeError`` handler already catches it and a polluted
+    baseline cannot escape a caller that was written before this guard.
+    Callers that want the distinct exit code catch this one FIRST.
+
+    Carries :attr:`consumers` so a caller can print WHICH process to deal with
+    rather than only that something was wrong.
+    """
+
+    def __init__(self, consumers: Sequence[GpuConsumer], context: str = ''):
+        self.consumers = list(consumers)
+        offenders = '; '.join(
+            f'pid {c.pid} {c.process_name} holding {c.used_mib} MiB '
+            f'({c.used_gib} GiB)'
+            for c in self.consumers
+        )
+        lead = context or 'the GPU baseline is polluted'
+        super().__init__(
+            f'{lead}: {offenders}. Nothing but whisper-writer should hold this '
+            'card before an arm starts, so a baseline taken now would be '
+            "subtracted from the arm's footprint and misattribute another "
+            "process's memory. This tool does not stop or police those "
+            'processes (ollama self-expires on keep_alive); free the card and '
+            'start the arm again'
+        )
+
+
 class GpuReading(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -182,6 +213,72 @@ class GpuConsumer(BaseModel):
     @property
     def used_gib(self) -> float:
         return round(self.used_mib / MIB_PER_GIB, 2)
+
+
+class PollutionState(StrEnum):
+    """Whether a VRAM measurement can be attributed to the arm at all.
+
+    A StrEnum so it serialises as a plain string under
+    ``model_dump(mode='json')`` and a downstream filter can match on it without
+    knowing this module.
+    """
+
+    #: Nobody but the expected residents held the card across the measurement.
+    CLEAN = 'CLEAN'
+    #: A foreign process moved on the card. The budget arithmetic is void — not
+    #: merely unflattering. Nothing was learned about the arm.
+    POLLUTED = 'POLLUTED'
+    #: Nobody looked. Emitted by NO code path in this package; it exists only
+    #: so an artifact written before this guard still parses, and reads
+    #: honestly as "unmeasured" rather than defaulting to CLEAN.
+    UNMEASURED = 'UNMEASURED'
+
+
+class ExpectedConsumer(BaseModel):
+    """One process this host is KNOWN to run on the GPU at baseline.
+
+    A ceiling, not just a name: an allowlist keyed on the process name alone
+    would let anything calling itself ``python`` sit in a "clean" baseline at
+    any size.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    name_pattern: str
+    ceiling_mib: int
+
+    def matches(self, process_name: str) -> bool:
+        return re.search(self.name_pattern, process_name) is not None
+
+
+#: Below this a consumer cannot move a budget verdict, and flagging it would
+#: make the guard cry wolf until an operator learns to ignore it.  The task's
+#: "~1 GiB".
+POLLUTION_FLOOR_MIB = 1024
+
+#: The ONLY process this host is expected to be running on the GPU when an arm
+#: has not started yet.  PRD D10 requires whisper-writer resident, so it is
+#: the allowlist and not an exception to it.
+#:
+#: The ceiling is DERIVED, not guessed: every whisper-writer reading recorded on
+#: this host is 4050 MiB, and 6144 sits far above that (leaving room for reload
+#: drift) and far below the 10314 MiB ollama holding that motivated this guard.
+#: Its only failure direction is a false REFUSAL, which is loud and gets fixed.
+#:
+#: Deliberately a module constant with NO environment override.  An env var
+#: could silence this guard invisibly, leaving no trace in any diff or
+#: artifact — the same class of hole the frozen baseline esc-3713-6 removed.
+#: Changing what this host is expected to run is a code change with a
+#: reviewable diff.  (`LMS_BASELINE_DIR` is not a counterexample: it redirects
+#: WHERE a measurement is stored, not what counts as a passing one.)
+EXPECTED_CONSUMERS: tuple[ExpectedConsumer, ...] = (
+    ExpectedConsumer(
+        label='whisper-writer (PRD D10 requires it resident)',
+        name_pattern=r'(?:^|/)python3?$',
+        ceiling_mib=6144,
+    ),
+)
 
 
 class GpuSnapshot(BaseModel):
@@ -421,6 +518,43 @@ def probe_gpu_consumers(runner: GpuRunner | None = None) -> list[GpuConsumer]:
             f'could not run {" ".join(_NVIDIA_SMI_COMPUTE_APPS_QUERY)}: {exc}'
         ) from exc
     return parse_nvidia_smi_compute_apps_csv(output)
+
+
+def unexpected_baseline_consumers(
+    consumers: Sequence[GpuConsumer],
+) -> list[GpuConsumer]:
+    """Which of these has no business holding the card before an arm starts?
+
+    A POSITIVE ALLOWLIST, and that choice is the crux of the design.
+    ``lms_ctl.start`` records the baseline BEFORE ``systemctl start``, so at
+    that instant nothing of ours is on the card: any consumer over
+    :data:`POLLUTION_FLOOR_MIB` that is not in :data:`EXPECTED_CONSUMERS` is a
+    surprise.  There is no false-positive direction to protect, so the strictest
+    possible rule is also the safest one — it catches ollama and equally
+    catches whatever nobody anticipated.
+
+    :func:`classify_pollution` deliberately CANNOT use this rule.  At probe time
+    the arm's own container is legitimately a new consumer, and
+    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell a
+    containerised vLLM ``python`` from any other ``python``, so this allowlist
+    there would flag every healthy run.  The asymmetry is intended.
+
+    Size matters as much as name: an allowlist keyed on the process name alone
+    would let a leftover containerised vLLM sit in a "clean" baseline under the
+    name ``python`` and be subtracted from the next arm's footprint.
+    """
+    offenders: list[GpuConsumer] = []
+    for consumer in consumers:
+        if consumer.used_mib < POLLUTION_FLOOR_MIB:
+            continue
+        expected = any(
+            entry.matches(consumer.process_name)
+            and consumer.used_mib <= entry.ceiling_mib
+            for entry in EXPECTED_CONSUMERS
+        )
+        if not expected:
+            offenders.append(consumer)
+    return offenders
 
 
 def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
