@@ -3225,6 +3225,111 @@ class TestDiffStatusCorrection:
 
 
 # ---------------------------------------------------------------------------
+# Clause boundary grammar — _CLAUSE_SPLIT_RE (task 3403)
+# ---------------------------------------------------------------------------
+
+
+class TestClauseSplitRe:
+    """Tests for _CLAUSE_SPLIT_RE in task_filter.py — the clause boundary shared
+    by find_conflicting_task_status_ids() and
+    find_present_tense_completion_claim_task_ids().
+
+    Task 3403. The original alphabet was a bare character class, ``[.;\\n!?]``,
+    so EVERY dot was a clause boundary. Recon-authored prose is dense with
+    dotted tokens — ``dark-factory-orchestrator.yaml``, ``CLAUDE.md:95``,
+    ``.envrc``, ``v1.2.3``, ``1.5s``, dotted Python identifiers such as
+    ``task_filter.TASK_REF_RE`` — and every one of them shattered the sentence
+    containing it. When the shatter landed BETWEEN a task reference and the
+    status marker in its own sentence, clause-scoped association returned the
+    EMPTY SET on real recon-authored content (probe memory
+    80d3f4c9-c334-490e-ab14-443b8aebb5c1): both detectors were silently inert on
+    exactly the corpus they were written for.
+
+    The widened form guards the dot with a RIGHT-SIDE lookahead only —
+    ``\\.(?!\\w)|[;\\n!?]``. Right-side-only is load-bearing: a left-side
+    lookbehind, or a whitespace-on-both-sides rule, would stop splitting
+    ``'done. Task'`` — and that split is the precision guarantee separating
+    these detectors from is_mixed_temporal_framing (see
+    test_negative_two_different_task_ids below).
+
+    These tests pin both halves of the contract — the dotted tokens that must
+    NOT split, and every terminator that must still split — so a later edit to
+    the splitter can neither re-shatter technical prose nor quietly drop a
+    terminator.
+    """
+
+    # ------------------------------------------------------------------ #
+    # dotted technical tokens must NOT be clause boundaries (the defect)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_dotted_tokens_are_not_clause_boundaries(self):
+        """A dot followed by a word character belongs to a token, not to a
+        sentence boundary: each of these real-corpus shapes must survive as a
+        single, unsplit clause. Under the pre-3403 ``[.;\\n!?]`` alphabet every
+        one of them was broken into two or more pieces.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        for text in (
+            'dark-factory-orchestrator.yaml',
+            'CLAUDE.md:95',
+            '.envrc',
+            'v1.2.3',
+            '1.5s',
+            'task_filter.TASK_REF_RE',
+        ):
+            assert _CLAUSE_SPLIT_RE.split(text) == [text], (
+                f'Expected a dotted technical token to yield exactly one '
+                f'non-empty clause, unsplit.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # every pre-existing terminator must still split
+    # ------------------------------------------------------------------ #
+
+    def test_positive_sentence_terminators_still_split(self):
+        """Narrowing the dot must cost no terminator: '.', ';', newline, '!' and
+        '?' all still end a clause, including a trailing '.' at end-of-string.
+
+        ``'a. b'`` is the case the right-side-only guard exists to preserve — a
+        lookbehind-based narrowing would stop splitting it, which is what makes
+        the two-different-ids precision tests pass.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        for text, expected in (
+            ('a. b', ['a', ' b']),
+            ('a.', ['a', '']),
+            ('a;b', ['a', 'b']),
+            ('a\nb', ['a', 'b']),
+            ('a!b', ['a', 'b']),
+            ('a?b', ['a', 'b']),
+        ):
+            assert _CLAUSE_SPLIT_RE.split(text) == expected, (
+                f'Expected the clause splitter to still break on this sentence '
+                f'terminator.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # arity: the splitter must never capture
+    # ------------------------------------------------------------------ #
+
+    def test_clause_split_re_has_no_capture_group(self):
+        """``re.split`` on a pattern carrying a capture group interleaves the
+        matched separators into its result, so both callers' per-clause loops
+        would start seeing bare '.'/';' fragments as clauses. The widened form
+        uses a non-capturing lookahead precisely for this reason; the arity is
+        pinned so a later edit cannot reintroduce a group.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        assert _CLAUSE_SPLIT_RE.groups == 0, (
+            f'Expected _CLAUSE_SPLIT_RE to carry zero capture groups so re.split '
+            f'returns clauses only.\npattern={_CLAUSE_SPLIT_RE.pattern!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Conflicting task-status framing detection (task 2276)
 # ---------------------------------------------------------------------------
 
@@ -3287,6 +3392,29 @@ class TestConflictingTaskStatusFraming:
             f'case-insensitively.\ntext={text!r}'
         )
 
+    def test_positive_dotted_token_between_ref_and_status(self):
+        """Task 3403: a dotted technical token sitting BETWEEN the task ref and
+        its status marker must not hide the contradiction.
+
+        Under the pre-3403 clause splitter every dot was a boundary, so
+        'dark-factory-orchestrator.yaml' shattered the first sentence into
+        '...Task 4802 (tracked in dark-factory-orchestrator' + 'yaml) is still
+        pending' — divorcing the ref from 'still pending' and dropping the
+        non-terminal tag entirely. MEASURED: returned set() before the widening,
+        i.e. the detector was inert on the very filenames recon prose is full of.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = (
+            'Task 4802 (tracked in dark-factory-orchestrator.yaml) is still '
+            'pending. Task 4802 landed as merge commit eb7f5d6437.'
+        )
+        assert find_conflicting_task_status_ids(text) == {4802}, (
+            f'Expected find_conflicting_task_status_ids to return {{4802}} when a '
+            f'dotted filename separates the ref from its status marker.'
+            f'\ntext={text!r}'
+        )
+
     def test_is_conflicting_task_status_framing_true_for_incident_shape(self):
         """is_conflicting_task_status_framing must mirror find_...ids() as a bool."""
         from fused_memory.reconciliation.task_filter import is_conflicting_task_status_framing
@@ -3318,6 +3446,29 @@ class TestConflictingTaskStatusFraming:
             f'Expected empty set for two different ids with different statuses, '
             f'got a non-empty set.\ntext={text!r}'
         )
+
+    def test_negative_two_different_ids_across_every_terminator(self):
+        """The same precision check as above, once per NON-dot terminator.
+
+        Only the dot form had coverage before task 3403, so ';', '!', '?' and a
+        newline could each have been dropped from the splitter's alphabet
+        without a single test failing. These four are green both before and
+        after the widening — they exist so a later edit to the clause splitter
+        cannot silently collapse a terminator and start merging two
+        independently-framed tasks into one clause.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        for text in (
+            'Task 100 is done; Task 200 is still pending.',
+            'Task 100 is done! Task 200 is still pending.',
+            'Task 100 is done? Task 200 is still pending.',
+            'Task 100 is done\nTask 200 is still pending.',
+        ):
+            assert find_conflicting_task_status_ids(text) == set(), (
+                f'Expected empty set for two different ids separated by this '
+                f'clause terminator, got a non-empty set.\ntext={text!r}'
+            )
 
     def test_negative_terminal_only(self):
         """Terminal-only framing for one id must NOT fire."""
@@ -3370,6 +3521,41 @@ class TestConflictingTaskStatusFraming:
         assert is_conflicting_task_status_framing(text) is False, (
             f'Expected is_conflicting_task_status_framing to return False for two '
             f'different ids, got True.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # clause-granularity caveat (task 3403): a wider clause makes the module's
+    # already-documented over-broad tagging fire MORE often. Pinned, not hidden.
+    # ------------------------------------------------------------------ #
+
+    def test_widened_clause_tags_both_coordinated_ids(self):
+        """Two different ids coordinated in ONE sentence, each with its own
+        status, are now BOTH tagged — a deliberate, characterized over-fire.
+
+        This is the module's inherited clause-granularity caveat
+        (task_filter.py:450-460 — a clause naming several ids tags ALL of them,
+        the detector does not bind a status marker to its nearest ref) firing
+        more often now that 'orchestrator.yaml' no longer shatters the sentence
+        into two clauses. MEASURED: set() before the widening, {1985, 1986}
+        after. It moves these two detectors off the module's
+        fail-open-on-under-firing default toward over-firing.
+
+        The blast radius is bounded by construction: a hit only soft-blocks a
+        recon-stage write in server/tools.py with a rephrase hint
+        (conflicting_task_status_framing_write_blocked) — no exception, no
+        write, no data corruption. Suppressing it instead would require
+        nearest-ref proximity binding, a redesign of the association algorithm
+        and a far larger risk to the two edge-invalidation consumers of
+        TASK_REF_RE. Following the module's house idiom, the trade-off is pinned
+        by a test so it stays visible rather than being discovered later.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'df 1985 landed in orchestrator.yaml and task 1986 is still pending.'
+        assert find_conflicting_task_status_ids(text) == {1985, 1986}, (
+            f'Expected {{1985, 1986}} — the widened clause tags every id in a '
+            f'sentence carrying both a terminal and a non-terminal marker.'
+            f'\ntext={text!r}'
         )
 
 
@@ -3764,6 +3950,27 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         assert find_present_tense_completion_claim_task_ids(text) == {10, 11}, (
             f'Expected {{10, 11}} for two clauses each framing a distinct task as '
             f'complete.\ntext={text!r}'
+        )
+
+    def test_positive_dotted_token_between_ref_and_claim(self):
+        """Task 3403: a dotted technical token BETWEEN the task ref and its
+        completion phrase must not hide the claim.
+
+        Under the pre-3403 clause splitter every dot was a boundary, so the
+        doc-and-line citation 'CLAUDE.md:95' shattered the sentence into 'Task
+        5252 (see CLAUDE' + 'md:95) has landed and now enforces the gate' — the
+        first clause holds the ref with no completion phrase, the second holds
+        the completion phrase with no ref, and the detector tagged neither.
+        MEASURED: returned set() before the widening.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'Task 5252 (see CLAUDE.md:95) has landed and now enforces the gate.'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} when a dotted doc citation separates the ref from '
+            f'its completion phrase.\ntext={text!r}'
         )
 
     # ------------------------------------------------------------------ #
