@@ -819,6 +819,94 @@ class TestClockStopMessageAttribution:
         assert 'max-total-stopped cap' in out, f'Unexpected message: {out!r}'
         assert 'unattributed' not in out, f'Legitimate kill wrongly reported unattributed: {out!r}'
 
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_unattributed_stop_warns_with_structured_facts(self, tmp_path: Path, caplog):
+        """(a) The self-consistency guard must be LOUD, not just honest in
+        the returned string (scope item 2): a refused attribution logs a
+        WARNING carrying the four facts a triager needs — the armed kind,
+        the named limit, the real elapsed, and the shortfall — greppable
+        across the fleet the moment it happens, and the only channel that
+        survives _extract_cause_hint's 200-char cap truncating the returned
+        message.  Reuses the step-3(a) fake-process drive."""
+        import logging as _logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from orchestrator.verify import _run_cmd
+
+        fake_stdout = MagicMock()
+        fake_stdout.read = AsyncMock(side_effect=[b'ordinary output\n', TimeoutError()])
+        fake_proc = MagicMock()
+        fake_proc.pid = 4242
+        fake_proc.returncode = 0
+        fake_proc.stdout = fake_stdout
+
+        log_path = tmp_path / 'verify.log'
+        with (
+            caplog.at_level(_logging.WARNING, logger='orchestrator.verify'),
+            patch('asyncio.create_subprocess_shell', AsyncMock(return_value=fake_proc)),
+        ):
+            rc, out, timed_out = await _run_cmd(
+                'never actually run (create_subprocess_shell is mocked)',
+                tmp_path,
+                timeout=5400.0,
+                log_path=log_path,
+                clock_stop=self._make_cfg(),
+            )
+
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.verify'
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly one WARNING under orchestrator.verify; got '
+            f'{len(warn_records)}: {[r.getMessage() for r in warn_records]}'
+        )
+        message = warn_records[0].getMessage()
+        # Assert on the RENDERED text, not on %-arg positions, so this
+        # survives a reformat of the log call.
+        match = re.search(
+            r'armed (?P<kind>.+?) \((?P<limit>\d+)s\) still had '
+            r'(?P<remaining>[\d.]+)s left .* wall time (?P<elapsed>[\d.]+)s',
+            message,
+        )
+        assert match is not None, f'Warning missing structured facts: {message!r}'
+        assert match.group('kind') == 'wall-clock budget'
+        assert match.group('limit') == '5400'
+        assert float(match.group('elapsed')) < 5.0, (
+            f'Expected the real sub-second elapsed; got {message!r}'
+        )
+        assert float(match.group('remaining')) > 1000.0, (
+            f'Expected the large shortfall the armed deadline still had left; got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_genuine_expiry_does_not_warn(self, tmp_path: Path, caplog):
+        """(b) A genuine wall-clock expiry must stay silent — the guard must
+        fire only on the anomaly, or it becomes noise on every ordinary
+        verify timeout and stops meaning anything.  Reuses the step-3(b)
+        real-subprocess drive."""
+        import logging as _logging
+
+        from orchestrator.verify import _run_cmd
+        log_path = tmp_path / 'verify.log'
+        cmd = 'echo "starting"; sleep 5'
+        cfg = self._make_cfg(heartbeat_idle_max=5.0)
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.verify'):
+            rc, out, timed_out = await _run_cmd(
+                cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
+            )
+        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and r.name == 'orchestrator.verify'
+        ]
+        assert warn_records == [], (
+            f'A genuine expiry must not warn; got: {[r.getMessage() for r in warn_records]}'
+        )
+
 
 # ── Step-11 / Step-12: Wiring test (_run_or_skip_timed / run_verification) ────
 
