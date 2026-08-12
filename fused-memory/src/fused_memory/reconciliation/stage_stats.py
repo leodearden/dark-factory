@@ -19,6 +19,15 @@ silently yields 0 for every counter here rather than an error.
 ``stats_verifier.verify_and_rewrite_stats`` logs an INFO diagnostic when a
 write op carries a ``recon-stage-*`` agent_id that matches no known stage,
 which backstops (but does not fully cover) this dependency.
+
+The counters here answer "did the write LAND", which is a different fact from
+``write_ops.success`` ("was the enqueue ACCEPTED"). A write can be accepted at
+enqueue and still never reach the backend, because the durable queue retries
+it asynchronously and may ultimately dead-letter it — long after the stage
+that issued it has finished and reported. ``derive_stage_stats`` therefore
+applies ``_landed`` (reading ``write_ops.terminal_status``, stamped back by
+``DurableWriteQueue``'s terminal hook) on top of the existing ``success``
+gates, so an operation whose writes all died reports 0 rather than green.
 """
 
 from __future__ import annotations
@@ -64,6 +73,28 @@ def _parse_result_summary(raw: Any) -> dict:
     return {}
 
 
+def _landed(op: dict) -> bool:
+    """Return False only for a write the durable queue gave up on.
+
+    Reads ``write_ops.terminal_status``, which ``DurableWriteQueue``'s terminal
+    hook stamps back once an item reaches a terminal state. The domain is
+    ``NULL | 'completed' | 'dead'``.
+
+    Deliberately a DENYLIST on the single literal ``'dead'``, not an allowlist
+    on ``{None, 'completed'}``. A NULL means the write's outcome is genuinely
+    unknown — every row predating the terminal-status migration is NULL (it
+    deliberately does not backfill), as is every operation that never touches
+    the durable queue at all (``delete_memory``, ``update_edge``, task writes).
+    Those, and any future or unrecognised status value, keep their current
+    counting behaviour, so a partially-applied migration or a new queue state
+    can never silently zero a stage's real counters.
+
+    Applied by ``derive_stage_stats`` once per op, NOT by the ``_count_*``
+    helpers — those stay purely about ``result_summary`` shape.
+    """
+    return op.get('terminal_status') != 'dead'
+
+
 def _count_update_edge(op: dict) -> bool:
     """Return True only if the update_edge op was verified by a server-side readback.
 
@@ -75,6 +106,9 @@ def _count_update_edge(op: dict) -> bool:
 
     The strict ``is True`` identity check (not truthy) prevents strings like
     ``'true'`` or ``1`` from accidentally counting.
+
+    Answers only "what SHAPE of write was this". Whether the write LANDED is
+    the orthogonal ``_landed`` gate, applied by the caller.
     """
     if not op.get('success', 1):
         return False
@@ -90,6 +124,9 @@ def _count_add_memory(op: dict) -> bool:
     Graphiti-only async-enqueued writes (``memory_ids=[]``, ``stores=['graphiti']``)
     are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
     An op that reached neither store with a returned ID is a no-op here.
+
+    Answers only "what SHAPE of write was this". Whether the write LANDED is
+    the orthogonal ``_landed`` gate, applied by the caller.
     """
     if not op.get('success', 1):
         return False
@@ -107,6 +144,11 @@ def _count_graphiti_queued(op: dict) -> bool:
     and ``stores``/``stores_written`` contains ``'graphiti'``. These are
     tallied separately under ``graphiti_writes_queued`` rather than
     ``memories_added`` to avoid inflating the memories count.
+
+    Answers only "what SHAPE of write was this". Whether the enqueued write
+    ultimately LANDED is the orthogonal ``_landed`` gate, applied by the
+    caller — this helper's subject is precisely the queued writes that gate
+    most affects.
     """
     if not op.get('success', 1):
         return False
@@ -129,6 +171,14 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
     unlike timestamp-window bucketing, and correctly excludes ops from other
     stages/agents that happen to fall in the same time window).
 
+    Ops the durable queue dead-lettered are then dropped by ``_landed``: they
+    were accepted at enqueue (``success=1``) but never reached the backend, so
+    counting them would report a 0%-landing-rate stage as green. The gate is
+    applied ONCE here rather than inside the ``_count_*`` helpers, so every
+    branch — including the ``add_memory`` arm's early ``continue`` — inherits
+    it by construction and the helpers stay purely about ``result_summary``
+    shape.
+
     Always returns every key in ``_COMPUTED_STAT_KEYS``, 0-default, even when
     no ops matched.
     """
@@ -145,6 +195,9 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
             continue
         stat_key = _OP_TO_STAT.get(operation)
         if stat_key is None:
+            continue
+
+        if not _landed(op):
             continue
 
         if operation == 'add_memory':
