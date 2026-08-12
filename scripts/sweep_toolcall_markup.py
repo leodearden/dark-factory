@@ -55,7 +55,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -825,3 +827,112 @@ def round_trips(raw: str, obj: Any) -> bool:
     the diff that the corrupted strings did not cause.
     """
     return serialize_like(raw, obj) == raw
+
+
+# ---------------------------------------------------------------------------
+# The atomic writer (PRD contract C3, boundary row B11).
+# ---------------------------------------------------------------------------
+
+#: The swap itself failed (os.replace, fsync, or the write).
+REASON_WRITE_FAILED = 'write-failed'
+#: The temp file did not re-parse as JSON, so it was never swapped in.
+REASON_VERIFY_FAILED = 'verify-failed'
+
+#: Prefix for this sweep's temp files. Dot-prefixed so a crashed run's debris
+#: is excluded by the same dot rule discovery uses, and named so an operator
+#: can tell whose leftovers they are.
+_TEMP_PREFIX = '.sweep.'
+_TEMP_SUFFIX = '.tmp'
+
+
+class WriteFailure(NamedTuple):
+    """A write that did not happen, and why. The original is untouched."""
+
+    path: Path
+    lane: str
+    reason: str
+    #: The underlying error, stringified — an operator needs ENOSPC vs EACCES.
+    error: str
+
+
+def _target_file_mode(path: Path) -> int | None:
+    """The target's current permission bits, or ``None`` if it does not exist.
+
+    Mirrors ``plan_tools._target_file_mode``. Without this the swapped-in file
+    inherits ``mkstemp``'s 0600 and the record silently becomes unreadable to
+    every other process that shares the queue directory.
+    """
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def write_repaired(
+    target: ResolvedTarget, raw: str, new_obj: Any
+) -> WriteFailure | None:
+    """Atomically replace *target* with *new_obj*. ``None`` on success.
+
+    PRD contract C3, boundary row B11: **the original file is never left
+    partially written**. If the process is interrupted at any point, the target
+    is either its old bytes or its new bytes — never a mixture, and never
+    truncated.
+
+    The ordering is load-bearing and follows ``plan_tools._atomic_write_plan``:
+
+    1. ``mkstemp`` in the RESOLVED TARGET'S OWN DIRECTORY — ``os.replace`` is
+       only atomic within a filesystem, so a ``/tmp`` scratch file would
+       silently degrade the swap into a copy.
+    2. write, ``flush``, ``fsync`` — so the bytes are durable before the swap,
+       not merely in the page cache.
+    3. restore the target's permission bits BEFORE the swap, so the file is
+       never briefly 0600 and never left that way.
+    4. verify the temp RE-PARSES as JSON.
+    5. ``os.replace``.
+
+    Verifying before replacing is what makes step 5 safe to be the only
+    destructive operation: whatever lands is already known to parse.
+
+    ``target.write_path`` is the realpath-resolved file, so the swap lands on
+    the FILE and never on a symlink pointing at it — replacing the link would
+    re-fork the lane and meta-root copies (plan_tools:715).
+
+    On any failure the temp is unlinked in a ``finally`` and a
+    :class:`WriteFailure` is returned as a VALUE carrying the path and the
+    underlying error. Caught exceptions are narrow (``OSError``,
+    ``UnicodeError``, ``json.JSONDecodeError``) so a genuine bug in the
+    repairer surfaces as a traceback rather than as a plausible "write failed".
+    """
+    write_path = target.write_path
+    tmp_path: Path | None = None
+    reason = REASON_WRITE_FAILED
+    try:
+        payload = serialize_like(raw, new_obj)
+        handle_fd, tmp_name = tempfile.mkstemp(
+            prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX, dir=str(write_path.parent)
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(handle_fd, 'w', encoding='utf-8') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        mode = _target_file_mode(write_path)
+        if mode is not None:
+            os.chmod(tmp_path, mode)
+
+        reason = REASON_VERIFY_FAILED
+        with open(tmp_path, encoding='utf-8') as verify_handle:
+            json.load(verify_handle)
+
+        reason = REASON_WRITE_FAILED
+        os.replace(tmp_path, write_path)
+        tmp_path = None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return WriteFailure(
+            path=write_path, lane=target.lane, reason=reason, error=str(exc)
+        )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    return None

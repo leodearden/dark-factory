@@ -1296,3 +1296,102 @@ def test_key_order_is_reproduced_from_the_file_not_re_sorted():
     raw = json.dumps({'z': 1, 'a': 2}, indent=2, sort_keys=True)
     assert raw.index('"a"') < raw.index('"z"')
     assert sweep.round_trips(raw, json.loads(raw)) is True
+
+
+# ---------------------------------------------------------------------------
+# step-15 — atomicity, boundary row B11.
+# ---------------------------------------------------------------------------
+
+
+def _resolved(root, relpath, lane=sweep.LANE_ESCALATIONS):
+    target = sweep.Target(path=root / relpath, lane=lane)
+    resolved = sweep.resolve_write_target(target, root)
+    assert isinstance(resolved, sweep.ResolvedTarget)
+    return resolved
+
+
+def _tmp_leftovers(directory):
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith('.sweep.'))
+
+
+def test_the_temp_file_is_created_in_the_resolved_targets_own_directory(sweep_root, monkeypatch):
+    """os.replace is only atomic WITHIN a filesystem, so /tmp will not do.
+
+    Captured at the mkstemp seam rather than inferred from the result, because
+    a cross-device temp would still produce a correct-looking file — it would
+    just stop being an atomic swap, which is the entire contract.
+    """
+    seen = {}
+    real_mkstemp = sweep.tempfile.mkstemp
+
+    def _spy(*args, **kwargs):
+        seen['dir'] = kwargs.get('dir')
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(sweep.tempfile, 'mkstemp', _spy)
+    resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-3-1.json')
+
+    assert sweep.write_repaired(resolved, '{}', {'a': 1}) is None
+    assert Path(seen['dir']) == resolved.write_path.parent
+
+
+def test_a_successful_write_preserves_the_targets_permission_bits(sweep_root):
+    """A 0600 mkstemp artifact must not become the record's new mode."""
+    resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-3-1.json')
+    os.chmod(resolved.write_path, 0o640)
+
+    assert sweep.write_repaired(resolved, '{}', {'a': 1}) is None
+    assert oct(resolved.write_path.stat().st_mode & 0o777) == oct(0o640)
+
+
+def test_a_failed_replace_leaves_the_target_byte_identical(sweep_root, monkeypatch):
+    """The interrupt-between-write-and-replace case. Nothing half-written."""
+    resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-2-1.json')
+    before = resolved.write_path.read_bytes()
+
+    def _boom(src, dst):
+        raise OSError(28, 'No space left on device')
+
+    monkeypatch.setattr(sweep.os, 'replace', _boom)
+    failure = sweep.write_repaired(resolved, before.decode(), {'a': 1})
+
+    assert isinstance(failure, sweep.WriteFailure)
+    assert str(resolved.write_path) in str(failure.path)
+    assert 'No space left' in failure.error, 'the underlying error is carried'
+    assert resolved.write_path.read_bytes() == before
+    assert json.loads(resolved.write_path.read_text(encoding='utf-8'))
+    assert _tmp_leftovers(resolved.write_path.parent) == [], 'no .sweep. debris'
+
+
+def test_a_failed_verify_leaves_the_target_byte_identical(sweep_root, monkeypatch):
+    """Verify-before-replace: a payload that will not re-parse never lands.
+
+    Forced through serialize_like so the whole write-then-verify path really
+    runs, rather than stubbing the verifier and proving only that a stub was
+    called.
+    """
+    resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-2-1.json')
+    before = resolved.write_path.read_bytes()
+
+    monkeypatch.setattr(sweep, 'serialize_like', lambda raw, obj: '{"truncated": ')
+    failure = sweep.write_repaired(resolved, before.decode(), {'a': 1})
+
+    assert isinstance(failure, sweep.WriteFailure)
+    assert failure.reason == sweep.REASON_VERIFY_FAILED
+    assert resolved.write_path.read_bytes() == before
+    assert json.loads(resolved.write_path.read_text(encoding='utf-8'))
+    assert _tmp_leftovers(resolved.write_path.parent) == []
+
+
+def test_the_swap_lands_on_the_meta_root_file_never_on_the_link(sweep_root):
+    """The symlink survives as a symlink; its TARGET receives the bytes."""
+    link = sweep_root / '.worktrees-orphaned' / '9002-2026' / '.task' / 'plan.json'
+    resolved = _resolved(
+        sweep_root, '.worktrees-orphaned/9002-2026/.task/plan.json', sweep.LANE_PLANS
+    )
+    raw = link.read_text(encoding='utf-8')
+
+    assert sweep.write_repaired(resolved, raw, {'swapped': True}) is None
+    assert link.is_symlink(), 'the LINK must never be replaced by a regular file'
+    assert json.loads(link.read_text(encoding='utf-8')) == {'swapped': True}
+    assert json.loads(resolved.write_path.read_text(encoding='utf-8')) == {'swapped': True}
