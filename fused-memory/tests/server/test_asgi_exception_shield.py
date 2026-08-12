@@ -164,3 +164,39 @@ class TestASGIExceptionShieldResponseStarted:
         # Stronger than "no second start": proves the whole fallback block
         # (start + body) was skipped, not just the start message deduped.
         assert not any(m['type'] == 'http.response.body' for m in sent)
+
+
+class _BaseExceptionApp:
+    """Minimal ASGI app that raises a given BaseException before sending anything."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def __call__(self, scope, receive, send):
+        raise self._exc
+
+
+class TestASGIExceptionShieldInterpreterExit:
+    """Pins the `except (KeyboardInterrupt, SystemExit): raise` clause.
+
+    This clause bounds the deliberate CancelledError swallow exercised by
+    TestASGIExceptionShieldCancelledError above: without it, that test's
+    assertion could be satisfied by a shield that swallows every
+    BaseException indiscriminately — including a legitimate interpreter
+    shutdown signal. KeyboardInterrupt and SystemExit must still propagate
+    out of `await shield(...)`, with nothing fabricated on the wire before
+    the re-raise.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc_type', [KeyboardInterrupt, SystemExit])
+    async def test_interpreter_exit_propagates_uncontained(self, monkeypatch, exc_type):
+        monkeypatch.setattr(main_module, '_operator_stop_received', False)
+        sent, invoke = _make_shield_call(_ASGIExceptionShield(_BaseExceptionApp(exc_type())))
+
+        with pytest.raises(exc_type):
+            await invoke()
+
+        # Nothing at all emitted before the re-raise — the shield does not
+        # fabricate a 500 on the way out of a legitimate interpreter exit.
+        assert sent == []
