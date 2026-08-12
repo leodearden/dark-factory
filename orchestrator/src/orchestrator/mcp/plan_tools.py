@@ -804,8 +804,19 @@ _MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
 #:
 #: Bounded by the number of DISTINCT refusals a process sees (a handful per
 #: plan), and keyed on the value's hash so an EDITED field reports again rather
-#: than being suppressed by a stale locator.
+#: than being suppressed by a stale locator. ONE refusal is never memoized at
+#: all: a locator that no longer resolves (see :data:`_UNRESOLVED_VALUE`) never
+#: gets a key built for it, so it is reported on every call instead of being
+#: suppressed under a key that means nothing.
 _REPORTED_REFUSALS: set[tuple[str, str | None, int | None, str, int]] = set()
+
+#: Sentinel returned by :func:`_fact_value` when a fact's locators no longer
+#: resolve against the plan (a collection shrank, an index moved). DISTINCT
+#: from a resolvable locator whose field is legitimately absent — both used to
+#: read back as plain ``None``, so "the locator broke" and "the field is
+#: missing" were indistinguishable and shared one memo key. Module-private;
+#: never leaves this file.
+_UNRESOLVED_VALUE = object()
 
 
 def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
@@ -814,15 +825,21 @@ def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
     Kept OUT of the fact itself: a fact is attached to the tool response, and
     echoing a whole corrupted prose field back into the caller's context is the
     amplification this memo exists to avoid. The locators are enough to find it.
+
+    Returns :data:`_UNRESOLVED_VALUE` — never plain ``None`` — when the
+    locators themselves no longer resolve, so that case can never share a memo
+    key with a locator that resolves to a field that is legitimately absent.
     """
     try:
         collection = fact['collection']
         holder = plan if collection is None else plan[collection][fact['index']]
         return holder.get(fact['field'])
     except (KeyError, IndexError, TypeError, AttributeError):
-        # A locator that no longer resolves cannot be memoized safely — report
-        # it every time rather than suppress on a key that means nothing.
-        return None
+        # An unresolvable locator is signalled distinctly and is NEVER
+        # memoized (see _report_markup_facts), so it is reported every time —
+        # rather than collapsing to a constant hash key under which a second,
+        # unrelated unresolvable refusal would be silently suppressed.
+        return _UNRESOLVED_VALUE
 
 
 def _report_markup_facts(
@@ -848,17 +865,22 @@ def _report_markup_facts(
             **fact,
         })
         if fact['outcome'] == 'unrepairable':
-            key = (
-                str(plan_path),
-                fact['collection'],
-                fact['index'],
-                fact['field'],
-                hash(_fact_value(plan, fact)),
-            )
-            if key in _REPORTED_REFUSALS:
-                logger.debug(payload)
-                continue
-            _REPORTED_REFUSALS.add(key)
+            value = _fact_value(plan, fact)
+            if value is not _UNRESOLVED_VALUE:
+                key = (
+                    str(plan_path),
+                    fact['collection'],
+                    fact['index'],
+                    fact['field'],
+                    hash(value),
+                )
+                if key in _REPORTED_REFUSALS:
+                    logger.debug(payload)
+                    continue
+                _REPORTED_REFUSALS.add(key)
+            # else: the locator no longer resolves. No key means anything for
+            # it, so nothing is built or inserted — fall through and report
+            # this call exactly like a first-time refusal, every time.
         logger.warning(payload)
         reportable.append(fact)
     return reportable

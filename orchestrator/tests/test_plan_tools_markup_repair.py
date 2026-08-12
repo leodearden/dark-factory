@@ -2089,7 +2089,7 @@ class TestUnresolvableLocatorIsNeverMemoized:
             'an unresolvable locator must be reported every time, not '
             'suppressed on the second call'
         )
-        assert plan_tools._REPORTED_REFUSALS == set(), (
+        assert set() == plan_tools._REPORTED_REFUSALS, (
             'no key that means nothing may ever be recorded'
         )
         assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
