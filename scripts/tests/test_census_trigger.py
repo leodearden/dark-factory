@@ -567,6 +567,159 @@ def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
+# ---------------------------------------------------------------------------
+# task 4085: the BASELINE side of the same fail-safe contract.
+#
+# task 3291 (above) made an unusable get_statuses PAYLOAD fail safe. The other
+# input to the same subtraction -- the `last_census_done_count` baseline read
+# off disk -- was left unvalidated, and it is the one an operator hand-edits
+# (skills/census/SKILL.md documents seeding it by hand), so malformed values
+# are an expected input rather than a hypothetical. Three measured behaviours,
+# all from the single unguarded `current_done - baseline`:
+#
+#   * `"2872"` (a quoted JSON int) raises TypeError out of a function whose
+#     docstring promises a fail-safe None. Via the `evaluate` CLI, main()'s
+#     catch-all swallows it into NO-FIRE + exit 0, which discards the ENTIRE
+#     evaluation -- so conditions (a) max-interval and (c) novelty-spike are
+#     suppressed by a fault in (b), taking out the very backstop that exists
+#     to survive a broken (b);
+#   * `true` returns `current_done - 1` with ZERO warnings, because
+#     `isinstance(True, int)` is True in Python -- arming (b) with essentially
+#     every done task ever. Strictly more dangerous than the crash: nothing
+#     signals it at all;
+#   * `1.5` returns a fractional delta that flows into evaluate()'s
+#     `>= threshold` comparison as a real number.
+#
+# The contract pinned here: a baseline that is not a non-negative int fails
+# SAFE (return None, condition (b) inert, (a)/(c) unaffected) with exactly one
+# WARNING naming the value and its type. VALIDATE, never coerce -- `int("2872")`
+# would silently bless a malformed state file and arm a ~$100 census run on an
+# unaudited number, which is precisely the defect class task 3291 closed on the
+# fetch side.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "baseline",
+    ["2872", "", 2872.0, 1.5, True, False, [2872], {"n": 2872}, object()],
+    ids=["str-int", "str-empty", "float-whole", "float-frac", "bool-true", "bool-false",
+         "list", "dict", "object"],
+)
+def test_compute_tasks_landed_non_int_baseline_fails_safe_with_one_warning(baseline, caplog):
+    """Every non-int baseline lands in the same "one WARNING, return None"
+    branch the fetch and payload faults already use.
+
+    `True`/`False`/`2872.0` are the interesting parameters: they are not
+    TypeErrors, they are SILENT wrong answers today (`True` == 1, so the delta
+    is `current_done - 1`), which is why a bare `except TypeError` would not
+    have been a fix."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(3000))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Both facts, because either alone is ambiguous in a journal line: the
+    # repr says WHICH value is wrong, the type name says WHY it is wrong
+    # (`"2872"` and `2872` are visually near-identical without it).
+    assert repr(baseline) in message
+    assert type(baseline).__name__ in message
+
+
+def test_compute_tasks_landed_negative_baseline_fails_safe_with_one_warning(caplog):
+    """A done-count cannot be negative. Today `-5` silently inflates the delta
+    in the FIRE-ward direction (`current_done + 5`), so it belongs in the same
+    guard as the type faults rather than being treated as a usable int."""
+    state = {"last_census_done_count": -5}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_bad_baseline_warns_before_touching_the_fetcher(caplog):
+    """Pins the guard's POSITION, not just its existence.
+
+    The baseline is a state-side fault and must be reported BEFORE the
+    `status_fetcher is None` branch and before any fetch. That ordering is what
+    makes a mis-seeded baseline visible on the DEFAULT nightly trickle wiring,
+    where `run_nightly` passes `status_fetcher=None` (nightly.py) and the
+    fetcher guard would otherwise return first -- leaving a corrupt state file
+    unreported in total silence for as long as it sits there."""
+    calls = []
+
+    def _recording_fetcher():
+        calls.append(1)
+        return {"statuses": {"1": "done"}}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=_recording_fetcher
+        )
+
+    assert result is None
+    assert calls == []
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ...and with no fetcher at all, the single warning is still the specific
+    # baseline complaint, not the generic "no status_fetcher configured" one.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=None
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "last_census_done_count" in warnings[0].getMessage()
+
+
+def test_compute_tasks_landed_bad_baseline_warning_is_bounded(caplog):
+    """The WARNING is re-emitted into the nightly systemd journal as ONE line,
+    and census-state.json is hand-editable, so an arbitrarily large value must
+    not dump itself into the log (`_bounded_repr`'s whole reason to exist)."""
+    state = {"last_census_done_count": "9" * 5000}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(10))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "repr truncated" in message
+
+
+@pytest.mark.parametrize("baseline,expected", [(0, 600), (500, 100), (2872, -2272)])
+def test_compute_tasks_landed_int_baseline_still_computes_delta(baseline, expected, caplog):
+    """Over-rejection guard: a real non-negative int -- including a real 0 and a
+    baseline larger than the current count -- still computes its delta and warns
+    nothing. Complements
+    `test_compute_tasks_landed_empty_project_computes_a_real_zero_delta`, which
+    pins the same property from the payload side."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result == expected
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
     tmp_path, install_fake_httpx
 ):
