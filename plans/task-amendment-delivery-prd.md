@@ -388,7 +388,7 @@ splitting rather than by sequencing, removing the block instead of inheriting it
 | **γ** | Converse merge gate at submission: branch commits ⊆ owned ∪ descoped | `orchestrator/` | Submitting a merge for a branch carrying a commit owned by no plan step and named in no disposition is refused **at `_submit_to_merge_queue`** (before enqueue), with the offending sha in the reason | β |
 | **δ** | Write-boundary amendment advisory + event | `fused-memory/`, `shared/` | `update_task` changing `description`/`details` on a task whose `metadata.plan_text_fp` disagrees returns `amendment_advisory` in its result, and emits a structured `task_text_amended` event carrying the writer source | α |
 | **ε** | Curator combine: execution-time predicate matches selection | `fused-memory/` | A combine whose live target is `in-progress` (or holds a claimant) is refused and the candidate is filed as its own task; `data/combine_audit.jsonl` records the refusal | — |
-| **ζ** | One-off plan-fingerprint migration sweep | `scripts/` | Every live plan under `.worktrees/.task-meta/*/plan.json` carries `_task_text_fp`; the 27 measured-exposed tasks carry the forcing sentinel; the script reports counts per class | α |
+| **ζ** | One-off plan-fingerprint migration sweep | `scripts/` | Every live plan under `.worktrees/.task-meta/*/plan.json` carries `_task_text_fp`; plans whose text has moved carry the forcing sentinel; the script reports counts per class — **re-derived at run time, not hard-coded at 27** (G6 relaxation at decompose: 27 is an authoring-time measurement, so asserting it as a signal would bake in a stale number; retained only as a sanity band — cf. open question 3 and INV-3) | α |
 | **η** | *(integration gate, B+H)* End-to-end amendment-delivery boundary tests | `orchestrator/`, `fused-memory/` | The §10 boundary-test table passes end-to-end, including the mid-EXECUTE non-refresh case and the fused-memory advisory case | α, β, γ, δ, ε |
 
 α, ε, ζ are independently observable; β, γ, δ are observable in their own right and
@@ -533,7 +533,11 @@ DESCOPED := { commit of every _descoped_steps entry }
               OR is classified equivalent by find_equivalent_commit
 ```
 
-Fail-open on git error (matching the sibling gates' documented convention). Rejection
+Fail-open on git error — but **with a streak counter, not bare** (G7 redesign at
+decompose, INV-4 `storm-escape-required`; see task 4033). The sibling gates' documented
+fail-open convention turns out on reading to be loud-log-only with no counter, so
+inheriting it verbatim would let γ degrade silently under a persistent git fault. A
+repeated fail-open must escalate. Rejection
 returns the offending sha; the workflow may remedy in place and re-check, as
 `_try_narrow_plan` already does at the same site. **INV-8:** the commit walk uses the
 async git runner (`git_ops._run`), never a blocking `subprocess.run`, and its fan-out
@@ -561,13 +565,18 @@ classifier LLM.
 
 ### C8 — The ε predicate
 
-```python
-# task_interceptor.py, replacing `if target_status in {'done', 'cancelled'}`
-if target_status != 'pending' or target.get('claimant_run_id') is not None:
-    # abort -> falls through to create (the candidate becomes its own task)
-```
+Execution must match selection (`combine_eligible == (status == 'pending')`) — but
+**via ONE shared predicate, not a second hand-copy** (G7 redesign at decompose, INV-5
+`no-lockstep-duplication`; see task 4035). Writing
+`if target_status != 'pending' …` inline at `task_interceptor.py:2144` would copy
+`status == 'pending'` from `task_curator.py:2793` into a second site that must agree
+with the first — which is exactly how the original divergence arose. Extract the
+eligibility predicate to one home and call it from both. The live-claimant conjunct
+(D11) stays **execution-only**: selection cannot see a claimant that does not exist yet.
 
-This makes execution match selection (`combine_eligible == (status == 'pending')`).
+The refusal must also be **countable** (INV-2 + INV-4): fall-through-to-create is a
+fail-soft path — INV-4's own evidence names "curator degrade-to-create" — and at a
+measured 20.2% rate an operator needs a counter, not just a log line.
 
 ---
 
@@ -627,9 +636,26 @@ This makes execution match selection (`combine_eligible == (status == 'pending')
 | `holds-owned-and-bounded` | A β refusal is a hold: who exits it, and what bounds it? | **Satisfied via D13** — exit owner is the architect in-loop; bound is the pre-existing `consecutive_no_plan_failures` streak, escalating to a human at ≥2 |
 | `loop-thread-occupancy-bounded` | γ walks branch commits (git I/O); δ runs inside fused-memory's loop — the exact process of the task-3778 incident. | Addressed by C6 (async runner, hoisted invariants, bounded fan-out) and D10 (δ reads `task.metadata`, never the filesystem) |
 
-No waivers proposed, and no live items: D13 closed the `holds-owned-and-bounded` and
+No waivers proposed. D13 closed the `holds-owned-and-bounded` and
 `status-matches-liveness` rows by **reusing** an existing bounded path rather than
-adding one. The decompose walk re-checks all eight against every task in the batch.
+adding one.
+
+**CORRECTION — the decompose walk (2026-08-12) found TWO hits this advisory walk
+MISSED.** Both were resolved by redesign, still no waivers, and both are now conjuncts
+of their filed tasks:
+
+1. **γ / `storm-escape-required`** — C6 inherited the sibling gates' fail-open
+   convention, which on reading is loud-log-only with **no counter**. γ's fail-open now
+   requires a streak escalation (C6 corrected above; task 4033).
+2. **ε / `no-lockstep-duplication`** — C8 as originally written hand-copied
+   `status == 'pending'` into a second site, which is precisely how the divergence
+   being fixed arose. ε now extracts one shared eligibility predicate, with the
+   claimant conjunct kept execution-only, plus a countable refusal (C8 corrected
+   above; task 4035).
+
+This row is itself evidence for the PRD's own thesis: an advisory walk at authoring
+time is weaker than the walk at decompose, so the authoring record must be corrected
+rather than left asserting a clean sheet.
 
 ---
 
