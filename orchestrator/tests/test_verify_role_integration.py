@@ -18,16 +18,30 @@ test_reviewer_trial_corpus.py:129).
 Environment
 -----------
 REIFY_ROOT
-    Path to the reify repository checkout.  Defaults to ``/home/leo/src/reify``
-    (mirrors the hardcoded path already in config.py / evals/reviewer_trial/corpus.py).
-    Override this in CI or on machines that check out reify at a different location:
+    Path to the reify repository checkout.  There is NO hardcoded default: the
+    checkout is DISCOVERED by walking up from this file to the nearest ancestor
+    carrying ``reify/scripts/verify.sh``, which works for any side-by-side
+    checkout on any machine and in either the bare-checkout or worktree layout.
+    Set REIFY_ROOT only to point somewhere else:
 
         export REIFY_ROOT=/path/to/reify
 
-    When the integration test is skipped because the path is absent or nice/ionice
-    are unavailable, a ``UserWarning`` is emitted in CI runs (``CI`` env-var set) so
-    the silent no-op is visible in the CI log rather than silently providing no
-    cross-repo coverage.
+    Precedence, and the full contract, live in ``shared.reify_checkout`` — the
+    single source shared with fused-memory's lock-charter drift guard, so one
+    ``export REIFY_ROOT=`` steers every reify-dependent test in dark-factory.
+    Two consequences worth knowing here:
+
+    - REIFY_ROOT is honored VERBATIM even when it does not exist on disk, so a
+      typo skips LOUDLY naming the bad path rather than silently falling back to
+      a discovered checkout that would answer for a different repo.
+    - The constants below are resolved at IMPORT time, so REIFY_ROOT must be
+      exported BEFORE pytest starts to steer them.
+
+    When the integration test is skipped — reify undiscoverable, REIFY_ROOT
+    naming a path without the script, or nice/ionice unavailable — a
+    ``UserWarning`` carrying the specific reason is emitted in CI runs (``CI``
+    env-var set) so the silent no-op is visible in the CI log rather than
+    silently providing no cross-repo coverage.
 """
 from __future__ import annotations
 
@@ -41,6 +55,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_root
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import _resolve_verify_env
@@ -48,37 +63,52 @@ from orchestrator.verify import _resolve_verify_env
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+#
+# Resolved at IMPORT time via shared.reify_checkout — the single source of reify
+# discovery, shared with fused-memory's lock-charter drift guard.  Discovery is
+# a nearest-ancestor walk from THIS file, so it is correct in both the bare
+# checkout and the .worktrees/<id> layout; see that module's docstring for the
+# measured evidence table and why no fixed parents[N] index can serve both.
+# ---------------------------------------------------------------------------
 
-REIFY_VERIFY_SH: Path = (
-    Path(os.environ.get("REIFY_ROOT", "/home/leo/src/reify")) / "scripts" / "verify.sh"
+_REIFY_VERIFY_RELPATH = Path("scripts") / "verify.sh"
+REIFY_ROOT: Path | None = resolve_reify_root(_REIFY_VERIFY_RELPATH, start=Path(__file__))
+REIFY_VERIFY_SH: Path | None = (
+    REIFY_ROOT / _REIFY_VERIFY_RELPATH if REIFY_ROOT is not None else None
 )
 
-_INTEGRATION_SKIP = pytest.mark.skipif(
-    not REIFY_VERIFY_SH.exists()
-    or shutil.which("nice") is None
-    or shutil.which("ionice") is None,
-    reason=(
-        "reify checkout or nice/ionice unavailable — cross-repo integration gate"
-        " cannot run; reify verify.sh degrades its CARGO_PRIO without nice/ionice."
-        " Set REIFY_ROOT env-var to enable."
-    ),
+# The skip decision is kept in TWO parts on purpose.  _REIFY_SKIP_REASON is the
+# reify half alone: it is host-independent, so the planted-layout tests at the
+# bottom of this file can assert on the gate's ADMISSION DECISION from a module
+# copy loaded out of a synthetic tree without also requiring the host to have
+# nice/ionice.  Splitting also names WHICH of the three causes fired — the old
+# single reason string conflated reify-absent, nice-absent and ionice-absent, so
+# an operator reading `pytest -rs` could not tell them apart.
+_REIFY_SKIP_REASON: str | None = reify_skip_reason(_REIFY_VERIFY_RELPATH, REIFY_ROOT)
+_MISSING_TOOLS = [t for t in ("nice", "ionice") if shutil.which(t) is None]
+_TOOL_SKIP_REASON: str | None = (
+    f"{'/'.join(_MISSING_TOOLS)} unavailable — reify verify.sh degrades its "
+    f"CARGO_PRIO without nice/ionice"
+    if _MISSING_TOOLS
+    else None
 )
+_SKIP_REASON: str | None = _REIFY_SKIP_REASON or _TOOL_SKIP_REASON
+
+_INTEGRATION_SKIP = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 # Emit a visible warning when the integration gate is silently skipped in CI so
-# the coverage gap is not hidden.  Fires at collection time (module import).
-if os.environ.get("CI") and (
-    not REIFY_VERIFY_SH.exists()
-    or shutil.which("nice") is None
-    or shutil.which("ionice") is None
-):
+# the coverage gap is not hidden.  Fires at collection time (module import), and
+# carries the resolved reason VERBATIM so the CI log names the actual cause (and
+# the resolved path, when one was named) rather than a generic three-way string.
+if os.environ.get("CI") and _SKIP_REASON is not None:
     import warnings
 
     warnings.warn(
         f"Integration gate test_role_env_propagates_to_reify_verify_plan will be "
-        f"SKIPPED in this CI run: "
-        f"REIFY_VERIFY_SH={REIFY_VERIFY_SH} exists={REIFY_VERIFY_SH.exists()}, "
-        f"nice={shutil.which('nice')!r}, ionice={shutil.which('ionice')!r}. "
-        f"Set REIFY_ROOT env-var to a reify checkout path to enable cross-repo "
+        f"SKIPPED in this CI run: {_SKIP_REASON}. "
+        f"(REIFY_ROOT={REIFY_ROOT}, REIFY_VERIFY_SH={REIFY_VERIFY_SH}, "
+        f"nice={shutil.which('nice')!r}, ionice={shutil.which('ionice')!r}.) "
+        f"Set {REIFY_ROOT_ENV} to a reify checkout path to enable cross-repo "
         f"integration coverage.",
         UserWarning,
         stacklevel=1,
@@ -134,7 +164,16 @@ def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
     Invokes the script directly; falls back to `bash <script>` if the +x bit
     is absent in this checkout.
     """
-    reify_root = REIFY_VERIFY_SH.parents[1]
+    # Every caller is guarded by _INTEGRATION_SKIP, so reaching here with an
+    # unresolved checkout means a caller lost its guard.  Fail loudly rather
+    # than stringifying None into a bogus subprocess argv.  (Mirrors the
+    # identical assert in fused-memory's _reify_guard_vector.)
+    assert REIFY_VERIFY_SH is not None and REIFY_ROOT is not None, (
+        "no reify checkout resolved, but a test reached _run_reify_print_plan — "
+        "its @_INTEGRATION_SKIP guard is missing or was evaluated against a "
+        f"different module state (_SKIP_REASON={_SKIP_REASON!r})"
+    )
+    reify_root = REIFY_ROOT
     child_env = {**os.environ, **verify_env}
 
     try:
