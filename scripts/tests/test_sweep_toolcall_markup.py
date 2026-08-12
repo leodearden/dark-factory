@@ -893,3 +893,101 @@ def test_echo_dialect_falls_through_to_a_later_candidate():
     assert original_detail.startswith(repaired['detail']), 'D5 still holds: a PREFIX'
     assert repaired['evidence'] == [], 'the list-typed field is still NOT displaced'
     assert detect(repaired['detail']) is None, 'and the result no longer trips detect()'
+
+
+# ---------------------------------------------------------------------------
+# step-7 — convergence, and the bound.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
+    """Case (a): a recovered value that ITSELF still carries markup.
+
+    The nested double-leak shape cancelled task 3654 classified. What actually
+    happens is worth pinning precisely, because it is NOT "repaired twice":
+
+    ``_parse_tail`` refuses outright when a recovered item contains a further
+    mis-close (PRD boundary row B5 — the inner value's boundary would be a
+    guess), so a STRICTLY nested leak is a refusal, not a two-round repair. The
+    shape that DOES survive round one is the unterminated inner opener below:
+    it carries no closing tag, so B5 does not fire, and the recovered value
+    lands in its hole still tripping detect().
+
+    Round two then REFUSES it (there is no qualifying mis-close to scan), so
+    the residue is reported rather than silently left — and a second
+    ``repair_document`` call applies zero repairs. That is the idempotence the
+    second-run-zero invariant needs, and it holds here by measurement rather
+    than by assumption.
+    """
+    intended = 'The intended detail.'
+    inner = 'rc_text' + _lit('triage_note') + 'tn_text'
+    record = make_escalation(
+        'esc-8-1',
+        'resolved',
+        intended + _closer('detail') + '\n' + _lit('suggested_action') + inner
+        + _closer('parameter') + '\n' + INVOKE_CLOSER + '\n',
+    )
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert repaired['detail'] == intended
+    assert repaired['suggested_action'] == inner
+    assert [o.action for o in outcomes].count(sweep.ACTION_REPAIRED) == 1
+    assert sweep.ACTION_REFUSED in [o.action for o in outcomes], (
+        'the residue must be REPORTED, never silently left'
+    )
+
+    # Idempotence: a second pass changes nothing and repairs nothing.
+    before = json.dumps(repaired, indent=2)
+    again, again_outcomes = sweep.repair_document(repaired)
+    assert json.dumps(again, indent=2) == before
+    assert [o.action for o in again_outcomes].count(sweep.ACTION_REPAIRED) == 0
+
+
+def test_the_round_bound_is_a_named_module_constant():
+    """Not a magic number inline — an operator has to be able to find it."""
+    assert isinstance(sweep._MAX_REPAIR_ROUNDS, int)
+    assert sweep._MAX_REPAIR_ROUNDS >= 2, 'a fixed point needs at least two passes'
+
+
+def test_a_non_converging_document_reports_did_not_converge(monkeypatch):
+    """Case (b): the bound truncates the LOOP, never a repair.
+
+    Driven through a stubbed ``repair`` rather than a hand-built document, and
+    deliberately so: with the real repairer no document can reach the bound —
+    a recovered value can never contain a further mis-close (B5 refuses the
+    parse), so one round always converges on every shape repair() accepts. That
+    is exactly why the loop is INSURANCE rather than routine machinery, and why
+    its bound has to be tested at the seam instead of through a fixture that
+    cannot exist today.
+
+    What must hold when the bound is hit: the document is still valid, every
+    repair already applied is INTACT, and the failure is reported loudly with
+    the path that was still changing — never silently truncated into a
+    plausible-looking clean result.
+    """
+    def _never_converges(value, param, schema_params, supplied):
+        # Always "repairs", never reaching a fixed point.
+        return sweep.Repair(
+            clean_value=value,
+            recovered={'root_cause': 'restored by the stub'},
+            pattern=INVOKE_CLOSER,
+            misclose=INVOKE_CLOSER,
+        )
+
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+    record = make_escalation('esc-8-2', 'resolved', 'detail ' + INVOKE_CLOSER)
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    stalled = [o for o in outcomes if o.action == sweep.ACTION_DID_NOT_CONVERGE]
+    assert len(stalled) == 1, 'exactly one loud did-not-converge outcome'
+    assert stalled[0].json_path == 'detail', 'it names the path still changing'
+    assert stalled[0].reason == sweep.REASON_ROUND_BOUND_EXCEEDED
+
+    # The document survives, and the applied repair was not rolled back.
+    assert json.loads(json.dumps(repaired)) == repaired, 'still valid JSON'
+    assert repaired['root_cause'] == 'restored by the stub', 'repair intact'
+    assert len([o for o in outcomes if o.action == sweep.ACTION_REPAIRED]) == (
+        sweep._MAX_REPAIR_ROUNDS
+    ), 'one repair per round, and the loop stopped AT the bound'

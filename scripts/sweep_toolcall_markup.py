@@ -379,6 +379,22 @@ REASON_NO_STRING_HOLE_TARGET = 'no-string-hole-target'
 #: not parse with zero leftover, or a recovered name is not a field of this
 #: record at all, or the clean prefix would itself still carry markup.
 REASON_UNREPAIRABLE = 'unrepairable'
+#: The repair walk was still applying changes when the round bound ran out.
+#: Reported loudly rather than silently truncated into a plausible-looking
+#: clean result — a document that stops converging is a signal that repair()'s
+#: behaviour has changed, not something to paper over.
+ACTION_DID_NOT_CONVERGE = 'did-not-converge'
+
+#: How many times the walk may repeat before giving up. Small on purpose: a
+#: recovered value can carry markup at most one level deep before B5 refuses
+#: the parse, so anything past two rounds already means repair() is behaving
+#: differently than measured. Four leaves headroom without turning a runaway
+#: into a hang.
+_MAX_REPAIR_ROUNDS = 4
+
+#: Paired with :data:`ACTION_DID_NOT_CONVERGE`.
+REASON_ROUND_BOUND_EXCEEDED = 'round-bound-exceeded'
+
 #: The tail names the very field it mis-closed. Applying it would make the
 #: field's clean prefix and its recovered value fight over one key, and one of
 #: them would be silently dropped — so this refuses instead.
@@ -570,7 +586,50 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     verbatim substring (invariant D5, enforced by construction in repair()), so
     the union of the rewritten fields contains every byte of the original
     except the markup tags themselves.
-    """
+
+    The walk repeats until a pass changes nothing, bounded by
+    :data:`_MAX_REPAIR_ROUNDS`. The loop exists because a recovered value is a
+    verbatim substring of the corrupted tail and can therefore itself carry
+    markup — the nested double-leak class cancelled task 3654 identified.
+    Landing such a value in a hole and stopping would leave a repairable string
+    behind and break the binding "a second run reports 0" invariant.
+
+    Measured today, the loop never runs twice: ``_parse_tail`` refuses outright
+    when a recovered item contains a further mis-close (B5), so on every shape
+    repair() accepts, one pass already converges and a second yields zero
+    repairs on both live corpora. The loop is therefore INSURANCE — it makes
+    the second-run-zero invariant STRUCTURAL rather than an empirical
+    observation that a future widening of repair() could quietly invalidate.
+
+    Exceeding the bound is reported LOUDLY as a
+    :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still
+    changing. The bound truncates the LOOP, never a repair: every repair
+    already applied stays applied and the document stays valid, because a
+    half-converged document is still strictly better than a corrupted one —
+    and silently returning it as if it were clean is the failure mode that
+    would matter.
+    """  # noqa: D205
     outcomes: list[Outcome] = []
-    new_obj, _changed = _repair_node(obj, '', outcomes)
-    return new_obj, outcomes
+    current = obj
+
+    for _round in range(_MAX_REPAIR_ROUNDS):
+        round_outcomes: list[Outcome] = []
+        current, changed = _repair_node(current, '', round_outcomes)
+        outcomes.extend(round_outcomes)
+        if not changed:
+            return current, outcomes
+        last_changed = round_outcomes
+    else:
+        # The bound was reached with the last pass STILL changing something.
+        stalled = next(
+            (o for o in last_changed if o.action == ACTION_REPAIRED), None
+        )
+        outcomes.append(Outcome(
+            json_path=stalled.json_path if stalled is not None else '',
+            field=stalled.field if stalled is not None else '',
+            action=ACTION_DID_NOT_CONVERGE,
+            recovered_names=(),
+            reason=REASON_ROUND_BOUND_EXCEEDED,
+        ))
+
+    return current, outcomes
